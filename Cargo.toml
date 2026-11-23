@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = ["crates/neha"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "GPL-3.0-only"
+publish = false
+
+# Shared dependency versions live here so a crate declares `foo.workspace = true`
+# and one edit updates every crate. Add an entry when a second crate needs the
+# same dependency, not in advance.
+[workspace.dependencies]
+
+# Workspace-wide lints. `cargo clippy -- -D warnings` turns every warning into a
+# failure, so a crate that needs an exception narrows it locally and states why.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+# Test codegen. Unoptimized test code makes numerical and rendering suites
+# several times slower. opt-level 2 inherits `dev`, so debug assertions and
+# overflow checks stay enabled and only code generation differs.
+[profile.test]
+opt-level = 2

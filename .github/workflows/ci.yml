@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Verification gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # The gate does not need debug symbols in CI.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Run gate with evidence
+        run: just verify "$RUNNER_TEMP/verification"
+
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verification-evidence
+          path: ${{ runner.temp }}/verification
+          if-no-files-found: error

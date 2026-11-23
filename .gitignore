@@ -1,0 +1,19 @@
+target/
+
+# Editor and OS files.
+.DS_Store
+**/.DS_Store
+
+# Python interpreter caches are generated locally.
+__pycache__/
+*.py[cod]
+
+# Local design-tooling state (Impeccable) is machine-local, not shared.
+.impeccable/
+
+# Diagnostic outputs from local runs. Scoped to the repository root so
+# legitimate fixtures under data/ and tests/ stay tracked.
+/test_*.png
+/*.tif
+/*.tiff
+/*.jpg

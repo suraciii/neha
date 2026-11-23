@@ -1,0 +1,10 @@
+# Normalize text to LF in the repository and in checkouts on every platform.
+* text=auto eol=lf
+
+# Binary assets keep their bytes.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.tif binary
+*.tiff binary
+*.exr binary
