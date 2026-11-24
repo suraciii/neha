@@ -5,15 +5,31 @@
 ```text
 specs/
 ├── VISION.md              # Product vision (optional)
+├── USER-STORIES.md        # User stories
 ├── AGENTS.md              # This file
 └── {topic}/
     ├── VISION.md          # Feature vision (optional)
-    ├── spec.md            # Required — product behavior
+    ├── product.md         # Required — product behavior
     ├── design.md          # Optional — boundaries, invariants
     └── {sub-topic}/       # Same shape, nested on demand
 ```
 
 A specification directory is created with the capability it describes. `VISION.md` is created when the product purpose is decided.
+
+## Vision template
+
+Vision headings come from a fixed vocabulary, so every `VISION.md` reads alike:
+
+- **Why** — the problem and who it serves; a user story can open it.
+- **What** — the thing itself, as declaratives.
+- **Why this way** — the reasons for the chosen shape, and what it protects.
+- **Principles** — one rule per bullet, each a test for a change.
+- **What this enables** — what the shape makes possible.
+- **User stories** — the concrete moments the capability serves.
+
+The product's `VISION.md` uses Why, What, and Principles. A topic's `VISION.md` uses every heading, because a capability earns its place by a problem, a shape, what the shape unlocks, and the moments it serves.
+
+State everything positively: what the product is not follows from what it is, and Why this way states reasons rather than the alternatives it beat. Architecture goes in `design.md`, behavior in `product.md`, and rejected alternatives in the owning Issue or pull request. User stories live in [USER-STORIES.md](USER-STORIES.md); a topic's User stories section links to the entries it serves.
 
 ## Rules
 
@@ -21,7 +37,7 @@ A specification directory is created with the capability it describes. `VISION.m
 - Write durable target state only.
 - Rewrites MUST preserve the target contract. Treat requirement changes as separate product decisions.
 - Keep one fact in one authoritative document; link instead of duplicating rules.
-- `spec.md` states observable product behavior, not implementation or test procedures.
+- `product.md` states observable product behavior, not implementation or test procedures.
 - Define shared domain terms in [CONTEXT.md](../CONTEXT.md). Define capability-specific concepts in the owning spec and link to shared terms.
 - Higher layers constrain lower layers. Never the reverse.
 - Keep transient material outside the repository.
@@ -32,7 +48,7 @@ A specification directory is created with the capability it describes. `VISION.m
 
 ## Detail placement
 
-- `spec.md` states durable product behavior and invariants. It MUST NOT contain test procedures, fixtures, exact tolerances, command transcripts, or evidence matrices.
+- `product.md` states durable product behavior and invariants. It MUST NOT contain test procedures, fixtures, exact tolerances, command transcripts, or evidence matrices.
 - Tests own concrete cases, fixtures, tolerances, byte-identity checks, failure injection, and step sequences.
 - Help, schemas, and code own exhaustive field, option, and parameter inventories.
 - Issues and pull requests own migration steps, implementation gaps, counts, dates, and rejected alternatives.
@@ -61,11 +77,11 @@ Choose the smallest form that makes the target contract clear:
 
 ## Ownership
 
-A capability directory is owned by the capability it names. Its `spec.md` owns observable product behavior; its optional `design.md` owns boundaries and invariants. Write each rule in its owning document and link from dependent capabilities.
+A capability directory is owned by the capability it names. Its `product.md` owns observable product behavior; its optional `design.md` owns boundaries and invariants. Write each rule in its owning document and link from dependent capabilities.
 
 ## Context Layers
 
 - **Product Vision** (`VISION.md`, optional) → why the product exists.
 - **Domain Language** ([CONTEXT.md](../CONTEXT.md)) → what each term is.
-- **Spec Documents** (`spec.md` / `design.md`) → what the product does.
+- **Spec Documents** (`product.md` / `design.md`) → what the product does.
 - **Code** → the implementation.

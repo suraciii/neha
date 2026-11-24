@@ -1,6 +1,6 @@
 # Neha
 
-A Rust workspace. The product scope is not defined yet; [specs/](specs/) records it when it is, and [CONTEXT.md](CONTEXT.md) records its language.
+A Rust workspace. [specs/VISION.md](specs/VISION.md) defines the product vision, and [CONTEXT.md](CONTEXT.md) defines its language.
 
 This repository holds the product contracts and the engineering design; it contains no product behavior.
 
