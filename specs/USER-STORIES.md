@@ -32,7 +32,8 @@ This is the baseline every agent product has, and Neha has it too.
 As a user with a task that repeats or a condition to watch for, I want to tell my Bot once when to act, so that it runs on its own and tells me when it matters.
 
 - Exercises:
-  - Routine
+  - Schedule
+  - Watcher
   - notification
   - memory
 - Starter:

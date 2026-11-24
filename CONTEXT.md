@@ -12,12 +12,16 @@ A term enters this file when a specification needs it. Each entry is one paragra
 A human actor who owns Bots and Computers and grants authority. An OS account is never a User.
 _Avoid_: person, principal, member
 
+**Account**:
+A User's identity on a Space: a display name, a picture, and one or more ways to sign in. The built-in Space has no accounts.
+_Avoid_: login, profile, credential
+
 **Space**:
 The Neha that Users belong to: it holds the record, the Users, the Bots, and their memory. The desktop app runs a built-in Space or connects to a remote one.
 _Avoid_: instance, workspace, server, community, tenant, organization
 
 **Admin**:
-The User who runs a Space: invites its Users and configures the model providers it offers.
+The User who runs a Space: invites its Users, connects its Providers, and configures the Space.
 _Avoid_: operator, owner (of a Space), manager
 
 **Bot**:
@@ -27,6 +31,14 @@ _Avoid_: teammate (as a term), agent (when meaning Neha's own), assistant, prima
 **Computer**:
 The machine a Bot runs on, managed or real; a real Computer runs Neha. Each Bot has its own Computer, chosen by its owner, and several Bots may share one.
 _Avoid_: host, sandbox (as the umbrella), VM, device
+
+**Provider**:
+A source of Models a Space connects to: a known vendor reached with an API key, or an OpenAI-compatible server reached with its address.
+_Avoid_: vendor, backend, adapter, service
+
+**Model**:
+What a Bot thinks with, offered by a Provider. A Model states whether it reads images, whether it thinks, and its context limit.
+_Avoid_: LLM, engine, model name
 
 **Chat**:
 The conversation between one User and one Bot. Each User allowed to use a Bot has one Chat with it; the owner's is created and removed with the Bot.
@@ -56,9 +68,13 @@ _Avoid_: block, widget, embed, canvas
 A Card with a state, an owner, and optional tags and dependencies; its Thread is the work log. A Task is made when work needs to be claimed, handed off, or waited on.
 _Avoid_: ticket, issue, work item, job
 
-**Routine**:
-A standing instruction that tells a Bot when to start working: on a schedule, when a condition is met, or after being shown once.
-_Avoid_: trigger, schedule, automation, job
+**Schedule**:
+A standing instruction that tells a Bot to start work at a time, once or repeatedly.
+_Avoid_: routine, trigger, automation, cron, job
+
+**Watcher**:
+A standing instruction that tells a Bot to start work when a condition is met.
+_Avoid_: routine, trigger, automation, job
 
 **Plugin**:
 The unit of replaceability. Every part of Neha — model, tools, Bot loop, Group — is a Plugin, and a Plugin replaces any of them or adds to it.
