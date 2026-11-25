@@ -151,6 +151,17 @@ impl Store {
         Ok(EventPage { events, next })
     }
 
+    /// Returns the cursor of the last recorded event.
+    pub async fn last_seq(&self) -> Result<Seq, StoreError> {
+        let text: String = sqlx::query_scalar("SELECT value FROM meta WHERE key = 'last_seq'")
+            .fetch_one(&self.reader)
+            .await?;
+        text.parse::<i64>()
+            .ok()
+            .and_then(Seq::from_i64)
+            .ok_or_else(|| corrupt("last_seq is not a cursor"))
+    }
+
     /// Replays the whole record into a projection.
     pub async fn replay(&self, projection: &mut impl Projection) -> Result<Seq, StoreError> {
         let mut cursor = Seq::ZERO;

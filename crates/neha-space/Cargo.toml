@@ -8,7 +8,9 @@ publish.workspace = true
 
 [dependencies]
 argon2 = { version = "0.5", features = ["std"] }
+axum = { version = "0.8", features = ["http1", "json", "tokio", "ws"] }
 base64 = "0.22"
+futures-util = "0.3"
 neha = { path = "../neha" }
 rand = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -17,11 +19,13 @@ serde_json.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 subtle = "2"
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["net", "rt", "sync", "time"] }
 
 [dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio-tungstenite = "0.29"
 
 [lints]
 workspace = true

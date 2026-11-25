@@ -7,8 +7,10 @@
 pub mod home;
 pub mod identity;
 pub mod schema;
+pub mod server;
 pub mod store;
 
 pub use home::{Home, HomeError, SCHEMA_VERSION};
 pub use identity::{Account, Identity, IdentityError};
+pub use server::{Running, ServerError, SpaceServer, start};
 pub use store::{AppendRequest, AppendResult, EventPage, Projection, Store, StoreError};
