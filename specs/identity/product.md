@@ -6,15 +6,15 @@ Owned by identity. [Space](../space/product.md) holds the accounts; [CLI](../cli
 
 ## Laws
 
-1. Every User of a remote Space has an account on it.
-2. The built-in Space signs in no one.
+1. Every User of a Space has an account on it.
+2. The built-in Space signs its first User in without a prompt.
 3. A device joins a Space only through a code that a signed-in User enters.
 
 ## Accounts
 
 An account has a display name, a picture, and one or more ways to sign in. An email address is optional and never the account's identity.
 
-The first account on a remote Space is its Admin, created with a setup code that the Space prints when it starts.
+The first account on a remote Space is its Admin, created with an invitation link that the Space prints when it starts.
 
 ## Signing in
 
@@ -24,11 +24,13 @@ The first account on a remote Space is its Admin, created with a setup code that
 | Password | Every remote Space |
 | An external provider | An Admin has added one as a Plugin |
 
-A signed-in client stays signed in until the User signs out or the Admin removes the account.
+A signed-in client stays signed in until the User signs out or removes that client, or the Admin removes the account.
+
+A User can see the clients signed in as them and remove any one of them. A removed client is signed out at once.
 
 ## Inviting
 
-The Admin makes an invitation link, which admits one User and expires.
+The Admin makes an invitation link, which admits one User and expires. An invitation also shows as a QR code, which admits the same one User.
 
 The invited User opens the link in an app or a browser, sets a display name and a way to sign in, and joins the Space.
 

@@ -10,7 +10,7 @@ Identity has to disappear for a user alone, work on whatever the Space runs on, 
 
 A User's identity is an account on the Space: a display name and a way to sign in.
 
-The built-in Space signs in no one; its first user is its Admin.
+The built-in Space signs its first user in without a prompt; that user is its Admin.
 
 A remote Space signs a User in with a passkey, with a password, or with an external provider added as a Plugin.
 
@@ -33,7 +33,7 @@ Sign-in methods are Plugins because a Space that already has an identity provide
 ## Principles
 
 - **Accounts live on the Space.** A User is known to a Space by an account on it, with a display name and a way to sign in.
-- **No sign-in when alone.** The built-in Space has no sign-in; its first user is its Admin.
+- **No sign-in step when alone.** The built-in Space signs its first user in without a prompt, and that user is its Admin.
 - **Passkey when the Space can, password always.** A Space with a domain and HTTPS offers a passkey; every remote Space offers a password.
 - **Invite by link.** The Admin makes an invitation link; the invited User sets up their own account.
 - **Devices join by code.** A CLI or a real Computer shows a code, and a signed-in User enters it.

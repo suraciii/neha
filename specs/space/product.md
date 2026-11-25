@@ -33,11 +33,19 @@ A new Space has no Provider. Connecting one is the first thing its Admin does, b
 
 The phone app connects to a remote Space.
 
+## Closing the desktop app
+
+Closing the desktop app's window keeps its built-in Space running in the background. A User can set the app to exit when its window closes.
+
 ## Connecting
 
-A User connects to a remote Space with an invitation from its Admin. [Identity](../identity/product.md) covers invitations, accounts, and sign-in.
+A User connects to a remote Space with an invitation link: the first from the Space, the rest from its Admin. [Identity](../identity/product.md) covers invitations, accounts, and sign-in.
 
 A connected client shows the User's Bots, Chats, and Groups, the same on every client.
+
+## Who can read the record
+
+Whoever runs a Space can read its record and what passes through it from a Computer. A built-in Space is run by its first User, and a hosted Space is run by Neha.
 
 ## Users
 
@@ -59,5 +67,5 @@ The Admin can delete the Space, which deletes its record, Bots, and Users.
 
 ## Gaps
 
-- Exporting the Space's record, for backup or for moving it, is not yet specified.
+- Exporting the Space's record, for backup, is not yet specified.
 - Reaching Neha from outside its apps, by sharing into it from any app or calling it with a global shortcut, is not yet specified and comes after the CLI.

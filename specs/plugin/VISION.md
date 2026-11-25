@@ -8,7 +8,7 @@ None of these change what Neha is. Each is a Plugin: something added that replac
 
 ## What
 
-A Plugin is the unit of replaceability: every part of Neha — model, tools, a Bot's loop, a Group — is a Plugin, and a Plugin replaces any part or adds to it.
+A Plugin is the unit of replaceability: every part of Neha — model, tools, a Bot's loop, a Group — is a Plugin, a Plugin replaces any part or adds to it, and the Kernel they attach to is fixed.
 
 Plugins are installed and enabled on a Space; a Bot uses the tools and loop its Plugins provide.
 
@@ -26,7 +26,7 @@ Keeping the record out of Plugins means a Plugin can come and go without taking 
 
 ## Principles
 
-- **Everything is a Plugin.** Model, tools, a Bot's loop, and a Group are Plugins; a Plugin replaces any part or adds to it.
+- **Everything is a Plugin.** Model, tools, a Bot's loop, and a Group are Plugins; a Plugin replaces any part or adds to it. The Kernel is fixed.
 - **Installed on the Space.** Plugins are installed and enabled on a Space, and a Bot uses what they provide.
 - **Integrations are Plugins.** A bridge to another service is added to Neha; the record stays in Neha.
 - **Plugins hold no record.** A Plugin reads and writes the record like a member and takes nothing with it when removed.

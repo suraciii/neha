@@ -6,9 +6,10 @@ Owned by plugin. Every part of Neha is a Plugin, so every topic depends on this 
 
 ## Laws
 
-1. Every part of Neha is a Plugin.
+1. Every part of Neha outside the Kernel is a Plugin.
 2. A built-in Plugin ships with Neha and is available on every Space.
 3. A Plugin holds no record.
+4. The Kernel is fixed, and a Plugin attaches to it.
 
 ## Built-in Plugins
 
@@ -30,8 +31,22 @@ A bridge carries Messages between Neha and the other surface. The record stays i
 
 A Plugin reads and writes the Space's record like a member. Removing a Plugin leaves the record as it was.
 
+## Installing
+
+The Admin installs and enables a Plugin on the Space. The owner of a real Computer approves any code a Plugin runs on that Computer.
+
+A reference that starts a program on a Computer counts as code.
+
+## Skills
+
+A skill is a Plugin that holds instructions for how to do a task. A skill adds no authority: its instructions carry only what the Bot was already allowed to do.
+
+The Admin installs a skill on the Space, and a Bot's owner enables it for the Bot. A skill that a Bot wrote itself is not installed; [Bot](../bot/product.md) covers it.
+
+A script that a skill carries runs only as one of the Bot's actions, and the owner of a real Computer approves it before a Bot on that Computer runs it.
+
+The Admin can set a Space to treat skills as instructions only; then the scripts of a skill never reach a Computer.
+
 ## Gaps
 
-- Plugins a User installs, and who installs them, wait for the technical design.
 - A Bot whose loop is an outside harness is not yet specified.
-- Whether a skill is a Plugin or part of a Bot's memory is not yet specified.

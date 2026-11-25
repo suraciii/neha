@@ -47,5 +47,4 @@ When a Provider fails or runs out, the Bot says so as a Message and the work is 
 
 - Signing in with a subscription plan instead of an API key is not yet specified.
 - Fallback Models, used when the chosen Model fails, are not yet specified.
-- A Model per Schedule or Watcher is not yet specified.
 - Usage and cost by Model are not yet specified.

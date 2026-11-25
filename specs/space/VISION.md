@@ -2,7 +2,7 @@
 
 ## Why
 
-A user installs the desktop app and it works on the spot. Later they want their Bots to keep working while the laptop is closed, so they point the app at a server; the same Bots, the same Chats, now reachable from the phone as well.
+A user installs the desktop app and it works on the spot. Later they want their Bots to keep working while the laptop is closed, so they run the same product on a server and connect the app to it; the product is the same from the phone as well.
 
 A Space is the Neha that holds everything: Users, Bots, their memory, every Chat and Group. It has to be usable with no setup and ownable end to end, and it has to serve one User or several with the same model.
 
@@ -22,7 +22,7 @@ A Space sends notifications when a Bot finishes or waits for a User.
 
 ## Why this way
 
-A built-in Space lets a user start with nothing to install but the app; a remote Space is the step taken when the user wants Bots to keep working with the client closed.
+A built-in Space lets a user start with nothing to install but the app; a remote Space is the step taken when the user wants Bots to keep working while the computer is asleep or off.
 
 One model for both keeps a local User and a server's Users on the same product; connecting to a remote Space changes nothing but where the Space runs.
 

@@ -22,7 +22,7 @@ A Bot posting a File into a Group is a Bot posting a Message that carries the Fi
 
 ## Running a Space
 
-`neha serve` starts a Space on the machine and prints its address and a setup code. The first User opens the address in an app or a browser and enters the code to become the Admin.
+`neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
 
 ## Gaps
 

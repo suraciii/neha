@@ -10,7 +10,7 @@ This is what sets Neha apart. A Bot runs on a managed Computer or on a machine t
 
 A Computer is the machine a Bot runs on: a managed one that Neha provides, or a real one the user owns.
 
-A new Bot lives on a managed Computer. Its owner can move it to a real machine.
+A new Bot lives on a real Computer of its owner, and on a managed one when the owner has none.
 
 A real Computer is a machine with Neha installed on it; it connects to the Space and stays reachable from any client.
 
@@ -20,9 +20,9 @@ A Computer's screen is a panel in the Chat: the user can watch, take over, and h
 
 ## Why this way
 
-A managed Computer by default lets a user start with no machine of their own and nothing to set up.
+A Bot starts on its owner's own machine because that is where the work is: its files, its logins, and its software. The owner turns that machine on once, and can turn it off again.
 
-Moving to a real machine is the owner's choice because that is where a Bot touches the user's actual files and logins; it is a step taken knowingly, not a default.
+A managed Computer lets a user start with no machine of their own, or keep a Bot away from the machine it runs on.
 
 Neha installed on the machine, connecting out to the Space, is what lets a Bot live behind a home router or a company network and still be reached from anywhere.
 
@@ -32,7 +32,7 @@ The panel is part of the Chat because watching a Bot work on the user's own mach
 
 ## Principles
 
-- **Managed by default, real by choice.** A new Bot lives on a managed Computer; its owner moves it to a real one when ready.
+- **The owner's machine first.** A new Bot lives on a real Computer of its owner, and on a managed one when the owner has none.
 - **A real Computer runs Neha.** Installing Neha on a machine makes it a Computer that connects out and is reachable from any client.
 - **One Computer per Bot, shared when wanted.** A Bot's capabilities are its machine's; several Bots can point at the same machine.
 - **The machine's screen is a panel.** A user can watch a Bot work, take over, and hand back, from the Chat.

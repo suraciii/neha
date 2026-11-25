@@ -13,7 +13,7 @@ A human actor who owns Bots and Computers and grants authority. An OS account is
 _Avoid_: person, principal, member
 
 **Account**:
-A User's identity on a Space: a display name, a picture, and one or more ways to sign in. The built-in Space has no accounts.
+A User's identity on a Space: a display name, a picture, and one or more ways to sign in.
 _Avoid_: login, profile, credential
 
 **Space**:
@@ -31,6 +31,10 @@ _Avoid_: teammate (as a term), agent (when meaning Neha's own), assistant, prima
 **Computer**:
 The machine a Bot runs on, managed or real; a real Computer runs Neha. Each Bot has its own Computer, chosen by its owner, and several Bots may share one.
 _Avoid_: host, sandbox (as the umbrella), VM, device
+
+**Vault**:
+The Space's store of passwords and keys that a Bot uses without seeing.
+_Avoid_: wallet, safe, secret store
 
 **Provider**:
 A source of Models a Space connects to: a known vendor reached with an API key, or an OpenAI-compatible server reached with its address.
@@ -76,6 +80,14 @@ _Avoid_: routine, trigger, automation, cron, job
 A standing instruction that tells a Bot to start work when a condition is met.
 _Avoid_: routine, trigger, automation, job
 
+**Skill**:
+A reusable set of instructions for how to do a task. A skill tells a Bot how and adds no authority. It is a Plugin, kept with a Space or with the Bot that wrote it.
+_Avoid_: recipe, playbook, macro, workflow
+
+**Kernel**:
+The fixed part of Neha that Plugins attach to: accounts and authority, the record, the composition of Plugins, the clock, and the Approval gate.
+_Avoid_: core, platform, foundation, system
+
 **Plugin**:
-The unit of replaceability. Every part of Neha — model, tools, Bot loop, Group — is a Plugin, and a Plugin replaces any of them or adds to it.
+The unit of replaceability. Every part of Neha outside the Kernel — model, tools, Bot loop, Group — is a Plugin, and a Plugin replaces any of them or adds to it.
 _Avoid_: extension, addon, integration, connector
