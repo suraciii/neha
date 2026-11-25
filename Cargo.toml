@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/neha"]
+members = ["crates/neha", "crates/neha-space"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,6 +13,8 @@ publish = false
 # and one edit updates every crate. Add an entry when a second crate needs the
 # same dependency, not in advance.
 [workspace.dependencies]
+serde_json = "1"
+thiserror = "2"
 
 # Workspace-wide lints. `cargo clippy -- -D warnings` turns every warning into a
 # failure, so a crate that needs an exception narrows it locally and states why.
