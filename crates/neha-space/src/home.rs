@@ -10,7 +10,7 @@ use neha::id::Id;
 use thiserror::Error;
 
 /// The schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 1;
+pub use crate::schema::SCHEMA_VERSION;
 
 const DIRECTORIES: [&str; 7] = [
     "db",
@@ -72,7 +72,7 @@ impl Home {
     pub fn db_path(&self) -> PathBuf {
         self.root
             .join("db")
-            .join(format!("neha-{SCHEMA_VERSION}.sqlite3"))
+            .join(format!("neha-{}.sqlite3", crate::schema::SCHEMA_VERSION))
     }
 
     /// Returns the directory for a Computer's workspace.

@@ -15,7 +15,8 @@ use sqlx::{Connection, Row, SqliteConnection, SqlitePool};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::home::{Home, SCHEMA_VERSION};
+use crate::home::Home;
+use crate::schema::{self, SchemaError};
 
 const EVENTS: &str = "SELECT seq, kind, class, version, at, author, acting, command, data \
                       FROM events";
@@ -96,7 +97,7 @@ impl Store {
             .busy_timeout(Duration::from_secs(5));
 
         let mut writer = SqliteConnection::connect_with(&options).await?;
-        migrate(&mut writer).await?;
+        schema::migrate(&mut writer).await?;
 
         let reader = SqlitePoolOptions::new()
             .max_connections(4)
@@ -367,43 +368,6 @@ fn parse_id(text: Option<String>) -> Result<Option<Id>, StoreError> {
         .transpose()
 }
 
-async fn migrate(connection: &mut SqliteConnection) -> Result<(), StoreError> {
-    let version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&mut *connection)
-        .await?;
-    if version > SCHEMA_VERSION {
-        return Err(StoreError::SchemaTooNew {
-            found: version,
-            supported: SCHEMA_VERSION,
-        });
-    }
-    if version == SCHEMA_VERSION {
-        return Ok(());
-    }
-
-    for statement in [
-        "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-        "INSERT INTO meta (key, value) VALUES ('last_seq', '0')",
-        "CREATE TABLE events (\
-            seq INTEGER PRIMARY KEY, kind TEXT NOT NULL, class TEXT NOT NULL, \
-            version INTEGER NOT NULL, at INTEGER NOT NULL, author TEXT NOT NULL, \
-            acting TEXT, command TEXT, data TEXT NOT NULL)",
-        "CREATE INDEX events_command ON events(command)",
-        "CREATE TABLE commands (\
-            command_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, \
-            first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL)",
-    ] {
-        sqlx::query(statement).execute(&mut *connection).await?;
-    }
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "PRAGMA user_version = {SCHEMA_VERSION}"
-    )))
-    .execute(&mut *connection)
-    .await?;
-
-    Ok(())
-}
-
 fn corrupt(reason: &str) -> StoreError {
     StoreError::Corrupt(reason.to_owned())
 }
@@ -435,14 +399,9 @@ pub enum StoreError {
     /// A command wrote no events.
     #[error("a command must write at least one event")]
     EmptyCommand,
-    /// The database schema is newer than this version supports.
-    #[error("schema version {found} is newer than {supported}")]
-    SchemaTooNew {
-        /// The version found.
-        found: i64,
-        /// The version supported.
-        supported: i64,
-    },
+    /// The database schema cannot be created or is newer than this build.
+    #[error("schema error: {0}")]
+    Schema(#[from] SchemaError),
 }
 
 #[cfg(test)]

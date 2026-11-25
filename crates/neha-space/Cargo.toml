@@ -7,9 +7,15 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+argon2 = { version = "0.5", features = ["std"] }
+base64 = "0.22"
 neha = { path = "../neha" }
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 serde_json.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+subtle = "2"
 thiserror.workspace = true
 tokio = { version = "1", features = ["rt", "sync"] }
 
