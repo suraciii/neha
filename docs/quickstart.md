@@ -110,7 +110,7 @@ The record, the Provider, the Bot, and the Messages survive. A new Space run pri
 target/debug/neha login --name Ada
 ```
 
-When the Space has a new address, pass `--server http://127.0.0.1:<port>`. Then read the old Chat again; it contains every recorded Message.
+When the Space has a new address, or the saved credential is gone, pass `--server http://127.0.0.1:<port>`. Then read the old Chat again; it contains every recorded Message.
 
 ## What this milestone does not do
 
