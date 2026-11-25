@@ -48,7 +48,7 @@ When a User asks a Bot to remember something, it keeps the entry at the scope of
 
 A suggestion applies to nothing until the owner approves it. A rule the owner gives in a Group applies to the Group.
 
-The owner sees that every entry exists, without reading a User entry's content, and can clear any entry. A User sees and clears the entries that are theirs by asking the Bot in the Chat.
+The owner can audit every entry's scope, author, and source without reading a User entry's content, and can clear any entry. A User sees and clears the entries that are theirs by asking the Bot in the Chat.
 
 As a conversation grows past what the Model can hold, the Bot summarizes its older parts. Lasting rules live in memory and stay.
 
@@ -88,7 +88,9 @@ The User it acts for answers with Allow or Deny. In a Chat, the User can make an
 
 While a Bot waits for an answer, its other work goes on.
 
-A request from a run the User started has no time limit. A request from a run no User is with expires after 30 minutes by default; the Space can change that period, the Bot does not do the action, and it says so.
+A request from a run the User started has no time limit. By default, a request from a run no User is with expires after 30 minutes; the Space can change that period.
+
+The Bot does not do an expired action and says so.
 
 A request also ends when the User leaves the conversation, the Computer is revoked, or the run is cancelled.
 

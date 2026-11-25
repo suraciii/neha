@@ -54,7 +54,7 @@ Stopping a managed Computer saves its workspace and takes the machine offline. S
 
 Recovery first saves what it can from the machine, then builds a new machine from the last saved workspace. Reset builds a new machine from the last saved workspace and saves nothing.
 
-A run stops at a step boundary before a saved workspace is replaced, and the Bot says when work was interrupted.
+A run stops between two actions before a saved workspace is replaced, and the Bot says when work was interrupted.
 
 Destroying a Computer deletes its saved workspace.
 

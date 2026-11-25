@@ -59,7 +59,7 @@ A need that completes moves its dependents from waiting to ready. A need that fa
 
 A claim moves a ready Task to claimed. Releasing a claim, or letting its lease expire, moves the Task back to ready. The owner can cancel a Task that is waiting, ready, or claimed.
 
-A claimed Task becomes completed, failed, or blocked. A failed Task can become ready again, and a canceled Task stays canceled.
+A claimed Task becomes completed, failed, or blocked. A failed Task can become ready again.
 
 The owner of a Task can reopen a completed Task by moving it to ready. A canceled Task stays canceled.
 
@@ -75,6 +75,6 @@ A Bot claims a Task only when it can write in the Task's conversation. Writing a
 
 A Task becomes blocked when its work needs a person: a Question or an Approval.
 
-The answer is in the Task's Thread, and the usual approval rules apply. An Allow moves the Task back to ready; a Deny moves it to failed, and the action never runs.
+The answer is in the Task's Thread, and the usual approval rules apply. A Question's answer or an Approval's Allow moves the Task back to ready; a Deny moves it to failed, and the action never runs.
 
 A Bot cannot unblock a Task by itself.

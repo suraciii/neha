@@ -85,7 +85,7 @@ Structured content in a Message that is more than text: an approval request, a q
 _Avoid_: block, widget, embed, canvas
 
 **Task**:
-A Card with a state, an owner, an assignee, and optional tags and dependencies; its Thread is the work log. A Task is made when work needs to be claimed, handed off, or waited on.
+A Card with a state, an owner, an optional assignee, and optional tags and dependencies; its Thread is the work log. A Task is made when work needs to be claimed, handed off, or waited on.
 _Avoid_: ticket, issue, work item, job
 
 **Board**:
