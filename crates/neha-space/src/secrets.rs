@@ -47,6 +47,11 @@ impl Secrets {
         write_private(&self.directory.join(provider_file(provider)), &sealed)
     }
 
+    /// Removes a Provider key that no command recorded.
+    pub fn discard_provider_key(&self, provider: Id) {
+        let _ = fs::remove_file(self.directory.join(provider_file(provider)));
+    }
+
     /// Opens a Provider's API key.
     pub fn provider_key(&self, provider: Id) -> Result<String, SecretsError> {
         let sealed = fs::read(self.directory.join(provider_file(provider)))?;

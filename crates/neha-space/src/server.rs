@@ -123,6 +123,7 @@ pub struct Running {
     pub addr: std::net::SocketAddr,
     /// The invitation URL, when the Space has no Admin yet.
     pub invite: Option<String>,
+    home: Home,
     task: JoinHandle<()>,
 }
 
@@ -131,6 +132,12 @@ impl Running {
     #[must_use]
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// Returns the Space's home.
+    #[must_use]
+    pub fn server_home(&self) -> std::path::PathBuf {
+        self.home.root().to_path_buf()
     }
 
     /// Stops the server.
@@ -153,7 +160,12 @@ pub async fn start(home: Home, port: u16) -> Result<Running, ServerError> {
         let _ = axum::serve(listener, router).await;
     });
 
-    Ok(Running { addr, invite, task })
+    Ok(Running {
+        addr,
+        invite,
+        home: server.home().clone(),
+        task,
+    })
 }
 
 async fn guard(request: Request, next: Next) -> Response {
@@ -419,8 +431,8 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                 }
                                 match outcome.pending {
                                     Some(pending) => {
-                                        match commands::finish_run(&server.store, &server.state, &server.secrets, &server.model, pending).await {
-                                            Ok(result) => (outcome.committed, result),
+                                        match commands::finish_run(&server.store, &server.state, &server.model, pending).await {
+                                            Ok((result, _events)) => (outcome.committed, result),
                                             Err(error) => {
                                                 let _ = send_frame(&mut socket, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
                                                 continue;
@@ -537,27 +549,23 @@ async fn recover_interrupted(store: &Store, state: &mut SpaceState) -> Result<()
             .acting(run.acting),
         ];
         let appended = store
-            .append(AppendRequest::new(
-                Id::new(),
-                format!("recover:{}", run.id),
-                drafts,
-            ))
+            .append(
+                AppendRequest::new(Id::new(), format!("recover:{}", run.id), drafts)
+                    .with_confirmation(
+                        run.command,
+                        serde_json::json!({
+                            "run": run.id,
+                            "status": "failed",
+                            "reply": message,
+                            "text": text,
+                            "error": "the Space stopped before the run finished",
+                        }),
+                    ),
+            )
             .await?;
         for event in &appended.events {
             state.apply(event).map_err(StoreError::Corrupt)?;
         }
-        store
-            .set_result(
-                run.command,
-                serde_json::json!({
-                    "run": run.id,
-                    "status": "failed",
-                    "reply": message,
-                    "text": text,
-                    "error": "the Space stopped before the run finished",
-                }),
-            )
-            .await?;
     }
 
     Ok(())
@@ -595,6 +603,10 @@ impl ApiError {
 
     pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument, message)
+    }
+
+    pub(crate) fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, ErrorCode::Conflict, message)
     }
 
     pub(crate) fn idempotency_conflict(message: impl Into<String>) -> Self {
@@ -1002,9 +1014,16 @@ mod tests {
         })
     }
 
-    async fn admin_socket(running: &Running, invite: &str) -> Socket {
+    async fn admin(running: &Running, invite: &str) -> (Socket, String) {
         let session = join(running, invite, "Ada", "correct horse battery").await;
-        open_socket(running, session["token"].as_str().unwrap()).await
+        let token = session["token"].as_str().unwrap().to_owned();
+        let socket = open_socket(running, &token).await;
+
+        (socket, token)
+    }
+
+    async fn admin_socket(running: &Running, invite: &str) -> Socket {
+        admin(running, invite).await.0
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1358,7 +1377,7 @@ mod tests {
             .acting(user),
         ];
         store
-            .append(AppendRequest::new(Id::new(), "seed", drafts))
+            .append(AppendRequest::new(command, "seed", drafts))
             .await
             .unwrap();
         store.close().await.unwrap();
@@ -1375,6 +1394,8 @@ mod tests {
                 "I was interrupted before I could answer."
             );
         }
+        let recorded = server.store.command(command).await.unwrap().unwrap();
+        assert_eq!(recorded.result.unwrap()["status"], "failed");
         server.store.close().await.unwrap();
     }
 
@@ -1585,6 +1606,334 @@ mod tests {
             assert!(texts.contains(&"Hello from fake"));
             assert!(texts.contains(&"again"));
         }
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    fn provider_base(base_url: String) -> CommandCall {
+        provider_add(base_url)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replaying_create_commands_has_no_side_effects() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (provider, provider_task) = fake_provider().await;
+        let provider_command = Id::new();
+        let add = provider_base(provider);
+
+        command(&mut socket, provider_command, add.clone()).await;
+        command(&mut socket, provider_command, add).await;
+
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        assert_eq!(models.as_array().unwrap().len(), 1);
+        assert_eq!(models[0]["is_default"], true);
+
+        let create = Id::new();
+        let bot_command = CommandCall::BotCreate(BotCreate {
+            name: "Scout".to_owned(),
+        });
+        let first = command(&mut socket, create, bot_command.clone()).await;
+        let second = command(&mut socket, create, bot_command).await;
+        assert_eq!(first, second);
+        let bots = command(&mut socket, Id::new(), CommandCall::BotList).await;
+        assert_eq!(bots.as_array().unwrap().len(), 1);
+
+        let home = running.server_home();
+        let keys = std::fs::read_dir(home.join("secrets"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("provider-"))
+            .count();
+        assert_eq!(keys, 1, "a replay must not leave an orphan Provider key");
+        let computers = std::fs::read_dir(home.join("computers")).unwrap().count();
+        assert_eq!(computers, 1, "a replay must not leave an orphan workspace");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_send_replay_changes_nothing() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = fake_provider().await;
+        command(&mut socket, Id::new(), provider_base(base)).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let send = Id::new();
+        let message = CommandCall::MessageSend(MessageSend {
+            chat,
+            text: "hello".to_owned(),
+        });
+
+        let first = command(&mut socket, send, message.clone()).await;
+        let second = command(&mut socket, send, message).await;
+
+        assert_eq!(first, second);
+        assert_eq!(first["status"], "succeeded");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        let run: Id = serde_json::from_value(first["run"].clone()).unwrap();
+        let shown = command(&mut socket, Id::new(), CommandCall::RunShow { run }).await;
+        assert_eq!(shown["status"], "succeeded");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retry_while_the_run_works_waits_for_the_first_result() {
+        let (_dir, running, invite) = running().await;
+        let (mut first_socket, token) = admin(&running, &invite).await;
+        let (base, provider_task) = slow_provider().await;
+        command(&mut first_socket, Id::new(), provider_base(base)).await;
+        let bot = command(
+            &mut first_socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let command_id = Id::new();
+        first_socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: command_id,
+                    command: CommandCall::MessageSend(MessageSend {
+                        chat,
+                        text: "hello".to_owned(),
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let first_frame = next_frame(&mut first_socket).await;
+        let second_frame = next_frame(&mut first_socket).await;
+        assert!(matches!(first_frame, ServerFrame::Accepted { .. }));
+        assert!(matches!(second_frame, ServerFrame::Committed { .. }));
+
+        let mut second_socket = open_socket(&running, &token).await;
+        let result = command(
+            &mut second_socket,
+            command_id,
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(result["status"], "succeeded");
+
+        loop {
+            match next_frame(&mut first_socket).await {
+                ServerFrame::Confirmed { .. } => break,
+                ServerFrame::Heartbeat { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        let messages = command(
+            &mut second_socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        first_socket.close(None).await.unwrap();
+        second_socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_provider_leaves_a_failure_message_and_run() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = failing_provider().await;
+        command(&mut socket, Id::new(), provider_base(base)).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        let result = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+
+        assert_eq!(result["status"], "failed");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        assert!(
+            messages[1]["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not answer")
+        );
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = command(&mut socket, Id::new(), CommandCall::RunShow { run }).await;
+        assert_eq!(shown["status"], "failed");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_provider_key_is_rejected_before_the_record_changes() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = fake_provider().await;
+        command(&mut socket, Id::new(), provider_base(base)).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let home = running.server_home();
+        for entry in std::fs::read_dir(home.join("secrets")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("provider-") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(error, Err((ErrorCode::InvalidArgument, _))));
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert!(messages.as_array().unwrap().is_empty());
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    async fn slow_provider() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from fake\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task)
+    }
+
+    async fn failing_provider() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::routing::post;
+
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async { (axum::http::StatusCode::UNAUTHORIZED, "no") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_key_never_reaches_disk_in_plaintext() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = fake_provider().await;
+        let secret = "sk-unique-review-secret";
+
+        let mut add = provider_base(base);
+        if let CommandCall::ProviderAdd(arguments) = &mut add {
+            arguments.api_key = secret.to_owned();
+        }
+        command(&mut socket, Id::new(), add).await;
+
+        let mut found = Vec::new();
+        let mut pending = vec![running.server_home()];
+        while let Some(path) = pending.pop() {
+            for entry in std::fs::read_dir(&path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if let Ok(bytes) = std::fs::read(&path)
+                    && bytes
+                        .windows(secret.len())
+                        .any(|window| window == secret.as_bytes())
+                {
+                    found.push(path);
+                }
+            }
+        }
+        assert!(found.is_empty(), "plaintext key found in {found:?}");
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;

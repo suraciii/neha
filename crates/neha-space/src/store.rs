@@ -39,6 +39,17 @@ pub struct AppendRequest {
     pub events: Vec<EventDraft>,
     /// The command's result, once known.
     pub result: Option<serde_json::Value>,
+    /// Another command whose result this append confirms in the same transaction.
+    pub confirmation: Option<Confirmation>,
+}
+
+/// A result written for another command in the same transaction.
+#[derive(Clone, Debug)]
+pub struct Confirmation {
+    /// The command to confirm.
+    pub command: Id,
+    /// The result to store.
+    pub result: serde_json::Value,
 }
 
 impl AppendRequest {
@@ -50,6 +61,7 @@ impl AppendRequest {
             fingerprint: fingerprint.into(),
             events,
             result: None,
+            confirmation: None,
         }
     }
 
@@ -57,6 +69,13 @@ impl AppendRequest {
     #[must_use]
     pub fn with_result(mut self, result: serde_json::Value) -> Self {
         self.result = Some(result);
+        self
+    }
+
+    /// Confirms another command's result in the same transaction.
+    #[must_use]
+    pub fn with_confirmation(mut self, command: Id, result: serde_json::Value) -> Self {
+        self.confirmation = Some(Confirmation { command, result });
         self
     }
 }
@@ -69,6 +88,17 @@ pub struct AppendResult {
     /// Whether this call found the command already recorded.
     pub existing: bool,
     /// The command's result, when the record holds it.
+    pub result: Option<serde_json::Value>,
+}
+
+/// A recorded command.
+#[derive(Clone, Debug)]
+pub struct CommandRecord {
+    /// A digest of the command's parameters.
+    pub fingerprint: String,
+    /// The cursor of the command's last event.
+    pub last_seq: Seq,
+    /// The command's result, once known.
     pub result: Option<serde_json::Value>,
 }
 
@@ -85,11 +115,6 @@ enum WriteRequest {
     Append {
         request: AppendRequest,
         reply: oneshot::Sender<Result<AppendResult, StoreError>>,
-    },
-    SetResult {
-        command: Id,
-        result: serde_json::Value,
-        reply: oneshot::Sender<Result<(), StoreError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -194,23 +219,31 @@ impl Store {
         }
     }
 
-    /// Stores the result of a command that finished later, such as a run.
-    pub async fn set_result(
-        &self,
-        command: Id,
-        result: serde_json::Value,
-    ) -> Result<(), StoreError> {
-        let (reply, answer) = oneshot::channel();
-        self.writer
-            .send(WriteRequest::SetResult {
-                command,
-                result,
-                reply,
+    /// Returns a recorded command, if the record holds it.
+    pub async fn command(&self, command: Id) -> Result<Option<CommandRecord>, StoreError> {
+        let row =
+            sqlx::query("SELECT fingerprint, last_seq, result FROM commands WHERE command_id = ?")
+                .bind(command.to_string())
+                .fetch_optional(&self.reader)
+                .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let fingerprint: String = row.try_get("fingerprint")?;
+        let last: i64 = row.try_get("last_seq")?;
+        let last_seq = Seq::from_i64(last).ok_or_else(|| corrupt("command cursor"))?;
+        let stored: Option<String> = row.try_get("result")?;
+        let result = stored
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|_| corrupt("command result is not JSON"))
             })
-            .await
-            .map_err(|_| StoreError::WriterGone)?;
+            .transpose()?;
 
-        answer.await.map_err(|_| StoreError::WriterGone)?
+        Ok(Some(CommandRecord {
+            fingerprint,
+            last_seq,
+            result,
+        }))
     }
 
     /// Stops the writer and closes the record.
@@ -237,13 +270,6 @@ fn spawn_writer(
             match message {
                 WriteRequest::Append { request, reply } => {
                     let _ = reply.send(append(&mut connection, request).await);
-                }
-                WriteRequest::SetResult {
-                    command,
-                    result,
-                    reply,
-                } => {
-                    let _ = reply.send(set_result(&mut connection, command, result).await);
                 }
                 WriteRequest::Shutdown { reply } => {
                     let _ = reply.send(());
@@ -340,6 +366,18 @@ async fn append(
     .bind(stored_result)
     .execute(&mut *transaction)
     .await?;
+    if let Some(confirmation) = request.confirmation {
+        let stored =
+            serde_json::to_string(&confirmation.result).map_err(|_| corrupt("confirmed result"))?;
+        let updated = sqlx::query("UPDATE commands SET result = ? WHERE command_id = ?")
+            .bind(stored)
+            .bind(confirmation.command.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        if updated.rows_affected() != 1 {
+            return Err(corrupt("the command to confirm is not recorded"));
+        }
+    }
     transaction.commit().await?;
 
     Ok(AppendResult {
@@ -436,21 +474,6 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Event>, StoreErr
 fn parse_id(text: Option<String>) -> Result<Option<Id>, StoreError> {
     text.map(|text| text.parse().map_err(|_| corrupt("id is not a UUID")))
         .transpose()
-}
-
-async fn set_result(
-    connection: &mut SqliteConnection,
-    command: Id,
-    result: serde_json::Value,
-) -> Result<(), StoreError> {
-    let text = serde_json::to_string(&result).map_err(|_| corrupt("command result"))?;
-    sqlx::query("UPDATE commands SET result = ? WHERE command_id = ?")
-        .bind(text)
-        .bind(command.to_string())
-        .execute(&mut *connection)
-        .await?;
-
-    Ok(())
 }
 
 fn corrupt(reason: &str) -> StoreError {
@@ -599,6 +622,48 @@ mod tests {
         assert_eq!(page.events, recorded.events);
         assert_eq!(page.next, recorded.events[0].seq);
         store.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_completion_confirms_its_command_in_one_transaction() {
+        let (_dir, _home, store) = open().await;
+        let starting = Id::new();
+        let first = store
+            .append(AppendRequest::new(
+                starting,
+                "start",
+                vec![draft(EventKind::MessageAdded)],
+            ))
+            .await
+            .unwrap();
+        let completion = Id::new();
+        store
+            .append(
+                AppendRequest::new(completion, "finish", vec![draft(EventKind::RunFinished)])
+                    .with_confirmation(starting, serde_json::json!({"status": "succeeded"})),
+            )
+            .await
+            .unwrap();
+
+        let record = store.command(starting).await.unwrap().unwrap();
+        assert_eq!(record.result.unwrap()["status"], "succeeded");
+        assert_eq!(record.last_seq, first.events.last().unwrap().seq);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_completion_rolls_the_events_back() {
+        let (_dir, _home, store) = open().await;
+        let before = store.last_seq().await.unwrap();
+
+        let error = store
+            .append(
+                AppendRequest::new(Id::new(), "finish", vec![draft(EventKind::RunFinished)])
+                    .with_confirmation(Id::new(), serde_json::json!({"status": "failed"})),
+            )
+            .await;
+
+        assert!(error.is_err());
+        assert_eq!(store.last_seq().await.unwrap(), before);
     }
 
     #[tokio::test]
