@@ -52,6 +52,9 @@ impl Credential {
     }
 
     /// Saves the credential for later commands.
+    ///
+    /// The file is created 0600 and replaces the old one atomically, so a
+    /// reader never sees a partly written or world-readable credential.
     pub fn save(&self) -> Result<()> {
         let path = credential_path();
         if let Some(parent) = path.parent() {
@@ -60,7 +63,25 @@ impl Credential {
             restrict(parent, 0o700)?;
         }
         let bytes = serde_json::to_vec(self)?;
-        fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .with_context(|| format!("cannot write {}", temporary.display()))?;
+        {
+            use std::io::Write as _;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        drop(file);
+        fs::rename(&temporary, &path)
+            .with_context(|| format!("cannot move the credential to {}", path.display()))?;
         restrict(&path, 0o600)?;
 
         Ok(())

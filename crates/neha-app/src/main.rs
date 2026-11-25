@@ -37,9 +37,6 @@ enum Top {
         /// Your display name in the Space.
         #[arg(long)]
         name: String,
-        /// The password; prompted when omitted.
-        #[arg(long)]
-        password: Option<String>,
     },
     /// Sign in to a Space you already joined.
     Login {
@@ -49,9 +46,6 @@ enum Top {
         /// The Space URL; defaults to the saved one.
         #[arg(long)]
         server: Option<String>,
-        /// The password; prompted when omitted.
-        #[arg(long)]
-        password: Option<String>,
     },
     /// Show the account and Space this CLI uses.
     Whoami,
@@ -169,16 +163,8 @@ enum RunCommand {
 async fn main() -> Result<()> {
     match Cli::parse().command {
         Top::Serve { port } => serve(port).await,
-        Top::Join {
-            link,
-            name,
-            password,
-        } => join(&link, &name, password).await,
-        Top::Login {
-            name,
-            server,
-            password,
-        } => login(&name, server, &read_password(password)?).await,
+        Top::Join { link, name } => join(&link, &name).await,
+        Top::Login { name, server } => login(&name, server).await,
         Top::Whoami => whoami(),
         Top::Provider { command } => provider(command).await,
         Top::Model { command } => model(command).await,
@@ -212,9 +198,9 @@ async fn serve(port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn join(link: &str, name: &str, password: Option<String>) -> Result<()> {
+async fn join(link: &str, name: &str) -> Result<()> {
     client::split_invite(link)?;
-    let password = read_password(password)?;
+    let password = read_password()?;
     let credential = client::join(link, name, &password).await?;
     credential.save()?;
     println!(
@@ -231,7 +217,7 @@ async fn join(link: &str, name: &str, password: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn login(name: &str, server: Option<String>, password: &str) -> Result<()> {
+async fn login(name: &str, server: Option<String>) -> Result<()> {
     let server = match server {
         Some(server) => server,
         None => {
@@ -240,7 +226,8 @@ async fn login(name: &str, server: Option<String>, password: &str) -> Result<()>
                 .url
         }
     };
-    let credential = client::login(&server, name, password).await?;
+    let password = read_password()?;
+    let credential = client::login(&server, name, &password).await?;
     credential.save()?;
     println!(
         "Signed in to {} as {}.",
@@ -344,8 +331,13 @@ async fn model(command: ModelCommand) -> Result<()> {
                 } else {
                     ""
                 };
+                let images = if model["reads_images"].as_bool().unwrap_or(false) {
+                    "images"
+                } else {
+                    "no images"
+                };
                 println!(
-                    "{}  {}  context {}  max output {}{default}",
+                    "{}  {}  context {}  max output {}  {images}{default}",
                     id_of(model, "id")?,
                     text_of(model, "name")?,
                     model["context_limit"].as_u64().unwrap_or_default(),
@@ -502,11 +494,14 @@ fn provider_key() -> Result<String> {
     rpassword::prompt_password("Provider API key: ").context("cannot read the API key")
 }
 
-fn read_password(given: Option<String>) -> Result<String> {
-    match given {
-        Some(password) => Ok(password),
-        None => rpassword::prompt_password("Password: ").context("cannot read the password"),
+fn read_password() -> Result<String> {
+    if let Ok(password) = std::env::var("NEHA_PASSWORD")
+        && !password.is_empty()
+    {
+        return Ok(password);
     }
+
+    rpassword::prompt_password("Password: ").context("cannot read the password")
 }
 
 fn id_of(value: &Value, field: &str) -> Result<Id> {

@@ -5,13 +5,14 @@
 //! until a remote Space is configured.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::rand_core::RngCore as _;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Request, State};
 use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
@@ -43,7 +44,9 @@ use crate::state::State as SpaceState;
 use crate::store::{AppendRequest, Projection, Store, StoreError};
 
 const LOGIN_ATTEMPTS: usize = 5;
+const SOURCE_ATTEMPTS: usize = 20;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
+const LOGIN_NAMES: usize = 1024;
 const HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// A Space ready to answer clients.
@@ -104,6 +107,7 @@ impl SpaceServer {
             .route("/api/login", post(login))
             .route("/api/me", get(me))
             .route("/api/socket", get(socket))
+            .layer(DefaultBodyLimit::max(64 * 1024))
             .layer(middleware::from_fn(guard))
             .with_state(Arc::clone(self))
     }
@@ -162,7 +166,11 @@ pub async fn start(home: Home, port: u16) -> Result<Running, ServerError> {
         .map(|secret| format!("http://{addr}/invite#{secret}"));
     let router = server.router();
     let task = tokio::spawn(async move {
-        let _ = axum::serve(listener, router).await;
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await;
     });
 
     Ok(Running {
@@ -197,13 +205,34 @@ async fn guard(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-fn loopback_host(host: &str) -> bool {
-    let name = match host.strip_prefix('[') {
-        Some(inner) => inner.split(']').next().unwrap_or_default(),
-        None => host.split(':').next().unwrap_or_default(),
+fn loopback_host(value: &str) -> bool {
+    let Some((host, port)) = split_authority(value) else {
+        return false;
     };
+    if let Some(port) = port
+        && !port.parse::<u16>().is_ok_and(|port| port != 0)
+    {
+        return false;
+    }
 
-    matches!(name, "127.0.0.1" | "localhost" | "::1")
+    matches!(host, "127.0.0.1" | "localhost" | "::1")
+}
+
+fn split_authority(value: &str) -> Option<(&str, Option<&str>)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = if tail.is_empty() {
+            None
+        } else {
+            Some(tail.strip_prefix(':')?)
+        };
+        return Some((host, port));
+    }
+    match value.split_once(':') {
+        Some((host, port)) if !port.contains(':') => Some((host, Some(port))),
+        Some(_) => None,
+        None => Some((value, None)),
+    }
 }
 
 async fn health() -> &'static str {
@@ -299,13 +328,14 @@ async fn join(
 
 async fn login(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<SessionResponse>, ApiError> {
     if !server
         .login
         .lock()
         .expect("login lock")
-        .allows(&request.display_name)
+        .allows(&request.display_name, source.ip())
     {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -328,7 +358,7 @@ async fn login(
                 .login
                 .lock()
                 .expect("login lock")
-                .record(&request.display_name);
+                .record(&request.display_name, source.ip());
             Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 ErrorCode::Unauthorized,
@@ -818,22 +848,45 @@ fn digest(secret: &str) -> [u8; 32] {
 #[derive(Default)]
 struct LoginLimiter {
     failures: HashMap<String, Vec<Instant>>,
+    sources: HashMap<IpAddr, Vec<Instant>>,
 }
 
 impl LoginLimiter {
-    fn allows(&mut self, display_name: &str) -> bool {
-        let now = Instant::now();
-        let failures = self.failures.entry(display_name.to_owned()).or_default();
-        failures.retain(|at| now.duration_since(*at) < LOGIN_WINDOW);
+    fn allows(&mut self, display_name: &str, source: IpAddr) -> bool {
+        self.prune();
+        let account_ok = self
+            .failures
+            .get(display_name)
+            .is_none_or(|failures| failures.len() < LOGIN_ATTEMPTS);
+        let source_ok = self
+            .sources
+            .get(&source)
+            .is_none_or(|failures| failures.len() < SOURCE_ATTEMPTS);
+        let room_for_name =
+            self.failures.contains_key(display_name) || self.failures.len() < LOGIN_NAMES;
 
-        failures.len() < LOGIN_ATTEMPTS
+        account_ok && source_ok && room_for_name
     }
 
-    fn record(&mut self, display_name: &str) {
+    fn record(&mut self, display_name: &str, source: IpAddr) {
+        let now = Instant::now();
         self.failures
             .entry(display_name.to_owned())
             .or_default()
-            .push(Instant::now());
+            .push(now);
+        self.sources.entry(source).or_default().push(now);
+    }
+
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.failures.retain(|_, failures| {
+            failures.retain(|at| now.duration_since(*at) < LOGIN_WINDOW);
+            !failures.is_empty()
+        });
+        self.sources.retain(|_, failures| {
+            failures.retain(|at| now.duration_since(*at) < LOGIN_WINDOW);
+            !failures.is_empty()
+        });
     }
 }
 
@@ -1333,6 +1386,34 @@ mod tests {
         running.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_is_rate_limited_across_names() {
+        let (_dir, running, invite) = running().await;
+        let _session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let client = reqwest::Client::new();
+        for index in 0..20 {
+            let wrong = client
+                .post(format!("{}/api/login", running.url()))
+                .json(
+                    &json!({"display_name": format!("name-{index}"), "password": "wrong password"}),
+                )
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+
+        let limited = client
+            .post(format!("{}/api/login", running.url()))
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        running.shutdown().await;
+    }
+
     async fn raw_socket(running: &Running, token: &str) -> Socket {
         let mut request = format!("ws://{}/api/socket", running.addr)
             .into_client_request()
@@ -1547,6 +1628,14 @@ mod tests {
         )
         .await;
         assert!(loopback.contains("200"), "{loopback}");
+        for bad in ["[::1]junk", "127.0.0.1:", "evil.example:7337"] {
+            let response = raw_http(
+                running.addr,
+                &format!("GET /healthz HTTP/1.1\r\nHost: {bad}\r\nConnection: close\r\n\r\n"),
+            )
+            .await;
+            assert!(response.contains("403"), "{bad}: {response}");
+        }
 
         let browser = reqwest::Client::new()
             .get(format!("{}/healthz", running.url()))

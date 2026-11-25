@@ -74,6 +74,7 @@ fn cli(home: &Path, credential: &Path, arguments: &[&str]) -> Output {
         .env("NEHA_HOME", home)
         .env("NEHA_CREDENTIAL", credential)
         .env("NEHA_PROVIDER_KEY", "sk-test")
+        .env("NEHA_PASSWORD", PASSWORD)
         .output()
         .expect("neha runs")
 }
@@ -134,11 +135,7 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
     let (server, url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
 
-    run(
-        &home,
-        &credential,
-        &["join", &invite, "--name", "Ada", "--password", PASSWORD],
-    );
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
     assert!(run(&home, &credential, &["whoami"]).contains("Ada"));
 
     #[cfg(unix)]
@@ -196,15 +193,7 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
     run(
         &home,
         &credential,
-        &[
-            "login",
-            "--name",
-            "Ada",
-            "--server",
-            &new_url,
-            "--password",
-            PASSWORD,
-        ],
+        &["login", "--name", "Ada", "--server", &new_url],
     );
     let read_again = run(&home, &credential, &["chat", "read", &chat]);
     assert!(read_again.contains("Hello from fake"), "{read_again}");

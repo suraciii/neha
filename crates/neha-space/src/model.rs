@@ -5,6 +5,10 @@
 
 use std::time::Duration;
 
+const MAX_ATTEMPTS: u32 = 5;
+const BASE_DELAY: Duration = Duration::from_millis(500);
+const MAX_DELAY: Duration = Duration::from_secs(10);
+
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use neha::error::ErrorCode;
@@ -68,9 +72,30 @@ pub struct ChatRequest<'a> {
     pub max_output: u32,
 }
 
+/// How a step retries a failed call.
+#[derive(Clone, Copy, Debug)]
+struct RetryPolicy {
+    max_attempts: u32,
+    base_delay: Duration,
+    max_delay: Duration,
+    jitter: bool,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: MAX_ATTEMPTS,
+            base_delay: BASE_DELAY,
+            max_delay: MAX_DELAY,
+            jitter: true,
+        }
+    }
+}
+
 /// A client for OpenAI Chat Completions providers.
 pub struct ModelClient {
     http: reqwest::Client,
+    policy: RetryPolicy,
 }
 
 impl ModelClient {
@@ -78,29 +103,62 @@ impl ModelClient {
     pub fn new() -> Result<Self, ModelError> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(60))
             .timeout(Duration::from_secs(120))
             .build()
             .map_err(|_| ModelError::Transport)?;
 
-        Ok(Self { http })
+        Ok(Self {
+            http,
+            policy: RetryPolicy::default(),
+        })
+    }
+
+    #[cfg(test)]
+    fn fast_retry() -> Result<Self, ModelError> {
+        let mut client = Self::new()?;
+        client.policy = RetryPolicy {
+            max_attempts: MAX_ATTEMPTS,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+            jitter: false,
+        };
+
+        Ok(client)
     }
 
     /// Sends a request and returns the complete reply.
     ///
-    /// A step is retried as a whole: transport and provider failures try
-    /// again at most twice, while a rejected or oversized request does not.
+    /// A step is retried as a whole: rate limits, provider failures, empty
+    /// replies, and transport failures try again up to five times with
+    /// jittered exponential backoff, honoring `Retry-After` when it is in
+    /// range. A rejected or oversized request is not retried.
     pub async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatReply, ModelError> {
         let mut attempt = 0_u32;
         loop {
             match self.attempt(&request).await {
                 Ok(reply) => return Ok(reply),
-                Err(error) if error.retryable() && attempt < 2 => {
+                Err(error) if error.retryable() && attempt + 1 < self.policy.max_attempts => {
+                    let delay = error.retry_after().unwrap_or_else(|| self.backoff(attempt));
+                    tokio::time::sleep(delay.min(self.policy.max_delay)).await;
                     attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
                 }
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn backoff(&self, attempt: u32) -> Duration {
+        let base = self
+            .policy
+            .base_delay
+            .saturating_mul(1_u32 << attempt.min(5));
+        let factor = if self.policy.jitter {
+            0.5 + rand::random::<f64>()
+        } else {
+            1.0
+        };
+        base.mul_f64(factor).min(self.policy.max_delay)
     }
 
     async fn attempt(&self, request: &ChatRequest<'_>) -> Result<ChatReply, ModelError> {
@@ -134,8 +192,14 @@ impl ModelClient {
             .map_err(|_| ModelError::Transport)?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
             let text = response.text().await.unwrap_or_default();
-            return Err(map_status(status, &text));
+            return Err(map_status(status, retry_after, &text));
         }
 
         let mut events = response.bytes_stream().eventsource();
@@ -171,10 +235,14 @@ impl ModelClient {
     }
 }
 
-fn map_status(status: reqwest::StatusCode, body: &str) -> ModelError {
+fn map_status(
+    status: reqwest::StatusCode,
+    retry_after: Option<Duration>,
+    body: &str,
+) -> ModelError {
     match status.as_u16() {
         401 | 403 => ModelError::Unauthorized,
-        429 => ModelError::RateLimited,
+        429 => ModelError::RateLimited { retry_after },
         413 => ModelError::ContextTooLarge,
         500..=599 => ModelError::Server,
         _ if body.to_lowercase().contains("context") => ModelError::ContextTooLarge,
@@ -267,7 +335,10 @@ pub enum ModelError {
     Unauthorized,
     /// The Provider asked the Space to slow down.
     #[error("the Provider rate-limited the call")]
-    RateLimited,
+    RateLimited {
+        /// The delay the Provider named.
+        retry_after: Option<Duration>,
+    },
     /// The request is larger than the Model's context.
     #[error("the request is larger than the Model's context")]
     ContextTooLarge,
@@ -295,7 +366,19 @@ impl ModelError {
     /// Returns whether retrying the step can help.
     #[must_use]
     pub fn retryable(&self) -> bool {
-        matches!(self, Self::RateLimited | Self::Server | Self::Transport)
+        matches!(
+            self,
+            Self::RateLimited { .. } | Self::Server | Self::Transport | Self::Empty
+        )
+    }
+
+    /// Returns the delay the Provider asked for, when it named one.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::RateLimited { retry_after } => *retry_after,
+            _ => None,
+        }
     }
 
     /// Returns the command-surface code for this failure.
@@ -303,7 +386,7 @@ impl ModelError {
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
-            Self::RateLimited => ErrorCode::RateLimited,
+            Self::RateLimited { .. } => ErrorCode::RateLimited,
             Self::Server | Self::Transport => ErrorCode::Unavailable,
             Self::ContextTooLarge
             | Self::Empty
@@ -375,7 +458,7 @@ mod tests {
             }),
         );
         let (base, task) = provider(app).await;
-        let client = ModelClient::new().unwrap();
+        let client = ModelClient::fast_retry().unwrap();
 
         let reply = client.chat(request(&base, "sk-test")).await.unwrap();
 
@@ -401,7 +484,7 @@ mod tests {
             post(|| async { (StatusCode::UNAUTHORIZED, "no") }),
         );
         let (base, task) = provider(app).await;
-        let client = ModelClient::new().unwrap();
+        let client = ModelClient::fast_retry().unwrap();
 
         let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
 
@@ -438,12 +521,89 @@ mod tests {
             }),
         );
         let (base, task) = provider(app).await;
-        let client = ModelClient::new().unwrap();
+        let client = ModelClient::fast_retry().unwrap();
 
         let reply = client.chat(request(&base, "sk-test")).await.unwrap();
 
         assert_eq!(reply.text, "retried");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_empty_reply_is_retried() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"second\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        "data: [DONE]\n\n"
+                    } else {
+                        sse
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(reply.text, "second");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_stops_after_five_attempts() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::RETRY_AFTER, "0")],
+                        "slow down",
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            ModelError::RateLimited {
+                retry_after: Some(_)
+            }
+        ));
+        assert_eq!(error.code(), neha::error::ErrorCode::RateLimited);
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
         task.abort();
     }
 
@@ -459,7 +619,7 @@ mod tests {
             }),
         );
         let (base, task) = provider(app).await;
-        let client = Arc::new(ModelClient::new().unwrap());
+        let client = Arc::new(ModelClient::fast_retry().unwrap());
 
         let error = client.chat(request(&base, "sk-test")).await;
 
