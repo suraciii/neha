@@ -18,11 +18,19 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 | Managed | Neha, on the Space's own machine | An isolated environment Neha sets up, with files of its own, a terminal, and a browser |
 | Real | The user, by installing Neha on a machine | The machine's own files, logins, and software |
 
+## Keeping files
+
+A managed Computer keeps its files when it stops and after a recovery.
+
+Recovering or resetting a managed Computer builds a new machine from the last saved files; work since that save is lost.
+
+A real Computer keeps its files on the machine, and the Space keeps no copy.
+
 ## Assigning a Computer
 
 A Bot's page shows its Computer. The owner picks a managed one or one of the real Computers the owner owns.
 
-Several Bots can be assigned the same real Computer, and then share its files and logins.
+Several Bots can be assigned the same Computer, and then share its files and logins. The Bots on one Computer are not isolated from each other.
 
 ## Adding a real Computer
 

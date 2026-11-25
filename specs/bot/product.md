@@ -76,7 +76,7 @@ A Bot does what it was asked without asking. It asks before an action that goes 
 
 The User it acts for answers with Allow or Deny. The User can make an Allow last for that kind of action by saying so, and the Bot keeps it as a lasting rule.
 
-While a Bot waits for an answer, its other work goes on. A request that waits has no deadline.
+While a Bot waits for an answer, its other work goes on. A request from a run the User started waits until it is answered. A request from a run no User is with expires after the Space's set time; the Bot does not do the action and says so.
 
 ## Deleting a Bot
 

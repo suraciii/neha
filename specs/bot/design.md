@@ -24,15 +24,29 @@ An outside harness is a loop that runs on the Bot's Computer. Its work lands in 
 
 ## State
 
-The record holds a run: its requests, the actions the Bot took, and what the Bot saw. A demonstration holds what the User did and saw while in control, and never holds a credential.
+The record holds a run: its requests, its steps, the actions the Bot took, and what the Bot saw. A demonstration holds what the User did and saw while in control, and never holds a credential.
 
 A summary the Bot writes is a record event. The history a Model sees is a projection of the record, and the record keeps every original Message.
 
 A Bot's memory is a set of entries in the record that belong to the Bot. The system prompt is rebuilt for every request.
 
-## Resuming
+## Steps and actions
+
+A step holds one Model call and the actions that call requests. A completed step never runs again; the record gives its result back to the context. A step interrupted before it completes runs again from its start.
+
+An action is recorded before it runs and after it returns. A started action never runs twice.
+
+An action whose result never returns is unknown. The loop checks its effect on the Computer, or asks the User, and never repeats it without that check.
+
+## Waiting and resuming
 
 A loop stops a run when the Bot's Computer goes offline and resumes it when the Computer is back. A Message sent to an offline Computer waits in the record.
+
+A run stops at a step boundary when it waits for an Approval or an answer, when its Computer goes offline, or when a User takes control of its screen. It resumes from the last completed step when the cause ends.
+
+A managed Computer's recovery, reset, or replacement stops its runs at a step boundary before its saved workspace is replaced.
+
+A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 
 ## Instructions and data
 

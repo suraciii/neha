@@ -2,7 +2,7 @@
 
 ## Authority
 
-Owned by cli. Every topic's behavior is reachable through the CLI, so the CLI depends on all of them and none of them depends on it.
+Owned by cli. The CLI depends on every topic for its behavior. No topic depends on the CLI for its behavior; every topic is reached through it.
 
 ## Laws
 
