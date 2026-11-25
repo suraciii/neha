@@ -32,6 +32,22 @@ _Avoid_: teammate (as a term), agent (when meaning Neha's own), assistant, prima
 The machine a Bot runs on, managed or real; a real Computer runs Neha. Each Bot has its own Computer, chosen by its owner, and several Bots may share one.
 _Avoid_: host, sandbox (as the umbrella), VM, device
 
+**Workspace**:
+The durable file tree a managed Computer keeps in the Space. A real Computer's disk holds its files instead.
+_Avoid_: home, volume, sandbox disk
+
+**Run**:
+One pass of a Bot's loop, from a request to a reply or a failure. A run holds steps and the actions the Bot took.
+_Avoid_: turn, job, execution
+
+**Step**:
+A checkpoint in a run: one Model call and the actions that call requests. A run resumes from a completed step.
+_Avoid_: iteration, cycle, phase
+
+**Action**:
+One thing a Bot does on its Computer or with a tool. The record holds an action before it runs.
+_Avoid_: call, command, tool call
+
 **Vault**:
 The Space's store of passwords and keys that a Bot uses without seeing.
 _Avoid_: wallet, safe, secret store

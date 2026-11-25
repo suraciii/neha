@@ -34,7 +34,9 @@ A Bot's handoff to another Bot is a Message in the Group that addresses that Bot
 
 A Group's row in the sidebar shows the Group's name, its members, the latest Message, and the same states a Chat shows.
 
-An Approval or a Question appears in the Group where the request was made, and the User the Bot acts for answers it.
+An Approval or a Question appears in the Group where the request was made. Every member sees it; the User the Bot acts for answers it, and the others see who it waits for.
+
+An answer given in a Group covers one action. A lasting rule is given in a Chat, never in a Group.
 
 ## Leaving and end
 

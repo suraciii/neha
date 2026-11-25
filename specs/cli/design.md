@@ -4,7 +4,7 @@
 
 ## Authority
 
-Owned by cli. Every topic's behavior is reachable through the command surface, so every topic depends on this page for how it is reached.
+Owned by cli. Every topic's behavior is reachable through the command surface, so every topic depends on this page for how it is reached. No topic depends on it for what it does.
 
 ## Laws
 
