@@ -26,13 +26,17 @@ An outside harness is a loop that runs on the Bot's Computer. Its work lands in 
 
 The record holds a run: its requests, the actions the Bot took, and what the Bot saw. A demonstration holds what the User did and saw while in control, and never holds a credential.
 
+A summary the Bot writes is a record event. The history a Model sees is a projection of the record, and the record keeps every original Message.
+
+A Bot's memory is a set of entries in the record that belong to the Bot. The system prompt is rebuilt for every request.
+
 ## Resuming
 
 A loop stops a run when the Bot's Computer goes offline and resumes it when the Computer is back. A Message sent to an offline Computer waits in the record.
 
 ## Instructions and data
 
-A lasting rule that the Bot's owner asked it to keep is an instruction to the Bot.
+A lasting rule is an instruction to the Bot within the authority of the User who gave it.
 
 Everything else a Bot reads is data: tool results, files, web pages, messages, and what the Bot noticed itself. Data enters the context with a label that names where it came from.
 

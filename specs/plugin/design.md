@@ -12,6 +12,9 @@ Owned by plugin. Every topic depends on this one for what a Plugin can replace.
 2. Every registration is reversible, and removing a Plugin removes all that it registered.
 3. Code that is not built in runs in a process of its own, and that process cannot read the Space's files.
 4. Neha loads no dynamic library and hot-reloads no Plugin.
+5. An installed Plugin is pinned to one content digest, and to one commit when it comes from a repository.
+6. Installing a Plugin never executes code from its source.
+7. A Space installs a Plugin only from a source its Admin allows.
 
 ## Seams
 

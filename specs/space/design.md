@@ -12,6 +12,8 @@ Owned by space. Every other topic depends on a Space to hold its record.
 2. A Space keeps its record in one database.
 3. An event does not change once it is in the record.
 4. A reader skips an event it does not understand only when its kind affects presentation alone.
+5. A listener beyond the Space's own machine requires TLS or a trusted proxy that terminates it, and the Space refuses to start without either.
+6. The Space checks `Host` and `Origin` before it authenticates a request, except that a request that carries a bearer token skips the `Origin` check.
 
 ## Storage
 

@@ -9,9 +9,11 @@ Owned by identity. [CLI](../cli/product.md) and [Computer](../computer/product.m
 ## Laws
 
 1. A Space admits a connection only from a caller it has signed in, or from a device that is pairing.
-2. A connection to a Space is encrypted, except one from the Space's own machine.
+2. A connection to a Space is encrypted, except one from the Space's own machine or from a proxy the Space trusts.
 3. A code works once, expires, and belongs to one caller and one Space. A code that a User types can be tried only a limited number of times.
 4. A device checks the Space's key against one it received from a signed-in User before it connects.
+5. The Space stores only a hash of a token, never its plaintext.
+6. A client that loads the Space's own pages keeps its token only in an HttpOnly cookie. Any other client sends its token in the Authorization header.
 
 ## The same Space, deployed two ways
 
@@ -21,7 +23,7 @@ A Space on a user's own machine listens on that machine alone until its Admin op
 
 ## Signing in without a prompt
 
-The app on the machine that runs a Space signs its first User in without a prompt. It proves itself with a token that only that machine's operating-system account can read.
+The app on the machine that runs a Space signs its first User in without a prompt. It proves itself with a secret that the app creates for one launch and hands to the Space's process over a pipe. The Space honors it for one sign-in request and never writes it to a file.
 
 ## A Space without a domain
 
