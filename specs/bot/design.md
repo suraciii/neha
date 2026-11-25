@@ -28,7 +28,7 @@ The record holds a run: its requests, its steps, the actions the Bot took, and w
 
 A summary the Bot writes is a record event. The history a Model sees is a projection of the record, and the record keeps every original Message.
 
-A Bot's memory is a set of entries in the record that belong to the Bot. The system prompt is rebuilt for every request.
+A Bot's memory is a set of entries in the record that belong to the Bot. Each entry names the scope it applies to. The system prompt is rebuilt for every request from the entries that apply to the acting User and the conversation.
 
 ## Steps and actions
 

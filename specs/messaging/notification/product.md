@@ -22,6 +22,16 @@ Owned by messaging. A Notification depends on [Chat](../chat/product.md) and [Gr
 
 A Bot's progress never starts a Notification.
 
+## Needs attention
+
+A User sees a Needs attention view: one list of Questions, Approvals, failed work, and work an offline Computer blocks.
+
+Opening an item opens its Chat or Group at the Message that waits.
+
+The view is a projection of the record, not a second stream of Messages.
+
+A Notification points at the same item.
+
 ## Default levels
 
 | Conversation | By default, a User is notified of |
