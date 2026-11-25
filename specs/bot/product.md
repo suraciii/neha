@@ -36,11 +36,19 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 
 ## Memory
 
-A Bot keeps what it learns in its Chats and Groups, and carries it into every conversation.
+A Bot keeps what it learns as memory entries. An entry applies at one scope: the owner's Chats, one other User's Chat, or a Group.
 
-When a User asks a Bot to remember something, the Bot keeps it as a lasting rule.
+| Scope | Applies in | Who reads it | Who clears it |
+| --- | --- | --- | --- |
+| Owner | The owner's Chats | The owner | The owner |
+| User | One other User's Chat | That User | That User, and the owner |
+| Group | The Group where it was learned | Every member of the Group | The owner |
 
-A User sees what a Bot remembers by asking it in the Chat.
+When a User asks a Bot to remember something, it keeps the entry at the scope of that conversation.
+
+A rule the owner gives in a Group applies to the Group. A rule another member gives applies to that member's Chats until the owner approves it for the Group.
+
+A User sees what a Bot remembers for them by asking it in the Chat. The owner can clear every entry, including entries the owner cannot read.
 
 As a conversation grows past what the Model can hold, the Bot summarizes its older parts. Lasting rules live in memory and stay.
 

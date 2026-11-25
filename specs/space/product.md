@@ -57,6 +57,16 @@ A User who is removed loses access to the Space; their Bots stay until the Admin
 
 The Admin connects the Space's model providers. [Model](../model/product.md) covers connecting one, what a Model can do, and how a Bot chooses.
 
+## Usage budget
+
+The Admin sets a usage budget for the Space or for one Bot, over a day, a month, or no period.
+
+Usage a run records counts against the budget. [Model](../model/product.md) covers usage.
+
+When the budget is reached, no new run starts, and a run in progress stops at its next step boundary. The Bot says so as a Message.
+
+A Space with no budget set places no limit.
+
 ## Notifications
 
 A Space delivers Notifications to a User's clients. [Notification](../messaging/notification/product.md) covers what starts one and how a User controls it.
