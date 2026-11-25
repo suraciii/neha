@@ -44,7 +44,7 @@ impl ChatMessage {
 }
 
 /// The normalized usage of one Model call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     /// Input tokens that were not cached.
     pub uncached_input: u64,

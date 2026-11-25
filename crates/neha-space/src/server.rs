@@ -31,8 +31,12 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
+use crate::commands;
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError};
+use crate::model::{ModelClient, ModelError};
+use crate::secrets::{Secrets, SecretsError};
+use crate::state::State as SpaceState;
 use crate::store::{AppendRequest, Store, StoreError};
 
 const LOGIN_ATTEMPTS: usize = 5;
@@ -46,6 +50,9 @@ pub struct SpaceServer {
     identity: Identity,
     invite: Mutex<Option<Invite>>,
     login: Mutex<LoginLimiter>,
+    state: Mutex<SpaceState>,
+    secrets: Secrets,
+    model: ModelClient,
 }
 
 impl SpaceServer {
@@ -58,6 +65,10 @@ impl SpaceServer {
         } else {
             Some(Invite::generate())
         };
+        let mut state = SpaceState::default();
+        store.replay(&mut state).await?;
+        let secrets = Secrets::load(&home)?;
+        let model = ModelClient::new()?;
 
         Ok(Self {
             home,
@@ -65,6 +76,9 @@ impl SpaceServer {
             identity,
             invite: Mutex::new(invite),
             login: Mutex::new(LoginLimiter::default()),
+            state: Mutex::new(state),
+            secrets,
+            model,
         })
     }
 
@@ -286,7 +300,7 @@ async fn socket(
         .on_upgrade(move |socket| handle_socket(socket, server, account))
 }
 
-async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, _account: Account) {
+async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account: Account) {
     let Some(Ok(Message::Text(text))) = socket.recv().await else {
         return;
     };
@@ -355,8 +369,38 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, _account
                             }
                         }
                     }
-                    Ok(ClientFrame::Command { id, .. }) => {
-                        if send_frame(&mut socket, ServerFrame::Error { id: Some(id), code: ErrorCode::Unavailable, message: "this command is not served yet".to_owned() }).await.is_err() {
+                    Ok(ClientFrame::Command { id, command }) => {
+                        if send_frame(&mut socket, ServerFrame::Accepted { id }).await.is_err() {
+                            return;
+                        }
+                        let outcome = commands::execute(&server.store, &server.state, &server.home, &server.secrets, &account, id, command).await;
+                        let (committed, result) = match outcome {
+                            Ok(outcome) => {
+                                if let Some(seq) = outcome.committed
+                                    && send_frame(&mut socket, ServerFrame::Committed { id, seq }).await.is_err()
+                                {
+                                    return;
+                                }
+                                match outcome.pending {
+                                    Some(pending) => {
+                                        match commands::finish_run(&server.store, &server.state, &server.secrets, &server.model, pending).await {
+                                            Ok(result) => (outcome.committed, result),
+                                            Err(error) => {
+                                                let _ = send_frame(&mut socket, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    None => (outcome.committed, outcome.result),
+                                }
+                            }
+                            Err(error) => {
+                                let _ = send_frame(&mut socket, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
+                                continue;
+                            }
+                        };
+                        let _ = committed;
+                        if send_frame(&mut socket, ServerFrame::Confirmed { id, result }).await.is_err() {
                             return;
                         }
                     }
@@ -436,7 +480,7 @@ pub struct ApiError {
 }
 
 impl ApiError {
-    fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status,
             code,
@@ -444,16 +488,34 @@ impl ApiError {
         }
     }
 
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, ErrorCode::NotFound, message)
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, ErrorCode::Forbidden, message)
+    }
+
+    pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument, message)
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal,
             message,
         )
+    }
+
+    pub(crate) fn code(&self) -> ErrorCode {
+        self.code
+    }
+}
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
     }
 }
 
@@ -545,6 +607,12 @@ pub enum ServerError {
     /// The listener failed.
     #[error("listener error: {0}")]
     Io(#[from] std::io::Error),
+    /// The secrets cannot be loaded.
+    #[error("secrets error: {0}")]
+    Secrets(#[from] SecretsError),
+    /// The model client cannot be built.
+    #[error("model error: {0}")]
+    Model(#[from] ModelError),
 }
 
 #[cfg(test)]
@@ -701,5 +769,289 @@ mod tests {
         }
         socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    use neha::error::ErrorCode;
+    use neha::id::Id;
+    use neha::seq::Seq;
+    use neha::surface::{
+        BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
+    };
+    use serde_json::Value;
+    use tokio::net::TcpStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+    type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+    async fn fake_provider() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from fake\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(body))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task)
+    }
+
+    async fn open_socket(running: &Running, token: &str) -> Socket {
+        let mut request = format!("ws://{}/api/socket", running.addr)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Hello {
+                    version: PROTOCOL_VERSION,
+                    capabilities: Vec::new(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let _hello = next_frame(&mut socket).await;
+        socket
+    }
+
+    async fn next_frame(socket: &mut Socket) -> ServerFrame {
+        loop {
+            let message = socket.next().await.unwrap().unwrap();
+            let Message::Text(text) = message else {
+                continue;
+            };
+            return serde_json::from_str(text.as_str()).unwrap();
+        }
+    }
+
+    async fn try_command(
+        socket: &mut Socket,
+        id: Id,
+        command: CommandCall,
+    ) -> Result<(Option<Seq>, Value), (ErrorCode, String)> {
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command { id, command })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let mut committed = None;
+        loop {
+            match next_frame(socket).await {
+                ServerFrame::Accepted { .. } => {}
+                ServerFrame::Committed { seq, .. } => committed = Some(seq),
+                ServerFrame::Confirmed { result, .. } => return Ok((committed, result)),
+                ServerFrame::Error { code, message, .. } => return Err((code, message)),
+                ServerFrame::Heartbeat { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    async fn command(socket: &mut Socket, id: Id, command: CommandCall) -> Value {
+        try_command(socket, id, command).await.unwrap().1
+    }
+
+    fn provider_add(base_url: String) -> CommandCall {
+        CommandCall::ProviderAdd(ProviderAdd {
+            protocol: ProviderProtocol::ChatCompletions,
+            base_url,
+            api_key: "sk-test".to_owned(),
+            models: vec![ModelSpec {
+                name: "test-model".to_owned(),
+                context_limit: 128_000,
+                max_output: 8_192,
+                reads_images: false,
+            }],
+            default_model: Some("test-model".to_owned()),
+        })
+    }
+
+    async fn admin_socket(running: &Running, invite: &str) -> Socket {
+        let session = join(running, invite, "Ada", "correct horse battery").await;
+        open_socket(running, session["token"].as_str().unwrap()).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chat_round_trip_writes_messages_and_a_run() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = fake_provider().await;
+
+        let provider = command(&mut socket, Id::new(), provider_add(base)).await;
+        let provider_id: Id = serde_json::from_value(provider["provider"].clone()).unwrap();
+        assert!(
+            provider["models"]
+                .as_array()
+                .is_some_and(|models| models.len() == 1)
+        );
+
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        assert_eq!(models.as_array().unwrap().len(), 1);
+        assert_eq!(models[0]["is_default"], true);
+        assert_eq!(models[0]["provider"], serde_json::json!(provider_id));
+
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let bot_id: Id = serde_json::from_value(bot["bot"]["id"].clone()).unwrap();
+        assert_eq!(bot["computer"]["kind"], "managed");
+
+        let sent = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+        assert_eq!(sent["status"], "succeeded");
+        assert_eq!(sent["text"], "Hello from fake");
+        let run: Id = serde_json::from_value(sent["run"].clone()).unwrap();
+
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages.as_array().unwrap().len(), 2);
+        assert_eq!(messages[1]["text"], "Hello from fake");
+
+        let shown = command(&mut socket, Id::new(), CommandCall::RunShow { run }).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert_eq!(shown["bot"], serde_json::json!(bot_id));
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_without_a_provider_cannot_work() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        let result = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err((ErrorCode::InvalidArgument, _))));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_command_id_is_not_run_twice() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let command_id = Id::new();
+        let create = CommandCall::BotCreate(BotCreate {
+            name: "Scout".to_owned(),
+        });
+
+        let (first_seq, first) = try_command(&mut socket, command_id, create.clone())
+            .await
+            .unwrap();
+        let (second_seq, second) = try_command(&mut socket, command_id, create).await.unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first_seq, second_seq);
+        let bots = command(&mut socket, Id::new(), CommandCall::BotList).await;
+        assert_eq!(bots.as_array().unwrap().len(), 1);
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_keeps_the_record_and_the_sign_in() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let first = start(home.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let mut socket = admin_socket(&first, &invite).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        let second = start(home, 0).await.unwrap();
+        let login: serde_json::Value = reqwest::Client::new()
+            .post(format!("{}/api/login", second.url()))
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let mut socket = open_socket(&second, login["token"].as_str().unwrap()).await;
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+
+        assert!(second.invite.is_none());
+        assert_eq!(messages.as_array().unwrap().len(), 0);
+        let bots = command(&mut socket, Id::new(), CommandCall::BotList).await;
+        assert_eq!(bots.as_array().unwrap().len(), 1);
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
     }
 }

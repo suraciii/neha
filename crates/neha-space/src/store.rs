@@ -24,8 +24,8 @@ const PAGE_SIZE: usize = 256;
 
 /// A projection of the record, rebuilt by replaying events in order.
 pub trait Projection {
-    /// Applies one event.
-    fn apply(&mut self, event: &Event);
+    /// Applies one event, or reports why it does not fit.
+    fn apply(&mut self, event: &Event) -> Result<(), String>;
 }
 
 /// A request to append the events of one command.
@@ -37,6 +37,8 @@ pub struct AppendRequest {
     pub fingerprint: String,
     /// The events to append in order.
     pub events: Vec<EventDraft>,
+    /// The command's result, once known.
+    pub result: Option<serde_json::Value>,
 }
 
 impl AppendRequest {
@@ -47,7 +49,15 @@ impl AppendRequest {
             command,
             fingerprint: fingerprint.into(),
             events,
+            result: None,
         }
+    }
+
+    /// Attaches the command's result.
+    #[must_use]
+    pub fn with_result(mut self, result: serde_json::Value) -> Self {
+        self.result = Some(result);
+        self
     }
 }
 
@@ -58,6 +68,8 @@ pub struct AppendResult {
     pub events: Vec<Event>,
     /// Whether this call found the command already recorded.
     pub existing: bool,
+    /// The command's result, when the record holds it.
+    pub result: Option<serde_json::Value>,
 }
 
 /// A page of the record and the cursor to continue from.
@@ -73,6 +85,11 @@ enum WriteRequest {
     Append {
         request: AppendRequest,
         reply: oneshot::Sender<Result<AppendResult, StoreError>>,
+    },
+    SetResult {
+        command: Id,
+        result: serde_json::Value,
+        reply: oneshot::Sender<Result<(), StoreError>>,
     },
     Shutdown {
         reply: oneshot::Sender<()>,
@@ -168,13 +185,32 @@ impl Store {
         loop {
             let page = self.events_from(cursor, PAGE_SIZE).await?;
             for event in &page.events {
-                projection.apply(event);
+                projection.apply(event).map_err(StoreError::Corrupt)?;
             }
             if page.next <= cursor {
                 return Ok(cursor);
             }
             cursor = page.next;
         }
+    }
+
+    /// Stores the result of a command that finished later, such as a run.
+    pub async fn set_result(
+        &self,
+        command: Id,
+        result: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let (reply, answer) = oneshot::channel();
+        self.writer
+            .send(WriteRequest::SetResult {
+                command,
+                result,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterGone)?;
+
+        answer.await.map_err(|_| StoreError::WriterGone)?
     }
 
     /// Stops the writer and closes the record.
@@ -202,6 +238,13 @@ fn spawn_writer(
                 WriteRequest::Append { request, reply } => {
                     let _ = reply.send(append(&mut connection, request).await);
                 }
+                WriteRequest::SetResult {
+                    command,
+                    result,
+                    reply,
+                } => {
+                    let _ = reply.send(set_result(&mut connection, command, result).await);
+                }
                 WriteRequest::Shutdown { reply } => {
                     let _ = reply.send(());
                     break;
@@ -222,11 +265,12 @@ async fn append(
     }
 
     let mut transaction = connection.begin().await?;
-    let existing =
-        sqlx::query("SELECT fingerprint, first_seq, last_seq FROM commands WHERE command_id = ?")
-            .bind(request.command.to_string())
-            .fetch_optional(&mut *transaction)
-            .await?;
+    let existing = sqlx::query(
+        "SELECT fingerprint, first_seq, last_seq, result FROM commands WHERE command_id = ?",
+    )
+    .bind(request.command.to_string())
+    .fetch_optional(&mut *transaction)
+    .await?;
 
     if let Some(row) = existing {
         let fingerprint: String = row.try_get("fingerprint")?;
@@ -235,12 +279,19 @@ async fn append(
         }
         let first: i64 = row.try_get("first_seq")?;
         let last: i64 = row.try_get("last_seq")?;
+        let stored: Option<String> = row.try_get("result")?;
+        let result = stored
+            .map(|text| {
+                serde_json::from_str(&text).map_err(|_| corrupt("command result is not JSON"))
+            })
+            .transpose()?;
         let events = load_range(&mut transaction, first, last).await?;
         transaction.commit().await?;
 
         return Ok(AppendResult {
             events,
             existing: true,
+            result,
         });
     }
 
@@ -273,13 +324,20 @@ async fn append(
         .bind(last.to_string())
         .execute(&mut *transaction)
         .await?;
+    let stored_result = request
+        .result
+        .as_ref()
+        .map(|result| serde_json::to_string(result).map_err(|_| corrupt("command result")));
+    let stored_result = stored_result.transpose()?;
     sqlx::query(
-        "INSERT INTO commands (command_id, fingerprint, first_seq, last_seq) VALUES (?, ?, ?, ?)",
+        "INSERT INTO commands (command_id, fingerprint, first_seq, last_seq, result) \
+         VALUES (?, ?, ?, ?, ?)",
     )
     .bind(request.command.to_string())
     .bind(request.fingerprint)
     .bind(events.first().map(|event| event.seq.as_i64()))
     .bind(events.last().map(|event| event.seq.as_i64()))
+    .bind(stored_result)
     .execute(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -287,6 +345,7 @@ async fn append(
     Ok(AppendResult {
         events,
         existing: false,
+        result: request.result,
     })
 }
 
@@ -377,6 +436,21 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Event>, StoreErr
 fn parse_id(text: Option<String>) -> Result<Option<Id>, StoreError> {
     text.map(|text| text.parse().map_err(|_| corrupt("id is not a UUID")))
         .transpose()
+}
+
+async fn set_result(
+    connection: &mut SqliteConnection,
+    command: Id,
+    result: serde_json::Value,
+) -> Result<(), StoreError> {
+    let text = serde_json::to_string(&result).map_err(|_| corrupt("command result"))?;
+    sqlx::query("UPDATE commands SET result = ? WHERE command_id = ?")
+        .bind(text)
+        .bind(command.to_string())
+        .execute(&mut *connection)
+        .await?;
+
+    Ok(())
 }
 
 fn corrupt(reason: &str) -> StoreError {
@@ -553,8 +627,9 @@ mod tests {
         struct Collector(Vec<Event>);
 
         impl Projection for Collector {
-            fn apply(&mut self, event: &Event) {
+            fn apply(&mut self, event: &Event) -> Result<(), String> {
                 self.0.push(event.clone());
+                Ok(())
             }
         }
 

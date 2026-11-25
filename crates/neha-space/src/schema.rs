@@ -19,7 +19,7 @@ const STATEMENTS: [&str; 7] = [
     "CREATE INDEX events_command ON events(command)",
     "CREATE TABLE commands (\
         command_id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, \
-        first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL)",
+        first_seq INTEGER NOT NULL, last_seq INTEGER NOT NULL, result TEXT)",
     "CREATE TABLE accounts (\
         id TEXT PRIMARY KEY, display_name TEXT NOT NULL UNIQUE, \
         password_hash TEXT NOT NULL, is_admin INTEGER NOT NULL, \
