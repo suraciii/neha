@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::rand_core::RngCore as _;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{FromRequestParts, State};
-use axum::http::header::AUTHORIZATION;
+use axum::extract::{FromRequestParts, Request, State};
+use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -37,7 +38,7 @@ use crate::identity::{Account, Identity, IdentityError};
 use crate::model::{ModelClient, ModelError};
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
-use crate::store::{AppendRequest, Store, StoreError};
+use crate::store::{AppendRequest, Projection, Store, StoreError};
 
 const LOGIN_ATTEMPTS: usize = 5;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
@@ -67,6 +68,7 @@ impl SpaceServer {
         };
         let mut state = SpaceState::default();
         store.replay(&mut state).await?;
+        recover_interrupted(&store, &mut state).await?;
         let secrets = Secrets::load(&home)?;
         let model = ModelClient::new()?;
 
@@ -97,6 +99,7 @@ impl SpaceServer {
             .route("/api/login", post(login))
             .route("/api/me", get(me))
             .route("/api/socket", get(socket))
+            .layer(middleware::from_fn(guard))
             .with_state(Arc::clone(self))
     }
 
@@ -151,6 +154,39 @@ pub async fn start(home: Home, port: u16) -> Result<Running, ServerError> {
     });
 
     Ok(Running { addr, invite, task })
+}
+
+async fn guard(request: Request, next: Next) -> Response {
+    let host = request
+        .headers()
+        .get(HOST)
+        .and_then(|value| value.to_str().ok());
+    if !host.is_some_and(loopback_host) {
+        return ApiError::forbidden("the Host header must name loopback").into_response();
+    }
+    let origin = request
+        .headers()
+        .get(ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    let bearer = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "));
+    if origin.is_some() && !bearer {
+        return ApiError::forbidden("a browser Origin requires a Bearer token").into_response();
+    }
+
+    next.run(request).await
+}
+
+fn loopback_host(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(inner) => inner.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+
+    matches!(name, "127.0.0.1" | "localhost" | "::1")
 }
 
 async fn health() -> &'static str {
@@ -466,6 +502,67 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
     }
 }
 
+/// Finishes runs the previous Space run left working.
+///
+/// A one-shot run is answered or failed; it is never silently dropped. The
+/// Bot says the work was interrupted and the command that started the run
+/// receives that failure as its result.
+async fn recover_interrupted(store: &Store, state: &mut SpaceState) -> Result<(), StoreError> {
+    let interrupted: Vec<_> = state
+        .runs
+        .values()
+        .filter(|run| run.status == crate::state::RunStatus::Running)
+        .cloned()
+        .collect();
+    for run in interrupted {
+        let message = Id::new();
+        let text = "I was interrupted before I could answer.";
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::Bot(run.bot),
+                serde_json::json!({"message": message, "chat": run.chat, "text": text, "run": run.id}),
+            )
+            .acting(run.acting),
+            EventDraft::new(
+                EventKind::RunFinished,
+                Author::Bot(run.bot),
+                serde_json::json!({
+                    "run": run.id,
+                    "status": crate::state::RunStatus::Failed,
+                    "reply": message,
+                    "error": "the Space stopped before the run finished",
+                }),
+            )
+            .acting(run.acting),
+        ];
+        let appended = store
+            .append(AppendRequest::new(
+                Id::new(),
+                format!("recover:{}", run.id),
+                drafts,
+            ))
+            .await?;
+        for event in &appended.events {
+            state.apply(event).map_err(StoreError::Corrupt)?;
+        }
+        store
+            .set_result(
+                run.command,
+                serde_json::json!({
+                    "run": run.id,
+                    "status": "failed",
+                    "reply": message,
+                    "text": text,
+                    "error": "the Space stopped before the run finished",
+                }),
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
 fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
 
@@ -498,6 +595,18 @@ impl ApiError {
 
     pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, ErrorCode::InvalidArgument, message)
+    }
+
+    pub(crate) fn idempotency_conflict(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::CONFLICT,
+            ErrorCode::IdempotencyConflict,
+            message,
+        )
+    }
+
+    pub(crate) fn unsupported_version(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, ErrorCode::UnsupportedVersion, message)
     }
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
@@ -622,8 +731,9 @@ mod tests {
     use serde_json::json;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use super::{Running, start};
+    use super::{Running, SpaceServer, start};
     use crate::home::Home;
+    use crate::store::{AppendRequest, Store};
 
     async fn running() -> (tempfile::TempDir, Running, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -1053,5 +1163,430 @@ mod tests {
         assert_eq!(bots.as_array().unwrap().len(), 1);
         socket.close(None).await.unwrap();
         second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn repeated_wrong_passwords_are_rate_limited() {
+        let (_dir, running, invite) = running().await;
+        let _session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let client = reqwest::Client::new();
+        for _ in 0..5 {
+            let wrong = client
+                .post(format!("{}/api/login", running.url()))
+                .json(&json!({"display_name": "Ada", "password": "wrong password"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+
+        let limited = client
+            .post(format!("{}/api/login", running.url()))
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let body: Value = limited.json().await.unwrap();
+        assert_eq!(body["code"], "rate_limited");
+        running.shutdown().await;
+    }
+
+    async fn raw_socket(running: &Running, token: &str) -> Socket {
+        let mut request = format!("ws://{}/api/socket", running.addr)
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        socket
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_socket_rejects_a_bad_greeting() {
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let mut malformed = raw_socket(&running, token).await;
+        malformed
+            .send(Message::Text("not a frame".into()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut malformed).await,
+            ServerFrame::ProtocolError { .. }
+        ));
+
+        let mut outdated = raw_socket(&running, token).await;
+        outdated
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Hello {
+                    version: PROTOCOL_VERSION + 1,
+                    capabilities: Vec::new(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_frame(&mut outdated).await,
+            ServerFrame::ProtocolError { .. }
+        ));
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_socket_refuses_an_oversized_frame() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let oversized = "x".repeat(neha::surface::MAX_FRAME_BYTES + 1);
+
+        let _ = socket.send(Message::Text(oversized.into())).await;
+        let next = socket.next().await;
+
+        assert!(!matches!(next, Some(Ok(Message::Text(_)))));
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cursor_skips_the_events_it_already_holds() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+
+        let first = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let _chat: Id = serde_json::from_value(first["chat"]["id"].clone()).unwrap();
+
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: Some(100),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let ServerFrame::Snapshot { cursor, events } = next_frame(&mut socket).await else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(events.len(), 4);
+
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: Some(cursor),
+                    limit: Some(100),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let ServerFrame::Snapshot { cursor, events } = next_frame(&mut socket).await else {
+            panic!("expected a snapshot");
+        };
+        assert!(events.is_empty());
+        assert_eq!(cursor, neha::seq::Seq::from_i64(4).unwrap());
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_answers_an_interrupted_run() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let user = Id::new();
+        let bot = Id::new();
+        let computer = Id::new();
+        let chat = Id::new();
+        let message = Id::new();
+        let run = Id::new();
+        let command = Id::new();
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(user),
+                json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventDraft::new(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                json!({"computer": computer, "owner": user, "kind": "managed"}),
+            ),
+            EventDraft::new(
+                EventKind::BotCreated,
+                Author::User(user),
+                json!({"bot": bot, "owner": user, "name": "Scout", "computer": computer, "chat": chat}),
+            ),
+            EventDraft::new(
+                EventKind::ChatCreated,
+                Author::User(user),
+                json!({"chat": chat, "owner": user, "bot": bot}),
+            ),
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({"message": message, "chat": chat, "text": "hello", "run": run}),
+            ),
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "message": message,
+                    "command": command,
+                }),
+            )
+            .acting(user),
+        ];
+        store
+            .append(AppendRequest::new(Id::new(), "seed", drafts))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let server = SpaceServer::open(home).await.unwrap();
+        {
+            let state = server.state.lock().unwrap();
+            let recovered = &state.runs[&run];
+
+            assert_eq!(recovered.status, crate::state::RunStatus::Failed);
+            assert_eq!(recovered.reply, Some(state.messages.last().unwrap().id));
+            assert_eq!(
+                state.messages.last().unwrap().text,
+                "I was interrupted before I could answer."
+            );
+        }
+        server.store.close().await.unwrap();
+    }
+
+    async fn raw_http(addr: std::net::SocketAddr, request: &str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_server_checks_host_and_origin() {
+        let (_dir, running, invite) = running().await;
+        assert!(running.addr.ip().is_loopback());
+
+        let evil_host = raw_http(
+            running.addr,
+            "GET /healthz HTTP/1.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(evil_host.contains("403"), "{evil_host}");
+        let loopback = raw_http(
+            running.addr,
+            "GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(loopback.contains("200"), "{loopback}");
+
+        let browser = reqwest::Client::new()
+            .get(format!("{}/healthz", running.url()))
+            .header("origin", "http://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(browser.status(), reqwest::StatusCode::FORBIDDEN);
+
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let native = reqwest::Client::new()
+            .get(format!("{}/api/me", running.url()))
+            .bearer_auth(token)
+            .header("origin", "http://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(native.status(), reqwest::StatusCode::OK);
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_command_gets_accepted_committed_and_confirmed() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: Id::new(),
+                    command: CommandCall::BotCreate(BotCreate {
+                        name: "Scout".to_owned(),
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut seen = Vec::new();
+        loop {
+            match next_frame(&mut socket).await {
+                ServerFrame::Heartbeat { .. } => {}
+                frame => {
+                    let last = matches!(frame, ServerFrame::Confirmed { .. });
+                    seen.push(frame);
+                    if last {
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(matches!(seen[0], ServerFrame::Accepted { .. }));
+        assert!(matches!(seen[1], ServerFrame::Committed { .. }));
+        assert!(matches!(seen.last(), Some(ServerFrame::Confirmed { .. })));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_command_with_new_parameters_conflicts() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let command_id = Id::new();
+
+        command(
+            &mut socket,
+            command_id,
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let conflict = try_command(
+            &mut socket,
+            command_id,
+            CommandCall::BotCreate(BotCreate {
+                name: "Other".to_owned(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(conflict, Err((ErrorCode::IdempotencyConflict, _))));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    async fn recording_provider() -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use axum::Json;
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from fake\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{}}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":3}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(request): Json<Value>| {
+                let recorded = Arc::clone(&recorded);
+                async move {
+                    recorded.lock().unwrap().push(request);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task, seen)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_message_sees_the_previous_one() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, seen) = recording_provider().await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+            }),
+        )
+        .await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "again".to_owned(),
+            }),
+        )
+        .await;
+
+        {
+            let requests = seen.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let messages = requests[1]["messages"].as_array().unwrap();
+            let texts: Vec<_> = messages
+                .iter()
+                .map(|message| message["content"].as_str().unwrap_or_default())
+                .collect();
+            assert!(texts.contains(&"hello"));
+            assert!(texts.contains(&"Hello from fake"));
+            assert!(texts.contains(&"again"));
+        }
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
     }
 }

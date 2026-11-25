@@ -89,9 +89,9 @@ enum ProviderCommand {
         /// The Provider's base URL, such as http://127.0.0.1:8000/v1.
         #[arg(long)]
         base_url: String,
-        /// The Provider's API key.
-        #[arg(long)]
-        api_key: String,
+        /// The protocol; only chat-completions is supported.
+        #[arg(long, default_value = "chat-completions")]
+        protocol: String,
         /// A Model name at the Provider; repeat for more.
         #[arg(long = "model", value_name = "NAME", required = true)]
         models: Vec<String>,
@@ -101,9 +101,9 @@ enum ProviderCommand {
         /// The Model's largest reply in tokens.
         #[arg(long, default_value_t = 8_192)]
         max_output: u32,
-        /// Whether the Model reads images.
+        /// The Model does not read images.
         #[arg(long)]
-        reads_images: bool,
+        no_images: bool,
     },
     /// List connected Providers.
     List,
@@ -120,8 +120,12 @@ enum BotCommand {
     /// Create a Bot with its own Chat and Computer.
     Create {
         /// The Bot's name.
-        #[arg(long)]
         name: String,
+    },
+    /// Show your Bot, its Chat, and its Computer.
+    Show {
+        /// The Bot identifier.
+        bot: Id,
     },
     /// List your Bots.
     List,
@@ -268,12 +272,16 @@ async fn provider(command: ProviderCommand) -> Result<()> {
     match command {
         ProviderCommand::Add {
             base_url,
-            api_key,
+            protocol,
             models,
             context_limit,
             max_output,
-            reads_images,
+            no_images,
         } => {
+            if protocol != "chat-completions" {
+                bail!("this version only speaks chat-completions");
+            }
+            let api_key = provider_key()?;
             let default = models.first().cloned();
             let result = client::command(
                 &credential,
@@ -287,7 +295,7 @@ async fn provider(command: ProviderCommand) -> Result<()> {
                             name,
                             context_limit,
                             max_output,
-                            reads_images,
+                            reads_images: !no_images,
                         })
                         .collect(),
                     default_model: default,
@@ -367,6 +375,25 @@ async fn bot(command: BotCommand) -> Result<()> {
                 id_of(&result["bot"], "id")?
             );
         }
+        BotCommand::Show { bot } => {
+            let result = client::command(&credential, CommandCall::BotShow { bot }).await?;
+            println!(
+                "Bot {} ({})",
+                id_of(&result["bot"], "id")?,
+                text_of(&result["bot"], "name")?
+            );
+            println!("  Chat: {}", id_of(&result["chat"], "id")?);
+            println!(
+                "  Computer: {} ({}, online: {})",
+                id_of(&result["computer"], "id")?,
+                text_of(&result["computer"], "kind")?,
+                result["computer"]["online"].as_bool().unwrap_or(false)
+            );
+            println!(
+                "  Workspace: {}",
+                text_of(&result["computer"], "workspace")?
+            );
+        }
         BotCommand::List => {
             let result = client::command(&credential, CommandCall::BotList).await?;
             for bot in result.as_array().context("no Bots in the answer")? {
@@ -399,7 +426,15 @@ async fn chat(command: ChatCommand) -> Result<()> {
                     let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
                     id_of(&shown["chat"], "id")?
                 }
-                (None, None) => bail!("pass --chat or --bot"),
+                (None, None) => {
+                    let chats = client::command(&credential, CommandCall::ChatList).await?;
+                    let chats = chats.as_array().context("no Chats in the answer")?;
+                    match chats.as_slice() {
+                        [chat] => id_of(chat, "id")?,
+                        [] => bail!("this Space has no Chat; create a Bot first"),
+                        _ => bail!("pass --chat or --bot; this Space has several Chats"),
+                    }
+                }
             };
             let result = client::command(
                 &credential,
@@ -455,6 +490,16 @@ async fn run(command: RunCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn provider_key() -> Result<String> {
+    if let Ok(key) = std::env::var("NEHA_PROVIDER_KEY")
+        && !key.trim().is_empty()
+    {
+        return Ok(key);
+    }
+
+    rpassword::prompt_password("Provider API key: ").context("cannot read the API key")
 }
 
 fn read_password(given: Option<String>) -> Result<String> {

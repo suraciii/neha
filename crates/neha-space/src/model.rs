@@ -110,7 +110,24 @@ impl ModelClient {
     }
 
     /// Sends a request and returns the complete reply.
+    ///
+    /// A step is retried as a whole: transport and provider failures try
+    /// again at most twice, while a rejected or oversized request does not.
     pub async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatReply, ModelError> {
+        let mut attempt = 0_u32;
+        loop {
+            match self.attempt(&request).await {
+                Ok(reply) => return Ok(reply),
+                Err(error) if error.retryable() && attempt < 2 => {
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_millis(200 * u64::from(attempt))).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn attempt(&self, request: &ChatRequest<'_>) -> Result<ChatReply, ModelError> {
         let url = format!(
             "{}/chat/completions",
             request.base_url.trim_end_matches('/')
@@ -299,6 +316,12 @@ pub enum ModelError {
 }
 
 impl ModelError {
+    /// Returns whether retrying the step can help.
+    #[must_use]
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::RateLimited | Self::Server | Self::Transport)
+    }
+
     /// Returns the command-surface code for this failure.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -322,7 +345,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
-    use axum::response::Response;
+    use axum::response::{IntoResponse, Response};
     use axum::routing::post;
     use tokio::net::TcpListener;
 
@@ -408,6 +431,43 @@ mod tests {
 
         assert!(matches!(error, ModelError::Unauthorized));
         assert_eq!(error.code(), neha::error::ErrorCode::Unauthorized);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_is_retried_once() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"retried\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "later").into_response();
+                    }
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::new().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(reply.text, "retried");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
         task.abort();
     }
 

@@ -308,7 +308,7 @@ async fn message_send(
         EventDraft::new(
             EventKind::RunStarted,
             Author::Bot(bot.id),
-            json!({"run": run, "chat": arguments.chat, "bot": bot.id, "message": message}),
+            json!({"run": run, "chat": arguments.chat, "bot": bot.id, "message": message, "command": command_id}),
         )
         .acting(account.id),
     ];
@@ -459,7 +459,7 @@ pub async fn finish_run(
     store
         .set_result(pending.command, result.clone())
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+        .map_err(store_error)?;
 
     Ok(completion.result.unwrap_or(result))
 }
@@ -499,10 +499,7 @@ async fn append(
     if let Some(result) = result {
         request = request.with_result(result);
     }
-    let appended = store
-        .append(request)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let appended = store.append(request).await.map_err(store_error)?;
     apply(state, &appended.events)?;
 
     Ok(appended)
@@ -536,4 +533,16 @@ fn read(
 
 fn json_error(error: serde_json::Error) -> ApiError {
     ApiError::internal(error.to_string())
+}
+
+fn store_error(error: crate::store::StoreError) -> ApiError {
+    match error {
+        crate::store::StoreError::IdempotencyConflict(id) => ApiError::idempotency_conflict(
+            format!("command {id} was reused with different parameters"),
+        ),
+        crate::store::StoreError::UpgradeRequired { kind } => {
+            ApiError::unsupported_version(format!("this Space must be upgraded to read {kind}"))
+        }
+        other => ApiError::internal(other.to_string()),
+    }
 }

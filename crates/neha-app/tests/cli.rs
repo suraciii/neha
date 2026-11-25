@@ -73,6 +73,7 @@ fn cli(home: &Path, credential: &Path, arguments: &[&str]) -> Output {
         .args(arguments)
         .env("NEHA_HOME", home)
         .env("NEHA_CREDENTIAL", credential)
+        .env("NEHA_PROVIDER_KEY", "sk-test")
         .output()
         .expect("neha runs")
 }
@@ -140,6 +141,13 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
     );
     assert!(run(&home, &credential, &["whoami"]).contains("Ada"));
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&credential).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
     run(
         &home,
         &credential,
@@ -148,23 +156,25 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
             "add",
             "--base-url",
             &provider,
-            "--api-key",
-            "sk-test",
             "--model",
             "test-model",
         ],
     );
     assert!(run(&home, &credential, &["model", "list"]).contains("test-model"));
 
-    let created = run(&home, &credential, &["bot", "create", "--name", "Scout"]);
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = field(&created, "Created Bot ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
     let chat = field(&created, "Chat:");
     assert!(run(&home, &credential, &["bot", "list"]).contains("Scout"));
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains("workspace"), "{shown}");
 
-    let sent = run(
-        &home,
-        &credential,
-        &["chat", "send", "--chat", &chat, "hello"],
-    );
+    // With one Chat, `chat send` needs no identifier.
+    let sent = run(&home, &credential, &["chat", "send", "hello"]);
     assert!(sent.contains("Hello from fake"), "{sent}");
 
     let read = run(&home, &credential, &["chat", "read", &chat]);
@@ -176,12 +186,13 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
         .next()
         .unwrap()
         .to_owned();
-    let shown = run(&home, &credential, &["run", "show", &run_id]);
-    assert!(shown.contains("succeeded"), "{shown}");
+    let shown_run = run(&home, &credential, &["run", "show", &run_id]);
+    assert!(shown_run.contains("succeeded"), "{shown_run}");
 
     drop(server);
 
     let (restarted, new_url, _) = serve(&home);
+    std::fs::remove_file(&credential).unwrap();
     run(
         &home,
         &credential,
@@ -197,6 +208,15 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
     );
     let read_again = run(&home, &credential, &["chat", "read", &chat]);
     assert!(read_again.contains("Hello from fake"), "{read_again}");
+
+    // The sealed Provider key and the recorded history still work after a
+    // restart.
+    let sent_again = run(
+        &home,
+        &credential,
+        &["chat", "send", "--chat", &chat, "again"],
+    );
+    assert!(sent_again.contains("Hello from fake"), "{sent_again}");
     drop(restarted);
 
     provider_task.abort();

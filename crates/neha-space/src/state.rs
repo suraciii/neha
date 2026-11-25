@@ -81,6 +81,8 @@ pub struct ComputerView {
     pub kind: String,
     /// Whether its channel is up.
     pub online: bool,
+    /// The Computer's workspace directory.
+    pub workspace: String,
 }
 
 /// A Chat.
@@ -138,6 +140,8 @@ pub struct RunView {
     pub bot: Id,
     /// The User the Bot acts for.
     pub acting: Id,
+    /// The command that started it.
+    pub command: Id,
     /// The Message that started it.
     pub message: Id,
     /// Its status.
@@ -280,6 +284,7 @@ impl Projection for State {
                         owner: data.owner,
                         kind: data.kind,
                         online: true,
+                        workspace: data.workspace,
                     },
                 );
             }
@@ -317,6 +322,7 @@ impl Projection for State {
                         chat: data.chat,
                         bot: data.bot,
                         acting,
+                        command: data.command,
                         message: data.message,
                         status: RunStatus::Running,
                         reply: None,
@@ -385,6 +391,8 @@ struct ComputerCreated {
     computer: Id,
     owner: Id,
     kind: String,
+    #[serde(default)]
+    workspace: String,
 }
 
 #[derive(Deserialize)]
@@ -408,6 +416,7 @@ struct RunStarted {
     run: Id,
     chat: Id,
     bot: Id,
+    command: Id,
     message: Id,
 }
 

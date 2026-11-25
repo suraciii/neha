@@ -52,12 +52,11 @@ target/debug/neha whoami
 
 ## Connect a Provider
 
-Add a Provider and its default Model:
+Add a Provider and its default Model. Put the API key in the environment or let the CLI prompt for it; never put it in the command line:
 
 ```bash
-target/debug/neha provider add \
+NEHA_PROVIDER_KEY=sk-... target/debug/neha provider add \
   --base-url https://api.example.com/v1 \
-  --api-key sk-... \
   --model example-chat
 ```
 
@@ -75,21 +74,19 @@ target/debug/neha model list
 A new Bot gets its own Chat and its own Computer:
 
 ```bash
-target/debug/neha bot create --name Scout
+target/debug/neha bot create Scout
 ```
 
-The output names the Bot, its Chat, and its Computer:
-
-```text
-Created Bot <bot-id> (Scout).
-  Chat: <chat-id>
-  Computer: <computer-id>
-```
-
-Send a Message and wait for the one-shot reply:
+The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's workspace:
 
 ```bash
-target/debug/neha chat send --chat <chat-id> "hello"
+target/debug/neha bot show <bot-id>
+```
+
+Send a Message and wait for the one-shot reply. With one Chat, no identifier is needed:
+
+```bash
+target/debug/neha chat send "hello"
 ```
 
 The CLI prints the Bot's reply and the run that produced it. Read the whole Chat or inspect the run:
