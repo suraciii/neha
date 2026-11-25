@@ -11,6 +11,8 @@ use neha::error::ErrorCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub use neha::usage::Usage;
+
 /// The role of a Message sent to a Model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,32 +42,6 @@ impl ChatMessage {
             role,
             content: content.into(),
         }
-    }
-}
-
-/// The normalized usage of one Model call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Usage {
-    /// Input tokens that were not cached.
-    pub uncached_input: u64,
-    /// Input tokens read from the provider's cache.
-    pub cache_read: u64,
-    /// Input tokens written to the provider's cache.
-    pub cache_write: u64,
-    /// Output tokens.
-    pub output: u64,
-    /// Output tokens that were reasoning.
-    pub reasoning: u64,
-}
-
-impl Usage {
-    /// Returns the tokens a usage budget counts.
-    #[must_use]
-    pub fn budgeted(self) -> u64 {
-        self.uncached_input
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_write)
-            .saturating_add(self.output)
     }
 }
 

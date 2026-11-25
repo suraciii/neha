@@ -289,6 +289,11 @@ async fn append(
     if request.events.is_empty() {
         return Err(StoreError::EmptyCommand);
     }
+    for draft in &request.events {
+        draft
+            .validate()
+            .map_err(|error| StoreError::InvalidEvent(error.to_string()))?;
+    }
 
     let mut transaction = connection.begin().await?;
     let existing = sqlx::query(
@@ -507,6 +512,9 @@ pub enum StoreError {
     /// A command wrote no events.
     #[error("a command must write at least one event")]
     EmptyCommand,
+    /// An event does not fit its kind's schema.
+    #[error("invalid event: {0}")]
+    InvalidEvent(String),
     /// The database schema cannot be created or is newer than this build.
     #[error("schema error: {0}")]
     Schema(#[from] SchemaError),
@@ -534,11 +542,95 @@ mod tests {
     }
 
     fn draft(kind: EventKind) -> EventDraft {
-        EventDraft::new(
-            kind,
-            Author::User(Id::new()),
-            serde_json::json!({"ok": true}),
-        )
+        let user = Id::new();
+        match kind {
+            EventKind::UserJoined => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventKind::ProviderAdded => {
+                let provider = Id::new();
+                let model = Id::new();
+                EventDraft::new(
+                    kind,
+                    Author::User(user),
+                    serde_json::json!({
+                        "provider": provider,
+                        "protocol": "chat_completions",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "models": [{
+                            "id": model,
+                            "name": "model",
+                            "context_limit": 1000,
+                            "max_output": 100,
+                            "reads_images": false,
+                        }],
+                        "default_model": model,
+                    }),
+                )
+            }
+            EventKind::BotCreated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "bot": Id::new(),
+                    "owner": user,
+                    "name": "Scout",
+                    "computer": Id::new(),
+                    "chat": Id::new(),
+                }),
+            ),
+            EventKind::ComputerCreated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "computer": Id::new(),
+                    "owner": user,
+                    "kind": "managed",
+                    "workspace": "/tmp/workspace",
+                }),
+            ),
+            EventKind::ChatCreated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"chat": Id::new(), "owner": user, "bot": Id::new()}),
+            ),
+            EventKind::MessageAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "message": Id::new(),
+                    "chat": Id::new(),
+                    "text": "hello",
+                    "run": null,
+                }),
+            ),
+            EventKind::RunStarted => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "chat": Id::new(),
+                    "bot": Id::new(),
+                    "command": Id::new(),
+                    "message": Id::new(),
+                }),
+            )
+            .acting(user),
+            EventKind::RunFinished => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "status": "succeeded",
+                    "reply": null,
+                    "usage": null,
+                    "error": null,
+                }),
+            )
+            .acting(user),
+        }
     }
 
     fn request(events: Vec<EventDraft>) -> AppendRequest {
@@ -663,6 +755,31 @@ mod tests {
             .await;
 
         assert!(error.is_err());
+        assert_eq!(store.last_seq().await.unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn an_event_that_does_not_fit_its_schema_is_rejected() {
+        let (_dir, _home, store) = open().await;
+        let before = store.last_seq().await.unwrap();
+        let mut missing = draft(EventKind::MessageAdded);
+        missing.data = serde_json::json!({"message": Id::new(), "chat": Id::new()});
+        let mut extra = draft(EventKind::MessageAdded);
+        extra.data["surprise"] = serde_json::json!(true);
+        let mut wrong_type = draft(EventKind::ProviderAdded);
+        wrong_type.data["models"][0]["context_limit"] = serde_json::json!("many");
+        let mut future = draft(EventKind::MessageAdded);
+        future.version = 2;
+        let mut bad_author = draft(EventKind::RunStarted);
+        bad_author.author = Author::User(Id::new());
+
+        for invalid in [missing, extra, wrong_type, future, bad_author] {
+            let error = store.append(request(vec![invalid])).await;
+            assert!(
+                matches!(error, Err(StoreError::InvalidEvent(_))),
+                "the record accepted invalid data"
+            );
+        }
         assert_eq!(store.last_seq().await.unwrap(), before);
     }
 

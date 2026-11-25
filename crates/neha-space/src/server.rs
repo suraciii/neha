@@ -21,6 +21,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use futures_util::{SinkExt, StreamExt};
 use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{Author, EventDraft, EventKind};
@@ -30,6 +31,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::commands;
@@ -54,6 +56,7 @@ pub struct SpaceServer {
     state: Mutex<SpaceState>,
     secrets: Secrets,
     model: ModelClient,
+    events: broadcast::Sender<neha::record::Event>,
 }
 
 impl SpaceServer {
@@ -71,6 +74,7 @@ impl SpaceServer {
         recover_interrupted(&store, &mut state).await?;
         let secrets = Secrets::load(&home)?;
         let model = ModelClient::new()?;
+        let (events, _) = broadcast::channel(256);
 
         Ok(Self {
             home,
@@ -81,6 +85,7 @@ impl SpaceServer {
             state: Mutex::new(state),
             secrets,
             model,
+            events,
         })
     }
 
@@ -355,7 +360,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
     let hello = match serde_json::from_str::<ClientFrame>(text.as_str()) {
         Ok(ClientFrame::Hello { version, .. }) => version,
         _ => {
-            let _ = send_frame(
+            let _ = send_raw(
                 &mut socket,
                 ServerFrame::ProtocolError {
                     message: "the first frame must be hello".to_owned(),
@@ -366,7 +371,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
         }
     };
     if hello != PROTOCOL_VERSION {
-        let _ = send_frame(
+        let _ = send_raw(
             &mut socket,
             ServerFrame::ProtocolError {
                 message: format!("this Space speaks protocol version {PROTOCOL_VERSION}"),
@@ -375,7 +380,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
         .await;
         return;
     }
-    if send_frame(
+    if send_raw(
         &mut socket,
         ServerFrame::Hello {
             version: PROTOCOL_VERSION,
@@ -388,93 +393,208 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
         return;
     }
 
+    let (mut sink, mut stream) = socket.split();
+    let (out, mut pending) = mpsc::channel::<ServerFrame>(128);
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = pending.recv().await {
+            let Ok(text) = serde_json::to_string(&frame) else {
+                break;
+            };
+            if text.len() > MAX_FRAME_BYTES {
+                break;
+            }
+            if sink.send(Message::Text(text.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut forwarder: Option<JoinHandle<()>> = None;
     let mut heartbeat = tokio::time::interval(HEARTBEAT);
     heartbeat.tick().await;
 
     loop {
         tokio::select! {
-            message = socket.recv() => {
-                let Some(Ok(message)) = message else { return; };
+            message = stream.next() => {
+                let Some(Ok(message)) = message else { break; };
                 let Message::Text(text) = message else { continue; };
                 match serde_json::from_str::<ClientFrame>(text.as_str()) {
                     Ok(ClientFrame::Hello { .. }) => {
-                        if send_frame(&mut socket, ServerFrame::ProtocolError { message: "hello was already sent".to_owned() }).await.is_err() {
-                            return;
+                        if send(&out, ServerFrame::ProtocolError { message: "hello was already sent".to_owned() }).await.is_err() {
+                            break;
                         }
                     }
                     Ok(ClientFrame::Subscribe { id: _, cursor, limit }) => {
+                        if let Some(task) = forwarder.take() {
+                            task.abort();
+                        }
+                        let receiver = server.events.subscribe();
                         let cursor = cursor.unwrap_or(neha::seq::Seq::ZERO);
-                        match server.store.events_from(cursor, limit.unwrap_or(256)).await {
-                            Ok(page) => {
-                                if send_frame(&mut socket, ServerFrame::Snapshot { cursor: page.next, events: page.events }).await.is_err() {
-                                    return;
+                        match snapshot_page(&server.store, cursor, limit).await {
+                            Ok((next, events)) => {
+                                if send(&out, ServerFrame::Snapshot { cursor: next, events }).await.is_err() {
+                                    break;
                                 }
+                                forwarder = Some(spawn_forwarder(receiver, out.clone(), next));
                             }
-                            Err(error) => {
-                                if send_frame(&mut socket, ServerFrame::Error { id: None, code: ErrorCode::Internal, message: error.to_string() }).await.is_err() {
-                                    return;
+                            Err(_) => {
+                                if send(&out, ServerFrame::Error {
+                                    id: None,
+                                    code: ErrorCode::Internal,
+                                    message: "the record could not be read".to_owned(),
+                                }).await.is_err() {
+                                    break;
                                 }
                             }
                         }
                     }
                     Ok(ClientFrame::Command { id, command }) => {
-                        if send_frame(&mut socket, ServerFrame::Accepted { id }).await.is_err() {
-                            return;
+                        if send(&out, ServerFrame::Accepted { id }).await.is_err() {
+                            break;
                         }
                         let outcome = commands::execute(&server.store, &server.state, &server.home, &server.secrets, &account, id, command).await;
-                        let (committed, result) = match outcome {
+                        let result = match outcome {
                             Ok(outcome) => {
+                                broadcast(&server, &outcome.events);
                                 if let Some(seq) = outcome.committed
-                                    && send_frame(&mut socket, ServerFrame::Committed { id, seq }).await.is_err()
+                                    && send(&out, ServerFrame::Committed { id, seq }).await.is_err()
                                 {
-                                    return;
+                                    break;
                                 }
                                 match outcome.pending {
                                     Some(pending) => {
                                         match commands::finish_run(&server.store, &server.state, &server.model, pending).await {
-                                            Ok((result, _events)) => (outcome.committed, result),
+                                            Ok((result, events)) => {
+                                                broadcast(&server, &events);
+                                                result
+                                            }
                                             Err(error) => {
-                                                let _ = send_frame(&mut socket, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
+                                                let _ = send(&out, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
                                                 continue;
                                             }
                                         }
                                     }
-                                    None => (outcome.committed, outcome.result),
+                                    None => outcome.result,
                                 }
                             }
                             Err(error) => {
-                                let _ = send_frame(&mut socket, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
+                                let _ = send(&out, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
                                 continue;
                             }
                         };
-                        let _ = committed;
-                        if send_frame(&mut socket, ServerFrame::Confirmed { id, result }).await.is_err() {
-                            return;
+                        if send(&out, ServerFrame::Confirmed { id, result }).await.is_err() {
+                            break;
                         }
                     }
                     Err(_) => {
-                        if send_frame(&mut socket, ServerFrame::ProtocolError { message: "the frame is not valid JSON".to_owned() }).await.is_err() {
-                            return;
+                        if send(&out, ServerFrame::ProtocolError { message: "the frame is not valid JSON".to_owned() }).await.is_err() {
+                            break;
                         }
                     }
                 }
             }
             _ = heartbeat.tick() => {
                 let cursor = server.store.last_seq().await.unwrap_or(neha::seq::Seq::ZERO);
-                if send_frame(&mut socket, ServerFrame::Heartbeat { cursor }).await.is_err() {
-                    return;
+                if send(&out, ServerFrame::Heartbeat { cursor }).await.is_err() {
+                    break;
                 }
             }
         }
     }
+
+    if let Some(task) = forwarder.take() {
+        task.abort();
+    }
+    drop(out);
+    let _ = writer.await;
 }
 
-async fn send_frame(socket: &mut WebSocket, frame: ServerFrame) -> Result<(), ()> {
+async fn send_raw(socket: &mut WebSocket, frame: ServerFrame) -> Result<(), ()> {
     let text = serde_json::to_string(&frame).map_err(|_| ())?;
     socket
         .send(Message::Text(text.into()))
         .await
         .map_err(|_| ())
+}
+
+async fn send(out: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> Result<(), ()> {
+    out.send(frame).await.map_err(|_| ())
+}
+
+fn broadcast(server: &SpaceServer, events: &[neha::record::Event]) {
+    for event in events {
+        let _ = server.events.send(event.clone());
+    }
+}
+
+fn spawn_forwarder(
+    mut receiver: broadcast::Receiver<neha::record::Event>,
+    out: mpsc::Sender<ServerFrame>,
+    mut cursor: neha::seq::Seq,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    if event.seq <= cursor {
+                        continue;
+                    }
+                    cursor = event.seq;
+                    if out.send(ServerFrame::Event { event }).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    let _ = out
+                        .send(ServerFrame::Error {
+                            id: None,
+                            code: ErrorCode::Unavailable,
+                            message:
+                                "the subscription fell behind; reconnect and resume from the cursor"
+                                    .to_owned(),
+                        })
+                        .await;
+                    break;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
+/// Reads a page that fits one frame, trimming events from its end when needed.
+async fn snapshot_page(
+    store: &Store,
+    cursor: neha::seq::Seq,
+    limit: Option<usize>,
+) -> Result<(neha::seq::Seq, Vec<neha::record::Event>), StoreError> {
+    let page_size = limit.unwrap_or(256).clamp(1, 256);
+    let page = store.events_from(cursor, page_size).await?;
+    let complete = page.events.len();
+    let mut next = page.next;
+    let mut events = page.events;
+    while !events.is_empty() {
+        let candidate = if events.len() == complete {
+            next
+        } else {
+            events.last().map(|event| event.seq).unwrap_or(cursor)
+        };
+        let frame = ServerFrame::Snapshot {
+            cursor: candidate,
+            events: events.clone(),
+        };
+        if serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() + 4096 <= MAX_FRAME_BYTES) {
+            next = candidate;
+            break;
+        }
+        events.pop();
+        next = events.last().map(|event| event.seq).unwrap_or(cursor);
+    }
+    if events.is_empty() {
+        return Ok((cursor, events));
+    }
+
+    Ok((next, events))
 }
 
 /// An authenticated account.
@@ -622,10 +742,11 @@ impl ApiError {
     }
 
     pub(crate) fn internal(message: impl Into<String>) -> Self {
+        eprintln!("neha: internal error: {}", message.into());
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal,
-            message,
+            "the Space hit an internal error",
         )
     }
 
@@ -989,7 +1110,7 @@ mod tests {
                 ServerFrame::Committed { seq, .. } => committed = Some(seq),
                 ServerFrame::Confirmed { result, .. } => return Ok((committed, result)),
                 ServerFrame::Error { code, message, .. } => return Err((code, message)),
-                ServerFrame::Heartbeat { .. } => {}
+                ServerFrame::Heartbeat { .. } | ServerFrame::Event { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }
         }
@@ -1346,7 +1467,7 @@ mod tests {
             EventDraft::new(
                 EventKind::ComputerCreated,
                 Author::User(user),
-                json!({"computer": computer, "owner": user, "kind": "managed"}),
+                json!({"computer": computer, "owner": user, "kind": "managed", "workspace": "/tmp/workspace"}),
             ),
             EventDraft::new(
                 EventKind::BotCreated,
@@ -1935,6 +2056,124 @@ mod tests {
         }
         assert!(found.is_empty(), "plaintext key found in {found:?}");
         socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscription_streams_live_events_and_resumes() {
+        use neha::record::EventKind;
+
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (base, provider_task) = fake_provider().await;
+        command(&mut socket, Id::new(), provider_base(base)).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: Some(100),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let ServerFrame::Snapshot { cursor, events } = next_frame(&mut socket).await else {
+            panic!("expected a snapshot");
+        };
+        assert_eq!(events.len(), 5);
+        assert_eq!(cursor, events.last().unwrap().seq);
+
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: Id::new(),
+                    command: CommandCall::MessageSend(MessageSend {
+                        chat,
+                        text: "hello".to_owned(),
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut live = Vec::new();
+        loop {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), next_frame(&mut socket))
+                    .await
+                    .expect("the subscription keeps sending");
+            if let ServerFrame::Event { event } = frame {
+                assert!(event.seq > cursor);
+                let last = matches!(event.kind, EventKind::RunFinished);
+                live.push(event);
+                if last {
+                    break;
+                }
+            }
+        }
+        assert!(
+            live.iter()
+                .any(|event| event.kind == EventKind::MessageAdded)
+        );
+        assert_eq!(live.last().unwrap().kind, EventKind::RunFinished);
+        let resume = live.last().unwrap().seq;
+
+        let mut second = open_socket(&running, &token).await;
+        second
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: Some(resume),
+                    limit: Some(100),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let ServerFrame::Snapshot { events, cursor } = next_frame(&mut second).await else {
+            panic!("expected a snapshot");
+        };
+        assert!(events.is_empty());
+        assert_eq!(cursor, resume);
+
+        command(
+            &mut second,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "again".to_owned(),
+            }),
+        )
+        .await;
+        loop {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), next_frame(&mut second))
+                    .await
+                    .expect("the subscription keeps sending");
+            if let ServerFrame::Event { event } = frame
+                && event.kind == EventKind::RunFinished
+            {
+                assert!(event.seq > resume);
+                break;
+            }
+        }
+        socket.close(None).await.unwrap();
+        second.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
     }

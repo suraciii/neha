@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 
 use neha::id::Id;
-use neha::record::{Author, Event, EventKind};
+use neha::record::{Author, Event, EventData};
 use neha::seq::Seq;
 use neha::time::Timestamp;
 use serde::{Deserialize, Serialize};
+
+pub use neha::record::RunStatus;
 
 use crate::model::Usage;
 use crate::store::Projection;
@@ -117,18 +119,6 @@ pub struct MessageView {
     pub run: Option<Id>,
 }
 
-/// How a run ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunStatus {
-    /// The run is still working.
-    Running,
-    /// The run produced a reply.
-    Succeeded,
-    /// The run failed.
-    Failed,
-}
-
 /// A run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunView {
@@ -217,12 +207,15 @@ impl State {
 
 impl Projection for State {
     fn apply(&mut self, event: &Event) -> Result<(), String> {
-        match event.kind {
-            EventKind::UserJoined => {
+        let data = event
+            .kind
+            .decode(&event.data)
+            .map_err(|error| error.to_string())?;
+        match data {
+            EventData::UserJoined(data) => {
                 let Author::User(id) = event.author else {
                     return Err("a joined User must author the event".to_owned());
                 };
-                let data: UserJoined = from_data(event)?;
                 self.users.insert(
                     id,
                     UserView {
@@ -232,8 +225,7 @@ impl Projection for State {
                     },
                 );
             }
-            EventKind::ProviderAdded => {
-                let data: ProviderAdded = from_data(event)?;
+            EventData::ProviderAdded(data) => {
                 self.providers.insert(
                     data.provider,
                     ProviderView {
@@ -262,8 +254,7 @@ impl Projection for State {
                     );
                 }
             }
-            EventKind::BotCreated => {
-                let data: BotCreated = from_data(event)?;
+            EventData::BotCreated(data) => {
                 self.bots.insert(
                     data.bot,
                     BotView {
@@ -275,8 +266,7 @@ impl Projection for State {
                     },
                 );
             }
-            EventKind::ComputerCreated => {
-                let data: ComputerCreated = from_data(event)?;
+            EventData::ComputerCreated(data) => {
                 self.computers.insert(
                     data.computer,
                     ComputerView {
@@ -288,8 +278,7 @@ impl Projection for State {
                     },
                 );
             }
-            EventKind::ChatCreated => {
-                let data: ChatCreated = from_data(event)?;
+            EventData::ChatCreated(data) => {
                 self.chats.insert(
                     data.chat,
                     ChatView {
@@ -299,8 +288,7 @@ impl Projection for State {
                     },
                 );
             }
-            EventKind::MessageAdded => {
-                let data: MessageAdded = from_data(event)?;
+            EventData::MessageAdded(data) => {
                 self.messages.push(MessageView {
                     id: data.message,
                     chat: data.chat,
@@ -312,8 +300,7 @@ impl Projection for State {
                     run: data.run,
                 });
             }
-            EventKind::RunStarted => {
-                let data: RunStarted = from_data(event)?;
+            EventData::RunStarted(data) => {
                 let acting = event.acting.ok_or("a run names the User it acts for")?;
                 self.runs.insert(
                     data.run,
@@ -331,8 +318,7 @@ impl Projection for State {
                     },
                 );
             }
-            EventKind::RunFinished => {
-                let data: RunFinished = from_data(event)?;
+            EventData::RunFinished(data) => {
                 let run = self
                     .runs
                     .get_mut(&data.run)
@@ -346,88 +332,4 @@ impl Projection for State {
 
         Ok(())
     }
-}
-
-fn from_data<T: serde::de::DeserializeOwned>(event: &Event) -> Result<T, String> {
-    serde_json::from_value(event.data.clone())
-        .map_err(|_| format!("event {} does not match its kind", event.kind.as_str()))
-}
-
-#[derive(Deserialize)]
-struct UserJoined {
-    display_name: String,
-    is_admin: bool,
-}
-
-#[derive(Deserialize)]
-struct ProviderAdded {
-    provider: Id,
-    protocol: String,
-    base_url: String,
-    models: Vec<ModelData>,
-    default_model: Option<Id>,
-}
-
-#[derive(Deserialize)]
-struct ModelData {
-    id: Id,
-    name: String,
-    context_limit: u32,
-    max_output: u32,
-    reads_images: bool,
-}
-
-#[derive(Deserialize)]
-struct BotCreated {
-    bot: Id,
-    owner: Id,
-    name: String,
-    computer: Id,
-    chat: Id,
-}
-
-#[derive(Deserialize)]
-struct ComputerCreated {
-    computer: Id,
-    owner: Id,
-    kind: String,
-    #[serde(default)]
-    workspace: String,
-}
-
-#[derive(Deserialize)]
-struct ChatCreated {
-    chat: Id,
-    owner: Id,
-    bot: Id,
-}
-
-#[derive(Deserialize)]
-struct MessageAdded {
-    message: Id,
-    chat: Id,
-    text: String,
-    #[serde(default)]
-    run: Option<Id>,
-}
-
-#[derive(Deserialize)]
-struct RunStarted {
-    run: Id,
-    chat: Id,
-    bot: Id,
-    command: Id,
-    message: Id,
-}
-
-#[derive(Deserialize)]
-struct RunFinished {
-    run: Id,
-    status: RunStatus,
-    #[serde(default)]
-    reply: Option<Id>,
-    #[serde(default)]
-    usage: Option<Usage>,
-    #[serde(default)]
-    error: Option<String>,
 }
