@@ -29,7 +29,7 @@ Automated checks are necessary but not sufficient. Exercise the changed behavior
 
 - [Coding standards](CODING_STANDARDS.md) — reviewer judgment rules.
 - [Test architecture](eng/testing.md) — test requirements and the gate.
-- [Crate architecture](eng/architecture.md) — workspace layout.
+- [Architecture](eng/architecture.md) — processes, planes, and layout.
 - [specs/](specs/) — product contracts; [docs/](docs/README.md) — user guides.
 
 ## Language
