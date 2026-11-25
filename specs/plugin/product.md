@@ -41,7 +41,7 @@ A reference that starts a program on a Computer counts as code.
 
 A skill is a set of instructions for how to do a task. A skill adds no authority: its instructions carry only what the Bot was already allowed to do.
 
-A skill is content kept in the record, not a Plugin. A Plugin can carry skills, and installing it adds them to the Space's library or to a Bot's memory.
+A skill is an instruction entry kept in the record, in the Space's library or in a Bot's record. A Plugin can carry skills; installing it creates those Skill entries.
 
 The Admin installs skills on the Space, and a Bot's owner enables them for the Bot. A skill that a Bot wrote itself is not installed; [Bot](../bot/product.md) covers it.
 

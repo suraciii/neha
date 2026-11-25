@@ -38,8 +38,6 @@ The record names a Computer's kind and a provider's machine. That machine refere
 
 A managed Computer keeps its durable files in a workspace the Space holds. A real Computer keeps its files on the machine, and the Space keeps no copy.
 
-The record, a Bot's memory, and credentials never enter a workspace.
-
 ## Isolation
 
 A Computer is the unit of isolation.

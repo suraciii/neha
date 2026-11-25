@@ -36,25 +36,27 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 
 ## Memory
 
-A Bot keeps what it learns as memory entries. An entry applies at one scope: the owner's Chats, one other User's Chat, or a Group.
+A Bot keeps what it learns as memory entries. The default scope is the owner's Chats; a Chat entry belongs to that Chat's User, and a Group entry belongs to the Group.
 
 | Scope | Applies in | Who reads it | Who clears it |
 | --- | --- | --- | --- |
 | Owner | The owner's Chats | The owner | The owner |
 | User | One other User's Chat | That User | That User, and the owner |
-| Group | The Group where it was learned | Every member of the Group | The owner |
+| Group | The Group where it was learned | Every member of the Group | Its author, and the owner |
 
-When a User asks a Bot to remember something, it keeps the entry at the scope of that conversation.
+When a User asks a Bot to remember something, it keeps the entry at the scope of that conversation. In a Group, an entry from a non-owner waits as a suggestion.
 
-A rule the owner gives in a Group applies to the Group. A rule another member gives applies to that member's Chats until the owner approves it for the Group.
+A suggestion applies to nothing until the owner approves it. A rule the owner gives in a Group applies to the Group.
 
-A User sees what a Bot remembers for them by asking it in the Chat. The owner can clear every entry, including entries the owner cannot read.
+The owner sees that every entry exists, without reading a User entry's content, and can clear any entry. A User sees and clears the entries that are theirs by asking the Bot in the Chat.
 
 As a conversation grows past what the Model can hold, the Bot summarizes its older parts. Lasting rules live in memory and stay.
 
 ## Skills
 
 A skill is a reusable set of instructions for how to do a task. A Bot uses the skills its owner enables for it, and a User can name one in a Chat to use it for that request. [Plugin](../plugin/product.md) covers installing skills.
+
+A skill's entry records the Bot or Space it belongs to and where it came from.
 
 A User teaches a Bot a task by showing it once: the User takes control of the Bot's Computer and does the task while the Bot watches and does not act. The record keeps what the User did and what was on the screen, and never keeps what the User typed as a password.
 
@@ -82,9 +84,24 @@ A Bot asks for information, a decision, or an approval in the Chat or Group wher
 
 A Bot does what it was asked without asking. It asks before an action that goes beyond the request, an action the User said to ask about, an action the Computer's owner requires asking for, and an action that its tool asks about by default.
 
-The User it acts for answers with Allow or Deny. The User can make an Allow last for that kind of action by saying so, and the Bot keeps it as a lasting rule.
+The User it acts for answers with Allow or Deny. In a Chat, the User can make an Allow last for that kind of action by saying so, and the Bot keeps it as a lasting rule.
 
-While a Bot waits for an answer, its other work goes on. A request from a run the User started waits until it is answered. A request from a run no User is with expires after the Space's set time; the Bot does not do the action and says so.
+While a Bot waits for an answer, its other work goes on.
+
+A request from a run the User started has no time limit. A request from a run no User is with expires after 30 minutes by default; the Space can change that period, the Bot does not do the action, and it says so.
+
+A request also ends when the User leaves the conversation, the Computer is revoked, or the run is cancelled.
+
+## Actions that always ask
+
+These actions always need the acting User's Allow, and a lasting rule never covers them:
+
+- Changing the Bot's rules or instructions.
+- Accepting a Bot connection from another owner.
+- The first use of a real Computer.
+- The first use of an app on a Computer.
+- Paying or spending.
+- Filling a saved credential or card.
 
 ## Deleting a Bot
 
