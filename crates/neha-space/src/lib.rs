@@ -6,11 +6,15 @@
 
 pub mod home;
 pub mod identity;
+pub mod model;
 pub mod schema;
+pub mod secrets;
 pub mod server;
 pub mod store;
 
 pub use home::{Home, HomeError, SCHEMA_VERSION};
 pub use identity::{Account, Identity, IdentityError};
+pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage};
+pub use secrets::{Secrets, SecretsError};
 pub use server::{Running, ServerError, SpaceServer, start};
 pub use store::{AppendRequest, AppendResult, EventPage, Projection, Store, StoreError};
