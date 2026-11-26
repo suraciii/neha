@@ -736,6 +736,71 @@ mod tests {
                 }),
             )
             .acting(user),
+            EventKind::RunReply => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "content": null,
+                    "calls": [{"call": "call-1-0", "tool": "shell", "arguments": {"command": "true"}}],
+                    "usage": null,
+                }),
+            )
+            .acting(user),
+            EventKind::ApprovalRequested => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "approval": Id::new(),
+                    "run": Id::new(),
+                    "bot": Id::new(),
+                    "computer": Id::new(),
+                    "chat": Id::new(),
+                    "acting": user,
+                    "action": Id::new(),
+                    "index": 0,
+                    "step": 1,
+                    "call": "call-1-0",
+                    "tool": "shell",
+                    "arguments": {"command": "true"},
+                    "summary": "shell: true",
+                    "reason": "first_use_local",
+                    "lasting_scope": null,
+                    "undoable": "no",
+                }),
+            )
+            .acting(user),
+            EventKind::ApprovalDecided => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "approval": Id::new(),
+                    "run": Id::new(),
+                    "allow": true,
+                    "lasting": false,
+                    "user": user,
+                }),
+            )
+            .acting(user),
+            EventKind::RuleAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "rule": Id::new(),
+                    "bot": Id::new(),
+                    "user": user,
+                    "effect": "ask",
+                    "tool": "shell",
+                }),
+            )
+            .acting(user),
+            EventKind::RuleRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"rule": Id::new(), "bot": Id::new(), "user": user}),
+            )
+            .acting(user),
         }
     }
 

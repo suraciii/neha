@@ -70,6 +70,21 @@ pub enum EventKind {
     /// A run finished one action.
     #[serde(rename = "neha.action.finished")]
     ActionFinished,
+    /// The Model's reply for one step, with the calls it asked to run.
+    #[serde(rename = "neha.run.reply")]
+    RunReply,
+    /// A run waits for the acting User to allow or deny an action.
+    #[serde(rename = "neha.approval.requested")]
+    ApprovalRequested,
+    /// The acting User answered an approval.
+    #[serde(rename = "neha.approval.decided")]
+    ApprovalDecided,
+    /// A lasting rule about what a Bot may do without asking.
+    #[serde(rename = "neha.rule.added")]
+    RuleAdded,
+    /// A lasting rule was removed.
+    #[serde(rename = "neha.rule.removed")]
+    RuleRemoved,
 }
 
 impl EventKind {
@@ -91,6 +106,11 @@ impl EventKind {
             Self::RunStep => "neha.run.step",
             Self::ActionStarted => "neha.action.started",
             Self::ActionFinished => "neha.action.finished",
+            Self::RunReply => "neha.run.reply",
+            Self::ApprovalRequested => "neha.approval.requested",
+            Self::ApprovalDecided => "neha.approval.decided",
+            Self::RuleAdded => "neha.rule.added",
+            Self::RuleRemoved => "neha.rule.removed",
         }
     }
 
@@ -105,7 +125,14 @@ impl EventKind {
             | Self::RunFinished => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
-            Self::RunStep | Self::ActionStarted | Self::ActionFinished => EventClass::Authority,
+            Self::RunStep
+            | Self::ActionStarted
+            | Self::ActionFinished
+            | Self::RunReply
+            | Self::ApprovalRequested
+            | Self::ApprovalDecided
+            | Self::RuleAdded
+            | Self::RuleRemoved => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::BotCreated
@@ -135,6 +162,11 @@ impl FromStr for EventKind {
             "neha.run.step" => Ok(Self::RunStep),
             "neha.action.started" => Ok(Self::ActionStarted),
             "neha.action.finished" => Ok(Self::ActionFinished),
+            "neha.run.reply" => Ok(Self::RunReply),
+            "neha.approval.requested" => Ok(Self::ApprovalRequested),
+            "neha.approval.decided" => Ok(Self::ApprovalDecided),
+            "neha.rule.added" => Ok(Self::RuleAdded),
+            "neha.rule.removed" => Ok(Self::RuleRemoved),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -231,6 +263,11 @@ mod tests {
             EventKind::RunStep,
             EventKind::ActionStarted,
             EventKind::ActionFinished,
+            EventKind::RunReply,
+            EventKind::ApprovalRequested,
+            EventKind::ApprovalDecided,
+            EventKind::RuleAdded,
+            EventKind::RuleRemoved,
         ];
 
         for kind in kinds {
@@ -251,6 +288,11 @@ mod tests {
         assert_eq!(EventKind::ActionFinished.class(), EventClass::Authority);
         assert_eq!(EventKind::BotCreated.class(), EventClass::Authority);
         assert_eq!(EventKind::BotMoved.class(), EventClass::Authority);
+        assert_eq!(EventKind::RunReply.class(), EventClass::Authority);
+        assert_eq!(EventKind::ApprovalRequested.class(), EventClass::Authority);
+        assert_eq!(EventKind::ApprovalDecided.class(), EventClass::Authority);
+        assert_eq!(EventKind::RuleAdded.class(), EventClass::Authority);
+        assert_eq!(EventKind::RuleRemoved.class(), EventClass::Authority);
     }
 
     #[test]
@@ -340,6 +382,11 @@ mod tests {
         let run = Id::new();
         let queued = serde_json::json!({"run": run, "status": "queued"});
         assert!(EventKind::RunFinished.decode(&queued).is_err());
+        let waiting = serde_json::json!({"run": run, "status": "waiting"});
+        assert!(
+            EventKind::RunFinished.decode(&waiting).is_err(),
+            "a finished run cannot be waiting"
+        );
 
         for status in ["running", "succeeded", "failed"] {
             let data = serde_json::json!({"run": run, "status": status});
@@ -519,6 +566,174 @@ mod tests {
 
         assert!(matches!(error, EventDataError::Data(_)), "{error}");
     }
+    #[test]
+    fn a_run_reply_round_trips() {
+        let run = Id::new();
+        let value = serde_json::json!({
+            "run": run,
+            "step": 2,
+            "content": "Let me look",
+            "calls": [
+                {
+                    "call": "call-2-0",
+                    "tool": "shell",
+                    "arguments": {"command": "pwd"},
+                    "refused": null,
+                },
+            ],
+            "usage": {
+                "uncached_input": 11,
+                "cache_read": 2,
+                "cache_write": 0,
+                "output": 5,
+                "reasoning": 0,
+            },
+        });
+
+        let EventData::RunReply(reply) = EventKind::RunReply.decode(&value).unwrap() else {
+            panic!("a reply decodes to its data");
+        };
+        assert_eq!(reply.run, run);
+        assert_eq!(reply.step, 2);
+        assert_eq!(reply.content.as_deref(), Some("Let me look"));
+        assert_eq!(reply.calls.len(), 1);
+        assert_eq!(reply.calls[0].call, "call-2-0");
+        assert_eq!(reply.calls[0].tool, "shell");
+        assert!(reply.usage.is_some());
+
+        let mut unknown = value;
+        unknown["text"] = serde_json::json!("no");
+        assert!(EventKind::RunReply.decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn an_approval_requested_round_trips() {
+        let ids: Vec<Id> = (0..7).map(|_| Id::new()).collect();
+        let value = serde_json::json!({
+            "approval": ids[0],
+            "run": ids[1],
+            "bot": ids[2],
+            "computer": ids[6],
+            "chat": ids[3],
+            "acting": ids[4],
+            "action": ids[5],
+            "index": 0,
+            "step": 1,
+            "call": "call-1-0",
+            "tool": "shell",
+            "arguments": {"command": "pwd"},
+            "summary": "Run pwd",
+            "reason": "first_use_local",
+            "ambiguous": false,
+            "lasting_scope": null,
+            "undoable": "no",
+        });
+
+        let EventData::ApprovalRequested(requested) =
+            EventKind::ApprovalRequested.decode(&value).unwrap()
+        else {
+            panic!("an approval request decodes to its data");
+        };
+        assert_eq!(requested.approval, ids[0]);
+        assert_eq!(requested.computer, ids[6]);
+        assert_eq!(requested.action, ids[5]);
+        assert_eq!(requested.index, 0);
+        assert_eq!(requested.step, 1);
+        assert_eq!(requested.undoable, super::Undoability::No);
+        assert_eq!(requested.lasting_scope, None);
+        assert_eq!(requested.call, "call-1-0");
+        assert_eq!(requested.tool, "shell");
+        assert_eq!(requested.summary, "Run pwd");
+        assert_eq!(requested.reason, super::ApprovalReason::FirstUseLocal);
+        assert!(!requested.ambiguous);
+        assert_eq!(requested.rule, None);
+
+        let mut unknown = value;
+        unknown["group"] = serde_json::json!(Id::new());
+        assert!(EventKind::ApprovalRequested.decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn an_approval_decided_round_trips() {
+        let (approval, run, user, rule) = (Id::new(), Id::new(), Id::new(), Id::new());
+        let value = serde_json::json!({
+            "approval": approval,
+            "run": run,
+            "allow": true,
+            "lasting": true,
+            "user": user,
+            "rule": rule,
+        });
+
+        let EventData::ApprovalDecided(decided) =
+            EventKind::ApprovalDecided.decode(&value).unwrap()
+        else {
+            panic!("a decision decodes to its data");
+        };
+        assert_eq!(decided.approval, approval);
+        assert_eq!(decided.run, run);
+        assert!(decided.allow);
+        assert!(decided.lasting);
+        assert_eq!(decided.user, user);
+        assert_eq!(decided.rule, Some(rule));
+    }
+
+    #[test]
+    fn a_rule_added_and_removed_round_trip() {
+        let (rule, bot, user) = (Id::new(), Id::new(), Id::new());
+        let added = serde_json::json!({
+            "rule": rule,
+            "bot": bot,
+            "user": user,
+            "effect": "allow",
+            "tool": "shell",
+            "command_prefix": "git",
+        });
+        let EventData::RuleAdded(data) = EventKind::RuleAdded.decode(&added).unwrap() else {
+            panic!("a rule decodes to its data");
+        };
+        assert_eq!(data.rule, rule);
+        assert_eq!(data.bot, bot);
+        assert_eq!(data.user, user);
+        assert_eq!(data.effect, super::RuleEffect::Allow);
+        assert_eq!(data.tool, "shell");
+        assert_eq!(data.command_prefix.as_deref(), Some("git"));
+        assert_eq!(data.path_prefix, None);
+
+        let removed = serde_json::json!({"rule": rule, "bot": bot, "user": user});
+        let EventData::RuleRemoved(data) = EventKind::RuleRemoved.decode(&removed).unwrap() else {
+            panic!("a removed rule decodes to its data");
+        };
+        assert_eq!((data.rule, data.bot, data.user), (rule, bot, user));
+    }
+
+    #[test]
+    fn a_reply_and_an_approval_take_a_bot_author() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        for kind in [EventKind::RunReply, EventKind::ApprovalRequested] {
+            assert!(kind.validate_author(bot, Some(Id::new())).is_ok());
+            assert!(kind.validate_author(user, None).is_err());
+            assert!(kind.validate_author(user, Some(Id::new())).is_err());
+            assert!(kind.validate_author(bot, None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_decision_and_a_rule_take_their_user_as_acting() {
+        let owner = Id::new();
+        let user = Author::User(owner);
+        let bot = Author::Bot(Id::new());
+        for kind in [
+            EventKind::ApprovalDecided,
+            EventKind::RuleAdded,
+            EventKind::RuleRemoved,
+        ] {
+            assert!(kind.validate_author(user, Some(owner)).is_ok());
+            assert!(kind.validate_author(user, None).is_err());
+            assert!(kind.validate_author(bot, Some(owner)).is_err());
+        }
+    }
 }
 
 /// Where a run is: waiting, working, or how it ended.
@@ -529,6 +744,8 @@ pub enum RunStatus {
     Queued,
     /// The run is still working.
     Running,
+    /// The run waits for the acting User to allow or deny an action.
+    Waiting,
     /// The run produced a reply.
     Succeeded,
     /// The run failed.
@@ -566,6 +783,16 @@ pub enum EventData {
     ActionStarted(ActionStarted),
     /// A run finished an action.
     ActionFinished(ActionFinished),
+    /// The Model's reply for one step.
+    RunReply(RunReply),
+    /// A run waits for an approval.
+    ApprovalRequested(ApprovalRequested),
+    /// The acting User answered an approval.
+    ApprovalDecided(ApprovalDecided),
+    /// A lasting rule was added.
+    RuleAdded(RuleAdded),
+    /// A lasting rule was removed.
+    RuleRemoved(RuleRemoved),
 }
 
 /// The first version of every event kind.
@@ -598,10 +825,11 @@ impl EventKind {
             Self::RunStarted => EventData::RunStarted(decode(data)?),
             Self::RunFinished => {
                 let data: RunFinished = decode(data)?;
-                // Waiting is where a run is before it starts, not how it ends.
-                if data.status == RunStatus::Queued {
+                // Waiting is where a run stands while it asks, not how it
+                // ends: a reader that saw it as an end would resume nothing.
+                if matches!(data.status, RunStatus::Queued | RunStatus::Waiting) {
                     return Err(EventDataError::Data(
-                        "a finished run cannot be queued".to_owned(),
+                        "a finished run cannot be queued or waiting".to_owned(),
                     ));
                 }
 
@@ -610,6 +838,11 @@ impl EventKind {
             Self::RunStep => EventData::RunStep(decode(data)?),
             Self::ActionStarted => EventData::ActionStarted(decode(data)?),
             Self::ActionFinished => EventData::ActionFinished(decode(data)?),
+            Self::RunReply => EventData::RunReply(decode(data)?),
+            Self::ApprovalRequested => EventData::ApprovalRequested(decode(data)?),
+            Self::ApprovalDecided => EventData::ApprovalDecided(decode(data)?),
+            Self::RuleAdded => EventData::RuleAdded(decode(data)?),
+            Self::RuleRemoved => EventData::RuleRemoved(decode(data)?),
         };
 
         Ok(decoded)
@@ -637,8 +870,15 @@ impl EventKind {
             | Self::RunFinished
             | Self::RunStep
             | Self::ActionStarted
-            | Self::ActionFinished => {
+            | Self::ActionFinished
+            | Self::RunReply
+            | Self::ApprovalRequested => {
                 if !matches!(author, Author::Bot(_)) || acting.is_none() {
+                    return Err(EventDataError::Author);
+                }
+            }
+            Self::ApprovalDecided | Self::RuleAdded | Self::RuleRemoved => {
+                if !matches!(author, Author::User(_)) || acting.is_none() {
                     return Err(EventDataError::Author);
                 }
             }
@@ -1055,4 +1295,167 @@ pub struct RunFinished {
     /// The failure.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// One tool call the Model asked for in one step.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecordedCall {
+    /// The tool-call identifier the provider expects in the result.
+    pub call: String,
+    /// The tool's name.
+    pub tool: String,
+    /// The arguments the tool runs with.
+    pub arguments: serde_json::Value,
+    /// Why the loop refused the call before anything ran; `None` when it can run.
+    #[serde(default)]
+    pub refused: Option<String>,
+}
+
+/// The data of `neha.run.reply`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunReply {
+    /// The run.
+    pub run: Id,
+    /// The step number, starting at one.
+    pub step: u32,
+    /// What the Model said, when it said anything.
+    #[serde(default)]
+    pub content: Option<String>,
+    /// The calls the step asked to run.
+    pub calls: Vec<RecordedCall>,
+    /// The usage the Model reported for the reply.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// Why a run asks its acting User for an approval.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalReason {
+    /// The first use of a Local Computer by this Bot for this User.
+    FirstUseLocal,
+    /// A lasting rule asks first.
+    Rule,
+}
+
+/// Whether the User can undo an action after allowing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Undoability {
+    /// The action cannot be undone.
+    No,
+    /// The action may or may not be undoable; this build cannot tell.
+    Unknown,
+}
+
+/// What a lasting rule does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleEffect {
+    /// Ask before a matching action.
+    Ask,
+    /// Allow matching actions without asking.
+    Allow,
+}
+
+/// The data of `neha.approval.requested`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalRequested {
+    /// The approval.
+    pub approval: Id,
+    /// The run that waits.
+    pub run: Id,
+    /// The Bot.
+    pub bot: Id,
+    /// The Computer the run works on; a first use counts per machine.
+    pub computer: Id,
+    /// The Chat.
+    pub chat: Id,
+    /// The User the Bot acts for; they answer.
+    pub acting: Id,
+    /// The action that waits.
+    pub action: Id,
+    /// The call's position among the step's calls, from zero.
+    pub index: u32,
+    /// The step.
+    pub step: u32,
+    /// The tool-call identifier.
+    pub call: String,
+    /// The tool's name.
+    pub tool: String,
+    /// The arguments the action will run with.
+    pub arguments: serde_json::Value,
+    /// A short text the User reads.
+    pub summary: String,
+    /// Why this run asks.
+    pub reason: ApprovalReason,
+    /// Whether a command form defeated the rules and forced the ask (the
+    /// reason is then `rule`, but no rule actually matched).
+    #[serde(default)]
+    pub ambiguous: bool,
+    /// The rule that asked, when a rule did.
+    #[serde(default)]
+    pub rule: Option<Id>,
+    /// What an "Always allow" would allow, in words the User reads.
+    #[serde(default)]
+    pub lasting_scope: Option<String>,
+    /// Whether the action can still be undone after it runs.
+    pub undoable: Undoability,
+}
+
+/// The data of `neha.approval.decided`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovalDecided {
+    /// The approval.
+    pub approval: Id,
+    /// The run that waited.
+    pub run: Id,
+    /// Whether the User allowed it.
+    pub allow: bool,
+    /// Whether this also makes a lasting rule.
+    pub lasting: bool,
+    /// The User who answered.
+    pub user: Id,
+    /// The rule the answer added, if any.
+    #[serde(default)]
+    pub rule: Option<Id>,
+}
+
+/// The data of `neha.rule.added`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleAdded {
+    /// The rule.
+    pub rule: Id,
+    /// The Bot it constrains.
+    pub bot: Id,
+    /// The User who made it.
+    pub user: Id,
+    /// What matching actions do.
+    pub effect: RuleEffect,
+    /// The tool name.
+    pub tool: String,
+    /// The shell command prefix a matching shell action starts with.
+    #[serde(default)]
+    pub command_prefix: Option<String>,
+    /// The path prefix a matching file action's path starts with.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+}
+
+/// The data of `neha.rule.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RuleRemoved {
+    /// The rule.
+    pub rule: Id,
+    /// The Bot it constrained.
+    pub bot: Id,
+    /// The User who removed it; the Bot's owner may remove another User's
+    /// rule, so this is not necessarily the rule's maker.
+    pub user: Id,
 }

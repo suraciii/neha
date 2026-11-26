@@ -102,6 +102,8 @@ pub struct SpaceServer {
     pub(crate) links: ComputerLinks,
     /// Pairing attempts that are running or recently failed, per account.
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
+    /// Serializes approval answers and rule changes.
+    pub(crate) approvals: tokio::sync::Mutex<()>,
     /// Local-ticket pair attempts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
     /// The ticket file this start wrote for its Admin, with its digest.
@@ -175,6 +177,7 @@ impl SpaceServer {
             tool_timeout,
             links: ComputerLinks::new(),
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
+            approvals: tokio::sync::Mutex::new(()),
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -1565,6 +1568,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             out.clone(),
                             cursor.unwrap_or(neha::seq::Seq::ZERO),
                             limit,
+                            account.id,
                         ));
                     }
                     Ok(ClientFrame::Command { id, command }) => {
@@ -1643,6 +1647,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             identity: &server.identity,
                             links: &server.links,
                             pairings: &server.pairings,
+                            approvals: &server.approvals,
                         };
                         let outcome = commands::execute(&context, &account, id, command).await;
                         let result = match outcome {
@@ -1717,9 +1722,10 @@ fn spawn_forwarder(
     out: mpsc::Sender<ServerFrame>,
     cursor: neha::seq::Seq,
     limit: Option<usize>,
+    account: Id,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut cursor = match catch_up(&reader, &out, cursor, limit).await {
+        let mut cursor = match catch_up(&reader, &out, cursor, limit, account).await {
             Ok(cursor) => cursor,
             Err(StreamError::Oversized(event)) => {
                 let _ = out
@@ -1747,6 +1753,13 @@ fn spawn_forwarder(
                         continue;
                     }
                     let seq = event.seq;
+                    // A client sees its own events and the Space-wide ones;
+                    // the rest only advance the cursor so a later reconnect
+                    // neither repeats nor misses them.
+                    if !visible_to(account, &event) {
+                        cursor = seq;
+                        continue;
+                    }
                     let frame = ServerFrame::Event { event };
                     if !frame_fits(&frame) {
                         let _ = out
@@ -1762,7 +1775,7 @@ fn spawn_forwarder(
                     cursor = seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    match catch_up(&reader, &out, cursor, limit).await {
+                    match catch_up(&reader, &out, cursor, limit, account).await {
                         Ok(next) => cursor = next,
                         Err(StreamError::Oversized(event)) => {
                             let _ = out
@@ -1800,6 +1813,7 @@ async fn catch_up(
     out: &mpsc::Sender<ServerFrame>,
     cursor: neha::seq::Seq,
     limit: Option<usize>,
+    account: Id,
 ) -> Result<neha::seq::Seq, StreamError> {
     let page_size = limit.unwrap_or(256).clamp(1, 256);
     let mut cursor = cursor;
@@ -1827,13 +1841,36 @@ async fn catch_up(
             }
             return Ok(cursor);
         }
-        let complete = page.events.len();
+        let full_page = page.events.len() == page_size;
         let first = page.events[0].seq;
-        let mut events = page.events;
-        let mut next = page.next;
+        let page_next = page.next;
+        // Only the account's own events and the Space-wide ones go into a
+        // snapshot; a filtered event still counts as scanned, so the cursor
+        // never repeats it.
+        let mut events: Vec<neha::record::Event> = page
+            .events
+            .into_iter()
+            .filter(|event| visible_to(account, event))
+            .collect();
+        if events.is_empty() {
+            cursor = page_next;
+            if full_page {
+                continue;
+            }
+            if !sent {
+                out.send(ServerFrame::Snapshot {
+                    cursor,
+                    events: Vec::new(),
+                })
+                .await
+                .map_err(|_| StreamError::Closed)?;
+            }
+            return Ok(cursor);
+        }
+        let complete = events.len();
         while !events.is_empty() {
             let candidate = if events.len() == complete {
-                next
+                page_next
             } else {
                 events.last().map(|event| event.seq).unwrap_or(cursor)
             };
@@ -1842,15 +1879,21 @@ async fn catch_up(
                 events: events.clone(),
             };
             if frame_fits(&frame) {
-                next = candidate;
                 break;
             }
             events.pop();
-            next = events.last().map(|event| event.seq).unwrap_or(cursor);
         }
         if events.is_empty() {
             return Err(StreamError::Oversized(first));
         }
+        let next = events.last().map(|event| event.seq).unwrap_or(page_next);
+        // The chunk's cursor is where scanning resumes: the whole page when
+        // its events fit, otherwise the last event the chunk holds.
+        let next = if complete == events.len() {
+            page_next
+        } else {
+            next
+        };
         out.send(ServerFrame::Snapshot {
             cursor: next,
             events,
@@ -1858,13 +1901,30 @@ async fn catch_up(
         .await
         .map_err(|_| StreamError::Closed)?;
         sent = true;
-        let trimmed = next < page.next;
         // A full page or a trimmed page leaves more to read.
-        if complete < page_size && !trimmed {
+        if !full_page && next >= page_next {
             return Ok(next);
         }
         cursor = next;
     }
+}
+
+/// Returns whether one account may see an event.
+///
+/// This milestone has no Groups: an event belongs to the User who wrote it,
+/// to the User a Bot wrote it for, or to the Space itself.
+fn visible_to(account: Id, event: &neha::record::Event) -> bool {
+    if matches!(event.author, neha::record::Author::User(author) if author == account) {
+        return true;
+    }
+    if event.acting == Some(account) {
+        return true;
+    }
+
+    matches!(
+        event.kind,
+        neha::record::EventKind::UserJoined | neha::record::EventKind::ProviderAdded
+    )
 }
 
 /// An authenticated account.
@@ -1965,6 +2025,11 @@ async fn reconcile_pairings(server: &Arc<SpaceServer>) -> Result<(), ServerError
 /// receives that failure as its result. This runs after the Space owns its
 /// port and before it serves, so a start that cannot listen writes nothing.
 async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result<(), StoreError> {
+    // A run whose action waited keeps waiting when its approval is undecided;
+    // an allowed one is left for the pump to resume, and a denied one is left
+    // for the pump to fail with its own message. Anything else that was still
+    // running when the Space stopped cannot continue without redoing work, so
+    // it ends here.
     let interrupted: Vec<_> = {
         let state = state
             .lock()
@@ -1973,12 +2038,31 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
             .runs
             .values()
             .filter(|run| run.status == crate::state::RunStatus::Running)
-            .cloned()
+            .filter(|run| !state.is_resumable(run))
+            .map(|run| {
+                let after_approval = state
+                    .latest_approval(run.id)
+                    .is_some_and(|approval| approval.decided == Some(true));
+
+                (run.clone(), after_approval)
+            })
             .collect()
     };
-    for run in interrupted {
+    for (run, after_approval) in interrupted {
         let message = Id::new();
-        let text = "I was interrupted before I could answer.";
+        let (text, error) = if after_approval {
+            // The User allowed the action, but the run ended before the
+            // action could start or finish: resuming would run work twice.
+            (
+                "I could not continue after the approval.",
+                "the approval could not be resumed",
+            )
+        } else {
+            (
+                "I was interrupted before I could answer.",
+                "the Space stopped before the run finished",
+            )
+        };
         let usage = run
             .steps
             .iter()
@@ -1999,7 +2083,7 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
                     "status": crate::state::RunStatus::Failed,
                     "reply": message,
                     "usage": usage,
-                    "error": "the Space stopped before the run finished",
+                    "error": error,
                 }),
             )
             .acting(run.acting),
@@ -2014,7 +2098,7 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
                             "status": "failed",
                             "reply": message,
                             "text": text,
-                            "error": "the Space stopped before the run finished",
+                            "error": error,
                         }),
                     ),
             )
@@ -4072,11 +4156,37 @@ mod tests {
             }
         }
 
-        assert!(snapshots >= 2, "the history needs more than one page");
+        // The seeded messages belong to nobody in this Space, so the stream
+        // skips them; the admin's own events arrive in order and without gaps.
+        let recorded = running
+            .server
+            .store
+            .events_from(neha::seq::Seq::ZERO, 10_000)
+            .await
+            .unwrap()
+            .events;
+        let admin = recorded
+            .iter()
+            .find(|event| event.kind == EventKind::UserJoined)
+            .and_then(|event| match event.author {
+                Author::User(id) => Some(id),
+                Author::Bot(_) => None,
+            })
+            .expect("the admin joined");
+        let expected: Vec<i64> = recorded
+            .iter()
+            .filter(|event| {
+                matches!(event.author, Author::User(author) if author == admin)
+                    || event.acting == Some(admin)
+                    || matches!(event.kind, EventKind::UserJoined | EventKind::ProviderAdded)
+            })
+            .map(|event| event.seq.as_i64())
+            .collect();
+        assert!(snapshots >= 1, "the history streams in a snapshot");
         assert_eq!(
             seen.into_iter().collect::<Vec<_>>(),
-            (1..=last).collect::<Vec<_>>(),
-            "the stream skipped a recorded event"
+            expected,
+            "the stream skipped a visible event or showed a hidden one"
         );
         socket.close(None).await.unwrap();
         running.shutdown().await;
@@ -4117,7 +4227,7 @@ mod tests {
         let reader = store.reader();
         let (out, mut frames) = tokio::sync::mpsc::channel(8);
 
-        let result = catch_up(&reader, &out, neha::seq::Seq::ZERO, None).await;
+        let result = catch_up(&reader, &out, neha::seq::Seq::ZERO, None, user).await;
 
         assert!(matches!(result, Err(StreamError::Oversized(_))));
         assert!(matches!(
@@ -4319,6 +4429,39 @@ mod tests {
             "text": text,
             "usage": shown["usage"],
         })
+    }
+
+    /// Allows the first Local use of a run that waits in a Chat.
+    ///
+    /// A Local Computer asks before its first action for a Bot and acting
+    /// User; tests that exercise the action itself answer that ask first.
+    async fn allow_first_use(socket: &mut Socket, chat: Id) -> Id {
+        for _ in 0..500 {
+            let approvals = command(
+                socket,
+                Id::new(),
+                CommandCall::ApprovalList { chat: Some(chat) },
+            )
+            .await;
+            if let Some(first) = approvals.as_array().and_then(|list| list.first()) {
+                let approval: Id = serde_json::from_value(first["approval"].clone()).unwrap();
+                command(
+                    socket,
+                    Id::new(),
+                    CommandCall::ApprovalDecide {
+                        approval,
+                        allow: true,
+                        lasting: false,
+                    },
+                )
+                .await;
+
+                return approval;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("the run never asked for its first Local use");
     }
 
     async fn send(socket: &mut Socket, chat: Id, text: &str) -> Value {
@@ -5728,30 +5871,16 @@ mod tests {
             .await
             .unwrap();
         let last = store.last_seq().await.unwrap();
-        store.close().await.unwrap();
-
-        let running = start(home, 0).await.unwrap();
-        let invite = running.invite.clone().unwrap();
-        let (mut socket, _token) = admin(&running, &invite).await;
-        socket
-            .send(Message::Text(
-                serde_json::to_string(&ClientFrame::Subscribe {
-                    id: Id::new(),
-                    cursor: None,
-                    limit: None,
-                })
-                .unwrap()
-                .into(),
-            ))
-            .await
-            .unwrap();
+        let reader = store.reader();
+        let (out, mut frames) = tokio::sync::mpsc::channel(64);
+        // The account is the one the record's events act for; the whole
+        // record is visible to it.
+        let result = catch_up(&reader, &out, neha::seq::Seq::ZERO, None, user).await;
+        assert!(result.is_ok());
+        drop(out);
         let mut seen = std::collections::BTreeSet::new();
         let mut snapshots = 0;
-        while !seen.contains(&last.as_i64()) {
-            let frame =
-                tokio::time::timeout(std::time::Duration::from_secs(10), next_frame(&mut socket))
-                    .await
-                    .expect("the stream keeps sending");
+        while let Ok(frame) = frames.try_recv() {
             match frame {
                 ServerFrame::Snapshot { cursor, events } => {
                     snapshots += 1;
@@ -5760,26 +5889,15 @@ mod tests {
                         seen.insert(event.seq.as_i64());
                     }
                 }
-                ServerFrame::Event { event } => {
-                    seen.insert(event.seq.as_i64());
-                }
-                ServerFrame::Heartbeat { .. }
-                | ServerFrame::Accepted { .. }
-                | ServerFrame::Committed { .. }
-                | ServerFrame::Confirmed { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }
         }
-
         assert!(snapshots >= 2, "the record must be split across frames");
-        let recorded: Vec<i64> = seen
-            .iter()
-            .copied()
-            .filter(|seq| *seq <= last.as_i64())
-            .collect();
-        assert_eq!(recorded, (1..=last.as_i64()).collect::<Vec<_>>());
-        socket.close(None).await.unwrap();
-        running.shutdown().await;
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            (1..=last.as_i64()).collect::<Vec<_>>()
+        );
+        store.close().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8296,6 +8414,7 @@ mod tests {
 
         let queued = submit(&mut socket, chat, "run pwd", None).await;
         let run = run_of(&queued);
+        allow_first_use(&mut socket, chat).await;
         let (id, named, action) = match next_host_frame(&mut device).await {
             HostFrame::Action { id, bot, action } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
@@ -8355,6 +8474,7 @@ mod tests {
 
         let queued = submit(&mut socket, chat, "run pwd", None).await;
         let run = run_of(&queued);
+        allow_first_use(&mut socket, chat).await;
         let HostFrame::Action { .. } = next_host_frame(&mut device).await else {
             panic!("expected an action frame");
         };
@@ -8421,6 +8541,7 @@ mod tests {
 
         let mut device = connect_computer(&running, &machine, computer).await;
         wait_online(&mut socket, computer).await;
+        allow_first_use(&mut socket, chat).await;
         let (id, named, _action) = match next_host_frame(&mut device).await {
             HostFrame::Action { id, bot, action } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
@@ -8750,6 +8871,7 @@ mod tests {
         )
         .await;
         assert_eq!(moved["bot"]["computer"], json!(new));
+        allow_first_use(&mut socket, chat).await;
         let (id, named, action) = match next_host_frame(&mut device).await {
             HostFrame::Action { id, bot, action } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
@@ -8918,6 +9040,7 @@ mod tests {
             )
             .await;
             assert_eq!(moved["bot"]["computer"], json!(new));
+            allow_first_use(&mut socket, chat).await;
 
             let (from_old, frame) =
                 tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -9051,6 +9174,7 @@ mod tests {
         release.notify_one();
         let moved = mover_task.await.unwrap().expect("the move succeeds");
         assert_eq!(moved.1["bot"]["computer"], json!(new));
+        allow_first_use(&mut admin, chat).await;
 
         // The run still starts on the Computer it snapshot (the old one)...
         let (from_old, frame) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -9978,5 +10102,2805 @@ mod tests {
             "the child Space failed: {stdout}\n{stderr}"
         );
         assert!(stdout.contains("NO_CONFIG_UI_CHILD_OK"), "{stdout}");
+    }
+
+    // ---- Approvals and lasting rules (PR7) ----
+
+    /// A Bot on a paired local Computer whose daemon is connected.
+    struct LocalBot {
+        socket: Socket,
+        device: Socket,
+        computer: Id,
+        machine: String,
+        bot: Id,
+        chat: Id,
+        provider_task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn local_bot(running: &Running, invite: &str, script: Vec<ScriptedReply>) -> LocalBot {
+        let socket = admin_socket(running, invite).await;
+        local_bot_with(running, socket, machine_token_n(40), script).await
+    }
+
+    async fn local_bot_with(
+        running: &Running,
+        mut socket: Socket,
+        machine: String,
+        script: Vec<ScriptedReply>,
+    ) -> LocalBot {
+        let (base, provider_task) = scripted_provider(script).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let (computer, machine) = paired_computer_with_token(&mut socket, running, &machine).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let device = connect_computer(running, &machine, computer).await;
+        wait_online(&mut socket, computer).await;
+
+        LocalBot {
+            socket,
+            device,
+            computer,
+            machine,
+            bot,
+            chat,
+            provider_task,
+        }
+    }
+
+    async fn approvals_in(socket: &mut Socket, chat: Option<Id>) -> Vec<Value> {
+        match command(socket, Id::new(), CommandCall::ApprovalList { chat }).await {
+            Value::Array(list) => list,
+            other => panic!("expected approvals, got {other}"),
+        }
+    }
+
+    /// Waits for the approval of one run; the pump writes it after the reply.
+    async fn approval_for_run(socket: &mut Socket, run: Id) -> Value {
+        for _ in 0..500 {
+            let approvals = approvals_in(socket, None).await;
+            if let Some(found) = approvals.into_iter().find(|view| view["run"] == json!(run)) {
+                return found;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        panic!("run {run} never asked for an approval");
+    }
+
+    fn command_context(running: &Running) -> crate::commands::CommandContext<'_> {
+        let server = &running.server;
+
+        crate::commands::CommandContext {
+            store: &server.store,
+            state: &server.state,
+            home: &server.home,
+            secrets: &server.secrets,
+            identity: &server.identity,
+            links: &server.links,
+            pairings: &server.pairings,
+            approvals: &server.approvals,
+        }
+    }
+
+    async fn decide_approval(
+        socket: &mut Socket,
+        approval: Id,
+        allow: bool,
+        lasting: bool,
+    ) -> Value {
+        command(
+            socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval,
+                allow,
+                lasting,
+            },
+        )
+        .await
+    }
+
+    fn add_rule(
+        bot: Id,
+        effect: neha::record::RuleEffect,
+        tool: &str,
+        command_prefix: Option<&str>,
+        path_prefix: Option<&str>,
+    ) -> CommandCall {
+        CommandCall::RuleAdd {
+            bot,
+            effect,
+            tool: tool.to_owned(),
+            command_prefix: command_prefix.map(ToOwned::to_owned),
+            path_prefix: path_prefix.map(ToOwned::to_owned),
+        }
+    }
+
+    /// Answers the next action a fake Computer receives.
+    async fn answer_next_action(device: &mut Socket, output: &str) -> WireAction {
+        let (id, _bot, action) = match next_host_frame(device).await {
+            HostFrame::Action { id, bot, action } => (id, bot, action),
+            other => panic!("expected an action, got {other:?}"),
+        };
+        reply_action(device, id, ActionStatus::Succeeded, output).await;
+
+        action
+    }
+
+    /// Returns whether no approval appears for a Chat while a run works.
+    ///
+    /// Each poll finishes its command, so a poll never cancels a frame the
+    /// next command would read as its answer.
+    async fn waits_without_approval(socket: &mut Socket, chat: Id) -> bool {
+        for _ in 0..50 {
+            if !approvals_in(socket, Some(chat)).await.is_empty() {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        true
+    }
+
+    /// Returns the `action.started` events of one run.
+    async fn started_actions(running: &Running, run: Id) -> Vec<neha::record::Event> {
+        running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| {
+                event.kind == EventKind::ActionStarted && event.data["run"] == json!(run)
+            })
+            .collect()
+    }
+
+    async fn last_message(socket: &mut Socket, chat: Id) -> Value {
+        let messages = command(
+            socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+
+        messages.as_array().unwrap().last().unwrap().clone()
+    }
+
+    async fn approvals_of(socket: &mut Socket, bot: Id) -> Vec<Value> {
+        let list = command(socket, Id::new(), CommandCall::RuleList { bot: Some(bot) }).await;
+
+        list.as_array().cloned().unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_run_asks_before_its_first_action() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![tool("shell", json!({"command": "pwd"})), text("done")],
+        )
+        .await;
+        let queued = submit(&mut local.socket, local.chat, "run pwd", None).await;
+        let run = run_of(&queued);
+
+        let shown = wait_status(&mut local.socket, run, "waiting").await;
+        assert!(
+            shown["approval"].is_string(),
+            "RunShow names the approval a waiting run waits on"
+        );
+        let approvals = approvals_in(&mut local.socket, Some(local.chat)).await;
+        assert_eq!(approvals.len(), 1);
+        let approval = &approvals[0];
+        assert_eq!(approval["approval"], shown["approval"]);
+        assert_eq!(approval["run"], json!(run));
+        assert_eq!(approval["bot"], json!(local.bot));
+        assert_eq!(approval["acting"], shown["acting"]);
+        assert_eq!(approval["tool"], "shell");
+        assert_eq!(approval["reason"], "first_use_local");
+        assert!(approval["decided"].is_null());
+        assert!(approval["rule"].is_null());
+        assert!(
+            approval["summary"].as_str().unwrap().contains("pwd"),
+            "the card names the command: {}",
+            approval["summary"]
+        );
+
+        // A waiting action never reaches the Computer before the answer.
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                next_host_frame(&mut local.device)
+            )
+            .await
+            .is_err(),
+            "an action must not start before the User answers"
+        );
+
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        assert_eq!(decided["run"], json!(run));
+        let action = answer_next_action(&mut local.device, "/home/ada/.neha/workspace/scout").await;
+        assert_eq!(
+            action,
+            WireAction::Shell {
+                command: "pwd".to_owned()
+            }
+        );
+
+        let finished = wait_run(&mut local.socket, run).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(finished["approval"], Value::Null);
+        assert_eq!(started_actions(&running, run).await.len(), 1);
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "done"
+        );
+        assert!(approvals_in(&mut local.socket, None).await.is_empty());
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn allowing_the_first_local_use_keeps_later_runs_unasked() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("first done"),
+                text("second done"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "out").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let second = run_of(&submit(&mut local.socket, local.chat, "hello again", None).await);
+        let finished = wait_run(&mut local.socket, second).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert!(
+            started_actions(&running, second).await.is_empty(),
+            "a text answer runs no action"
+        );
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "second done"
+        );
+        assert!(
+            approvals_in(&mut local.socket, None).await.is_empty(),
+            "the allowed first use does not ask again"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn denying_a_local_action_fails_the_run_and_asks_again() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                tool("shell", json!({"command": "pwd"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        let decided = decide_approval(&mut local.socket, approval, false, false).await;
+        assert_eq!(decided["status"], "denied");
+
+        let finished = wait_run(&mut local.socket, first).await;
+        assert_eq!(finished["status"], "failed");
+        assert!(
+            finished["error"].as_str().unwrap().contains("denied"),
+            "the run says it was denied: {}",
+            finished["error"]
+        );
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "You denied the action, so I stopped."
+        );
+        assert!(
+            started_actions(&running, first).await.is_empty(),
+            "a denied action never starts"
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                next_host_frame(&mut local.device)
+            )
+            .await
+            .is_err(),
+            "a denied action never reaches the Computer"
+        );
+
+        // The denied first use was not allowed, so the next run asks again.
+        let second = run_of(&submit(&mut local.socket, local.chat, "run pwd again", None).await);
+        let again = wait_status(&mut local.socket, second, "waiting").await;
+        assert_eq!(again["status"], "waiting");
+        assert_eq!(
+            approval_for_run(&mut local.socket, second).await["reason"],
+            "first_use_local"
+        );
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, second).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_run_lets_the_next_run_finish_then_resumes_once() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("second done"),
+                text("first done"),
+            ],
+        )
+        .await;
+        let waiting = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval = approval_for_run(&mut local.socket, waiting).await;
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        assert_eq!(approval["reason"], "first_use_local");
+
+        // The waiting run does not hold the queue: the next run answers.
+        let later = run_of(&submit(&mut local.socket, local.chat, "hello", None).await);
+        let finished = wait_run(&mut local.socket, later).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "second done"
+        );
+        assert_eq!(
+            wait_status(&mut local.socket, waiting, "waiting").await["status"],
+            "waiting",
+            "the first run still waits after the second finished"
+        );
+
+        // Answering resumes the first run; its action runs exactly once.
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "out").await;
+        let finished = wait_run(&mut local.socket, waiting).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "first done"
+        );
+        assert_eq!(started_actions(&running, waiting).await.len(), 1);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(150),
+                next_host_frame(&mut local.device)
+            )
+            .await
+            .is_err(),
+            "a resumed action never runs twice"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_acting_user_answers_once() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![tool("shell", json!({"command": "pwd"})), text("done")],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval = approval_for_run(&mut local.socket, run).await;
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+
+        // A lasting answer cannot cover a first use.
+        let refused = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "a lasting rule cannot cover the first use of a Local Computer"
+        ));
+
+        // Only the User the Bot acts for answers.
+        let server = &running.server;
+        let context = crate::commands::CommandContext {
+            store: &server.store,
+            state: &server.state,
+            home: &server.home,
+            secrets: &server.secrets,
+            identity: &server.identity,
+            links: &server.links,
+            pairings: &server.pairings,
+            approvals: &server.approvals,
+        };
+        let stranger = crate::identity::Account {
+            id: Id::new(),
+            display_name: "Eve".to_owned(),
+            is_admin: false,
+        };
+        let error = crate::commands::execute(
+            &context,
+            &stranger,
+            Id::new(),
+            CommandCall::ApprovalList { chat: None },
+        )
+        .await
+        .unwrap();
+        assert_eq!(error.result, json!([]), "a stranger sees no approvals");
+        let error = match crate::commands::execute(
+            &context,
+            &stranger,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: false,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("only the acting User answers"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::Forbidden);
+        assert!(error.message.contains("acts for"));
+
+        // An unknown approval is not found.
+        let unknown = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: Id::new(),
+                allow: true,
+                lasting: false,
+            },
+        )
+        .await;
+        assert!(matches!(unknown, Err((ErrorCode::NotFound, _))));
+
+        // The acting User answers, once.
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "out").await;
+        assert_eq!(
+            wait_run(&mut local.socket, run).await["status"],
+            "succeeded"
+        );
+        let twice = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: false,
+                lasting: false,
+            },
+        )
+        .await;
+        assert!(matches!(twice, Err((ErrorCode::InvalidArgument, _))));
+
+        // A rule belongs to its Bot's owner...
+        let rule = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let rule_id: Id = serde_json::from_value(rule["rule"].clone()).unwrap();
+        let context = command_context(&running);
+        let not_owner = crate::commands::execute(
+            &context,
+            &stranger,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert!(matches!(not_owner, Err(error) if error.code == ErrorCode::NotFound));
+        // ...and only its maker or that owner removes it.
+        let not_maker = crate::commands::execute(
+            &context,
+            &stranger,
+            Id::new(),
+            CommandCall::RuleRemove { rule: rule_id },
+        )
+        .await;
+        assert!(matches!(not_maker, Err(error) if error.code == ErrorCode::Forbidden));
+
+        // A prefix only fits the tool kind that takes it.
+        let wrong_prefix = try_command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                Some("git"),
+                None,
+            ),
+        )
+        .await;
+        assert!(matches!(wrong_prefix, Err((ErrorCode::InvalidArgument, _))));
+        let wrong_kind = try_command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                None,
+                Some("logs"),
+            ),
+        )
+        .await;
+        assert!(matches!(wrong_kind, Err((ErrorCode::InvalidArgument, _))));
+        // A blank prefix is an error, never a silent tool-wide rule.
+        let blank_command = try_command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                Some("   "),
+                None,
+            ),
+        )
+        .await;
+        assert!(matches!(
+            blank_command,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "a command prefix needs a command"
+        ));
+        let blank_path = try_command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                Some("  "),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            blank_path,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "a path prefix needs a path"
+        ));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_clients_cannot_answer_one_approval_twice() {
+        let (_dir, running, invite) = running().await;
+        let (socket, token) = admin(&running, &invite).await;
+        let mut local = local_bot_with(
+            &running,
+            socket,
+            machine_token_n(40),
+            vec![tool("shell", json!({"command": "pwd"})), text("done")],
+        )
+        .await;
+        let mut other = open_socket(&running, &token).await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+
+        let decide = CommandCall::ApprovalDecide {
+            approval,
+            allow: true,
+            lasting: false,
+        };
+        let (first, second) = tokio::join!(
+            try_command(&mut local.socket, Id::new(), decide.clone()),
+            try_command(&mut other, Id::new(), decide),
+        );
+        let results = [first, second];
+        assert_eq!(
+            results.iter().filter(|result| result.is_ok()).count(),
+            1,
+            "exactly one answer is accepted: {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, Err((ErrorCode::InvalidArgument, _)))),
+            "the other answer is refused: {results:?}"
+        );
+
+        let decided = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| {
+                event.kind == EventKind::ApprovalDecided
+                    && event.data["approval"] == json!(approval)
+            })
+            .count();
+        assert_eq!(decided, 1, "the record holds one decision");
+
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, run).await["status"],
+            "succeeded"
+        );
+        assert_eq!(started_actions(&running, run).await.len(), 1);
+
+        other.close(None).await.unwrap();
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_specific_allow_rule_beats_a_wide_ask_rule() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf 1"})),
+                text("first"),
+                tool("shell", json!({"command": "printf 2"})),
+                text("second"),
+                tool("shell", json!({"command": "printf 3"})),
+                text("third"),
+                tool("shell", json!({"command": "rm -rf build"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A wide ask rule asks for every shell command...
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+        // ...until the User always allows one command.
+        let second = run_of(&submit(&mut local.socket, local.chat, "printf again", None).await);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        eprintln!(
+            "DEBUG second run: {}",
+            show_run(&mut local.socket, second).await
+        );
+        eprintln!(
+            "DEBUG approvals: {:?}",
+            approvals_in(&mut local.socket, None).await
+        );
+        eprintln!(
+            "DEBUG messages: {:?}",
+            command(
+                &mut local.socket,
+                Id::new(),
+                CommandCall::ChatRead {
+                    chat: local.chat,
+                    from: None
+                }
+            )
+            .await
+        );
+        eprintln!(
+            "DEBUG rules: {:?}",
+            approvals_of(&mut local.socket, local.bot).await
+        );
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(ask_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert_eq!(decided["status"], "allowed");
+        assert!(decided["rule"].is_string());
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // The derived allow rule is narrower, so it wins over the wide ask:
+        // the same command runs without asking...
+        let third = run_of(&submit(&mut local.socket, local.chat, "printf once more", None).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "a matching allow rule does not ask again"
+        );
+        answer_next_action(&mut local.device, "o").await;
+        let finished = wait_run(&mut local.socket, third).await;
+        assert_eq!(finished["status"], "succeeded");
+
+        // ...while other shell commands still ask.
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "rm build", None).await);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        eprintln!(
+            "DEBUG fourth: {}",
+            show_run(&mut local.socket, fourth).await
+        );
+        eprintln!(
+            "DEBUG approvals4: {:?}",
+            approvals_in(&mut local.socket, None).await
+        );
+        eprintln!(
+            "DEBUG messages4: {:?}",
+            command(
+                &mut local.socket,
+                Id::new(),
+                CommandCall::ChatRead {
+                    chat: local.chat,
+                    from: None
+                }
+            )
+            .await
+        );
+        let approval = approval_for_run(&mut local.socket, fourth).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(ask_id), "the wide ask rule stays");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "failed"
+        );
+
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert_eq!(rules.len(), 2, "the wide ask and the derived allow rule");
+        assert!(
+            rules.iter().any(|rule| rule["rule"] == json!(ask_id)),
+            "a wider ask rule stays for the commands it still covers"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_always_allowed_ask_rule_is_removed_with_its_decision() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf 1"})),
+                text("first"),
+                tool("shell", json!({"command": "printf 2"})),
+                text("second"),
+                tool("shell", json!({"command": "printf 3"})),
+                text("third"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                Some("printf"),
+                None,
+            ),
+        )
+        .await;
+        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+        // Always allow answers the ask with a rule as specific as it is, so
+        // the decision and the rule change land in one command.
+        let second = run_of(&submit(&mut local.socket, local.chat, "printf again", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let command_id = Id::new();
+        let (_, decided) = try_command(
+            &mut local.socket,
+            command_id,
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(decided["status"], "allowed");
+        let rule: Id = serde_json::from_value(decided["rule"].clone()).unwrap();
+        assert_eq!(decided["overridden"], json!(ask_id));
+
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let decided_in = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::ApprovalDecided
+                    && event.data["approval"] == json!(approval_id)
+            })
+            .unwrap();
+        let added_in = events
+            .iter()
+            .find(|event| event.kind == EventKind::RuleAdded && event.data["rule"] == json!(rule))
+            .unwrap();
+        let removed_in = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::RuleRemoved && event.data["rule"] == json!(ask_id)
+            })
+            .unwrap();
+        assert_eq!(
+            (decided_in.command, added_in.command, removed_in.command),
+            (Some(command_id), Some(command_id), Some(command_id)),
+            "the decision, the rule, and the removed ask share one command"
+        );
+        assert_eq!(
+            decided_in.data["rule"],
+            json!(rule),
+            "a lasting decision names the rule it derives"
+        );
+
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // The ask rule is gone and its allow replaces it.
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0]["rule"], json!(rule));
+        assert_eq!(rules[0]["effect"], "allow");
+
+        let third = run_of(&submit(&mut local.socket, local.chat, "printf once more", None).await);
+        answer_next_action(&mut local.device, "o").await;
+        let finished = wait_run(&mut local.socket, third).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert!(approvals_in(&mut local.socket, None).await.is_empty());
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_only_asks_for_its_own_tool_and_path() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("write_file", json!({"path": "/tmp/a", "content": "x"})),
+                text("first"),
+                tool("write_file", json!({"path": "/tmp/b", "content": "x"})),
+                text("second"),
+                tool("write_file", json!({"path": "/etc/passwd", "content": "x"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A path rule only asks under its prefix.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "write_file",
+                None,
+                Some("/etc"),
+            ),
+        )
+        .await;
+
+        let second = run_of(&submit(&mut local.socket, local.chat, "write tmp", None).await);
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        assert!(approvals_in(&mut local.socket, None).await.is_empty());
+
+        let third = run_of(&submit(&mut local.socket, local.chat, "write etc", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["tool"], "write_file");
+
+        // A rule on another tool does not ask for this one.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, third).await["status"], "failed");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ask_rule_wins_a_specificity_tie_with_an_allow_rule() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf 1"})),
+                text("first"),
+                tool("shell", json!({"command": "printf 2"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // Same tool and same prefix: the cautious reading wins.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Allow,
+                "shell",
+                Some("printf"),
+                None,
+            ),
+        )
+        .await;
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                Some("printf"),
+                None,
+            ),
+        )
+        .await;
+        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+        let second = run_of(&submit(&mut local.socket, local.chat, "printf again", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(ask_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_keeps_a_waiting_run_and_resumes_it_after_an_allow() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_home(dir.path());
+        let first = start(root.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("after restart"),
+            ],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+        local.device.close(None).await.unwrap();
+        local.socket.close(None).await.unwrap();
+        first.shutdown().await;
+        assert!(
+            !record(root.root()).await.iter().any(
+                |event| event.kind == EventKind::RunFinished && event.data["run"] == json!(run)
+            ),
+            "a waiting run does not end when the Space stops"
+        );
+
+        let second = start(root.clone(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        assert_eq!(
+            wait_status(&mut socket, run, "waiting").await["status"],
+            "waiting",
+            "an undecided approval keeps its run waiting after a restart"
+        );
+        let approvals = approvals_in(&mut socket, Some(local.chat)).await;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["approval"], json!(approval));
+
+        let mut device = connect_computer(&second, &local.machine, local.computer).await;
+        wait_online(&mut socket, local.computer).await;
+        let decided = decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        answer_next_action(&mut device, "o").await;
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(
+            last_message(&mut socket, local.chat).await["text"],
+            "after restart"
+        );
+        assert_eq!(
+            started_actions(&second, run).await.len(),
+            1,
+            "the action resumed once, not again"
+        );
+
+        device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+        local.provider_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_keeps_an_allowed_first_use_and_a_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_home(dir.path());
+        let first = start(root.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("first"),
+                tool("shell", json!({"command": "pwd"})),
+                text("second"),
+            ],
+        )
+        .await;
+        let first_run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first_run).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first_run).await["status"],
+            "succeeded"
+        );
+        let rule = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let rule_id: Id = serde_json::from_value(rule["rule"].clone()).unwrap();
+
+        local.device.close(None).await.unwrap();
+        local.socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        let second = start(root.clone(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        let rules = approvals_of(&mut socket, local.bot).await;
+        assert_eq!(rules.len(), 1, "a lasting rule replays");
+        assert_eq!(rules[0]["rule"], json!(rule_id));
+
+        let mut device = connect_computer(&second, &local.machine, local.computer).await;
+        wait_online(&mut socket, local.computer).await;
+        let second_run = run_of(&submit(&mut socket, local.chat, "run pwd again", None).await);
+        assert!(
+            waits_without_approval(&mut socket, local.chat).await,
+            "the allowed first use replays, so the same Bot and User do not ask again"
+        );
+        answer_next_action(&mut device, "o").await;
+        let finished = wait_run(&mut socket, second_run).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(
+            last_message(&mut socket, local.chat).await["text"],
+            "second"
+        );
+
+        device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+        local.provider_task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_allowed_run_waits_for_its_offline_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![tool("shell", json!({"command": "pwd"})), text("done")],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+
+        local.device.close(None).await.unwrap();
+        for _ in 0..500 {
+            let listed = command(&mut local.socket, Id::new(), CommandCall::ComputerList).await;
+            if listed.as_array().is_some_and(|views| {
+                views.iter().any(|view| {
+                    view["id"] == json!(local.computer) && view["online"] == json!(false)
+                })
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        decide_approval(&mut local.socket, approval, true, false).await;
+        let shown = wait_status(&mut local.socket, run, "running").await;
+        assert_eq!(shown["status"], "running");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let shown = show_run(&mut local.socket, run).await;
+        assert_eq!(
+            shown["status"], "running",
+            "an allowed run holds while its Computer is away"
+        );
+        assert!(shown["error"].is_null());
+
+        // The Computer comes back and the run continues where it waited.
+        let mut device = connect_computer(&running, &local.machine, local.computer).await;
+        wait_online(&mut local.socket, local.computer).await;
+        answer_next_action(&mut device, "o").await;
+        let finished = wait_run(&mut local.socket, run).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(started_actions(&running, run).await.len(), 1);
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "done"
+        );
+
+        device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_fails_a_denied_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_home(dir.path());
+        let first = start(root.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![tool("shell", json!({"command": "pwd"}))],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        let second = start(root.clone(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        assert_eq!(
+            wait_status(&mut socket, run, "waiting").await["status"],
+            "waiting"
+        );
+        let decided = decide_approval(&mut socket, approval, false, false).await;
+        assert_eq!(decided["status"], "denied");
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "failed");
+        assert!(
+            finished["error"].as_str().unwrap().contains("denied"),
+            "the denied run fails after the restart: {}",
+            finished["error"]
+        );
+        assert_eq!(
+            last_message(&mut socket, local.chat).await["text"],
+            "You denied the action, so I stopped."
+        );
+
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_allowed_run_on_an_offline_computer_does_not_hold_another() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("shell", json!({"command": "pwd"})),
+            text("done on b"),
+            text("done on b again"),
+            text("done on a"),
+        ])
+        .await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let (a, a_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(41)).await;
+        let (b, b_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(42)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(a))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let mut a_device = connect_computer(&running, &a_machine, a).await;
+        let _b_device = connect_computer(&running, &b_machine, b).await;
+        wait_online(&mut socket, a).await;
+        wait_online(&mut socket, b).await;
+
+        let waiting = run_of(&submit(&mut socket, chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut socket, waiting).await["approval"].clone(),
+        )
+        .unwrap();
+
+        // A leaves; the Bot moves to B. The waiting run keeps the Computer it
+        // began on.
+        a_device.close(None).await.unwrap();
+        for _ in 0..500 {
+            let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+            if listed.as_array().is_some_and(|views| {
+                views
+                    .iter()
+                    .any(|view| view["id"] == json!(a) && view["online"] == json!(false))
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove { bot, computer: b },
+        )
+        .await;
+
+        // B's queued work is not held by the allowed run whose Computer is
+        // away.
+        let later = run_of(&submit(&mut socket, chat, "hello", None).await);
+        assert_eq!(wait_run(&mut socket, later).await["status"], "succeeded");
+
+        // Allowing the old run does not hold B either.
+        let decided = decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        let after = run_of(&submit(&mut socket, chat, "hello again", None).await);
+        assert_eq!(wait_run(&mut socket, after).await["status"], "succeeded");
+        let shown = show_run(&mut socket, waiting).await;
+        assert_eq!(shown["status"], "running");
+        assert!(
+            shown["error"].is_null(),
+            "the allowed run just waits: {shown}"
+        );
+
+        // A reconnects: the run resumes on the Computer it began on.
+        let mut a_device = connect_computer(&running, &a_machine, a).await;
+        wait_online(&mut socket, a).await;
+        let action = answer_next_action(&mut a_device, "out").await;
+        assert_eq!(
+            action,
+            WireAction::Shell {
+                command: "pwd".to_owned()
+            }
+        );
+        let finished = wait_run(&mut socket, waiting).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(started_actions(&running, waiting).await.len(), 1);
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done on a");
+
+        a_device.close(None).await.unwrap();
+        provider_task.abort();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_always_allow_covers_the_ask_rule_it_answered() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "git status"})),
+                text("first"),
+                tool("shell", json!({"command": "git status"})),
+                text("second"),
+                tool("shell", json!({"command": "git status"})),
+                text("third"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // The ask is narrower than the derived allow, so answering it always
+        // removes it: `git` covers `git status`.
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                Some("git status"),
+                None,
+            ),
+        )
+        .await;
+        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+        let second = run_of(&submit(&mut local.socket, local.chat, "git status", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(ask_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert_eq!(decided["status"], "allowed");
+        assert_eq!(decided["overridden"], json!(ask_id));
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert_eq!(rules.len(), 1, "the answered ask rule is gone");
+        assert_eq!(rules[0]["effect"], "allow");
+        assert_eq!(rules[0]["command_prefix"], "git");
+
+        let third = run_of(&submit(&mut local.socket, local.chat, "git status", None).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "the derived `git` allow covers the same command"
+        );
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_always_allow_of_a_bare_relative_file_covers_relative_paths() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("write_file", json!({"path": "notes.txt", "content": "one"})),
+                text("first"),
+                tool("write_file", json!({"path": "notes.txt", "content": "two"})),
+                text("second"),
+                tool(
+                    "write_file",
+                    json!({"path": "other.txt", "content": "three"}),
+                ),
+                text("third"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/abs.txt", "content": "four"}),
+                ),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "write one", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A tool-wide ask keeps asking, and a bare relative file always-allows
+        // the workspace root: `.`.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "write_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let second = run_of(&submit(&mut local.socket, local.chat, "write two", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert!(decided["rule"].is_string());
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert_eq!(rules.len(), 2, "the wider ask rule stays");
+        let derived = rules.iter().find(|rule| rule["effect"] == "allow").unwrap();
+        assert_eq!(derived["path_prefix"], ".");
+
+        // A relative path does not ask...
+        let third = run_of(&submit(&mut local.socket, local.chat, "write three", None).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "`.` covers relative paths"
+        );
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+
+        // ...an absolute one still does.
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "write four", None).await);
+        let approval = approval_for_run(&mut local.socket, fourth).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["tool"], "write_file");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "failed"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    // ---- Event visibility, machine-scoped first use, and the approval fence ----
+
+    /// Subscribes and returns the snapshot's cursor and events.
+    async fn snapshot_events(socket: &mut Socket) -> (Seq, Vec<neha::record::Event>) {
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            match next_frame(socket).await {
+                ServerFrame::Snapshot { cursor, events } => return (cursor, events),
+                ServerFrame::Heartbeat { .. } => {}
+                other => panic!("expected a snapshot, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_denied_approval_cannot_last() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "true"})),
+                text("first"),
+                tool("shell", json!({"command": "printf hi"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let second = run_of(&submit(&mut local.socket, local.chat, "run it", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, second).await["approval"].clone(),
+        )
+        .unwrap();
+        let refused = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval,
+                allow: false,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            refused,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "a lasting answer can only be an allow"
+        ));
+        decide_approval(&mut local.socket, approval, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscription_shows_only_the_accounts_own_events() {
+        let (_dir, running, invite) = running().await;
+        let (mut a_socket, _a_token) = admin(&running, &invite).await;
+        let (base, provider_task) =
+            scripted_provider(vec![text("a done"), text("b done"), text("a again")]).await;
+        command(&mut a_socket, Id::new(), provider_add(base)).await;
+        let a_created = command(&mut a_socket, Id::new(), add_bot("Scout", None)).await;
+        let a_bot: Id = serde_json::from_value(a_created["bot"]["id"].clone()).unwrap();
+        let chat_a: Id = serde_json::from_value(a_created["chat"]["id"].clone()).unwrap();
+        assert_eq!(
+            send(&mut a_socket, chat_a, "a hello").await["status"],
+            "succeeded"
+        );
+
+        // A second account signs in through the test-only account path.
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let b_token = sign_in(&running, "Grace").await;
+        let mut b_socket = open_socket(&running, &b_token).await;
+        let b_created = command(&mut b_socket, Id::new(), add_bot("Reader", None)).await;
+        let _b_bot: Id = serde_json::from_value(b_created["bot"]["id"].clone()).unwrap();
+        let chat_b: Id = serde_json::from_value(b_created["chat"]["id"].clone()).unwrap();
+        assert_eq!(
+            send(&mut b_socket, chat_b, "b hello").await["status"],
+            "succeeded"
+        );
+
+        let (_a_cursor, a_events) = snapshot_events(&mut a_socket).await;
+        let (b_cursor, b_events) = snapshot_events(&mut b_socket).await;
+
+        // Every account sees the Space-wide events.
+        for events in [&a_events, &b_events] {
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == EventKind::UserJoined),
+                "the joined User is Space-wide"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event.kind == EventKind::ProviderAdded),
+                "the Provider is Space-wide"
+            );
+        }
+        // A sees its own Chat and not B's; B mirrors.
+        assert!(
+            a_events
+                .iter()
+                .any(|event| event.kind == EventKind::MessageAdded
+                    && event.data["chat"] == json!(chat_a))
+        );
+        assert!(
+            a_events
+                .iter()
+                .all(|event| event.data["chat"] != json!(chat_b)),
+            "a Client must not read another account's Chat"
+        );
+        assert!(
+            b_events
+                .iter()
+                .any(|event| event.kind == EventKind::MessageAdded
+                    && event.data["chat"] == json!(chat_b))
+        );
+        assert!(
+            b_events
+                .iter()
+                .all(|event| event.data["chat"] != json!(chat_a)),
+            "another account's Chat leaked into the snapshot"
+        );
+        // The run's own records (reply and steps) stay with their account.
+        assert!(
+            b_events
+                .iter()
+                .all(|event| event.data.get("bot") != Some(&json!(a_bot))),
+            "a Bot leaked into another account's snapshot"
+        );
+        snapshot_cursor_covers(&running, b_cursor).await;
+
+        // A live event is filtered the same way as a snapshot.
+        let _ = submit(&mut a_socket, chat_a, "a again", None).await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(400),
+                next_frame(&mut b_socket)
+            )
+            .await
+            .is_err(),
+            "a live event of another account must not arrive"
+        );
+
+        // The first account keeps receiving its own live events.
+        loop {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(5), next_frame(&mut a_socket))
+                    .await
+                    .expect("the first account keeps its stream");
+            if let ServerFrame::Event { event } = frame
+                && event.kind == EventKind::MessageAdded
+                && event.data["chat"] == json!(chat_a)
+                && event.data["text"] == "a again"
+            {
+                break;
+            }
+        }
+
+        b_socket.close(None).await.unwrap();
+        a_socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    /// Asserts a filtered snapshot's cursor covers the whole record.
+    async fn snapshot_cursor_covers(running: &Running, cursor: Seq) {
+        let last = running.server.store.last_seq().await.unwrap();
+        assert!(
+            cursor >= last,
+            "a filtered cursor must still pass every event: {cursor} < {last}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_use_counts_per_local_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("shell", json!({"command": "pwd"})),
+            text("on a"),
+            tool("shell", json!({"command": "pwd"})),
+            text("on b"),
+        ])
+        .await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let (a, a_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(43)).await;
+        let (b, b_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(44)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(a))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let mut a_device = connect_computer(&running, &a_machine, a).await;
+        let mut b_device = connect_computer(&running, &b_machine, b).await;
+        wait_online(&mut socket, a).await;
+        wait_online(&mut socket, b).await;
+
+        let first = run_of(&submit(&mut socket, chat, "run pwd", None).await);
+        let first_approval = approval_for_run(&mut socket, first).await;
+        assert_eq!(first_approval["reason"], "first_use_local");
+        assert_eq!(first_approval["computer"], json!(a));
+        let approval: Id = serde_json::from_value(first_approval["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        answer_next_action(&mut a_device, "o").await;
+        assert_eq!(wait_run(&mut socket, first).await["status"], "succeeded");
+
+        // The Bot moves to another machine: its first use there asks again.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove { bot, computer: b },
+        )
+        .await;
+        let second = run_of(&submit(&mut socket, chat, "run pwd again", None).await);
+        let second_approval = approval_for_run(&mut socket, second).await;
+        assert_eq!(
+            second_approval["reason"], "first_use_local",
+            "a move to another Local Computer starts a new first use"
+        );
+        assert_eq!(second_approval["computer"], json!(b));
+        let approval: Id = serde_json::from_value(second_approval["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        answer_next_action(&mut b_device, "o").await;
+        assert_eq!(wait_run(&mut socket, second).await["status"], "succeeded");
+
+        a_device.close(None).await.unwrap();
+        b_device.close(None).await.unwrap();
+        provider_task.abort();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_approval_card_escapes_control_characters_and_keeps_long_commands() {
+        let (_dir, running, invite) = running().await;
+        let long: String = "x".repeat(5000);
+        let evil = format!("printf \u{1b}[31mred\u{1b}[0m\nsecond line {long}");
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf hi"})),
+                text("first"),
+                tool("shell", json!({"command": evil})),
+                tool("read_file", json!({"path": "logs/a.txt"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let second = run_of(&submit(&mut local.socket, local.chat, "run it", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        let summary = approval["summary"].as_str().unwrap();
+        assert!(!summary.contains('\u{1b}'), "a card escapes ESC: {summary}");
+        assert!(
+            !summary.contains('\n'),
+            "a card escapes a newline: {summary}"
+        );
+        assert!(
+            summary.contains("\\u{001b}") && summary.contains("\\n"),
+            "the escapes stay readable: {summary}"
+        );
+        assert!(
+            summary.contains("bytes omitted"),
+            "a long summary says what it left out: {summary}"
+        );
+        assert_eq!(approval["undoable"], "no");
+        assert_eq!(
+            approval["lasting_scope"],
+            "shell commands starting with \"printf\""
+        );
+        assert_eq!(
+            approval["arguments"]["command"], evil,
+            "the card's summary never replaces the recorded arguments"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                Some("logs"),
+            ),
+        )
+        .await;
+        let third = run_of(&submit(&mut local.socket, local.chat, "read it", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["lasting_scope"], "files under \"logs\"");
+        assert_eq!(approval["undoable"], "unknown");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, third).await["status"], "failed");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ambiguous_command_or_path_is_never_covered_by_a_rule() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "true"})),
+                text("one"),
+                tool("shell", json!({"command": "echo hi; rm x"})),
+                tool("read_file", json!({"path": " logs/../secret"})),
+                tool("shell", json!({"command": "echo hi; rm x"})),
+                text("two"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                Some("rm"),
+                None,
+            ),
+        )
+        .await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                Some("."),
+            ),
+        )
+        .await;
+
+        // An ask rule for `rm` cannot be bypassed with a second command.
+        let second = run_of(&submit(&mut local.socket, local.chat, "run it", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["tool"], "shell");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        // A path with `..` is never judged by a relative prefix rule.
+        let third = run_of(&submit(&mut local.socket, local.chat, "read it", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["tool"], "read_file");
+        assert!(
+            approval["summary"]
+                .as_str()
+                .unwrap()
+                .contains("logs/../secret"),
+            "the card shows the executed path, without the leading blank"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let lasting = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(lasting, Err((ErrorCode::InvalidArgument, _))),
+            "a path that leaves the Workspace cannot make a lasting rule"
+        );
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, third).await["status"], "failed");
+
+        // Without a rule for the tool, a combined command keeps its default.
+        let created = command(
+            &mut local.socket,
+            Id::new(),
+            add_bot("Second", Some(local.computer)),
+        )
+        .await;
+        let second_bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let second_chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let fourth = run_of(&submit(&mut local.socket, second_chat, "run it", None).await);
+        let approval = approval_for_run(&mut local.socket, fourth).await;
+        assert_eq!(
+            approval["reason"], "first_use_local",
+            "the only ask is the first use, not a rule"
+        );
+        assert_eq!(approval["bot"], json!(second_bot));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        let action = answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            action,
+            WireAction::Shell {
+                command: "echo hi; rm x".to_owned()
+            }
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    /// Answers the channel frame a File delivery makes: reads the machine.
+    async fn answer_file_read(device: &mut Socket) -> String {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use neha_computer::channel::DeviceFrame;
+
+        match next_host_frame(device).await {
+            HostFrame::Read { id, path, .. } => {
+                device
+                    .send(Message::Text(
+                        serde_json::to_string(&DeviceFrame::Bytes {
+                            id,
+                            bytes: URL_SAFE_NO_PAD.encode(b"hello"),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+
+                path
+            }
+            HostFrame::Write { id, path, .. } => {
+                device
+                    .send(Message::Text(
+                        serde_json::to_string(&DeviceFrame::Bytes {
+                            id,
+                            bytes: String::new(),
+                        })
+                        .unwrap()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+
+                path
+            }
+            HostFrame::Action { id, .. } => {
+                reply_action(device, id, ActionStatus::Succeeded, "o").await;
+                "action".to_owned()
+            }
+            HostFrame::Ping => String::new(),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_delivery_asks_before_it_leaves_the_machine() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "put_file",
+                    json!({"path": "report.txt", "name": "answer.txt"}),
+                ),
+                text("delivered"),
+                tool(
+                    "put_file",
+                    json!({"path": "report.txt", "name": "answer.txt"}),
+                ),
+                text("again"),
+                tool(
+                    "put_file",
+                    json!({"path": "./logs/report.txt", "name": "logs.txt"}),
+                ),
+                text("third"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "deliver it", None).await);
+        let approval = approval_for_run(&mut local.socket, first).await;
+        assert_eq!(
+            approval["reason"], "first_use_local",
+            "a File delivery runs through the same first-use fence"
+        );
+        assert_eq!(approval["tool"], "put_file");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        assert_eq!(answer_file_read(&mut local.device).await, "report.txt");
+        let finished = wait_run(&mut local.socket, first).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert_eq!(started_actions(&running, first).await.len(), 1);
+        let messages = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ChatRead {
+                chat: local.chat,
+                from: None,
+            },
+        )
+        .await;
+        assert!(
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["file"].is_string()),
+            "the File reached the Chat"
+        );
+
+        // An ask rule on the file path intercepts the next delivery too.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "put_file",
+                None,
+                Some("."),
+            ),
+        )
+        .await;
+        let second = run_of(&submit(&mut local.socket, local.chat, "deliver again", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["tool"], "put_file");
+        assert_eq!(
+            approval["lasting_scope"], "files in the Workspace root",
+            "the always-allow scope is readable"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        assert_eq!(answer_file_read(&mut local.device).await, "report.txt");
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            started_actions(&running, second).await.len(),
+            1,
+            "a resumed File delivery runs once"
+        );
+
+        // A path rule is compared after the same normalization `./logs/x`.
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "put_file",
+                None,
+                Some("logs"),
+            ),
+        )
+        .await;
+        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+        let third = run_of(&submit(&mut local.socket, local.chat, "deliver logs", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(ask_id));
+        assert_eq!(
+            approval["lasting_scope"], "files under \"logs\"",
+            "the always-allow scope names the normalized directory"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        assert_eq!(
+            answer_file_read(&mut local.device).await,
+            "./logs/report.txt",
+            "the daemon's own spelling still reaches the machine"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        assert_eq!(started_actions(&running, third).await.len(), 1);
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_path_rule_normalizes_relative_spellings() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": "./logs/a.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": "logs//b.txt"})),
+                tool("read_file", json!({"path": "logs/./c.txt"})),
+                tool("read_file", json!({"path": "  ./logs/d.txt  "})),
+                tool("read_file", json!({"path": "./a.txt"})),
+                text("two"),
+                tool("read_file", json!({"path": "/a.txt"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "read", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                Some("logs"),
+            ),
+        )
+        .await;
+        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+        // `logs//x`, `logs/./x`, and outer whitespace all name `logs`.
+        for text in ["read double", "read dot", "read padded"] {
+            let run = run_of(&submit(&mut local.socket, local.chat, text, None).await);
+            let approval = approval_for_run(&mut local.socket, run).await;
+            assert_eq!(approval["reason"], "rule", "{text}");
+            assert_eq!(approval["rule"], json!(ask_id), "{text}");
+            assert_eq!(approval["ambiguous"], false, "{text}");
+            let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+            decide_approval(&mut local.socket, approval_id, false, false).await;
+            assert_eq!(wait_run(&mut local.socket, run).await["status"], "failed");
+        }
+
+        // `.` is the Workspace root: it covers a relative spelling...
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Allow,
+                "read_file",
+                None,
+                Some("."),
+            ),
+        )
+        .await;
+        let relative = run_of(&submit(&mut local.socket, local.chat, "read root", None).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "the Workspace root rule covers ./a.txt"
+        );
+        let action = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            answer_next_action(&mut local.device, "o"),
+        )
+        .await
+        .expect("the root rule lets the action run");
+        assert_eq!(
+            action,
+            WireAction::ReadFile {
+                path: "./a.txt".to_owned()
+            }
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, relative).await["status"],
+            "succeeded"
+        );
+
+        // ...and still asks when the path is absolute.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                Some("/"),
+            ),
+        )
+        .await;
+        let absolute = run_of(&submit(&mut local.socket, local.chat, "read abs", None).await);
+        let shown = wait_status(&mut local.socket, absolute, "waiting").await;
+        assert_eq!(
+            shown["status"], "waiting",
+            "an absolute path is not the root"
+        );
+        let approval = approval_for_run(&mut local.socket, absolute).await;
+        assert_eq!(approval["reason"], "rule");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(
+            wait_run(&mut local.socket, absolute).await["status"],
+            "failed"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ambiguous_approval_never_deletes_a_rule() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "true"})),
+                text("one"),
+                tool("shell", json!({"command": "echo hi; rm x"})),
+                text("two"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // Only an Allow rule exists, and a combined command is ambiguous: the
+        // card asks, but no rule actually asked.
+        let allow = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Allow,
+                "shell",
+                Some("rm"),
+                None,
+            ),
+        )
+        .await;
+        let allow_id: Id = serde_json::from_value(allow["rule"].clone()).unwrap();
+        let second = run_of(&submit(&mut local.socket, local.chat, "run it", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["ambiguous"], true);
+        assert_eq!(approval["rule"], Value::Null, "no rule actually asked");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert_eq!(decided["status"], "allowed");
+        assert!(decided["rule"].is_string(), "Always allow derives an allow");
+        assert!(decided["overridden"].is_null(), "no trigger Ask to remove");
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(started_actions(&running, second).await.len(), 1);
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert!(
+            rules.iter().any(|rule| rule["rule"] == json!(allow_id)),
+            "the user's Allow rule survives an ambiguous answer"
+        );
+        assert_eq!(rules.len(), 2, "the original Allow and the derived allow");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_directory_names_that_differ_by_a_space_stay_apart() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": "logs /report.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": "logs /other.txt"})),
+                text("two"),
+                tool("read_file", json!({"path": "logs/other.txt"})),
+                tool("read_file", json!({"path": "logs/report2.txt"})),
+                text("three"),
+                tool("read_file", json!({"path": "logs /more.txt"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let wide = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let wide_id: Id = serde_json::from_value(wide["rule"].clone()).unwrap();
+
+        // Always allowing the directory whose name ends in a space keeps that
+        // exact space in the derived rule.
+        let second = run_of(&submit(&mut local.socket, local.chat, "logs space", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["rule"], json!(wide_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        let spaced_rule: Id = serde_json::from_value(decided["rule"].clone()).unwrap();
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        let spaced = rules
+            .iter()
+            .find(|rule| rule["rule"] == json!(spaced_rule))
+            .expect("the derived rule");
+        assert_eq!(spaced["path_prefix"], "logs ");
+        assert_eq!(
+            approval["lasting_scope"], "files under \"logs \"",
+            "the card shows the exact directory"
+        );
+
+        // The `logs ` allow does not cover the `logs` directory.
+        let third = run_of(&submit(&mut local.socket, local.chat, "logs plain", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(wide_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, third).await["status"], "failed");
+
+        // Allow the plain `logs` directory as well, then the `logs ` allow
+        // must not cover it either.
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::RuleRemove { rule: spaced_rule },
+        )
+        .await;
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "logs again", None).await);
+        let approval = approval_for_run(&mut local.socket, fourth).await;
+        assert_eq!(approval["rule"], json!(wide_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let _decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "succeeded"
+        );
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert!(
+            rules.iter().any(|rule| rule["path_prefix"] == "logs"),
+            "the plain logs allow was derived: {rules:?}"
+        );
+
+        let fifth = run_of(&submit(&mut local.socket, local.chat, "logs space again", None).await);
+        let approval = approval_for_run(&mut local.socket, fifth).await;
+        assert_eq!(
+            approval["rule"],
+            json!(wide_id),
+            "the `logs` allow does not cover the `logs ` directory"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, fifth).await["status"], "failed");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_all_space_path_is_not_the_workspace_root() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": "a.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": "   "})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // The Workspace root allow must not cover a name made of spaces.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Allow,
+                "read_file",
+                None,
+                Some("."),
+            ),
+        )
+        .await;
+        let second = run_of(&submit(&mut local.socket, local.chat, "space name", None).await);
+        let shown = wait_status(&mut local.socket, second, "waiting").await;
+        assert_eq!(shown["status"], "waiting", "the path is not the root");
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["ambiguous"], true);
+        assert_eq!(approval["rule"], Value::Null);
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+
+        // Such a path cannot make a lasting rule either.
+        let lasting = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            lasting,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "the action path cannot make a lasting rule"
+        ));
+        let decided = decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(decided["status"], "denied");
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert_eq!(rules.len(), 1, "no derived rule for an all-space path");
+        assert_eq!(rules[0]["effect"], "allow");
+        assert_eq!(rules[0]["path_prefix"], ".");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leading_space_action_derives_the_executed_directory() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": " logs/report.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": " logs/other.txt"})),
+                text("two"),
+                tool("read_file", json!({"path": "logs/report2.txt"})),
+                text("three"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        assert_eq!(
+            answer_next_action(&mut local.device, "o").await,
+            WireAction::ReadFile {
+                path: " logs/report.txt".to_owned()
+            },
+            "the daemon's action keeps the model's spelling"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let wide = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let wide_id: Id = serde_json::from_value(wide["rule"].clone()).unwrap();
+        let second = run_of(&submit(&mut local.socket, local.chat, "logs rest", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["rule"], json!(wide_id));
+        assert_eq!(
+            approval["summary"], "read_file: logs/other.txt",
+            "the card shows the path the daemon will read"
+        );
+        assert_eq!(
+            approval["lasting_scope"], "files under \"logs\"",
+            "the derived directory is where the action runs"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert!(decided["rule"].is_string());
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // The derived `logs` rule covers the next action that runs in `logs`,
+        // with or without a leading blank.
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert!(
+            rules.iter().any(|rule| rule["path_prefix"] == "logs"),
+            "the derived rule names the executed directory: {rules:?}"
+        );
+        let third = run_of(&submit(&mut local.socket, local.chat, "logs again", None).await);
+        let action = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            answer_next_action(&mut local.device, "o"),
+        )
+        .await
+        .expect("the derived logs rule lets the action run");
+        assert_eq!(
+            action,
+            WireAction::ReadFile {
+                path: "logs/report2.txt".to_owned()
+            }
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        assert_eq!(started_actions(&running, third).await.len(), 1);
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 }

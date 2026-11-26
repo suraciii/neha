@@ -24,10 +24,24 @@ A Card has a kind. Neha provides four kinds, and a Plugin can add more.
 
 | Kind | What it holds | What the user does with it |
 | --- | --- | --- |
-| Approval | An action and its details | Allows or denies |
+| Approval | An action and its details | Allows, always allows, or denies |
 | Question | A question and its options | Answers |
 | Page | A document or report | Opens it |
 | Dashboard | Live figures | Reads them |
+
+An Approval card names one action of one run. It shows the action's tool, a summary, why the Bot asks, and whether the action can be undone: `shell` or `write_file` is not undoable, and every other action is unknown.
+
+An ambiguous form gives the reason `a form no rule can judge`, not a rule the User set.
+
+The summary escapes control characters and says how many bytes it leaves out when it is longer than 4096 bytes.
+
+When a rule asks and the action can make a lasting rule, the card shows what Always allow covers: the shell prefix, the file directory, the Workspace root, or the whole tool.
+
+It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
+
+A rule-triggered approval also offers no Always allow when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path.
+
+An ambiguous form still offers Always allow when the action can make a lasting rule, and that answer removes no rule.
 
 ## Files
 

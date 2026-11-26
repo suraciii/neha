@@ -182,6 +182,8 @@ Ask the new Bot to work:
 target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 ```
 
+The first action on this Local Computer asks for approval. At the card, type `a` to allow it once; [Approvals](approvals.md) covers the other answers.
+
 The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a Local Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
 
 ## Send a file
@@ -214,7 +216,7 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 ## What this milestone does not do
 
 - The Hosted Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
-- A Bot has no approval gate yet. It runs an action as soon as the Model asks for it.
-- One human joins a Space. Group Chats, Boards, approvals, notifications, and search arrive in later milestones.
-- The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, approvals, search, or notifications.
+- A Hosted Computer runs without the approval gate yet, and an unattended run's approval does not expire yet. [Approvals](approvals.md) covers the gate on a Local Computer.
+- One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
+- The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, search, or notifications.
 - The browser client does not stream a reply. It shows a working state until the Run finishes.

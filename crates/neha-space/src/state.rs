@@ -3,11 +3,13 @@
 //! A Space rebuilds this state by replaying its record. Commands append
 //! events, then apply the same events to keep the projection current.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use neha::id::Id;
-use neha::record::{ActionStatus, Author, Event, EventData};
+use neha::record::{
+    ActionStatus, ApprovalReason, Author, Event, EventData, RuleEffect, RunReply, Undoability,
+};
 use neha::seq::Seq;
 use neha::time::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -183,10 +185,84 @@ pub struct RunView {
     pub usage: Option<Usage>,
     /// The failure, when it failed.
     pub error: Option<String>,
+    /// The approval the run waits on, while it is undecided.
+    pub approval: Option<Id>,
+    /// The Computer the run started on, from the projection's replay.
+    ///
+    /// A move after the start does not change it: the run keeps the Computer
+    /// it began on. It is not part of the wire view.
+    #[serde(skip)]
+    pub computer: Option<Id>,
     /// The completed steps, in order.
     pub steps: Vec<StepView>,
     /// The actions, in order.
     pub actions: Vec<ActionView>,
+}
+
+/// An action a run waits to run until its acting User answers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalView {
+    /// The approval.
+    pub approval: Id,
+    /// The run that waits.
+    pub run: Id,
+    /// The Bot.
+    pub bot: Id,
+    /// The Computer the run works on.
+    pub computer: Id,
+    /// The Chat.
+    pub chat: Id,
+    /// The User the Bot acts for; they answer.
+    pub acting: Id,
+    /// The action that waits.
+    pub action: Id,
+    /// The call's position among the step's calls, from zero.
+    pub index: u32,
+    /// The step.
+    pub step: u32,
+    /// The tool-call identifier.
+    pub call: String,
+    /// The tool's name.
+    pub tool: String,
+    /// The arguments the action runs with.
+    pub arguments: serde_json::Value,
+    /// A short text a User reads.
+    pub summary: String,
+    /// Why the run asks.
+    pub reason: ApprovalReason,
+    /// Whether a command form defeated the rules and forced the ask.
+    pub ambiguous: bool,
+    /// The rule that asked, when a rule did.
+    pub rule: Option<Id>,
+    /// What an "Always allow" would allow, in words the User reads.
+    pub lasting_scope: Option<String>,
+    /// Whether the action can still be undone after it runs.
+    pub undoable: Undoability,
+    /// The answer, once the acting User gave one.
+    pub decided: Option<bool>,
+    /// The cursor of `approval.requested`.
+    pub seq: Seq,
+}
+
+/// A lasting rule a User gave a Bot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuleView {
+    /// The rule.
+    pub rule: Id,
+    /// The Bot it constrains.
+    pub bot: Id,
+    /// The User who made it.
+    pub user: Id,
+    /// Whether matching actions ask or run without asking.
+    pub effect: RuleEffect,
+    /// The tool name.
+    pub tool: String,
+    /// The shell command prefix a matching shell action starts with.
+    pub command_prefix: Option<String>,
+    /// The path prefix a matching file action's path starts with.
+    pub path_prefix: Option<String>,
+    /// The cursor of `rule.added`.
+    pub seq: Seq,
 }
 
 /// The Space's record, projected into memory.
@@ -212,6 +288,15 @@ pub struct State {
     pub files: Vec<FileView>,
     /// The runs, by identifier.
     pub runs: HashMap<Id, RunView>,
+    /// The approvals in the order the record asked them.
+    pub approvals: Vec<ApprovalView>,
+    /// The lasting rules in the order the record added them.
+    pub rules: Vec<RuleView>,
+    /// The (Bot, acting User, Computer) triples whose first Local use a User
+    /// allowed. A Bot moved to another machine asks again there.
+    pub first_use_allowed: HashSet<(Id, Id, Id)>,
+    /// The Model's replies per run, in the order the record holds them.
+    pub replies: HashMap<Id, Vec<RunReply>>,
 }
 
 impl State {
@@ -225,6 +310,88 @@ impl State {
     #[must_use]
     pub fn owned_bot(&self, bot: Id, owner: Id) -> Option<&BotView> {
         self.bots.get(&bot).filter(|bot| bot.owner == owner)
+    }
+
+    /// Returns whether a Bot's first Local use for a User on one Computer was
+    /// allowed.
+    #[must_use]
+    pub fn first_use_allowed(&self, bot: Id, acting: Id, computer: Id) -> bool {
+        self.first_use_allowed.contains(&(bot, acting, computer))
+    }
+
+    /// Returns an approval by identifier.
+    #[must_use]
+    pub fn approval(&self, approval: Id) -> Option<&ApprovalView> {
+        self.approvals.iter().find(|view| view.approval == approval)
+    }
+
+    /// Returns the approvals the User may answer, oldest first.
+    #[must_use]
+    pub fn approvals_for(&self, acting: Id, chat: Option<Id>) -> Vec<&ApprovalView> {
+        self.approvals
+            .iter()
+            .filter(|view| view.acting == acting && view.decided.is_none())
+            .filter(|view| chat.is_none_or(|chat| view.chat == chat))
+            .collect()
+    }
+
+    /// Returns the rules of one Bot.
+    #[must_use]
+    pub fn rules_of(&self, bot: Id) -> Vec<&RuleView> {
+        self.rules.iter().filter(|rule| rule.bot == bot).collect()
+    }
+
+    /// Returns the replies the record holds for one run.
+    #[must_use]
+    pub fn run_replies(&self, run: Id) -> &[RunReply] {
+        self.replies.get(&run).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the latest approval of one run.
+    #[must_use]
+    pub fn latest_approval(&self, run: Id) -> Option<&ApprovalView> {
+        self.approvals
+            .iter()
+            .filter(|view| view.run == run)
+            .max_by_key(|view| view.seq)
+    }
+
+    /// Returns whether a run may resume: its approval was allowed and the
+    /// approved action has not started.
+    #[must_use]
+    pub fn is_resumable(&self, run: &RunView) -> bool {
+        run.status == RunStatus::Running
+            && self.latest_approval(run.id).is_some_and(|approval| {
+                approval.decided == Some(true)
+                    && !run
+                        .actions
+                        .iter()
+                        .any(|action| action.id == approval.action)
+            })
+    }
+
+    /// Returns a run of one Bot whose approved action has not started yet.
+    ///
+    /// Such a run is ready to resume; see [`State::is_resumable`].
+    #[must_use]
+    pub fn resumable_run(&self, bot: Id) -> Option<&RunView> {
+        self.runs
+            .values()
+            .filter(|run| run.bot == bot && self.is_resumable(run))
+            .min_by_key(|run| run.seq)
+    }
+
+    /// Returns a run of one Bot that waits on a denied approval.
+    #[must_use]
+    pub fn denied_run(&self, bot: Id) -> Option<&RunView> {
+        self.runs
+            .values()
+            .filter(|run| run.bot == bot && run.status == RunStatus::Waiting)
+            .filter(|run| {
+                self.latest_approval(run.id)
+                    .is_some_and(|approval| approval.decided == Some(false))
+            })
+            .min_by_key(|run| run.seq)
     }
 
     /// Returns a File in a Chat the User owns.
@@ -269,7 +436,9 @@ impl State {
             .collect()
     }
 
-    /// Returns the runs of a Bot that wait or work, in the record's order.
+    /// Returns the runs of a Bot that wait in its queue or work, in the
+    /// record's order. A run waiting for an approval is not active: it does
+    /// not hold the queue.
     #[must_use]
     pub fn active_runs(&self, bot: Id) -> Vec<&RunView> {
         let mut runs: Vec<&RunView> = self
@@ -471,6 +640,8 @@ impl Projection for State {
                         reply: None,
                         usage: None,
                         error: None,
+                        approval: None,
+                        computer: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
                     },
@@ -478,8 +649,12 @@ impl Projection for State {
             }
             EventData::RunStarted(data) => {
                 let acting = event.acting.ok_or("a run names the User it acts for")?;
+                let computer = self.bots.get(&data.bot).map(|bot| bot.computer);
                 match self.runs.entry(data.run) {
-                    Entry::Occupied(mut run) => run.get_mut().status = RunStatus::Running,
+                    Entry::Occupied(mut run) => {
+                        run.get_mut().status = RunStatus::Running;
+                        run.get_mut().computer = computer;
+                    }
                     // A record this version wrote before it queued runs holds only
                     // the start event; it still creates the run it started.
                     Entry::Vacant(run) => {
@@ -495,6 +670,8 @@ impl Projection for State {
                             reply: None,
                             usage: None,
                             error: None,
+                            approval: None,
+                            computer,
                             steps: Vec::new(),
                             actions: Vec::new(),
                         });
@@ -510,6 +687,7 @@ impl Projection for State {
                 run.reply = data.reply;
                 run.usage = data.usage;
                 run.error = data.error;
+                run.approval = None;
             }
             EventData::RunStep(data) => {
                 let run = self
@@ -555,6 +733,152 @@ impl Projection for State {
                 action.omitted_bytes = data.omitted_bytes;
                 action.error = data.error;
             }
+            EventData::RunReply(data) => {
+                if !self.runs.contains_key(&data.run) {
+                    return Err("a reply must belong to a started run".to_owned());
+                }
+                self.replies.entry(data.run).or_default().push(data);
+            }
+            EventData::ApprovalRequested(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("an approval must belong to a started run")?;
+                if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                    return Err("an approval must belong to a working run".to_owned());
+                }
+                if data.bot != run.bot
+                    || data.chat != run.chat
+                    || data.acting != run.acting
+                    || run.computer != Some(data.computer)
+                {
+                    return Err(
+                        "an approval must name its run's Bot, Chat, Computer, and User".to_owned(),
+                    );
+                }
+                if data.ambiguous && data.reason != ApprovalReason::Rule {
+                    return Err("only a rule ask can be ambiguous".to_owned());
+                }
+                if data.ambiguous && data.rule.is_some() {
+                    return Err("an ambiguous approval names no rule".to_owned());
+                }
+                if self
+                    .approvals
+                    .iter()
+                    .any(|view| view.approval == data.approval)
+                {
+                    return Err("an approval is recorded once".to_owned());
+                }
+                run.status = RunStatus::Waiting;
+                run.approval = Some(data.approval);
+                self.approvals.push(ApprovalView {
+                    approval: data.approval,
+                    run: data.run,
+                    bot: data.bot,
+                    computer: data.computer,
+                    chat: data.chat,
+                    acting: data.acting,
+                    action: data.action,
+                    index: data.index,
+                    step: data.step,
+                    call: data.call,
+                    tool: data.tool,
+                    arguments: data.arguments,
+                    summary: data.summary,
+                    reason: data.reason,
+                    ambiguous: data.ambiguous,
+                    rule: data.rule,
+                    lasting_scope: data.lasting_scope,
+                    undoable: data.undoable,
+                    decided: None,
+                    seq: event.seq,
+                });
+            }
+            EventData::ApprovalDecided(data) => {
+                let position = self
+                    .approvals
+                    .iter()
+                    .position(|view| view.approval == data.approval)
+                    .ok_or("a decided approval must have been requested")?;
+                if self.approvals[position].decided.is_some() {
+                    return Err("an approval is decided once".to_owned());
+                }
+                if self.approvals[position].run != data.run {
+                    return Err("a decided approval must name its run".to_owned());
+                }
+                if self.approvals[position].acting != data.user
+                    || event.acting != Some(data.user)
+                    || !matches!(event.author, Author::User(author) if author == data.user)
+                {
+                    return Err("an approval is answered by its acting User".to_owned());
+                }
+                let (allow, reason, bot, acting, computer) = {
+                    let approval = &mut self.approvals[position];
+                    approval.decided = Some(data.allow);
+
+                    (
+                        data.allow,
+                        approval.reason,
+                        approval.bot,
+                        approval.acting,
+                        approval.computer,
+                    )
+                };
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a decided approval must belong to a started run")?;
+                if run.approval == Some(data.approval) {
+                    run.approval = None;
+                }
+                if allow {
+                    run.status = RunStatus::Running;
+                    if reason == ApprovalReason::FirstUseLocal {
+                        self.first_use_allowed.insert((bot, acting, computer));
+                    }
+                }
+            }
+            EventData::RuleAdded(data) => {
+                if !self.bots.contains_key(&data.bot) {
+                    return Err("a rule must belong to an existing Bot".to_owned());
+                }
+                if event.acting != Some(data.user)
+                    || !matches!(event.author, Author::User(author) if author == data.user)
+                {
+                    return Err("a rule is made by its User".to_owned());
+                }
+                if self.rules.iter().any(|rule| rule.rule == data.rule) {
+                    return Err("a rule is recorded once".to_owned());
+                }
+                self.rules.push(RuleView {
+                    rule: data.rule,
+                    bot: data.bot,
+                    user: data.user,
+                    effect: data.effect,
+                    tool: data.tool,
+                    command_prefix: data.command_prefix,
+                    path_prefix: data.path_prefix,
+                    seq: event.seq,
+                });
+            }
+            EventData::RuleRemoved(data) => {
+                if event.acting != Some(data.user)
+                    || !matches!(event.author, Author::User(author) if author == data.user)
+                {
+                    return Err("a rule is removed by the User who removed it".to_owned());
+                }
+                let position = self
+                    .rules
+                    .iter()
+                    .position(|rule| rule.rule == data.rule)
+                    .ok_or("a removed rule must exist")?;
+                // `user` names the remover, not the maker: a Bot's owner may
+                // remove a rule another User made.
+                if self.rules[position].bot != data.bot {
+                    return Err("a removed rule must name its Bot".to_owned());
+                }
+                self.rules.remove(position);
+            }
         }
 
         Ok(())
@@ -588,6 +912,25 @@ mod tests {
         }
     }
 
+    fn acted_event(
+        kind: EventKind,
+        author: Author,
+        acting: Id,
+        data: serde_json::Value,
+        seq: i64,
+    ) -> Event {
+        Event {
+            seq: Seq::from_i64(seq).unwrap(),
+            kind,
+            version: KIND_VERSION,
+            at: Timestamp::from_microseconds(0).unwrap(),
+            author,
+            acting: Some(acting),
+            command: Some(Id::new()),
+            data,
+        }
+    }
+
     fn chat_created(chat: Id, owner: Id) -> serde_json::Value {
         serde_json::json!({"chat": chat, "owner": owner, "bot": Id::new()})
     }
@@ -605,6 +948,275 @@ mod tests {
 
     fn message_added(chat: Id, text: &str, file: Option<Id>) -> serde_json::Value {
         serde_json::json!({"message": Id::new(), "chat": chat, "text": text, "file": file})
+    }
+
+    #[test]
+    fn an_approval_must_name_its_runs_bot_and_chat() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let run = Id::new();
+        let mut state = State::default();
+        let created = |kind, data, seq| event(kind, Author::User(owner), data, seq);
+        state
+            .apply(&created(
+                EventKind::ComputerCreated,
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::BotCreated,
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::ChatCreated,
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+        let bot_author = Author::Bot(bot);
+        let run_data = serde_json::json!({
+            "run": run,
+            "chat": chat,
+            "bot": bot,
+            "command": Id::new(),
+            "message": Id::new(),
+        });
+        state
+            .apply(&acted_event(
+                EventKind::RunQueued,
+                bot_author,
+                owner,
+                run_data.clone(),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::RunStarted,
+                bot_author,
+                owner,
+                run_data,
+                5,
+            ))
+            .unwrap();
+        let approval = Id::new();
+        let action = Id::new();
+        let requested = |named_bot: Id, named_chat: Id| {
+            serde_json::json!({
+                "approval": approval,
+                "run": run,
+                "bot": named_bot,
+                "computer": computer,
+                "chat": named_chat,
+                "acting": owner,
+                "action": action,
+                "index": 0,
+                "step": 1,
+                "call": "call-1",
+                "tool": "shell",
+                "arguments": {"command": "true"},
+                "summary": "shell: true",
+                "reason": "rule",
+                "rule": null,
+                "lasting_scope": null,
+                "undoable": "no",
+            })
+        };
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    requested(Id::new(), chat),
+                    6,
+                ))
+                .is_err(),
+            "an approval for another Bot is refused"
+        );
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    requested(bot, Id::new()),
+                    6,
+                ))
+                .is_err(),
+            "an approval for another Chat is refused"
+        );
+        state
+            .apply(&event(
+                EventKind::ApprovalRequested,
+                bot_author,
+                requested(bot, chat),
+                6,
+            ))
+            .unwrap();
+
+        // The acting User answers; nobody else.
+        let decided = serde_json::json!({
+            "approval": approval,
+            "run": run,
+            "allow": true,
+            "lasting": false,
+            "user": Id::new(),
+        });
+        let other = Id::new();
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::ApprovalDecided,
+                    Author::User(other),
+                    other,
+                    decided,
+                    7,
+                ))
+                .is_err(),
+            "only the acting User decides"
+        );
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::RuleAdded,
+                    Author::User(owner),
+                    owner,
+                    serde_json::json!({
+                        "rule": Id::new(),
+                        "bot": Id::new(),
+                        "user": owner,
+                        "effect": "ask",
+                        "tool": "shell",
+                    }),
+                    8,
+                ))
+                .is_err(),
+            "a rule needs an existing Bot"
+        );
+
+        // An ambiguous approval is a guard, not a rule hit.
+        let mut confused = requested(bot, chat);
+        confused["approval"] = serde_json::json!(Id::new());
+        confused["ambiguous"] = serde_json::json!(true);
+        confused["rule"] = serde_json::json!(Id::new());
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    confused,
+                    9,
+                ))
+                .is_err(),
+            "an ambiguous approval names no rule"
+        );
+
+        // First use never carries the ambiguity flag.
+        let mut first_use = requested(bot, chat);
+        first_use["approval"] = serde_json::json!(Id::new());
+        first_use["reason"] = serde_json::json!("first_use_local");
+        first_use["ambiguous"] = serde_json::json!(true);
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    first_use,
+                    10,
+                ))
+                .is_err(),
+            "a first use is not an ambiguous rule ask"
+        );
+    }
+
+    #[test]
+    fn a_rule_can_be_removed_by_its_bots_owner() {
+        let owner = Id::new();
+        let maker = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let rule = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::BotCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                Author::User(owner),
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+        // Another User made the rule; the Bot's owner removes it. The removal
+        // names the remover, so it need not equal the maker.
+        state
+            .apply(&acted_event(
+                EventKind::RuleAdded,
+                Author::User(maker),
+                maker,
+                serde_json::json!({
+                    "rule": rule,
+                    "bot": bot,
+                    "user": maker,
+                    "effect": "ask",
+                    "tool": "shell",
+                }),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::RuleRemoved,
+                Author::User(owner),
+                owner,
+                serde_json::json!({"rule": rule, "bot": bot, "user": owner}),
+                5,
+            ))
+            .unwrap();
+        assert!(state.rules.iter().all(|view| view.rule != rule));
     }
 
     #[test]

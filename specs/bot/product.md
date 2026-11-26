@@ -90,9 +90,19 @@ A Bot asks for information, a decision, or an approval in the Chat or Group wher
 
 A Bot does what it was asked without asking. It asks before an action that goes beyond the request, an action the User said to ask about, an action the Computer's owner requires asking for, and an action that its tool asks about by default.
 
-The User it acts for answers with Allow or Deny. In a Chat, the User can make an Allow last for that kind of action by saying so, and the Bot keeps it as a lasting rule.
+It also asks before the first action it runs on a Local Computer, once for each Bot, acting User, and Local Computer, and before an action a lasting Ask rule names.
+
+Only the User the Bot acts for answers the approval. An Allow runs the action once, and an Always allow also covers later actions of that kind.
+
+An Always allow covers the same tool and either a shell command that starts with the approved command's first word or a file path from the approved action's directory, including files below it. For a tool with no command or path, such as `take_file`, it covers every action of that tool.
+
+A file at the Workspace root makes the covered directory the Workspace root, so relative paths in the Workspace are covered and absolute ones are not. The first use of a Local Computer offers no Always allow, and no lasting rule covers it.
+
+An Ask rule makes the Bot ask before a kind of action, and an Allow rule lets it proceed without asking. Which rule wins, which forms a rule cannot judge, and what an Always allow writes follow [design](design.md#approvals).
 
 While a Bot waits for an answer, its other work goes on.
+
+A Deny ends the run, and the Bot says that it stopped.
 
 A request from a run the User started has no time limit. By default, a request from a run no User is with expires after 30 minutes; the Space can change that period.
 
@@ -144,4 +154,9 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 
 ## Gaps
 
+- A Question, an unattended approval's expiry, a Group approval, and cancelling an approval are not yet available.
+- The built-in approval triggers other than the first use of a Local Computer are not yet available.
+- A Hosted Computer does not ask before an action yet.
+- The Bot's page does not show approvals yet.
+- An independent reviewer of approvals is not yet specified.
 - A template shared across Spaces is not yet specified.

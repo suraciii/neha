@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorCode;
 use crate::id::Id;
-use crate::record::{Author, Event};
+use crate::record::{Author, Event, RuleEffect};
 use crate::seq::Seq;
 use crate::time::Timestamp;
 
@@ -104,6 +104,47 @@ pub enum CommandCall {
     RunShow {
         /// The run.
         run: Id,
+    },
+    /// Lists the approvals the caller can answer.
+    ApprovalList {
+        /// Only this Chat's approvals, when named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chat: Option<Id>,
+    },
+    /// Answers an approval.
+    ApprovalDecide {
+        /// The approval.
+        approval: Id,
+        /// Whether the action may run.
+        allow: bool,
+        /// Whether the answer also makes a lasting rule.
+        lasting: bool,
+    },
+    /// Lists lasting rules the caller made or can manage.
+    RuleList {
+        /// Only this Bot's rules, when named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bot: Option<Id>,
+    },
+    /// Adds a lasting rule.
+    RuleAdd {
+        /// The Bot it constrains.
+        bot: Id,
+        /// Whether matching actions ask or run without asking.
+        effect: RuleEffect,
+        /// The tool name.
+        tool: String,
+        /// The shell command prefix a matching shell action starts with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command_prefix: Option<String>,
+        /// The path prefix a matching file action's path starts with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path_prefix: Option<String>,
+    },
+    /// Removes a lasting rule.
+    RuleRemove {
+        /// The rule.
+        rule: Id,
     },
 }
 
@@ -459,6 +500,56 @@ mod tests {
 
         assert!(text.contains("\"type\":\"event\""));
         assert!(text.contains("\"kind\":\"neha.message.added\""));
+    }
+    #[test]
+    fn approval_commands_round_trip() {
+        let list = CommandCall::ApprovalList { chat: None };
+        let text = serde_json::to_string(&list).unwrap();
+        assert_eq!(text, "{\"name\":\"approval_list\",\"args\":{}}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), list);
+
+        let chat = Id::new();
+        let list = CommandCall::ApprovalList { chat: Some(chat) };
+        let text = serde_json::to_string(&list).unwrap();
+        assert!(text.contains(&format!("\"chat\":\"{chat}\"")), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), list);
+
+        let approval = Id::new();
+        let decide = CommandCall::ApprovalDecide {
+            approval,
+            allow: true,
+            lasting: false,
+        };
+        let text = serde_json::to_string(&decide).unwrap();
+        assert!(text.contains("\"name\":\"approval_decide\""), "{text}");
+        assert!(text.contains("\"allow\":true"), "{text}");
+        assert!(text.contains("\"lasting\":false"), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), decide);
+    }
+
+    #[test]
+    fn rule_commands_round_trip() {
+        let list = CommandCall::RuleList { bot: None };
+        let text = serde_json::to_string(&list).unwrap();
+        assert_eq!(text, "{\"name\":\"rule_list\",\"args\":{}}");
+
+        let add = CommandCall::RuleAdd {
+            bot: Id::new(),
+            effect: crate::record::RuleEffect::Ask,
+            tool: "shell".to_owned(),
+            command_prefix: Some("git".to_owned()),
+            path_prefix: None,
+        };
+        let text = serde_json::to_string(&add).unwrap();
+        assert!(text.contains("\"name\":\"rule_add\""), "{text}");
+        assert!(text.contains("\"effect\":\"ask\""), "{text}");
+        assert!(!text.contains("path_prefix"), "an absent prefix is omitted");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), add);
+
+        let remove = CommandCall::RuleRemove { rule: Id::new() };
+        let text = serde_json::to_string(&remove).unwrap();
+        assert!(text.contains("\"name\":\"rule_remove\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), remove);
     }
 }
 

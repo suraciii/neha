@@ -1,160 +1,17 @@
-import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import App from "./App";
 import { api, ApiError } from "./lib/api";
-import type { SubscriptionHandlers } from "./lib/ws";
 import { MAX_FILE_BYTES } from "./lib/files";
-import { setLocale } from "./i18n";
-import type { Account, Chat, FileSummary, Message, RunView } from "./types";
-
-// A Space that answers every command from memory and records what it was asked.
-const { space, FakeCommands } = vi.hoisted(() => {
-  const account = { id: "u1", display_name: "Ada", is_admin: true };
-  const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
-  const computer = { id: "p1", owner: "u1", kind: "local", online: true, workspace: "/w" };
-  const chat = { id: "h1", owner: "u1", bot: "b1" };
-  const otherChat = { id: "h2", owner: "u1", bot: "b1" };
-  // A send can be held open, so a test can act while the Space has not
-  // accepted the Message yet.
-  let sendGate: Promise<void> | null = null;
-  let openSend: (() => void) | null = null;
-  const space = {
-    account,
-    bot,
-    computer,
-    chat,
-    otherChat,
-    asked: [] as string[],
-    sent: [] as unknown[],
-    files: [] as FileSummary[],
-    messages: [] as Message[],
-    otherMessages: [] as Message[],
-    chats: [chat] as Chat[],
-    chatDelay: null as null | ((chatId: string) => Promise<void>),
-    handlers: null as SubscriptionHandlers | null,
-    // What the record says about each Run. A Run this map omits has succeeded.
-    runs: {} as Record<string, { status: RunView["status"]; position?: number }>,
-    runShows: [] as string[],
-    // A run_show answer can be held open, so a test can act while it is in flight.
-    runHolds: {} as Record<string, { gate: Promise<void>; release: () => void; fail: () => void } | undefined>,
-    // Sends that settled in the fake Space.
-    sendsDone: 0,
-    // Runs the Space accepted, in order.
-    sends: 0,
-    // The seq of the last event the client read.
-    seq: 100,
-    holdSends() {
-      sendGate = new Promise<void>((resolve) => {
-        openSend = resolve;
-      });
-    },
-    releaseSends() {
-      openSend?.();
-      openSend = null;
-      sendGate = null;
-    },
-    holdRunShow(run: string) {
-      let release!: () => void;
-      let fail!: () => void;
-      const gate = new Promise<void>((resolve, reject) => {
-        release = resolve;
-        fail = () => reject(new Error("the run_show answer was lost"));
-      });
-      space.runHolds[run] = { gate, release, fail };
-    },
-  };
-  class FakeCommands {
-    async subscribe(handlers: SubscriptionHandlers): Promise<void> {
-      space.handlers = handlers;
-    }
-
-    async close(): Promise<void> {
-      space.handlers = null;
-    }
-
-    async command<T>(name: string, args?: unknown): Promise<T> {
-      space.asked.push(name);
-      switch (name) {
-        case "provider_list":
-          return [{ id: "v1", protocol: "chat_completions", base_url: "http://provider" }] as T;
-        case "model_list":
-          return [] as T;
-        case "bot_list":
-          return [space.bot] as T;
-        case "chat_list":
-          return [...space.chats] as T;
-        case "chat_read": {
-          const asked = args as { chat: string };
-          await space.chatDelay?.(asked.chat);
-          return (asked.chat === space.chat.id ? [...space.messages] : [...space.otherMessages]) as T;
-        }
-        case "file_list":
-          return [...space.files] as T;
-        case "bot_show":
-          return { bot: space.bot, computer: space.computer, chat: space.chat } as T;
-        case "message_send": {
-          if (sendGate) await sendGate;
-          try {
-            const sent = args as { chat: string; text: string; file?: string };
-            space.sent.push(sent);
-            space.sends += 1;
-            const run = `r${space.sends}`;
-            // The place sits behind every Run its Bot has not finished.
-            const active = Object.values(space.runs).filter(
-              (known) => known.status === "queued" || known.status === "running",
-            ).length;
-            const position = active + 1;
-            space.messages.push({
-              id: `m${space.messages.length + 1}`,
-              chat: sent.chat,
-              author: { kind: "user", id: "u1" },
-              acting: null,
-              text: sent.text,
-              at: "2026-01-01T00:00:00.000Z",
-              seq: "3",
-              run,
-              file: sent.file ?? null,
-            });
-            space.runs[run] = { status: "queued", position };
-            return { run, status: "queued", position } as T;
-          } finally {
-            space.sendsDone += 1;
-          }
-        }
-        case "run_show": {
-          const requested = (args as { run: string }).run;
-          space.runShows.push(requested);
-          const hold = space.runHolds[requested];
-          if (hold) await hold.gate;
-          const known = space.runs[requested] ?? { status: "succeeded" };
-          return {
-            id: requested,
-            chat: space.chat.id,
-            bot: space.bot.id,
-            acting: "u1",
-            command: "c1",
-            message: "m1",
-            status: known.status,
-            seq: "4",
-            position: known.position,
-            reply: null,
-            error: null,
-            usage: null,
-          } as T;
-        }
-        default:
-          throw new Error(`the fake Space cannot answer ${name}`);
-      }
-    }
-  }
-  return { space, FakeCommands };
-});
+import { space } from "./test/fakeSpace";
+import { drain, element, openChat, record, renderApp, useView } from "./test/view";
+import type { FileSummary, Message } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/ws")>()),
-  Commands: FakeCommands,
+  Commands: (await import("./test/fakeSpace")).FakeCommands,
 }));
 
 const notes: FileSummary = {
@@ -168,26 +25,6 @@ const notes: FileSummary = {
   at: "2026-01-01T00:00:00.000Z",
   seq: "2",
 };
-
-function element<T extends Element>(view: ReturnType<typeof render>, selector: string): T {
-  const found = view.container.querySelector<T>(selector);
-  if (!found) throw new Error(`no ${selector} in the view`);
-  return found;
-}
-
-function renderApp() {
-  vi.spyOn(api, "me").mockResolvedValue(space.account as Account);
-  return render(() => <App />);
-}
-
-async function openChat() {
-  const view = renderApp();
-  await waitFor(() => expect(view.container.querySelector("form.composer")).toBeTruthy());
-  await waitFor(() => expect(space.asked).toContain("bot_show"));
-  await waitFor(() => expect(space.handlers).not.toBeNull());
-  flush();
-  return view;
-}
 
 function attach(view: ReturnType<typeof render>, file: File) {
   fireEvent.change(element<HTMLInputElement>(view, 'input[type="file"]'), {
@@ -210,20 +47,6 @@ function type(view: ReturnType<typeof render>, text: string) {
 
 function submit(view: ReturnType<typeof render>) {
   fireEvent.submit(element(view, "form.composer"));
-}
-
-// One event the page follows from the record.
-function record(kind: string, data: Record<string, unknown>) {
-  space.seq += 1;
-  space.handlers?.onEvent?.({
-    seq: String(space.seq),
-    kind,
-    version: 1,
-    at: "2026-01-01T00:00:00.000Z",
-    author: { kind: "bot", id: "b1" },
-    acting: "u1",
-    data,
-  });
 }
 
 // The record starts a queued Run.
@@ -282,47 +105,7 @@ async function openWaitingChat(view: ReturnType<typeof render>) {
   await waitFor(() => expect(queueText(view)).toBe("Waiting behind 2 requests"));
 }
 
-// Lets the microtask chains a settled answer starts run before a test reads the view.
-async function drain() {
-  for (let turn = 0; turn < 4; turn += 1) await Promise.resolve();
-}
-
-beforeAll(() => {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    value: (query: string) => ({
-      matches: false,
-      media: query,
-      addEventListener: () => undefined,
-      removeEventListener: () => undefined,
-    }),
-  });
-});
-
-beforeEach(() => {
-  space.releaseSends();
-  space.computer.kind = "local";
-  space.asked = [];
-  space.sent = [];
-  space.files = [];
-  space.messages = [];
-  space.otherMessages = [];
-  space.chats = [space.chat];
-  space.chatDelay = null;
-  space.handlers = null;
-  space.runs = {};
-  space.runShows = [];
-  space.runHolds = {};
-  space.sendsDone = 0;
-  space.sends = 0;
-  space.seq = 100;
-});
-
-afterEach(() => {
-  cleanup();
-  vi.restoreAllMocks();
-  flush(() => setLocale("en-US"));
-});
+useView();
 
 describe("App with Files", () => {
   it("shows a File the Bot delivered with its name, size, and download", async () => {

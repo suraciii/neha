@@ -93,6 +93,8 @@ Ask the Bot to work and check where the work ran:
 target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 ```
 
+The first action on this Local Computer asks for approval in the Chat: the Bot waits until you Allow or Deny, and the first use has no Always allow. Each Local Computer asks once for each Bot and User, so a Bot moved to another Local Computer asks again there. [Approvals](approvals.md) covers the card and the commands.
+
 ## The Bot's Workspace and the write fence
 
 The Workspace root is `~/.neha/workspaces` by default; `--workspace` on `computer pair` chooses another root. The root holds one folder for each Bot, named by the Bot's id:
@@ -109,7 +111,7 @@ The file tools read with the rights of the machine's user. A file read follows a
 
 The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token. The directory is `~/.config/neha` by default.
 
-The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
+The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. Both tools go through the approval gate like other actions. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
 
 A shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace is writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
 
@@ -155,6 +157,7 @@ The machine ends the command it was running when the channel drops, so no action
 | A `computer list` workspace is empty | A Local Computer's workspace is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none. `neha computer run` prints the real root. |
 | An older record uses `real` or `managed` | An old `real` Computer reads as Local and an old `managed` one as Hosted. No action is needed. |
 | `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.config/neha` by default, and a Workspace inside it is refused. Pair again with `--workspace` outside that directory. |
+| `chat send` stops with a run waiting for approval | Answer the card in a terminal, or use `neha approval allow <approval-id>` from the ids it printed. [Approvals](approvals.md) covers it. |
 | The ticket is not valid | A ticket lasts one pairing and one Space start. Restart the Space, then run `neha computer pair` again; a signed-in CLI can also ask for a ticket when no ticket file is present. |
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory. A Bot cannot read that directory. |
 | A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
@@ -172,7 +175,8 @@ The machine ends the command it was running when the channel drops, so no action
 - A request cannot choose a working directory. Every run starts in the Bot's Workspace.
 - Moving a Bot to or from a Hosted Computer is not available, and carrying its Workspace is not specified.
 - A Hosted Computer runs inside the Space's process; a provider-backed Hosted machine is not available.
-- There is no approval gate. A Bot runs an action as soon as the Model asks for it.
+- A Hosted Computer does not ask before an action yet; [Approvals](approvals.md) covers the gate for a Local Computer.
+- An approval of a run no User is with does not expire yet, and a Question, a Group approval, and an independent reviewer are not available.
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.
 - Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.

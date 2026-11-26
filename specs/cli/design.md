@@ -25,7 +25,7 @@ A Local Computer is reached through the CLI: the binary that runs `neha computer
 
 The daemon holds no record and runs the actions the Space sends with the machine's rights. [Computer](../computer/design.md#the-channel) covers the connection it makes and what crosses it.
 
-The `neha computer add`, `neha computer list`, `neha bot create --computer`, and `neha bot move` commands are part of the command surface.
+The `neha computer add`, `neha computer list`, `neha bot create --computer`, and `neha bot move` commands are part of the command surface, and so are `neha approval` and `neha rule`.
 
 ## Commands and events
 

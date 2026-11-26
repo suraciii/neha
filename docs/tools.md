@@ -13,7 +13,7 @@ A Bot has six tools. Four of them work in the workspace:
 | `write_file` | Writes a file in the workspace. |
 | `list_files` | Lists a directory in the workspace. |
 
-The other two, `take_file` and `put_file`, move Files in and out of the workspace. [Send and receive Files](files.md) shows them.
+The other two, `take_file` and `put_file`, move Files in and out of the workspace. [Send and receive Files](files.md) shows them. On a Local Computer, every tool action goes through the approval gate; [Approvals](approvals.md) covers when it asks.
 
 The loop offers these tools to the Model. When the Model asks for a tool, the Space records the action, runs it on the Bot's Computer, records the result, and gives the result back to the Model. The Bot can take several steps this way before it answers in the Chat.
 
@@ -77,5 +77,5 @@ The local runtime enforces these limits, and an action that breaks one returns a
 ## What the milestone does not do
 
 - The Computer is not isolated. The runtime executes real commands in a workspace directory with the Space user's permissions; it is a development and local-use implementation. Do not run a Space exposed to other machines or with prompts you do not trust.
-- There is no approval gate yet. A Bot runs an action as soon as the Model asks for it. The approval rules in [Bot](../specs/bot/product.md) arrive with their own milestone.
+- An unattended approval does not expire yet, and a Hosted Computer does not ask before an action. [Approvals](approvals.md) covers the gate that works on a Local Computer.
 - A Local Computer runs the same tools in the Bot's Workspace on that machine. The file tools check write paths, and the shell runs in a sandbox that allows persistent writes only there; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers the range and [offline behavior](computer.md#while-the-machine-is-offline).

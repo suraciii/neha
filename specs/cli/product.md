@@ -40,6 +40,20 @@ It finds the startup ticket the Space wrote under the machine's Neha configurati
 
 Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
 
+## Approvals
+
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. `neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
+
+`neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
+
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, `list_files`, or `put_file`, can name a path prefix.
+
+At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, when the card offers it, for a rule, what Always allow covers.
+
+An ambiguous form gives the reason `a form no rule can judge`, not a rule the User set. When the action cannot make a lasting rule, the card shows no Always allow and no scope.
+
+It offers Allow, Always allow, Deny, or leaving it waiting; without a terminal it prints the run and approval ids and exits, for `neha approval allow` to answer.
+
 ## Gaps
 
 - The command surface is not yet specified; it follows the topics as their product contracts settle.

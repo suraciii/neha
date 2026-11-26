@@ -856,7 +856,7 @@ fn pair_computer_to(
 struct LocalComputer {
     daemon: ComputerDaemon,
     /// The Space the Computer is paired to; dropping it stops the Space.
-    _server: SpaceProcess,
+    server: Option<SpaceProcess>,
     home: PathBuf,
     credential: PathBuf,
     machine: MachineEnv,
@@ -879,6 +879,205 @@ impl LocalComputer {
     fn path(&self) -> &Path {
         self.directory.path()
     }
+
+    /// Stops the Space and starts it again on the same address, without
+    /// waiting for the Computer to reconnect.
+    fn restart_space_only(&mut self) {
+        let port = space_port(&self.url);
+        drop(self.server.take());
+        let (server, url, _invite) = serve_on(&self.home, port);
+        assert_eq!(url, self.url, "the Space restarts on its own address");
+        self.server = Some(server);
+    }
+
+    /// Stops the Space and starts it again on the same address.
+    ///
+    /// The daemon reconnects by itself, as it does for a User restarting
+    /// `neha serve`; the saved CLI session keeps working because the address
+    /// does not change.
+    fn restart_space(&mut self) {
+        let port = space_port(&self.url);
+        drop(self.server.take());
+        let (server, url, _invite) = serve_on(&self.home, port);
+        assert_eq!(url, self.url, "the Space restarts on its own address");
+        self.server = Some(server);
+        wait_for_computer_online(&self.home, &self.credential, &self.computer);
+    }
+}
+
+/// Quotes one argument for the shell line `script` runs.
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// One interactive `neha` command on a pseudo-terminal.
+///
+/// The approval card is only printed when stdin is a terminal; `script(1)`
+/// gives the child a pty and forwards a test's answer to it, so a test reads
+/// the real card and answers it exactly as a User does.
+struct TtyCli {
+    child: Option<Child>,
+    stdin: Option<std::process::ChildStdin>,
+    lines: mpsc::Receiver<String>,
+    errors: mpsc::Receiver<String>,
+    output: String,
+}
+
+/// Returns whether this machine can give a command a pseudo-terminal.
+fn tty_available() -> bool {
+    Command::new("script")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+impl TtyCli {
+    /// Starts one CLI command on a pseudo-terminal.
+    fn spawn(home: &Path, credential: &Path, arguments: &[&str]) -> Self {
+        let line = std::iter::once(BIN.to_owned())
+            .chain(arguments.iter().map(|argument| shell_quote(argument)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut child = Command::new("script")
+            .args(["-qec", &line, "/dev/null"])
+            .env("NEHA_HOME", home)
+            .env("NEHA_CREDENTIAL", credential)
+            .env("NEHA_PROVIDER_KEY", "sk-test")
+            .env("NEHA_PASSWORD", PASSWORD)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("script runs");
+        let lines = line_reader(child.stdout.take().unwrap());
+        let errors = line_reader(child.stderr.take().unwrap());
+        let stdin = child.stdin.take();
+
+        Self {
+            child: Some(child),
+            stdin,
+            lines,
+            errors,
+            output: String::new(),
+        }
+    }
+
+    /// Reads the terminal until a line contains `needle`, and returns that line.
+    fn expect_containing(&mut self, needle: &str) -> String {
+        let mut output = std::mem::take(&mut self.output);
+        let line = read_until_matching(
+            &self.lines,
+            &mut output,
+            &format!("a line containing `{needle}`"),
+            |line| line.contains(needle),
+        );
+        self.output = output;
+
+        line
+    }
+
+    /// Answers the card with one line of input.
+    fn answer(&mut self, answer: &str) {
+        use std::io::Write as _;
+        let stdin = self.stdin.as_mut().expect("the terminal is open");
+        writeln!(stdin, "{answer}").expect("the terminal takes the answer");
+        stdin.flush().expect("the terminal takes the answer");
+    }
+
+    /// Waits for the command to end, and returns its success and all output.
+    fn finish(mut self) -> (bool, String) {
+        // Closing the input does not end the command; the child exits on its
+        // own after its final line, and `script` follows it.
+        drop(self.stdin.take());
+        let mut output = std::mem::take(&mut self.output);
+        while let Ok(line) = self.lines.recv_timeout(Duration::from_secs(10)) {
+            output.push_str(&line);
+            output.push('\n');
+        }
+        let status = self.child.take().expect("the terminal runs").wait();
+        while let Ok(line) = self.errors.recv_timeout(Duration::from_millis(50)) {
+            output.push_str(&line);
+            output.push('\n');
+        }
+
+        (status.is_ok_and(|status| status.success()), output)
+    }
+}
+
+impl Drop for TtyCli {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Waits until `run show` reports one run in `status`, and returns that view.
+fn wait_for_run_status(home: &Path, credential: &Path, run_id: &str, status: &str) -> String {
+    let mut shown = String::new();
+    wait_until("the run to change status", || {
+        shown = run(home, credential, &["run", "show", run_id]);
+        shown
+            .lines()
+            .any(|line| line == format!("Run {run_id}: {status}"))
+    });
+
+    shown
+}
+
+/// Returns the run and approval ids a non-TTY `chat send` left waiting.
+fn waiting_run(sent: &str) -> (String, String) {
+    let advice = sent
+        .lines()
+        .find(|line| line.starts_with("run ") && line.contains("is waiting for approval"))
+        .unwrap_or_else(|| panic!("`chat send` must report the waiting run:\n{sent}"));
+    let run_id = advice
+        .split_whitespace()
+        .nth(1)
+        .expect("the waiting line names the run")
+        .to_owned();
+    let approval = advice
+        .split_once("is waiting for approval ")
+        .expect("the waiting line names the approval")
+        .1
+        .split(|character: char| character == ';' || character.is_whitespace())
+        .next()
+        .expect("the waiting line names the approval")
+        .to_owned();
+
+    (run_id, approval)
+}
+
+/// Answers the first-use approval a Bot on a Local Computer asks for.
+///
+/// The first Computer action of a Bot on a Local Computer always asks, whatever
+/// rules exist, so the fixture spends it on a harmless command: tests that use
+/// [`local_computer`] then act as a User who has already approved the first use.
+fn approve_first_use(home: &Path, credential: &Path, chat: &str, script: &Script) {
+    script.call("shell", serde_json::json!({"command": "printf first-use"}));
+    script.say("The first use is approved.");
+    let sent = run(
+        home,
+        credential,
+        &["chat", "send", "--chat", chat, "first use"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let allowed = run(home, credential, &["approval", "allow", &approval]);
+    assert!(
+        allowed.contains(&format!("Allowed {approval} for run {run_id}.")),
+        "{allowed}"
+    );
+    wait_for_run_status(home, credential, &run_id, "succeeded");
+}
+
+/// Pairs a Local Computer into a fresh Space and creates one Bot on it, then
+/// approves the Bot's first use of the Computer.
+fn local_computer(directory: tempfile::TempDir, provider: &str, script: &Script) -> LocalComputer {
+    let computer = bare_local_computer(directory, provider);
+    approve_first_use(&computer.home, &computer.credential, &computer.chat, script);
+
+    computer
 }
 
 /// Pairs a Local Computer into a fresh Space and creates one Bot on it.
@@ -887,7 +1086,7 @@ impl LocalComputer {
 /// is created without naming a Computer so the default (Local) is itself under
 /// test. A `directory` outside `/tmp` keeps the sandbox's fresh `/tmp` out of
 /// a fence assertion.
-fn local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer {
+fn bare_local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer {
     let home = directory.path().join("home");
     let credential = directory.path().join("session").join("credential.json");
     let (server, url) = space_with_admin(directory.path(), Some(provider));
@@ -911,7 +1110,7 @@ fn local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer
 
     LocalComputer {
         daemon: paired.daemon,
-        _server: server,
+        server: Some(server),
         home,
         credential,
         machine: paired.machine,
@@ -1434,6 +1633,14 @@ async fn a_bot_runs_on_a_local_computer() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
+    // The scratch space sits outside `/tmp`, so the sandbox's fresh `/tmp`
+    // cannot mask a configuration directory its hidden-root mounts failed to
+    // hide: the shell assertion below is about the hidden root itself.
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-local-")
+        .tempdir_in("/var/tmp")
+        .expect("the credential test needs a writable /var/tmp outside /tmp");
+    let computer = local_computer(directory, &base, &script);
     // A shell in the Bot's folder writes a file there; another command reads a
     // path outside the folder, as the machine's user can.
     script.call(
@@ -1443,14 +1650,6 @@ async fn a_bot_runs_on_a_local_computer() {
     script.say("The work ran in my own folder.");
     script.call("shell", serde_json::json!({"command": "cat /etc/hostname"}));
     script.say("I read the whole machine.");
-    // The scratch space sits outside `/tmp`, so the sandbox's fresh `/tmp`
-    // cannot mask a configuration directory its hidden-root mounts failed to
-    // hide: the shell assertion below is about the hidden root itself.
-    let directory = tempfile::Builder::new()
-        .prefix("neha-e2e-local-")
-        .tempdir_in("/var/tmp")
-        .expect("the credential test needs a writable /var/tmp outside /tmp");
-    let computer = local_computer(directory, &base);
     let folder = computer.workspace.join(&computer.bot);
 
     // Pairing without a code admitted this machine as a Local Computer.
@@ -1617,7 +1816,7 @@ async fn a_local_computer_pairs_without_a_code_and_takes_the_default_bot() {
     }
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
-    let computer = local_computer(directory, &base);
+    let computer = local_computer(directory, &base, &script);
 
     // Pairing is zero-code: it printed the Computer it admitted, saved the
     // configuration privately, and spent the Space's one-use ticket.
@@ -1812,6 +2011,7 @@ async fn a_bot_on_a_local_computer_writes_only_its_own_folder() {
         .tempdir_in("/var/tmp")
         .expect("the fence test needs a writable /var/tmp outside /tmp");
     let (base, script, provider_task) = scripted_provider().await;
+    let computer = local_computer(directory, &base, &script);
     script.call(
         "shell",
         serde_json::json!({"command": "echo bad > ../escaped.txt"}),
@@ -1825,7 +2025,6 @@ async fn a_bot_on_a_local_computer_writes_only_its_own_folder() {
         serde_json::json!({"path": "inside.txt", "content": "inside"}),
     );
     script.say("Done trying.");
-    let computer = local_computer(directory, &base);
     let folder = computer.workspace.join(&computer.bot);
     let escaped = computer.workspace.join("escaped.txt");
 
@@ -1882,7 +2081,7 @@ async fn a_file_travels_over_a_local_computers_channel() {
     let (base, script, provider_task) = scripted_provider().await;
     let content = "the quick brown fox\n";
     let directory = tempfile::tempdir().unwrap();
-    let computer = local_computer(directory, &base);
+    let computer = local_computer(directory, &base, &script);
     let folder = computer.workspace.join(&computer.bot);
     let notes = computer.path().join("notes.txt");
     std::fs::write(&notes, content).unwrap();
@@ -1982,7 +2181,7 @@ async fn a_message_waits_while_a_local_computer_is_offline() {
     }
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = local_computer(directory, &base);
+    let mut computer = local_computer(directory, &base, &script);
 
     // The daemon stops, and the Space shows the Computer offline.
     computer.daemon.kill();
@@ -2038,12 +2237,12 @@ async fn a_run_fails_when_its_computer_leaves() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = local_computer(directory, &base, &script);
     // The first reply asks for a slow shell; the second reply is only wanted
     // if the run wrongly went on after the Computer left.
     script.call("shell", serde_json::json!({"command": "sleep 2"}));
     script.say("The slow command finished.");
-    let directory = tempfile::tempdir().unwrap();
-    let mut computer = local_computer(directory, &base);
 
     let (send, stdout, stderr) = spawn_cli(
         &computer.home,
@@ -2132,9 +2331,9 @@ async fn an_offline_local_computer_does_not_block_another_bot() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
-    script.say("The hosted Bot answered.");
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = local_computer(directory, &base);
+    let mut computer = local_computer(directory, &base, &script);
+    script.say("The hosted Bot answered.");
 
     // A second Bot works on a Hosted Computer inside the Space.
     let created = run(
@@ -2179,13 +2378,13 @@ async fn a_local_computers_messages_run_in_the_order_they_were_sent() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
     // Each run holds its reply open, so the next Messages queue behind it and
     // every run takes the reply holding its own place in the queue.
     script.hold("First reply.");
     script.hold("Second reply.");
     script.hold("Third reply.");
-    let directory = tempfile::tempdir().unwrap();
-    let computer = local_computer(directory, &base);
 
     let (first, first_lines, _stderr) = spawn_cli(
         &computer.home,
@@ -2237,10 +2436,14 @@ async fn a_local_computers_messages_run_in_the_order_they_were_sent() {
         .lines()
         .filter(|line| line.contains("] Bot: "))
         .collect();
-    assert_eq!(replies.len(), 3, "{read}");
-    assert!(replies[0].ends_with("Bot: First reply."), "{read}");
-    assert!(replies[1].ends_with("Bot: Second reply."), "{read}");
-    assert!(replies[2].ends_with("Bot: Third reply."), "{read}");
+    assert_eq!(replies.len(), 4, "{read}");
+    assert!(
+        replies[0].ends_with("Bot: The first use is approved."),
+        "{read}"
+    );
+    assert!(replies[1].ends_with("Bot: First reply."), "{read}");
+    assert!(replies[2].ends_with("Bot: Second reply."), "{read}");
+    assert!(replies[3].ends_with("Bot: Third reply."), "{read}");
 
     drop(computer);
     provider_task.abort();
@@ -2254,7 +2457,7 @@ async fn a_file_take_lost_with_its_computer_fails_the_run() {
     let (base, script, provider_task) = scripted_provider().await;
     let content = "the quick brown fox\n";
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = local_computer(directory, &base);
+    let mut computer = local_computer(directory, &base, &script);
     let notes = computer.path().join("notes.txt");
     std::fs::write(&notes, content).unwrap();
 
@@ -2407,6 +2610,7 @@ async fn a_bot_moves_to_another_local_computer() {
     );
     let bot = first_word(&field(&created, "Created Bot "));
     let chat = field(&created, "Chat:");
+    approve_first_use(&home, &credential, &chat, &script);
     let a_folder = a.workspace.join(&bot);
     script.call(
         "shell",
@@ -2458,6 +2662,10 @@ async fn a_bot_moves_to_another_local_computer() {
         !shown.contains("Workspace:"),
         "a Local Computer records no workspace path:\n{shown}"
     );
+
+    // The first use counts per (Bot, acting User, Computer): Computer B asks
+    // on its first action, even though Computer A was already approved.
+    approve_first_use(&home, &credential, &chat, &script);
 
     // The next Message runs in B's fresh folder: the working file stayed on A.
     let b_folder = b.workspace.join(&bot);
@@ -2806,4 +3014,1319 @@ fn a_local_pairing_uses_the_space_ticket() {
     );
 
     drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_first_local_action_waits_for_approval() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    // The action appends, so running it twice would show up in the file; its
+    // tab also proves a summary is escaped for the terminal.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf 'x\ty' >> proof.txt"}),
+    );
+    script.say("The proof was approved.");
+    let directory = tempfile::tempdir().unwrap();
+    let computer = bare_local_computer(directory, &base);
+    let folder = computer.workspace.join(&computer.bot);
+
+    // A non-TTY send reports the waiting run and exits successfully.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write the proof"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    assert!(
+        sent.contains(&format!("answer with `neha approval allow {approval}`")),
+        "{sent}"
+    );
+
+    // The run waits, and the approval covers an action that has not started.
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: waiting")),
+        "{shown}"
+    );
+    assert!(shown.contains(&format!("  approval {approval}")), "{shown}");
+    assert!(
+        !shown.contains("action "),
+        "an unanswered approval covers an action that has not started:\n{shown}"
+    );
+
+    // The list and the show name the pending approval for this Bot.
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    let row = format!(
+        "{approval}  {run_id}  {}  shell  first_use_local  shell: printf 'x\\ty' >> proof.txt",
+        computer.bot
+    );
+    assert!(listed.lines().any(|line| line == row), "{listed}");
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains("  step "), "{shown}");
+    assert!(shown.contains("  index 0"), "{shown}");
+    assert!(shown.contains("  action "), "{shown}");
+    let arguments = "{\"command\":\"printf 'x\\ty' >> proof.txt\"}";
+    assert!(
+        shown.contains(&format!("  arguments {arguments}")),
+        "the show names the full action:\n{shown}"
+    );
+    assert!(
+        !shown.contains("  rule "),
+        "a first use is not the result of a rule:\n{shown}"
+    );
+
+    // A lasting answer cannot cover the first use of a Local Computer.
+    let lasting = cli(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval, "--always"],
+    );
+    assert!(!lasting.status.success());
+    let stderr = String::from_utf8_lossy(&lasting.stderr);
+    assert!(
+        stderr.contains("a lasting rule cannot cover the first use of a Local Computer"),
+        "stderr: {stderr}"
+    );
+
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(shown.contains("  reply "), "{shown}");
+    // The action started after the answer and ran exactly once.
+    assert_eq!(shown.matches("shell (succeeded)").count(), 1, "{shown}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("proof.txt")).unwrap(),
+        "x\ty",
+        "an allowed action runs exactly once"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(
+        listed.trim().is_empty(),
+        "the answered approval is no longer pending:\n{listed}"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert!(read.contains("Bot: The proof was approved."), "{read}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_action_does_not_ask_after_an_allow() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf x >> remembered.txt"}),
+    );
+    script.say("The first action ran.");
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf x >> remembered.txt"}),
+    );
+    script.say("The second action ran.");
+    let directory = tempfile::tempdir().unwrap();
+    let computer = bare_local_computer(directory, &base);
+    let folder = computer.workspace.join(&computer.bot);
+
+    // The first use asks; the allow is remembered for this Bot and User.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "first"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("remembered.txt")).unwrap(),
+        "x"
+    );
+
+    // The same action does not ask again.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "second"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "the remembered first use must not ask again:\n{sent}"
+    );
+    assert!(sent.contains("The second action ran."), "{sent}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("remembered.txt")).unwrap(),
+        "xx",
+        "both actions ran"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.trim().is_empty(), "{listed}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_always_allow_rule_answers_the_next_action() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+
+    // An Ask rule makes the next matching action wait.
+    let added = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    assert!(
+        added.contains(": ask shell (command-prefix \"printf\")"),
+        "{added}"
+    );
+    // A rule makes metacharacters ask, so the command stays a plain form.
+    script.call("shell", serde_json::json!({"command": "printf always"}));
+    script.say("The always-allowed action ran.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "always allow"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.contains("  rule  shell: printf always"), "{listed}");
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains("  rule "), "{shown}");
+    assert!(shown.contains("  index 0"), "{shown}");
+    assert!(
+        shown.contains("  arguments {\"command\":\"printf always\"}"),
+        "{shown}"
+    );
+
+    // Always allow answers this approval and derives a lasting allow rule.
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval, "--always"],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(shown.contains("shell (succeeded)"), "{shown}");
+    let rules = run(&computer.home, &computer.credential, &["rule", "list"]);
+    let rows: Vec<&str> = rules.lines().collect();
+    assert_eq!(
+        rows.len(),
+        1,
+        "the derived allow rule replaces the ask rule it covers:\n{rules}"
+    );
+    assert!(
+        rows[0].ends_with("  allow  shell  command-prefix printf"),
+        "{rules}"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.trim().is_empty(), "{listed}");
+
+    // A following identical action does not ask.
+    script.call("shell", serde_json::json!({"command": "printf always"}));
+    script.say("The next action ran without asking.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "again"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "the derived allow rule answers the next matching action:\n{sent}"
+    );
+    assert!(
+        sent.contains("The next action ran without asking."),
+        "{sent}"
+    );
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(shown.contains("shell (succeeded)"), "{shown}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denied_action_ends_the_run() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    // A denied run never asks the Model again, so only its tool call is queued.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf x >> denied.txt"}),
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let computer = bare_local_computer(directory, &base);
+    let folder = computer.workspace.join(&computer.bot);
+
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "do not do it"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let denied = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "deny", &approval],
+    );
+    assert_eq!(
+        denied.trim(),
+        format!("Denied {approval} for run {run_id}.")
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "failed");
+    assert!(
+        shown.contains("  error You denied the action, so I stopped."),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("shell (succeeded)"),
+        "a denied action never runs:\n{shown}"
+    );
+    assert!(
+        !folder.join("denied.txt").exists(),
+        "a denied action writes nothing"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert!(
+        read.contains("Bot: You denied the action, so I stopped."),
+        "{read}"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.trim().is_empty(), "{listed}");
+
+    // A deny does not spend the first use: the same action asks again, and
+    // allowing it then runs it once.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf x >> denied.txt"}),
+    );
+    script.say("It ran after a second answer.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "try again"],
+    );
+    assert!(
+        sent.contains("is waiting for approval"),
+        "a deny leaves the first use unapproved:\n{sent}"
+    );
+    let (second_run, second_approval) = waiting_run(&sent);
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &second_approval],
+    );
+    wait_for_run_status(
+        &computer.home,
+        &computer.credential,
+        &second_run,
+        "succeeded",
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("denied.txt")).unwrap(),
+        "x",
+        "the retried action runs exactly once"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ask_rule_matches_only_its_command_prefix() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    script.call("shell", serde_json::json!({"command": "printf matched"}));
+    script.say("The matching command ran.");
+
+    // A command with the prefix asks.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "matching"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+
+    // A command without the prefix does not ask.
+    script.call("shell", serde_json::json!({"command": "echo unmatched"}));
+    script.say("The other command ran.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "other"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "only commands with the prefix should ask:\n{sent}"
+    );
+    assert!(sent.contains("The other command ran."), "{sent}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_run_yields_to_the_next_message() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    // The first run asks before its action; the second run takes the next
+    // reply while the first waits, and the first finishes after the answer.
+    script.call("shell", serde_json::json!({"command": "printf one"}));
+    script.say("The second one finished.");
+    script.say("The first one finished.");
+    let first = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "first"],
+    );
+    let (first_run, approval) = waiting_run(&first);
+
+    // The second Message's run finishes while the first still waits.
+    let second = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "second"],
+    );
+    assert!(second.contains("The second one finished."), "{second}");
+    let second_run = first_word(&field(&second, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &second_run],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {second_run}: succeeded")),
+        "{shown}"
+    );
+    let waiting = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &first_run],
+    );
+    assert!(
+        waiting.starts_with(&format!("Run {first_run}: waiting")),
+        "the first run must still wait for its answer:\n{waiting}"
+    );
+
+    // Answering lets the first run finish.
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    let shown = wait_for_run_status(
+        &computer.home,
+        &computer.credential,
+        &first_run,
+        "succeeded",
+    );
+    assert!(shown.contains("  reply "), "{shown}");
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert!(read.contains("Bot: The second one finished."), "{read}");
+    assert!(read.contains("Bot: The first one finished."), "{read}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_approval_survives_a_space_restart() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = local_computer(directory, &base, &script);
+    let folder = computer.workspace.join(&computer.bot);
+    let added = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "touch",
+        ],
+    );
+    let ask = first_word(&field(&added, "Added rule "));
+    // A plain command: with a shell rule, a redirection would be ambiguous and
+    // would ask without naming that rule.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "touch restarted.txt"}),
+    );
+    script.say("The action ran after the restart.");
+
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "wait through a restart",
+        ],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+
+    // The Space restarts while the approval waits.
+    computer.restart_space();
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: waiting")),
+        "a restart keeps the waiting run waiting:\n{shown}"
+    );
+    assert!(shown.contains(&format!("  approval {approval}")), "{shown}");
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(
+        listed.contains(&format!(
+            "{approval}  {run_id}  {}  shell  rule  ",
+            computer.bot
+        )),
+        "{listed}"
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(
+        shown.contains(&format!("  rule {ask}")),
+        "the pending approval still names its rule:\n{shown}"
+    );
+    assert!(shown.contains("  index 0"), "{shown}");
+    assert!(
+        shown.contains("  arguments {\"command\":\"touch restarted.txt\"}"),
+        "{shown}"
+    );
+
+    // The answer after the restart resumes the run, and it runs once.
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert_eq!(
+        shown.matches("shell (succeeded)").count(),
+        1,
+        "a resumed action runs exactly once:\n{shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("restarted.txt")).unwrap(),
+        "",
+        "the resumed action's side effect is there exactly once"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert!(
+        read.contains("Bot: The action ran after the restart."),
+        "{read}"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_allow_rule_wins_over_a_wider_ask_rule() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+
+    // A wide Ask rule covers every shell command; a narrower Allow rule wins
+    // on the commands it names.
+    let added = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+        ],
+    );
+    assert!(added.trim_end().ends_with(": ask shell"), "{added}");
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "allow",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+
+    // The more specific Allow rule answers without asking.
+    script.call("shell", serde_json::json!({"command": "printf fine"}));
+    script.say("The allowed command ran.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "allowed"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "a narrower allow rule wins over a wider ask rule:\n{sent}"
+    );
+    assert!(sent.contains("The allowed command ran."), "{sent}");
+
+    // A command only the wide Ask rule matches still asks.
+    script.call("shell", serde_json::json!({"command": "echo asked"}));
+    script.say("The asked command ran.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "asked"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_action_waits_for_approval_once() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let content = "the quick brown fox\n";
+    let directory = tempfile::tempdir().unwrap();
+    let computer = bare_local_computer(directory, &base);
+    let folder = computer.workspace.join(&computer.bot);
+    let notes = computer.path().join("notes.txt");
+    std::fs::write(&notes, content).unwrap();
+
+    // Uploading a File runs a normal reply: no Computer action, no approval.
+    script.say("Got the note.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--file",
+            notes.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "a reply with no action asks nothing:\n{sent}"
+    );
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let file = listed
+        .lines()
+        .find(|line| line.contains("notes.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the uploaded File is listed")
+        .to_owned();
+
+    // The first File action of the Bot on this Local Computer asks first.
+    script.call("take_file", serde_json::json!({"file": &file}));
+    script.say("Took the note.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "take the note"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(
+        listed.contains("  take_file  first_use_local  "),
+        "the first File action asks like any other Computer action:\n{listed}"
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains("  index 0"), "{shown}");
+    assert!(
+        shown.contains(&format!("  arguments {{\"file\":\"{file}\"}}")),
+        "the show names the File the action takes:\n{shown}"
+    );
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(shown.contains("take_file (succeeded)"), "{shown}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
+        content,
+        "the allowed take writes the File into the Bot's folder"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.trim().is_empty(), "{listed}");
+
+    // The next File action, delivering the File back, does not ask again.
+    script.call(
+        "put_file",
+        serde_json::json!({"path": "notes.txt", "name": "delivered.txt"}),
+    );
+    script.say("Delivered the note.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "deliver it back"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "the remembered first use covers the next File action:\n{sent}"
+    );
+    assert!(sent.contains("Delivered the note."), "{sent}");
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(shown.contains("put_file (succeeded)"), "{shown}");
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let delivered = listed
+        .lines()
+        .find(|line| line.contains("delivered.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the delivered File is listed")
+        .to_owned();
+    let out = computer.path().join("delivered.bin");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        content.as_bytes(),
+        "the delivered File keeps its bytes"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compound_command_asks_only_when_a_shell_rule_exists() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+
+    // With no shell rule, a compound command runs under the default allow.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf one; printf two"}),
+    );
+    script.say("The compound command ran.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "compound"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "with no shell rule the default allows the command:\n{sent}"
+    );
+    assert!(sent.contains("The compound command ran."), "{sent}");
+
+    // A shell rule makes the prefix match after leading whitespace...
+    let added = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    let ask = first_word(&field(&added, "Added rule "));
+    script.call("shell", serde_json::json!({"command": "  printf padded"}));
+    script.say("The padded command ran.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "padded"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains("  rule "), "{shown}");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+
+    // ...and a compound command is ambiguous for a prefix rule, so it asks
+    // instead of slipping past the rule under another first word.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "echo safe; printf danger"}),
+    );
+    script.say("The compound command ran after the answer.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "compound again"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: waiting")),
+        "{shown}"
+    );
+    // An ambiguous form is guarded by no single rule, so the approval names
+    // none: the User answers the action themselves.
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(
+        !shown.contains(&format!("  rule {ask}")),
+        "an ambiguous action names no rule:\n{shown}"
+    );
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(shown.contains("shell (succeeded)"), "{shown}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tty_card_names_the_scope_and_answers() {
+    if !local_computer_ready() {
+        return;
+    }
+    if !tty_available() {
+        eprintln!("skipping the TTY card test: script(1) is not available");
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    script.call("shell", serde_json::json!({"command": "printf card"}));
+    script.say("The card answered.");
+    let mut tty = TtyCli::spawn(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "on the card"],
+    );
+
+    // The card names the reason, what Always allow would cover, and whether
+    // the action can be undone.
+    let card = tty.expect_containing("for shell");
+    assert!(card.contains("Approval "), "{card}");
+    let reason = tty.expect_containing("reason:");
+    assert!(reason.contains("a rule you set"), "{reason}");
+    let scope = tty.expect_containing("Always allow covers:");
+    assert!(
+        scope.contains("shell commands starting with \"printf\""),
+        "{scope}"
+    );
+    let undo = tty.expect_containing("cannot be undone");
+    assert!(undo.contains("This action cannot be undone."), "{undo}");
+
+    // Answering on the terminal is a real answer: Always allow derives the rule.
+    tty.answer("A");
+    let (ok, output) = tty.finish();
+    assert!(ok, "the interactive send must finish:\n{output}");
+    assert!(output.contains("The card answered."), "{output}");
+    let rules = run(&computer.home, &computer.credential, &["rule", "list"]);
+    assert!(
+        rules.contains("  allow  shell  command-prefix printf"),
+        "Always allow on the card creates the rule:\n{rules}"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.trim().is_empty(), "{listed}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decided_allow_resumes_after_a_restart_before_the_action() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = local_computer(directory, &base, &script);
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    script.call("shell", serde_json::json!({"command": "printf resumed"}));
+    script.say("It resumed after the restart.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "wait for me"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+
+    // The Computer leaves, so the allow can be decided while the pump cannot
+    // start the action: the restart below then lands before the action.
+    computer.daemon.kill();
+    wait_for_computer_offline(&computer.home, &computer.credential, &computer.computer);
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: running")),
+        "a decided allow leaves the run ready to resume:\n{shown}"
+    );
+    assert!(
+        !shown.contains("action "),
+        "the allow has not started the action yet:\n{shown}"
+    );
+
+    // The Space restarts before the action starts; the decided allow survives.
+    computer.restart_space_only();
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: running")),
+        "a decided allow survives a restart before the action:\n{shown}"
+    );
+    assert!(!shown.contains("error "), "{shown}");
+
+    // Reconnecting the Computer resumes the run: the action starts, runs, and
+    // answers exactly once.
+    let mut daemon = ComputerDaemon::spawn(
+        &computer.machine,
+        &computer.credential,
+        &["computer", "run"],
+    );
+    daemon.expect_line(&format!(
+        "Computer {} is running for {}.",
+        computer.computer, computer.url
+    ));
+    wait_for_computer_online(&computer.home, &computer.credential, &computer.computer);
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert_eq!(
+        shown.matches("shell (succeeded)").count(),
+        1,
+        "a resumed action runs exactly once:\n{shown}"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert_eq!(
+        read.matches("It resumed after the restart.").count(),
+        1,
+        "the resumed step replies exactly once:\n{read}"
+    );
+
+    drop(daemon);
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = local_computer(directory, &base, &script);
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "sleep",
+        ],
+    );
+    // The action is still running when the Space goes away.
+    script.call("shell", serde_json::json!({"command": "sleep 3"}));
+    script.say("The action finished.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "restart mid-action",
+        ],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+
+    // The approved action starts and stays in flight; a restart now cannot
+    // resume it without running the action twice.
+    wait_until("the approved action to start", || {
+        run(
+            &computer.home,
+            &computer.credential,
+            &["run", "show", &run_id],
+        )
+        .contains("shell (unknown)")
+    });
+    computer.restart_space();
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "failed");
+    assert!(
+        shown.contains("  error the approval could not be resumed"),
+        "a restart after the action started must not resume it:\n{shown}"
+    );
+    assert!(
+        !shown.contains("shell (succeeded)"),
+        "the action must not be reported as finished:\n{shown}"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert!(
+        read.contains("Bot: I could not continue after the approval."),
+        "{read}"
+    );
+    assert!(
+        !read.contains("The action finished."),
+        "the Model's next reply must never be used:\n{read}"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_file_rule_asks_by_path_prefix() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let content = "the report\n";
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+    let folder = computer.workspace.join(&computer.bot);
+    std::fs::create_dir_all(folder.join("logs")).unwrap();
+    std::fs::write(folder.join("logs").join("report.txt"), content).unwrap();
+
+    // A path-prefix rule on put_file asks before the delivery.
+    let added = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "put_file",
+            "--path-prefix",
+            "logs",
+        ],
+    );
+    assert!(
+        added.contains(": ask put_file (path-prefix \"logs\")"),
+        "{added}"
+    );
+    let ask = first_word(&field(&added, "Added rule "));
+    script.call(
+        "put_file",
+        serde_json::json!({"path": "logs/report.txt", "name": "report.txt"}),
+    );
+    script.say("Delivered the report.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "send the report"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(
+        listed.contains(&format!(
+            "{approval}  {run_id}  {}  put_file  rule  ",
+            computer.bot
+        )),
+        "a File action is matched by its path rule:\n{listed}"
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains(&format!("  rule {ask}")), "{shown}");
+    assert!(shown.contains("\"path\":\"logs/report.txt\""), "{shown}");
+    assert!(shown.contains("\"name\":\"report.txt\""), "{shown}");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(shown.contains("put_file (succeeded)"), "{shown}");
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let delivered = listed
+        .lines()
+        .find(|line| line.contains("report.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the delivered File is listed")
+        .to_owned();
+    let out = computer.path().join("report.bin");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), content.as_bytes());
+
+    drop(computer);
+    provider_task.abort();
 }

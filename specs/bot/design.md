@@ -52,6 +52,44 @@ A Hosted Computer's recovery, reset, or replacement stops its runs between two a
 
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 
+## Approvals
+
+Before a Computer action, the loop asks whether to proceed. A File action asks like any other: `take_file` matches a rule that names only that tool, and `put_file` also matches a path-prefix rule. The first use of a Local Computer is never covered by a lasting rule.
+
+The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
+
+A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
+
+`RuleAdd` trims and normalizes a path prefix once and stores it; matching does not trim the stored prefix again. A raw action path is trimmed once, then compared after collapsing repeated `/` and removing `.` components, while keeping the absolute or relative form; `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule.
+
+`.` is the Workspace root: it matches `./a.txt` but no absolute path. A `..` component is never removed and still follows the fail-closed rule. A path made only of whitespace is ambiguous when the tool has a rule.
+
+A directory name that ends with a space is a scope of its own: `logs` and `logs ` differ.
+
+When an Ask rule and an Allow rule both match, the longer prefix wins, and a rule without a prefix is the shortest. A tie goes to the Ask rule.
+
+A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break is a form a prefix cannot judge. A file path with a `..` component, or an absolute/relative form unlike a rule prefix, is another.
+
+A form a prefix cannot judge asks when the Bot and User have any rule for that tool. With no rule for that tool, the action runs. Such an approval names no rule: its `rule` field is empty, its `ambiguous` field is true, and its Always allow removes no rule.
+
+An Always allow writes an Allow rule from the action itself: the command's first word when the action has a command, or the path's parent directory when it has a path. A relative path at the Workspace root writes `.`.
+
+Only an action with neither a command nor a path, such as `take_file`, writes a tool-only Allow rule.
+
+When an action cannot make a lasting rule, its approval offers no Always allow: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path.
+
+An ambiguous form with a derivable scope still offers Always allow, and that answer removes no rule. The Space refuses a lasting answer when no rule can be derived.
+
+The new Allow rule covers the Ask rule when the Ask rule's command prefix starts with the Allow rule's prefix, or when the Ask rule's path equals the Allow rule's path or sits below it. A tool-only Ask rule is not covered by a prefixed Allow rule.
+
+Neha removes the Ask rule the approval named when the new Allow rule covers it. An approval with an empty `rule` removes none, and an uncovered named rule stays.
+
+The approval records the Computer and the call's index. An Allow resumes the run from the record: the step's reply and finished actions replay, the waiting action keeps its recorded id, and no action runs twice. The resumed step binds the answer to that call by index.
+
+A Deny fails the run, and the Bot says why.
+
+A run that waits for an approval keeps no place in the Bot's queue, so a later request for the same Bot runs. A Space restart keeps an undecided approval waiting, resumes an allowed one, and fails a denied one.
+
 ## Instructions and data
 
 A lasting rule is an instruction to the Bot within the authority of the User who gave it.
@@ -81,3 +119,9 @@ A Message from the User the Bot acts for that answers the run's request steers t
 Runs of different Bots run in parallel.
 
 A handoff from one Bot to another carries the authority of the User the first Bot acted for, and never more.
+
+## Gaps
+
+- The Model does not ask for an approval on its own; only a built-in trigger or a lasting Ask rule asks.
+- Cancelling an approval and an unattended approval's expiry are not yet available.
+- An independent reviewer of approvals is not yet specified.

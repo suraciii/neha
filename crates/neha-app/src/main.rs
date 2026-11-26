@@ -4,11 +4,12 @@ mod client;
 mod computer;
 
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufRead, IsTerminal as _, Write};
 
 use anyhow::{Context as _, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
+use neha::record::RuleEffect;
 use neha::seq::Seq;
 use neha::surface::{
     BotComputer, BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
@@ -90,6 +91,16 @@ enum Top {
     Run {
         #[command(subcommand)]
         command: RunCommand,
+    },
+    /// Answer approval requests and manage approval rules.
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
+    /// Manage approval rules.
+    Rule {
+        #[command(subcommand)]
+        command: RuleCommand,
     },
 }
 
@@ -251,6 +262,91 @@ enum RunCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    /// List approvals waiting for you.
+    List,
+    /// Show one approval waiting for you.
+    Show {
+        /// The approval identifier.
+        approval: Id,
+    },
+    /// Allow one approval; the waiting run continues.
+    Allow {
+        /// The approval identifier.
+        approval: Id,
+        /// Also allow this kind of action from now on.
+        #[arg(long)]
+        always: bool,
+    },
+    /// Deny one approval; the waiting run stops.
+    Deny {
+        /// The approval identifier.
+        approval: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum RuleCommand {
+    /// List rules.
+    List {
+        /// Only the rules of this Bot.
+        #[arg(long)]
+        bot: Option<Id>,
+    },
+    /// Add a rule that asks before, or allows, matching actions.
+    Add {
+        /// The Bot the rule applies to.
+        #[arg(long)]
+        bot: Id,
+        /// What the rule does: ask before the action, or allow it.
+        #[arg(long, value_enum)]
+        effect: RuleEffectChoice,
+        /// The tool the rule matches, such as shell or write_file.
+        #[arg(long)]
+        tool: String,
+        /// Match shell commands that start with this text.
+        #[arg(long)]
+        command_prefix: Option<String>,
+        /// Match file paths that start with this text.
+        #[arg(long)]
+        path_prefix: Option<String>,
+    },
+    /// Remove one rule.
+    Remove {
+        /// The rule identifier.
+        rule: Id,
+    },
+}
+
+/// The effect a `rule add` asks the Space for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum RuleEffectChoice {
+    /// Ask before each matching action.
+    Ask,
+    /// Allow matching actions without asking.
+    Allow,
+}
+
+impl RuleEffectChoice {
+    /// Returns the pinned wire value.
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Allow => "allow",
+        }
+    }
+}
+
+impl From<RuleEffectChoice> for RuleEffect {
+    fn from(choice: RuleEffectChoice) -> Self {
+        match choice {
+            RuleEffectChoice::Ask => Self::Ask,
+            RuleEffectChoice::Allow => Self::Allow,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
@@ -265,6 +361,8 @@ async fn main() -> Result<()> {
         Top::Chat { command } => chat(command).await,
         Top::File { command } => file(command).await,
         Top::Run { command } => run(command).await,
+        Top::Approval { command } => approval(command).await,
+        Top::Rule { command } => rule(command).await,
     }
 }
 
@@ -614,8 +712,13 @@ async fn chat(command: ChatCommand) -> Result<()> {
             let run = id_of(&result, "run")?;
             let mut progress = Progress::new(follow);
             progress.accepted(&result);
-            let view =
-                client::wait_for_run(&credential, run, |view| progress.observed(view)).await?;
+            // A run that stops at an approval stays where it is: a terminal
+            // asks and answers it here, a script gets the ids and the command
+            // to answer it later.
+            let view = match follow_run(&credential, chat, run, &mut progress).await? {
+                Follow::Finished(view) => view,
+                Follow::Waiting => return Ok(()),
+            };
             let status = text_of(&view, "status")?;
             if status == "succeeded" {
                 println!("{}", reply_text(&credential, chat, &view).await?);
@@ -769,6 +872,9 @@ fn write_run(out: &mut impl Write, result: &Value) -> Result<()> {
     if let Some(position) = result["position"].as_u64() {
         writeln!(out, "  position {position}")?;
     }
+    if let Some(approval) = result["approval"].as_str() {
+        writeln!(out, "  approval {approval}")?;
+    }
     if let Some(reply) = result["reply"].as_str() {
         writeln!(out, "  reply {reply}")?;
     }
@@ -806,6 +912,637 @@ fn write_run(out: &mut impl Write, result: &Value) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Answers one approval and prints what the Space decided.
+async fn decide(credential: &Credential, approval: Id, allow: bool, always: bool) -> Result<()> {
+    let result = client::command(
+        credential,
+        CommandCall::ApprovalDecide {
+            approval,
+            allow,
+            lasting: always,
+        },
+    )
+    .await?;
+    let run = result.get("run").and_then(Value::as_str);
+    println!("{}", decision_line(allow, approval, run));
+
+    Ok(())
+}
+
+/// The line that reports one answered approval.
+fn decision_line(allow: bool, approval: Id, run: Option<&str>) -> String {
+    let verb = if allow { "Allowed" } else { "Denied" };
+    match run {
+        Some(run) => format!("{verb} {approval} for run {run}."),
+        None => format!("{verb} {approval}."),
+    }
+}
+
+/// Lists the approvals waiting for the caller.
+async fn approval(command: ApprovalCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        ApprovalCommand::List => {
+            let list =
+                client::command(&credential, CommandCall::ApprovalList { chat: None }).await?;
+            for row in approval_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        ApprovalCommand::Show { approval } => {
+            let list =
+                client::command(&credential, CommandCall::ApprovalList { chat: None }).await?;
+            let found = find_entity(&list, "approval", approval)?
+                .with_context(|| format!("there is no pending approval {approval}"))?;
+            println!("{}", approval_row(&found)?);
+            write_approval_details(&mut std::io::stdout().lock(), &found)?;
+        }
+        ApprovalCommand::Allow { approval, always } => {
+            decide(&credential, approval, true, always).await?;
+        }
+        ApprovalCommand::Deny { approval } => {
+            decide(&credential, approval, false, false).await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// One row per pending approval: approval, run, bot, tool, reason, summary.
+fn approval_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no approvals in the answer")?
+        .iter()
+        .map(approval_row)
+        .collect()
+}
+
+/// Formats one pending approval as a single line.
+fn approval_row(approval: &Value) -> Result<String> {
+    Ok(format!(
+        "{}  {}  {}  {}  {}  {}",
+        entity_id(approval, &["approval"])?,
+        entity_id(approval, &["run"])?,
+        entity_id(approval, &["bot"])?,
+        escape_text(text_of(approval, "tool")?),
+        text_of(approval, "reason")?,
+        escape_text(approval["summary"].as_str().unwrap_or_default())
+    ))
+}
+
+/// Prints where one approval sits in its run.
+fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> {
+    if let Some(step) = approval["step"].as_u64() {
+        writeln!(out, "  step {step}")?;
+    }
+    if let Some(index) = approval["index"].as_u64() {
+        writeln!(out, "  index {index}")?;
+    }
+    if let Some(action) = approval["action"].as_str() {
+        writeln!(out, "  action {action}")?;
+    }
+    if let Some(chat) = approval["chat"].as_str() {
+        writeln!(out, "  chat {chat}")?;
+    }
+    if let Some(rule) = approval["rule"].as_str() {
+        writeln!(out, "  rule {rule}")?;
+    }
+    // An ambiguous approval cannot name one rule; saying so lets the User
+    // know the answer may create a different lasting rule than expected.
+    let ambiguous = approval["ambiguous"].as_bool().unwrap_or(false);
+    writeln!(out, "  ambiguous {ambiguous}")?;
+    if let Some(arguments) = approval.get("arguments") {
+        // The whole action, escaped and never clipped, so the User can check
+        // exactly what the approval will run.
+        let arguments =
+            serde_json::to_string(arguments).context("the approval arguments are not JSON")?;
+        writeln!(out, "  arguments {}", escape_text(&arguments))?;
+    }
+
+    Ok(())
+}
+
+/// Escapes control characters so a card cannot hide or rewrite itself.
+fn escape_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:04x}}}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
+/// Names the files an Always allow would cover from a path.
+fn file_scope(path: &str) -> String {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    match parent {
+        None => "files in the Workspace root".to_owned(),
+        Some(parent) if parent == std::path::Path::new(".") => {
+            "files in the Workspace root".to_owned()
+        }
+        Some(parent) => format!(
+            "files under \"{}\"",
+            escape_text(&parent.display().to_string())
+        ),
+    }
+}
+
+/// Adds or removes approval rules.
+async fn rule(command: RuleCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        RuleCommand::List { bot } => {
+            let list = client::command(&credential, CommandCall::RuleList { bot }).await?;
+            for row in rule_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        RuleCommand::Add {
+            bot,
+            effect,
+            tool,
+            command_prefix,
+            path_prefix,
+        } => {
+            validate_rule_arguments(&tool, command_prefix.as_deref(), path_prefix.as_deref())?;
+            let result = client::command(
+                &credential,
+                CommandCall::RuleAdd {
+                    bot,
+                    effect: effect.into(),
+                    tool: tool.clone(),
+                    command_prefix: command_prefix.clone(),
+                    path_prefix: path_prefix.clone(),
+                },
+            )
+            .await?;
+            println!(
+                "{}",
+                rule_add_report(
+                    &result,
+                    bot,
+                    effect.wire(),
+                    &tool,
+                    command_prefix.as_deref(),
+                    path_prefix.as_deref()
+                )?
+            );
+        }
+        RuleCommand::Remove { rule } => {
+            let result = client::command(&credential, CommandCall::RuleRemove { rule }).await?;
+            let shown = result
+                .get("rule")
+                .and_then(Value::as_str)
+                .map_or_else(|| rule.to_string(), str::to_owned);
+            println!("Removed rule {shown}.");
+        }
+    }
+
+    Ok(())
+}
+
+/// One row per rule: rule, bot, effect, tool, and the matching prefix.
+fn rule_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no rules in the answer")?
+        .iter()
+        .map(rule_row)
+        .collect()
+}
+
+/// Formats one rule as a single line.
+fn rule_row(rule: &Value) -> Result<String> {
+    let mut row = format!(
+        "{}  {}  {}  {}",
+        entity_id(rule, &["rule", "id"])?,
+        entity_id(rule, &["bot"])?,
+        text_of(rule, "effect")?,
+        text_of(rule, "tool")?
+    );
+    if let Some(prefix) = rule["command_prefix"].as_str() {
+        row.push_str(&format!("  command-prefix {prefix}"));
+    }
+    if let Some(prefix) = rule["path_prefix"].as_str() {
+        row.push_str(&format!("  path-prefix {prefix}"));
+    }
+
+    Ok(row)
+}
+
+/// The line that reports one added rule.
+fn rule_add_line(
+    rule: Id,
+    bot: Id,
+    effect: &str,
+    tool: &str,
+    command_prefix: Option<&str>,
+    path_prefix: Option<&str>,
+) -> String {
+    let mut line = format!("Added rule {rule} for Bot {bot}: {effect} {tool}");
+    if let Some(prefix) = command_prefix {
+        line.push_str(&format!(" (command-prefix {prefix:?})"));
+    }
+    if let Some(prefix) = path_prefix {
+        line.push_str(&format!(" (path-prefix {prefix:?})"));
+    }
+
+    line
+}
+
+/// The line that reports one added rule with the values the Space stored.
+///
+/// The Space normalizes a prefix before it records the rule; printing what the
+/// Space returned shows the rule that actually exists, not the text typed.
+fn rule_add_report(
+    result: &Value,
+    bot: Id,
+    effect: &str,
+    tool: &str,
+    command_prefix: Option<&str>,
+    path_prefix: Option<&str>,
+) -> Result<String> {
+    let rule = entity_id(result, &["rule", "id"])?;
+    let command_prefix = result.get("command_prefix").map_or_else(
+        || command_prefix.map(str::to_owned),
+        |value| value.as_str().map(str::to_owned),
+    );
+    let path_prefix = result.get("path_prefix").map_or_else(
+        || path_prefix.map(str::to_owned),
+        |value| value.as_str().map(str::to_owned),
+    );
+
+    Ok(rule_add_line(
+        rule,
+        bot,
+        effect,
+        tool,
+        command_prefix.as_deref(),
+        path_prefix.as_deref(),
+    ))
+}
+
+/// Refuses a prefix that cannot match the tool it names.
+///
+/// The Space validates the rule too; this check turns the refusal into a
+/// local error before a request is sent, because a prefix on the wrong tool
+/// can only ever match nothing.
+fn validate_rule_arguments(
+    tool: &str,
+    command_prefix: Option<&str>,
+    path_prefix: Option<&str>,
+) -> Result<()> {
+    if command_prefix.is_some() && path_prefix.is_some() {
+        bail!("pass at most one of --command-prefix and --path-prefix");
+    }
+    let tool = tool.trim();
+    if tool.is_empty() {
+        bail!("--tool must not be empty");
+    }
+    if let Some(prefix) = command_prefix {
+        if tool != "shell" {
+            bail!("--command-prefix matches shell actions; {tool} is not shell");
+        }
+        if prefix.trim().is_empty() {
+            bail!("--command-prefix must not be empty");
+        }
+    }
+    if let Some(prefix) = path_prefix {
+        if tool == "shell" {
+            bail!("--path-prefix matches file actions; shell uses --command-prefix");
+        }
+        if !matches!(tool, "read_file" | "write_file" | "list_files" | "put_file") {
+            bail!(
+                "--path-prefix matches file actions (read_file, write_file, list_files, put_file); \
+                 {tool} is not one"
+            );
+        }
+        if prefix.trim().is_empty() {
+            bail!("--path-prefix must not be empty");
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns the identifier in one of the candidate fields.
+fn entity_id(value: &Value, fields: &[&str]) -> Result<Id> {
+    for field in fields {
+        if value.get(*field).is_some() {
+            return id_of(value, field);
+        }
+    }
+
+    bail!("the answer has none of {}", fields.join(", "))
+}
+
+/// Returns the entry with this identifier, when the answer has one.
+fn find_entity(list: &Value, field: &str, id: Id) -> Result<Option<Value>> {
+    let wanted = id.to_string();
+
+    Ok(list
+        .as_array()
+        .context("no entries in the answer")?
+        .iter()
+        .find(|entry| entry[field].as_str() == Some(wanted.as_str()))
+        .cloned())
+}
+
+/// What an approval view said about an Always allow's reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LastingScope {
+    /// The view had no field; the CLI may derive a scope from the action.
+    Missing,
+    /// The Space said this action has no lasting scope.
+    Unavailable,
+    /// The Space named the scope.
+    Named(String),
+}
+
+/// One approval as the interactive prompt shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApprovalCard {
+    /// The approval identifier.
+    approval: Id,
+    /// The tool that asked.
+    tool: String,
+    /// The short text the Space wrote.
+    summary: String,
+    /// The reason the Space gave.
+    reason: String,
+    /// Whether no rule can judge the action, so the reason cannot name one.
+    ambiguous: bool,
+    /// Whether the Space says the action can be undone, when it says.
+    undoable: Option<String>,
+    /// What an Always allow would cover, as the Space said or left out.
+    lasting_scope: LastingScope,
+    /// The arguments the action runs with.
+    arguments: Value,
+}
+
+impl ApprovalCard {
+    /// Reads one card from the Space's approval view.
+    fn from_view(approval: &Value) -> Result<Self> {
+        Ok(Self {
+            approval: entity_id(approval, &["approval"])?,
+            tool: text_of(approval, "tool")?.to_owned(),
+            summary: approval["summary"].as_str().unwrap_or_default().to_owned(),
+            reason: text_of(approval, "reason")?.to_owned(),
+            ambiguous: approval["ambiguous"].as_bool().unwrap_or(false),
+            undoable: approval["undoable"].as_str().map(str::to_owned),
+            lasting_scope: match approval.get("lasting_scope") {
+                None => LastingScope::Missing,
+                Some(Value::Null) => LastingScope::Unavailable,
+                Some(Value::String(scope)) if !scope.is_empty() => {
+                    LastingScope::Named(scope.clone())
+                }
+                Some(_) => LastingScope::Unavailable,
+            },
+            arguments: approval.get("arguments").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    /// Returns whether the Space would accept a lasting answer.
+    fn offers_always(&self) -> bool {
+        self.always_scope().is_some()
+    }
+
+    /// Returns the card's line about undoing the action.
+    ///
+    /// The Space names the undoability; when that field is missing this falls
+    /// back to the tool: a shell command or a write can change the machine and
+    /// is not undoable, while a read may leak data and is not called safe.
+    fn undo_text(&self) -> &'static str {
+        match self.undoable.as_deref() {
+            Some("no") => "This action cannot be undone.",
+            Some("unknown") => "It is not known whether this action can be undone.",
+            _ => match self.tool.as_str() {
+                "shell" | "write_file" => "This action cannot be undone.",
+                _ => "It is not known whether this action can be undone.",
+            },
+        }
+    }
+
+    /// Returns what an Always allow would cover, when the prompt offers it.
+    ///
+    /// The Space decides whether a lasting rule is possible: an unavailable
+    /// scope means no Always allow at all. A missing field is derived locally
+    /// from the tool and its arguments, but only when that derivation is
+    /// possible; the User never grants a lasting rule without seeing its
+    /// reach.
+    fn always_scope(&self) -> Option<String> {
+        if self.reason != "rule" {
+            return None;
+        }
+
+        match &self.lasting_scope {
+            LastingScope::Named(scope) => Some(escape_text(scope)),
+            LastingScope::Unavailable => None,
+            LastingScope::Missing => self.derived_scope(),
+        }
+    }
+
+    /// Derives a lasting scope from the tool and its arguments.
+    fn derived_scope(&self) -> Option<String> {
+        match self.tool.as_str() {
+            "shell" => self
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(|command| command.split_whitespace().next())
+                .map(|word| format!("shell commands starting with \"{}\"", escape_text(word))),
+            "read_file" | "write_file" | "list_files" | "put_file" => self
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .map(file_scope),
+            _ => None,
+        }
+    }
+
+    /// Returns the reason as the card reads it.
+    fn reason_text(&self) -> String {
+        // The first use of a Local Computer is the reason even if something
+        // else is true; then ambiguity wins because no rule can name what
+        // asked.
+        if self.reason == "first_use_local" {
+            "first use of your Local Computer".to_owned()
+        } else if self.ambiguous {
+            "a form no rule can judge".to_owned()
+        } else if self.reason == "rule" {
+            "a rule you set".to_owned()
+        } else {
+            self.reason.clone()
+        }
+    }
+
+    /// Returns the keys the prompt offers.
+    fn options(&self) -> &'static str {
+        if self.offers_always() {
+            "[a]llow / [A]lways allow / [d]eny / [q]uit"
+        } else {
+            "[a]llow / [d]eny / [q]uit"
+        }
+    }
+
+    /// Returns the answers the prompt accepts.
+    fn answers(&self) -> &'static str {
+        if self.offers_always() {
+            "a, A, d"
+        } else {
+            "a, d"
+        }
+    }
+
+    /// Renders the approval card; the prompt is printed by the reader.
+    fn render(&self) -> String {
+        let summary = if self.summary.is_empty() {
+            String::new()
+        } else {
+            format!("\n  {}", escape_text(&self.summary))
+        };
+
+        let scope = self
+            .always_scope()
+            .map(|scope| format!("\n  Always allow covers: {scope}"))
+            .unwrap_or_default();
+
+        format!(
+            "Approval {} for {}{}\n  reason: {}{}\n  {}",
+            self.approval,
+            escape_text(&self.tool),
+            summary,
+            self.reason_text(),
+            scope,
+            self.undo_text()
+        )
+    }
+}
+
+/// The answer a User gave to a card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Decision {
+    /// Allow this one action.
+    Allow,
+    /// Allow this kind of action from now on.
+    AlwaysAllow,
+    /// Deny the action; the run stops.
+    Deny,
+    /// Leave the run waiting.
+    Quit,
+}
+
+/// Maps one line of input to an answer.
+fn decision_from_input(line: &str, always_available: bool) -> Option<Decision> {
+    match line.trim() {
+        "a" => Some(Decision::Allow),
+        "A" if always_available => Some(Decision::AlwaysAllow),
+        "d" => Some(Decision::Deny),
+        "q" => Some(Decision::Quit),
+        _ => None,
+    }
+}
+
+/// Asks until the User gives an answer the card offers.
+fn read_decision(
+    card: &ApprovalCard,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<Decision> {
+    loop {
+        write!(output, "{} ", card.options())?;
+        output.flush()?;
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            // A terminal that closed cannot answer; leave the run waiting.
+            return Ok(Decision::Quit);
+        }
+        if let Some(decision) = decision_from_input(&line, card.offers_always()) {
+            return Ok(decision);
+        }
+        writeln!(output, "answer {}; q quits.", card.answers())?;
+    }
+}
+
+/// The line that tells a script how to answer a waiting run.
+fn waiting_advice(run: Id, approval: Id) -> String {
+    format!(
+        "run {run} is waiting for approval {approval}; answer with `neha approval allow {approval}`"
+    )
+}
+
+/// What following a run stopped at.
+enum Follow {
+    /// The run ended; this is its last view.
+    Finished(Value),
+    /// The run still waits for an approval.
+    Waiting,
+}
+
+/// Follows one run, answering approvals on a terminal and reporting them to a script.
+async fn follow_run(
+    credential: &Credential,
+    chat: Id,
+    run: Id,
+    progress: &mut Progress,
+) -> Result<Follow> {
+    loop {
+        let view = client::wait_for_run(credential, run, |view| progress.observed(view)).await?;
+        if view["status"].as_str() != Some("waiting") {
+            return Ok(Follow::Finished(view));
+        }
+        let approval = id_of(&view, "approval")?;
+        if !std::io::stdin().is_terminal() {
+            println!("{}", waiting_advice(run, approval));
+            return Ok(Follow::Waiting);
+        }
+        let card = approval_card(credential, chat, approval).await?;
+        println!("{}", card.render());
+        let decision = {
+            let stdin = std::io::stdin();
+            let mut input = stdin.lock();
+            let stdout = std::io::stdout();
+            let mut output = stdout.lock();
+            read_decision(&card, &mut input, &mut output)?
+        };
+        let (allow, lasting) = match decision {
+            Decision::Quit => {
+                println!("{}", waiting_advice(run, approval));
+                return Ok(Follow::Waiting);
+            }
+            Decision::Allow => (true, false),
+            Decision::AlwaysAllow => (true, true),
+            Decision::Deny => (false, false),
+        };
+        client::command(
+            credential,
+            CommandCall::ApprovalDecide {
+                approval,
+                allow,
+                lasting,
+            },
+        )
+        .await?;
+    }
+}
+
+/// Reads one waiting approval's card from the Space.
+async fn approval_card(credential: &Credential, chat: Id, approval: Id) -> Result<ApprovalCard> {
+    let list = client::command(credential, CommandCall::ApprovalList { chat: Some(chat) }).await?;
+    let found = find_entity(&list, "approval", approval)?
+        .with_context(|| format!("approval {approval} is no longer waiting"))?;
+
+    ApprovalCard::from_view(&found)
 }
 
 /// Reads the text of the Message a finished run replied with.
@@ -1001,6 +1738,34 @@ mod tests {
 
     use super::{Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer};
 
+    use super::{
+        ApprovalCard, ApprovalCommand, Decision, LastingScope, RuleCommand, RuleEffectChoice,
+        approval_row, decision_from_input, decision_line, escape_text, read_decision,
+        rule_add_line, rule_add_report, rule_rows, validate_rule_arguments, waiting_advice,
+        write_approval_details,
+    };
+
+    /// Parses a CLI command line.
+    fn parse(args: &[&str]) -> Top {
+        Cli::try_parse_from(std::iter::once("neha").chain(args.iter().copied()))
+            .unwrap()
+            .command
+    }
+
+    /// A card for one tool; absent Space fields exercise the local fallbacks.
+    fn approval_card(tool: &str, reason: &str) -> ApprovalCard {
+        ApprovalCard {
+            approval: Id::new(),
+            tool: tool.to_owned(),
+            summary: "printf approved > proof.txt".to_owned(),
+            reason: reason.to_owned(),
+            ambiguous: false,
+            undoable: None,
+            lasting_scope: LastingScope::Missing,
+            arguments: json!({"command": "printf approved > proof.txt"}),
+        }
+    }
+
     #[test]
     fn the_bot_computer_choice_parses_local_hosted_and_an_id() {
         assert_eq!(
@@ -1162,5 +1927,699 @@ mod tests {
         ] {
             assert!(space_file_name(name).is_err(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn the_approval_commands_parse() {
+        assert!(matches!(
+            parse(&["approval", "list"]),
+            Top::Approval {
+                command: ApprovalCommand::List
+            }
+        ));
+        let approval = Id::new();
+        let text = approval.to_string();
+        match parse(&["approval", "show", text.as_str()]) {
+            Top::Approval {
+                command: ApprovalCommand::Show { approval: shown },
+            } => assert_eq!(shown, approval),
+            _ => panic!("approval show did not parse"),
+        }
+        match parse(&["approval", "allow", text.as_str(), "--always"]) {
+            Top::Approval {
+                command:
+                    ApprovalCommand::Allow {
+                        approval: shown,
+                        always,
+                    },
+            } => {
+                assert_eq!(shown, approval);
+                assert!(always);
+            }
+            _ => panic!("approval allow did not parse"),
+        }
+        match parse(&["approval", "deny", text.as_str()]) {
+            Top::Approval {
+                command: ApprovalCommand::Deny { approval: shown },
+            } => assert_eq!(shown, approval),
+            _ => panic!("approval deny did not parse"),
+        }
+        assert!(Cli::try_parse_from(["neha", "approval", "allow"]).is_err());
+    }
+
+    #[test]
+    fn the_rule_commands_parse() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        match parse(&["rule", "list", "--bot", bot_text.as_str()]) {
+            Top::Rule {
+                command: RuleCommand::List { bot: shown },
+            } => assert_eq!(shown, Some(bot)),
+            _ => panic!("rule list did not parse"),
+        }
+        match parse(&[
+            "rule",
+            "add",
+            "--bot",
+            bot_text.as_str(),
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "git",
+        ]) {
+            Top::Rule {
+                command:
+                    RuleCommand::Add {
+                        bot: shown,
+                        effect,
+                        tool,
+                        command_prefix,
+                        path_prefix,
+                    },
+            } => {
+                assert_eq!(shown, bot);
+                assert_eq!(effect, RuleEffectChoice::Ask);
+                assert_eq!(tool, "shell");
+                assert_eq!(command_prefix.as_deref(), Some("git"));
+                assert_eq!(path_prefix, None);
+            }
+            _ => panic!("rule add did not parse"),
+        }
+        let rule = Id::new();
+        let rule_text = rule.to_string();
+        match parse(&["rule", "remove", rule_text.as_str()]) {
+            Top::Rule {
+                command: RuleCommand::Remove { rule: shown },
+            } => assert_eq!(shown, rule),
+            _ => panic!("rule remove did not parse"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "neha",
+                "rule",
+                "add",
+                "--bot",
+                bot_text.as_str(),
+                "--effect",
+                "maybe",
+                "--tool",
+                "shell",
+            ])
+            .is_err(),
+            "an unknown effect is refused"
+        );
+    }
+
+    #[test]
+    fn a_rule_prefix_is_checked_against_its_tool() {
+        validate_rule_arguments("shell", None, None).unwrap();
+        validate_rule_arguments("shell", Some("git"), None).unwrap();
+        validate_rule_arguments("read_file", None, Some("/home/ada")).unwrap();
+        validate_rule_arguments("write_file", None, Some(".")).unwrap();
+        validate_rule_arguments("put_file", None, Some("logs")).unwrap();
+
+        for (tool, command_prefix, path_prefix, expected) in [
+            ("shell", Some("git"), Some("/tmp"), "at most one"),
+            ("read_file", Some("git"), None, "--command-prefix"),
+            ("shell", None, Some("/tmp"), "--path-prefix"),
+            ("take_file", None, Some("/tmp"), "--path-prefix"),
+            ("shell", Some("  "), None, "must not be empty"),
+            ("read_file", None, Some(" "), "must not be empty"),
+            ("   ", None, None, "--tool"),
+        ] {
+            let error = validate_rule_arguments(tool, command_prefix, path_prefix)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{tool:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_card_hides_always_allow_until_a_rule_asked() {
+        let rule = approval_card("shell", "rule");
+        let rendered = rule.render();
+        assert!(rendered.contains("Approval "), "{rendered}");
+        assert!(rendered.contains("for shell"), "{rendered}");
+        assert!(
+            rendered.contains("printf approved > proof.txt"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("reason: a rule you set"), "{rendered}");
+        assert!(
+            rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+        assert_eq!(rule.options(), "[a]llow / [A]lways allow / [d]eny / [q]uit");
+
+        let first_use = approval_card("shell", "first_use_local");
+        let rendered = first_use.render();
+        assert!(
+            rendered.contains("reason: first use of your Local Computer"),
+            "{rendered}"
+        );
+        // The first use of a Local Computer cannot be covered by a lasting
+        // rule, so its card neither offers nor describes Always allow.
+        assert_eq!(first_use.options(), "[a]llow / [d]eny / [q]uit");
+        assert!(!rendered.contains("Always allow"), "{rendered}");
+    }
+
+    #[test]
+    fn a_card_reads_the_space_view_fields() {
+        let view = json!({
+            "approval": Id::new(),
+            "tool": "shell",
+            "summary": "printf hi",
+            "reason": "rule",
+            "ambiguous": true,
+            "undoable": "no",
+            "lasting_scope": "shell commands starting with \"printf\"",
+            "arguments": {"command": "printf hi"},
+        });
+        let card = ApprovalCard::from_view(&view).unwrap();
+        assert!(card.ambiguous);
+        assert_eq!(card.undoable.as_deref(), Some("no"));
+        assert_eq!(
+            card.lasting_scope,
+            LastingScope::Named("shell commands starting with \"printf\"".to_owned())
+        );
+        assert_eq!(card.arguments["command"], "printf hi");
+        let rendered = card.render();
+        assert!(
+            rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Always allow covers: shell commands starting with \"printf\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("reason: a form no rule can judge"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_card_says_whether_the_action_can_be_undone() {
+        // The Space's undoable field wins over what the tool looks like.
+        let mut card = approval_card("read_file", "rule");
+        card.undoable = Some("no".to_owned());
+        let rendered = card.render();
+        assert!(
+            rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("It is not known whether this action can be undone."),
+            "{rendered}"
+        );
+
+        let mut card = approval_card("shell", "rule");
+        card.undoable = Some("unknown".to_owned());
+        let rendered = card.render();
+        assert!(
+            rendered.contains("It is not known whether this action can be undone."),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+
+        // A missing field falls back to the tool.
+        for tool in ["shell", "write_file"] {
+            let rendered = approval_card(tool, "rule").render();
+            assert!(
+                rendered.contains("This action cannot be undone."),
+                "{tool}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("It is not known whether this action can be undone."),
+                "{tool}: {rendered}"
+            );
+            // The line comes after the tool, summary, and reason.
+            let reason = rendered.find("reason:").expect("the card names a reason");
+            let undo = rendered
+                .find("This action cannot be undone.")
+                .expect("the card names the undo state");
+            assert!(reason < undo, "{tool}: {rendered}");
+        }
+        for tool in ["read_file", "list_files"] {
+            let rendered = approval_card(tool, "rule").render();
+            assert!(
+                rendered.contains("It is not known whether this action can be undone."),
+                "{tool}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("This action cannot be undone."),
+                "{tool}: {rendered}"
+            );
+        }
+        // A tool this CLI does not know is not called safe either.
+        assert!(
+            approval_card("future_tool", "rule")
+                .render()
+                .contains("It is not known whether this action can be undone.")
+        );
+    }
+
+    #[test]
+    fn a_card_does_not_blame_a_rule_when_no_rule_can_judge() {
+        // An ambiguous approval has no matching rule: the card must not say a
+        // rule asked, while an ordinary rule approval still names the rule.
+        let mut card = approval_card("shell", "rule");
+        card.ambiguous = true;
+        let rendered = card.render();
+        assert!(
+            rendered.contains("reason: a form no rule can judge"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("a rule you set"), "{rendered}");
+
+        let card = approval_card("shell", "rule");
+        let rendered = card.render();
+        assert!(rendered.contains("reason: a rule you set"), "{rendered}");
+        assert!(!rendered.contains("a form no rule can judge"), "{rendered}");
+
+        // Ambiguity also wins for a reason this build does not know.
+        let mut card = approval_card("shell", "future_reason");
+        card.ambiguous = true;
+        assert!(
+            card.render().contains("reason: a form no rule can judge"),
+            "{}",
+            card.render()
+        );
+
+        // The first-use reason is unchanged even if the field says ambiguous.
+        for ambiguous in [false, true] {
+            let mut card = approval_card("shell", "first_use_local");
+            card.ambiguous = ambiguous;
+            let rendered = card.render();
+            assert!(
+                rendered.contains("reason: first use of your Local Computer"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("a rule you set"), "{rendered}");
+            assert!(!rendered.contains("a form no rule can judge"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn a_card_shows_what_always_allow_covers() {
+        // The Space's scope wins.
+        let mut card = approval_card("shell", "rule");
+        card.lasting_scope = LastingScope::Named("shell commands starting with \"git\"".to_owned());
+        let rendered = card.render();
+        assert!(
+            rendered.contains("Always allow covers: shell commands starting with \"git\""),
+            "{rendered}"
+        );
+
+        // Without the field the scope is derived from the command's first word.
+        let card = approval_card("shell", "rule");
+        let rendered = card.render();
+        assert!(
+            rendered.contains("Always allow covers: shell commands starting with \"printf\""),
+            "{rendered}"
+        );
+
+        // File scopes name the parent directory, or the Workspace root.
+        let mut card = approval_card("read_file", "rule");
+        card.arguments = json!({"path": "logs/run.txt"});
+        assert!(
+            card.render()
+                .contains("Always allow covers: files under \"logs\""),
+            "{}",
+            card.render()
+        );
+        card.arguments = json!({"path": "note.txt"});
+        assert!(
+            card.render()
+                .contains("Always allow covers: files in the Workspace root"),
+            "{}",
+            card.render()
+        );
+        card.arguments = json!({"path": "/tmp/report.txt"});
+        assert!(
+            card.render()
+                .contains("Always allow covers: files under \"/tmp\""),
+            "{}",
+            card.render()
+        );
+        // An unknown tool without a scope cannot derive one, so no Always
+        // allow is offered.
+        let mut card = approval_card("future_tool", "rule");
+        card.arguments = serde_json::Value::Null;
+        assert!(
+            !card.render().contains("Always allow covers"),
+            "{}",
+            card.render()
+        );
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
+
+        // First use has no Always allow, so it names no lasting scope.
+        let rendered = approval_card("shell", "first_use_local").render();
+        assert!(!rendered.contains("Always allow covers"), "{rendered}");
+    }
+
+    #[test]
+    fn a_card_offers_always_only_with_a_lasting_scope() {
+        // The Space named a scope: Always allow is offered with that reach.
+        let mut card = approval_card("shell", "rule");
+        card.lasting_scope = LastingScope::Named("shell commands starting with \"git\"".to_owned());
+        assert!(card.options().contains("[A]lways allow"), "{card:?}");
+        assert!(
+            card.render()
+                .contains("Always allow covers: shell commands starting with \"git\""),
+            "{}",
+            card.render()
+        );
+
+        // The Space said this action has no lasting scope (for example a path
+        // the Space refused): no Always allow, and no scope line.
+        let mut card = approval_card("shell", "rule");
+        card.lasting_scope = LastingScope::Unavailable;
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
+        assert!(
+            !card.render().contains("Always allow covers"),
+            "{}",
+            card.render()
+        );
+
+        // A missing field is derived when the action allows it.
+        let card = approval_card("shell", "rule");
+        assert!(card.options().contains("[A]lways allow"), "{card:?}");
+        assert!(
+            card.render()
+                .contains("Always allow covers: shell commands starting with \"printf\""),
+            "{}",
+            card.render()
+        );
+
+        // A missing field that cannot be derived offers no Always allow.
+        let mut card = approval_card("shell", "rule");
+        card.arguments = serde_json::Value::Null;
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
+        assert!(
+            !card.render().contains("Always allow covers"),
+            "{}",
+            card.render()
+        );
+
+        // A view with an explicit null is unavailable, not missing.
+        let view = json!({
+            "approval": Id::new(),
+            "tool": "shell",
+            "summary": "printf hi",
+            "reason": "rule",
+            "ambiguous": false,
+            "undoable": "no",
+            "lasting_scope": null,
+            "arguments": {"command": "printf hi"},
+        });
+        let card = ApprovalCard::from_view(&view).unwrap();
+        assert_eq!(card.lasting_scope, LastingScope::Unavailable);
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
+    }
+
+    #[test]
+    fn a_card_escapes_control_characters_and_keeps_long_commands() {
+        assert_eq!(
+            escape_text("a\nb\rc\td\u{001b}[31m"),
+            "a\\nb\\rc\\td\\u{001b}[31m"
+        );
+
+        let mut card = approval_card("shell", "rule");
+        card.summary = "printf 'hi'\n\r\t\u{001b}[2J spoof".to_owned();
+        let rendered = card.render();
+        assert!(
+            !rendered.contains('\u{001b}'),
+            "no escape byte: {rendered:?}"
+        );
+        assert!(rendered.contains("\\n"), "{rendered:?}");
+        assert!(rendered.contains("\\r"), "{rendered:?}");
+        assert!(rendered.contains("\\t"), "{rendered:?}");
+        assert!(rendered.contains("\\u{001b}[2J"), "{rendered:?}");
+        assert!(rendered.contains("spoof"), "{rendered:?}");
+
+        // A long command is shown whole; the terminal wraps it.
+        let long = format!("printf '{}' > proof.txt", "x".repeat(400));
+        card.summary = long.clone();
+        let rendered = card.render();
+        assert!(
+            rendered.contains(&escape_text(&long)),
+            "the long command is not clipped: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn approval_show_prints_the_full_arguments() {
+        let command = format!("printf '{}' > proof.txt", "a".repeat(400));
+        let rule = Id::new();
+        let approval = json!({
+            "approval": Id::new(),
+            "run": Id::new(),
+            "bot": Id::new(),
+            "action": Id::new(),
+            "chat": Id::new(),
+            "step": 2,
+            "index": 3,
+            "tool": "shell",
+            "reason": "rule",
+            "rule": rule,
+            "ambiguous": false,
+            "summary": "printf long",
+            "arguments": {"command": command, "cwd": "logs"},
+        });
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  index 3"), "{out}");
+        assert!(out.contains(&format!("  rule {rule}")), "{out}");
+        assert!(out.contains("  ambiguous false"), "{out}");
+        let expected = escape_text(&serde_json::to_string(&approval["arguments"]).unwrap());
+        assert!(out.contains(&format!("  arguments {expected}")), "{out}");
+        assert!(out.contains(&"a".repeat(400)), "the whole command is shown");
+    }
+
+    #[test]
+    fn approval_show_marks_an_ambiguous_approval() {
+        // A rule that cannot judge the action names no single rule; the User
+        // must see that before answering.
+        let mut approval = json!({
+            "approval": Id::new(),
+            "run": Id::new(),
+            "bot": Id::new(),
+            "action": Id::new(),
+            "chat": Id::new(),
+            "step": 1,
+            "index": 0,
+            "tool": "shell",
+            "reason": "rule",
+            "ambiguous": true,
+            "summary": "printf?",
+            "arguments": {"command": "printf? $(date)"},
+        });
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  ambiguous true"), "{out}");
+        assert!(!out.contains("  rule "), "{out}");
+
+        // A view without the field is not called ambiguous.
+        approval.as_object_mut().unwrap().remove("ambiguous");
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  ambiguous false"), "{out}");
+    }
+
+    #[test]
+    fn a_decision_letter_maps_to_an_approval_answer() {
+        for always in [false, true] {
+            assert_eq!(decision_from_input("a\n", always), Some(Decision::Allow));
+            assert_eq!(decision_from_input(" a ", always), Some(Decision::Allow));
+            assert_eq!(decision_from_input("d\n", always), Some(Decision::Deny));
+            assert_eq!(decision_from_input("q\n", always), Some(Decision::Quit));
+        }
+        assert_eq!(
+            decision_from_input("A\n", true),
+            Some(Decision::AlwaysAllow)
+        );
+        // The first use of a Local Computer cannot be covered by a rule, so
+        // the card does not offer Always allow there.
+        assert_eq!(decision_from_input("A\n", false), None);
+        for line in ["", "yes", "D", "Q", "aa"] {
+            assert_eq!(decision_from_input(line, true), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_card_reprompts_until_the_answer_is_offered() {
+        let card = approval_card("shell", "rule");
+        let mut input = std::io::Cursor::new(b"x\nA\n");
+        let mut output = Vec::new();
+        let decision = read_decision(&card, &mut input, &mut output).unwrap();
+        assert_eq!(decision, Decision::AlwaysAllow);
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("[a]llow / [A]lways allow").count(), 2);
+        assert!(output.contains("answer a, A, d; q quits."), "{output}");
+
+        // A terminal that closed cannot answer.
+        let mut input = std::io::Cursor::new(b"");
+        let mut output = Vec::new();
+        assert_eq!(
+            read_decision(&card, &mut input, &mut output).unwrap(),
+            Decision::Quit
+        );
+
+        // Always allow is not a valid answer for the first use.
+        let first_use = approval_card("shell", "first_use_local");
+        let mut input = std::io::Cursor::new(b"A\nq\n");
+        let mut output = Vec::new();
+        assert_eq!(
+            read_decision(&first_use, &mut input, &mut output).unwrap(),
+            Decision::Quit
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("answer a, d; q quits."), "{output}");
+    }
+
+    #[test]
+    fn a_waiting_run_names_the_command_to_answer_it() {
+        let run = Id::new();
+        let approval = Id::new();
+        assert_eq!(
+            waiting_advice(run, approval),
+            format!(
+                "run {run} is waiting for approval {approval}; answer with `neha approval allow {approval}`"
+            )
+        );
+    }
+
+    #[test]
+    fn approval_and_rule_rows_show_the_pinned_columns() {
+        let approval = Id::new();
+        let run = Id::new();
+        let bot = Id::new();
+        let action = Id::new();
+        let chat = Id::new();
+        let view = json!({
+            "approval": approval,
+            "run": run,
+            "bot": bot,
+            "action": action,
+            "chat": chat,
+            "step": 2,
+            "tool": "shell",
+            "reason": "first_use_local",
+            "summary": "printf approved > proof.txt",
+        });
+        assert_eq!(
+            approval_row(&view).unwrap(),
+            format!(
+                "{approval}  {run}  {bot}  shell  first_use_local  printf approved > proof.txt"
+            )
+        );
+        let mut details = Vec::new();
+        write_approval_details(&mut details, &view).unwrap();
+        let details = String::from_utf8(details).unwrap();
+        assert!(details.contains("  step 2"), "{details}");
+        assert!(details.contains(&format!("  action {action}")), "{details}");
+        assert!(details.contains(&format!("  chat {chat}")), "{details}");
+
+        let rule = Id::new();
+        let list = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "ask",
+            "tool": "shell",
+            "command_prefix": "git",
+            "path_prefix": null,
+        }]);
+        assert_eq!(
+            rule_rows(&list).unwrap(),
+            vec![format!("{rule}  {bot}  ask  shell  command-prefix git")]
+        );
+        assert_eq!(rule_rows(&json!([])).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            rule_add_line(rule, bot, "ask", "shell", Some("git"), None),
+            format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
+        );
+        assert_eq!(
+            rule_add_line(rule, bot, "allow", "read_file", None, Some("/tmp")),
+            format!("Added rule {rule} for Bot {bot}: allow read_file (path-prefix \"/tmp\")")
+        );
+        assert_eq!(
+            decision_line(true, approval, Some(&run.to_string())),
+            format!("Allowed {approval} for run {run}.")
+        );
+        assert_eq!(
+            decision_line(false, approval, None),
+            format!("Denied {approval}.")
+        );
+    }
+
+    #[test]
+    fn a_rule_add_reports_the_normalized_prefixes() {
+        let rule = Id::new();
+        let bot = Id::new();
+        // The Space stored "logs" after normalizing the typed "./logs/".
+        let result = json!({
+            "rule": rule,
+            "command_prefix": null,
+            "path_prefix": "logs",
+        });
+        assert_eq!(
+            rule_add_report(&result, bot, "ask", "put_file", None, Some("./logs/")).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: ask put_file (path-prefix \"logs\")")
+        );
+
+        // The same for shell commands: print what the Space kept.
+        let result = json!({
+            "rule": rule,
+            "command_prefix": "git",
+            "path_prefix": null,
+        });
+        assert_eq!(
+            rule_add_report(&result, bot, "allow", "shell", Some("  git  "), None).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: allow shell (command-prefix \"git\")")
+        );
+
+        // A Space answer without the fields falls back to what was typed.
+        let result = json!({"rule": rule});
+        assert_eq!(
+            rule_add_report(&result, bot, "ask", "shell", Some("git"), None).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
+        );
+    }
+
+    #[test]
+    fn a_waiting_run_shows_its_pending_approval() {
+        let mut view = run_view("waiting", None);
+        let approval = Id::new();
+        view["approval"] = json!(approval);
+        let mut shown = Vec::new();
+        write_run(&mut shown, &view).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains(&format!("  approval {approval}")), "{shown}");
+        assert!(shown.contains("Run "), "{shown}");
     }
 }

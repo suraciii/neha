@@ -84,8 +84,9 @@ export interface BotResult {
   chat: Chat;
 }
 
-// How a run is doing, from queued to finished.
-export type RunStatus = "queued" | "running" | "succeeded" | "failed";
+// How a run is doing, from queued to finished. A running run that asks for
+// an approval waits until the User answers.
+export type RunStatus = "queued" | "running" | "waiting" | "succeeded" | "failed";
 
 // The command result that starts a run: the Space accepts it into the queue.
 export interface SendResult {
@@ -110,9 +111,56 @@ export interface RunView {
   seq: string;
   // The run's place in its Bot's queue; only a queued run has one.
   position?: number;
+  // The approval a waiting run stops for.
+  approval?: string | null;
   reply: string | null;
   error: string | null;
   usage: unknown;
+}
+
+// Why a Bot asked before an action: the first use of the User's own Computer,
+// or a rule the User set to be asked.
+export type ApprovalReason = "first_use_local" | "rule";
+
+// Whether an action can be undone, as far as the Space knows.
+export type Undoable = "no" | "unknown";
+
+// One action a Bot waits to run until the User answers.
+export interface Approval {
+  approval: string;
+  run: string;
+  bot: string;
+  chat: string;
+  action: string;
+  step: number;
+  tool: string;
+  // What the Bot asked for, under the tool's own argument names.
+  arguments?: Record<string, unknown> | null;
+  summary: string;
+  reason: ApprovalReason;
+  // No rule could judge this action's form, so the Space asked instead.
+  ambiguous?: boolean | null;
+  rule?: string | null;
+  // Whether the action can be undone, as far as the Space knows.
+  undoable?: Undoable | null;
+  // What an Always allow would cover, in the Space's words: null when the Space
+  // says no lasting rule can come from this action, absent when it says nothing.
+  lasting_scope?: string | null;
+  // The machine the action would run on, and the User who answers.
+  computer?: string | null;
+  acting?: string | null;
+  // The call's position among its step's calls, and the call's identifier.
+  index?: number | null;
+  call?: string | null;
+  // The User's answer, once given. The Space lists only approvals still waiting.
+  decided?: boolean | null;
+}
+
+// The answer the Space records for one approval.
+export interface Decision {
+  approval: string;
+  run: string;
+  status: "allowed" | "denied";
 }
 
 // What the Chat shows while its run has not finished.

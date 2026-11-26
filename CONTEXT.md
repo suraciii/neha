@@ -48,6 +48,14 @@ _Avoid_: iteration, cycle, phase
 One thing a Bot does on its Computer or with a tool. The record holds an action before it runs.
 _Avoid_: call, command, tool call
 
+**Approval**:
+A request from a Bot's loop to the User it acts for, asking whether one Computer action may run. The User answers Allow, Always allow, or Deny.
+_Avoid_: permission, consent, confirmation (as the term)
+
+**Rule**:
+A lasting choice by a User that a kind of action always asks (Ask) or allows (Allow).
+_Avoid_: policy, permission, setting, mode
+
 **Vault**:
 The Space's store of passwords and keys that a Bot uses without seeing.
 _Avoid_: wallet, safe, secret store
