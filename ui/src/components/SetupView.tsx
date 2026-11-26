@@ -1,7 +1,9 @@
 import { Show, createSignal } from "solid-js";
 
+import { t } from "../i18n";
 import type { Account, Bot, Model, Provider } from "../types";
 import Icon from "./Icon";
+import LocaleSwitch from "./LocaleSwitch";
 
 interface ProviderInput {
   baseUrl: string;
@@ -54,12 +56,13 @@ export default function SetupView(props: SetupViewProps) {
   return (
     <div class="setup">
       <header class="setup__head">
-        <p class="eyebrow">{providerReady() ? "Step 2 of 2" : "Step 1 of 2"}</p>
-        <h1>{providerReady() ? "Create your first Bot" : "Connect a model Provider first"}</h1>
+        <div class="setup__top">
+          <p class="eyebrow">{providerReady() ? t("setup.step.two") : t("setup.step.one")}</p>
+          <LocaleSwitch />
+        </div>
+        <h1>{providerReady() ? t("setup.bot.title") : t("setup.provider.title")}</h1>
         <p class="setup__lede">
-          {providerReady()
-            ? "A Bot has its own identity, memory, and Computer. Give it a name and hand it work."
-            : "Every Bot in this Space thinks through a Provider. The key stays inside the Space."}
+          {providerReady() ? t("setup.bot.lede") : t("setup.provider.lede")}
         </p>
       </header>
 
@@ -77,23 +80,27 @@ export default function SetupView(props: SetupViewProps) {
             <section class="panel">
               <div class="panel__head">
                 <div>
-                  <p class="panel__kicker">Provider</p>
-                  <h2>{props.providers.length === 1 ? "Provider connected" : `${props.providers.length} Providers connected`}</h2>
+                  <p class="panel__kicker">{t("setup.panel.provider")}</p>
+                  <h2>
+                    {props.providers.length === 1
+                      ? t("setup.provider.connected.one")
+                      : t("setup.provider.connected.many", { count: props.providers.length })}
+                  </h2>
                 </div>
                 <span class="state state--done">
                   <span class="dot" />
-                  Ready
+                  {t("setup.ready")}
                 </span>
               </div>
               <div class="panel__body">
                 <div class="facts">
                   <div class="fact">
-                    <span class="fact__label">Base URL</span>
+                    <span class="fact__label">{t("setup.baseUrl")}</span>
                     <span class="fact__value mono">{props.providers[0]?.base_url}</span>
                   </div>
                   <div class="fact">
-                    <span class="fact__label">Models</span>
-                    <span class="fact__value">{props.models.map((item) => item.name).join(", ") || "None"}</span>
+                    <span class="fact__label">{t("setup.models")}</span>
+                    <span class="fact__value">{props.models.map((item) => item.name).join(", ") || t("setup.none")}</span>
                   </div>
                 </div>
               </div>
@@ -102,14 +109,14 @@ export default function SetupView(props: SetupViewProps) {
             <form class="panel" onSubmit={createBot}>
               <div class="panel__head">
                 <div>
-                  <p class="panel__kicker">Bot</p>
-                  <h2>Name the teammate</h2>
+                  <p class="panel__kicker">{t("setup.panel.bot")}</p>
+                  <h2>{t("setup.bot.panelTitle")}</h2>
                 </div>
-                <span class="badge">Owner only</span>
+                <span class="badge">{t("setup.bot.accessTitle")}</span>
               </div>
               <div class="panel__body">
                 <label class="field">
-                  <span class="field__label">Name</span>
+                  <span class="field__label">{t("setup.bot.name")}</span>
                   <input
                     class="input"
                     name="bot_name"
@@ -119,21 +126,21 @@ export default function SetupView(props: SetupViewProps) {
                     value={botName()}
                     onInput={(event) => setBotName(event.currentTarget.value)}
                   />
-                  <span class="field__hint">The name appears in Chats, Groups, and the task board.</span>
+                  <span class="field__hint">{t("setup.bot.nameHint")}</span>
                 </label>
                 <div class="access-row">
                   <span class="access-row__icon">
                     <Icon name="lock" size="sm" />
                   </span>
                   <span>
-                    <b>Owner only</b>
-                    <span>Only you can use this Bot. You can invite members later.</span>
+                    <b>{t("setup.bot.accessTitle")}</b>
+                    <span>{t("setup.bot.accessHint")}</span>
                   </span>
                 </div>
               </div>
               <div class="panel__foot">
                 <button class="btn btn--primary" type="submit" disabled={props.busy || botName().trim() === ""}>
-                  {props.busy ? "Creating…" : "Create Bot"}
+                  {props.busy ? t("setup.bot.creating") : t("setup.bot.create")}
                   <Icon name="arrow-right" size="sm" />
                 </button>
               </div>
@@ -144,20 +151,20 @@ export default function SetupView(props: SetupViewProps) {
         <Show
           when={props.account.is_admin}
           fallback={
-            <p class="banner">Ask the Space Admin to connect a Provider before a Bot can work.</p>
+            <p class="banner">{t("setup.noAdmin")}</p>
           }
         >
           <form class="panel" onSubmit={connectProvider}>
             <div class="panel__head">
               <div>
-                <p class="panel__kicker">Provider</p>
-                <h2>Connect an OpenAI-compatible Provider</h2>
+                <p class="panel__kicker">{t("setup.panel.provider")}</p>
+                <h2>{t("setup.provider.panelTitle")}</h2>
               </div>
-              <span class="badge">Admin only</span>
+              <span class="badge">{t("setup.adminOnly")}</span>
             </div>
             <div class="panel__body">
               <label class="field">
-                <span class="field__label">Base URL</span>
+                <span class="field__label">{t("setup.baseUrl")}</span>
                 <input
                   class="input mono"
                   name="base_url"
@@ -167,10 +174,10 @@ export default function SetupView(props: SetupViewProps) {
                   value={baseUrl()}
                   onInput={(event) => setBaseUrl(event.currentTarget.value)}
                 />
-                <span class="field__hint">The address that serves OpenAI Chat Completions.</span>
+                <span class="field__hint">{t("setup.baseUrl.hint")}</span>
               </label>
               <label class="field">
-                <span class="field__label">API key</span>
+                <span class="field__label">{t("setup.apiKey")}</span>
                 <input
                   class="input"
                   name="api_key"
@@ -180,10 +187,10 @@ export default function SetupView(props: SetupViewProps) {
                   value={apiKey()}
                   onInput={(event) => setApiKey(event.currentTarget.value)}
                 />
-                <span class="field__hint">Stored sealed in this Space. The browser never reads it back.</span>
+                <span class="field__hint">{t("setup.apiKey.hint")}</span>
               </label>
               <label class="field">
-                <span class="field__label">Model name</span>
+                <span class="field__label">{t("setup.model")}</span>
                 <input
                   class="input mono"
                   name="model"
@@ -192,7 +199,7 @@ export default function SetupView(props: SetupViewProps) {
                   value={model()}
                   onInput={(event) => setModel(event.currentTarget.value)}
                 />
-                <span class="field__hint">The exact name the Provider expects.</span>
+                <span class="field__hint">{t("setup.model.hint")}</span>
               </label>
 
               <button
@@ -202,12 +209,12 @@ export default function SetupView(props: SetupViewProps) {
                 onClick={() => setShowAdvanced((open) => !open)}
               >
                 <Icon name={showAdvanced() ? "chevron-up" : "chevron-down"} size="sm" />
-                Advanced
+                {t("setup.advanced")}
               </button>
               <Show when={showAdvanced()}>
                 <div class="field-row">
                   <label class="field">
-                    <span class="field__label">Context limit</span>
+                    <span class="field__label">{t("setup.contextLimit")}</span>
                     <input
                       class="input mono"
                       type="number"
@@ -217,7 +224,7 @@ export default function SetupView(props: SetupViewProps) {
                     />
                   </label>
                   <label class="field">
-                    <span class="field__label">Max output</span>
+                    <span class="field__label">{t("setup.maxOutput")}</span>
                     <input
                       class="input mono"
                       type="number"
@@ -230,9 +237,9 @@ export default function SetupView(props: SetupViewProps) {
               </Show>
             </div>
             <div class="panel__foot">
-              <span class="panel__note">A Provider belongs to the whole Space, not to one Browser.</span>
+              <span class="panel__note">{t("setup.provider.note")}</span>
               <button class="btn btn--primary" type="submit" disabled={props.busy}>
-                {props.busy ? "Connecting…" : "Connect Provider"}
+                {props.busy ? t("setup.connecting") : t("setup.connect")}
                 <Icon name="arrow-right" size="sm" />
               </button>
             </div>

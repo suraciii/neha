@@ -6,6 +6,7 @@ import ChatView from "./components/ChatView";
 import Rail from "./components/Rail";
 import SetupView from "./components/SetupView";
 import Sidebar from "./components/Sidebar";
+import { t } from "./i18n";
 import { api, ApiError } from "./lib/api";
 import { Commands, ProtocolError } from "./lib/ws";
 import type {
@@ -18,6 +19,7 @@ import type {
   Provider,
   ProviderResult,
   BotResult,
+  Preview,
   RunView,
   SendResult,
 } from "./types";
@@ -30,14 +32,14 @@ interface State {
   models: Model[];
   bots: Bot[];
   chats: Chat[];
-  previews: Record<string, string>;
+  previews: Record<string, Preview>;
   activeChat: Chat | null;
   messages: Message[];
   activeBot: Bot | null;
   activeComputer: Computer | null;
   working: boolean;
   busy: boolean;
-  error: string | null;
+  error: unknown | null;
 }
 
 const emptyState: State = {
@@ -115,31 +117,30 @@ export default function App() {
         bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
         chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
       });
-      await loadPreviews(chats, bots);
+      await loadPreviews(chats);
       const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
       const target = active ?? (!isMobile() ? chats[0] : undefined);
       if (target) await selectChat(target);
     } catch (reason) {
-      setState("error", messageFor(reason));
+      setState("error", reason);
     } finally {
       setState("busy", false);
     }
   }
 
-  async function loadPreviews(chats: Chat[], bots: Bot[]) {
+  async function loadPreviews(chats: Chat[]) {
     if (chats.length === 0) {
       setState("previews", {});
       return;
     }
-    const previews: Record<string, string> = {};
+    const previews: Record<string, Preview> = {};
     for (const chat of chats) {
       try {
         const messages = await commands.command<Message[]>("chat_read", { chat: chat.id });
         const last = messages.at(-1);
-        const bot = bots.find((candidate) => candidate.id === chat.bot);
-        previews[chat.id] = last?.text ?? (bot ? `Start a Chat with ${bot.name}` : "New Chat");
+        previews[chat.id] = last ? { text: last.text } : null;
       } catch {
-        previews[chat.id] = "Open Chat";
+        previews[chat.id] = { error: true };
       }
     }
     setState("previews", previews);
@@ -161,7 +162,7 @@ export default function App() {
       });
       await restoreRun(chat, messages, generation);
     } catch (reason) {
-      setState("error", messageFor(reason));
+      setState("error", reason);
     }
   }
 
@@ -208,9 +209,9 @@ export default function App() {
       const messages = await commands.command<Message[]>("chat_read", { chat: chat.id });
       setState("messages", messages);
       const last = messages.at(-1);
-      if (last) setState("previews", chat.id, last.text);
+      if (last) setState("previews", chat.id, { text: last.text });
     } catch (reason) {
-      setState("error", messageFor(reason));
+      setState("error", reason);
     }
   }
 
@@ -232,15 +233,15 @@ export default function App() {
       run: null,
     };
     setState({ messages: [...state.messages, optimistic], working: true, error: null });
-    setState("previews", chat.id, trimmed);
+    setState("previews", chat.id, { text: trimmed });
     try {
       const result = await commands.command<SendResult>("message_send", { chat: chat.id, text: trimmed }, 180_000);
       await refreshActive();
       if (result.status === "failed") {
-        setState("error", result.error ?? "The Bot could not answer.");
+        setState("error", result.error ? result.error : { key: "error.botAnswer" });
       }
     } catch (reason) {
-      setState("error", messageFor(reason));
+      setState("error", reason);
       await refreshActive();
     } finally {
       setState("working", false);
@@ -276,7 +277,7 @@ export default function App() {
       ]);
       setState({ providers, models });
     } catch (reason) {
-      setState("error", messageFor(reason));
+      setState("error", reason);
     } finally {
       setState("busy", false);
     }
@@ -295,11 +296,11 @@ export default function App() {
         chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
       });
       const sortedChats = [...chats].sort((left, right) => left.id.localeCompare(right.id));
-      await loadPreviews(sortedChats, bots);
+      await loadPreviews(sortedChats);
       const chat = sortedChats.find((candidate) => candidate.id === result.chat.id) ?? chats[0];
       if (chat) await selectChat(chat);
     } catch (reason) {
-      setState("error", messageFor(reason));
+      setState("error", reason);
     } finally {
       setState("busy", false);
     }
@@ -310,6 +311,7 @@ export default function App() {
     setState({ activeChat: null, messages: [], activeBot: null, activeComputer: null, working: false, error: null });
   }
 
+  const errorText = () => (state.error ? messageFor(state.error) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
 
@@ -340,8 +342,8 @@ export default function App() {
                     when={needsSetup()}
                     fallback={
                       <div class="select-chat">
-                        <p class="eyebrow">Chats</p>
-                        <h2>Select a Chat to open it.</h2>
+                        <p class="eyebrow">{t("select.eyebrow")}</p>
+                        <h2>{t("select.title")}</h2>
                       </div>
                     }
                   >
@@ -351,7 +353,7 @@ export default function App() {
                       models={state.models}
                       bots={state.bots}
                       busy={state.busy}
-                      error={state.error}
+                      error={errorText()}
                       onProvider={(input) => void connectProvider(input)}
                       onBot={(name) => void createBot(name)}
                     />
@@ -364,7 +366,7 @@ export default function App() {
                   computer={state.activeComputer}
                   messages={state.messages}
                   working={state.working}
-                  error={state.error}
+                  error={errorText()}
                   onSend={(text) => void sendMessage(text)}
                   onBack={backToList}
                 />
@@ -386,21 +388,44 @@ function Boot() {
           <path d="M16 11.4 20.6 16 16 20.6 11.4 16Z" />
         </svg>
       </span>
-      <span>Opening the Space…</span>
+      <span>{t("boot.opening")}</span>
     </div>
   );
 }
 
 function messageFor(reason: unknown): string {
-  if (reason instanceof ProtocolError) {
-    if (reason.code === "unauthorized") return "The session ended. Reload the page and sign in again.";
-    if (reason.code === "not_found") return "That record is no longer available.";
-    if (reason.code === "closed" || reason.code === "network") {
-      return "The browser cannot reach the Space. Is `neha serve` still running?";
-    }
-    return reason.message;
+  if (
+    reason !== null &&
+    typeof reason === "object" &&
+    "key" in reason &&
+    typeof (reason as { key?: unknown }).key === "string"
+  ) {
+    return t((reason as { key: Parameters<typeof t>[0] }).key);
   }
-  if (reason instanceof ApiError) return reason.message;
-  if (reason instanceof TypeError) return "The browser cannot reach the Space. Is `neha serve` still running?";
-  return "The Space cannot complete this request.";
+  if (reason instanceof ProtocolError) {
+    if (reason.code === "unauthorized") return t("error.session");
+    if (reason.code === "not_found") return t("error.record");
+    if (
+      reason.code === "closed" ||
+      reason.code === "network" ||
+      reason.code === "timeout" ||
+      reason.code === "hello_timeout"
+    ) {
+      return t("error.unreachable");
+    }
+    return t("error.generic");
+  }
+  if (reason instanceof ApiError) {
+    if (reason.code === "unauthorized") return t("error.session");
+    if (reason.code === "not_found") return t("error.record");
+    if (reason.code === "rate_limited") return t("error.rate");
+    if (reason.code === "invalid_argument" && /password/i.test(reason.message)) {
+      return t("error.password");
+    }
+    if (reason.code === "invalid_argument") return t("error.invalid");
+    return t("error.generic");
+  }
+  if (reason instanceof TypeError) return t("error.unreachable");
+  if (typeof reason === "string") return reason;
+  return t("error.generic");
 }

@@ -28,6 +28,10 @@ pnpm --dir ui build
 
 `neha serve` serves `ui/dist` by default. Pass `--ui <directory>` or set `NEHA_UI_DIR` to serve another build.
 
+## Language
+
+The client supports English (en-US) and Simplified Chinese (zh-CN). The switch lives on the sign-in card, the setup header, the Chat list footer, and the Chat header. The first visit follows the browser language; the chosen locale is kept in local storage and never changes the record.
+
 ## Test
 
 ```bash

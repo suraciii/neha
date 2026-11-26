@@ -1,0 +1,325 @@
+import { createSignal } from "solid-js";
+
+export type Locale = "en-US" | "zh-CN";
+
+const en = {
+  "brand.eyebrow": "Neha · Visual design, implemented",
+
+  "auth.headline": "Put work in the hands of a team you can see.",
+  "auth.lede":
+    "A Bot is a teammate. It has its own Computer, memory, and identity. Work lands in the Chat, and authority always stays with you.",
+  "auth.point.space": "One Space, on this machine",
+  "auth.point.provider": "Your Provider, your Models",
+  "auth.point.computer": "A managed Computer for each Bot",
+  "auth.missing.eyebrow": "Invitation required",
+  "auth.missing.title": "Open the whole invitation link",
+  "auth.missing.lead": "The link printed by",
+  "auth.missing.mid": "carries a secret after the",
+  "auth.missing.tail": ". Paste the complete link into this browser.",
+  "auth.join.eyebrow": "Admin invitation",
+  "auth.join.title": "Join this Space",
+  "auth.join.hint":
+    "Become the Admin of this Space. The invitation works once, while the Space runs.",
+  "auth.login.eyebrow": "Welcome back",
+  "auth.login.title": "Sign in to Neha",
+  "auth.login.hint": "Use the account that already belongs to this Space.",
+  "auth.name": "Display name",
+  "auth.password": "Password",
+  "auth.password.hint": "At least eight bytes. A short phrase is enough.",
+  "auth.join.action": "Join Space",
+  "auth.login.action": "Sign in",
+  "auth.working": "Working…",
+  "auth.fine":
+    "The Space listens on this machine only. The browser keeps the session in an HttpOnly cookie.",
+
+  "error.invitation": "This invitation is not usable. Start a new Space or ask the Admin.",
+  "error.credentials": "The display name or password is not correct.",
+  "error.rate": "Too many sign-in attempts. Wait a few minutes.",
+  "error.conflict": "This Space already has an Admin. Sign in instead.",
+  "error.unreachable": "The browser cannot reach this Space. Is neha serve still running?",
+  "error.generic": "The Space cannot complete this request.",
+  "error.session": "The session ended. Reload the page and sign in again.",
+  "error.record": "That record is no longer available.",
+  "error.botAnswer": "The Bot could not answer.",
+  "error.password": "The password must be at least eight bytes.",
+  "error.invalid": "There is a problem with that value.",
+
+  "sidebar.chats": "Chats",
+  "sidebar.conversation.one": "1 conversation",
+  "sidebar.conversation.many": "{count} conversations",
+  "sidebar.empty.title": "No Chats yet",
+  "sidebar.empty.text": "Create a Bot and its Chat will appear here.",
+  "sidebar.startChat": "Start a Chat with {name}",
+  "sidebar.newChat": "New Chat",
+  "sidebar.openChat": "Open Chat",
+  "sidebar.online": "Space online",
+
+  "rail.chats": "Chats",
+  "rail.admin": "Admin",
+  "rail.user": "User",
+  "rail.primary": "Primary navigation",
+
+  "setup.step.one": "Step 1 of 2",
+  "setup.step.two": "Step 2 of 2",
+  "setup.provider.title": "Connect a model Provider first",
+  "setup.provider.lede":
+    "Every Bot in this Space thinks through a Provider. The key stays inside the Space.",
+  "setup.bot.title": "Create your first Bot",
+  "setup.bot.lede":
+    "A Bot has its own identity, memory, and Computer. Give it a name and hand it work.",
+  "setup.panel.provider": "Provider",
+  "setup.panel.bot": "Bot",
+  "setup.bot.panelTitle": "Name the teammate",
+  "setup.provider.connected.one": "Provider connected",
+  "setup.provider.connected.many": "{count} Providers connected",
+  "setup.ready": "Ready",
+  "setup.models": "Models",
+  "setup.none": "None",
+  "setup.bot.name": "Name",
+  "setup.bot.nameHint": "The name appears in Chats and the task board.",
+  "setup.bot.accessTitle": "Owner only",
+  "setup.bot.accessHint": "Only you can use this Bot. You can invite members later.",
+  "setup.bot.create": "Create Bot",
+  "setup.bot.creating": "Creating…",
+  "setup.provider.panelTitle": "Connect an OpenAI-compatible Provider",
+  "setup.adminOnly": "Admin only",
+  "setup.baseUrl": "Base URL",
+  "setup.baseUrl.hint": "The address that serves OpenAI Chat Completions.",
+  "setup.apiKey": "API key",
+  "setup.apiKey.hint": "Stored sealed in this Space. The browser never reads it back.",
+  "setup.model": "Model name",
+  "setup.model.hint": "The exact name the Provider expects.",
+  "setup.advanced": "Advanced",
+  "setup.contextLimit": "Context limit",
+  "setup.maxOutput": "Max output",
+  "setup.connect": "Connect Provider",
+  "setup.connecting": "Connecting…",
+  "setup.provider.note": "A Provider belongs to the whole Space, not to one Browser.",
+  "setup.noAdmin": "Ask the Space Admin to connect a Provider before a Bot can work.",
+
+  "chat.title": "Chat",
+  "chat.aria": "Chat with {name}",
+  "chat.loading": "Loading…",
+  "chat.bot": "Bot",
+  "chat.managedComputer": "Managed Computer",
+  "chat.computer": "Computer",
+  "chat.online": "Online",
+  "chat.offline": "Offline",
+  "chat.ownerOnly": "Owner only",
+  "chat.back": "Back to Chats",
+  "chat.new.eyebrow": "A new Chat",
+  "chat.new.title": "Say hello to {name}.",
+  "chat.opening": "Opening the Chat…",
+  "chat.new.text":
+    "Give the Bot work in your own words. It answers here, and the record keeps the thread.",
+  "chat.suggestion.hello": "Say hello",
+  "chat.suggestion.work": "What are you working on?",
+  "chat.suggestion.plan": "Help me plan the next step.",
+  "chat.acting": "Acting for you",
+  "chat.working": "Working",
+  "chat.placeholder": "Message {name}…",
+  "chat.placeholder.empty": "Message the Bot…",
+  "chat.hint": "Enter to send · Shift+Enter for a new line",
+  "chat.send": "Send Message",
+
+  "select.eyebrow": "Chats",
+  "select.title": "Select a Chat to open it.",
+  "boot.opening": "Opening the Space…",
+
+  "format.today": "Today",
+  "locale.switch.to.zh": "Switch to Chinese",
+  "locale.switch.to.en": "Switch to English",
+  "locale.name.zh": "中文",
+  "locale.name.en": "English",
+} as const;
+
+type MessageKey = keyof typeof en;
+
+const zh: Record<MessageKey, string> = {
+  "brand.eyebrow": "Neha · 视觉设计，已实现",
+
+  "auth.headline": "把工作交给一支你看得见的团队。",
+  "auth.lede":
+    "Bot 是队友。它有自己的 Computer、记忆和身份。工作在 Chat 中沉淀，权限始终由你掌握。",
+  "auth.point.space": "Space 只在这台机器上",
+  "auth.point.provider": "你的 Provider，你的 Model",
+  "auth.point.computer": "每个 Bot 都有托管的 Computer",
+  "auth.missing.eyebrow": "需要邀请",
+  "auth.missing.title": "打开完整邀请链接",
+  "auth.missing.lead": "链接由",
+  "auth.missing.mid": "打印，密钥位于",
+  "auth.missing.tail": " 之后。请把完整链接粘贴到这个浏览器。",
+  "auth.join.eyebrow": "管理员邀请",
+  "auth.join.title": "加入这个 Space",
+  "auth.join.hint": "成为这个 Space 的管理员。邀请只在 Space 运行期间有效，并且只能使用一次。",
+  "auth.login.eyebrow": "欢迎回来",
+  "auth.login.title": "登录 Neha",
+  "auth.login.hint": "使用已经属于这个 Space 的账号。",
+  "auth.name": "显示名称",
+  "auth.password": "密码",
+  "auth.password.hint": "至少八个字节。一个短语就够了。",
+  "auth.join.action": "加入 Space",
+  "auth.login.action": "登录",
+  "auth.working": "处理中…",
+  "auth.fine": "Space 只监听这台机器。浏览器把会话保存在 HttpOnly cookie 中。",
+
+  "error.invitation": "这个邀请不可用。请启动新的 Space 或联系管理员。",
+  "error.credentials": "显示名称或密码不正确。",
+  "error.rate": "登录尝试过多。请等待几分钟。",
+  "error.conflict": "这个 Space 已经有管理员。请改用登录。",
+  "error.unreachable": "浏览器无法连接 Space。neha serve 还在运行吗？",
+  "error.generic": "Space 无法完成这个请求。",
+  "error.session": "会话已结束。请刷新页面并重新登录。",
+  "error.record": "这条记录已不存在。",
+  "error.botAnswer": "Bot 无法回答。",
+  "error.password": "密码至少需要八个字节。",
+  "error.invalid": "这个值不符合要求。",
+
+  "sidebar.chats": "Chats",
+  "sidebar.conversation.one": "1 个对话",
+  "sidebar.conversation.many": "{count} 个对话",
+  "sidebar.empty.title": "还没有 Chat",
+  "sidebar.empty.text": "创建一个 Bot，它的 Chat 会出现在这里。",
+  "sidebar.startChat": "和{name}打个招呼",
+  "sidebar.newChat": "新 Chat",
+  "sidebar.openChat": "打开 Chat",
+  "sidebar.online": "Space 在线",
+
+  "rail.chats": "Chats",
+  "rail.admin": "管理员",
+  "rail.user": "成员",
+  "rail.primary": "主导航",
+
+  "setup.step.one": "第 1 步，共 2 步",
+  "setup.step.two": "第 2 步，共 2 步",
+  "setup.provider.title": "先连接一个 Model Provider",
+  "setup.provider.lede": "这个 Space 里的每个 Bot 都通过 Provider 思考。密钥留在 Space 内。",
+  "setup.bot.title": "创建你的第一个 Bot",
+  "setup.bot.lede": "Bot 有自己的身份、记忆和 Computer。给它一个名字，然后把工作交给它。",
+  "setup.panel.provider": "Provider",
+  "setup.panel.bot": "Bot",
+  "setup.bot.panelTitle": "给队友起个名字",
+  "setup.provider.connected.one": "Provider 已连接",
+  "setup.provider.connected.many": "已连接 {count} 个 Provider",
+  "setup.ready": "就绪",
+  "setup.models": "Model",
+  "setup.none": "无",
+  "setup.bot.name": "名称",
+  "setup.bot.nameHint": "名称会出现在 Chat 和任务板中。",
+  "setup.bot.accessTitle": "仅所有者",
+  "setup.bot.accessHint": "只有你能使用这个 Bot。之后可以邀请成员。",
+  "setup.bot.create": "创建 Bot",
+  "setup.bot.creating": "创建中…",
+  "setup.provider.panelTitle": "连接兼容 OpenAI 的 Provider",
+  "setup.adminOnly": "仅管理员",
+  "setup.baseUrl": "基础 URL",
+  "setup.baseUrl.hint": "提供 OpenAI Chat Completions 的地址。",
+  "setup.apiKey": "API 密钥",
+  "setup.apiKey.hint": "在这个 Space 中加密保存。浏览器之后无法读取。",
+  "setup.model": "Model 名称",
+  "setup.model.hint": "Provider 期望的精确名称。",
+  "setup.advanced": "高级",
+  "setup.contextLimit": "上下文上限",
+  "setup.maxOutput": "最大输出",
+  "setup.connect": "连接 Provider",
+  "setup.connecting": "连接中…",
+  "setup.provider.note": "Provider 属于整个 Space，而不属于某个浏览器。",
+  "setup.noAdmin": "请 Space 管理员先连接 Provider，Bot 才能工作。",
+
+  "chat.title": "Chat",
+  "chat.aria": "与{name}的 Chat",
+  "chat.loading": "加载中…",
+  "chat.bot": "Bot",
+  "chat.managedComputer": "托管 Computer",
+  "chat.computer": "Computer",
+  "chat.online": "在线",
+  "chat.offline": "离线",
+  "chat.ownerOnly": "仅所有者",
+  "chat.back": "返回 Chat 列表",
+  "chat.new.eyebrow": "新 Chat",
+  "chat.new.title": "和{name}打个招呼。",
+  "chat.opening": "正在打开 Chat…",
+  "chat.new.text": "用你自己的话把工作交给 Bot。它在这里回答，记录会保留这条线程。",
+  "chat.suggestion.hello": "打个招呼",
+  "chat.suggestion.work": "你在忙什么？",
+  "chat.suggestion.plan": "帮我规划下一步。",
+  "chat.acting": "为你工作",
+  "chat.working": "正在工作",
+  "chat.placeholder": "给{name}发消息…",
+  "chat.placeholder.empty": "给 Bot 发消息…",
+  "chat.hint": "Enter 发送 · Shift+Enter 换行",
+  "chat.send": "发送消息",
+
+  "select.eyebrow": "Chats",
+  "select.title": "选择一个 Chat 打开。",
+  "boot.opening": "正在打开 Space…",
+
+  "format.today": "今天",
+  "locale.switch.to.zh": "切换到中文",
+  "locale.switch.to.en": "切换到英文",
+  "locale.name.zh": "中文",
+  "locale.name.en": "English",
+};
+
+const STORAGE_KEY = "neha.locale";
+
+function storedLocale(): Locale | null {
+  try {
+    const value = localStorage.getItem(STORAGE_KEY);
+    return value === "en-US" || value === "zh-CN" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function initialLocale(): Locale {
+  const stored = storedLocale();
+  if (stored) return stored;
+  const language = typeof navigator === "undefined" ? "" : navigator.language;
+  return language.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US";
+}
+
+const [locale, setLocaleSignal] = createSignal<Locale>(initialLocale());
+
+function applyLanguage(value: Locale) {
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = value;
+  }
+}
+
+applyLanguage(locale());
+
+export { locale };
+
+export function setLocale(value: Locale) {
+  setLocaleSignal(value);
+  applyLanguage(value);
+  try {
+    localStorage.setItem(STORAGE_KEY, value);
+  } catch {
+    // A browser that blocks storage still switches for this page.
+  }
+}
+
+export function toggleLocale() {
+  setLocale(locale() === "en-US" ? "zh-CN" : "en-US");
+}
+
+function interpolate(template: string, params?: Record<string, string | number>): string {
+  if (!params) return template;
+  return template.replace(/\{(\w+)\}/g, (match, name: string) =>
+    name in params ? String(params[name]) : match,
+  );
+}
+
+export function t(
+  key: MessageKey,
+  params?: Record<string, string | number>,
+  language: Locale = locale(),
+): string {
+  return interpolate(language === "zh-CN" ? zh[key] : en[key], params);
+}
+
+export const catalogs = { "en-US": en, "zh-CN": zh } as const;
+
+export type { MessageKey };

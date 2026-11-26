@@ -96,3 +96,5 @@ export interface RunView {
   error: string | null;
   usage: unknown;
 }
+
+export type Preview = { text: string } | { error: true } | null;

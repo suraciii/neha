@@ -12,6 +12,13 @@
   font-display: swap;
 }
 @font-face {
+  font-family: "Neha Sans SC";
+  src: url("/fonts/NotoSansSC-subset.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
   font-family: "Geist Mono";
   src: url("/fonts/GeistMono-latin.woff2") format("woff2");
   font-weight: 400 600;
@@ -21,7 +28,7 @@
 
 :root {
   color-scheme: light;
-  --font-sans: "Schibsted Grotesk", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-sans: "Schibsted Grotesk", "Neha Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "Geist Mono", "SFMono-Regular", "Cascadia Code", Consolas, monospace;
 
   --ground: #e9eae3;
@@ -245,12 +252,19 @@ code,
 }
 
 .auth__card {
+  position: relative;
   width: min(100%, 440px);
   padding: 32px;
   border: 1px solid var(--line);
   border-radius: var(--r-xl);
   background: var(--raised);
   box-shadow: 0 1px 2px rgba(24, 28, 24, 0.04), 0 18px 60px rgba(24, 28, 24, 0.06);
+}
+
+.auth__locale {
+  position: absolute;
+  top: 16px;
+  right: 16px;
 }
 
 .auth__card h2 {
@@ -612,6 +626,7 @@ code,
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+  flex-wrap: wrap;
   padding: 12px 16px;
   border-top: 1px solid var(--line);
   color: var(--ink-3);
@@ -731,6 +746,34 @@ code,
   display: flex;
   align-items: center;
   gap: 8px;
+}
+
+.chat__locale {
+  margin-left: auto;
+}
+
+.locale-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--raised);
+  color: var(--ink-3);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
+.locale-switch:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.locale-switch--foot {
+  height: 24px;
+  padding: 0 6px;
 }
 
 .chat__stream {
@@ -922,6 +965,13 @@ code,
 
 .setup__head {
   margin-bottom: 24px;
+}
+
+.setup__top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
 }
 
 .setup__head h1 {
@@ -1187,6 +1237,9 @@ code,
   .chat__actions {
     display: none;
   }
+  .chat__locale {
+    margin-left: 0;
+  }
   .chat__stream {
     padding: 20px 14px 12px;
   }
@@ -1230,6 +1283,36 @@ code,
   .msg__body {
     max-width: 88% !important;
   }
+}
+
+html[lang="zh-CN"] body {
+  line-height: 1.68;
+}
+
+html[lang="zh-CN"] .auth__lede,
+html[lang="zh-CN"] .auth__hint,
+html[lang="zh-CN"] .chat__empty-text,
+html[lang="zh-CN"] .setup__lede,
+html[lang="zh-CN"] .msg__text {
+  line-height: 1.72;
+}
+
+html[lang="zh-CN"] .eyebrow,
+html[lang="zh-CN"] .panel__kicker,
+html[lang="zh-CN"] .auth__copy h1,
+html[lang="zh-CN"] .auth__card h2,
+html[lang="zh-CN"] .sidebar__title,
+html[lang="zh-CN"] .setup__head h1,
+html[lang="zh-CN"] .panel__head h2,
+html[lang="zh-CN"] .chat__titles h1,
+html[lang="zh-CN"] .chat__empty h2,
+html[lang="zh-CN"] .select-chat h2 {
+  letter-spacing: 0;
+}
+
+html[lang="zh-CN"] .eyebrow,
+html[lang="zh-CN"] .panel__kicker {
+  text-transform: none;
 }
 
 @media (prefers-reduced-motion: reduce) {

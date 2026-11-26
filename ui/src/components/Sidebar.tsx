@@ -1,28 +1,40 @@
 import { For, Show } from "solid-js";
 
-import type { Account, Bot, Chat } from "../types";
+import { t } from "../i18n";
+import type { Account, Bot, Chat, Preview } from "../types";
 import Avatar from "./Avatar";
 import Icon from "./Icon";
+import LocaleSwitch from "./LocaleSwitch";
 
 interface SidebarProps {
   account: Account;
   chats: Chat[];
   bots: Bot[];
   activeChat: Chat | null;
-  previews: Record<string, string>;
+  previews: Record<string, Preview>;
   onSelect: (chat: Chat) => void;
 }
 
 export default function Sidebar(props: SidebarProps) {
   const botFor = (chat: Chat) => props.bots.find((bot) => bot.id === chat.bot);
-  const preview = (chat: Chat) => props.previews[chat.id] ?? "Open Chat";
+  const preview = (chat: Chat) => {
+    const recorded = props.previews[chat.id];
+    if (recorded && "text" in recorded) return recorded.text;
+    if (recorded && "error" in recorded) return t("sidebar.openChat");
+    const bot = botFor(chat);
+    return bot ? t("sidebar.startChat", { name: bot.name }) : t("sidebar.newChat");
+  };
 
   return (
-    <aside class="sidebar" aria-label="Chats">
+    <aside class="sidebar" aria-label={t("sidebar.chats")}>
       <header class="sidebar__head">
         <div>
-          <h1 class="sidebar__title">Chats</h1>
-          <p class="sidebar__sub">{props.chats.length === 1 ? "1 conversation" : `${props.chats.length} conversations`}</p>
+          <h1 class="sidebar__title">{t("sidebar.chats")}</h1>
+          <p class="sidebar__sub">
+            {props.chats.length === 1
+              ? t("sidebar.conversation.one")
+              : t("sidebar.conversation.many", { count: props.chats.length })}
+          </p>
         </div>
       </header>
 
@@ -34,8 +46,8 @@ export default function Sidebar(props: SidebarProps) {
               <span class="side-empty__icon">
                 <Icon name="message" size="lg" />
               </span>
-              <p class="side-empty__title">No Chats yet</p>
-              <p class="side-empty__text">Create a Bot and its Chat will appear here.</p>
+              <p class="side-empty__title">{t("sidebar.empty.title")}</p>
+              <p class="side-empty__text">{t("sidebar.empty.text")}</p>
             </div>
           }
         >
@@ -53,7 +65,7 @@ export default function Sidebar(props: SidebarProps) {
                   <span class="conv__text">
                     <span class="conv__top">
                       <span class="conv__name">{bot?.name ?? "Bot"}</span>
-                      <span class="conv__meta">Chat</span>
+                      <span class="conv__meta">{t("chat.title")}</span>
                     </span>
                     <span class="conv__preview">{preview(chat)}</span>
                   </span>
@@ -67,9 +79,12 @@ export default function Sidebar(props: SidebarProps) {
       <footer class="sidebar__foot">
         <span class="foot__row">
           <span class="dot dot--online" />
-          Space online
+          {t("sidebar.online")}
         </span>
-        <span class="foot__meta">{props.account.display_name}</span>
+        <div class="foot__row">
+          <LocaleSwitch class="locale-switch--foot" />
+          <span class="foot__meta">{props.account.display_name}</span>
+        </div>
       </footer>
     </aside>
   );
