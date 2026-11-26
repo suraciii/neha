@@ -157,10 +157,11 @@ export default function App() {
     update({ working: false, queue: null });
   }
 
-  // The record says this Run ended; the Chat is free again.
+  // The record says this Run ended. Only the Run still followed may settle the
+  // Chat: a late answer about an earlier Run must not drop a newer one.
   function finishFollowing(run: string) {
     settledRuns.add(run);
-    clearFollowed();
+    if (isFollowing(run)) clearFollowed();
   }
 
   // Applies one record answer about the followed Run. The caller always asks

@@ -38,7 +38,7 @@ const { space, FakeCommands } = vi.hoisted(() => {
     runs: {} as Record<string, { status: RunView["status"]; position?: number }>,
     runShows: [] as string[],
     // A run_show answer can be held open, so a test can act while it is in flight.
-    runHolds: {} as Record<string, { gate: Promise<void>; fail: () => void } | undefined>,
+    runHolds: {} as Record<string, { gate: Promise<void>; release: () => void; fail: () => void } | undefined>,
     // Sends that settled in the fake Space.
     sendsDone: 0,
     // Runs the Space accepted, in order.
@@ -56,11 +56,13 @@ const { space, FakeCommands } = vi.hoisted(() => {
       sendGate = null;
     },
     holdRunShow(run: string) {
+      let release!: () => void;
       let fail!: () => void;
-      const gate = new Promise<void>((_resolve, reject) => {
+      const gate = new Promise<void>((resolve, reject) => {
+        release = resolve;
         fail = () => reject(new Error("the run_show answer was lost"));
       });
-      space.runHolds[run] = { gate, fail };
+      space.runHolds[run] = { gate, release, fail };
     },
   };
   class FakeCommands {
@@ -749,6 +751,30 @@ describe("App with Files", () => {
     expect(queueText(view)).toBeUndefined();
     expect(view.container.querySelector(".msg--working")).toBeNull();
     await waitFor(() => expect(view.container.textContent).toContain("done already"));
+  });
+
+  it("keeps following a newer Run when an earlier Run's answer lands late", async () => {
+    const view = await openChat();
+    space.holdRunShow("r1");
+    type(view, "first");
+    submit(view);
+    await waitFor(() => expect(space.runShows).toContain("r1"));
+    startRun("r1");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+
+    // The second request becomes the followed Run while r1's answer is in flight.
+    type(view, "second");
+    submit(view);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    startRun("r2");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+
+    // r1's delayed answer says it ended; r2 is still the Run the page follows.
+    space.runs["r1"] = { status: "succeeded" };
+    space.runHolds["r1"]?.release();
+    await drain();
+    expect(element(view, ".msg--working")).toBeTruthy();
+    expect(queueText(view)).toBeUndefined();
   });
 
   it("does not let an old Chat's lost run_show answer clear the new Chat", async () => {
