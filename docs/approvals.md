@@ -97,7 +97,7 @@ Choose Always allow on that approval: the new Allow rule has the same `printf` p
 
 ## While a run waits
 
-A waiting approval does not block the Bot: a later request for the same Bot runs while the first waits. The waiting run resumes after its last recorded action when allowed, and no action runs twice.
+A waiting approval does not block the Bot: a later request for the same Bot runs while the first waits. The waiting run resumes after its last recorded action when allowed, and no action runs twice. A Space restart continues a working run from its record: completed steps replay, and an action that started before the stop is checked rather than run again.
 
 ## What this milestone does not do
 

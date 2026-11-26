@@ -425,6 +425,7 @@ impl Gate {
 struct Script {
     replies: tokio::sync::mpsc::UnboundedSender<ScriptedReply>,
     gate: Gate,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Script {
@@ -461,6 +462,11 @@ impl Script {
     fn release(&self) {
         self.gate.release();
     }
+
+    /// How many requests the fake Provider has received.
+    fn requests(&self) -> usize {
+        self.requests.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
@@ -469,6 +475,7 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
     let (replies, queued) = tokio::sync::mpsc::unbounded_channel::<ScriptedReply>();
     let queued = Arc::new(tokio::sync::Mutex::new(queued));
     let requests = Arc::new(AtomicUsize::new(0));
+    let script_requests = Arc::clone(&requests);
     let gate = Gate::new();
     let script_gate = gate.clone();
     let app = Router::new().route(
@@ -528,6 +535,7 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
         Script {
             replies,
             gate: script_gate,
+            requests: script_requests,
         },
         task,
     )
@@ -4346,6 +4354,73 @@ async fn a_decided_allow_resumes_after_a_restart_before_the_action() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_restart_continues_after_a_completed_step() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-recover-")
+        .tempdir_in("/var/tmp")
+        .expect("the recovery test needs a writable /var/tmp");
+    let mut computer = local_computer(directory, &base, &script);
+    let folder = computer.workspace.join(&computer.bot);
+
+    // Step one appends once; the next Model call is held so the Space can stop
+    // after the record holds the completed step.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf x >> count.txt"}),
+    );
+    script.hold("the held answer");
+    script.say("The recovered answer.");
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let home = computer.home.clone();
+    let credential = computer.credential.clone();
+    let chat = computer.chat.clone();
+    std::thread::spawn(move || {
+        let output = cli(
+            &home,
+            &credential,
+            &["chat", "send", "--chat", &chat, "recover this"],
+        );
+        let _ = sender.send(output);
+    });
+    // The fixture's first use used the first two replies; request four is the
+    // step after our action, so the action's result and step are in the record.
+    wait_until("the first step to be recorded", || script.requests() >= 4);
+
+    computer.restart_space();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let read = run(
+            &computer.home,
+            &computer.credential,
+            &["chat", "read", &computer.chat],
+        );
+        if read.contains("The recovered answer.") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the recovered answer:\n{read}\n\
+             count: {:?}",
+            std::fs::read_to_string(folder.join("count.txt"))
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        std::fs::read_to_string(folder.join("count.txt")).unwrap(),
+        "x",
+        "the completed action is replayed, not run again"
+    );
+    let _ = receiver.recv_timeout(Duration::from_secs(10));
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
     if !local_computer_ready() {
         return;
@@ -4407,8 +4482,8 @@ async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
     computer.restart_space();
     let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "failed");
     assert!(
-        shown.contains("  error the approval could not be resumed"),
-        "a restart after the action started must not resume it:\n{shown}"
+        shown.contains("cannot be verified"),
+        "a restart after an unverifiable action started must not resume it:\n{shown}"
     );
     assert!(
         !shown.contains("shell (succeeded)"),
@@ -4420,7 +4495,7 @@ async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
         &["chat", "read", &computer.chat],
     );
     assert!(
-        read.contains("Bot: I could not continue after the approval."),
+        read.contains("Bot: I could not continue after the interruption:"),
         "{read}"
     );
     assert!(

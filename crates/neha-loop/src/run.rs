@@ -35,8 +35,12 @@ pub struct RunRequest {
     pub max_output: u32,
     /// How many steps the run may take.
     pub max_steps: usize,
-    /// The step to finish first, when the run resumes after an approval.
+    /// The step to finish first, when the run resumes after an approval or a
+    /// recovery.
     pub resume: Option<Resume>,
+    /// The step a run without a recorded reply starts at, when the Space
+    /// recovers it after an interruption.
+    pub start_step: u32,
 }
 
 impl RunRequest {
@@ -49,6 +53,7 @@ impl RunRequest {
             max_output,
             max_steps: 8,
             resume: None,
+            start_step: 1,
         }
     }
 
@@ -63,6 +68,14 @@ impl RunRequest {
     #[must_use]
     pub fn with_resume(mut self, resume: Resume) -> Self {
         self.resume = Some(resume);
+        self
+    }
+
+    /// Starts a recovered run at a step when the record has no reply to
+    /// replay; the step itself is safe to call again.
+    #[must_use]
+    pub fn with_start_step(mut self, step: u32) -> Self {
+        self.start_step = step;
         self
     }
 }
@@ -81,9 +94,12 @@ pub struct Resume {
     /// `done` is the approved action.
     pub done: usize,
     /// The approved action's identifier, which the call at `done` keeps when it runs.
-    pub approved_action: Id,
+    pub approved_action: Option<Id>,
     /// The usage of the reply that made the step, which the run's usage starts from.
     pub usage: Usage,
+    /// Whether every call of this step already has a recorded result. The
+    /// loop then records the step and moves on without running an action.
+    pub recovered: bool,
 }
 
 /// A tool call as the record keeps it.
@@ -215,6 +231,7 @@ where
         max_output,
         max_steps,
         resume,
+        start_step,
     } = request;
     let mut messages = Vec::with_capacity(history.len() + 8);
     messages.push(Message::system(system));
@@ -223,13 +240,13 @@ where
     // A resumed run finishes the step that waited before it calls the Model,
     // and its usage starts from that step's reply.
     let mut resume = resume;
-    let first_step = resume.as_ref().map_or(1, |resume| resume.step);
+    let first_step = resume.as_ref().map_or(start_step, |resume| resume.step);
     let mut usage = resume
         .as_ref()
         .map_or(Usage::default(), |resume| resume.usage);
 
     for step in first_step..=max_steps {
-        let (calls, reply_usage, from, approved) = match resume.take() {
+        let (calls, reply_usage, from, approved, all_done) = match resume.take() {
             // The reply was recorded before the run waited, so it is not
             // recorded again; its done calls already have their results.
             Some(resume) => {
@@ -239,6 +256,7 @@ where
                     done,
                     approved_action,
                     usage,
+                    recovered,
                     ..
                 } = resume;
                 let calls = resumed_calls(calls)?;
@@ -249,7 +267,8 @@ where
                     at,
                     Message::assistant_with_calls(content, model_calls(&calls)),
                 );
-                (calls, usage, done, Some(approved_action))
+                let all_done = recovered && done >= calls.len();
+                (calls, usage, done, approved_action, all_done)
             }
             None => {
                 let reply = match model
@@ -288,83 +307,88 @@ where
                     reply.content,
                     reply.tool_calls,
                 ));
-                (calls, reply.usage, 0, None)
+                (calls, reply.usage, 0, None, false)
             }
         };
         let tool_calls = calls.len() as u32;
-        for (index, call) in calls.into_iter().enumerate().skip(from) {
-            // The action the User approved runs under its recorded identifier
-            // and is not asked for again. A refused call cannot have been
-            // approved, so it never takes that identifier.
-            let action = if index == from && call.parsed.is_ok() {
-                approved
-            } else {
-                None
-            };
-            let action = match action {
-                Some(action) => action,
-                None => {
-                    let action = Id::new();
-                    // A refused call runs nothing and asks nobody; every call
-                    // that can run asks, a File move included.
-                    if call.parsed.is_ok()
-                        && recorder.approve(step, &call.recorded, action).await? == Decision::Wait
-                    {
-                        let recorded = call.recorded;
-                        return Ok(RunOutcome::Waiting {
-                            approval: WaitingApproval {
-                                step,
-                                index: index as u32,
-                                call: recorded.call,
-                                tool: recorded.tool,
-                                arguments: recorded.arguments,
-                                action,
-                            },
-                        });
+        // A recovered step whose calls all have their recorded results has no
+        // action left to run; record the step and continue with the next one.
+        if !(all_done && from >= calls.len()) {
+            for (index, call) in calls.into_iter().enumerate().skip(from) {
+                // The action the User approved runs under its recorded identifier
+                // and is not asked for again. A refused call cannot have been
+                // approved, so it never takes that identifier.
+                let action = if index == from && call.parsed.is_ok() {
+                    approved
+                } else {
+                    None
+                };
+                let action = match action {
+                    Some(action) => action,
+                    None => {
+                        let action = Id::new();
+                        // A refused call runs nothing and asks nobody; every call
+                        // that can run asks, a File move included.
+                        if call.parsed.is_ok()
+                            && recorder.approve(step, &call.recorded, action).await?
+                                == Decision::Wait
+                        {
+                            let recorded = call.recorded;
+                            return Ok(RunOutcome::Waiting {
+                                approval: WaitingApproval {
+                                    step,
+                                    index: index as u32,
+                                    call: recorded.call,
+                                    tool: recorded.tool,
+                                    arguments: recorded.arguments,
+                                    action,
+                                },
+                            });
+                        }
+                        action
                     }
-                    action
+                };
+                recorder
+                    .action_started(
+                        step,
+                        action,
+                        call.recorded.tool.clone(),
+                        call.recorded.arguments.clone(),
+                    )
+                    .await?;
+                let result = match call.parsed {
+                    Ok(tools::Call::Computer(computer_action)) => {
+                        runtime.execute(computer_action).await
+                    }
+                    Ok(tools::Call::TakeFile { file }) => take_file(runtime, files, file).await,
+                    Ok(tools::Call::PutFile { path, name }) => {
+                        put_file(runtime, files, &path, name).await
+                    }
+                    Err(error) => ActionResult::failed(error),
+                };
+                recorder
+                    .action_finished(
+                        step,
+                        action,
+                        call.recorded.tool,
+                        result.status,
+                        result.output.clone(),
+                        result.error.clone(),
+                    )
+                    .await?;
+                messages.push(Message::tool_result(
+                    call.recorded.call,
+                    tool_result_text(&result),
+                ));
+                if result.status == ActionStatus::Unknown {
+                    // The action's result never returned. The record says unknown,
+                    // and the run ends here instead of resuming it blindly.
+                    return Ok(RunOutcome::Reply {
+                        text: "I lost my Computer before the action returned.".to_owned(),
+                        usage,
+                        succeeded: false,
+                    });
                 }
-            };
-            recorder
-                .action_started(
-                    step,
-                    action,
-                    call.recorded.tool.clone(),
-                    call.recorded.arguments.clone(),
-                )
-                .await?;
-            let result = match call.parsed {
-                Ok(tools::Call::Computer(computer_action)) => {
-                    runtime.execute(computer_action).await
-                }
-                Ok(tools::Call::TakeFile { file }) => take_file(runtime, files, file).await,
-                Ok(tools::Call::PutFile { path, name }) => {
-                    put_file(runtime, files, &path, name).await
-                }
-                Err(error) => ActionResult::failed(error),
-            };
-            recorder
-                .action_finished(
-                    step,
-                    action,
-                    call.recorded.tool,
-                    result.status,
-                    result.output.clone(),
-                    result.error.clone(),
-                )
-                .await?;
-            messages.push(Message::tool_result(
-                call.recorded.call,
-                tool_result_text(&result),
-            ));
-            if result.status == ActionStatus::Unknown {
-                // The action's result never returned. The record says unknown,
-                // and the run ends here instead of resuming it blindly.
-                return Ok(RunOutcome::Reply {
-                    text: "I lost my Computer before the action returned.".to_owned(),
-                    usage,
-                    succeeded: false,
-                });
             }
         }
         // A step completes only after all of its actions were recorded.
@@ -957,12 +981,13 @@ mod tests {
             content: None,
             calls,
             done,
-            approved_action,
+            approved_action: Some(approved_action),
             usage: Usage {
                 uncached_input: 3,
                 output: 7,
                 ..Usage::default()
             },
+            recovered: false,
         }
     }
 
@@ -1637,6 +1662,61 @@ mod tests {
             assert!(recorder.order.is_empty(), "nothing is recorded");
             assert!(runtime.actions.lock().unwrap().is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn a_recovered_step_with_every_result_continues_without_running_again() {
+        let calls = vec![
+            recorded(
+                "call-1",
+                "write_file",
+                json!({"path": "a.txt", "content": "a"}),
+            ),
+            recorded("call-2", "read_file", json!({"path": "a.txt"})),
+        ];
+        let usage_for_resume = Usage {
+            output: 3,
+            ..Usage::default()
+        };
+        let history = vec![
+            Message::tool_result("call-1", "wrote a.txt"),
+            Message::tool_result("call-2", "a"),
+        ];
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _usage, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", history, 100).with_resume(Resume {
+                    step: 2,
+                    content: Some("working".to_owned()),
+                    calls,
+                    done: 2,
+                    approved_action: None,
+                    usage: usage_for_resume,
+                    recovered: true,
+                }),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert!(recorder.started.is_empty(), "no recorded action runs again");
+        assert!(recorder.approvals.is_empty(), "no recorded call asks again");
+        assert_eq!(
+            recorder.steps,
+            [
+                (2, usage_for_resume, 2),
+                (3, reply("done").unwrap().usage, 0),
+            ]
+        );
     }
 
     #[tokio::test]

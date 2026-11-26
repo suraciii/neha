@@ -312,6 +312,9 @@ pub struct State {
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
     /// The Model's replies per run, in the order the record holds them.
     pub replies: HashMap<Id, Vec<RunReply>>,
+    /// Runs a Space start found interrupted and may recover. It is not part of
+    /// the record: a later start rebuilds it from the same events.
+    pub recovered_runs: HashSet<Id>,
 }
 
 impl State {
@@ -369,6 +372,17 @@ impl State {
             .iter()
             .filter(|view| view.run == run)
             .max_by_key(|view| view.seq)
+    }
+
+    /// Marks a run the current Space start recovered from an interruption.
+    pub fn mark_recovered(&mut self, run: Id) {
+        self.recovered_runs.insert(run);
+    }
+
+    /// Returns whether this Space start recovered the run.
+    #[must_use]
+    pub fn is_recovering(&self, run: &RunView) -> bool {
+        self.recovered_runs.contains(&run.id)
     }
 
     /// Returns whether a run may resume: its approval was allowed and the
@@ -738,6 +752,7 @@ impl Projection for State {
                 run.cwd = Some(data.working_dir);
             }
             EventData::RunFinished(data) => {
+                self.recovered_runs.remove(&data.run);
                 let run = self
                     .runs
                     .get_mut(&data.run)

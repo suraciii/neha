@@ -145,6 +145,8 @@ When the daemon starts again with `neha computer run`, it reconnects and queued 
 
 If the connection drops while an action runs, the Space records that action as unknown and fails the run. The Bot tells the Chat that it lost its Computer. The run does not resume.
 
+If the Space itself stops while a run works, the next start continues the run from its record. Completed steps replay into the Model's context; an action that started and never returned is checked, not run again: a `write_file` counts as done only when the file holds exactly the requested content, and any other unfinished action makes the run fail with its result unknown. A step whose Model reply never arrived is called again from its start. The Bot answers once, and no recorded action runs twice.
+
 The machine ends the command it was running when the channel drops, so no action keeps running unattended.
 
 ## Troubleshooting
@@ -176,7 +178,6 @@ The machine ends the command it was running when the channel drops, so no action
 - A Hosted Computer does not ask before an action yet; [Approvals](approvals.md) covers the gate for a Local Computer.
 - An approval of a run no User is with does not expire yet, and a Question, a Group approval, and an independent reviewer are not available.
 - The screen and process streams are not shown or carried by this channel yet.
-- A run interrupted by a lost connection fails and does not resume.
 - Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.
 
 ## File access and a run's directory

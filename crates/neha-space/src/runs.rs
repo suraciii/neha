@@ -120,6 +120,7 @@ impl RunQueue {
                 .values()
                 .filter(|run| {
                     run.status == RunStatus::Queued
+                        || state.is_recovering(run)
                         || state
                             .resumable_run(run.bot)
                             .is_some_and(|view| view.id == run.id)
@@ -218,6 +219,7 @@ async fn work(
                     // still make progress. It resumes when its Computer
                     // reconnects, because the run keeps the Computer it began
                     // with.
+
                     if let Some(run) = next_resumable(&state, &server.links, bot) {
                         return Some(Work::Resume(run));
                     }
@@ -362,7 +364,7 @@ fn next_resumable(
     state
         .runs
         .values()
-        .filter(|run| run.bot == bot && state.is_resumable(run))
+        .filter(|run| run.bot == bot && (state.is_resumable(run) || state.is_recovering(run)))
         .filter(|run| computer_online(state, links, run))
         .min_by_key(|run| run.seq)
         .cloned()
