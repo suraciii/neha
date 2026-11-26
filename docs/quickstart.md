@@ -4,6 +4,8 @@ This guide starts a Space on one machine, joins it as the Admin, connects an Ope
 
 Everything runs on the local machine. The Space listens on loopback and stores its record in `NEHA_HOME`.
 
+File bytes stay in `NEHA_HOME` by default too. [Storage](storage.md) shows how to keep them in an S3-compatible bucket instead.
+
 ## Requirements
 
 - Rust stable, version 1.94 or newer.

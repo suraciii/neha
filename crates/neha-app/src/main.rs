@@ -252,6 +252,7 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>) -> Result<()> {
         );
         println!("Build ui/ with `pnpm --dir ui build` to use the browser client.");
     }
+    println!("Files are stored in {}", running.storage());
     println!("Press Ctrl-C to stop.");
 
     tokio::signal::ctrl_c()

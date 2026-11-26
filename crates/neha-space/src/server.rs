@@ -45,6 +45,7 @@ use tokio::task::JoinHandle;
 
 use crate::blobs::{Blobs, BlobsError};
 use crate::commands;
+use crate::config::{Config, ConfigError, Storage};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError};
 use crate::model::{ModelClient, ModelError};
@@ -64,6 +65,7 @@ pub struct SpaceServer {
     store: Store,
     identity: Identity,
     blobs: Blobs,
+    storage: Storage,
     invite: Mutex<Option<Invite>>,
     login: Mutex<LoginLimiter>,
     state: Mutex<SpaceState>,
@@ -96,9 +98,22 @@ impl SpaceServer {
     ) -> Result<Self, ServerError> {
         let session_cookie = session_cookie_name(home.root());
         let browser_host = browser_host(home.root());
+        let storage = Config::load(&home)?.storage;
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
-        let blobs = Blobs::open(&home.blobs_dir())?;
+        let blobs = Blobs::open(&home, &storage)?;
+        match blobs.check().await {
+            Ok(()) => {}
+            // A store that is temporarily unreachable does not refuse the
+            // start: File operations answer 503 until it returns.
+            Err(error) if error.is_unavailable() => {}
+            Err(source) => {
+                return Err(ServerError::FileStore {
+                    storage: Box::new(storage.clone()),
+                    source: Box::new(source),
+                });
+            }
+        }
         let invite = if identity.has_accounts().await? {
             None
         } else {
@@ -116,6 +131,7 @@ impl SpaceServer {
             store,
             identity,
             blobs,
+            storage,
             invite: Mutex::new(invite),
             login: Mutex::new(LoginLimiter::default()),
             state: Mutex::new(state),
@@ -210,6 +226,7 @@ pub struct Running {
     /// The per-Space hostname the browser client uses.
     pub browser_host: String,
     home: Home,
+    storage: Storage,
     task: JoinHandle<()>,
 }
 
@@ -245,6 +262,12 @@ impl Running {
     #[must_use]
     pub fn server_home(&self) -> std::path::PathBuf {
         self.home.root().to_path_buf()
+    }
+
+    /// Returns where the bytes of Files are stored.
+    #[must_use]
+    pub fn storage(&self) -> &Storage {
+        &self.storage
     }
 
     /// Stops the server.
@@ -309,6 +332,7 @@ async fn start_with(
         invite,
         browser_host: server.browser_host.clone(),
         home: server.home().clone(),
+        storage: server.storage.clone(),
         task,
     })
 }
@@ -1379,6 +1403,16 @@ impl IntoResponse for ApiError {
 
 impl From<BlobsError> for ApiError {
     fn from(error: BlobsError) -> Self {
+        if error.is_unavailable() {
+            // The store is down, not broken: a caller may retry.
+            eprintln!("neha: unavailable: {error}");
+            return ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                ErrorCode::Unavailable,
+                "the File store is unavailable",
+            );
+        }
+
         ApiError::internal(error.to_string())
     }
 }
@@ -1486,9 +1520,21 @@ pub enum ServerError {
     /// The secrets cannot be loaded.
     #[error("secrets error: {0}")]
     Secrets(#[from] SecretsError),
+    /// The Space's configuration cannot be used.
+    #[error("configuration error: {0}")]
+    Config(#[from] ConfigError),
     /// The File bytes cannot be stored.
     #[error("blobs error: {0}")]
     Blobs(#[from] BlobsError),
+    /// The configured File store cannot be used.
+    #[error("the File store {storage} cannot be used: {source}")]
+    FileStore {
+        /// Where the Space was told to store the bytes.
+        storage: Box<Storage>,
+        /// Why the store cannot be used.
+        #[source]
+        source: Box<BlobsError>,
+    },
     /// The model client cannot be built.
     #[error("model error: {0}")]
     Model(#[from] ModelError),
@@ -1507,7 +1553,9 @@ mod tests {
     use serde_json::json;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use super::{Running, SpaceServer, StreamError, catch_up, start};
+    use super::{Running, ServerError, SpaceServer, StreamError, catch_up, start};
+    use crate::blobs::test_s3;
+    use crate::config::S3Storage;
     use crate::home::Home;
     use crate::store::{AppendRequest, Store};
 
@@ -1518,6 +1566,25 @@ mod tests {
         let invite = running.invite.clone().expect("a fresh Space invites");
 
         (dir, running, invite)
+    }
+
+    /// Starts a fresh Space whose `config.toml` is written first.
+    async fn running_with_config(config: &str) -> (tempfile::TempDir, Running, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), config).unwrap();
+        let running = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let invite = running.invite.clone().expect("a fresh Space invites");
+
+        (dir, running, invite)
+    }
+
+    /// Returns the `config.toml` that points a Space at one S3 test prefix.
+    fn s3_config(storage: &S3Storage) -> String {
+        format!(
+            "[storage]\nbackend = \"s3\"\nbucket = \"{}\"\nregion = \"{}\"\n\
+             prefix = \"{}\"\nendpoint = \"{}\"\n",
+            storage.bucket, storage.region, storage.prefix, storage.endpoint
+        )
     }
 
     async fn join(
@@ -4900,5 +4967,277 @@ mod tests {
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
+    }
+
+    #[test]
+    fn a_space_keeps_files_in_s3() {
+        test_s3::block_on(async {
+            let Some(storage) = test_s3::storage() else {
+                return;
+            };
+            let (dir, running, invite) = running_with_config(&s3_config(&storage)).await;
+            assert_eq!(
+                running.storage().to_string(),
+                format!(
+                    "s3://{}/{} at {}",
+                    storage.bucket, storage.prefix, storage.endpoint
+                )
+            );
+            let (mut socket, token) = admin(&running, &invite).await;
+            let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+            let uploaded: Value = upload(
+                &running,
+                &token,
+                chat,
+                "notes.txt",
+                "text/plain",
+                b"read me".to_vec(),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+            let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+            let sha = uploaded["sha256"].as_str().unwrap();
+            let response = download(&running, &token, file).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
+
+            // The bytes went under the configured prefix, and the home kept none.
+            assert_eq!(
+                test_s3::objects(&storage).await,
+                [(format!("{}/{}", &sha[..2], sha), 7)]
+            );
+            assert!(
+                std::fs::read_dir(running.server_home().join("blobs"))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+                "the local blob directory stays empty"
+            );
+
+            // A restart reads the same bytes back from S3.
+            socket.close(None).await.unwrap();
+            running.shutdown().await;
+            let restarted = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+            let token = sign_in(&restarted, "Ada").await;
+            let mut socket = open_socket(&restarted, &token).await;
+            let response = download(&restarted, &token, file).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
+            socket.close(None).await.unwrap();
+            restarted.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn a_bot_moves_files_through_s3() {
+        test_s3::block_on(async {
+            let Some(storage) = test_s3::storage() else {
+                return;
+            };
+            let (_dir, running, invite) = running_with_config(&s3_config(&storage)).await;
+            let (mut socket, token) = admin(&running, &invite).await;
+            let (_bot, chat, computer) = create_bot(&mut socket).await;
+
+            let uploaded: Value = upload(
+                &running,
+                &token,
+                chat,
+                "notes.txt",
+                "text/plain",
+                b"read me".to_vec(),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+            let taken: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+            let (base, provider_task) = scripted_provider(vec![
+                tool("take_file", json!({"file": taken})),
+                tool(
+                    "write_file",
+                    json!({"path": "out/answer.txt", "content": "the answer"}),
+                ),
+                tool(
+                    "put_file",
+                    json!({"path": "out/answer.txt", "name": "answer.txt"}),
+                ),
+                text("I read your notes and sent the answer back."),
+            ])
+            .await;
+            command(&mut socket, Id::new(), provider_add(base)).await;
+            let result = command(
+                &mut socket,
+                Id::new(),
+                CommandCall::MessageSend(MessageSend {
+                    chat,
+                    text: String::new(),
+                    file: Some(taken),
+                }),
+            )
+            .await;
+            assert_eq!(result["status"], "succeeded");
+
+            // The Workspace copy is the Bot's; the File the Chat got back is bytes
+            // in S3, one object per content.
+            let workspace = running
+                .server_home()
+                .join("computers")
+                .join(computer.to_string())
+                .join("workspace");
+            assert_eq!(
+                std::fs::read(workspace.join("notes.txt")).unwrap(),
+                b"read me"
+            );
+            let files = file_list(&mut socket, chat).await;
+            assert_eq!(files.len(), 2);
+            let delivered: Id = serde_json::from_value(files[1]["id"].clone()).unwrap();
+            let response = download(&running, &token, delivered).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.bytes().await.unwrap().as_ref(), b"the answer");
+            let mut keys: Vec<String> = test_s3::objects(&storage)
+                .await
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect();
+            let mut expected: Vec<String> = [
+                uploaded["sha256"].as_str().unwrap(),
+                files[1]["sha256"].as_str().unwrap(),
+            ]
+            .iter()
+            .map(|sha| format!("{}/{}", &sha[..2], sha))
+            .collect();
+            keys.sort();
+            expected.sort();
+            assert_eq!(keys, expected, "both Files are one object each in S3");
+
+            socket.close(None).await.unwrap();
+            provider_task.abort();
+            running.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn a_space_refuses_a_store_it_cannot_use() {
+        test_s3::block_on(async {
+            let Some(storage) = test_s3::storage() else {
+                return;
+            };
+            let bucket = format!("neha-missing-{}", Id::new());
+            let config = format!(
+                "[storage]\nbackend = \"s3\"\nbucket = \"{bucket}\"\nregion = \"{}\"\n\
+                 prefix = \"{}\"\nendpoint = \"{}\"\n",
+                storage.region, storage.prefix, storage.endpoint
+            );
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.toml"), config).unwrap();
+
+            let Err(error) = SpaceServer::open(Home::open(dir.path()).unwrap()).await else {
+                panic!("a store the Space cannot use must refuse the start");
+            };
+
+            assert!(matches!(error, ServerError::FileStore { .. }), "{error}");
+            let message = error.to_string();
+            assert!(message.contains("File store"), "{message}");
+            assert!(message.contains(&bucket), "{message}");
+        });
+    }
+
+    #[test]
+    fn a_file_whose_bytes_are_gone_answers_internal() {
+        test_s3::block_on(async {
+            let Some(storage) = test_s3::storage() else {
+                return;
+            };
+            let (_dir, running, invite) = running_with_config(&s3_config(&storage)).await;
+            let (mut socket, token) = admin(&running, &invite).await;
+            let (_bot, chat, _computer) = create_bot(&mut socket).await;
+            let uploaded: Value = upload(
+                &running,
+                &token,
+                chat,
+                "notes.txt",
+                "text/plain",
+                b"read me".to_vec(),
+            )
+            .await
+            .json()
+            .await
+            .unwrap();
+            let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+            test_s3::delete(&storage, uploaded["sha256"].as_str().unwrap()).await;
+
+            // The record still names the File but its bytes are gone: the store
+            // answered, it just has nothing to return. That is not an outage.
+            let refused = download(&running, &token, file).await;
+
+            assert_eq!(refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+            let body: Value = refused.json().await.unwrap();
+            assert_eq!(body["code"], "internal");
+            assert_eq!(
+                file_list(&mut socket, chat).await,
+                vec![uploaded],
+                "the File is still recorded"
+            );
+            socket.close(None).await.unwrap();
+            running.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn an_upload_to_a_store_that_is_down_answers_unavailable() {
+        test_s3::block_on(async {
+            let Some(_storage) = test_s3::storage() else {
+                return;
+            };
+            // A Space whose store cannot be reached still starts and serves: the
+            // bytes are the only thing the store holds, so uploads fail alone. A
+            // signed request needs the credentials the S3 gate requires; the
+            // environment-free check of the same classification lives in `blobs`.
+            let config = "[storage]\nbackend = \"s3\"\nbucket = \"neha\"\n\
+                          region = \"us-east-1\"\nendpoint = \"http://127.0.0.1:1\"\n";
+            let (_dir, running, invite) = running_with_config(config).await;
+            let (mut socket, token) = admin(&running, &invite).await;
+            let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+            let refused = upload(
+                &running,
+                &token,
+                chat,
+                "notes.txt",
+                "text/plain",
+                b"read me".to_vec(),
+            )
+            .await;
+
+            assert_eq!(refused.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+            let body: Value = refused.json().await.unwrap();
+            assert_eq!(body["code"], "unavailable");
+            assert!(
+                file_list(&mut socket, chat).await.is_empty(),
+                "an unreachable store records no File"
+            );
+            socket.close(None).await.unwrap();
+            running.shutdown().await;
+        });
+    }
+
+    #[tokio::test]
+    async fn a_space_refuses_an_invalid_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[storage]\nbackend = \"s3\"\nregion = \"us-east-1\"\n",
+        )
+        .unwrap();
+
+        let Err(error) = start(Home::open(dir.path()).unwrap(), 0).await else {
+            panic!("an invalid configuration must refuse the start");
+        };
+
+        assert!(matches!(error, ServerError::Config(_)), "{error}");
+        assert!(error.to_string().contains("storage.bucket"), "{error}");
     }
 }

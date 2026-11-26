@@ -20,12 +20,13 @@ publish = false
 # same dependency, not in advance.
 [workspace.dependencies]
 futures-util = "0.3"
-opendal = { version = "0.59", default-features = false, features = ["services-fs", "executors-tokio"] }
+opendal = { version = "0.59", default-features = false, features = ["services-fs", "services-s3", "executors-tokio", "http-transport-reqwest"] }
 reqwest = "0.12"
 serde = "1"
 serde_json = "1"
 thiserror = "2"
 tokio = "1"
+toml = "0.9"
 
 # Workspace-wide lints. `cargo clippy -- -D warnings` turns every warning into a
 # failure, so a crate that needs an exception narrows it locally and states why.
