@@ -1515,8 +1515,6 @@ fn scan_directory(
     depth: usize,
     budget: &mut usize,
 ) -> Result<(), RuntimeError> {
-    use std::os::fd::AsRawFd as _;
-
     if depth > MAX_SCAN_DEPTH {
         return Err(unsafe_folder(
             folder_path,
@@ -1526,16 +1524,17 @@ fn scan_directory(
             ),
         ));
     }
-    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
-    }
-    let stream = unsafe { libc::fdopendir(duplicate) };
+    // Open `.` afresh instead of `dup`: a duplicate shares the directory
+    // offset, so a second scan of a cached descriptor would start at EOF and
+    // silently see no entries at all.
+    use std::os::fd::IntoRawFd as _;
+    let opened = match open_directory_at(directory, std::ffi::OsStr::new(".")) {
+        Ok(opened) => opened,
+        Err(error) => return Err(RuntimeError::Io(error)),
+    };
+    let stream = unsafe { libc::fdopendir(opened.into_raw_fd()) };
     if stream.is_null() {
-        let error = std::io::Error::last_os_error();
-        // SAFETY: `duplicate` is still ours when `fdopendir` fails.
-        unsafe { libc::close(duplicate) };
-        return Err(RuntimeError::Io(error));
+        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
     }
     let result = scan_entries(directory, folder_path, relative, depth, budget, stream);
     // SAFETY: `stream` is the open directory stream created above.
@@ -4192,17 +4191,26 @@ mod tests {
         std::fs::create_dir(&granted).unwrap();
         let outside = directory.path().join("outside.txt");
         std::fs::write(&outside, "safe").unwrap();
-        std::fs::hard_link(&outside, granted.join("link.txt")).unwrap();
         let runtime = LocalRuntime::machine(directory.path().join("bot"))
             .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
             .with_machine_access(false, &[granted.to_string_lossy().into_owned()])
             .unwrap();
-        let result = runtime
+        // The first scan leaves the cached grant descriptor at EOF; a second
+        // scan must open a fresh directory stream, not read from that offset.
+        let first = runtime
             .execute(Action::Shell {
-                command: format!("printf changed > {}/link.txt", granted.display()),
+                command: format!("printf ok > {}/ok.txt", granted.display()),
             })
             .await;
-        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert_eq!(first.status, ActionStatus::Succeeded, "{first:?}");
+
+        std::fs::hard_link(&outside, granted.join("late.txt")).unwrap();
+        let second = runtime
+            .execute(Action::Shell {
+                command: format!("printf changed > {}/late.txt", granted.display()),
+            })
+            .await;
+        assert_eq!(second.status, ActionStatus::Failed, "{second:?}");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "safe");
     }
 
