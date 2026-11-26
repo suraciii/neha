@@ -38,6 +38,18 @@ jobs:
         with:
           tool: just
 
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
       - name: Run gate with evidence
         run: just verify "$RUNNER_TEMP/verification"
 

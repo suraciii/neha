@@ -8,12 +8,15 @@ Everything runs on the local machine. The Space listens on loopback and stores i
 
 - Rust stable, version 1.94 or newer.
 - `just` for the verification recipes.
+- Node 24 and pnpm 11 for the browser client.
 - A Provider that speaks OpenAI Chat Completions, or a compatible local server.
 
-Build the CLI:
+Build the CLI and the browser client:
 
 ```bash
 cargo build --locked --workspace
+pnpm --dir ui install --frozen-lockfile
+pnpm --dir ui build
 ```
 
 ## Start a Space
@@ -30,13 +33,25 @@ The CLI prints the address and, for a Space with no Admin, one invitation link:
 ```text
 Neha is listening on http://127.0.0.1:7337
 Invite: http://127.0.0.1:7337/invite#<secret>
+Open in a browser: http://neha-<hash>.localhost:7337/invite#<secret>
+Or join from the CLI: neha join 'http://127.0.0.1:7337/invite#<secret>' --name <your name>
 ```
+
+The browser hostname is stable for this Space and keeps its cookie off shared loopback addresses. Use the `Open in a browser` line the CLI prints.
 
 The invitation is valid once and only while this Space runs. Keep the terminal open.
 
-## Join as the Admin
+## Join as the Admin in the browser
 
-In a second terminal, join with the invitation link:
+Open the `Open in a browser` invitation link. The client asks for a display name and a password of at least eight bytes.
+
+The first User is the Admin. The browser keeps the session in an HttpOnly cookie; no token appears in the page or its URL.
+
+The browser client is served from `ui/dist`. `neha serve` finds it automatically, or takes `--ui <directory>` or `NEHA_UI_DIR`.
+
+## Join as the Admin from the CLI
+
+In a second terminal, join with the same invitation link:
 
 ```bash
 target/debug/neha join 'http://127.0.0.1:7337/invite#<secret>' --name Ada
@@ -112,10 +127,12 @@ The record, the Provider, the Bot, and the Messages survive. A new Space run pri
 target/debug/neha login --name Ada
 ```
 
-When the Space has a new address, or the saved credential is gone, pass `--server http://127.0.0.1:<port>`. Then read the old Chat again; it contains every recorded Message.
+When the Space has a new address, or the saved credential is gone, pass `--server` with the API address the Space prints. Then read the old Chat again; it contains every recorded Message.
 
 ## What this milestone does not do
 
 - The managed Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
 - A Bot has no approval gate yet. It runs an action as soon as the Model asks for it.
 - One human joins a Space. Group Chats, Files, Boards, approvals, notifications, and search arrive in later milestones.
+- The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, approvals, search, or notifications.
+- The browser client does not stream a reply. It shows a working state until the Run finishes.

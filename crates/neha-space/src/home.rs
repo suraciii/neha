@@ -40,8 +40,9 @@ impl Home {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, HomeError> {
         let home = Self { root: root.into() };
         home.prepare()?;
+        let root = fs::canonicalize(home.root()).unwrap_or(home.root);
 
-        Ok(home)
+        Ok(Self { root })
     }
 
     fn prepare(&self) -> Result<(), HomeError> {
@@ -154,5 +155,19 @@ mod tests {
 
         assert!(workspace.ends_with("workspace"));
         assert!(workspace.starts_with(home.root().join("computers")));
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::Home;
+
+    #[test]
+    fn a_relative_home_becomes_an_absolute_canonical_path() {
+        let relative = format!("target/neha-relative-home-{}", std::process::id());
+        let home = Home::open(&relative).unwrap();
+        assert!(home.root().is_absolute());
+        assert_eq!(home.root(), std::fs::canonicalize(&relative).unwrap());
+        std::fs::remove_dir_all(home.root()).ok();
     }
 }

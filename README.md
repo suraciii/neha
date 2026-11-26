@@ -9,6 +9,7 @@ This repository holds the product contracts, the engineering design, and the Rus
 | Path | Contents |
 | --- | --- |
 | `crates/` | Workspace crates: `neha` (domain and wire types), `neha-space` (the Space), `neha-computer` (the Computer runtime seam and local runtime), `neha-loop` (the built-in Bot loop), `neha-app` (the `neha` CLI) |
+| `ui/` | The Solid browser client the Space serves |
 | `specs/` | Product contracts: observable behavior, boundaries, invariants |
 | `docs/` | User-facing guidance |
 | `eng/` | Engineering practices |
@@ -19,7 +20,7 @@ The target layout, including the shells and the UI, is in [Architecture](eng/arc
 
 ## Build
 
-Rust stable (1.94 or newer), [`just`](https://github.com/casey/just), and Python 3 for the documentation and hygiene checks.
+Rust stable (1.94 or newer), [`just`](https://github.com/casey/just), Python 3 for the documentation and hygiene checks, and Node 24 with pnpm 11 for the browser client.
 
 ```bash
 cargo build --locked --workspace

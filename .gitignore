@@ -17,3 +17,7 @@ __pycache__/
 /*.tif
 /*.tiff
 /*.jpg
+
+# The browser client's dependencies and build output are local state.
+ui/node_modules/
+ui/dist/

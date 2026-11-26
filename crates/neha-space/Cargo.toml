@@ -24,7 +24,7 @@ serde_json.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 subtle = "2"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -13,12 +14,12 @@ use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::rand_core::RngCore as _;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Request, State};
-use axum::http::header::{AUTHORIZATION, HOST, ORIGIN};
+use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -29,6 +30,7 @@ use neha::record::{Author, EventDraft, EventKind};
 use neha::surface::{ClientFrame, CommandCall, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::{Component, Path};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use tokio::net::TcpListener;
@@ -62,6 +64,9 @@ pub struct SpaceServer {
     events: broadcast::Sender<neha::record::Event>,
     tool_timeout: Duration,
     chat_runs: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
+    ui: Option<PathBuf>,
+    session_cookie: String,
+    browser_host: String,
 }
 
 impl SpaceServer {
@@ -71,6 +76,17 @@ impl SpaceServer {
     }
 
     async fn open_with(home: Home, tool_timeout: Duration) -> Result<Self, ServerError> {
+        Self::open_with_ui(home, None, tool_timeout).await
+    }
+
+    /// Opens a home and serves the browser client from `ui`.
+    async fn open_with_ui(
+        home: Home,
+        ui: Option<PathBuf>,
+        tool_timeout: Duration,
+    ) -> Result<Self, ServerError> {
+        let session_cookie = session_cookie_name(home.root());
+        let browser_host = browser_host(home.root());
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
         let invite = if identity.has_accounts().await? {
@@ -97,6 +113,9 @@ impl SpaceServer {
             events,
             tool_timeout,
             chat_runs: Mutex::new(std::collections::HashMap::new()),
+            ui,
+            session_cookie,
+            browser_host,
         })
     }
 
@@ -118,15 +137,23 @@ impl SpaceServer {
 
     /// Returns the router a listener serves.
     pub fn router(self: &Arc<Self>) -> Router {
-        Router::new()
+        let router = Router::new()
             .route("/healthz", get(health))
-            .route("/invite", get(invite_page))
             .route("/api/join", post(join))
             .route("/api/login", post(login))
             .route("/api/me", get(me))
             .route("/api/socket", get(socket))
+            .route("/api", any(api_not_found))
+            .route("/api/", any(api_not_found))
+            .route("/api/{*rest}", any(api_not_found));
+        let router = if self.ui.is_some() {
+            router.fallback(get(client_file))
+        } else {
+            router.route("/invite", get(invite_page))
+        };
+        router
             .layer(DefaultBodyLimit::max(64 * 1024))
-            .layer(middleware::from_fn(guard))
+            .layer(middleware::from_fn_with_state(Arc::clone(self), guard))
             .with_state(Arc::clone(self))
     }
 
@@ -150,6 +177,8 @@ pub struct Running {
     pub addr: std::net::SocketAddr,
     /// The invitation URL, when the Space has no Admin yet.
     pub invite: Option<String>,
+    /// The per-Space hostname the browser client uses.
+    pub browser_host: String,
     home: Home,
     task: JoinHandle<()>,
 }
@@ -159,6 +188,27 @@ impl Running {
     #[must_use]
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
+    }
+
+    /// Returns the URL the browser client uses.
+    #[must_use]
+    pub fn browser_url(&self) -> String {
+        format!("http://{}:{}", self.browser_host, self.addr.port())
+    }
+
+    /// Returns the browser invitation, when the Space has no Admin yet.
+    #[must_use]
+    pub fn browser_invite(&self) -> Option<String> {
+        self.invite
+            .as_ref()
+            .map(|_| format!("{}/invite#{}", self.browser_url(), self.invite_secret()))
+    }
+
+    fn invite_secret(&self) -> String {
+        self.invite
+            .as_deref()
+            .and_then(|invite| invite.split_once('#').map(|(_, secret)| secret.to_owned()))
+            .unwrap_or_default()
     }
 
     /// Returns the Space's home.
@@ -179,13 +229,37 @@ pub async fn start(home: Home, port: u16) -> Result<Running, ServerError> {
     start_with_tool_timeout(home, port, neha_computer::local::DEFAULT_TIMEOUT).await
 }
 
+/// Binds a home on loopback and starts serving it with a browser client.
+pub async fn start_with_ui(
+    home: Home,
+    port: u16,
+    ui: Option<PathBuf>,
+) -> Result<Running, ServerError> {
+    start_with(home, port, ui, neha_computer::local::DEFAULT_TIMEOUT).await
+}
+
 /// Binds a home on loopback and starts serving it with a tool time limit.
 pub async fn start_with_tool_timeout(
     home: Home,
     port: u16,
     tool_timeout: Duration,
 ) -> Result<Running, ServerError> {
-    let server = Arc::new(SpaceServer::open_with(home, tool_timeout).await?);
+    start_with(home, port, None, tool_timeout).await
+}
+
+async fn start_with(
+    home: Home,
+    port: u16,
+    ui: Option<PathBuf>,
+    tool_timeout: Duration,
+) -> Result<Running, ServerError> {
+    if let Some(dir) = &ui
+        && !dir.join("index.html").is_file()
+    {
+        return Err(ServerError::Ui(dir.clone()));
+    }
+    let server = Arc::new(SpaceServer::open_with_ui(home, ui, tool_timeout).await?);
+    validate_client_directory(&server).await?;
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     let invite = server
@@ -203,17 +277,21 @@ pub async fn start_with_tool_timeout(
     Ok(Running {
         addr,
         invite,
+        browser_host: server.browser_host.clone(),
         home: server.home().clone(),
         task,
     })
 }
 
-async fn guard(request: Request, next: Next) -> Response {
+async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: Next) -> Response {
     let host = request
         .headers()
         .get(HOST)
         .and_then(|value| value.to_str().ok());
-    if !host.is_some_and(loopback_host) {
+    let browser_host = host
+        .and_then(split_authority)
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&server.browser_host));
+    if !host.is_some_and(loopback_host) && !browser_host {
         return ApiError::forbidden("the Host header must name loopback").into_response();
     }
     let origin = request
@@ -225,11 +303,28 @@ async fn guard(request: Request, next: Next) -> Response {
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("Bearer "));
-    if origin.is_some() && !bearer {
-        return ApiError::forbidden("a browser Origin requires a Bearer token").into_response();
+    if let Some(origin) = origin {
+        let same_site = host.is_some_and(|host| same_authority(origin, host));
+        if (!same_site || !browser_host) && !bearer {
+            return ApiError::forbidden("a browser Origin must name this Space").into_response();
+        }
     }
 
     next.run(request).await
+}
+
+fn same_authority(origin: &str, host: &str) -> bool {
+    let Some((scheme, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    // This Space listens on plain HTTP on loopback. A page served by it has
+    // an http Origin; accepting another scheme would claim transport security
+    // the listener does not provide.
+    if scheme != "http" {
+        return false;
+    }
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority.eq_ignore_ascii_case(host)
 }
 
 fn loopback_host(value: &str) -> bool {
@@ -242,7 +337,10 @@ fn loopback_host(value: &str) -> bool {
         return false;
     }
 
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    host == "localhost"
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn split_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -262,8 +360,150 @@ fn split_authority(value: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+fn path_identity(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        path.as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        path.to_string_lossy().into_owned().into_bytes()
+    }
+}
+
+/// Returns the stable browser hostname for a Space.
+///
+/// A cookie is scoped to a host but not a port. A dedicated `*.localhost`
+/// hostname keeps the browser session off shared loopback aliases and other
+/// local services.
+fn browser_host(home: &Path) -> String {
+    let digest = Sha256::digest(path_identity(home));
+    let suffix: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("neha-{suffix}.localhost")
+}
+
+async fn validate_client_directory(server: &SpaceServer) -> Result<(), ServerError> {
+    let Some(dir) = &server.ui else {
+        return Ok(());
+    };
+    let root = tokio::fs::canonicalize(dir)
+        .await
+        .map_err(|_| ServerError::Ui(dir.clone()))?;
+    let index = tokio::fs::canonicalize(root.join("index.html"))
+        .await
+        .map_err(|_| ServerError::Ui(dir.clone()))?;
+    if !index.starts_with(&root) || !index.is_file() {
+        return Err(ServerError::Ui(dir.clone()));
+    }
+    let home = tokio::fs::canonicalize(server.home.root())
+        .await
+        .map_err(|_| ServerError::Ui(dir.clone()))?;
+    if root.starts_with(&home) || home.starts_with(&root) {
+        return Err(ServerError::UiOverlapsHome(dir.clone()));
+    }
+    Ok(())
+}
+
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn api_not_found() -> Response {
+    ApiError::not_found("no such API route").into_response()
+}
+
+async fn client_file(
+    State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let host_name = host
+        .and_then(split_authority)
+        .map(|(host, _)| host)
+        .unwrap_or_default();
+    if !host_name.eq_ignore_ascii_case(&server.browser_host) {
+        let port = host
+            .and_then(split_authority)
+            .and_then(|(_, port)| port)
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        let location = format!("http://{}{}{}", server.browser_host, port, uri.path());
+        return (StatusCode::TEMPORARY_REDIRECT, [("location", location)]).into_response();
+    }
+    let Some(configured) = &server.ui else {
+        return ApiError::not_found("no browser client is configured").into_response();
+    };
+    let Ok(root) = tokio::fs::canonicalize(configured).await else {
+        return ApiError::not_found("the browser client is missing").into_response();
+    };
+    let requested = uri.path().trim_start_matches('/');
+    let requested = if requested.is_empty() {
+        PathBuf::from("index.html")
+    } else {
+        PathBuf::from(requested)
+    };
+    if requested.is_absolute()
+        || requested
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return ApiError::not_found("no such file").into_response();
+    }
+
+    let target = root.join(&requested);
+    let target = match tokio::fs::canonicalize(&target).await {
+        Ok(target) if target.starts_with(&root) && target.is_file() => target,
+        _ if requested.extension().is_some() => {
+            return ApiError::not_found("no such file").into_response();
+        }
+        _ => match tokio::fs::canonicalize(root.join("index.html")).await {
+            Ok(index) if index.starts_with(&root) && index.is_file() => index,
+            _ => return ApiError::not_found("the browser client is missing").into_response(),
+        },
+    };
+
+    let Ok(bytes) = tokio::fs::read(&target).await else {
+        return ApiError::not_found("no such file").into_response();
+    };
+    let content_type = content_type(&target);
+    let mut response = ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response();
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn content_type(path: &Path) -> &'static str {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("json") | Some("map") => "application/json",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("txt") => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
 }
 
 async fn invite_page() -> Html<&'static str> {
@@ -311,8 +551,9 @@ impl From<Account> for AccountBody {
 
 async fn join(
     State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
     Json(request): Json<JoinRequest>,
-) -> Result<Json<SessionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let accepted = server
         .invite
         .lock()
@@ -347,17 +588,26 @@ async fn join(
         .map_err(|error| ApiError::internal(error.to_string()))?;
     server.consume_invite();
 
-    Ok(Json(SessionResponse {
-        token,
-        account: account.into(),
-    }))
+    let account = AccountBody::from(account);
+    let browser = browser_request(&server, &headers);
+    let cookie = browser.then(|| server.session_headers(&token));
+    let response = if browser {
+        Json(account).into_response()
+    } else {
+        Json(SessionResponse { token, account }).into_response()
+    };
+    Ok(match cookie {
+        Some(cookie) => (cookie, response).into_response(),
+        None => response,
+    })
 }
 
 async fn login(
     State(server): State<Arc<SpaceServer>>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<LoginRequest>,
-) -> Result<Json<SessionResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     if !server
         .login
         .lock()
@@ -376,10 +626,20 @@ async fn login(
         .login(&request.display_name, &request.password)
         .await
     {
-        Ok((account, token)) => Ok(Json(SessionResponse {
-            token,
-            account: account.into(),
-        })),
+        Ok((account, token)) => {
+            let account = AccountBody::from(account);
+            let browser = browser_request(&server, &headers);
+            let cookie = browser.then(|| server.session_headers(&token));
+            let response = if browser {
+                Json(account).into_response()
+            } else {
+                Json(SessionResponse { token, account }).into_response()
+            };
+            Ok(match cookie {
+                Some(cookie) => (cookie, response).into_response(),
+                None => response,
+            })
+        }
         Err(IdentityError::InvalidCredentials) => {
             server
                 .login
@@ -394,6 +654,46 @@ async fn login(
         }
         Err(error) => Err(identity_error(error)),
     }
+}
+
+impl SpaceServer {
+    fn session_headers(&self, token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let cookie = format!(
+            "{}={token}; Path=/; HttpOnly; SameSite=Strict",
+            self.session_cookie
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+            headers.insert(SET_COOKIE, value);
+        }
+        headers
+    }
+}
+
+fn session_cookie_name(home: &Path) -> String {
+    let digest = Sha256::digest(path_identity(home));
+    let suffix: String = digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("neha_session_{suffix}")
+}
+
+fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
+    let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
+    let host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(split_authority)
+        .map(|(host, _)| host);
+    origin.is_some_and(|origin| {
+        host.is_some_and(|host| host.eq_ignore_ascii_case(&server.browser_host))
+            && headers
+                .get(HOST)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|host| same_authority(origin, host))
+    })
 }
 
 async fn me(Authed { account }: Authed) -> Json<AccountBody> {
@@ -754,13 +1054,25 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
         parts: &mut Parts,
         server: &Arc<SpaceServer>,
     ) -> Result<Self, Self::Rejection> {
-        let token = bearer(&parts.headers).ok_or_else(|| {
-            ApiError::new(
-                StatusCode::UNAUTHORIZED,
-                ErrorCode::Unauthorized,
-                "a Bearer token is required",
-            )
-        })?;
+        let token = bearer(&parts.headers)
+            .or_else(|| {
+                let browser_host = parts
+                    .headers
+                    .get(HOST)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(split_authority)
+                    .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&server.browser_host));
+                browser_host
+                    .then(|| cookie_token(&parts.headers, &server.session_cookie))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::UNAUTHORIZED,
+                    ErrorCode::Unauthorized,
+                    "a session token is required",
+                )
+            })?;
         let account = server
             .identity
             .authenticate(token)
@@ -845,6 +1157,14 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
 
     value.strip_prefix("Bearer ").map(str::trim)
+}
+
+fn cookie_token<'a>(headers: &'a HeaderMap, cookie_name: &str) -> Option<&'a str> {
+    let cookies = headers.get(COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|cookie| {
+        let (name, value) = cookie.trim().split_once('=')?;
+        (name == cookie_name).then_some(value)
+    })
 }
 
 #[derive(Debug)]
@@ -1028,6 +1348,12 @@ pub enum ServerError {
     /// The model client cannot be built.
     #[error("model error: {0}")]
     Model(#[from] ModelError),
+    /// The browser client has no entry point.
+    #[error("the browser client at {} has no index.html", .0.display())]
+    Ui(PathBuf),
+    /// The browser client directory overlaps the Space home.
+    #[error("the browser client at {} overlaps the Space home", .0.display())]
+    UiOverlapsHome(PathBuf),
 }
 
 #[cfg(test)]
