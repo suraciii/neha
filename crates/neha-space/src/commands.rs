@@ -2541,7 +2541,12 @@ fn lasting_scope(call: &LoopCall) -> Option<String> {
         | neha_loop::tools::LIST_FILES
         | neha_loop::tools::PUT_FILE => {
             let path = call.arguments.get("path").and_then(Value::as_str)?;
-            let derived = derived_path(path)?;
+            let derived = action_path(path)?;
+            if derived.split('/').any(|component| {
+                component == ".." || (!component.is_empty() && component.trim().is_empty())
+            }) {
+                return None;
+            }
 
             Some(file_scope(&sanitize_text(&parent_of(&derived))))
         }
@@ -2618,10 +2623,14 @@ fn lexical_path(path: &str) -> String {
     }
 }
 
-/// Normalizes a raw action path for comparison.
+/// The one normalized form of a raw action path.
 ///
-/// A raw path is trimmed once, as the daemon trims it. A path that is only
-/// whitespace, though, names a directory made of spaces and is not the
+/// A raw path is trimmed once, as the daemon trims it, and then lexical: the
+/// card, rule matching, rule derivation, ambiguity judgement, and lasting
+/// validation all use this same value. Trimming the whole path keeps a
+/// directory name that ends in a space (`"logs /x"` derives `logs `) while a
+/// path that merely starts with blank space is the same as without it. A path
+/// that is only whitespace names a directory made of spaces and is not the
 /// Workspace root: it has no comparable lexical form (`None`).
 fn action_path(path: &str) -> Option<String> {
     let trimmed = path.trim();
@@ -2637,15 +2646,6 @@ fn action_path(path: &str) -> Option<String> {
 /// Derivation trims only the end of the raw path, so a leading space can be a
 /// directory name. The result is already lexical, so it is never trimmed
 /// again: two directories that differ by a trailing space stay distinct.
-fn derived_path(path: &str) -> Option<String> {
-    let trimmed = path.trim_end();
-    if trimmed.trim().is_empty() && !path.is_empty() {
-        return None;
-    }
-
-    Some(lexical_path(trimmed))
-}
-
 /// Returns the parent directory of an already-derived path.
 fn parent_of(path: &str) -> String {
     match path.rsplit_once('/') {
@@ -2735,7 +2735,7 @@ fn rule_covers(
 /// Returns the parent directory of a path, as a rule stores it.
 #[cfg(test)]
 fn path_parent(path: &str) -> String {
-    match derived_path(path) {
+    match action_path(path) {
         Some(path) => parent_of(&path),
         // A path that is only spaces has no parent in the Workspace root.
         None => lexical_path(path),
@@ -2770,7 +2770,7 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
                 .ok_or_else(|| {
                     ApiError::invalid_argument("the action has no path to make a rule from")
                 })?;
-            let derived = derived_path(path).ok_or_else(|| {
+            let derived = action_path(path).ok_or_else(|| {
                 ApiError::invalid_argument("the action path cannot make a lasting rule")
             })?;
             if derived.split('/').any(|component| {
@@ -2799,17 +2799,31 @@ const MAX_SUMMARY_BYTES: usize = 4096;
 /// arguments are in the event and in `RunShow`.
 fn approval_summary(call: &LoopCall) -> String {
     let detail = match call.tool.as_str() {
-        neha_loop::tools::SHELL => call.arguments.get("command").and_then(Value::as_str),
+        neha_loop::tools::SHELL => call
+            .arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|command| command.trim().to_owned()),
         neha_loop::tools::READ_FILE
         | neha_loop::tools::WRITE_FILE
         | neha_loop::tools::LIST_FILES
-        | neha_loop::tools::PUT_FILE => call.arguments.get("path").and_then(Value::as_str),
-        neha_loop::tools::TAKE_FILE => call.arguments.get("file").and_then(Value::as_str),
+        | neha_loop::tools::PUT_FILE => {
+            call.arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map(|path| {
+                    // Show the path the daemon will actually read or write.
+                    action_path(path).unwrap_or_else(|| path.trim().to_owned())
+                })
+        }
+        neha_loop::tools::TAKE_FILE => call
+            .arguments
+            .get("file")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         _ => None,
-    }
-    .unwrap_or("")
-    .trim();
-    let detail = sanitize_text(detail);
+    };
+    let detail = sanitize_text(detail.as_deref().unwrap_or(""));
     let text = if detail.is_empty() {
         format!("{} on this Computer", call.tool)
     } else {
@@ -3631,6 +3645,16 @@ mod tests {
         assert_eq!(path_parent("logs /report.txt"), "logs ");
         assert_eq!(path_parent("logs/report.txt"), "logs");
         assert_eq!(path_parent("./logs/report.txt  "), "logs");
+
+        // A leading blank is not part of the directory: the card, matching,
+        // and derivation all see the executed path.
+        assert!(path_matches(" logs/report.txt", "logs"));
+        assert_eq!(path_parent(" logs/report.txt"), "logs");
+        let broad = ask("read_file", None, None);
+        assert!(ambiguous_path(
+            " logs/../secret",
+            std::slice::from_ref(&broad)
+        ));
 
         // A path or component made only of whitespace is not judgeable: it is
         // never the Workspace root and it always asks when rules exist.

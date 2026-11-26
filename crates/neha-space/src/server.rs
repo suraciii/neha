@@ -12113,7 +12113,7 @@ mod tests {
                 tool("shell", json!({"command": "true"})),
                 text("one"),
                 tool("shell", json!({"command": "echo hi; rm x"})),
-                tool("read_file", json!({"path": "../x"})),
+                tool("read_file", json!({"path": " logs/../secret"})),
                 tool("shell", json!({"command": "echo hi; rm x"})),
                 text("two"),
             ],
@@ -12173,6 +12173,13 @@ mod tests {
         let approval = approval_for_run(&mut local.socket, third).await;
         assert_eq!(approval["reason"], "rule");
         assert_eq!(approval["tool"], "read_file");
+        assert!(
+            approval["summary"]
+                .as_str()
+                .unwrap()
+                .contains("logs/../secret"),
+            "the card shows the executed path, without the leading blank"
+        );
         let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
         let lasting = try_command(
             &mut local.socket,
@@ -12791,6 +12798,105 @@ mod tests {
         assert_eq!(rules.len(), 1, "no derived rule for an all-space path");
         assert_eq!(rules[0]["effect"], "allow");
         assert_eq!(rules[0]["path_prefix"], ".");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_leading_space_action_derives_the_executed_directory() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": " logs/report.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": " logs/other.txt"})),
+                text("two"),
+                tool("read_file", json!({"path": "logs/report2.txt"})),
+                text("three"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        assert_eq!(
+            answer_next_action(&mut local.device, "o").await,
+            WireAction::ReadFile {
+                path: " logs/report.txt".to_owned()
+            },
+            "the daemon's action keeps the model's spelling"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let wide = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let wide_id: Id = serde_json::from_value(wide["rule"].clone()).unwrap();
+        let second = run_of(&submit(&mut local.socket, local.chat, "logs rest", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["rule"], json!(wide_id));
+        assert_eq!(
+            approval["summary"], "read_file: logs/other.txt",
+            "the card shows the path the daemon will read"
+        );
+        assert_eq!(
+            approval["lasting_scope"], "files under \"logs\"",
+            "the derived directory is where the action runs"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert!(decided["rule"].is_string());
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // The derived `logs` rule covers the next action that runs in `logs`,
+        // with or without a leading blank.
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert!(
+            rules.iter().any(|rule| rule["path_prefix"] == "logs"),
+            "the derived rule names the executed directory: {rules:?}"
+        );
+        let third = run_of(&submit(&mut local.socket, local.chat, "logs again", None).await);
+        let action = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            answer_next_action(&mut local.device, "o"),
+        )
+        .await
+        .expect("the derived logs rule lets the action run");
+        assert_eq!(
+            action,
+            WireAction::ReadFile {
+                path: "logs/report2.txt".to_owned()
+            }
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        assert_eq!(started_actions(&running, third).await.len(), 1);
 
         local.device.close(None).await.unwrap();
         local.provider_task.abort();
