@@ -9,6 +9,7 @@
 //! again: its recorded result is the answer.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -93,6 +94,8 @@ pub struct PendingRun {
     pub command: Id,
     /// The directory this run works in, when it named one.
     pub cwd: Option<String>,
+    /// A folder allowed for the next action after a one-time grant.
+    pub once_grant: Option<String>,
     /// The Model to call.
     pub model: ModelView,
     /// The Provider that offers the Model.
@@ -311,6 +314,22 @@ async fn approval_decide(
             "only the User the Bot acts for answers an approval",
         ));
     }
+    if view.reason == ApprovalReason::Grant {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let owner = state
+            .bots
+            .get(&view.bot)
+            .map(|bot| bot.owner)
+            .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
+        if owner != account.id {
+            return Err(ApiError::forbidden(
+                "only the Bot's owner grants file access",
+            ));
+        }
+    }
     if view.decided.is_some() {
         return Err(ApiError::invalid_argument(
             "the approval is already decided",
@@ -329,7 +348,39 @@ async fn approval_decide(
 
     // A lasting answer records the derived rule in the same transaction, and
     // the decision names it.
-    let lasting_rule = lasting.then(Id::new);
+    let lasting_grant = if lasting && view.reason == ApprovalReason::Grant {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let bot = state
+            .bots
+            .get(&view.bot)
+            .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
+        let run = state
+            .runs
+            .get(&view.run)
+            .ok_or_else(|| ApiError::internal("the run is gone"))?;
+        let call = LoopCall {
+            call: view.call.clone(),
+            tool: view.tool.clone(),
+            arguments: view.arguments.clone(),
+            refused: None,
+        };
+        grant_folder(bot, run.cwd.as_deref(), &call).map(|(folder, _)| folder)
+    } else {
+        None
+    };
+    if lasting && view.reason == ApprovalReason::Grant && lasting_grant.is_none() {
+        return Err(ApiError::invalid_argument(
+            "the action has no folder that can become a lasting grant",
+        ));
+    }
+    let lasting_rule = if lasting && view.reason != ApprovalReason::Grant {
+        Some(Id::new())
+    } else {
+        None
+    };
     let mut drafts = vec![
         EventDraft::new(
             EventKind::ApprovalDecided,
@@ -407,6 +458,29 @@ async fn approval_decide(
                 .acting(view.acting),
             );
         }
+    }
+    if let Some(folder) = &lasting_grant {
+        let grants = {
+            let state = context
+                .state
+                .lock()
+                .map_err(|_| ApiError::internal("state lock"))?;
+            let bot = state
+                .bots
+                .get(&view.bot)
+                .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
+            let mut grants = bot.grants.clone();
+            grants.push(folder.clone());
+            grants.sort();
+            grants.dedup();
+            grants
+        };
+        result["grant"] = json!(folder);
+        drafts.push(EventDraft::new(
+            EventKind::BotUpdated,
+            Author::User(view.acting),
+            json!({"bot": view.bot, "grants": grants}),
+        ));
     }
     let mut confirmation = None;
     if !allow {
@@ -1504,6 +1578,7 @@ pub async fn resume_pending(
         message: run.message,
         command: run.command,
         cwd: run.cwd.clone(),
+        once_grant: run.once_grant.clone(),
         model,
         provider,
         api_key,
@@ -1816,6 +1891,9 @@ async fn finish_run_with(
                 });
                 if let Some(cwd) = &pending.cwd {
                     runtime = runtime.with_working_dir(cwd);
+                }
+                if let Some(folder) = &pending.once_grant {
+                    runtime = runtime.with_once_grant(folder);
                 }
                 runtime
             })
@@ -2534,7 +2612,10 @@ impl Recorder for RunRecorder<'_> {
             // A Hosted Computer has no fence yet (M2-B); it never asks.
             return Ok(Decision::Allow);
         }
-        let (reason, rule, ambiguous) = if first_use {
+        let grant = grant_folder(&bot, self.log.cwd.as_deref(), call);
+        let (reason, rule, ambiguous) = if grant.is_some() {
+            (ApprovalReason::Grant, None, false)
+        } else if first_use {
             // The first use of a Local Computer always asks, whatever rules
             // exist: a lasting allow cannot cover it.
             (ApprovalReason::FirstUseLocal, None, false)
@@ -2557,10 +2638,12 @@ impl Recorder for RunRecorder<'_> {
             }
         };
         let index = self.call_index(step, call)?;
-        let lasting_scope = if reason == ApprovalReason::Rule {
-            lasting_scope(call)
-        } else {
-            None
+        let lasting_scope = match reason {
+            ApprovalReason::Rule => lasting_scope(call),
+            ApprovalReason::Grant => grant
+                .as_ref()
+                .map(|(folder, scope)| format!("{scope} under {folder}")),
+            ApprovalReason::FirstUseLocal => None,
         };
         let approval = Id::new();
         self.log
@@ -3038,6 +3121,52 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
         }
         _ => Ok((tool, None, None)),
     }
+}
+
+/// Returns the folder a write action needs granted, when the owner has not
+/// already granted it.
+///
+/// The Space knows the owner's grants and the run's working directory; it does
+/// not know a Local Bot's absolute Workspace path, so a relative path is only
+/// judged when the run named a working directory. The daemon still enforces
+/// the fence; this check decides when to ask before the action runs.
+fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(String, String)> {
+    if bot.full_access {
+        return None;
+    }
+    let target = match call.tool.as_str() {
+        neha_loop::tools::WRITE_FILE | neha_loop::tools::PUT_FILE => {
+            let path = call.arguments.get("path").and_then(Value::as_str)?;
+            if Path::new(path).is_absolute() {
+                action_path(path)?
+            } else {
+                let cwd = cwd?;
+                action_path(&format!("{}/{path}", cwd.trim_end_matches('/')))?
+            }
+        }
+        neha_loop::tools::SHELL => {
+            // A shell can write anywhere; its working directory is the only
+            // target the Space can name before it runs.
+            let cwd = cwd?;
+            action_path(cwd)?
+        }
+        _ => return None,
+    };
+    if under_grants(&target, &bot.grants) {
+        return None;
+    }
+    let folder = parent_of(&target);
+    Some((folder, "writes".to_owned()))
+}
+
+/// Returns whether a normalized path lies in one of the granted folders.
+fn under_grants(path: &str, grants: &[String]) -> bool {
+    grants.iter().any(|grant| {
+        let grant = lexical_path(grant);
+        path == grant
+            || (grant == "/" && path.starts_with('/'))
+            || path.starts_with(&(grant.trim_end_matches('/').to_owned() + "/"))
+    })
 }
 
 /// The largest summary the record keeps whole.

@@ -24,9 +24,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const reason = () =>
     props.approval.reason === "first_use_local"
       ? t("chat.approval.reason.firstUse", { name: props.botName })
-      : props.approval.ambiguous
-        ? t("chat.approval.reason.ambiguous")
-        : t("chat.approval.reason.rule");
+      : props.approval.reason === "grant"
+        ? t("chat.approval.reason.grant")
+        : props.approval.ambiguous
+          ? t("chat.approval.reason.ambiguous")
+          : t("chat.approval.reason.rule");
   const undo = () =>
     t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
   // What an Always allow would cover. null, or an empty string, is the Space
@@ -34,7 +36,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   // says nothing at all leaves this page to name what it can see.
   const scope = () => {
     const approval = props.approval;
-    if (approval.reason !== "rule" || approval.lasting_scope === null) return null;
+    if (
+      (approval.reason !== "rule" && approval.reason !== "grant") ||
+      approval.lasting_scope === null
+    )
+      return null;
     if (approval.lasting_scope !== undefined) {
       const said = approval.lasting_scope.trim();
       return said ? t("chat.approval.lastingScope", { scope: said }) : null;

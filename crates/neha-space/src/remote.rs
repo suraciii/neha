@@ -34,6 +34,8 @@ pub struct RemoteRuntime {
     working_dir: Option<String>,
     /// The owner-granted write access the run carries.
     access: neha_computer::channel::AccessFrame,
+    /// A folder allowed for the next action only.
+    once_grant: std::sync::Mutex<Option<String>>,
 }
 
 impl RemoteRuntime {
@@ -47,6 +49,7 @@ impl RemoteRuntime {
             timeout,
             working_dir: None,
             access: neha_computer::channel::AccessFrame::default(),
+            once_grant: std::sync::Mutex::new(None),
         }
     }
 
@@ -64,6 +67,15 @@ impl RemoteRuntime {
         self
     }
 
+    /// Allows one extra folder for the next action only.
+    #[must_use]
+    pub fn with_once_grant(self, folder: impl Into<String>) -> Self {
+        if let Ok(mut once) = self.once_grant.lock() {
+            *once = Some(folder.into());
+        }
+        self
+    }
+
     /// Returns the id for the next request.
     fn next_id(&self) -> u64 {
         self.ids.fetch_add(1, Ordering::Relaxed)
@@ -76,15 +88,16 @@ impl ComputerRuntime for RemoteRuntime {
     fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send {
         async move {
             let id = self.next_id();
+            let mut access = self.access.clone();
+            if let Ok(mut once) = self.once_grant.lock()
+                && let Some(folder) = once.take()
+            {
+                access.write_roots.push(folder);
+            }
             let answer = tokio::time::timeout(
                 self.timeout,
-                self.link.act(
-                    id,
-                    self.bot,
-                    action,
-                    self.working_dir.as_deref(),
-                    &self.access,
-                ),
+                self.link
+                    .act(id, self.bot, action, self.working_dir.as_deref(), &access),
             )
             .await;
             match answer {

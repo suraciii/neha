@@ -198,6 +198,8 @@ pub struct RunView {
     pub approval: Option<Id>,
     /// The directory the run works in, when it named one.
     pub cwd: Option<String>,
+    /// A write folder allowed for the next action after a one-time grant.
+    pub once_grant: Option<String>,
     /// The Computer the run started on, from the projection's replay.
     ///
     /// A move after the start does not change it: the run keeps the Computer
@@ -681,6 +683,7 @@ impl Projection for State {
                         error: None,
                         approval: None,
                         cwd: None,
+                        once_grant: None,
                         computer: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
@@ -714,6 +717,7 @@ impl Projection for State {
                             error: None,
                             approval: None,
                             cwd: None,
+                            once_grant: None,
                             computer,
                             steps: Vec::new(),
                             actions: Vec::new(),
@@ -758,6 +762,7 @@ impl Projection for State {
                     .runs
                     .get_mut(&data.run)
                     .ok_or("an action must belong to a started run")?;
+                run.once_grant = None;
                 run.actions.push(ActionView {
                     id: data.action,
                     step: data.step,
@@ -865,7 +870,7 @@ impl Projection for State {
                 {
                     return Err("an approval is answered by its acting User".to_owned());
                 }
-                let (allow, reason, bot, acting, computer) = {
+                let (allow, reason, bot, acting, computer, scope) = {
                     let approval = &mut self.approvals[position];
                     approval.decided = Some(data.allow);
 
@@ -875,6 +880,7 @@ impl Projection for State {
                         approval.bot,
                         approval.acting,
                         approval.computer,
+                        approval.lasting_scope.clone(),
                     )
                 };
                 let run = self
@@ -888,6 +894,9 @@ impl Projection for State {
                     run.status = RunStatus::Running;
                     if reason == ApprovalReason::FirstUseLocal {
                         self.first_use_allowed.insert((bot, acting, computer));
+                    }
+                    if reason == ApprovalReason::Grant && !data.lasting {
+                        run.once_grant = scope;
                     }
                 }
             }

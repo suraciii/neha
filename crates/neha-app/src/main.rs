@@ -639,17 +639,25 @@ async fn bot(command: BotCommand) -> Result<()> {
             grants,
             clear_grants,
         } => {
+            if clear_grants && !grants.is_empty() {
+                bail!("--clear-grants and --grant cannot be used together");
+            }
             let grants = if clear_grants {
                 Some(Vec::new())
             } else if grants.is_empty() {
                 None
             } else {
-                Some(
-                    grants
-                        .into_iter()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .collect(),
-                )
+                let mut checked = Vec::new();
+                for path in grants {
+                    let folder = std::fs::canonicalize(&path).with_context(|| {
+                        format!("the grant folder does not exist: {}", path.display())
+                    })?;
+                    if !folder.is_dir() {
+                        bail!("a grant must be a folder: {}", folder.display());
+                    }
+                    checked.push(folder.to_string_lossy().into_owned());
+                }
+                Some(checked)
             };
             let result = client::command(
                 &credential,
@@ -1419,7 +1427,7 @@ impl ApprovalCard {
     /// possible; the User never grants a lasting rule without seeing its
     /// reach.
     fn always_scope(&self) -> Option<String> {
-        if self.reason != "rule" {
+        if self.reason != "rule" && self.reason != "grant" {
             return None;
         }
 
@@ -1460,6 +1468,8 @@ impl ApprovalCard {
             "a form no rule can judge".to_owned()
         } else if self.reason == "rule" {
             "a rule you set".to_owned()
+        } else if self.reason == "grant" {
+            "a folder you have not granted".to_owned()
         } else {
             self.reason.clone()
         }

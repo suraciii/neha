@@ -1384,6 +1384,8 @@ pub enum ApprovalReason {
     FirstUseLocal,
     /// A lasting rule asks first.
     Rule,
+    /// The action writes outside the folders the owner granted.
+    Grant,
 }
 
 /// Whether the User can undo an action after allowing it.

@@ -44,7 +44,9 @@ Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves
 
 `--full-access on` gives it the daemon's own file rights and removes the shell fence. `--full-access off` restores the Bot's Workspace fence.
 
-`--grant <path>` grants write access to an extra folder; repeat it for more folders. `--clear-grants` removes them all. `neha bot show` prints what is in effect.
+`--grant <path>` grants write access to an extra folder; repeat it for more folders. The folder MUST exist on the Local Computer.
+
+`--clear-grants` removes them all and cannot be combined with `--grant`. `neha bot show` prints what is in effect.
 
 `neha chat send --cwd <path>` starts that run's actions in the named directory. Without it they start in the Bot's Workspace. The directory is recorded with the run and shown on an approval card.
 

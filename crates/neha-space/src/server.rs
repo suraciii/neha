@@ -11219,6 +11219,16 @@ mod tests {
             ],
         )
         .await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotUpdate(neha::surface::BotUpdate {
+                bot: local.bot,
+                full_access: None,
+                grants: Some(vec!["/tmp".to_owned(), "/etc".to_owned()]),
+            }),
+        )
+        .await;
         let first = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
         let approval: Id = serde_json::from_value(
             approval_for_run(&mut local.socket, first).await["approval"].clone(),
@@ -11783,6 +11793,16 @@ mod tests {
                     json!({"path": "/tmp/abs.txt", "content": "four"}),
                 ),
             ],
+        )
+        .await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotUpdate(neha::surface::BotUpdate {
+                bot: local.bot,
+                full_access: None,
+                grants: Some(vec!["/tmp".to_owned()]),
+            }),
         )
         .await;
         let first = run_of(&submit(&mut local.socket, local.chat, "write one", None).await);
@@ -13214,6 +13234,99 @@ mod tests {
         device.close(None).await.unwrap();
         provider_task.abort();
         socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_outside_the_grants_asks_the_owner() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "inside.txt", "content": "one"}),
+                ),
+                text("first"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "two"}),
+                ),
+                text("second"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "three"}),
+                ),
+                text("third"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "four"}),
+                ),
+                text("fourth"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "inside", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A write outside the Workspace and its grants asks the owner.
+        let second = run_of(&submit(&mut local.socket, local.chat, "outside", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "grant");
+        assert_eq!(approval["lasting_scope"], "writes under /tmp");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // One allow does not last: the next write asks again, and a lasting
+        // answer adds the folder to the Bot.
+        let third = run_of(&submit(&mut local.socket, local.chat, "outside again", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "grant");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert_eq!(decided["grant"], "/tmp");
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!(["/tmp"]));
+
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "granted", None).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "the lasting grant covers the next write"
+        );
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 

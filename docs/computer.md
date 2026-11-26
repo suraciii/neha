@@ -191,7 +191,7 @@ neha bot update <bot-id> --full-access on
 neha bot update <bot-id> --clear-grants
 ```
 
-`--grant` adds one extra folder the Bot may write; repeat it for more. `--full-access on` gives the Bot the daemon process's own write rights and removes the shell fence; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
+`--grant` adds one extra folder the Bot may write; repeat it for more. The folder must already exist on this machine. `--full-access on` gives the Bot the daemon process's own write rights and removes the shell fence; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
 
 A run can start its actions in another directory with `neha chat send --cwd`:
 
