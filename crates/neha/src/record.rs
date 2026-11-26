@@ -51,6 +51,15 @@ pub enum EventKind {
     /// A run finished.
     #[serde(rename = "neha.run.finished")]
     RunFinished,
+    /// A run completed one step.
+    #[serde(rename = "neha.run.step")]
+    RunStep,
+    /// A run started one action.
+    #[serde(rename = "neha.action.started")]
+    ActionStarted,
+    /// A run finished one action.
+    #[serde(rename = "neha.action.finished")]
+    ActionFinished,
 }
 
 impl EventKind {
@@ -66,6 +75,9 @@ impl EventKind {
             Self::MessageAdded => "neha.message.added",
             Self::RunStarted => "neha.run.started",
             Self::RunFinished => "neha.run.finished",
+            Self::RunStep => "neha.run.step",
+            Self::ActionStarted => "neha.action.started",
+            Self::ActionFinished => "neha.action.finished",
         }
     }
 
@@ -74,6 +86,9 @@ impl EventKind {
     pub const fn class(self) -> EventClass {
         match self {
             Self::MessageAdded | Self::RunStarted | Self::RunFinished => EventClass::Presentation,
+            // Steps and actions decide which work may run again and what a
+            // budget counted: a reader that does not know them must stop.
+            Self::RunStep | Self::ActionStarted | Self::ActionFinished => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::BotCreated
@@ -96,6 +111,9 @@ impl FromStr for EventKind {
             "neha.message.added" => Ok(Self::MessageAdded),
             "neha.run.started" => Ok(Self::RunStarted),
             "neha.run.finished" => Ok(Self::RunFinished),
+            "neha.run.step" => Ok(Self::RunStep),
+            "neha.action.started" => Ok(Self::ActionStarted),
+            "neha.action.finished" => Ok(Self::ActionFinished),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -182,6 +200,9 @@ mod tests {
             EventKind::MessageAdded,
             EventKind::RunStarted,
             EventKind::RunFinished,
+            EventKind::RunStep,
+            EventKind::ActionStarted,
+            EventKind::ActionFinished,
         ];
 
         for kind in kinds {
@@ -193,6 +214,9 @@ mod tests {
     fn message_and_run_events_are_presentation() {
         assert_eq!(EventKind::MessageAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStarted.class(), EventClass::Presentation);
+        assert_eq!(EventKind::RunStep.class(), EventClass::Authority);
+        assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
+        assert_eq!(EventKind::ActionFinished.class(), EventClass::Authority);
         assert_eq!(EventKind::BotCreated.class(), EventClass::Authority);
     }
 
@@ -246,6 +270,12 @@ pub enum EventData {
     RunStarted(RunStarted),
     /// A run finished.
     RunFinished(RunFinished),
+    /// A run completed a step.
+    RunStep(RunStep),
+    /// A run started an action.
+    ActionStarted(ActionStarted),
+    /// A run finished an action.
+    ActionFinished(ActionFinished),
 }
 
 /// The first version of every event kind.
@@ -269,6 +299,9 @@ impl EventKind {
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
             Self::RunStarted => EventData::RunStarted(decode(data)?),
             Self::RunFinished => EventData::RunFinished(decode(data)?),
+            Self::RunStep => EventData::RunStep(decode(data)?),
+            Self::ActionStarted => EventData::ActionStarted(decode(data)?),
+            Self::ActionFinished => EventData::ActionFinished(decode(data)?),
         };
 
         Ok(decoded)
@@ -290,7 +323,11 @@ impl EventKind {
                 (Author::User(_), None) | (Author::Bot(_), Some(_)) => {}
                 _ => return Err(EventDataError::Author),
             },
-            Self::RunStarted | Self::RunFinished => {
+            Self::RunStarted
+            | Self::RunFinished
+            | Self::RunStep
+            | Self::ActionStarted
+            | Self::ActionFinished => {
                 if !matches!(author, Author::Bot(_)) || acting.is_none() {
                     return Err(EventDataError::Author);
                 }
@@ -446,6 +483,79 @@ pub struct RunStarted {
     pub command: Id,
     /// The Message that started it.
     pub message: Id,
+}
+
+/// How a Bot's action ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionStatus {
+    /// The action did what it was asked.
+    Succeeded,
+    /// The action returned an error.
+    Failed,
+    /// The action ran past its time limit and was killed.
+    TimedOut,
+    /// The action's result never returned.
+    Unknown,
+}
+
+/// The data of `neha.run.step`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunStep {
+    /// The run.
+    pub run: Id,
+    /// The step number, starting at one.
+    pub step: u32,
+    /// The usage the Model reported.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+    /// How many tool calls the step requested.
+    pub tool_calls: u32,
+}
+
+/// The data of `neha.action.started`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionStarted {
+    /// The run.
+    pub run: Id,
+    /// The step.
+    pub step: u32,
+    /// The action.
+    pub action: Id,
+    /// The tool's name.
+    pub tool: String,
+    /// The tool's arguments.
+    #[serde(default)]
+    pub arguments: serde_json::Value,
+}
+
+/// The data of `neha.action.finished`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActionFinished {
+    /// The run.
+    pub run: Id,
+    /// The step.
+    pub step: u32,
+    /// The action.
+    pub action: Id,
+    /// The tool's name.
+    pub tool: String,
+    /// How it ended.
+    pub status: ActionStatus,
+    /// The text the Model reads.
+    pub output: String,
+    /// Whether the output dropped bytes.
+    #[serde(default)]
+    pub truncated: bool,
+    /// How many bytes the output dropped.
+    #[serde(default)]
+    pub omitted_bytes: u64,
+    /// The failure, when it failed.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// The data of `neha.run.finished`.

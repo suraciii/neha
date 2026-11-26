@@ -1,0 +1,13 @@
+//! The built-in Bot loop.
+//!
+//! The loop speaks one provider-neutral Model vocabulary, executes every
+//! requested action through a [`neha_computer::ComputerRuntime`], and writes
+//! its steps and actions through a [`run::Recorder`]. The Space supplies the
+//! Model adapter and the record implementation.
+
+pub mod model;
+pub mod run;
+pub mod tools;
+
+pub use model::{Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall, ToolSpec};
+pub use run::{LoopError, Recorder, RunOutcome, RunRequest, run};

@@ -1,6 +1,6 @@
 # Quick start: chat with a Bot
 
-This guide starts a Space on one machine, joins it as the Admin, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User with one Model reply.
+This guide starts a Space on one machine, joins it as the Admin, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User and can work in its own Computer workspace with tools.
 
 Everything runs on the local machine. The Space listens on loopback and stores its record in `NEHA_HOME`.
 
@@ -83,18 +83,20 @@ The output names the Bot, its Chat, and its Computer. Show them again, including
 target/debug/neha bot show <bot-id>
 ```
 
-Send a Message and wait for the one-shot reply. With one Chat, no identifier is needed:
+Send a Message and wait for the Bot's reply, including any steps it took on its Computer. With one Chat, no identifier is needed:
 
 ```bash
 target/debug/neha chat send "hello"
 ```
 
-The CLI prints the Bot's reply and the run that produced it. Read the whole Chat or inspect the run:
+The CLI prints the Bot's reply and the run that produced it. Read the whole Chat or inspect the run's steps and actions:
 
 ```bash
 target/debug/neha chat read <chat-id>
 target/debug/neha run show <run-id>
 ```
+
+A Bot can also write files, read them back, and run shell commands in its Computer's workspace. [Let a Bot work on its Computer](tools.md) shows how.
 
 ## Restart and sign in again
 
@@ -114,6 +116,6 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 ## What this milestone does not do
 
-- Bots answer once and do not use tools yet. The next milestone adds shell and file tools on the Bot's Computer.
-- The managed Computer is an in-process workspace and is not isolated. Do not run a Space exposed to other machines.
+- The managed Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
+- A Bot has no approval gate yet. It runs an action as soon as the Model asks for it.
 - One human joins a Space. Group Chats, Files, Boards, approvals, notifications, and search arrive in later milestones.

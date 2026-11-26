@@ -1141,6 +1141,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "neha-computer"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "neha-loop"
+version = "0.1.0"
+dependencies = [
+ "neha",
+ "neha-computer",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "neha-space"
 version = "0.1.0"
 dependencies = [
@@ -1151,6 +1174,8 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "neha",
+ "neha-computer",
+ "neha-loop",
  "rand 0.9.5",
  "reqwest",
  "serde",

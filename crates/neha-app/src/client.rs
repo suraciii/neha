@@ -202,6 +202,144 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
     Ok((token, account))
 }
 
+/// Runs one command and returns its result, reporting its own run's events.
+pub async fn command_following(
+    credential: &Credential,
+    command: CommandCall,
+    mut on_event: impl FnMut(&neha::record::Event),
+) -> Result<Value> {
+    let command_id = Id::new();
+    let mut socket = connect(credential).await?;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&ClientFrame::Subscribe {
+                id: Id::new(),
+                cursor: None,
+                limit: None,
+            })?
+            .into(),
+        ))
+        .await
+        .context("cannot subscribe to the record")?;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&ClientFrame::Command {
+                id: command_id,
+                command,
+            })?
+            .into(),
+        ))
+        .await
+        .context("cannot send the command")?;
+
+    let mut filter = FollowFilter::new(command_id);
+    loop {
+        let Some(message) = socket.next().await else {
+            bail!("the Space closed the connection");
+        };
+        let message = message.context("the Space's stream failed")?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        match serde_json::from_str::<ServerFrame>(text.as_str()) {
+            Ok(ServerFrame::Confirmed { result, .. }) => return Ok(result),
+            Ok(ServerFrame::Error { code, message, .. }) => {
+                bail!("the Space refused ({code}): {message}");
+            }
+            Ok(ServerFrame::ProtocolError { message }) => {
+                bail!("the Space ended the subscription: {message}");
+            }
+            Ok(ServerFrame::Event { event }) => {
+                for event in filter.push_event(event) {
+                    on_event(&event);
+                }
+            }
+            Ok(ServerFrame::Snapshot { events, .. }) => {
+                for event in filter.push_snapshot(events) {
+                    on_event(&event);
+                }
+            }
+            Ok(
+                ServerFrame::Accepted { .. }
+                | ServerFrame::Committed { .. }
+                | ServerFrame::Hello { .. }
+                | ServerFrame::Heartbeat { .. },
+            ) => {}
+            Err(_) => bail!("the Space sent a frame this CLI does not understand"),
+        }
+    }
+}
+
+/// Keeps only the events of the run a submitted command started.
+#[derive(Debug)]
+struct FollowFilter {
+    command: Id,
+    target: Option<Id>,
+    pending: Vec<neha::record::Event>,
+}
+
+impl FollowFilter {
+    fn new(command: Id) -> Self {
+        Self {
+            command,
+            target: None,
+            pending: Vec::new(),
+        }
+    }
+
+    fn push_event(&mut self, event: neha::record::Event) -> Vec<neha::record::Event> {
+        if self.target.is_none() {
+            self.target = self.started_run(&event);
+            self.pending.push(event);
+            if self.target.is_some() {
+                return std::mem::take(&mut self.pending)
+                    .into_iter()
+                    .filter(|event| self.belongs(event))
+                    .collect();
+            }
+            return Vec::new();
+        }
+        if self.belongs(&event) {
+            vec![event]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn push_snapshot(&mut self, events: Vec<neha::record::Event>) -> Vec<neha::record::Event> {
+        if self.target.is_none() {
+            self.target = events.iter().find_map(|event| self.started_run(event));
+        }
+
+        events
+            .into_iter()
+            .filter(|event| self.belongs(event))
+            .collect()
+    }
+
+    fn started_run(&self, event: &neha::record::Event) -> Option<Id> {
+        if event.kind != neha::record::EventKind::RunStarted {
+            return None;
+        }
+        let started_for = event.data.get("command")?.as_str()?;
+        if started_for != self.command.to_string() {
+            return None;
+        }
+        serde_json::from_value(event.data.get("run")?.clone()).ok()
+    }
+
+    fn belongs(&self, event: &neha::record::Event) -> bool {
+        let Some(run) = self.target else {
+            return false;
+        };
+        event
+            .data
+            .get("run")
+            .and_then(|value| serde_json::from_value::<Id>(value.clone()).ok())
+            == Some(run)
+    }
+}
+
 /// Runs one command and returns its result.
 pub async fn command(credential: &Credential, command: CommandCall) -> Result<Value> {
     let mut socket = connect(credential).await?;
@@ -285,5 +423,100 @@ async fn connect(credential: &Credential) -> Result<Socket> {
             bail!("the Space disagreed on the protocol: {message}");
         }
         _ => bail!("the Space did not greet the CLI"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use neha::id::Id;
+    use neha::record::{Author, Event, EventKind, KIND_VERSION};
+    use neha::seq::Seq;
+    use neha::time::Timestamp;
+
+    use super::FollowFilter;
+
+    fn event(kind: EventKind, data: serde_json::Value, seq: i64) -> Event {
+        Event {
+            seq: Seq::from_i64(seq).unwrap(),
+            kind,
+            version: KIND_VERSION,
+            at: Timestamp::from_microseconds(0).unwrap(),
+            author: Author::Bot(Id::new()),
+            acting: Some(Id::new()),
+            command: None,
+            data,
+        }
+    }
+
+    fn started(run: Id, command: Id, seq: i64) -> Event {
+        event(
+            EventKind::RunStarted,
+            serde_json::json!({
+                "run": run,
+                "chat": Id::new(),
+                "bot": Id::new(),
+                "command": command,
+                "message": Id::new(),
+            }),
+            seq,
+        )
+    }
+
+    fn action(run: Id, seq: i64) -> Event {
+        event(
+            EventKind::RunStep,
+            serde_json::json!({"run": run, "step": 1, "tool_calls": 1}),
+            seq,
+        )
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_submitted_runs_early_progress() {
+        let command = Id::new();
+        let run = Id::new();
+        let mut filter = FollowFilter::new(command);
+        let snapshot = vec![
+            event(
+                EventKind::MessageAdded,
+                serde_json::json!({"run": run, "chat": Id::new(), "text": "hi"}),
+                1,
+            ),
+            started(run, command, 2),
+            action(run, 3),
+        ];
+
+        let kept = filter.push_snapshot(snapshot);
+
+        assert_eq!(kept.len(), 3);
+    }
+
+    #[test]
+    fn another_runs_events_are_ignored() {
+        let command = Id::new();
+        let other = Id::new();
+        let mut filter = FollowFilter::new(command);
+
+        let kept = filter.push_event(started(other, Id::new(), 1));
+
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn events_before_the_run_start_are_replayed_once() {
+        let command = Id::new();
+        let run = Id::new();
+        let mut filter = FollowFilter::new(command);
+        let user_message = event(
+            EventKind::MessageAdded,
+            serde_json::json!({"run": run, "chat": Id::new(), "text": "hi"}),
+            1,
+        );
+
+        assert!(filter.push_event(user_message).is_empty());
+        let kept = filter.push_event(started(run, command, 2));
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].kind, EventKind::MessageAdded);
+        assert_eq!(kept[1].kind, EventKind::RunStarted);
+        assert_eq!(filter.push_event(action(run, 3)).len(), 1);
     }
 }

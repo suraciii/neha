@@ -27,6 +27,19 @@ pub enum ChatRole {
     User,
     /// A Bot's earlier Message.
     Assistant,
+    /// A tool result.
+    Tool,
+}
+
+/// A tool call on the wire.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatToolCall {
+    /// The identifier the Model gave the call.
+    pub id: String,
+    /// The tool's name.
+    pub name: String,
+    /// The raw JSON arguments.
+    pub arguments: String,
 }
 
 /// One Message in a Model request.
@@ -35,7 +48,11 @@ pub struct ChatMessage {
     /// The role.
     pub role: ChatRole,
     /// The text.
-    pub content: String,
+    pub content: Option<String>,
+    /// The tool calls an assistant Message requested.
+    pub tool_calls: Vec<ChatToolCall>,
+    /// The call a tool Message answers.
+    pub tool_call_id: Option<String>,
 }
 
 impl ChatMessage {
@@ -44,9 +61,44 @@ impl ChatMessage {
     pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
         Self {
             role,
-            content: content.into(),
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }
     }
+
+    /// Builds an assistant Message that requested tools.
+    #[must_use]
+    pub fn assistant_calls(content: Option<String>, tool_calls: Vec<ChatToolCall>) -> Self {
+        Self {
+            role: ChatRole::Assistant,
+            content,
+            tool_calls,
+            tool_call_id: None,
+        }
+    }
+
+    /// Builds a tool result Message.
+    #[must_use]
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: ChatRole::Tool,
+            content: Some(content.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+/// A tool offered to a Model.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatTool {
+    /// Its name.
+    pub name: String,
+    /// What it does.
+    pub description: String,
+    /// Its JSON schema.
+    pub parameters: serde_json::Value,
 }
 
 /// A reply from a Model.
@@ -54,6 +106,8 @@ impl ChatMessage {
 pub struct ChatReply {
     /// The reply text.
     pub text: String,
+    /// The tool calls the Model requested.
+    pub tool_calls: Vec<ChatToolCall>,
     /// The usage the Provider reported.
     pub usage: Usage,
 }
@@ -68,6 +122,8 @@ pub struct ChatRequest<'a> {
     pub model: &'a str,
     /// The Messages, oldest first.
     pub messages: Vec<ChatMessage>,
+    /// The tools the Model may call.
+    pub tools: Vec<ChatTool>,
     /// The largest reply in tokens.
     pub max_output: u32,
 }
@@ -135,15 +191,28 @@ impl ModelClient {
     /// range. A rejected or oversized request is not retried.
     pub async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatReply, ModelError> {
         let mut attempt = 0_u32;
+        let mut reported = Usage::default();
         loop {
             match self.attempt(&request).await {
-                Ok(reply) => return Ok(reply),
+                Ok(mut reply) => {
+                    reply.usage += reported;
+                    return Ok(reply);
+                }
                 Err(error) if error.retryable() && attempt + 1 < self.policy.max_attempts => {
+                    reported += error.usage().unwrap_or_default();
                     let delay = error.retry_after().unwrap_or_else(|| self.backoff(attempt));
                     tokio::time::sleep(delay.min(self.policy.max_delay)).await;
                     attempt += 1;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if reported == Usage::default() {
+                        return Err(error);
+                    }
+                    return Err(ModelError::Retried {
+                        usage: reported + error.usage().unwrap_or_default(),
+                        source: Box::new(error),
+                    });
+                }
             }
         }
     }
@@ -173,7 +242,25 @@ impl ModelClient {
                 .iter()
                 .map(|message| WireMessage {
                     role: message.role,
-                    content: &message.content,
+                    content: message.content.as_deref(),
+                    tool_calls: if message.tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(message.tool_calls.iter().map(WireToolCall::from).collect())
+                    },
+                    tool_call_id: message.tool_call_id.as_deref(),
+                })
+                .collect(),
+            tools: request
+                .tools
+                .iter()
+                .map(|tool| WireTool {
+                    kind: "function",
+                    function: WireToolDefinition {
+                        name: &tool.name,
+                        description: &tool.description,
+                        parameters: &tool.parameters,
+                    },
                 })
                 .collect(),
             stream: true,
@@ -204,7 +291,11 @@ impl ModelClient {
 
         let mut events = response.bytes_stream().eventsource();
         let mut text = String::new();
+        let mut calls: std::collections::BTreeMap<u32, ChatToolCall> =
+            std::collections::BTreeMap::new();
         let mut usage = Usage::default();
+        let mut finished = false;
+        let mut finish_failure: Option<ModelError> = None;
         while let Some(event) = events.next().await {
             let event = event.map_err(|_| ModelError::Transport)?;
             if event.event == "error" {
@@ -215,23 +306,181 @@ impl ModelClient {
                 continue;
             }
             if data == "[DONE]" {
+                finished = true;
                 break;
             }
             let chunk: Chunk = serde_json::from_str(data).map_err(|_| ModelError::Protocol)?;
-            if let Some(choice) = chunk.choices.first()
-                && let Some(delta) = &choice.delta.content
-            {
-                text.push_str(delta);
+            if let Some(choice) = chunk.choices.first() {
+                if let Some(reason) = choice.finish_reason.as_deref() {
+                    match reason {
+                        "stop" | "tool_calls" | "function_call" => finished = true,
+                        "length" => {
+                            finished = true;
+                            finish_failure = Some(ModelError::Truncated { usage });
+                        }
+                        "content_filter" => {
+                            finished = true;
+                            finish_failure = Some(ModelError::Filtered { usage });
+                        }
+                        _ => return Err(ModelError::Protocol),
+                    }
+                }
+                if finish_failure.is_none() {
+                    if let Some(delta) = &choice.delta.content {
+                        text.push_str(delta);
+                    }
+                    for delta in &choice.delta.tool_calls {
+                        let call = calls.entry(delta.index).or_default();
+                        if let Some(id) = &delta.id
+                            && !id.is_empty()
+                        {
+                            call.id.clone_from(id);
+                        }
+                        if let Some(function) = &delta.function {
+                            if let Some(name) = &function.name {
+                                call.name.push_str(name);
+                            }
+                            if let Some(arguments) = &function.arguments {
+                                call.arguments.push_str(arguments);
+                            }
+                        }
+                    }
+                }
             }
             if let Some(reported) = chunk.usage {
                 usage = reported.normalize();
             }
         }
-        if text.is_empty() {
+        if let Some(mut failure) = finish_failure {
+            match &mut failure {
+                ModelError::Truncated { usage: reported }
+                | ModelError::Filtered { usage: reported } => *reported = usage,
+                _ => {}
+            }
+            return Err(failure);
+        }
+        if !finished {
+            return Err(ModelError::StreamEnded { usage });
+        }
+        let tool_calls: Vec<ChatToolCall> = calls.into_values().collect();
+        if text.is_empty() && tool_calls.is_empty() {
             return Err(ModelError::Empty);
         }
 
-        Ok(ChatReply { text, usage })
+        Ok(ChatReply {
+            text,
+            tool_calls,
+            usage,
+        })
+    }
+}
+
+/// The loop's Model seam, backed by this adapter.
+pub struct SpaceModel<'a> {
+    client: &'a ModelClient,
+    base_url: &'a str,
+    api_key: &'a str,
+    model: &'a str,
+}
+
+impl<'a> SpaceModel<'a> {
+    /// Builds the adapter for one Provider and Model.
+    #[must_use]
+    pub fn new(
+        client: &'a ModelClient,
+        base_url: &'a str,
+        api_key: &'a str,
+        model: &'a str,
+    ) -> Self {
+        Self {
+            client,
+            base_url,
+            api_key,
+            model,
+        }
+    }
+}
+
+impl neha_loop::Model for SpaceModel<'_> {
+    // The trait promises a `Send` future; `async fn` would not state that.
+    #[allow(clippy::manual_async_fn)]
+    fn complete(
+        &self,
+        request: neha_loop::ModelRequest,
+    ) -> impl std::future::Future<Output = Result<neha_loop::ModelReply, neha_loop::ModelFailure>> + Send
+    {
+        async move {
+            let messages = request
+                .messages
+                .into_iter()
+                .map(|message| {
+                    let calls = message
+                        .tool_calls
+                        .into_iter()
+                        .map(|call| ChatToolCall {
+                            id: call.id,
+                            name: call.name,
+                            arguments: call.arguments,
+                        })
+                        .collect();
+                    let role = match message.role {
+                        neha_loop::Role::System => ChatRole::System,
+                        neha_loop::Role::User => ChatRole::User,
+                        neha_loop::Role::Assistant => ChatRole::Assistant,
+                        neha_loop::Role::Tool => ChatRole::Tool,
+                    };
+                    ChatMessage {
+                        role,
+                        content: message.content,
+                        tool_calls: calls,
+                        tool_call_id: message.tool_call_id,
+                    }
+                })
+                .collect();
+            let tools = request
+                .tools
+                .into_iter()
+                .map(|tool| ChatTool {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                })
+                .collect();
+            let reply = self
+                .client
+                .chat(ChatRequest {
+                    base_url: self.base_url,
+                    api_key: self.api_key,
+                    model: self.model,
+                    messages,
+                    tools,
+                    max_output: request.max_output,
+                })
+                .await
+                .map_err(|error| neha_loop::ModelFailure {
+                    code: error.code(),
+                    detail: error.to_string(),
+                    usage: error.usage().unwrap_or_default(),
+                })?;
+
+            Ok(neha_loop::ModelReply {
+                content: if reply.text.is_empty() {
+                    None
+                } else {
+                    Some(reply.text)
+                },
+                tool_calls: reply
+                    .tool_calls
+                    .into_iter()
+                    .map(|call| neha_loop::ToolCall {
+                        id: call.id,
+                        name: call.name,
+                        arguments: call.arguments,
+                    })
+                    .collect(),
+                usage: reply.usage,
+            })
+        }
     }
 }
 
@@ -254,6 +503,8 @@ fn map_status(
 struct RequestBody<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<WireTool<'a>>,
     stream: bool,
     stream_options: StreamOptions,
     max_tokens: u32,
@@ -262,7 +513,53 @@ struct RequestBody<'a> {
 #[derive(Serialize)]
 struct WireMessage<'a> {
     role: ChatRole,
-    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<WireToolCall<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct WireToolCall<'a> {
+    id: &'a str,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireFunction<'a>,
+}
+
+impl<'a> From<&'a ChatToolCall> for WireToolCall<'a> {
+    fn from(call: &'a ChatToolCall) -> Self {
+        Self {
+            id: &call.id,
+            kind: "function",
+            function: WireFunction {
+                name: &call.name,
+                arguments: &call.arguments,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct WireFunction<'a> {
+    name: &'a str,
+    arguments: &'a str,
+}
+
+#[derive(Serialize)]
+struct WireTool<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: WireToolDefinition<'a>,
+}
+
+#[derive(Serialize)]
+struct WireToolDefinition<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -282,12 +579,34 @@ struct Chunk {
 struct Choice {
     #[serde(default)]
     delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<DeltaToolCall>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaToolCall {
+    #[serde(default)]
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<DeltaFunction>,
+}
+
+#[derive(Deserialize, Default)]
+struct DeltaFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -354,6 +673,32 @@ pub enum ModelError {
     /// The reply was empty.
     #[error("the Model returned an empty reply")]
     Empty,
+    /// The provider stream ended before it said the reply was complete.
+    #[error("the Provider closed the stream before the reply was complete")]
+    StreamEnded {
+        /// The usage it reported before it ended.
+        usage: Usage,
+    },
+    /// The provider cut the reply at its output limit.
+    #[error("the Provider cut the reply at its output limit")]
+    Truncated {
+        /// The usage it reported.
+        usage: Usage,
+    },
+    /// The provider filtered the reply.
+    #[error("the Provider filtered the reply")]
+    Filtered {
+        /// The usage it reported.
+        usage: Usage,
+    },
+    /// The call failed after earlier attempts reported usage.
+    #[error("{source}")]
+    Retried {
+        /// The usage every attempt reported.
+        usage: Usage,
+        /// The failure that ended the call.
+        source: Box<ModelError>,
+    },
     /// The Provider's stream did not fit the protocol.
     #[error("the Provider's reply did not fit the protocol")]
     Protocol,
@@ -371,7 +716,11 @@ impl ModelError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Server { .. } | Self::Transport | Self::Empty
+            Self::RateLimited { .. }
+                | Self::Server { .. }
+                | Self::Transport
+                | Self::Empty
+                | Self::StreamEnded { .. }
         )
     }
 
@@ -380,6 +729,19 @@ impl ModelError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after } | Self::Server { retry_after } => *retry_after,
+            Self::Retried { source, .. } => source.retry_after(),
+            _ => None,
+        }
+    }
+
+    /// Returns the usage the Provider reported for a failed call.
+    #[must_use]
+    pub fn usage(&self) -> Option<Usage> {
+        match self {
+            Self::StreamEnded { usage }
+            | Self::Truncated { usage }
+            | Self::Filtered { usage }
+            | Self::Retried { usage, .. } => Some(*usage),
             _ => None,
         }
     }
@@ -390,10 +752,15 @@ impl ModelError {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
             Self::RateLimited { .. } => ErrorCode::RateLimited,
-            Self::Server { .. } | Self::Transport => ErrorCode::Unavailable,
+            Self::Server { .. } | Self::Transport | Self::StreamEnded { .. } => {
+                ErrorCode::Unavailable
+            }
+            Self::Retried { source, .. } => source.code(),
             Self::ContextTooLarge
             | Self::Empty
             | Self::Protocol
+            | Self::Truncated { .. }
+            | Self::Filtered { .. }
             | Self::Provider(_)
             | Self::Request(_) => ErrorCode::InvalidArgument,
         }
@@ -430,6 +797,7 @@ mod tests {
             base_url: base,
             api_key,
             model: "test-model",
+            tools: Vec::new(),
             messages: vec![
                 ChatMessage::new(ChatRole::System, "be brief"),
                 ChatMessage::new(ChatRole::User, "hello"),
@@ -477,6 +845,210 @@ mod tests {
             }
         );
         assert_eq!(reply.usage.budgeted(), 12);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn streams_a_tool_call_and_offers_tools() {
+        use axum::body::Bytes;
+
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"id\":\"call_1\",\"type\":\"function\",\"function\":",
+            "{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,",
+            "\"function\":{\"arguments\":\"\\\"a.txt\\\"}\"}}]}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |body: Bytes| async move {
+                let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body["tools"][0]["type"], "function");
+                assert_eq!(body["tools"][0]["function"]["name"], "read_file");
+                assert_eq!(
+                    body["messages"][0]["role"], "system",
+                    "the adapter sends roles"
+                );
+                assert!(
+                    body["messages"][0].get("tool_calls").is_none(),
+                    "a plain message must not carry an empty tool_calls field"
+                );
+                assert!(body["messages"][1].get("tool_calls").is_none());
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+        let mut request = request(&base, "sk-test");
+        request.tools = vec![super::ChatTool {
+            name: "read_file".to_owned(),
+            description: "Read a file.".to_owned(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+
+        let reply = client.chat(request).await.unwrap();
+
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "call_1");
+        assert_eq!(reply.tool_calls[0].name, "read_file");
+        assert_eq!(reply.tool_calls[0].arguments, "{\"path\":\"a.txt\"}");
+        assert!(reply.text.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn parses_two_tool_calls_from_one_chunk() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[\
+            {\"index\":0,\"id\":\"a\",\"type\":\"function\",\"function\":\
+            {\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}},\
+            {\"index\":1,\"id\":\"b\",\"type\":\"function\",\"function\":\
+            {\"name\":\"list_files\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]}}]}\n\n\
+            data: [DONE]\n\n";
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(reply.tool_calls.len(), 2);
+        assert_eq!(reply.tool_calls[0].id, "a");
+        assert_eq!(reply.tool_calls[0].name, "read_file");
+        assert_eq!(reply.tool_calls[1].id, "b");
+        assert_eq!(reply.tool_calls[1].name, "list_files");
+        assert_eq!(reply.tool_calls[1].arguments, "{\"path\":\".\"}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_early_is_retried_and_never_released() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await;
+
+        assert!(matches!(error, Err(ModelError::StreamEnded { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_length_finish_releases_no_tool_call() {
+        let chunk = serde_json::json!({"choices":[{
+            "delta": {"tool_calls":[{
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"a.txt\",\"content\":\"a\"}",
+                },
+            }]},
+            "finish_reason": "length",
+        }]});
+        let usage = serde_json::json!({"choices":[],"usage":{
+            "prompt_tokens": 40,
+            "completion_tokens": 12,
+        }});
+        let sse = format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let sse = sse.clone();
+                async move {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await;
+
+        match error {
+            Err(ModelError::Truncated { usage }) => {
+                assert_eq!(usage.budgeted(), 52);
+            }
+            other => panic!("expected a truncated stream, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_retry_keeps_the_usage_of_every_attempt() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":12}}\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(reply.text, "complete");
+        assert_eq!(reply.usage.uncached_input, 48);
+        assert_eq!(reply.usage.output, 14);
         task.abort();
     }
 
