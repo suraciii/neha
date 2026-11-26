@@ -3,7 +3,10 @@
 use serde::{Deserialize, Serialize};
 
 /// One action a Bot asks its Computer to run.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The channel's wire spelling is [`WireAction`](crate::channel::WireAction);
+/// this type's own Serde shape is for tests and local transports.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     /// Runs a POSIX shell command in the workspace.
     Shell {
@@ -67,7 +70,7 @@ impl ToolOutput {
 }
 
 /// What an action returned.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActionResult {
     /// How the action ended.
     pub status: ActionStatus,

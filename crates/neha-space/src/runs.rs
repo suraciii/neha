@@ -2,10 +2,14 @@
 //!
 //! The record is the queue: a run enters it as `neha.run.queued`, and a Bot's
 //! pump starts the waiting run with the smallest cursor. A pump wakes when a
-//! run is admitted or when the Space starts, then drains everything its Bot
-//! has waiting before it sleeps again. Losing a wake-up or replacing a pump
-//! therefore never strands a run: the next wake, and the next start of the
-//! Space, read the backlog from the record.
+//! run is admitted, when the Space starts, and when a Computer connects or
+//! leaves, then drains everything its Bot has waiting before it sleeps again.
+//! Losing a wake-up or replacing a pump therefore never strands a run: the next
+//! wake, and the next start of the Space, read the backlog from the record.
+//!
+//! A real Computer that is offline holds its Bot's queue: the pump stops in
+//! front of the waiting run instead of skipping it, so the record's order is
+//! the order the Computer runs the work in.
 //!
 //! One pump works the runs of one Bot at a time. A run it cannot prepare, or
 //! one it cannot finish, is recorded by the pump itself; a store failure ends
@@ -103,9 +107,10 @@ impl RunQueue {
 
     /// Wakes every Bot that has a run waiting in the record.
     ///
-    /// This is what a start after a stop needs: the pumps then work the record
-    /// in its own order, so that recovery needs no stored work of its own.
-    pub fn resume(&self, server: &Arc<SpaceServer>) {
+    /// A start after a stop and a Computer connecting or leaving need it: the
+    /// pumps then work the record in its own order, so no wake-up has to be
+    /// remembered.
+    pub fn wake_all(&self, server: &Arc<SpaceServer>) {
         let bots: Vec<Id> = {
             let Ok(state) = server.state.lock() else {
                 return;
@@ -188,6 +193,7 @@ async fn work(
                 &server.model,
                 &server.events,
                 server.tool_timeout,
+                &server.links,
                 pending,
             )
             .await
@@ -208,13 +214,26 @@ async fn work(
 }
 
 /// Returns the waiting run of a Bot that the record holds first.
+///
+/// A real Computer that is offline holds the queue: the run keeps its place in
+/// the record and its pump waits for the channel, so a later run never
+/// overtakes it.
 fn next_queued(server: &SpaceServer, bot: Id) -> Option<RunView> {
     let state = server.state.lock().ok()?;
-
-    state
+    let run = state
         .runs
         .values()
         .filter(|run| run.bot == bot && run.status == RunStatus::Queued)
-        .min_by_key(|run| run.seq)
-        .cloned()
+        .min_by_key(|run| run.seq)?
+        .clone();
+    let computer = state.bots.get(&bot).map(|bot| bot.computer)?;
+    let real = state
+        .computers
+        .get(&computer)
+        .is_some_and(|view| view.kind == "real");
+    if real && !server.links.online(computer) {
+        return None;
+    }
+
+    Some(run)
 }

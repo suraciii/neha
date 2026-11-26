@@ -192,6 +192,15 @@ where
                 call_id(call, step, index),
                 tool_result_text(&result),
             ));
+            if result.status == ActionStatus::Unknown {
+                // The action's result never returned. The record says unknown,
+                // and the run ends here instead of resuming it blindly.
+                return Ok(RunOutcome {
+                    text: "I lost my Computer before the action returned.".to_owned(),
+                    usage,
+                    succeeded: false,
+                });
+            }
         }
         // A step completes only after all of its actions were recorded.
         recorder.step(step, reply.usage, calls.len() as u32).await?;
@@ -344,6 +353,7 @@ mod tests {
         actions: Mutex<Vec<Action>>,
         files: Mutex<Vec<(String, Vec<u8>)>>,
         fail_writes: bool,
+        lost: bool,
     }
 
     impl FakeRuntime {
@@ -353,13 +363,31 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        /// A Computer that goes away before it answers.
+        fn lost() -> Self {
+            Self {
+                lost: true,
+                ..Self::default()
+            }
+        }
     }
 
     impl ComputerRuntime for FakeRuntime {
         #[allow(clippy::manual_async_fn)]
         fn execute(&self, action: Action) -> impl Future<Output = ActionResult> + Send {
             self.actions.lock().unwrap().push(action);
-            async move { ActionResult::succeeded(ToolOutput::full("42")) }
+            let lost = self.lost;
+            async move {
+                if lost {
+                    return ActionResult {
+                        status: ActionStatus::Unknown,
+                        output: ToolOutput::full("the Computer went offline"),
+                        error: Some("the Computer went offline".to_owned()),
+                    };
+                }
+                ActionResult::succeeded(ToolOutput::full("42"))
+            }
         }
 
         #[allow(clippy::manual_async_fn)]
@@ -607,6 +635,38 @@ mod tests {
         let second = requests[1].messages.last().unwrap();
         assert_eq!(second.role, crate::model::Role::Tool);
         assert_eq!(second.content.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn an_action_whose_result_never_returned_ends_the_run() {
+        let model = FakeModel::with(vec![
+            call_reply(
+                "write_file",
+                json!({"path": "hello.txt", "content": "hello neha"}),
+            ),
+            reply("the Model must not be asked again"),
+        ]);
+        let runtime = FakeRuntime::lost();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            &files,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.succeeded);
+        assert_eq!(
+            outcome.text,
+            "I lost my Computer before the action returned."
+        );
+        assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

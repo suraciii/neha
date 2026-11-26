@@ -151,6 +151,32 @@ target/debug/neha run show <run-id>
 
 `neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
 
+## Put a Bot on a real Computer
+
+A real Computer is a Neha process that runs outside the Space and connects out to it. It runs a Bot's actions in a folder of its own on the machine. This milestone pairs a machine on the same host as the Space, because the Space listens only on loopback.
+
+Open a second terminal and start the machine:
+
+```bash
+target/debug/neha computer pair --space http://127.0.0.1:7337
+```
+
+It prints a pairing code that lasts 10 minutes, then waits. In a third terminal, enter the code from the signed-in CLI and create a Bot on the new Computer:
+
+```bash
+target/debug/neha computer add <code>
+target/debug/neha computer list
+target/debug/neha bot create Runner --computer <computer-id>
+```
+
+Ask the new Bot to work:
+
+```bash
+target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
+```
+
+The Bot works in its own folder on the machine, and `pwd` prints that folder. The machine needs `bubblewrap` for the sandbox that fences its writes. [Add a real Computer](computer.md) covers the fence, pairing, and offline behavior.
+
 ## Send a file
 
 A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it:

@@ -59,40 +59,43 @@ impl Credential {
     }
 
     /// Saves the credential for later commands.
-    ///
-    /// The file is created 0600 and replaces the old one atomically, so a
-    /// reader never sees a partly written or world-readable credential.
     pub fn save(&self) -> Result<()> {
-        let path = credential_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-            restrict(parent, 0o700)?;
-        }
-        let bytes = serde_json::to_vec(self)?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("cannot write {}", temporary.display()))?;
-        {
-            use std::io::Write as _;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        drop(file);
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("cannot move the credential to {}", path.display()))?;
-        restrict(&path, 0o600)?;
-
-        Ok(())
+        write_private(&credential_path(), &serde_json::to_vec(self)?)
     }
+}
+
+/// Writes a secret file only this machine user can read, atomically.
+///
+/// The directory is made 0700 and the file 0600, and the file moves into place
+/// whole, so a reader never sees a partly written or world-readable secret.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+        restrict(parent, 0o700)?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    drop(file);
+    fs::rename(&temporary, path)
+        .with_context(|| format!("cannot move the file to {}", path.display()))?;
+    restrict(path, 0o600)?;
+
+    Ok(())
 }
 
 fn credential_path() -> PathBuf {
@@ -111,7 +114,7 @@ fn credential_path() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn restrict(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn restrict(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
@@ -119,7 +122,7 @@ fn restrict(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path, _mode: u32) -> Result<()> {
+pub(crate) fn restrict(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -217,6 +220,118 @@ async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
         .or(status.canonical_reason())
         .unwrap_or("no message");
     bail!("the Space refused ({code}): {message}");
+}
+
+/// What a Space tells a machine when pairing starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingStart {
+    /// The device identifier the machine polls its pairing with.
+    pub device: String,
+    /// The one-time code a signed-in User enters.
+    pub code: String,
+}
+
+/// What a machine learns when it polls its pairing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingState {
+    /// No User has entered the code yet.
+    Pending,
+    /// A User entered the code; the Space created this Computer.
+    Approved {
+        /// The identifier of the Computer the Space created.
+        computer: String,
+    },
+}
+
+/// Asks a Space to start pairing this machine.
+pub async fn pair_start(
+    space_url: &str,
+    machine: &str,
+    workspace: &str,
+    token: &str,
+    poll_secret: &str,
+) -> Result<PairingStart> {
+    let body: Value = accepted(
+        reqwest::Client::new()
+            .post(pair_start_url(space_url))
+            .json(&pair_request_body(machine, workspace, token, poll_secret))
+            .send()
+            .await
+            .context("the Space could not be reached")?,
+    )
+    .await?
+    .json()
+    .await
+    .context("the Space did not answer with JSON")?;
+
+    Ok(PairingStart {
+        device: text_field(&body, "device")?,
+        code: text_field(&body, "code")?,
+    })
+}
+
+/// Asks a Space how the pairing this machine started is doing.
+pub async fn pair_poll(space_url: &str, device: &str, poll_secret: &str) -> Result<PairingState> {
+    let response = reqwest::Client::new()
+        .get(pair_poll_url(space_url, device, poll_secret))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("the pairing expired before it was approved; run `neha computer pair` again");
+    }
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+
+    pairing_state(&body)
+}
+
+/// The URL a machine starts its pairing at.
+fn pair_start_url(space_url: &str) -> String {
+    format!("{}/api/computers/pair", space_url.trim_end_matches('/'))
+}
+
+/// The URL a machine polls its pairing at.
+///
+/// The device and the secret are URL-safe base64, so they need no escaping.
+fn pair_poll_url(space_url: &str, device: &str, poll_secret: &str) -> String {
+    format!(
+        "{}/api/computers/pair/{device}?secret={poll_secret}",
+        space_url.trim_end_matches('/')
+    )
+}
+
+/// The body a machine sends to start pairing.
+fn pair_request_body(machine: &str, workspace: &str, token: &str, poll_secret: &str) -> Value {
+    serde_json::json!({
+        "machine": machine,
+        "workspace": workspace,
+        "token": token,
+        "poll_secret": poll_secret,
+    })
+}
+
+/// Reads the pairing state a poll answered with.
+fn pairing_state(answer: &Value) -> Result<PairingState> {
+    match answer.get("state").and_then(Value::as_str) {
+        Some("pending") => Ok(PairingState::Pending),
+        Some("approved") => Ok(PairingState::Approved {
+            computer: text_field(answer, "computer")?,
+        }),
+        _ => bail!("the Space's answer does not describe a pairing"),
+    }
+}
+
+/// Reads a string field out of a Space's answer.
+fn text_field(value: &Value, field: &str) -> Result<String> {
+    Ok(value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("the Space's answer has no {field}"))?
+        .to_owned())
 }
 
 /// Uploads one File to a Chat and returns what the Space recorded.
@@ -484,7 +599,10 @@ mod tests {
     use neha::surface::PROTOCOL_VERSION;
     use tokio_tungstenite::tungstenite::Message;
 
-    use super::{Credential, SignedIn, disposition_name, read_for_upload, wait_for_run_within};
+    use super::{
+        Credential, PairingState, SignedIn, disposition_name, pair_poll_url, pair_request_body,
+        pair_start_url, pairing_state, read_for_upload, wait_for_run_within,
+    };
 
     /// The CLI's credential for a Space at this address.
     fn credential_at(address: std::net::SocketAddr) -> Credential {
@@ -550,6 +668,56 @@ mod tests {
             b"hi"
         );
         assert!(read_for_upload(directory.path()).is_err());
+    }
+
+    #[test]
+    fn the_pairing_request_is_the_pinned_body() {
+        assert_eq!(
+            pair_request_body(
+                "laptop",
+                "/home/ada/.neha/workspace",
+                "machine-token",
+                "poll-secret"
+            ),
+            serde_json::json!({
+                "machine": "laptop",
+                "workspace": "/home/ada/.neha/workspace",
+                "token": "machine-token",
+                "poll_secret": "poll-secret",
+            })
+        );
+    }
+
+    #[test]
+    fn the_pairing_urls_are_the_pinned_paths() {
+        assert_eq!(
+            pair_start_url("http://127.0.0.1:7337/"),
+            "http://127.0.0.1:7337/api/computers/pair"
+        );
+        assert_eq!(
+            pair_poll_url("http://127.0.0.1:7337/", "device-a", "secret-a"),
+            "http://127.0.0.1:7337/api/computers/pair/device-a?secret=secret-a"
+        );
+    }
+
+    #[test]
+    fn a_poll_answer_says_whether_the_pairing_is_approved() {
+        assert_eq!(
+            pairing_state(&serde_json::json!({"state": "pending"})).unwrap(),
+            PairingState::Pending
+        );
+        assert_eq!(
+            pairing_state(
+                &serde_json::json!({"state": "approved", "computer": "01890a5d-ac96-774b-bcce-b302099a8057"})
+            )
+            .unwrap(),
+            PairingState::Approved {
+                computer: "01890a5d-ac96-774b-bcce-b302099a8057".to_owned(),
+            }
+        );
+        assert!(pairing_state(&serde_json::json!({"state": "approved"})).is_err());
+        assert!(pairing_state(&serde_json::json!({"state": "later"})).is_err());
+        assert!(pairing_state(&serde_json::json!({})).is_err());
     }
 
     #[test]

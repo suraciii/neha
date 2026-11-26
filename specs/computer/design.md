@@ -23,9 +23,15 @@ A managed Computer depends on [Space](../space/product.md) for the workspace it 
 
 ## The channel
 
-A real Computer runs Neha as a persistent process. The process holds one outgoing connection to the Space for control and data, and one more per screen; it listens on no network port.
+A real Computer runs Neha as a persistent process, started as `neha computer`. The process holds one outgoing connection to the Space for control and data, and one more per screen; it listens on no network port.
 
-The channel carries commands, file reads and writes, process streams, and the screen. A managed Computer uses the same channel on the Space's own machine.
+A machine joins a Space by pairing. The machine shows a code, and a signed-in User enters it in the Space. The machine keeps the token that admits it to the Space, and the Space stores only a hash of that token.
+
+The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange, and a managed Computer uses the same channel on the Space's own machine.
+
+The Space sends each action with an id, and the Computer answers that id with the action's result. Each action has a time limit, and an action that runs past it ends as timed out.
+
+A connection that ends makes every action in flight unknown. The process reconnects while it runs, and the Space shows the Computer offline until it does.
 
 ## The machine
 
@@ -39,11 +45,15 @@ The record names a Computer's kind and a provider's machine. That machine refere
 
 A managed Computer keeps its durable files in a workspace the Space holds. A real Computer keeps its files on the machine, and the Space keeps no copy.
 
+The Workspace of a real Computer is a folder on that machine. Each Bot on that Computer has a folder of its own inside it, and the actions of a run start there.
+
 ## Isolation
 
 A Computer is the unit of isolation.
 
 Bots assigned to one Computer share its files, processes, and logins. The Space does not isolate them from each other.
+
+On a real Computer, a Bot writes only in its own folder, and it reads with the machine user's rights. The operating system's sandbox enforces the write fence, and a machine that cannot start a sandbox does not serve as a Computer.
 
 A real Computer's owner grants what a Bot on it can reach. [product.md](product.md) covers the grants.
 

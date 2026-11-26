@@ -6,10 +6,12 @@
 
 pub mod blobs;
 pub mod commands;
+pub mod computer_link;
 pub mod config;
 pub mod home;
 pub mod identity;
 pub mod model;
+pub mod remote;
 pub mod runs;
 pub mod schema;
 pub mod secrets;

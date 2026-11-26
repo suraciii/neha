@@ -60,6 +60,13 @@ pub enum CommandCall {
     ProviderList,
     /// Lists the Space's Models.
     ModelList,
+    /// Adds a real Computer the User just paired.
+    ComputerAdd {
+        /// The pairing code the machine showed.
+        code: String,
+    },
+    /// Lists the caller's Computers.
+    ComputerList,
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
     /// Lists the caller's Bots.
@@ -135,6 +142,9 @@ pub struct ModelSpec {
 pub struct BotCreate {
     /// The Bot's name.
     pub name: String,
+    /// The real Computer the Bot works on; a managed Computer when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub computer: Option<Id>,
 }
 
 /// The parameters of `message_send`.
@@ -232,11 +242,57 @@ mod tests {
             id: Id::new(),
             command: CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
+                computer: None,
             }),
         };
 
         let text = serde_json::to_string(&frame).unwrap();
         assert_eq!(serde_json::from_str::<ClientFrame>(&text).unwrap(), frame);
+    }
+
+    #[test]
+    fn computer_commands_round_trip() {
+        let add = CommandCall::ComputerAdd {
+            code: "ABCD2345".to_owned(),
+        };
+        let text = serde_json::to_string(&add).unwrap();
+        assert!(text.contains("\"name\":\"computer_add\""));
+        assert!(text.contains("\"code\":\"ABCD2345\""));
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), add);
+
+        let list = CommandCall::ComputerList;
+        let text = serde_json::to_string(&list).unwrap();
+        assert_eq!(text, "{\"name\":\"computer_list\"}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), list);
+    }
+
+    #[test]
+    fn bot_create_keeps_its_old_shape_without_a_computer() {
+        let command = CommandCall::BotCreate(BotCreate {
+            name: "Scout".to_owned(),
+            computer: None,
+        });
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(
+            !text.contains("\"computer\""),
+            "an absent Computer is omitted"
+        );
+
+        let old: CommandCall =
+            serde_json::from_str("{\"name\":\"bot_create\",\"args\":{\"name\":\"Scout\"}}")
+                .unwrap();
+        assert_eq!(old, command);
+    }
+
+    #[test]
+    fn bot_create_carries_a_real_computer() {
+        let computer = Id::new();
+        let command = CommandCall::BotCreate(BotCreate {
+            name: "Scout".to_owned(),
+            computer: Some(computer),
+        });
+        let text = serde_json::to_string(&command).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 
     #[test]

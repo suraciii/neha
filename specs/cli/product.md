@@ -24,6 +24,12 @@ A Bot posting a File into a Group is a Bot posting a Message that carries the Fi
 
 `neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
 
+## Computers
+
+A real Computer runs the CLI. `neha computer pair` joins the machine to a Space and prints a pairing code, which a signed-in User enters with `neha computer add`. `neha computer run` starts the machine's channel again after a stop.
+
+`neha computer list` shows the Computers the User owns. `neha bot create --computer` starts a new Bot on one of them.
+
 ## Gaps
 
 - The command surface is not yet specified; it follows the topics as their product contracts settle.

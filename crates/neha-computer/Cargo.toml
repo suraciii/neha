@@ -16,6 +16,7 @@ tokio = { workspace = true, features = ["io-util", "process", "rt", "time"] }
 libc = "0.2"
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

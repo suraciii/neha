@@ -18,19 +18,24 @@ use neha::record::{
     ActionStatus as RecordedActionStatus, Author, Event, EventDraft, EventKind, FileAdded,
 };
 use neha::seq::Seq;
-use neha::surface::{CommandCall, FileSummary, MessageSend, ProviderAdd};
+use neha::surface::{BotCreate, CommandCall, FileSummary, MessageSend, ProviderAdd};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::blobs::Blobs;
+use crate::computer_link::ComputerLinks;
 use crate::home::Home;
+use crate::identity::{Account, Identity, PairingRequest};
 use crate::model::{ModelClient, SpaceModel};
+use crate::remote::{RemoteRuntime, TIMEOUT_GRACE};
 use crate::secrets::Secrets;
-use crate::server::ApiError;
-use crate::state::{BotView, ChatView, ModelView, ProviderView, RunStatus, State};
+use crate::server::{ApiError, PairingBook, identity_error};
+use crate::state::{BotView, ChatView, ComputerView, ModelView, ProviderView, RunStatus, State};
 use crate::store::{AppendRequest, AppendResult, CommandRecord, Projection, Store};
 
-use neha_computer::{ActionStatus, LocalRuntime, ToolOutput};
+use neha_computer::{
+    Action, ActionResult, ActionStatus, ComputerRuntime, LocalRuntime, ToolOutput,
+};
 use neha_loop::{DeliveredFile, FileHost, LoopError, Recorder, RunOutcome, RunRequest, TakenFile};
 
 const RESULT_RUNNING: &str = "running";
@@ -80,13 +85,28 @@ pub struct PendingRun {
     pub api_key: String,
 }
 
+/// The Space connections one command handler reads and writes through.
+pub struct CommandContext<'a> {
+    /// The record.
+    pub store: &'a Store,
+    /// The in-process projection.
+    pub state: &'a Mutex<State>,
+    /// The Space's home.
+    pub home: &'a Home,
+    /// The Provider keys.
+    pub secrets: &'a Secrets,
+    /// Accounts, device tokens, and pairings.
+    pub identity: &'a Identity,
+    /// The live Computer channels.
+    pub links: &'a ComputerLinks,
+    /// The Space's pairing attempts.
+    pub pairings: &'a tokio::sync::Mutex<PairingBook>,
+}
+
 /// Runs one command for an account.
 pub async fn execute(
-    store: &Store,
-    state: &Mutex<State>,
-    home: &Home,
-    secrets: &Secrets,
-    account: &crate::identity::Account,
+    context: &CommandContext<'_>,
+    account: &Account,
     command_id: Id,
     command: CommandCall,
 ) -> Result<Outcome, ApiError> {
@@ -97,36 +117,24 @@ pub async fn execute(
             if !account.is_admin {
                 return Err(ApiError::forbidden("only the Admin connects a Provider"));
             }
-            provider_add(
-                store,
-                state,
-                secrets,
-                account,
-                command_id,
-                fingerprint,
-                arguments,
-            )
-            .await
+            provider_add(context, account, command_id, fingerprint, arguments).await
         }
-        CommandCall::ProviderList => read(state, |state| {
+        CommandCall::ProviderList => read(context.state, |state| {
             serde_json::to_value(state.providers.values().collect::<Vec<_>>()).map_err(json_error)
         }),
-        CommandCall::ModelList => read(state, |state| {
+        CommandCall::ModelList => read(context.state, |state| {
             serde_json::to_value(state.models.values().collect::<Vec<_>>()).map_err(json_error)
         }),
-        CommandCall::BotCreate(arguments) => {
-            bot_create(
-                store,
-                state,
-                home,
-                account,
-                command_id,
-                fingerprint,
-                arguments.name,
-            )
-            .await
+        CommandCall::ComputerAdd { code } => {
+            computer_add(context, account, command_id, fingerprint, code).await
         }
-        CommandCall::BotList => read(state, |state| {
+        CommandCall::ComputerList => read(context.state, |state| {
+            list_computers(state, context.links, account.id)
+        }),
+        CommandCall::BotCreate(arguments) => {
+            bot_create(context, account, command_id, fingerprint, arguments).await
+        }
+        CommandCall::BotList => read(context.state, |state| {
             let bots: Vec<&BotView> = state
                 .bots
                 .values()
@@ -134,7 +142,7 @@ pub async fn execute(
                 .collect();
             serde_json::to_value(bots).map_err(json_error)
         }),
-        CommandCall::BotShow { bot } => read(state, |state| {
+        CommandCall::BotShow { bot } => read(context.state, |state| {
             let bot = state
                 .owned_bot(bot, account.id)
                 .ok_or_else(|| ApiError::not_found("no such Bot"))?;
@@ -146,9 +154,13 @@ pub async fn execute(
                 .chats
                 .get(&bot.chat)
                 .ok_or_else(|| ApiError::internal("the Bot has no Chat"))?;
-            Ok(json!({"bot": bot, "computer": computer, "chat": chat}))
+            Ok(json!({
+                "bot": bot,
+                "computer": viewed_computer(computer, context.links),
+                "chat": chat,
+            }))
         }),
-        CommandCall::ChatList => read(state, |state| {
+        CommandCall::ChatList => read(context.state, |state| {
             let chats: Vec<&ChatView> = state
                 .chats
                 .values()
@@ -156,31 +168,22 @@ pub async fn execute(
                 .collect();
             serde_json::to_value(chats).map_err(json_error)
         }),
-        CommandCall::FileList { chat } => read(state, |state| {
+        CommandCall::FileList { chat } => read(context.state, |state| {
             state
                 .owned_chat(chat, account.id)
                 .ok_or_else(|| ApiError::not_found("no such Chat"))?;
             serde_json::to_value(state.files_of(chat, None)).map_err(json_error)
         }),
-        CommandCall::ChatRead { chat, from } => read(state, |state| {
+        CommandCall::ChatRead { chat, from } => read(context.state, |state| {
             state
                 .owned_chat(chat, account.id)
                 .ok_or_else(|| ApiError::not_found("no such Chat"))?;
             serde_json::to_value(state.messages_of(chat, from)).map_err(json_error)
         }),
         CommandCall::MessageSend(arguments) => {
-            message_send(
-                store,
-                state,
-                secrets,
-                account,
-                command_id,
-                fingerprint,
-                arguments,
-            )
-            .await
+            message_send(context, account, command_id, fingerprint, arguments).await
         }
-        CommandCall::RunShow { run } => read(state, |state| {
+        CommandCall::RunShow { run } => read(context.state, |state| {
             let run = state
                 .runs
                 .get(&run)
@@ -201,10 +204,8 @@ pub async fn execute(
 }
 
 async fn provider_add(
-    store: &Store,
-    state: &Mutex<State>,
-    secrets: &Secrets,
-    account: &crate::identity::Account,
+    context: &CommandContext<'_>,
+    account: &Account,
     command_id: Id,
     fingerprint: String,
     arguments: ProviderAdd,
@@ -214,8 +215,8 @@ async fn provider_add(
             "a Provider needs at least one Model",
         ));
     }
-    if let Some(record) = existing(store, command_id, &fingerprint).await? {
-        return existing_outcome(store, command_id, record).await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
     }
 
     let provider = Id::new();
@@ -253,13 +254,14 @@ async fn provider_add(
         "default_model": default_model,
     });
     let result = json!({"provider": provider, "models": models});
-    secrets
+    context
+        .secrets
         .store_provider_key(provider, &arguments.api_key)
         .map_err(|_| ApiError::internal("cannot store the Provider key"))?;
     let draft = EventDraft::new(EventKind::ProviderAdded, Author::User(account.id), data);
     let appended = match append(
-        store,
-        state,
+        context.store,
+        context.state,
         command_id,
         fingerprint,
         vec![draft],
@@ -270,13 +272,13 @@ async fn provider_add(
     {
         Ok(appended) => appended,
         Err(error) => {
-            secrets.discard_provider_key(provider);
+            context.secrets.discard_provider_key(provider);
             return Err(error);
         }
     };
     if appended.existing {
-        secrets.discard_provider_key(provider);
-        return recorded_outcome(store, command_id).await;
+        context.secrets.discard_provider_key(provider);
+        return recorded_outcome(context.store, command_id).await;
     }
 
     Ok(Outcome {
@@ -288,30 +290,65 @@ async fn provider_add(
 }
 
 async fn bot_create(
-    store: &Store,
-    state: &Mutex<State>,
-    home: &Home,
-    account: &crate::identity::Account,
+    context: &CommandContext<'_>,
+    account: &Account,
     command_id: Id,
     fingerprint: String,
-    name: String,
+    arguments: BotCreate,
 ) -> Result<Outcome, ApiError> {
-    let name = name.trim().to_owned();
+    let name = arguments.name.trim().to_owned();
     if name.is_empty() {
         return Err(ApiError::invalid_argument("a Bot needs a name"));
     }
-    if let Some(record) = existing(store, command_id, &fingerprint).await? {
-        return existing_outcome(store, command_id, record).await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
     }
 
     let bot = Id::new();
-    let computer = Id::new();
     let chat = Id::new();
-    let workspace = home.workspace_dir(computer);
-    std::fs::create_dir_all(&workspace)
-        .map_err(|_| ApiError::internal("cannot create the Computer workspace"))?;
-    let drafts = vec![
-        EventDraft::new(
+    // A Bot either gets a fresh managed Computer or joins a real one the
+    // caller already owns; a real Computer's Bot folder is the machine's.
+    let (computer, computer_view, created_workspace) = match arguments.computer {
+        Some(computer) => {
+            let view = {
+                let state = context
+                    .state
+                    .lock()
+                    .map_err(|_| ApiError::internal("state lock"))?;
+                state
+                    .computers
+                    .get(&computer)
+                    .cloned()
+                    .ok_or_else(|| ApiError::not_found("no such Computer"))?
+            };
+            if view.owner != account.id {
+                return Err(ApiError::not_found("no such Computer"));
+            }
+            if view.kind != "real" {
+                return Err(ApiError::invalid_argument(
+                    "a Bot needs a real Computer; leave the Computer out to get a managed one",
+                ));
+            }
+            (computer, viewed_computer(&view, context.links), None)
+        }
+        None => {
+            let computer = Id::new();
+            let workspace = context.home.workspace_dir(computer);
+            std::fs::create_dir_all(&workspace)
+                .map_err(|_| ApiError::internal("cannot create the Computer workspace"))?;
+            let view = ComputerView {
+                id: computer,
+                owner: account.id,
+                kind: "managed".to_owned(),
+                online: true,
+                workspace: workspace.to_string_lossy().into_owned(),
+            };
+            (computer, view, Some(workspace))
+        }
+    };
+    let mut drafts = Vec::new();
+    if let Some(workspace) = &created_workspace {
+        drafts.push(EventDraft::new(
             EventKind::ComputerCreated,
             Author::User(account.id),
             json!({
@@ -320,26 +357,26 @@ async fn bot_create(
                 "kind": "managed",
                 "workspace": workspace.to_string_lossy(),
             }),
-        ),
-        EventDraft::new(
-            EventKind::BotCreated,
-            Author::User(account.id),
-            json!({"bot": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat}),
-        ),
-        EventDraft::new(
-            EventKind::ChatCreated,
-            Author::User(account.id),
-            json!({"chat": chat, "owner": account.id, "bot": bot}),
-        ),
-    ];
+        ));
+    }
+    drafts.push(EventDraft::new(
+        EventKind::BotCreated,
+        Author::User(account.id),
+        json!({"bot": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat}),
+    ));
+    drafts.push(EventDraft::new(
+        EventKind::ChatCreated,
+        Author::User(account.id),
+        json!({"chat": chat, "owner": account.id, "bot": bot}),
+    ));
     let result = json!({
         "bot": {"id": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat},
-        "computer": {"id": computer, "owner": account.id, "kind": "managed", "online": true, "workspace": workspace.to_string_lossy()},
+        "computer": computer_view,
         "chat": {"id": chat, "owner": account.id, "bot": bot},
     });
     let appended = match append(
-        store,
-        state,
+        context.store,
+        context.state,
         command_id,
         fingerprint,
         drafts,
@@ -350,13 +387,17 @@ async fn bot_create(
     {
         Ok(appended) => appended,
         Err(error) => {
-            let _ = std::fs::remove_dir_all(&workspace);
+            if let Some(workspace) = &created_workspace {
+                let _ = std::fs::remove_dir_all(workspace);
+            }
             return Err(error);
         }
     };
     if appended.existing {
-        let _ = std::fs::remove_dir_all(&workspace);
-        return recorded_outcome(store, command_id).await;
+        if let Some(workspace) = &created_workspace {
+            let _ = std::fs::remove_dir_all(workspace);
+        }
+        return recorded_outcome(context.store, command_id).await;
     }
 
     Ok(Outcome {
@@ -368,26 +409,33 @@ async fn bot_create(
 }
 
 async fn message_send(
-    store: &Store,
-    state: &Mutex<State>,
-    secrets: &Secrets,
-    account: &crate::identity::Account,
+    context: &CommandContext<'_>,
+    account: &Account,
     command_id: Id,
     fingerprint: String,
     arguments: MessageSend,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(store, command_id, &fingerprint).await? {
-        return existing_outcome(store, command_id, record).await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
     }
 
-    let (bot, ..) = preflight(state, arguments.chat, account.id, secrets, arguments.file)?;
+    let (bot, ..) = preflight(
+        context.state,
+        arguments.chat,
+        account.id,
+        context.secrets,
+        arguments.file,
+    )?;
     if arguments.file.is_none() && arguments.text.trim().is_empty() {
         return Err(ApiError::invalid_argument("a Message needs text or a File"));
     }
     // The run joins the queue behind the Bot's active runs. It is counted
     // before the append so the confirmed place matches the record order.
     let position = {
-        let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
         u32::try_from(state.active_runs(bot.id).len())
             .ok()
             .and_then(|active| active.checked_add(1))
@@ -426,8 +474,8 @@ async fn message_send(
         "position": position,
     });
     let appended = append(
-        store,
-        state,
+        context.store,
+        context.state,
         command_id,
         fingerprint,
         drafts,
@@ -436,7 +484,7 @@ async fn message_send(
     )
     .await?;
     if appended.existing {
-        return recorded_outcome(store, command_id).await;
+        return recorded_outcome(context.store, command_id).await;
     }
 
     Ok(Outcome {
@@ -445,6 +493,121 @@ async fn message_send(
         queued: Some(bot.id),
         events: appended.events,
     })
+}
+
+/// Adds a real Computer a User paired, and returns it as a client sees it.
+async fn computer_add(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    code: String,
+) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+    if !context.pairings.lock().await.attempt_allowed(account.id) {
+        return Err(rate_limited(
+            "too many pairing attempts; wait a minute and try again",
+        ));
+    }
+    let Some(PairingRequest {
+        device, workspace, ..
+    }) = context
+        .identity
+        .pairing_request(&code)
+        .await
+        .map_err(identity_error)?
+    else {
+        context.pairings.lock().await.record_failure(account.id);
+        return Err(invalid_pairing_code());
+    };
+    let computer = Id::new();
+    if !context
+        .identity
+        .claim_pairing(&code, account.id, computer)
+        .await
+        .map_err(identity_error)?
+    {
+        context.pairings.lock().await.record_failure(account.id);
+        return Err(invalid_pairing_code());
+    }
+
+    let draft = EventDraft::new(
+        EventKind::ComputerCreated,
+        Author::User(account.id),
+        json!({
+            "computer": computer,
+            "owner": account.id,
+            "kind": "real",
+            "workspace": workspace,
+        }),
+    );
+    let result = json!(ComputerView {
+        id: computer,
+        owner: account.id,
+        kind: "real".to_owned(),
+        online: false,
+        workspace,
+    });
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+    // The pairing approved, so it stops holding a pending slot.
+    context.pairings.lock().await.approved(&device);
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Returns the Computers a User owns, in creation order.
+fn list_computers(state: &State, links: &ComputerLinks, owner: Id) -> Result<Value, ApiError> {
+    let computers: Vec<ComputerView> = state
+        .computer_order
+        .iter()
+        .filter_map(|computer| state.computers.get(computer))
+        .filter(|computer| computer.owner == owner)
+        .map(|computer| viewed_computer(computer, links))
+        .collect();
+    serde_json::to_value(computers).map_err(json_error)
+}
+
+/// Returns a Computer as a client sees it.
+///
+/// A real Computer is online only while its channel is up; the projection
+/// cannot know that, so the runtime links answer for it. A managed Computer
+/// runs inside the Space and is always online.
+fn viewed_computer(computer: &ComputerView, links: &ComputerLinks) -> ComputerView {
+    let mut computer = computer.clone();
+    computer.online = computer.kind != "real" || links.online(computer.id);
+
+    computer
+}
+
+fn invalid_pairing_code() -> ApiError {
+    ApiError::invalid_argument("the pairing code is not valid or has expired")
+}
+
+fn rate_limited(message: &str) -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::TOO_MANY_REQUESTS,
+        neha::error::ErrorCode::RateLimited,
+        message,
+    )
 }
 
 /// Records that the Bot starts a queued run and streams the event.
@@ -682,19 +845,47 @@ pub async fn finish_run(
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
+    links: &ComputerLinks,
     pending: PendingRun,
 ) -> Result<(Value, Vec<Event>), ApiError> {
     let history = build_history(state, &pending)?;
-    let runtime = match LocalRuntime::new(home.workspace_dir(pending.bot.computer)) {
-        Ok(runtime) => runtime.with_timeout(tool_timeout),
-        Err(error) => {
-            let outcome = RunOutcome {
-                text: format!("I could not start my Computer: {error}"),
-                usage: neha::usage::Usage::default(),
-                succeeded: false,
+    let computer = pending.bot.computer;
+    // The Computer's kind picks the runtime: a managed Computer runs inside
+    // the Space, a real one across its channel. The queue never starts a run
+    // whose real Computer is offline; starting one here anyway fails it the
+    // way a User would see a Computer that went away.
+    let kind = state
+        .lock()
+        .ok()
+        .and_then(|state| state.computers.get(&computer).map(|view| view.kind.clone()));
+    let runtime = match kind.as_deref() {
+        Some("real") => {
+            let Some(link) = links.link(computer) else {
+                let outcome = RunOutcome {
+                    text: "I could not start my Computer: it is offline.".to_owned(),
+                    usage: neha::usage::Usage::default(),
+                    succeeded: false,
+                };
+                return finish_completion(store, state, pending, outcome).await;
             };
-            return finish_completion(store, state, pending, outcome).await;
+            RunRuntime::Remote(RemoteRuntime::new(
+                link,
+                pending.bot.id,
+                links.ids(),
+                tool_timeout.saturating_add(TIMEOUT_GRACE),
+            ))
         }
+        _ => match LocalRuntime::new(home.workspace_dir(computer)) {
+            Ok(runtime) => RunRuntime::Managed(runtime.with_timeout(tool_timeout)),
+            Err(error) => {
+                let outcome = RunOutcome {
+                    text: format!("I could not start my Computer: {error}"),
+                    usage: neha::usage::Usage::default(),
+                    succeeded: false,
+                };
+                return finish_completion(store, state, pending, outcome).await;
+            }
+        },
     };
     let space_model = SpaceModel::new(
         model,
@@ -759,6 +950,59 @@ async fn finish_completion(
     .await?;
 
     Ok((result, completion.events))
+}
+
+/// The runtime a run works on.
+///
+/// The loop needs one type whatever the Computer is, so this enum forwards to
+/// the managed runtime or the real Computer's channel.
+enum RunRuntime {
+    /// A workspace inside the Space.
+    Managed(LocalRuntime),
+    /// A Bot's folder on a real Computer, across its channel.
+    Remote(RemoteRuntime),
+}
+
+impl ComputerRuntime for RunRuntime {
+    // The trait promises a `Send` future; `async fn` would not state that.
+    #[allow(clippy::manual_async_fn)]
+    fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send {
+        async move {
+            match self {
+                Self::Managed(runtime) => runtime.execute(action).await,
+                Self::Remote(runtime) => runtime.execute(action).await,
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn read_bytes(
+        &self,
+        path: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+        let path = path.to_owned();
+        async move {
+            match self {
+                Self::Managed(runtime) => runtime.read_bytes(&path).await,
+                Self::Remote(runtime) => runtime.read_bytes(&path).await,
+            }
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn write_bytes(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let path = path.to_owned();
+        async move {
+            match self {
+                Self::Managed(runtime) => runtime.write_bytes(&path, bytes).await,
+                Self::Remote(runtime) => runtime.write_bytes(&path, bytes).await,
+            }
+        }
+    }
 }
 
 fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {

@@ -1,8 +1,12 @@
-//! Accounts, passwords, and device tokens.
+//! Accounts, passwords, paired Computers, and device tokens.
 //!
 //! The first User joins with the Space's invitation and becomes the Admin.
 //! A password is stored as an Argon2id hash, and a device token is stored only
 //! as its SHA-256 digest.
+//!
+//! A real Computer pairs by showing a code: the machine keeps its token and
+//! polling secret, the User enters the code, and the Space stores only their
+//! digests.
 
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
@@ -11,10 +15,12 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
 use neha::time::Timestamp;
+use rand::Rng as _;
 use rand::RngCore as _;
 use sha2::{Digest, Sha256};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Connection, Row, SqlitePool};
+use subtle::ConstantTimeEq;
 use thiserror::Error;
 
 use crate::home::Home;
@@ -25,6 +31,23 @@ pub const MIN_PASSWORD_BYTES: usize = 8;
 
 /// The longest display name a Space accepts.
 pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
+
+/// How long a pairing code stays valid, in seconds.
+pub const PAIRING_TTL_SECS: i64 = 600;
+
+/// How many tries a pairing code allows before it is void.
+pub const MAX_CODE_TRIES: i64 = 5;
+
+/// The bytes of random device identifier a pairing starts with.
+const DEVICE_BYTES: usize = 16;
+
+/// The characters of a pairing code.
+const CODE_CHARS: usize = 8;
+
+/// Base32 without the characters that look alike: `I` and `O`, `0` and `1`.
+///
+/// Eight characters from the 32 remaining ones carry 40 bits.
+const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// A person who can sign in to the Space.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,7 +60,39 @@ pub struct Account {
     pub is_admin: bool,
 }
 
-/// The Space's accounts and their tokens.
+/// What a Space tells a machine when pairing starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingStart {
+    /// The device identifier the machine polls with.
+    pub device: String,
+    /// The code the User enters.
+    pub code: String,
+}
+
+/// What a machine learns when it polls its pairing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingState {
+    /// No User has approved the machine yet.
+    Pending,
+    /// The Space bonded the machine to a Computer.
+    Approved {
+        /// The Computer the machine now controls.
+        computer: Id,
+    },
+}
+
+/// What the Space knows about a pairing before a User approves it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingRequest {
+    /// The device identifier the machine polls with.
+    pub device: String,
+    /// The name the machine gave itself.
+    pub machine: String,
+    /// The folder on the machine the Computer uses.
+    pub workspace: String,
+}
+
+/// The Space's accounts, their tokens, and its paired Computers.
 pub struct Identity {
     pool: SqlitePool,
 }
@@ -182,6 +237,228 @@ impl Identity {
         row.as_ref().map(account_from_row).transpose()
     }
 
+    /// Starts pairing a real Computer.
+    ///
+    /// The machine generated `token` and `poll_secret` and keeps them; the
+    /// Space stores only their digests. The returned device identifier and
+    /// code appear once.
+    pub async fn begin_pairing(
+        &self,
+        machine: &str,
+        workspace: &str,
+        token: &str,
+        poll_secret: &str,
+    ) -> Result<PairingStart, IdentityError> {
+        self.begin_pairing_at(now(), machine, workspace, token, poll_secret)
+            .await
+    }
+
+    /// Returns the state a machine polls for, or `None` when the device or
+    /// secret is unknown, or no User approved the machine before the code
+    /// expired. A poll never consumes the code.
+    pub async fn pairing(
+        &self,
+        device: &str,
+        poll_secret: &str,
+    ) -> Result<Option<PairingState>, IdentityError> {
+        self.pairing_at(now(), device, poll_secret).await
+    }
+
+    /// Looks up an unexpired, unclaimed code for a User to approve.
+    ///
+    /// Returns `None` when the code is unknown, already used, expired, or out
+    /// of tries. A lookup that finds the pairing uses one try, so a code that
+    /// is entered over and over stops working.
+    pub async fn pairing_request(
+        &self,
+        code: &str,
+    ) -> Result<Option<PairingRequest>, IdentityError> {
+        self.pairing_request_at(now(), code).await
+    }
+
+    /// Bonds a pairing to a User and a Computer.
+    ///
+    /// The claim is one transaction: it marks the code used and records the
+    /// machine's token digest for the Computer. Returns `false` when the code
+    /// is unknown, already used, expired, or out of tries.
+    pub async fn claim_pairing(
+        &self,
+        code: &str,
+        owner: Id,
+        computer: Id,
+    ) -> Result<bool, IdentityError> {
+        self.claim_pairing_at(now(), code, owner, computer).await
+    }
+
+    /// Returns the Computer a machine token belongs to.
+    pub async fn authenticate_computer(&self, token: &str) -> Result<Option<Id>, IdentityError> {
+        let digest = digest(token);
+        let computer: Option<String> =
+            sqlx::query_scalar("SELECT computer_id FROM computer_tokens WHERE token_hash = ?")
+                .bind(digest.as_slice())
+                .fetch_optional(&self.pool)
+                .await?;
+
+        computer
+            .map(|computer| computer.parse().map_err(|_| IdentityError::Corrupt))
+            .transpose()
+    }
+
+    async fn begin_pairing_at(
+        &self,
+        now: i64,
+        machine: &str,
+        workspace: &str,
+        token: &str,
+        poll_secret: &str,
+    ) -> Result<PairingStart, IdentityError> {
+        let device = random_base64(DEVICE_BYTES);
+        let code = random_code();
+        let code_hash = digest(&code);
+        let poll_hash = digest(poll_secret);
+        let token_hash = digest(token);
+        let expires_at = now.saturating_add(PAIRING_TTL_SECS.saturating_mul(1_000_000));
+        sqlx::query(
+            "INSERT INTO computer_codes (\
+             device_id, code_hash, poll_hash, token_hash, machine, workspace, \
+             owner, computer, created_at, expires_at, tries) \
+             VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0)",
+        )
+        .bind(&device)
+        .bind(code_hash.as_slice())
+        .bind(poll_hash.as_slice())
+        .bind(token_hash.as_slice())
+        .bind(machine)
+        .bind(workspace)
+        .bind(now)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(PairingStart { device, code })
+    }
+
+    async fn pairing_at(
+        &self,
+        now: i64,
+        device: &str,
+        poll_secret: &str,
+    ) -> Result<Option<PairingState>, IdentityError> {
+        let row = sqlx::query(
+            "SELECT poll_hash, owner, computer, expires_at FROM computer_codes \
+             WHERE device_id = ?",
+        )
+        .bind(device)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let poll_hash: Vec<u8> = row.try_get("poll_hash")?;
+        let matches: bool = digest(poll_secret)
+            .as_slice()
+            .ct_eq(poll_hash.as_slice())
+            .into();
+        if !matches {
+            return Ok(None);
+        }
+
+        let owner: Option<String> = row.try_get("owner")?;
+        let computer: Option<String> = row.try_get("computer")?;
+        match (owner, computer) {
+            (Some(_), Some(computer)) => {
+                let computer = computer.parse().map_err(|_| IdentityError::Corrupt)?;
+                Ok(Some(PairingState::Approved { computer }))
+            }
+            (None, None) => {
+                let expires_at: i64 = row.try_get("expires_at")?;
+                if now >= expires_at {
+                    return Ok(None);
+                }
+                Ok(Some(PairingState::Pending))
+            }
+            _ => Err(IdentityError::Corrupt),
+        }
+    }
+
+    async fn pairing_request_at(
+        &self,
+        now: i64,
+        code: &str,
+    ) -> Result<Option<PairingRequest>, IdentityError> {
+        let code_hash = digest(&normalize_code(code));
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE computer_codes SET tries = tries + 1 \
+             WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
+        )
+        .bind(code_hash.as_slice())
+        .bind(now)
+        .bind(MAX_CODE_TRIES)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "SELECT device_id, machine, workspace FROM computer_codes WHERE code_hash = ?",
+        )
+        .bind(code_hash.as_slice())
+        .fetch_one(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        Ok(Some(PairingRequest {
+            device: row.try_get("device_id")?,
+            machine: row.try_get("machine")?,
+            workspace: row.try_get("workspace")?,
+        }))
+    }
+
+    async fn claim_pairing_at(
+        &self,
+        now: i64,
+        code: &str,
+        owner: Id,
+        computer: Id,
+    ) -> Result<bool, IdentityError> {
+        let code_hash = digest(&normalize_code(code));
+        let mut transaction = self.pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE computer_codes SET owner = ?, computer = ? \
+             WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
+        )
+        .bind(owner.to_string())
+        .bind(computer.to_string())
+        .bind(code_hash.as_slice())
+        .bind(now)
+        .bind(MAX_CODE_TRIES)
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let token_hash: Vec<u8> =
+            sqlx::query_scalar("SELECT token_hash FROM computer_codes WHERE code_hash = ?")
+                .bind(code_hash.as_slice())
+                .fetch_one(&mut *transaction)
+                .await?;
+        sqlx::query(
+            "INSERT INTO computer_tokens (token_hash, computer_id, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(token_hash.as_slice())
+        .bind(computer.to_string())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+
+        Ok(true)
+    }
+
     async fn issue_token(&self, account: Id) -> Result<String, IdentityError> {
         let mut bytes = [0_u8; 32];
         rand::rng().fill_bytes(&mut bytes);
@@ -238,6 +515,29 @@ fn digest(token: &str) -> [u8; 32] {
     Sha256::digest(token.as_bytes()).into()
 }
 
+fn now() -> i64 {
+    Timestamp::now().as_microseconds()
+}
+
+fn normalize_code(code: &str) -> String {
+    code.trim().to_ascii_uppercase()
+}
+
+fn random_code() -> String {
+    let mut rng = rand::rng();
+
+    (0..CODE_CHARS)
+        .map(|_| CODE_ALPHABET[rng.random_range(0..CODE_ALPHABET.len())] as char)
+        .collect()
+}
+
+fn random_base64(bytes: usize) -> String {
+    let mut value = vec![0_u8; bytes];
+    rand::rng().fill_bytes(&mut value);
+
+    URL_SAFE_NO_PAD.encode(value)
+}
+
 /// Accounts or sign-in failed.
 #[derive(Debug, Error)]
 pub enum IdentityError {
@@ -272,8 +572,16 @@ pub enum IdentityError {
 
 #[cfg(test)]
 mod tests {
-    use super::{Identity, IdentityError};
+    use super::{
+        Account, CODE_ALPHABET, Identity, IdentityError, MAX_CODE_TRIES, PAIRING_TTL_SECS,
+        PairingRequest, PairingState, digest,
+    };
     use crate::home::Home;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use neha::id::Id;
+    use sqlx::sqlite::SqliteConnectOptions;
+    use sqlx::{Connection, SqliteConnection};
 
     async fn identity() -> (tempfile::TempDir, Home, Identity) {
         let dir = tempfile::tempdir().unwrap();
@@ -380,5 +688,373 @@ mod tests {
             identity.create_admin("Ada", "short").await,
             Err(IdentityError::WeakPassword)
         ));
+    }
+
+    #[tokio::test]
+    async fn shows_a_pairing_code_once_and_uses_it_once() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/home/ada/neha", "machine-token", "poll-secret")
+            .await
+            .unwrap();
+
+        let request = identity.pairing_request(&start.code).await.unwrap();
+
+        assert_eq!(
+            request,
+            Some(PairingRequest {
+                device: start.device.clone(),
+                machine: "laptop".to_owned(),
+                workspace: "/home/ada/neha".to_owned(),
+            })
+        );
+        assert_eq!(
+            identity.pairing_request("ZZZZZZZZ").await.unwrap(),
+            None,
+            "an unknown code names no pairing"
+        );
+        let owner = Id::new();
+        let computer = Id::new();
+        assert!(
+            identity
+                .claim_pairing(&start.code, owner, computer)
+                .await
+                .unwrap()
+        );
+        assert!(
+            identity
+                .pairing_request(&start.code)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !identity
+                .claim_pairing(&start.code, owner, Id::new())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_typed_code_ignores_case_and_surrounding_space() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+        let typed = format!(" {} ", start.code.to_lowercase());
+
+        let request = identity.pairing_request(&typed).await.unwrap();
+
+        assert!(request.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_pairing_code_expires() {
+        let (_dir, _home, identity) = identity().await;
+        let now = 1_000_000_i64;
+        let start = identity
+            .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+        let expires_at = now + PAIRING_TTL_SECS * 1_000_000;
+
+        assert!(
+            identity
+                .pairing_request_at(expires_at - 1, &start.code)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            identity
+                .pairing_request_at(expires_at, &start.code)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(
+            !identity
+                .claim_pairing_at(expires_at, &start.code, Id::new(), Id::new())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            identity
+                .pairing_at(expires_at, &start.device, "poll")
+                .await
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pairing_code_stops_working_after_its_tries() {
+        let (_dir, _home, identity) = identity().await;
+        let now = 1_000_000_i64;
+        let start = identity
+            .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+
+        for _ in 0..MAX_CODE_TRIES {
+            assert!(
+                identity
+                    .pairing_request_at(now, &start.code)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+        }
+
+        assert!(
+            identity
+                .pairing_request_at(now, &start.code)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !identity
+                .claim_pairing_at(now, &start.code, Id::new(), Id::new())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_stays_pending_until_the_user_approves_it() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            identity.pairing(&start.device, "poll").await.unwrap(),
+            Some(PairingState::Pending)
+        );
+        assert_eq!(
+            identity.pairing(&start.device, "wrong").await.unwrap(),
+            None
+        );
+        assert_eq!(
+            identity.pairing("unknown-device", "poll").await.unwrap(),
+            None
+        );
+
+        let computer = Id::new();
+        assert!(
+            identity
+                .claim_pairing(&start.code, Id::new(), computer)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            identity.pairing(&start.device, "poll").await.unwrap(),
+            Some(PairingState::Approved { computer })
+        );
+    }
+
+    #[tokio::test]
+    async fn only_one_of_two_concurrent_claims_wins() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+        let owner = Id::new();
+        let first = Id::new();
+        let second = Id::new();
+
+        let (one, two) = tokio::join!(
+            identity.claim_pairing(&start.code, owner, first),
+            identity.claim_pairing(&start.code, owner, second),
+        );
+        let one = one.unwrap();
+        let two = two.unwrap();
+
+        assert_ne!(one, two, "one claim must lose");
+        let winner = if one { first } else { second };
+        assert_eq!(
+            identity.pairing(&start.device, "poll").await.unwrap(),
+            Some(PairingState::Approved { computer: winner })
+        );
+        assert_eq!(
+            identity.authenticate_computer("token").await.unwrap(),
+            Some(winner)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pairing_tables_store_only_hashes() {
+        let (_dir, _home, identity) = identity().await;
+        let token = "machine-token-plaintext";
+        let poll_secret = "poll-secret-plaintext";
+        let start = identity
+            .begin_pairing("laptop", "/ws", token, poll_secret)
+            .await
+            .unwrap();
+        assert!(
+            identity
+                .claim_pairing(&start.code, Id::new(), Id::new())
+                .await
+                .unwrap()
+        );
+
+        let code_hash: Vec<u8> = sqlx::query_scalar("SELECT code_hash FROM computer_codes")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        let poll_hash: Vec<u8> = sqlx::query_scalar("SELECT poll_hash FROM computer_codes")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        let token_hash: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM computer_codes")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+
+        assert_eq!(code_hash, digest(&start.code));
+        assert_eq!(poll_hash, digest(poll_secret));
+        assert_eq!(token_hash, digest(token));
+        for hash in [&code_hash, &poll_hash, &token_hash] {
+            assert_eq!(hash.len(), 32);
+        }
+        let stored: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM computer_tokens")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, digest(token));
+        assert_ne!(stored, token.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_computer_authenticates_with_the_token_the_machine_keeps() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "machine-token", "poll")
+            .await
+            .unwrap();
+        let computer = Id::new();
+        assert!(
+            identity
+                .claim_pairing(&start.code, Id::new(), computer)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            identity
+                .authenticate_computer("machine-token")
+                .await
+                .unwrap(),
+            Some(computer)
+        );
+        assert_eq!(
+            identity.authenticate_computer("not-a-token").await.unwrap(),
+            None
+        );
+        let (_account, account_token) = identity
+            .create_admin("Ada", "correct horse battery")
+            .await
+            .unwrap();
+        assert_eq!(
+            identity
+                .authenticate_computer(&account_token)
+                .await
+                .unwrap(),
+            None,
+            "an account token is not a Computer token"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairing_codes_and_devices_have_the_expected_shape() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+
+        assert_eq!(CODE_ALPHABET.len(), 32);
+        assert_eq!(start.code.len(), 8);
+        assert!(start.code.bytes().all(|byte| CODE_ALPHABET.contains(&byte)));
+        assert_eq!(URL_SAFE_NO_PAD.decode(&start.device).unwrap().len(), 16);
+    }
+
+    async fn version_one_database(path: &std::path::Path, token: &str) -> Account {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        for statement in crate::schema::VERSION_ONE_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 1")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let account = Account {
+            id: Id::new(),
+            display_name: "Legacy Ada".to_owned(),
+            is_admin: true,
+        };
+        sqlx::query(
+            "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
+             VALUES (?, ?, 'unused', 1, 0)",
+        )
+        .bind(account.id.to_string())
+        .bind(&account.display_name)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let token_hash = digest(token);
+        sqlx::query("INSERT INTO tokens (token_hash, account_id, created_at) VALUES (?, ?, 0)")
+            .bind(token_hash.as_slice())
+            .bind(account.id.to_string())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+
+        account
+    }
+
+    #[tokio::test]
+    async fn opening_a_version_one_database_keeps_accounts_and_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let account = version_one_database(&home.db_path(), "legacy-token").await;
+
+        let identity = Identity::open(&home).await.unwrap();
+
+        assert!(identity.has_accounts().await.unwrap());
+        assert_eq!(
+            identity.authenticate("legacy-token").await.unwrap(),
+            Some(account)
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_a_home_renames_and_upgrades_the_legacy_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("db").join("neha-1.sqlite3");
+        let account = version_one_database(&legacy, "legacy-token").await;
+
+        let home = Home::open(dir.path()).unwrap();
+        let identity = Identity::open(&home).await.unwrap();
+
+        assert!(!legacy.exists(), "the legacy file must be renamed");
+        assert!(home.db_path().exists());
+        assert_eq!(
+            identity.authenticate("legacy-token").await.unwrap(),
+            Some(account)
+        );
     }
 }

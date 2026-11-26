@@ -19,6 +19,14 @@ Owned by cli. Every topic's behavior is reachable through the command surface, s
 
 The command surface is the set of commands a Space accepts and the events it sends. One definition of it produces the Space's types and the clients' types.
 
+## The computer daemon
+
+A real Computer is reached through the CLI: the binary that runs `neha computer pair` is the daemon that `neha computer run` starts.
+
+The daemon listens on no network port. It holds one outgoing connection and no record, and it runs the actions the Space sends with the machine's rights.
+
+The `neha computer add` and `neha computer list` commands, and `neha bot create --computer`, are part of the command surface.
+
 ## Commands and events
 
 A command carries an identifier from its caller, the scope it acts in, and its parameters. A caller that sends a command again receives the result of the first one, or a conflict. The result of a run-starting command settles when its run ends; a caller that sends the command again before then waits for the settled result.

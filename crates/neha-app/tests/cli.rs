@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::response::Response;
@@ -33,15 +33,7 @@ fn serve(home: &Path) -> (SpaceProcess, String, Option<String>) {
         .stderr(Stdio::piped())
         .spawn()
         .expect("neha serve starts");
-    let stdout = child.stdout.take().unwrap();
-    let (lines, received) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if lines.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let received = line_reader(child.stdout.take().unwrap());
 
     let mut url = None;
     let mut invite = None;
@@ -102,12 +94,28 @@ fn run(home: &Path, credential: &Path, arguments: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Starts the CLI in the background and returns a reader of its stdout.
+/// Reads a piped stream line by line on its own thread, and hands the lines
+/// over until the receiving end goes away.
+fn line_reader(stream: impl std::io::Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (lines, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    received
+}
+
+/// Starts the CLI in the background and returns readers of its stdout and
+/// stderr.
 fn spawn_cli(
     home: &Path,
     credential: &Path,
     arguments: &[&str],
-) -> (Child, mpsc::Receiver<String>) {
+) -> (Child, mpsc::Receiver<String>, mpsc::Receiver<String>) {
     let mut child = Command::new(BIN)
         .args(arguments)
         .env("NEHA_HOME", home)
@@ -115,34 +123,50 @@ fn spawn_cli(
         .env("NEHA_PROVIDER_KEY", "sk-test")
         .env("NEHA_PASSWORD", PASSWORD)
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("neha runs");
-    let stdout = child.stdout.take().unwrap();
-    let (lines, received) = mpsc::channel();
-    std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if lines.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let stdout = line_reader(child.stdout.take().unwrap());
+    let stderr = line_reader(child.stderr.take().unwrap());
 
-    (child, received)
+    (child, stdout, stderr)
 }
 
 /// Reads a background CLI's stdout until it prints this line, appending to
 /// `output`.
 fn read_until(lines: &mpsc::Receiver<String>, output: &mut String, expected: &str) {
+    read_until_matching(lines, output, &format!("`{expected}`"), |line| {
+        line == expected
+    });
+}
+
+/// Reads a background CLI's stdout until a line satisfies `matches`, appends
+/// every line it read to `output`, and returns the matching line.
+fn read_until_matching(
+    lines: &mpsc::Receiver<String>,
+    output: &mut String,
+    describe: &str,
+    matches: impl Fn(&str) -> bool,
+) -> String {
     loop {
         let line = lines
             .recv_timeout(Duration::from_secs(10))
-            .unwrap_or_else(|_| panic!("the CLI did not print `{expected}`:\n{output}"));
+            .unwrap_or_else(|_| panic!("the CLI did not print {describe}:\n{output}"));
         output.push_str(&line);
         output.push('\n');
-        if line == expected {
-            return;
+        if matches(&line) {
+            return line;
         }
     }
+}
+
+/// Returns the first word of a field a command printed.
+fn first_word(field: &str) -> String {
+    field
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Waits for a background CLI and returns whether it succeeded and all stdout.
@@ -355,6 +379,219 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
         },
         task,
     )
+}
+
+/// Runs a real-Computer test only where a Bot can actually be fenced.
+///
+/// The gate is `NEHA_TEST_BWRAP`, the same one the runtime's own fence tests
+/// use, and then bubblewrap actually starting a sandbox: a machine where the
+/// daemon cannot serve is a skip with its reason, not a failure of the CLI.
+fn real_computer_ready() -> bool {
+    if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+        eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+        return false;
+    }
+    let probe = tempfile::tempdir().unwrap();
+    match neha_computer::LocalRuntime::machine(probe.path().join("probe")) {
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("skipping the real-Computer test: {error}");
+            false
+        }
+    }
+}
+
+/// Waits up to ten seconds for a state the real processes reach on their own.
+///
+/// The wait is bounded and re-checks the condition; it never opens a window a
+/// later assertion depends on.
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Waits for `computer list` to show one Computer online, and returns the
+/// listing that showed it.
+fn wait_for_computer_online(home: &Path, credential: &Path, computer: &str) -> String {
+    let wanted = format!("{computer}  real  online  ");
+    let mut listing = String::new();
+    wait_until("the Computer to come online", || {
+        listing = run(home, credential, &["computer", "list"]);
+        listing.lines().any(|line| line.starts_with(&wanted))
+    });
+
+    listing
+}
+
+/// Waits for `computer list` to show one Computer offline.
+fn wait_for_computer_offline(home: &Path, credential: &Path, computer: &str) {
+    let wanted = format!("{computer}  real  offline  ");
+    wait_until("the Computer to go offline", || {
+        run(home, credential, &["computer", "list"])
+            .lines()
+            .any(|line| line.starts_with(&wanted))
+    });
+}
+
+/// A machine-side `neha computer pair` or `neha computer run`, killed on drop.
+struct ComputerDaemon {
+    child: Option<Child>,
+    lines: mpsc::Receiver<String>,
+    output: String,
+}
+
+impl ComputerDaemon {
+    /// Starts a computer command for this machine's own Neha directory.
+    fn spawn(computer_home: &Path, arguments: &[&str]) -> Self {
+        let mut child = Command::new(BIN)
+            .args(arguments)
+            .env("NEHA_COMPUTER_HOME", computer_home)
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("neha computer starts");
+        let lines = line_reader(child.stdout.take().unwrap());
+
+        Self {
+            child: Some(child),
+            lines,
+            output: String::new(),
+        }
+    }
+
+    /// Reads this daemon's stdout until it prints this line.
+    fn expect_line(&mut self, expected: &str) {
+        let mut output = std::mem::take(&mut self.output);
+        read_until_matching(&self.lines, &mut output, &format!("`{expected}`"), |line| {
+            line == expected
+        });
+        self.output = output;
+    }
+
+    /// Reads this daemon's stdout until a line starts with `prefix`, and
+    /// returns that line.
+    fn expect_prefix(&mut self, prefix: &str) -> String {
+        let mut output = std::mem::take(&mut self.output);
+        let line = read_until_matching(
+            &self.lines,
+            &mut output,
+            &format!("a line starting with `{prefix}`"),
+            |line| line.starts_with(prefix),
+        );
+        self.output = output;
+
+        line
+    }
+
+    /// Stops the daemon and waits for it to go.
+    fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for ComputerDaemon {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// A Space with a paired real Computer, its running daemon, and one Bot on it.
+///
+/// The daemon is declared first so it is stopped before the Space it serves:
+/// dropping the Space under a connected daemon would print a channel failure.
+struct RealComputer {
+    daemon: ComputerDaemon,
+    /// The Space the Computer is paired to; dropping it stops the Space.
+    _server: SpaceProcess,
+    home: PathBuf,
+    credential: PathBuf,
+    computer_home: PathBuf,
+    /// The machine's workspace, resolved as the daemon resolved it.
+    workspace: PathBuf,
+    url: String,
+    /// What the pairing and the first commands printed.
+    added: String,
+    listed: String,
+    created: String,
+    computer: String,
+    bot: String,
+    chat: String,
+    /// Holds the fixture's scratch directory until the processes are gone.
+    directory: tempfile::TempDir,
+}
+
+impl RealComputer {
+    /// Returns the fixture's scratch directory.
+    fn path(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+/// Pairs a real Computer into a fresh Space and creates one Bot on it.
+///
+/// The pairing, the daemon, and the Bot creation are the paths a User takes.
+/// A `directory` outside `/tmp` keeps the sandbox's fresh `/tmp` out of a
+/// fence assertion.
+fn real_computer(directory: tempfile::TempDir, provider: &str) -> RealComputer {
+    let home = directory.path().join("home");
+    let credential = directory.path().join("credential.json");
+    let computer_home = directory.path().join("computer");
+    let (server, url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            provider,
+            "--model",
+            "test-model",
+        ],
+    );
+
+    // The machine shows a code, a signed-in User enters it, and the daemon the
+    // machine then starts connects back to the Space.
+    let mut daemon = ComputerDaemon::spawn(&computer_home, &["computer", "pair", "--space", &url]);
+    let printed = daemon.expect_prefix("Pairing code: ");
+    let code = printed.trim_start_matches("Pairing code: ").trim();
+    let added = run(&home, &credential, &["computer", "add", code]);
+    let computer = first_word(&field(&added, "Added Computer "));
+    daemon.expect_line(&format!("Connected to {url}."));
+    let listed = wait_for_computer_online(&home, &credential, &computer);
+    let created = run(
+        &home,
+        &credential,
+        &["bot", "create", "Scout", "--computer", &computer],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+    let chat = field(&created, "Chat:");
+    let workspace = std::fs::canonicalize(computer_home.join("workspace"))
+        .expect("the daemon's workspace exists");
+
+    RealComputer {
+        daemon,
+        _server: server,
+        home,
+        credential,
+        computer_home,
+        workspace,
+        url,
+        added,
+        listed,
+        created,
+        computer,
+        bot,
+        chat,
+        directory,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -766,13 +1003,13 @@ async fn a_second_message_waits_while_the_first_run_holds_the_bot() {
     );
     run(&home, &credential, &["bot", "create", "Scout"]);
 
-    let (first, first_lines) = spawn_cli(&home, &credential, &["chat", "send", "first"]);
+    let (first, first_lines, _) = spawn_cli(&home, &credential, &["chat", "send", "first"]);
     let mut first_output = String::new();
     read_until(&first_lines, &mut first_output, "running");
-    let (second, second_lines) = spawn_cli(&home, &credential, &["chat", "send", "second"]);
+    let (second, second_lines, _) = spawn_cli(&home, &credential, &["chat", "send", "second"]);
     let mut second_output = String::new();
     read_until(&second_lines, &mut second_output, "queued (position 2)");
-    let (third, third_lines) = spawn_cli(&home, &credential, &["chat", "send", "third"]);
+    let (third, third_lines, _) = spawn_cli(&home, &credential, &["chat", "send", "third"]);
     let mut third_output = String::new();
     read_until(&third_lines, &mut third_output, "queued (position 3)");
 
@@ -855,4 +1092,421 @@ fn an_invitation_without_a_secret_is_refused() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no secret"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_runs_on_a_real_computer() {
+    if !real_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    // A shell in the Bot's folder writes a file there; another command reads a
+    // path outside the folder, as the machine's user can.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "pwd; echo hi > a.txt"}),
+    );
+    script.say("The work ran in my own folder.");
+    script.call("shell", serde_json::json!({"command": "cat /etc/hostname"}));
+    script.say("I read the whole machine.");
+    let directory = tempfile::tempdir().unwrap();
+    let computer = real_computer(directory, &base);
+    let workspace = computer.workspace.to_string_lossy().into_owned();
+    let folder = computer.workspace.join(&computer.bot);
+
+    // The code the machine printed admitted a real Computer, and its daemon
+    // shows it online with its workspace.
+    assert!(computer.added.contains("(real)."), "{}", computer.added);
+    let listed = format!("{}  real  online  {workspace}", computer.computer);
+    assert!(
+        computer.listed.lines().any(|line| line == listed),
+        "`computer list` must show the paired Computer online: {}",
+        computer.listed
+    );
+    // The Bot was created on that Computer, and no managed one.
+    assert_eq!(field(&computer.created, "Computer:"), computer.computer);
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "show", &computer.bot],
+    );
+    assert!(
+        shown.contains(&format!(
+            "Computer: {} (real, online: true)",
+            computer.computer
+        )),
+        "{shown}"
+    );
+
+    // A relative path names the Bot's own folder: that is its working
+    // directory and the file lands in its folder on the machine.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "where do you work?",
+        ],
+    );
+    assert!(sent.contains("The work ran in my own folder."), "{sent}");
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.contains(folder.to_str().unwrap()),
+        "the shell must run in the Bot's folder:\n{shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("a.txt")).unwrap(),
+        "hi\n",
+        "a relative write must land in the Bot's folder on the machine"
+    );
+
+    // Reading the whole machine is allowed: `cat /etc/hostname` prints the
+    // machine's own hostname, not one the sandbox made up.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "cat /etc/hostname",
+        ],
+    );
+    assert!(sent.contains("I read the whole machine."), "{sent}");
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    let hostname = std::fs::read_to_string("/etc/hostname").expect("this machine has a hostname");
+    assert!(
+        shown.contains(hostname.trim()),
+        "a Bot must read outside its folder:\n{shown}"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_on_a_real_computer_writes_only_its_own_folder() {
+    if !real_computer_ready() {
+        return;
+    }
+    // The workspace sits outside `/tmp`: the sandbox gets a fresh `/tmp`, so
+    // a relative escape has to reach this real folder for the OS to refuse it.
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-fence-")
+        .tempdir_in("/var/tmp")
+        .expect("the fence test needs a writable /var/tmp outside /tmp");
+    let (base, script, provider_task) = scripted_provider().await;
+    script.call(
+        "shell",
+        serde_json::json!({"command": "echo bad > ../escaped.txt"}),
+    );
+    script.call(
+        "write_file",
+        serde_json::json!({"path": "../escaped.txt", "content": "bad"}),
+    );
+    script.call(
+        "write_file",
+        serde_json::json!({"path": "inside.txt", "content": "inside"}),
+    );
+    script.say("Done trying.");
+    let computer = real_computer(directory, &base);
+    let folder = computer.workspace.join(&computer.bot);
+    let escaped = computer.workspace.join("escaped.txt");
+
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "try to write outside",
+        ],
+    );
+    assert!(sent.contains("Done trying."), "{sent}");
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.contains("shell (failed)"),
+        "a shell write outside the Bot's folder must fail:\n{shown}"
+    );
+    assert!(
+        shown.contains("write_file (failed)"),
+        "a file write outside the Bot's folder must fail:\n{shown}"
+    );
+    assert!(
+        shown.contains("write_file (succeeded)"),
+        "a file write inside the Bot's folder must succeed:\n{shown}"
+    );
+    assert!(
+        !escaped.exists(),
+        "a refused write must not reach the machine: {}",
+        escaped.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("inside.txt")).unwrap(),
+        "inside",
+        "the write inside the Bot's folder must reach the machine"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_travels_over_a_real_computers_channel() {
+    if !real_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let content = "the quick brown fox\n";
+    let directory = tempfile::tempdir().unwrap();
+    let computer = real_computer(directory, &base);
+    let folder = computer.workspace.join(&computer.bot);
+    let notes = computer.path().join("notes.txt");
+    std::fs::write(&notes, content).unwrap();
+
+    // A User uploads a File in the Chat.
+    script.say("Got the note.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--file",
+            notes.to_str().unwrap(),
+        ],
+    );
+    assert!(sent.contains("Got the note."), "{sent}");
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let file = listed
+        .lines()
+        .find(|line| line.contains("notes.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the uploaded File is listed")
+        .to_owned();
+
+    // The Bot takes the File into its folder and delivers it back: the bytes
+    // cross the channel twice and must come back unchanged.
+    script.call("take_file", serde_json::json!({"file": &file}));
+    script.call(
+        "put_file",
+        serde_json::json!({"path": "notes.txt", "name": "roundtrip.txt"}),
+    );
+    script.say("Delivered it back.");
+    let answered = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "please send it back",
+        ],
+    );
+    assert!(answered.contains("Delivered it back."), "{answered}");
+    let run_id = first_word(&field(&answered, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(shown.contains("take_file (succeeded)"), "{shown}");
+    assert!(shown.contains("put_file (succeeded)"), "{shown}");
+    assert_eq!(
+        std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
+        content,
+        "taking the File must write it into the Bot's folder"
+    );
+
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let delivered = listed
+        .lines()
+        .find(|line| line.contains("roundtrip.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the delivered File is listed")
+        .to_owned();
+    let out = computer.path().join("roundtrip.txt");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        content.as_bytes(),
+        "the File's bytes must round-trip through the Bot's Computer"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_waits_while_a_real_computer_is_offline() {
+    if !real_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = real_computer(directory, &base);
+
+    // The daemon stops, and the Space shows the Computer offline.
+    computer.daemon.kill();
+    wait_for_computer_offline(&computer.home, &computer.credential, &computer.computer);
+
+    // A Message to a Bot on the offline Computer stays queued, and the command
+    // keeps waiting instead of failing.
+    script.say("Yes, I am back.");
+    let (mut send, lines, _) = spawn_cli(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "are you there?"],
+    );
+    let mut output = String::new();
+    read_until(&lines, &mut output, "queued (position 1)");
+    assert!(
+        send.try_wait().unwrap().is_none(),
+        "the send must keep waiting on the queued run:\n{output}"
+    );
+
+    // Starting the daemon again reconnects the Computer, and the run goes.
+    let mut restarted = ComputerDaemon::spawn(&computer.computer_home, &["computer", "run"]);
+    restarted.expect_line(&format!("Connected to {}.", computer.url));
+    let (ok, output) = finish(send, lines, output);
+    assert!(
+        ok,
+        "the queued send must finish once the Computer is back:\n{output}"
+    );
+    assert!(output.contains("Yes, I am back."), "{output}");
+    wait_for_computer_online(&computer.home, &computer.credential, &computer.computer);
+
+    drop(restarted);
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_fails_when_its_computer_leaves() {
+    if !real_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    // The first reply asks for a slow shell; the second reply is only wanted
+    // if the run wrongly went on after the Computer left.
+    script.call("shell", serde_json::json!({"command": "sleep 2"}));
+    script.say("The slow command finished.");
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = real_computer(directory, &base);
+
+    let (send, stdout, stderr) = spawn_cli(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--follow",
+            "--chat",
+            &computer.chat,
+            "run the slow command",
+        ],
+    );
+    let output = String::new();
+    let mut error = String::new();
+    // `--follow` prints an action as running while its result is still owed:
+    // that is the moment the shell is in flight on the daemon.
+    read_until_matching(&stderr, &mut error, "the shell action to start", |line| {
+        line.contains("action shell (step 1): running")
+    });
+
+    // The machine leaves while its shell is still running.
+    computer.daemon.kill();
+    read_until_matching(
+        &stderr,
+        &mut error,
+        "the run to report the lost Computer",
+        |line| line.contains("I lost my Computer before the action returned."),
+    );
+    let (ok, output) = finish(send, stdout, output);
+    assert!(
+        !ok,
+        "the run must fail when its Computer leaves:\nstdout: {output}\nstderr: {error}"
+    );
+    let run_id = first_word(&field(&output, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .ends_with(": failed"),
+        "a run whose action result never returned must fail:\n{shown}"
+    );
+    assert!(
+        shown.contains("shell (unknown)"),
+        "the action whose result never returned must be unknown:\n{shown}"
+    );
+    assert!(
+        !shown.contains("step 2"),
+        "the Model must not be asked again after the Computer left:\n{shown}"
+    );
+
+    // The Chat says what happened, and the Model's unused second reply never
+    // reaches the User.
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    let last = read.lines().last().expect("the Chat has a last Message");
+    let (_, text) = last
+        .split_once("Bot: ")
+        .expect("the last Message is the Bot's");
+    assert_eq!(
+        text, "I lost my Computer before the action returned.",
+        "{read}"
+    );
+    assert!(
+        !read.contains("The slow command finished."),
+        "the Model's next reply must never be used:\n{read}"
+    );
+    wait_for_computer_offline(&computer.home, &computer.credential, &computer.computer);
+
+    drop(computer);
+    provider_task.abort();
 }

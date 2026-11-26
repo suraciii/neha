@@ -1,9 +1,12 @@
 //! The in-process Computer runtime.
 //!
-//! It executes real POSIX shell commands and real file operations inside one
-//! workspace directory. It is the M1 implementation: not isolated, not
-//! transported, and only for a Space on the same machine.
+//! It executes real POSIX shell commands and real file operations. In managed
+//! mode everything stays inside one workspace directory: not isolated, not
+//! transported, and only for a Space on the same machine. In real mode it is
+//! one Bot's view of a real machine: reads reach what the machine user can
+//! read, writes reach one folder, and the shell runs under bubblewrap.
 
+use std::ffi::OsString;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -26,15 +29,42 @@ const MAX_LIST_ENTRIES: usize = 1000;
 /// The largest shell command a tool accepts.
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
+/// The path a shell searches for its commands, in both modes.
+const SHELL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+/// The writable root outside a Bot's folder that a real shell also gets.
+const SANDBOX_TMPDIR: &str = "/tmp";
 
-/// A Computer runtime backed by one workspace directory.
+/// The reach of a Bot on a real machine: it reads the machine and writes one
+/// folder.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MachineAccess {
+    /// This Bot's folder: its default working directory and its only writable
+    /// place.
+    pub folder: PathBuf,
+}
+
+/// A Computer runtime backed by one directory.
 pub struct LocalRuntime {
-    workspace: PathBuf,
+    /// The only root writes may reach: the managed workspace, or the Bot's
+    /// folder on a real machine.
+    root: PathBuf,
+    mode: Mode,
     timeout: Duration,
 }
 
+/// Which kind of machine a runtime drives.
+enum Mode {
+    /// A managed workspace: the root is also everything a read may reach.
+    Managed,
+    /// A real machine, fenced by bubblewrap.
+    Machine {
+        /// The resolved `bwrap` binary.
+        bwrap: PathBuf,
+    },
+}
+
 impl LocalRuntime {
-    /// Opens a workspace, creating it when absent.
+    /// Opens a managed workspace, creating it when absent.
     pub fn new(workspace: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
         let workspace = workspace.into();
         std::fs::create_dir_all(&workspace)?;
@@ -43,7 +73,38 @@ impl LocalRuntime {
         std::fs::create_dir_all(&temporary)?;
 
         Ok(Self {
-            workspace,
+            root: workspace,
+            mode: Mode::Managed,
+            timeout: DEFAULT_TIMEOUT,
+        })
+    }
+
+    /// Opens one Bot's folder on a real machine.
+    ///
+    /// Reads reach everything the machine user can read, writes reach only the
+    /// folder, and the shell runs under bubblewrap. The constructor refuses
+    /// when bubblewrap is missing or cannot start a sandbox, so a daemon never
+    /// serves a Computer it cannot fence.
+    pub fn machine(folder: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
+        Self::machine_with_bwrap(folder, find_bwrap())
+    }
+
+    /// Opens a real-machine runtime with a specific `bwrap`, for tests.
+    fn machine_with_bwrap(
+        folder: impl Into<PathBuf>,
+        bwrap: Option<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        let folder = folder.into();
+        std::fs::create_dir_all(&folder)?;
+        let folder = std::fs::canonicalize(&folder)?;
+        let bwrap = bwrap.ok_or_else(|| {
+            RuntimeError::NoSandbox("bwrap was not found on PATH; install bubblewrap".to_owned())
+        })?;
+        probe_bwrap(&bwrap, &folder).map_err(RuntimeError::NoSandbox)?;
+
+        Ok(Self {
+            root: folder,
+            mode: Mode::Machine { bwrap },
             timeout: DEFAULT_TIMEOUT,
         })
     }
@@ -55,23 +116,31 @@ impl LocalRuntime {
         self
     }
 
-    /// Returns the workspace.
+    /// Returns the only root writes reach: the workspace in managed mode, the
+    /// Bot's folder in real mode.
     #[must_use]
     pub fn workspace(&self) -> &Path {
-        &self.workspace
+        &self.root
     }
 
-    fn resolve(&self, input: &str) -> Result<PathBuf, String> {
+    /// The path a model asked for, before any mode's rules apply.
+    fn requested(&self, input: &str) -> Result<PathBuf, String> {
         let input = input.trim();
         if input.is_empty() {
             return Err("the path is empty".to_owned());
         }
         let requested = Path::new(input);
-        let joined = if requested.is_absolute() {
+        Ok(if requested.is_absolute() {
             requested.to_path_buf()
         } else {
-            self.workspace.join(requested)
-        };
+            self.root.join(requested)
+        })
+    }
+
+    /// Resolves a path in managed mode: everything must stay in the workspace,
+    /// and no symlink is followed.
+    fn resolve_managed(&self, input: &str) -> Result<PathBuf, String> {
+        let joined = self.requested(input)?;
         let mut normalized = PathBuf::new();
         for component in joined.components() {
             match component {
@@ -86,7 +155,7 @@ impl LocalRuntime {
                 }
             }
         }
-        if !normalized.starts_with(&self.workspace) {
+        if !normalized.starts_with(&self.root) {
             return Err("the path escapes the workspace".to_owned());
         }
 
@@ -94,9 +163,9 @@ impl LocalRuntime {
         // `exists` would follow a dangling link, and a later write would
         // follow it too.
         let relative = normalized
-            .strip_prefix(&self.workspace)
+            .strip_prefix(&self.root)
             .map_err(|_| "the path escapes the workspace".to_owned())?;
-        let mut current = self.workspace.clone();
+        let mut current = self.root.clone();
         for component in relative.components() {
             let Component::Normal(part) = component else {
                 continue;
@@ -117,15 +186,90 @@ impl LocalRuntime {
         Ok(normalized)
     }
 
+    /// Resolves a read on a real machine: a relative path sits in the Bot's
+    /// folder and an absolute path is the machine's own. Reads may reach
+    /// anything the machine user can read.
+    fn resolve_machine_read(&self, input: &str) -> Result<PathBuf, String> {
+        Ok(normalize_path(&self.requested(input)?))
+    }
+
+    /// Resolves a write on a real machine: the target, or the nearest existing
+    /// parent of a new file, must canonicalize inside the Bot's folder, and a
+    /// symlink is never written through.
+    fn resolve_machine_write(&self, input: &str) -> Result<PathBuf, String> {
+        let requested = normalize_path(&self.requested(input)?);
+        let shown = self.relative(&requested);
+        let mut existing = requested.clone();
+        let mut missing: Vec<OsString> = Vec::new();
+        loop {
+            match std::fs::symlink_metadata(&existing) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() {
+                        return Err(format!(
+                            "the path uses a symlink, which is not written through: {shown}"
+                        ));
+                    }
+                    if !missing.is_empty() && !metadata.is_dir() {
+                        return Err(format!("{} is not a directory", self.relative(&existing)));
+                    }
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(name) = existing.file_name() else {
+                        return Err(format!("{shown} cannot be written"));
+                    };
+                    missing.push(name.to_owned());
+                    existing.pop();
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "cannot resolve {}: {error}",
+                        self.relative(&existing)
+                    ));
+                }
+            }
+        }
+        let canonical = std::fs::canonicalize(&existing)
+            .map_err(|error| format!("cannot resolve {}: {error}", self.relative(&existing)))?;
+        if !canonical.starts_with(&self.root) {
+            return Err(outside_folder(&shown));
+        }
+        let mut target = canonical;
+        for name in missing.into_iter().rev() {
+            target.push(name);
+        }
+        if !target.starts_with(&self.root) {
+            return Err(outside_folder(&shown));
+        }
+
+        Ok(target)
+    }
+
+    /// Resolves a read for this mode's rules.
+    fn resolve_read(&self, input: &str) -> Result<PathBuf, String> {
+        match &self.mode {
+            Mode::Managed => self.resolve_managed(input),
+            Mode::Machine { .. } => self.resolve_machine_read(input),
+        }
+    }
+
+    /// Resolves a write for this mode's rules.
+    fn resolve_write(&self, input: &str) -> Result<PathBuf, String> {
+        match &self.mode {
+            Mode::Managed => self.resolve_managed(input),
+            Mode::Machine { .. } => self.resolve_machine_write(input),
+        }
+    }
+
     fn relative(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace)
+        path.strip_prefix(&self.root)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned()
     }
 
     fn read_file(&self, path: &str) -> ActionResult {
-        let path = match self.resolve(path) {
+        let path = match self.resolve_read(path) {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
@@ -169,7 +313,7 @@ impl LocalRuntime {
                 "the content is larger than {MAX_WRITE_BYTES} bytes"
             ));
         }
-        let path = match self.resolve(path) {
+        let path = match self.resolve_write(path) {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
@@ -189,7 +333,7 @@ impl LocalRuntime {
     }
 
     fn list_files(&self, path: &str) -> ActionResult {
-        let path = match self.resolve(path) {
+        let path = match self.resolve_read(path) {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
@@ -221,6 +365,40 @@ impl LocalRuntime {
         ActionResult::succeeded(truncate(lines.join("\n")))
     }
 
+    /// Builds the shell process for this mode, without starting it.
+    fn shell_command(&self, command: &str) -> Command {
+        let mut process = match &self.mode {
+            Mode::Managed => {
+                let mut process = Command::new("sh");
+                process.arg("-c").arg(command).current_dir(&self.root);
+                process
+            }
+            Mode::Machine { bwrap } => {
+                let mut process = sandbox_command(bwrap, &self.root);
+                process
+                    .arg("/bin/sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(&self.root);
+                process
+            }
+        };
+        let temporary = match &self.mode {
+            Mode::Managed => self.root.join(".tmp"),
+            Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
+        };
+        process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env_clear()
+            .env("PATH", SHELL_PATH)
+            .env("HOME", &self.root)
+            .env("TMPDIR", temporary)
+            .kill_on_drop(true);
+        process
+    }
+
     async fn shell(&self, command: &str) -> ActionResult {
         if command.trim().is_empty() {
             return ActionResult::failed("the command is empty");
@@ -228,19 +406,7 @@ impl LocalRuntime {
         if command.len() > MAX_COMMAND_BYTES {
             return ActionResult::failed("the command is too long");
         }
-        let mut process = Command::new("sh");
-        process
-            .arg("-c")
-            .arg(command)
-            .current_dir(&self.workspace)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .env("PATH", "/usr/local/bin:/usr/bin:/bin")
-            .env("HOME", &self.workspace)
-            .env("TMPDIR", self.workspace.join(".tmp"))
-            .kill_on_drop(true);
+        let mut process = self.shell_command(command);
         #[cfg(unix)]
         process.process_group(0);
 
@@ -329,12 +495,16 @@ impl ComputerRuntime for LocalRuntime {
         }
     }
 
+    // A File take reads what the runtime can reach: the managed workspace, or
+    // anything the real machine's user can read. One File is at most
+    // `neha::file::MAX_FILE_BYTES`, the same limit the managed mode has always
+    // applied; the tool action above keeps its own 8 MiB read cap.
     #[allow(clippy::manual_async_fn)]
     fn read_bytes(
         &self,
         path: &str,
     ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve_read(path);
         async move {
             let path = resolved?;
             let metadata = std::fs::metadata(&path)
@@ -352,13 +522,17 @@ impl ComputerRuntime for LocalRuntime {
         }
     }
 
+    // A File delivery writes where the runtime lets it write: the managed
+    // workspace, or only the Bot's folder on a real machine. The limit is one
+    // `neha::file::MAX_FILE_BYTES` File; the write tool above keeps its own
+    // 64 KiB cap.
     #[allow(clippy::manual_async_fn)]
     fn write_bytes(
         &self,
         path: &str,
         bytes: Vec<u8>,
     ) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        let resolved = self.resolve(path);
+        let resolved = self.resolve_write(path);
         async move {
             if bytes.len() as u64 > neha::file::MAX_FILE_BYTES {
                 return Err(format!(
@@ -376,6 +550,105 @@ impl ComputerRuntime for LocalRuntime {
                 .map_err(|error| format!("cannot write {}: {error}", path.display()))
         }
     }
+}
+
+/// Finds `bwrap` on the machine user's `PATH`.
+fn find_bwrap() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("bwrap"))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Starts one empty sandbox, so a Computer never serves a machine where
+/// bubblewrap is installed but cannot run.
+fn probe_bwrap(bwrap: &Path, folder: &Path) -> Result<(), String> {
+    let version = std::process::Command::new(bwrap)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("bwrap cannot run: {error}; install bubblewrap"))?;
+    if !version.status.success() {
+        return Err("bwrap --version failed; install a working bubblewrap".to_owned());
+    }
+    let output = std::process::Command::new(bwrap)
+        .args(sandbox_args(folder))
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("true")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| format!("bwrap cannot run: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "bwrap cannot start a sandbox: {}",
+        stderr.lines().next().unwrap_or("no error output")
+    ))
+}
+
+/// The bubblewrap arguments that fence one real shell: the machine
+/// read-only, the Bot's folder writable, a fresh `/tmp`, and the folder as the
+/// working directory.
+fn sandbox_args(folder: &Path) -> Vec<OsString> {
+    let folder = folder.as_os_str();
+    let mut arguments: Vec<OsString> = [
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev-bind",
+        "/dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect();
+    arguments.push(OsString::from("--bind"));
+    arguments.push(folder.to_owned());
+    arguments.push(folder.to_owned());
+    arguments.push(OsString::from("--chdir"));
+    arguments.push(folder.to_owned());
+    arguments.push(OsString::from("--"));
+
+    arguments
+}
+
+/// Builds the fenced shell process without starting it.
+fn sandbox_command(bwrap: &Path, folder: &Path) -> Command {
+    let mut process = Command::new(bwrap);
+    process.args(sandbox_args(folder));
+    process
+}
+
+/// Normalizes `.` and `..` without touching the file system; an absolute path
+/// stops at `/`.
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() && !normalized.has_root() {
+                    normalized.push("..");
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+
+    normalized
+}
+
+/// The one refusal a real write outside the Bot's folder gets.
+fn outside_folder(shown: &str) -> String {
+    format!("the path is outside this Bot's writable folder: {shown}")
 }
 
 #[derive(Default)]
@@ -581,12 +854,16 @@ fn kill_group(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_group(_pid: Option<u32>) {}
 
-/// The runtime cannot open its workspace.
+/// The runtime cannot open its workspace or fence a real machine.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
     /// A directory could not be created or read.
     #[error("workspace error: {0}")]
     Io(#[from] std::io::Error),
+    /// Bubblewrap is missing or cannot start a sandbox on this machine, so a
+    /// real Computer would run unfenced.
+    #[error("the machine cannot be fenced: {0}")]
+    NoSandbox(String),
 }
 
 #[cfg(test)]
@@ -609,6 +886,32 @@ mod tests {
         let runtime = LocalRuntime::new(directory.path().join("workspace")).unwrap();
 
         (directory, runtime)
+    }
+
+    /// Returns a real-machine runtime, or `None` when the bwrap tests are off.
+    ///
+    /// `NEHA_TEST_BWRAP` opens them. Once it is set, a missing or broken
+    /// bubblewrap fails the test instead of skipping: the gate promises a
+    /// working sandbox.
+    fn machine_runtime() -> Option<(tempfile::TempDir, LocalRuntime)> {
+        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+            return None;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
+
+        Some((directory, runtime))
+    }
+
+    /// A temporary directory outside `/tmp`, which the sandbox replaces with a
+    /// fresh tmpfs. A real shell test writes "outside" there.
+    fn outside_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("neha-outside-")
+            .tempdir_in("/var/tmp")
+            .expect("the fence test needs a writable /var/tmp outside /tmp")
     }
 
     #[tokio::test]
@@ -970,5 +1273,364 @@ mod tests {
         assert!(result.output.truncated);
         assert!(result.output.omitted_bytes > 0);
         assert!(result.output.text.contains("bytes omitted"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_machine_without_a_working_bubblewrap_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::RuntimeError;
+
+        let directory = tempfile::tempdir().unwrap();
+        let error = LocalRuntime::machine_with_bwrap(directory.path().join("bot"), None)
+            .err()
+            .expect("a missing bwrap must refuse the machine");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+
+        let fake = directory.path().join("bwrap");
+        std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = LocalRuntime::machine_with_bwrap(directory.path().join("bot2"), Some(fake))
+            .err()
+            .expect("a bwrap that cannot start a sandbox must refuse the machine");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_machine_tool_writes_and_reads_inside_the_bot_folder() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let folder = runtime.workspace().to_path_buf();
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "notes/hello.txt".to_owned(),
+                content: "hello neha".to_owned(),
+            })
+            .await;
+
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("notes/hello.txt")).unwrap(),
+            "hello neha"
+        );
+
+        // A relative path stays in the folder, through `.` and `..` that do
+        // not leave it.
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "notes/../top.txt".to_owned(),
+                content: "top".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("top.txt")).unwrap(),
+            "top"
+        );
+
+        // An absolute path inside the folder names the same files, for reading
+        // and for writing.
+        let absolute = folder.join("notes/hello.txt");
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: absolute.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.output.text, "hello neha");
+        let absolute_target = folder.join("notes/absolute.txt");
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: absolute_target.to_string_lossy().into_owned(),
+                content: "absolute".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(&absolute_target).unwrap(),
+            "absolute"
+        );
+
+        let listed = runtime
+            .execute(Action::ListFiles {
+                path: folder.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert!(
+            listed.output.text.contains("notes"),
+            "{}",
+            listed.output.text
+        );
+        assert!(
+            listed.output.text.contains("top.txt"),
+            "{}",
+            listed.output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_tool_refuses_to_write_outside_the_bot_folder() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = directory.path().join("outside.txt");
+        let absolute = outside.to_string_lossy().into_owned();
+        for path in ["../outside.txt", "nested/../../outside.txt", &absolute] {
+            let result = runtime
+                .execute(Action::WriteFile {
+                    path: path.to_owned(),
+                    content: "pwned".to_owned(),
+                })
+                .await;
+            assert_eq!(result.status, ActionStatus::Failed, "{path}");
+            assert!(
+                result.output.text.contains("writable folder"),
+                "{path}: {}",
+                result.output.text
+            );
+        }
+        assert!(!outside.exists(), "a refused write leaves no file");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_tool_refuses_to_write_through_a_symlink() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        std::os::unix::fs::symlink(directory.path(), runtime.workspace().join("escape")).unwrap();
+
+        let result = runtime
+            .execute(Action::WriteFile {
+                path: "escape/created.txt".to_owned(),
+                content: "pwned".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed);
+        assert!(
+            result.output.text.contains("symlink"),
+            "{}",
+            result.output.text
+        );
+        assert!(!directory.path().join("created.txt").exists());
+
+        // A symlink as the target is never written through, dangling or not.
+        let dangling = runtime.workspace().join("dangling");
+        std::os::unix::fs::symlink(runtime.workspace().join("created-by-link.txt"), &dangling)
+            .unwrap();
+        let result = runtime
+            .execute(Action::WriteFile {
+                path: "dangling".to_owned(),
+                content: "pwned".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed);
+        assert!(
+            result.output.text.contains("symlink"),
+            "{}",
+            result.output.text
+        );
+        assert!(!runtime.workspace().join("created-by-link.txt").exists());
+
+        let error = runtime
+            .write_bytes("escape/created.bin", b"pwned".to_vec())
+            .await
+            .unwrap_err();
+        assert!(error.contains("symlink"), "{error}");
+        assert!(!directory.path().join("created.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn a_machine_tool_reads_the_whole_machine() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "readable").unwrap();
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: outside.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "readable");
+
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: "/etc/hostname".to_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert!(!read.output.text.trim().is_empty());
+
+        let missing = runtime
+            .execute(Action::ReadFile {
+                path: directory
+                    .path()
+                    .join("missing.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+            })
+            .await;
+        assert_eq!(missing.status, ActionStatus::Failed);
+        assert!(
+            missing.output.text.contains("cannot read"),
+            "{}",
+            missing.output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_machine_byte_transfer_reads_anywhere_and_writes_inside_the_folder() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let folder = runtime.workspace().to_path_buf();
+        let outside = directory.path().join("outside.bin");
+        std::fs::write(&outside, b"take me").unwrap();
+
+        let read = runtime
+            .read_bytes(&outside.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(read, b"take me");
+
+        runtime
+            .write_bytes("deliver/report.bin", vec![0, 1, 2])
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(folder.join("deliver/report.bin")).unwrap(),
+            vec![0, 1, 2]
+        );
+
+        let error = runtime
+            .write_bytes("../pwned.bin", b"x".to_vec())
+            .await
+            .unwrap_err();
+        assert!(error.contains("writable folder"), "{error}");
+        assert!(!directory.path().join("pwned.bin").exists());
+        let error = runtime
+            .write_bytes(&outside.to_string_lossy(), b"x".to_vec())
+            .await
+            .unwrap_err();
+        assert!(error.contains("writable folder"), "{error}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"take me");
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_starts_in_the_bot_folder() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let result = runtime
+            .execute(Action::Shell {
+                command: "pwd".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            result
+                .output
+                .text
+                .contains(&runtime.workspace().to_string_lossy().into_owned()),
+            "{}",
+            result.output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_writes_inside_the_bot_folder() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let folder = runtime.workspace().to_path_buf();
+        let result = runtime
+            .execute(Action::Shell {
+                command: "printf hi > inside.txt && printf hi > \"$PWD/absolute.txt\"".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("inside.txt")).unwrap(),
+            "hi"
+        );
+        assert_eq!(
+            std::fs::read_to_string(folder.join("absolute.txt")).unwrap(),
+            "hi"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_cannot_write_outside_the_bot_folder() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = outside_tempdir();
+        let sink = outside.path().join("pwned.txt");
+        let result = runtime
+            .execute(Action::Shell {
+                command: format!("printf hi > {}", sink.display()),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(!sink.exists(), "the sandbox wrote outside the folder");
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_reads_the_whole_machine() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let result = runtime
+            .execute(Action::Shell {
+                command: "cat /etc/hostname".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(!result.output.text.trim().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_cannot_escape_through_a_symlink() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = outside_tempdir();
+        let sink = outside.path().join("pwned.txt");
+        std::os::unix::fs::symlink(outside.path(), runtime.workspace().join("escape")).unwrap();
+        let result = runtime
+            .execute(Action::Shell {
+                command: "printf hi > escape/pwned.txt".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(!sink.exists(), "the sandbox escaped through a symlink");
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_that_runs_too_long_is_killed() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let runtime = runtime.with_timeout(Duration::from_millis(500));
+        let started = std::time::Instant::now();
+        let result = runtime
+            .execute(Action::Shell {
+                command: "sleep 30".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::TimedOut, "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

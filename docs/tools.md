@@ -1,6 +1,6 @@
 # Let a Bot work on its Computer
 
-This guide shows a Bot using the built-in tools to work in its Computer's workspace: a shell, file reads, file writes, and file listing. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
+This guide shows a Bot using the built-in tools to work in its Computer's workspace: a shell, file reads, file writes, and file listing. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist. It describes the managed Computer of that quick start; [Add a real Computer](computer.md) covers a Bot on a machine of its own.
 
 ## What the Bot has
 
@@ -78,4 +78,4 @@ The local runtime enforces these limits, and an action that breaks one returns a
 
 - The Computer is not isolated. The runtime executes real commands in a workspace directory with the Space user's permissions; it is a development and local-use implementation. Do not run a Space exposed to other machines or with prompts you do not trust.
 - There is no approval gate yet. A Bot runs an action as soon as the Model asks for it. The approval rules in [Bot](../specs/bot/product.md) arrive with their own milestone.
-- The workspace is local to the Space's machine. A real Computer, its outbound channel, and its access settings arrive in a later milestone.
+- A real Computer runs the same tools in a folder of its own on that machine, with a write fence the operating system enforces. [Add a real Computer](computer.md) covers its folders, its write range, and its offline behavior.
