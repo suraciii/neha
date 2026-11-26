@@ -12,7 +12,7 @@ Only the User the Bot acts for can answer. An Allow runs the action once; an Alw
 
 ## Answer in the Chat
 
-Run `neha chat send` as usual. When the run waits, a terminal shows the approval card: the action's tool, a summary, why the Bot asks, whether the action can be undone, and, for a rule, what Always allow covers. A `shell` or `write_file` action says that it cannot be undone; a `read_file`, `list_files`, or other action says that the undoability is unknown. An ambiguous form gives the reason `a form no rule can judge`, not a rule you set. The summary escapes control characters, and one longer than 4096 bytes says how many bytes it left out. Answer with:
+Run `neha chat send` as usual. When the run waits, a terminal shows the approval card: the action's tool, a summary, why the Bot asks, whether the action can be undone, and, for a rule that offers it, what Always allow covers. A `shell` or `write_file` action says that it cannot be undone; a `read_file`, `list_files`, or other action says that the undoability is unknown. An ambiguous form gives the reason `a form no rule can judge`, not a rule you set. The summary escapes control characters, and one longer than 4096 bytes says how many bytes it left out. Answer with:
 
 ```text
 [a]llow / [A]lways allow / [d]eny / [q]uit
@@ -48,6 +48,8 @@ An Always allow covers the same tool and one of these:
 - every action of a tool with no command or path, such as `take_file`.
 
 An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, and only an action with neither, such as `take_file`, gives a tool-only rule.
+
+A rule-triggered approval offers no Always allow, and `--always` is refused, when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path. An ambiguous form that can still make a lasting rule does offer Always allow, and that answer removes no rule.
 
 For a file at the Workspace root, the covered directory is the Workspace root: relative paths are covered and absolute ones are not. When a rule asks, the card names the scope: `shell commands starting with "printf"`, `files under "logs"`, `files in the Workspace root`, or `all take_file actions`. The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
 

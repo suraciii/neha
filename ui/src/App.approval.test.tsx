@@ -25,13 +25,13 @@ const firstUse: Approval = {
   rule: null,
 };
 
-// An action a rule of the User's stops every time.
+// An action a rule of the User's stops every time, as the Space describes it.
 const byRule: Approval = {
   ...firstUse,
   approval: "a2",
   action: "act2",
   tool: "write_file",
-  summary: "notes.txt",
+  summary: "write_file: notes.txt",
   reason: "rule",
   rule: "rule1",
 };
@@ -113,10 +113,11 @@ describe("App with approvals", () => {
   it("shows what an Always allow would cover, in the Space's words or this page's", async () => {
     space.approvals.push(
       { ...byRule, approval: "a1", lasting_scope: 'shell commands starting with "git"' },
-      { ...byRule, approval: "a2", tool: "shell", summary: "shell: git status", lasting_scope: null },
-      { ...byRule, approval: "a3", tool: "write_file", summary: "write_file: logs/out.txt", lasting_scope: null },
+      // A Space that says nothing about the scope leaves the page to name it.
+      { ...byRule, approval: "a2", tool: "shell", summary: "shell: git status" },
+      { ...byRule, approval: "a3", tool: "write_file", summary: "write_file: logs/out.txt" },
       // The arguments say where the action lands; the summary only names it.
-      { ...byRule, approval: "a4", tool: "write_file", arguments: { path: "cache/tmp.txt" }, summary: "write_file: logs/out.txt", lasting_scope: null },
+      { ...byRule, approval: "a4", tool: "write_file", arguments: { path: "cache/tmp.txt" }, summary: "write_file: logs/out.txt" },
     );
     const view = await openChat();
 
@@ -188,7 +189,9 @@ describe("App with approvals", () => {
     expect(card(view)).toContain("A rule you set asks before this action.");
     expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Always allow", "Deny"]);
     // The Space said nothing about the scope, so the page names what it can see.
-    expect(element(view, ".approval__scope").textContent).toBe('Always allow covers: files under "."');
+    expect(element(view, ".approval__scope").textContent).toBe(
+      "Always allow covers: files in the Workspace root",
+    );
   });
 
   it("offers no Always allow when nothing can be made lasting", async () => {
@@ -199,6 +202,25 @@ describe("App with approvals", () => {
     expect(card(view)).toContain("A rule you set asks before this action.");
     expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
     expect(view.container.querySelector(".approval__scope")).toBeNull();
+  });
+
+  it("offers no Always allow when the Space, or the path, says none can last", async () => {
+    space.approvals.push(
+      // The Space said no; the page does not second-guess it with its own guess.
+      { ...byRule, approval: "a1", tool: "shell", summary: "shell: git status", lasting_scope: null },
+      // A path that leaves the Workspace, or is blank, makes no rule.
+      { ...byRule, approval: "a2", tool: "write_file", arguments: { path: "../x" }, summary: "write_file: ../x" },
+      { ...byRule, approval: "a3", tool: "read_file", arguments: { path: "   " }, summary: "read_file: notes.txt" },
+    );
+    const view = await openChat();
+
+    expect(view.container.querySelectorAll(".approval__scope")).toHaveLength(0);
+    for (const approval of view.container.querySelectorAll(".approval")) {
+      expect([...approval.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
+        "Allow",
+        "Deny",
+      ]);
+    }
   });
 
   it("sends Allow once, waits for the Space, and then shows the verdict", async () => {

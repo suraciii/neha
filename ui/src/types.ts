@@ -142,7 +142,8 @@ export interface Approval {
   ambiguous?: boolean | null;
   rule?: string | null;
   undoable?: Undoable | null;
-  // What an Always allow would cover, in the Space's words.
+  // What an Always allow would cover, in the Space's words: null when the Space
+  // says no lasting rule can come from this action, absent when it says nothing.
   lasting_scope?: string | null;
   // The User's answer, once given. The Space lists only approvals still waiting.
   decided?: boolean | null;

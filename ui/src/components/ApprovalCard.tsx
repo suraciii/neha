@@ -29,15 +29,18 @@ export default function ApprovalCard(props: ApprovalCardProps) {
         : t("chat.approval.reason.rule");
   const undo = () =>
     t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
-  // What an Always allow would cover: the Space's words, else this page's
-  // guess. Without either there is nothing to make lasting, so the Space
-  // would refuse it.
+  // What an Always allow would cover. null, or an empty string, is the Space
+  // saying that no lasting rule can come from this action; only a Space that
+  // says nothing at all leaves this page to name what it can see.
   const scope = () => {
-    if (props.approval.reason !== "rule") return null;
-    const said = props.approval.lasting_scope?.trim();
-    const local = localScope(props.approval);
-    const scope = said || (local ? t(local.key, local.params) : null);
-    return scope ? t("chat.approval.lastingScope", { scope }) : null;
+    const approval = props.approval;
+    if (approval.reason !== "rule" || approval.lasting_scope === null) return null;
+    if (approval.lasting_scope !== undefined) {
+      const said = approval.lasting_scope.trim();
+      return said ? t("chat.approval.lastingScope", { scope: said }) : null;
+    }
+    const local = localScope(approval);
+    return local ? t("chat.approval.lastingScope", { scope: t(local.key, local.params) }) : null;
   };
   const long = () => isLongSummary(props.approval.summary);
   const folded = () => long() && !expanded();

@@ -76,6 +76,10 @@ An Always allow writes an Allow rule from the action itself: the command's first
 
 Only an action with neither a command nor a path, such as `take_file`, writes a tool-only Allow rule.
 
+When an action cannot make a lasting rule, its approval offers no Always allow: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path.
+
+An ambiguous form with a derivable scope still offers Always allow, and that answer removes no rule. The Space refuses a lasting answer when no rule can be derived.
+
 The new Allow rule covers the Ask rule when the Ask rule's command prefix starts with the Allow rule's prefix, or when the Ask rule's path equals the Allow rule's path or sits below it. A tool-only Ask rule is not covered by a prefixed Allow rule.
 
 Neha removes the Ask rule the approval named when the new Allow rule covers it. An approval with an empty `rule` removes none, and an uncovered named rule stays.

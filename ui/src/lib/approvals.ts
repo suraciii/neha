@@ -11,43 +11,61 @@ const FILE_TOOLS = new Set(["read_file", "write_file", "list_files", "put_file"]
 const LONG_SUMMARY = 240;
 const LONG_LINES = 3;
 
+type Scope = { key: MessageKey; params: Record<string, string> };
+
 // Whether the action can be undone: what the Space says, else the tool's habit.
 export function undoableOf(approval: Approval): Undoable {
   return approval.undoable ?? (IRREVERSIBLE.has(approval.tool) ? "no" : "unknown");
 }
 
 // What an Always allow would cover, as far as this page can tell without the
-// Space's own words: the action's arguments first, else its summary.
-export function localScope(approval: Approval): { key: MessageKey; params: Record<string, string> } | null {
+// Space's own words: the action's arguments first, else its summary. It follows
+// the Space's derivation, so it too gives up on a path that is blank or leaves
+// the Workspace.
+export function localScope(approval: Approval): Scope | null {
   if (approval.tool === "shell") {
-    const command = (text(approval.arguments?.command) ?? detailOf(approval)).trim().split(/\s+/)[0];
-    return command ? { key: "chat.approval.scope.shell", params: { command } } : null;
+    const raw = typeof approval.arguments?.command === "string" ? approval.arguments.command : detailOf(approval);
+    const word = raw?.trim().split(/\s+/)[0];
+    return word ? { key: "chat.approval.scope.shell", params: { command: word } } : null;
   }
   if (FILE_TOOLS.has(approval.tool)) {
-    const path = text(approval.arguments?.path) ?? detailOf(approval);
-    return path ? { key: "chat.approval.scope.files", params: { path: parentDirectory(path) } } : null;
+    const raw = typeof approval.arguments?.path === "string" ? approval.arguments.path : detailOf(approval);
+    if (raw === null || (raw.trim() === "" && raw !== "")) return null;
+    const derived = raw.trim() === "" ? "." : lexical(raw.trim());
+    if (derived.split("/").some((part) => part === ".." || (part !== "" && part.trim() === ""))) return null;
+    const parent = parentOf(derived);
+    return parent === "." ? { key: "chat.approval.scope.root", params: {} } : scopeFiles(parent);
   }
   return null;
 }
 
-function text(value: unknown): string | null {
-  return typeof value === "string" && value.trim() !== "" ? value : null;
-}
-
-// The summary names the action after its tool, as in "write_file: logs/out.txt".
-function detailOf(approval: Approval): string {
-  const summary = approval.summary.trim();
-  const prefix = `${approval.tool}:`;
-  return summary.startsWith(prefix) ? summary.slice(prefix.length).trim() : summary;
+function scopeFiles(path: string): Scope {
+  return { key: "chat.approval.scope.files", params: { path } };
 }
 
 // The directory a path sits in: "." for a bare name, "/" at the root.
-export function parentDirectory(path: string): string {
-  const trimmed = path.trim().replace(/\/+$/, "");
-  const cut = trimmed.lastIndexOf("/");
+export function parentOf(path: string): string {
+  const cut = path.lastIndexOf("/");
   if (cut < 0) return ".";
   if (cut === 0) return "/";
-  return trimmed.slice(0, cut);
+  return path.slice(0, cut);
+}
+
+// A path as the machine reads it: "." steps and doubled separators removed.
+function lexical(path: string): string {
+  const parts = path.split("/").filter((part) => part !== "" && part !== ".");
+  const joined = parts.join("/");
+  if (joined === "") return path.startsWith("/") ? "/" : ".";
+  return (path.startsWith("/") ? "/" : "") + joined;
+}
+
+// The summary names the action after its tool, as in "write_file: logs/out.txt".
+// Any other summary is prose for the User, not a path or a command.
+function detailOf(approval: Approval): string | null {
+  const summary = approval.summary.trim();
+  const prefix = `${approval.tool}:`;
+  const detail = summary.startsWith(prefix) ? summary.slice(prefix.length).trim() : "";
+  return detail || null;
 }
 
 // Whether a summary is long enough to start folded.

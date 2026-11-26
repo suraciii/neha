@@ -2540,15 +2540,9 @@ fn lasting_scope(call: &LoopCall) -> Option<String> {
         | neha_loop::tools::WRITE_FILE
         | neha_loop::tools::LIST_FILES
         | neha_loop::tools::PUT_FILE => {
-            let path = call.arguments.get("path").and_then(Value::as_str)?;
-            let derived = action_path(path)?;
-            if derived.split('/').any(|component| {
-                component == ".." || (!component.is_empty() && component.trim().is_empty())
-            }) {
-                return None;
-            }
+            let scope = lasting_rule_path(&call.arguments)?;
 
-            Some(file_scope(&sanitize_text(&parent_of(&derived))))
+            Some(file_scope(&sanitize_text(&scope)))
         }
         _ => Some(format!("all {} actions", call.tool)),
     }
@@ -2641,12 +2635,29 @@ fn action_path(path: &str) -> Option<String> {
     Some(lexical_path(trimmed))
 }
 
-/// Normalizes a raw path for deriving a lasting scope.
+/// The directory a lasting path rule for this action would cover.
 ///
-/// Derivation trims only the end of the raw path, so a leading space can be a
-/// directory name. The result is already lexical, so it is never trimmed
-/// again: two directories that differ by a trailing space stay distinct.
-/// Returns the parent directory of an already-derived path.
+/// The approval card (`lasting_scope`) and the decision's rule (`derived_rule`)
+/// both use this one function, so the scope a User reads and the scope the
+/// Space writes cannot drift. `None` means the path cannot become a lasting
+/// scope: it is missing or empty, it is all whitespace, or it is a path with
+/// `..` or all-space components.
+fn lasting_rule_path(arguments: &serde_json::Value) -> Option<String> {
+    let path = arguments
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())?;
+    let derived = action_path(path)?;
+    if derived.split('/').any(|component| {
+        component == ".." || (!component.is_empty() && component.trim().is_empty())
+    }) {
+        return None;
+    }
+
+    Some(parent_of(&derived))
+}
+
+/// Returns the parent directory of an already-normalized path.
 fn parent_of(path: &str) -> String {
     match path.rsplit_once('/') {
         None => ".".to_owned(),
@@ -2762,28 +2773,26 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
         | neha_loop::tools::WRITE_FILE
         | neha_loop::tools::LIST_FILES
         | neha_loop::tools::PUT_FILE => {
-            let path = view
+            if view
                 .arguments
                 .get("path")
                 .and_then(Value::as_str)
                 .filter(|path| !path.is_empty())
-                .ok_or_else(|| {
-                    ApiError::invalid_argument("the action has no path to make a rule from")
-                })?;
-            let derived = action_path(path).ok_or_else(|| {
-                ApiError::invalid_argument("the action path cannot make a lasting rule")
-            })?;
-            if derived.split('/').any(|component| {
-                component == ".." || (!component.is_empty() && component.trim().is_empty())
-            }) {
-                // A frightening path may be answered once, but it cannot
-                // become a lasting scope: its parent is not meaningful.
+                .is_none()
+            {
                 return Err(ApiError::invalid_argument(
-                    "the action path cannot make a lasting rule",
+                    "the action has no path to make a rule from",
                 ));
             }
+            // The card and the rule share one computation, so the scope shown
+            // is exactly the scope recorded.
+            let scope = lasting_rule_path(&view.arguments).ok_or_else(|| {
+                // A frightening path may be answered once, but it cannot
+                // become a lasting scope: its parent is not meaningful.
+                ApiError::invalid_argument("the action path cannot make a lasting rule")
+            })?;
 
-            Ok((tool, None, Some(parent_of(&derived))))
+            Ok((tool, None, Some(scope)))
         }
         _ => Ok((tool, None, None)),
     }
@@ -3585,6 +3594,48 @@ mod tests {
             &[(Id::new(), "shell", json!({"command": "b"}))],
         );
         assert!(prepare_resume(&std::sync::Mutex::new(state), &run).is_err());
+    }
+
+    #[test]
+    fn the_lasting_path_scope_is_computed_once() {
+        use super::{lasting_rule_path, lasting_scope};
+
+        // The helper is the only implementation: the card's scope and the
+        // rule's scope come from it.
+        let cases = [
+            ("logs/x", Some("logs")),
+            (" logs/x", Some("logs")),
+            ("logs /x", Some("logs ")),
+            ("./logs/x", Some("logs")),
+            ("logs/   /x", None),
+            ("logs/../x", None),
+            ("   ", None),
+            ("", None),
+        ];
+        for (path, expected) in cases {
+            assert_eq!(
+                lasting_rule_path(&json!({"path": path})).as_deref(),
+                expected,
+                "{path}"
+            );
+        }
+        let card = lasting_scope(&call(
+            neha_loop::tools::READ_FILE,
+            json!({"path": " logs/x"}),
+        ));
+        assert_eq!(
+            card.as_deref(),
+            Some("files under \"logs\""),
+            "the card names the same scope the rule derives"
+        );
+        assert_eq!(
+            lasting_scope(&call(
+                neha_loop::tools::READ_FILE,
+                json!({"path": "logs/../x"}),
+            )),
+            None,
+            "an unusable path marks no scope on the card"
+        );
     }
 
     #[test]
