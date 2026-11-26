@@ -10399,6 +10399,80 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_denial_reaches_a_subscriber_in_record_order() {
+        let (_dir, running, invite) = running().await;
+        let (socket, token) = admin(&running, &invite).await;
+        let mut local = local_bot_with(
+            &running,
+            socket,
+            machine_token_n(40),
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("never reached"),
+            ],
+        )
+        .await;
+        let mut observer = open_socket(&running, &token).await;
+        let _ = snapshot_events(&mut observer).await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval = approval_for_run(&mut local.socket, run).await;
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+
+        let mut kinds = Vec::new();
+        for _ in 0..200 {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(2), next_frame(&mut observer))
+                    .await
+                    .expect("the subscriber receives the denial");
+            if let ServerFrame::Event { event } = frame
+                && event.data["run"] == json!(run)
+            {
+                kinds.push(event.kind);
+                if event.kind == EventKind::RunFinished {
+                    break;
+                }
+            }
+        }
+        let decided = kinds
+            .iter()
+            .position(|kind| *kind == EventKind::ApprovalDecided);
+        let said = decided.and_then(|at| {
+            kinds
+                .iter()
+                .enumerate()
+                .skip(at + 1)
+                .find(|(_, kind)| **kind == EventKind::MessageAdded)
+                .map(|(at, _)| at)
+        });
+        let finished = kinds
+            .iter()
+            .position(|kind| *kind == EventKind::RunFinished);
+        assert!(
+            decided < said && said < finished,
+            "a subscriber sees decide, explain, finish in order: {kinds:?}"
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| **kind == EventKind::ApprovalDecided)
+                .count(),
+            1,
+            "the decision is broadcast once: {kinds:?}"
+        );
+        assert!(
+            started_actions(&running, run).await.is_empty(),
+            "a denied action never starts"
+        );
+
+        observer.close(None).await.unwrap();
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn denying_a_local_action_fails_the_run_and_asks_again() {
         let (_dir, running, invite) = running().await;
         let mut local = local_bot(
@@ -12915,10 +12989,28 @@ mod tests {
         let command_id = Id::new();
         let call = add_rule(bot, neha::record::RuleEffect::Allow, "shell", None, None);
         let first = command(&mut socket, command_id, call.clone()).await;
-        let second = command(&mut socket, command_id, call).await;
+        let second = command(&mut socket, command_id, call.clone()).await;
         assert_eq!(
             first, second,
             "a recorded rule add must confirm the same result on retry"
+        );
+
+        // Adding the same rule under another command is idempotent; a retry
+        // after that rule is deleted must not create a new rule.
+        let duplicate_id = Id::new();
+        let duplicate = command(&mut socket, duplicate_id, call.clone()).await;
+        assert_eq!(duplicate["rule"], first["rule"]);
+        let rule: Id = serde_json::from_value(duplicate["rule"].clone()).unwrap();
+        command(&mut socket, Id::new(), CommandCall::RuleRemove { rule }).await;
+        let retried = command(&mut socket, duplicate_id, call).await;
+        assert_eq!(
+            retried["rule"], duplicate["rule"],
+            "a confirmed duplicate rule add survives the rule's deletion"
+        );
+        let rules = approvals_of(&mut socket, bot).await;
+        assert!(
+            rules.iter().all(|view| view["rule"] != json!(rule)),
+            "the retry must not recreate a deleted rule: {rules:?}"
         );
 
         socket.close(None).await.unwrap();

@@ -177,6 +177,9 @@ pub struct RunView {
     pub message: Id,
     /// The cursor of the event that queued it.
     pub seq: Seq,
+    /// The cursor of the event that started it, when it started.
+    #[serde(skip)]
+    pub started: Option<Seq>,
     /// Its status.
     pub status: RunStatus,
     /// The Bot's reply Message, when it succeeded.
@@ -649,6 +652,7 @@ impl Projection for State {
                         command: data.command,
                         message: data.message,
                         seq: event.seq,
+                        started: None,
                         status: RunStatus::Queued,
                         reply: None,
                         usage: None,
@@ -666,6 +670,7 @@ impl Projection for State {
                 match self.runs.entry(data.run) {
                     Entry::Occupied(mut run) => {
                         run.get_mut().status = RunStatus::Running;
+                        run.get_mut().started = Some(event.seq);
                         run.get_mut().computer = computer;
                     }
                     // A record this version wrote before it queued runs holds only
@@ -679,6 +684,7 @@ impl Projection for State {
                             command: data.command,
                             message: data.message,
                             seq: event.seq,
+                            started: Some(event.seq),
                             status: RunStatus::Running,
                             reply: None,
                             usage: None,
