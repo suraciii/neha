@@ -21,6 +21,26 @@ pub struct Usage {
     pub reasoning: u64,
 }
 
+impl std::ops::Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            uncached_input: self.uncached_input.saturating_add(other.uncached_input),
+            cache_read: self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+            output: self.output.saturating_add(other.output),
+            reasoning: self.reasoning.saturating_add(other.reasoning),
+        }
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+
 impl Usage {
     /// Returns the tokens a usage budget counts.
     #[must_use]
