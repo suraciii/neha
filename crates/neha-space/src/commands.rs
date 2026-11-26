@@ -21,7 +21,9 @@ use neha::record::{
     FileAdded, RuleEffect, Undoability,
 };
 use neha::seq::Seq;
-use neha::surface::{BotComputer, BotCreate, CommandCall, FileSummary, MessageSend, ProviderAdd};
+use neha::surface::{
+    BotComputer, BotCreate, BotUpdate, CommandCall, FileSummary, MessageSend, ProviderAdd,
+};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -89,6 +91,8 @@ pub struct PendingRun {
     pub message: Id,
     /// The command to confirm when the run finishes.
     pub command: Id,
+    /// The directory this run works in, when it named one.
+    pub cwd: Option<String>,
     /// The Model to call.
     pub model: ModelView,
     /// The Provider that offers the Model.
@@ -153,6 +157,9 @@ pub async fn execute(
         }
         CommandCall::BotMove { bot, computer } => {
             bot_move(context, account, command_id, fingerprint, bot, computer).await
+        }
+        CommandCall::BotUpdate(arguments) => {
+            bot_update(context, account, command_id, fingerprint, arguments).await
         }
         CommandCall::BotList => read(context.state, |state| {
             let bots: Vec<&BotView> = state
@@ -786,6 +793,106 @@ async fn provider_add(
     })
 }
 
+async fn bot_update(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    update: BotUpdate,
+) -> Result<Outcome, ApiError> {
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    if update.full_access.is_none() && update.grants.is_none() {
+        return Err(ApiError::invalid_argument("a Bot update needs a change"));
+    }
+    let grants = update.grants.map(|grants| {
+        let mut checked = Vec::new();
+        for grant in grants {
+            let grant = grant.trim();
+            if grant.is_empty() {
+                return Err(ApiError::invalid_argument("a grant cannot be empty"));
+            }
+            let path = std::path::Path::new(grant);
+            if !path.is_absolute() {
+                return Err(ApiError::invalid_argument(
+                    "a grant must be an absolute folder path",
+                ));
+            }
+            if path
+                .components()
+                .any(|part| matches!(part, std::path::Component::ParentDir))
+            {
+                return Err(ApiError::invalid_argument("a grant cannot contain .."));
+            }
+            if grant.contains('\0') {
+                return Err(ApiError::invalid_argument("a grant cannot contain NUL"));
+            }
+            checked.push(grant.to_owned());
+        }
+        checked.sort();
+        checked.dedup();
+        Ok(checked)
+    });
+    let grants = match grants {
+        Some(grants) => Some(grants?),
+        None => None,
+    };
+    let mut data = json!({"bot": update.bot});
+    if let Some(full_access) = update.full_access {
+        data["full_access"] = json!(full_access);
+    }
+    if let Some(grants) = grants {
+        data["grants"] = json!(grants);
+    }
+    let result = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let mut bot = state
+            .owned_bot(update.bot, account.id)
+            .ok_or_else(|| ApiError::not_found("no such Bot"))?
+            .clone();
+        if let Some(full_access) = update.full_access {
+            bot.full_access = full_access;
+        }
+        if let Some(grants) = data.get("grants").and_then(|value| value.as_array()) {
+            bot.grants = grants
+                .iter()
+                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+                .collect();
+        }
+        let mut result = serde_json::to_value(bot).map_err(json_error)?;
+        result["user"] = json!(account.id);
+        result
+    };
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![EventDraft::new(
+            EventKind::BotUpdated,
+            Author::User(account.id),
+            data,
+        )],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
 async fn bot_create(
     context: &CommandContext<'_>,
     account: &Account,
@@ -868,7 +975,15 @@ async fn bot_create(
         json!({"chat": chat, "owner": account.id, "bot": bot}),
     ));
     let result = json!({
-        "bot": {"id": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat},
+        "bot": {
+            "id": bot,
+            "owner": account.id,
+            "name": name,
+            "computer": computer,
+            "chat": chat,
+            "full_access": false,
+            "grants": Vec::<String>::new(),
+        },
         "computer": computer_view,
         "chat": {"id": chat, "owner": account.id, "bot": bot},
     });
@@ -1021,6 +1136,18 @@ async fn message_send(
     if arguments.file.is_none() && arguments.text.trim().is_empty() {
         return Err(ApiError::invalid_argument("a Message needs text or a File"));
     }
+    let cwd = arguments
+        .cwd
+        .as_ref()
+        .map(|cwd| cwd.trim().to_owned())
+        .filter(|cwd| !cwd.is_empty());
+    if let Some(cwd) = &cwd
+        && !std::path::Path::new(cwd).is_absolute()
+    {
+        return Err(ApiError::invalid_argument(
+            "a working directory must be an absolute path",
+        ));
+    }
     // The run joins the queue behind the Bot's active runs. It is counted
     // before the append so the confirmed place matches the record order.
     let position = {
@@ -1045,7 +1172,7 @@ async fn message_send(
     if let Some(file) = arguments.file {
         added["file"] = json!(file);
     }
-    let drafts = vec![
+    let mut drafts = vec![
         EventDraft::new(EventKind::MessageAdded, Author::User(account.id), added),
         EventDraft::new(
             EventKind::RunQueued,
@@ -1060,6 +1187,16 @@ async fn message_send(
         )
         .acting(account.id),
     ];
+    if let Some(cwd) = &cwd {
+        drafts.push(
+            EventDraft::new(
+                EventKind::RunContext,
+                Author::Bot(bot.id),
+                json!({"run": run, "working_dir": cwd}),
+            )
+            .acting(account.id),
+        );
+    }
     let provisional = json!({
         "run": run,
         "status": RESULT_QUEUED,
@@ -1366,6 +1503,7 @@ pub async fn resume_pending(
         acting: run.acting,
         message: run.message,
         command: run.command,
+        cwd: run.cwd.clone(),
         model,
         provider,
         api_key,
@@ -1665,12 +1803,22 @@ async fn finish_run_with(
                 };
                 return finish_completion(store, state, pending, outcome).await;
             };
-            RunRuntime::Remote(RemoteRuntime::new(
-                link,
-                pending.bot.id,
-                links.ids(),
-                tool_timeout.saturating_add(TIMEOUT_GRACE),
-            ))
+            RunRuntime::Remote({
+                let mut runtime = RemoteRuntime::new(
+                    link,
+                    pending.bot.id,
+                    links.ids(),
+                    tool_timeout.saturating_add(TIMEOUT_GRACE),
+                )
+                .with_access(neha_computer::channel::AccessFrame {
+                    full_access: pending.bot.full_access,
+                    write_roots: pending.bot.grants.clone(),
+                });
+                if let Some(cwd) = &pending.cwd {
+                    runtime = runtime.with_working_dir(cwd);
+                }
+                runtime
+            })
         }
         _ => match LocalRuntime::new(home.workspace_dir(computer)) {
             Ok(runtime) => RunRuntime::Managed(runtime.with_timeout(tool_timeout)),
@@ -1697,9 +1845,10 @@ async fn finish_run_with(
         bot: pending.bot.id,
         acting: pending.acting,
         run: pending.run,
+        cwd: pending.cwd.clone(),
     };
     let mut recorder = RunRecorder {
-        log,
+        log: log.clone(),
         calls: HashMap::new(),
     };
     let files = RunFiles {
@@ -2169,7 +2318,7 @@ fn completion_drafts(
 }
 
 /// Where one run records what it does.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RunLog<'a> {
     store: &'a Store,
     state: &'a Mutex<State>,
@@ -2177,6 +2326,7 @@ struct RunLog<'a> {
     bot: Id,
     acting: Id,
     run: Id,
+    cwd: Option<String>,
 }
 
 impl RunLog<'_> {
@@ -2429,7 +2579,7 @@ impl Recorder for RunRecorder<'_> {
                     "call": call.call,
                     "tool": call.tool,
                     "arguments": call.arguments,
-                    "summary": approval_summary(call),
+                    "summary": approval_summary(call, self.log.cwd.as_deref()),
                     "reason": reason,
                     "ambiguous": ambiguous,
                     "rule": rule,
@@ -2898,7 +3048,7 @@ const MAX_SUMMARY_BYTES: usize = 4096;
 /// Control characters are escaped and the full command is never silently cut:
 /// a very long summary says how many bytes it left out. The complete
 /// arguments are in the event and in `RunShow`.
-fn approval_summary(call: &LoopCall) -> String {
+fn approval_summary(call: &LoopCall, cwd: Option<&str>) -> String {
     let detail = match call.tool.as_str() {
         neha_loop::tools::SHELL => call
             .arguments
@@ -2925,11 +3075,14 @@ fn approval_summary(call: &LoopCall) -> String {
         _ => None,
     };
     let detail = sanitize_text(detail.as_deref().unwrap_or(""));
-    let text = if detail.is_empty() {
+    let mut text = if detail.is_empty() {
         format!("{} on this Computer", call.tool)
     } else {
         format!("{}: {detail}", call.tool)
     };
+    if let Some(cwd) = cwd {
+        text.push_str(&format!(" (in {})", sanitize_text(cwd)));
+    }
 
     clip_summary(&text)
 }

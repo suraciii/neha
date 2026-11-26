@@ -180,3 +180,23 @@ The machine ends the command it was running when the channel drops, so no action
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.
 - Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.
+
+## File access and a run's directory
+
+A Local Bot starts in its own Workspace and may write only there. The owner can widen that with `neha bot update`:
+
+```sh
+neha bot update <bot-id> --grant /data/shared
+neha bot update <bot-id> --full-access on
+neha bot update <bot-id> --clear-grants
+```
+
+`--grant` adds one extra folder the Bot may write; repeat it for more. `--full-access on` gives the Bot the daemon process's own write rights and removes the shell fence; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
+
+A run can start its actions in another directory with `neha chat send --cwd`:
+
+```sh
+neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
+```
+
+Without `--cwd` the run starts in the Bot's Workspace. The directory is recorded with the run and appears on an approval card. It must be absolute. Reading still follows the machine user's rights, except the Computer's own configuration directory, which stays hidden.

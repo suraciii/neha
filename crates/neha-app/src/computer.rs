@@ -24,6 +24,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt as _, StreamExt as _};
 use neha::id::Id;
+use neha_computer::channel::AccessFrame;
 use neha_computer::{
     ActionStatus, CHANNEL_VERSION, ComputerRuntime as _, DeviceFrame, HostFrame, LocalRuntime,
     MAX_CHANNEL_FRAME_BYTES, ToolOutput,
@@ -618,8 +619,22 @@ async fn execute_frame(
 ) -> DeviceFrame {
     match frame {
         HostFrame::Ping => DeviceFrame::Pong,
-        HostFrame::Action { id, bot, action } => {
-            let runtime = match machine(config, hidden, denied, runtimes, &bot) {
+        HostFrame::Action {
+            id,
+            bot,
+            action,
+            working_dir,
+            access,
+        } => {
+            let runtime = match machine(
+                config,
+                hidden,
+                denied,
+                runtimes,
+                &bot,
+                &access,
+                working_dir.as_deref(),
+            ) {
                 Ok(runtime) => runtime,
                 Err(message) => return DeviceFrame::Failed { id, message },
             };
@@ -635,7 +650,15 @@ async fn execute_frame(
             }
         }
         HostFrame::Read { id, bot, path } => {
-            match machine(config, hidden, denied, runtimes, &bot) {
+            match machine(
+                config,
+                hidden,
+                denied,
+                runtimes,
+                &bot,
+                &AccessFrame::default(),
+                None,
+            ) {
                 Ok(runtime) => match runtime.read_bytes(&path).await {
                     Ok(bytes) => DeviceFrame::Bytes {
                         id,
@@ -654,7 +677,15 @@ async fn execute_frame(
             bot,
             path,
             bytes,
-        } => match machine(config, hidden, denied, runtimes, &bot) {
+        } => match machine(
+            config,
+            hidden,
+            denied,
+            runtimes,
+            &bot,
+            &AccessFrame::default(),
+            None,
+        ) {
             Ok(runtime) => match decode_bytes(&bytes) {
                 Ok(bytes) => {
                     let length = bytes.len();
@@ -680,27 +711,48 @@ fn machine(
     denied: &[PathBuf],
     runtimes: &Runtimes,
     bot: &str,
+    access: &AccessFrame,
+    working_dir: Option<&str>,
 ) -> Result<Arc<LocalRuntime>, String> {
     // The Bot must be one identifier component; reject anything else before
     // touching the filesystem.
-    folder_for(&config.workspace, bot)?;
+    let folder = folder_for(&config.workspace, bot)?;
+    let mut key = format!(
+        "{bot}\0{}\0{}",
+        access.full_access,
+        access.write_roots.join("\0")
+    );
+    if let Some(working_dir) = working_dir {
+        key.push('\0');
+        key.push_str(working_dir);
+    }
     let mut runtimes = runtimes
         .lock()
         .map_err(|_| "the runtime table is locked".to_owned())?;
-    match runtimes.entry(bot.to_owned()) {
+    match runtimes.entry(key) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
-            // Open the workspace root without following a symlink, then walk
-            // the Bot's folder through descriptors: a swapped path component
-            // can never redirect the runtime outside its folder.
-            let root = LocalRuntime::open_workspace(&config.workspace)
-                .map_err(|error| error.to_string())?;
-            let runtime = Arc::new(
+            let mut grants = access.write_roots.clone();
+            let runtime = if let Some(working_dir) = working_dir {
+                // A run can ask to work in another folder. Its own folder stays
+                // writable, and the owner's grants still apply.
+                grants.push(folder.to_string_lossy().into_owned());
+                LocalRuntime::machine_with_hidden(working_dir, hidden.to_vec())
+                    .map_err(|error| error.to_string())?
+            } else {
+                // Open the workspace root without following a symlink, then walk
+                // the Bot's folder through descriptors: a swapped path component
+                // can never redirect the runtime outside its folder.
+                let root = LocalRuntime::open_workspace(&config.workspace)
+                    .map_err(|error| error.to_string())?;
                 LocalRuntime::machine_at(&root, bot, hidden.to_vec())
                     .map_err(|error| error.to_string())?
-                    .with_denied(denied.to_vec()),
-            );
-            Ok(Arc::clone(entry.insert(runtime)))
+            };
+            let runtime = runtime
+                .with_denied(denied.to_vec())
+                .with_machine_access(access.full_access, &grants)
+                .map_err(|error| error.to_string())?;
+            Ok(Arc::clone(entry.insert(Arc::new(runtime))))
         }
     }
 }
@@ -2432,6 +2484,8 @@ mod tests {
                 action: WireAction::Shell {
                     command: "true".to_owned(),
                 },
+                working_dir: None,
+                access: Default::default(),
             },
         )
         .await;
@@ -2467,6 +2521,8 @@ mod tests {
                     folder.join("done").display()
                 ),
             },
+            working_dir: None,
+            access: Default::default(),
         };
         let second = HostFrame::Action {
             id: 2,
@@ -2474,6 +2530,8 @@ mod tests {
             action: WireAction::Shell {
                 command: format!("echo second > {}", folder.join("second").display()),
             },
+            working_dir: None,
+            access: Default::default(),
         };
         for frame in [first, second] {
             socket
@@ -2640,6 +2698,8 @@ mod tests {
                                 folder.join("done").display()
                             ),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     },
                 )
                 .await;
@@ -2650,6 +2710,8 @@ mod tests {
                         action: WireAction::Shell {
                             command: "true".to_owned(),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     };
                     if socket
                         .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -2703,6 +2765,8 @@ mod tests {
                                 folder.join("done").display()
                             ),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     },
                 )
                 .await;
@@ -2716,6 +2780,8 @@ mod tests {
                         action: WireAction::Shell {
                             command: huge.clone(),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     };
                     send_space_frame(&mut socket, frame).await;
                 }

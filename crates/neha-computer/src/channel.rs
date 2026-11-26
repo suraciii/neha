@@ -20,6 +20,26 @@ pub const CHANNEL_VERSION: u32 = 1;
 /// The largest frame either end accepts, 64 MiB.
 pub const MAX_CHANNEL_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// The file access a Bot has on its Computer.
+///
+/// `write_roots` are extra folders the owner granted; the Bot's own folder is
+/// always writable. A full-access Bot runs without the write fence.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessFrame {
+    /// Writes anything the machine user can write; the shell is not fenced.
+    #[serde(default)]
+    pub full_access: bool,
+    /// Extra folders the owner granted for writing, as absolute paths.
+    #[serde(default)]
+    pub write_roots: Vec<String>,
+}
+
+impl AccessFrame {
+    fn is_default(&self) -> bool {
+        !self.full_access && self.write_roots.is_empty()
+    }
+}
+
 /// A frame the Space sends to a Computer.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -32,6 +52,12 @@ pub enum HostFrame {
         bot: String,
         /// The action to run.
         action: WireAction,
+        /// The directory this run works in; absent means the Bot's folder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
+        /// The owner-granted write access this run carries.
+        #[serde(default, skip_serializing_if = "AccessFrame::is_default")]
+        access: AccessFrame,
     },
     /// Reads a file's bytes from the machine (a File take).
     Read {
@@ -176,6 +202,8 @@ mod tests {
                     action: WireAction::Shell {
                         command: "pwd".to_owned(),
                     },
+                    working_dir: None,
+                    access: super::AccessFrame::default(),
                 },
                 json!({
                     "type": "action",
@@ -191,6 +219,8 @@ mod tests {
                     action: WireAction::ReadFile {
                         path: "notes.txt".to_owned(),
                     },
+                    working_dir: None,
+                    access: super::AccessFrame::default(),
                 },
                 json!({
                     "type": "action",
@@ -207,6 +237,8 @@ mod tests {
                         path: "notes.txt".to_owned(),
                         content: "hello".to_owned(),
                     },
+                    working_dir: None,
+                    access: super::AccessFrame::default(),
                 },
                 json!({
                     "type": "action",
@@ -222,6 +254,8 @@ mod tests {
                     action: WireAction::ListFiles {
                         path: ".".to_owned(),
                     },
+                    working_dir: None,
+                    access: super::AccessFrame::default(),
                 },
                 json!({
                     "type": "action",

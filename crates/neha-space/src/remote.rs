@@ -30,6 +30,10 @@ pub struct RemoteRuntime {
     ids: Arc<AtomicU64>,
     /// How long one request may wait for its answer.
     timeout: Duration,
+    /// The directory the run works in.
+    working_dir: Option<String>,
+    /// The owner-granted write access the run carries.
+    access: neha_computer::channel::AccessFrame,
 }
 
 impl RemoteRuntime {
@@ -41,7 +45,23 @@ impl RemoteRuntime {
             bot,
             ids,
             timeout,
+            working_dir: None,
+            access: neha_computer::channel::AccessFrame::default(),
         }
+    }
+
+    /// Sets the directory this run's actions work in.
+    #[must_use]
+    pub fn with_working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    /// Sets the owner-granted write access this run carries.
+    #[must_use]
+    pub fn with_access(mut self, access: neha_computer::channel::AccessFrame) -> Self {
+        self.access = access;
+        self
     }
 
     /// Returns the id for the next request.
@@ -56,8 +76,17 @@ impl ComputerRuntime for RemoteRuntime {
     fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send {
         async move {
             let id = self.next_id();
-            let answer =
-                tokio::time::timeout(self.timeout, self.link.act(id, self.bot, action)).await;
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.link.act(
+                    id,
+                    self.bot,
+                    action,
+                    self.working_dir.as_deref(),
+                    &self.access,
+                ),
+            )
+            .await;
             match answer {
                 Ok(Answer::ActionResult(result)) => result,
                 Ok(Answer::Bytes(_)) => {

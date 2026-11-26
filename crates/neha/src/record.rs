@@ -40,6 +40,9 @@ pub enum EventKind {
     /// A Bot moved to another Computer.
     #[serde(rename = "neha.bot.moved")]
     BotMoved,
+    /// A Bot's owner changed its file access.
+    #[serde(rename = "neha.bot.updated")]
+    BotUpdated,
     /// A Computer was created.
     #[serde(rename = "neha.computer.created")]
     ComputerCreated,
@@ -58,6 +61,9 @@ pub enum EventKind {
     /// A run started.
     #[serde(rename = "neha.run.started")]
     RunStarted,
+    /// The directory a run works in.
+    #[serde(rename = "neha.run.context")]
+    RunContext,
     /// A run finished.
     #[serde(rename = "neha.run.finished")]
     RunFinished,
@@ -96,12 +102,14 @@ impl EventKind {
             Self::ProviderAdded => "neha.provider.added",
             Self::BotCreated => "neha.bot.created",
             Self::BotMoved => "neha.bot.moved",
+            Self::BotUpdated => "neha.bot.updated",
             Self::ComputerCreated => "neha.computer.created",
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
             Self::FileAdded => "neha.file.added",
             Self::RunQueued => "neha.run.queued",
             Self::RunStarted => "neha.run.started",
+            Self::RunContext => "neha.run.context",
             Self::RunFinished => "neha.run.finished",
             Self::RunStep => "neha.run.step",
             Self::ActionStarted => "neha.action.started",
@@ -125,7 +133,8 @@ impl EventKind {
             | Self::RunFinished => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
-            Self::RunStep
+            Self::RunContext
+            | Self::RunStep
             | Self::ActionStarted
             | Self::ActionFinished
             | Self::RunReply
@@ -137,6 +146,7 @@ impl EventKind {
             | Self::ProviderAdded
             | Self::BotCreated
             | Self::BotMoved
+            | Self::BotUpdated
             | Self::ComputerCreated
             | Self::ChatCreated => EventClass::Authority,
         }
@@ -152,12 +162,14 @@ impl FromStr for EventKind {
             "neha.provider.added" => Ok(Self::ProviderAdded),
             "neha.bot.created" => Ok(Self::BotCreated),
             "neha.bot.moved" => Ok(Self::BotMoved),
+            "neha.bot.updated" => Ok(Self::BotUpdated),
             "neha.computer.created" => Ok(Self::ComputerCreated),
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
             "neha.file.added" => Ok(Self::FileAdded),
             "neha.run.queued" => Ok(Self::RunQueued),
             "neha.run.started" => Ok(Self::RunStarted),
+            "neha.run.context" => Ok(Self::RunContext),
             "neha.run.finished" => Ok(Self::RunFinished),
             "neha.run.step" => Ok(Self::RunStep),
             "neha.action.started" => Ok(Self::ActionStarted),
@@ -763,6 +775,8 @@ pub enum EventData {
     BotCreated(BotCreated),
     /// A Bot moved to another Computer.
     BotMoved(BotMoved),
+    /// A Bot's owner changed its file access.
+    BotUpdated(BotUpdated),
     /// A Computer was created.
     ComputerCreated(ComputerCreated),
     /// A Chat was created.
@@ -775,6 +789,8 @@ pub enum EventData {
     RunQueued(RunQueued),
     /// A run started.
     RunStarted(RunStarted),
+    /// The directory a run works in.
+    RunContext(RunContext),
     /// A run finished.
     RunFinished(RunFinished),
     /// A run completed a step.
@@ -812,6 +828,7 @@ impl EventKind {
             Self::ProviderAdded => EventData::ProviderAdded(decode(data)?),
             Self::BotCreated => EventData::BotCreated(decode(data)?),
             Self::BotMoved => EventData::BotMoved(decode(data)?),
+            Self::BotUpdated => EventData::BotUpdated(decode(data)?),
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
@@ -823,6 +840,7 @@ impl EventKind {
             }
             Self::RunQueued => EventData::RunQueued(decode(data)?),
             Self::RunStarted => EventData::RunStarted(decode(data)?),
+            Self::RunContext => EventData::RunContext(decode(data)?),
             Self::RunFinished => {
                 let data: RunFinished = decode(data)?;
                 // Waiting is where a run stands while it asks, not how it
@@ -855,6 +873,7 @@ impl EventKind {
             | Self::ProviderAdded
             | Self::BotCreated
             | Self::BotMoved
+            | Self::BotUpdated
             | Self::ComputerCreated
             | Self::ChatCreated => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
@@ -867,6 +886,7 @@ impl EventKind {
             },
             Self::RunQueued
             | Self::RunStarted
+            | Self::RunContext
             | Self::RunFinished
             | Self::RunStep
             | Self::ActionStarted
@@ -988,6 +1008,22 @@ pub struct BotMoved {
     pub from: Id,
     /// The Computer it works on now.
     pub to: Id,
+}
+
+/// The data of `neha.bot.updated`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotUpdated {
+    /// The Bot.
+    pub bot: Id,
+    /// Whether it may write outside its Workspace fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_access: Option<bool>,
+    /// The complete list of extra folders it may write.
+    ///
+    /// `Some(empty)` removes every grant; `None` leaves them unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<String>>,
 }
 
 /// What a Computer is: the machine Neha runs on, or the Space itself.
@@ -1276,6 +1312,16 @@ pub struct ActionFinished {
     /// The failure, when it failed.
     #[serde(default)]
     pub error: Option<String>,
+}
+
+/// The data of `neha.run.context`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunContext {
+    /// The run.
+    pub run: Id,
+    /// The directory it works in.
+    pub working_dir: String,
 }
 
 /// The data of `neha.run.finished`.

@@ -1628,6 +1628,72 @@ fn an_invitation_without_a_secret_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_bot_owner_grants_access_and_a_run_can_name_its_directory() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-access-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch directory outside /tmp");
+    let granted = directory.path().join("granted");
+    std::fs::create_dir(&granted).unwrap();
+    let computer = local_computer(directory, &base, &script);
+
+    let updated = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "bot",
+            "update",
+            &computer.bot,
+            "--full-access",
+            "on",
+            "--grant",
+            granted.to_str().unwrap(),
+        ],
+    );
+    assert!(updated.contains("full access: true"), "{updated}");
+    assert!(updated.contains("grants: 1"), "{updated}");
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "show", &computer.bot],
+    );
+    assert!(shown.contains("full access: true"), "{shown}");
+    assert!(shown.contains(granted.to_str().unwrap()), "{shown}");
+
+    // A run's working directory is where its shell starts.
+    let work = computer.path().join("run-directory");
+    std::fs::create_dir(&work).unwrap();
+    script.call("shell", serde_json::json!({"command": "pwd > started.txt"}));
+    script.say("I worked in the directory.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--cwd",
+            work.to_str().unwrap(),
+            "where are you?",
+        ],
+    );
+    assert!(sent.contains("I worked in the directory"), "{sent}");
+    assert_eq!(
+        std::fs::read_to_string(work.join("started.txt"))
+            .unwrap()
+            .trim(),
+        work.to_str().unwrap()
+    );
+
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_bot_runs_on_a_local_computer() {
     if !local_computer_ready() {
         return;

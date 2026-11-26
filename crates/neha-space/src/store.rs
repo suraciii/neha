@@ -680,6 +680,17 @@ mod tests {
                     }),
                 )
             }
+            EventKind::RunContext => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({"run": Id::new(), "working_dir": "/tmp"}),
+            )
+            .acting(Id::new()),
+            EventKind::BotUpdated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"bot": Id::new(), "full_access": true}),
+            ),
             EventKind::BotMoved => EventDraft::new(
                 kind,
                 Author::User(user),

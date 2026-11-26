@@ -12,7 +12,8 @@ use neha::id::Id;
 use neha::record::RuleEffect;
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
+    BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
+    ProviderProtocol,
 };
 use neha_space::Home;
 use serde_json::Value;
@@ -158,6 +159,20 @@ enum BotCommand {
         #[arg(long)]
         computer: Id,
     },
+    /// Change your Bot's file access.
+    Update {
+        /// The Bot identifier.
+        bot: Id,
+        /// Allow (on) or refuse (off) writes outside the Bot's Workspace fence.
+        #[arg(long, value_parser = parse_full_access)]
+        full_access: Option<bool>,
+        /// Grant write access to an extra folder; repeatable.
+        #[arg(long = "grant", value_name = "PATH")]
+        grants: Vec<std::path::PathBuf>,
+        /// Remove every extra write grant.
+        #[arg(long)]
+        clear_grants: bool,
+    },
     /// Show your Bot, its Chat, and its Computer.
     Show {
         /// The Bot identifier.
@@ -218,6 +233,9 @@ enum ChatCommand {
         /// A file to upload and send with the Message.
         #[arg(long)]
         file: Option<std::path::PathBuf>,
+        /// The directory this run works in; defaults to the Bot's Workspace.
+        #[arg(long)]
+        cwd: Option<std::path::PathBuf>,
         /// Print the run's steps and actions while it works.
         #[arg(long)]
         follow: bool,
@@ -573,6 +591,15 @@ async fn model(command: ModelCommand) -> Result<()> {
     Ok(())
 }
 
+/// Parses `--full-access on|off`.
+fn parse_full_access(value: &str) -> Result<bool> {
+    match value {
+        "on" | "true" | "yes" => Ok(true),
+        "off" | "false" | "no" => Ok(false),
+        other => bail!("--full-access expects on or off, not {other:?}"),
+    }
+}
+
 async fn bot(command: BotCommand) -> Result<()> {
     let credential = Credential::load()?;
     match command {
@@ -606,6 +633,47 @@ async fn bot(command: BotCommand) -> Result<()> {
                 result["to"]["online"].as_bool().unwrap_or(false),
             );
         }
+        BotCommand::Update {
+            bot,
+            full_access,
+            grants,
+            clear_grants,
+        } => {
+            let grants = if clear_grants {
+                Some(Vec::new())
+            } else if grants.is_empty() {
+                None
+            } else {
+                Some(
+                    grants
+                        .into_iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect(),
+                )
+            };
+            let result = client::command(
+                &credential,
+                CommandCall::BotUpdate(BotUpdate {
+                    bot,
+                    full_access,
+                    grants,
+                }),
+            )
+            .await?;
+            println!(
+                "Updated Bot {} ({})",
+                id_of(&result, "id")?,
+                text_of(&result, "name")?
+            );
+            println!(
+                "  full access: {}",
+                result["full_access"].as_bool().unwrap_or(false)
+            );
+            println!(
+                "  grants: {}",
+                result["grants"].as_array().map_or(0, Vec::len)
+            );
+        }
         BotCommand::Show { bot } => {
             let result = client::command(&credential, CommandCall::BotShow { bot }).await?;
             println!(
@@ -625,6 +693,15 @@ async fn bot(command: BotCommand) -> Result<()> {
             let workspace = text_of(&result["computer"], "workspace")?;
             if !workspace.is_empty() {
                 println!("  Workspace: {workspace}");
+            }
+            println!(
+                "  full access: {}",
+                result["bot"]["full_access"].as_bool().unwrap_or(false)
+            );
+            if let Some(grants) = result["bot"]["grants"].as_array() {
+                for grant in grants {
+                    println!("  grant: {}", grant.as_str().unwrap_or_default());
+                }
             }
         }
         BotCommand::List => {
@@ -696,6 +773,7 @@ async fn chat(command: ChatCommand) -> Result<()> {
             bot,
             text,
             file,
+            cwd,
             follow,
         } => {
             let chat = resolve_chat(&credential, chat, bot).await?;
@@ -705,6 +783,7 @@ async fn chat(command: ChatCommand) -> Result<()> {
             };
             let command = CommandCall::MessageSend(MessageSend {
                 chat,
+                cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
                 text: text.unwrap_or_default(),
                 file: uploaded.as_ref().map(|file| file.id),
             });

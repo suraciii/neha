@@ -96,13 +96,22 @@ impl ComputerLink {
     }
 
     /// Runs one action on the Computer and waits for its result.
-    pub async fn act(&self, id: u64, bot: Id, action: Action) -> Answer {
+    pub async fn act(
+        &self,
+        id: u64,
+        bot: Id,
+        action: Action,
+        working_dir: Option<&str>,
+        access: &neha_computer::channel::AccessFrame,
+    ) -> Answer {
         self.request(
             id,
             HostFrame::Action {
                 id,
                 bot: bot.to_string(),
                 action: action.into(),
+                working_dir: working_dir.map(ToOwned::to_owned),
+                access: access.clone(),
             },
         )
         .await
@@ -418,6 +427,8 @@ mod tests {
                     Action::Shell {
                         command: "pwd".to_owned(),
                     },
+                    None,
+                    &neha_computer::channel::AccessFrame::default(),
                 )
                 .await
             }
@@ -431,6 +442,8 @@ mod tests {
                 action: neha_computer::channel::WireAction::Shell {
                     command: "pwd".to_owned(),
                 },
+                working_dir: None,
+                access: Default::default(),
             }
         );
 
@@ -496,7 +509,15 @@ mod tests {
         assert!(matches!(waiting.await.unwrap(), Answer::Gone(message) if message == OFFLINE));
         assert!(
             matches!(
-                link.act(5, Id::new(), Action::Shell { command: "true".to_owned() }).await,
+                link
+                    .act(
+                        5,
+                        Id::new(),
+                        Action::Shell { command: "true".to_owned() },
+                        None,
+                        &neha_computer::channel::AccessFrame::default(),
+                    )
+                    .await,
                 Answer::Gone(message) if message == OFFLINE
             ),
             "a closed channel refuses new requests"
@@ -551,6 +572,8 @@ mod tests {
                         Action::Shell {
                             command: format!("sleep {id}"),
                         },
+                        None,
+                        &neha_computer::channel::AccessFrame::default(),
                     )
                     .await
                 }
