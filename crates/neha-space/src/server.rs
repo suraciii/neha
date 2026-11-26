@@ -6988,6 +6988,25 @@ mod tests {
             json!({"state": "pending"}),
             "a claim without a recorded Computer is rolled back"
         );
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            None,
+            "the reservation's token is deleted with the rollback"
+        );
+        assert!(
+            restarted
+                .server
+                .identity
+                .pairing_claims()
+                .await
+                .unwrap()
+                .is_empty()
+        );
         // The code is usable again through the real command.
         let mut socket = open_socket(&restarted, &token).await;
         let added = command(&mut socket, Id::new(), add_computer(&code)).await;
@@ -6999,6 +7018,156 @@ mod tests {
             .unwrap();
         assert_eq!(approved["state"], "approved");
         socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_rolls_back_a_token_that_was_finalized_but_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let running = start(home.clone(), 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let token = session["token"].as_str().unwrap().to_owned();
+        let (device, code) = pair_machine(&running).await;
+        let computer = Id::new();
+        assert!(
+            running
+                .server
+                .identity
+                .reserve_pairing(&code, owner, computer)
+                .await
+                .unwrap()
+        );
+        // The command finalized the token, then a crash stopped it before the
+        // Computer reached the record.
+        assert!(
+            running
+                .server
+                .identity
+                .finalize_pairing(owner, computer)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            running
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            Some(computer),
+            "before the crash the token is active"
+        );
+        running.shutdown().await;
+
+        let restarted = start(home, 0).await.unwrap();
+        let pending: Value = poll_pairing(&restarted, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending, json!({"state": "pending"}));
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            None,
+            "an unrecorded Computer never keeps a token after a restart"
+        );
+        assert!(
+            restarted
+                .server
+                .identity
+                .pairing_claims()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The code is usable again through the real command.
+        let mut socket = open_socket(&restarted, &token).await;
+        let added = command(&mut socket, Id::new(), add_computer(&code)).await;
+        assert_eq!(added["kind"], "real");
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_keeps_a_recorded_and_finalized_pairing() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let running = start(home.clone(), 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let (device, code) = pair_machine(&running).await;
+        let computer = Id::new();
+        assert!(
+            running
+                .server
+                .identity
+                .reserve_pairing(&code, owner, computer)
+                .await
+                .unwrap()
+        );
+        assert!(
+            running
+                .server
+                .identity
+                .finalize_pairing(owner, computer)
+                .await
+                .unwrap()
+        );
+        let draft = neha::record::EventDraft::new(
+            EventKind::ComputerCreated,
+            neha::record::Author::User(owner),
+            json!({
+                "computer": computer,
+                "owner": owner,
+                "kind": "real",
+                "workspace": MACHINE_WORKSPACE,
+            }),
+        );
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                format!("crash:{computer}"),
+                vec![draft],
+            ))
+            .await
+            .unwrap();
+        {
+            use crate::store::Projection as _;
+            let mut state = running.server.state.lock().unwrap();
+            for event in &appended.events {
+                state.apply(event).unwrap();
+            }
+        }
+        running.shutdown().await;
+
+        let restarted = start(home, 0).await.unwrap();
+        let approved: Value = poll_pairing(&restarted, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(approved, json!({"state": "approved", "computer": computer}));
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            Some(computer),
+            "a crash after the record leaves the pairing working"
+        );
         restarted.shutdown().await;
     }
 
@@ -7170,6 +7339,22 @@ mod tests {
         let second = command(&mut socket, command_id, add_computer(&code)).await;
         assert_eq!(first, second, "a replay answers from the record");
         let computer: Id = serde_json::from_value(first["id"].clone()).unwrap();
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        assert_eq!(
+            listed.as_array().map(Vec::len),
+            Some(1),
+            "a replayed add must leave one Computer"
+        );
+        assert_eq!(
+            running
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            Some(computer),
+            "the replayed Computer's token is usable"
+        );
         let approved: Value = poll_pairing(&running, &device, &machine_poll())
             .await
             .json()
@@ -7189,6 +7374,46 @@ mod tests {
             })
             .count();
         assert_eq!(created, 1, "the replay must not record a second Computer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_machine_cannot_reuse_a_paired_token() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        // Both fake machines present the same token; pairing hands each its
+        // own code and Computer identifier.
+        let (_first_device, first_code) = pair_machine(&running).await;
+        let first = command(&mut socket, Id::new(), add_computer(&first_code)).await;
+        let first_computer: Id = serde_json::from_value(first["id"].clone()).unwrap();
+        let (second_device, second_code) = pair_machine(&running).await;
+
+        let refused = try_command(&mut socket, Id::new(), add_computer(&second_code)).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::Internal, _))),
+            "the token's owner is reserved before any Computer is published"
+        );
+        // No second Computer, the first token still works, and the second
+        // machine stays pending with its code untouched by a half-claim.
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        assert_eq!(listed.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            running
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            Some(first_computer)
+        );
+        let pending: Value = poll_pairing(&running, &second_device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending, json!({"state": "pending"}));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

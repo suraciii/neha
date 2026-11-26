@@ -204,6 +204,10 @@ impl LocalRuntime {
         let workspace_path = opened_path(workspace).map_err(RuntimeError::Io)?;
         let folder_path = workspace_path.join(bot);
         let folder = open_or_create_machine_folder(workspace, bot, &folder_path)?;
+        // bwrap binds this descriptor, so it must survive the sandbox's exec:
+        // the mount then names the object opened and scanned here, not a path
+        // that a later rename could point somewhere else.
+        make_inheritable(&folder).map_err(RuntimeError::Io)?;
         // A hidden root must exist: it is the directory the daemon wrote its
         // own configuration into, and a missing one would mean the tmpfs that
         // hides it cannot be mounted.
@@ -649,8 +653,12 @@ impl LocalRuntime {
                 process.arg("-c").arg(command).current_dir(&self.root);
                 process
             }
-            Mode::Machine { bwrap, .. } => {
-                let mut process = sandbox_command(bwrap, &self.root, &self.hidden);
+            Mode::Machine { bwrap, folder } => {
+                #[cfg(unix)]
+                let source = folder_mount_source(folder);
+                #[cfg(not(unix))]
+                let source = self.root.as_os_str().to_owned();
+                let mut process = sandbox_command(bwrap, &source, &self.root, &self.hidden);
                 process
                     .arg("/bin/sh")
                     .arg("-c")
@@ -685,7 +693,6 @@ impl LocalRuntime {
         let mut process = self.shell_command(command);
         #[cfg(unix)]
         process.process_group(0);
-
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(error) => return ActionResult::failed(format!("cannot start a shell: {error}")),
@@ -784,7 +791,7 @@ impl ComputerRuntime for LocalRuntime {
         let resolved = self.resolve_read(path);
         async move {
             let path = resolved.map_err(ByteError::Failed)?;
-            let (mut file, metadata) = self.open_read(&path).map_err(ByteError::Failed)?;
+            let (file, metadata) = self.open_read(&path).map_err(ByteError::Failed)?;
             if !metadata.is_file() {
                 return Err(ByteError::Failed(format!(
                     "{} is not a file",
@@ -797,12 +804,11 @@ impl ComputerRuntime for LocalRuntime {
                     neha::file::MAX_FILE_BYTES
                 )));
             }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|error| {
-                ByteError::Failed(format!("cannot read {}: {error}", path.display()))
-            })?;
-
-            Ok(bytes)
+            read_file_bounded(
+                file,
+                neha::file::MAX_FILE_BYTES,
+                &path.display().to_string(),
+            )
         }
     }
 
@@ -849,7 +855,7 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
         return Err("bwrap --version failed; install a working bubblewrap".to_owned());
     }
     let output = std::process::Command::new(bwrap)
-        .args(sandbox_args(folder, hidden))
+        .args(sandbox_args(folder.as_os_str(), folder, hidden))
         .arg("/bin/sh")
         .arg("-c")
         .arg("true")
@@ -875,7 +881,11 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
 /// empty tmpfs, so the Computer's own directory and its credential are absent
 /// from the sandbox. The network is not unshared: a real Computer uses its
 /// machine's network as before.
-fn sandbox_args(folder: &Path, hidden: &[PathBuf]) -> Vec<OsString> {
+///
+/// The writable mount's source is `source` — the runtime's opened folder by
+/// descriptor — while its target, and the working directory, stay the
+/// folder's path.
+fn sandbox_args(source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Vec<OsString> {
     let folder = folder.as_os_str();
     let mut arguments: Vec<OsString> = ["--ro-bind", "/", "/"]
         .into_iter()
@@ -904,7 +914,7 @@ fn sandbox_args(folder: &Path, hidden: &[PathBuf]) -> Vec<OsString> {
         .map(OsString::from),
     );
     arguments.push(OsString::from("--bind"));
-    arguments.push(folder.to_owned());
+    arguments.push(source.to_owned());
     arguments.push(folder.to_owned());
     arguments.push(OsString::from("--chdir"));
     arguments.push(folder.to_owned());
@@ -913,10 +923,38 @@ fn sandbox_args(folder: &Path, hidden: &[PathBuf]) -> Vec<OsString> {
     arguments
 }
 
+/// Names the opened Bot folder as a path the sandbox can bind.
+#[cfg(unix)]
+fn folder_mount_source(folder: &std::fs::File) -> OsString {
+    use std::os::fd::AsRawFd as _;
+
+    OsString::from(format!("/proc/self/fd/{}", folder.as_raw_fd()))
+}
+
+/// Makes a directory descriptor survive `exec`, so bwrap can bind the object
+/// this runtime opened as `/proc/self/fd/<fd>`.
+///
+/// The descriptor is opened with `FD_CLOEXEC`; clearing it once, when the
+/// runtime is built, keeps it open for every shell the runtime starts and
+/// leaves no flag state to restore after a spawn.
+#[cfg(unix)]
+fn make_inheritable(folder: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `folder` is a live descriptor owned by the runtime; `F_SETFD`
+    // only writes its descriptor flags. 0 clears `FD_CLOEXEC`.
+    let cleared = unsafe { libc::fcntl(folder.as_raw_fd(), libc::F_SETFD, 0) };
+    if cleared < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(())
+}
+
 /// Builds the fenced shell process without starting it.
-fn sandbox_command(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Command {
+fn sandbox_command(bwrap: &Path, source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Command {
     let mut process = Command::new(bwrap);
-    process.args(sandbox_args(folder, hidden));
+    process.args(sandbox_args(source, folder, hidden));
     process
 }
 
@@ -1002,6 +1040,30 @@ fn list_entries(entries: std::fs::ReadDir) -> Vec<String> {
     }
 
     lines
+}
+
+/// Reads at most `limit` bytes, refusing a file that grew past the limit after
+/// its length was checked.
+///
+/// The read stops after `limit + 1` bytes, so a file another process keeps
+/// appending to can never put more than one File's worth of bytes in memory.
+fn read_file_bounded(
+    reader: impl std::io::Read,
+    limit: u64,
+    shown: &str,
+) -> Result<Vec<u8>, ByteError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ByteError::Failed(format!("cannot read {shown}: {error}")))?;
+    if bytes.len() as u64 > limit {
+        return Err(ByteError::Failed(format!(
+            "the file is larger than {limit} bytes"
+        )));
+    }
+
+    Ok(bytes)
 }
 
 /// The error a real-machine constructor returns when bubblewrap is absent.
@@ -3245,5 +3307,134 @@ mod tests {
                 .is_err_and(|error| error.to_string().contains("hidden")),
             "{bytes:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_mounts_the_opened_bot_folder_after_its_path_moves() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "marker.txt".to_owned(),
+                content: "original".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        let folder = runtime.workspace().to_path_buf();
+        let moved = directory.path().join("moved");
+        std::fs::rename(&folder, &moved).unwrap();
+        std::fs::create_dir(&folder).unwrap();
+
+        let result = runtime
+            .execute(Action::Shell {
+                command: "cat marker.txt".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            result.output.text.contains("original"),
+            "the shell mounts the opened folder, not the new path: {}",
+            result.output.text
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_does_not_follow_a_replaced_bot_folder_path() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "marker.txt".to_owned(),
+                content: "original".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        let folder = runtime.workspace().to_path_buf();
+        let moved = directory.path().join("moved");
+        std::fs::rename(&folder, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &folder).unwrap();
+
+        let result = runtime
+            .execute(Action::Shell {
+                command: "cat marker.txt".to_owned(),
+            })
+            .await;
+        match result.status {
+            // The mounted object is still the opened folder, whose marker is
+            // only reachable through the old root.
+            ActionStatus::Succeeded => assert!(
+                result.output.text.contains("original"),
+                "{}",
+                result.output.text
+            ),
+            // A replacement the sandbox cannot mount is refused, not followed.
+            ActionStatus::Failed => {}
+            other => panic!("unexpected status {other:?}: {}", result.output.text),
+        }
+    }
+
+    #[test]
+    fn a_byte_read_stops_a_file_that_grows_past_the_limit() {
+        use std::io::Read as _;
+
+        // A file that reported a small length and then grew: the reader keeps
+        // producing bytes past the limit.
+        let growing = std::io::repeat(0u8).take(MAX_FILE_BYTES + 1);
+        let error = super::read_file_bounded(growing, MAX_FILE_BYTES, "growing.bin").unwrap_err();
+        assert!(error.to_string().contains("larger than"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_byte_read_of_a_file_that_grows_never_returns_more_than_one_file() {
+        use std::io::Write as _;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (_dir, runtime) = runtime();
+        let path = runtime.workspace().join("growing.bin");
+        std::fs::write(&path, "start").unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                let Ok(mut file) = std::fs::OpenOptions::new().append(true).open(&path) else {
+                    return;
+                };
+                let chunk = vec![b'x'; 256 * 1024];
+                let mut written = 0u64;
+                while !stop.load(Ordering::Relaxed) && written <= MAX_FILE_BYTES + 2 * 1024 * 1024 {
+                    if file.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    written += chunk.len() as u64;
+                }
+            })
+        };
+        let mut refused = false;
+        for _ in 0..500 {
+            match runtime.read_bytes("growing.bin").await {
+                Ok(bytes) => {
+                    assert!(
+                        bytes.len() as u64 <= MAX_FILE_BYTES,
+                        "a byte read returned more than one File"
+                    );
+                }
+                Err(error) => {
+                    assert!(error.to_string().contains("larger than"), "{error}");
+                    refused = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(refused, "a file that grew past the limit is refused");
     }
 }

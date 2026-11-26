@@ -8,7 +8,7 @@ use sqlx::{Connection, SqliteConnection};
 use thiserror::Error;
 
 /// The schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// The statements that create the tables of schema version 1.
 ///
@@ -34,7 +34,7 @@ pub(crate) const VERSION_ONE_STATEMENTS: [&str; 7] = [
 ];
 
 /// The statements that create the tables schema version 2 adds.
-const VERSION_TWO_STATEMENTS: [&str; 2] = [
+pub(crate) const VERSION_TWO_STATEMENTS: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS computer_codes (\
         device_id TEXT PRIMARY KEY, code_hash BLOB NOT NULL, \
         poll_hash BLOB NOT NULL, token_hash BLOB NOT NULL, \
@@ -46,6 +46,15 @@ const VERSION_TWO_STATEMENTS: [&str; 2] = [
         token_hash BLOB PRIMARY KEY, computer_id TEXT NOT NULL, \
         created_at INTEGER NOT NULL)",
 ];
+
+/// The statements schema version 3 adds.
+///
+/// A Computer token is reserved with its claim, before the Computer is
+/// published: `finalized` starts at 0 and only `finalize_pairing` makes the
+/// token usable. Rows written before this version were all final, so the
+/// column's default upgrades them to 1; every new insert names the value.
+const VERSION_THREE_STATEMENTS: [&str; 1] =
+    ["ALTER TABLE computer_tokens ADD COLUMN finalized INTEGER NOT NULL DEFAULT 1"];
 
 /// Creates or upgrades the Space database.
 pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaError> {
@@ -71,11 +80,24 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_TWO_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_THREE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         1 => {
             // A version 1 database has the record and the account tables;
             // only the Computer tables are new.
             for statement in VERSION_TWO_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_THREE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+        }
+        2 => {
+            // Version 2 paired Computers: their token rows were final, which
+            // the new column's default preserves.
+            for statement in VERSION_THREE_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
         }
@@ -114,7 +136,9 @@ pub enum SchemaError {
 
 #[cfg(test)]
 mod tests {
-    use super::{SCHEMA_VERSION, SchemaError, VERSION_ONE_STATEMENTS, migrate};
+    use super::{
+        SCHEMA_VERSION, SchemaError, VERSION_ONE_STATEMENTS, VERSION_TWO_STATEMENTS, migrate,
+    };
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{Connection, SqliteConnection};
 
@@ -152,6 +176,22 @@ mod tests {
         found.is_some()
     }
 
+    async fn connection_at_version_two() -> SqliteConnection {
+        let mut connection = connection_at_version_one().await;
+        for statement in VERSION_TWO_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        connection
+    }
+
     async fn connection_at_version_one() -> SqliteConnection {
         let mut connection = connection().await;
         for statement in VERSION_ONE_STATEMENTS {
@@ -180,6 +220,48 @@ mod tests {
         }
         migrate(&mut connection).await.unwrap();
         assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        // Any token row written without the column is final: that keeps a
+        // version 2 database's paired Machines working after the upgrade.
+        sqlx::query(
+            "INSERT INTO computer_tokens (token_hash, computer_id, created_at) \
+             VALUES (x'00', 'legacy', 0)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let finalized: i64 = sqlx::query_scalar(
+            "SELECT finalized FROM computer_tokens WHERE computer_id = 'legacy'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(finalized, 1);
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_two_database_and_keeps_its_tokens_final() {
+        let mut connection = connection_at_version_two().await;
+        sqlx::query(
+            "INSERT INTO computer_tokens (token_hash, computer_id, created_at) \
+             VALUES (x'00', 'computer', 0)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        let finalized: i64 = sqlx::query_scalar(
+            "SELECT finalized FROM computer_tokens WHERE computer_id = 'computer'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(
+            finalized, 1,
+            "a token written before the column existed was already final"
+        );
     }
 
     #[tokio::test]
@@ -208,7 +290,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_database_from_a_newer_build() {
         let mut connection = connection().await;
-        sqlx::query("PRAGMA user_version = 3")
+        sqlx::query("PRAGMA user_version = 4")
             .execute(&mut connection)
             .await
             .unwrap();
@@ -218,7 +300,7 @@ mod tests {
         assert!(matches!(
             error,
             Err(SchemaError::TooNew {
-                found: 3,
+                found: 4,
                 supported: SCHEMA_VERSION
             })
         ));

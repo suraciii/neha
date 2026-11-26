@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -50,6 +51,35 @@ const PAIR_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// How long a cancelled action may take to end before its task is dropped.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// How many frames may wait in one direction of one channel.
+const CHANNEL_QUEUE: usize = 64;
+/// How long one socket write may take before the channel is dropped.
+///
+/// Ten seconds in a release build; the test build uses a short limit so a
+/// Space that stopped reading is disconnected without slowing the suite.
+const CHANNEL_WRITE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(250)
+} else {
+    Duration::from_secs(10)
+};
+/// How many unprocessed bytes may wait toward the worker (inbound).
+///
+/// Two File limits in release. The test build uses a smaller sum so the budget
+/// path is exercised cheaply.
+const INBOUND_QUEUE_BYTES: usize = if cfg!(test) {
+    1 << 20
+} else {
+    2 * (neha::file::MAX_FILE_BYTES as usize)
+};
+/// How many unprocessed bytes may wait toward the socket (outbound).
+///
+/// Two File limits in release. The test build keeps a cap above the socket
+/// buffers a test can fill, so the write-deadline path stays reachable.
+const OUTBOUND_QUEUE_BYTES: usize = if cfg!(test) {
+    32 << 20
+} else {
+    2 * (neha::file::MAX_FILE_BYTES as usize)
+};
 
 /// What a paired machine remembers between starts.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +267,12 @@ async fn connect_and_serve(config: &Config, hidden: &[PathBuf], runtimes: Runtim
 
 /// Serves one open channel: reads frames, runs them one at a time, and kills
 /// the running action as soon as the Space goes away.
+///
+/// Both directions are bounded and byte-budgeted. A Space that stops reading,
+/// or sends faster than this machine can run, can only fill a queue; when a
+/// queue or a budget fills, the channel is treated as broken and dropped, and
+/// the worker's action dies with it. Socket writes have a deadline for the
+/// same reason.
 async fn serve_channel(
     config: &Config,
     hidden: &[PathBuf],
@@ -244,45 +280,83 @@ async fn serve_channel(
     runtimes: Runtimes,
 ) -> Result<()> {
     let (sink, stream) = socket.split();
-    let (answers, mut outgoing) = mpsc::unbounded_channel::<DeviceFrame>();
-    let mut writer = tokio::spawn(async move {
-        let mut sink = sink;
-        while let Some(frame) = outgoing.recv().await {
-            let Ok(text) = serde_json::to_string(&frame) else {
-                break;
-            };
-            if sink.send(Message::Text(text.into())).await.is_err() {
-                break;
+    let (stop, _) = watch::channel(false);
+    let outbound_bytes = Arc::new(AtomicUsize::new(0));
+    let (answers, mut outgoing) = mpsc::channel::<(String, usize)>(CHANNEL_QUEUE);
+    let mut writer = tokio::spawn({
+        let outbound_bytes = Arc::clone(&outbound_bytes);
+        let stop = stop.clone();
+        async move {
+            let mut sink = sink;
+            while let Some((text, size)) = outgoing.recv().await {
+                // A Space that never drains its socket must not pin this task
+                // (or the answers behind it) forever.
+                let sent = tokio::time::timeout(
+                    CHANNEL_WRITE_TIMEOUT,
+                    sink.send(Message::Text(text.into())),
+                )
+                .await;
+                if !matches!(sent, Ok(Ok(()))) {
+                    let _ = stop.send(true);
+                    break;
+                }
+                release_bytes(&outbound_bytes, size);
             }
         }
     });
 
-    let (frames, mut incoming) = mpsc::unbounded_channel::<HostFrame>();
+    let (frames, mut incoming) = mpsc::channel::<(HostFrame, usize)>(CHANNEL_QUEUE);
+    let inbound_bytes = Arc::new(AtomicUsize::new(0));
     // The runtime whose action is running, so the reader can kill it without
     // waiting for `execute` to return.
     let current: Arc<Mutex<Option<Arc<LocalRuntime>>>> = Arc::new(Mutex::new(None));
-    let (stop, mut stopped) = watch::channel(false);
 
     let reader = tokio::spawn({
         let current = Arc::clone(&current);
-        let stop = stop.clone();
         let answers = answers.clone();
+        let frames = frames.clone();
+        let inbound_bytes = Arc::clone(&inbound_bytes);
+        let outbound_bytes = Arc::clone(&outbound_bytes);
+        let stop = stop.clone();
+        let mut stopped = stop.subscribe();
         async move {
             let mut stream = stream;
             let result = loop {
-                match stream.next().await {
+                let message = tokio::select! {
+                    biased;
+                    _ = stopped.changed() => break Err(anyhow::anyhow!(
+                        "the channel writer stopped"
+                    )),
+                    message = stream.next() => message,
+                };
+                match message {
                     Some(Ok(Message::Text(text))) => {
                         match serde_json::from_str::<HostFrame>(text.as_str()) {
                             // A heartbeat needs no Computer work and must not
-                            // queue behind a running action.
+                            // wait on a full queue.
                             Ok(HostFrame::Ping) => {
-                                if answers.send(DeviceFrame::Pong).is_err() {
-                                    break Err(anyhow::anyhow!("the channel writer stopped"));
+                                let Ok(text) = serde_json::to_string(&DeviceFrame::Pong) else {
+                                    break Err(anyhow::anyhow!("cannot write a heartbeat"));
+                                };
+                                let size = text.len();
+                                if within_byte_budget(&outbound_bytes, OUTBOUND_QUEUE_BYTES, size)
+                                    && answers.try_send((text, size)).is_err()
+                                {
+                                    release_bytes(&outbound_bytes, size);
                                 }
                             }
                             Ok(frame) => {
-                                if frames.send(frame).is_err() {
-                                    break Err(anyhow::anyhow!("the channel worker stopped"));
+                                let size = text.len();
+                                if !within_byte_budget(&inbound_bytes, INBOUND_QUEUE_BYTES, size) {
+                                    break Err(anyhow::anyhow!(
+                                        "the Space is sending more than this Computer can run"
+                                    ));
+                                }
+                                if frames.try_send((frame, size)).is_err() {
+                                    release_bytes(&inbound_bytes, size);
+                                    break Err(anyhow::anyhow!(
+                                        "the Space is sending frames faster than this Computer runs them"
+                                    ));
                                 }
                             }
                             Err(_) => {
@@ -326,6 +400,10 @@ async fn serve_channel(
         let runtimes = Arc::clone(&runtimes);
         let current = Arc::clone(&current);
         let answers = answers.clone();
+        let inbound_bytes = Arc::clone(&inbound_bytes);
+        let outbound_bytes = Arc::clone(&outbound_bytes);
+        let stop = stop.clone();
+        let mut stopped = stop.subscribe();
         async move {
             loop {
                 if *stopped.borrow() {
@@ -334,7 +412,8 @@ async fn serve_channel(
                 tokio::select! {
                     biased;
                     _ = stopped.changed() => break,
-                    Some(frame) = incoming.recv() => {
+                    frame = incoming.recv() => {
+                        let Some((frame, size)) = frame else { break; };
                         let answer = tokio::select! {
                             biased;
                             _ = stopped.changed() => None,
@@ -342,13 +421,24 @@ async fn serve_channel(
                                 Some(answer)
                             }
                         };
+                        release_bytes(&inbound_bytes, size);
                         let Some(answer) = answer else { break; };
-                        if answers.send(answer).is_err() {
+                        let Ok(text) = serde_json::to_string(&answer) else { break; };
+                        let size = text.len();
+                        // The answer queue is bounded too: a Space that stopped
+                        // reading cannot make the worker buffer output forever.
+                        if !within_byte_budget(&outbound_bytes, OUTBOUND_QUEUE_BYTES, size) {
+                            let _ = stop.send(true);
+                            break;
+                        }
+                        if answers.send((text, size)).await.is_err() {
+                            let _ = stop.send(true);
                             break;
                         }
                     }
                 }
             }
+            let _ = stop.send(true);
             // The second half of the cancellation: a frame that was starting
             // while the reader cancelled may have spawned a shell after it.
             if let Ok(runtimes) = runtimes.lock() {
@@ -386,6 +476,30 @@ async fn serve_channel(
     }
 
     reader_result
+}
+
+/// Counts `size` unprocessed bytes in one direction, returning false when the
+/// queue's byte budget would be exceeded.
+fn within_byte_budget(counted: &AtomicUsize, budget: usize, size: usize) -> bool {
+    let held = counted.fetch_add(size, Ordering::SeqCst) + size;
+    if held > budget {
+        counted.fetch_sub(size, Ordering::SeqCst);
+        return false;
+    }
+
+    true
+}
+
+/// Removes processed bytes from a direction's backlog counter.
+fn release_bytes(counted: &AtomicUsize, size: usize) {
+    let mut held = counted.load(Ordering::SeqCst);
+    loop {
+        let next = held.saturating_sub(size);
+        match counted.compare_exchange(held, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(actual) => held = actual,
+        }
+    }
 }
 
 /// Answers one frame from the Space.
@@ -697,6 +811,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use futures_util::{SinkExt as _, StreamExt as _};
     use neha::id::Id;
@@ -706,9 +821,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        Config, Runtimes, decode_bytes, default_workspace_from, encode_bytes, execute_frame,
-        folder_for, home_from, normalized_space_url, refuse_workspace, secret, serve_channel,
-        socket_url, space_url, write_receipt,
+        Config, Runtimes, Socket, decode_bytes, default_workspace_from, encode_bytes,
+        execute_frame, folder_for, home_from, normalized_space_url, refuse_workspace, secret,
+        serve_channel, socket_url, space_url, write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -1084,6 +1199,263 @@ mod tests {
             !folder.join("second").exists(),
             "a frame queued behind the killed action never starts"
         );
+        let _ = space.await;
+    }
+
+    /// The accepting side of a fake Space's channel.
+    type SpaceSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+    /// Starts a fake Space's listener on loopback.
+    async fn space_listener() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        (listener, address)
+    }
+
+    /// Accepts the daemon's channel and reads its greeting.
+    async fn accept_space(listener: tokio::net::TcpListener) -> SpaceSocket {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let greeting = socket.next().await.unwrap().unwrap();
+        assert!(matches!(greeting, Message::Text(_)));
+
+        socket
+    }
+
+    /// Connects the daemon end of the channel and announces this Computer.
+    async fn connect_daemon(address: std::net::SocketAddr, workspace: &Path) -> Socket {
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{address}/api/computer/socket"))
+                .await
+                .unwrap();
+        let hello = DeviceFrame::Hello {
+            version: CHANNEL_VERSION,
+            computer: "01890a5d-ac96-774b-bcce-b302099a8057".to_owned(),
+            workspace: workspace.to_string_lossy().into_owned(),
+            sandbox: true,
+        };
+        socket
+            .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+            .await
+            .unwrap();
+
+        socket
+    }
+
+    /// Sends one frame as the Space would.
+    async fn send_space_frame(socket: &mut SpaceSocket, frame: HostFrame) {
+        socket
+            .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+            .await
+            .unwrap();
+    }
+
+    /// A workspace holding one managed Bot runtime, ready for the daemon.
+    fn managed_bot(workspace: &Path, bot: Id) -> (PathBuf, Runtimes) {
+        let folder = workspace.join(bot.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        let runtime = LocalRuntime::new(&folder).unwrap();
+        let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::from([(
+            bot.to_string(),
+            Arc::new(runtime),
+        )])));
+
+        (folder, runtimes)
+    }
+
+    fn channel_config(workspace: &Path) -> Config {
+        Config {
+            workspace: workspace.to_path_buf(),
+            ..config_at(workspace.to_path_buf())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_that_sends_faster_than_the_worker_is_disconnected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        let config = channel_config(workspace.path());
+        let (listener, address) = space_listener().await;
+        let space = tokio::spawn({
+            let folder = folder.clone();
+            async move {
+                let mut socket = accept_space(listener).await;
+                // One action keeps the worker busy while the Space floods the
+                // channel with frames it cannot run yet.
+                send_space_frame(
+                    &mut socket,
+                    HostFrame::Action {
+                        id: 1,
+                        bot: bot.to_string(),
+                        action: WireAction::Shell {
+                            command: format!(
+                                "sleep 0.5; echo done > {}",
+                                folder.join("done").display()
+                            ),
+                        },
+                    },
+                )
+                .await;
+                for id in 2..=200 {
+                    let frame = HostFrame::Action {
+                        id,
+                        bot: "not a bot".to_owned(),
+                        action: WireAction::Shell {
+                            command: "true".to_owned(),
+                        },
+                    };
+                    if socket
+                        .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        let daemon = connect_daemon(address, workspace.path()).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_channel(&config, &[], daemon, runtimes),
+        )
+        .await
+        .expect("a flooding Space must not hang the daemon")
+        .expect_err("a flooding Space is disconnected");
+        assert!(error.to_string().contains("faster"), "{error}");
+
+        space.abort();
+        // The action the abandoned channel was running is killed.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !folder.join("done").exists(),
+            "an abandoned action is killed with its channel"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_that_sends_huge_frames_is_disconnected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        let config = channel_config(workspace.path());
+        let (listener, address) = space_listener().await;
+        let space = tokio::spawn({
+            let folder = folder.clone();
+            async move {
+                let mut socket = accept_space(listener).await;
+                send_space_frame(
+                    &mut socket,
+                    HostFrame::Action {
+                        id: 1,
+                        bot: bot.to_string(),
+                        action: WireAction::Shell {
+                            command: format!(
+                                "sleep 0.5; echo done > {}",
+                                folder.join("done").display()
+                            ),
+                        },
+                    },
+                )
+                .await;
+                // Each frame alone fits; together they exceed the byte budget
+                // long before the worker can run them.
+                let huge = "x".repeat(600 * 1024);
+                for id in 2..=4 {
+                    let frame = HostFrame::Action {
+                        id,
+                        bot: "not a bot".to_owned(),
+                        action: WireAction::Shell {
+                            command: huge.clone(),
+                        },
+                    };
+                    send_space_frame(&mut socket, frame).await;
+                }
+            }
+        });
+        let daemon = connect_daemon(address, workspace.path()).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_channel(&config, &[], daemon, runtimes),
+        )
+        .await
+        .expect("a Space stuffing huge frames must not hang the daemon")
+        .expect_err("a Space stuffing huge frames is disconnected");
+        assert!(error.to_string().contains("more than"), "{error}");
+
+        space.abort();
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(
+            !folder.join("done").exists(),
+            "an abandoned action is killed with its channel"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_that_stops_reading_is_disconnected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        std::fs::write(folder.join("big.bin"), vec![7_u8; 4 * 1024 * 1024]).unwrap();
+        let config = channel_config(workspace.path());
+        let (listener, address) = space_listener().await;
+        let space = tokio::spawn({
+            async move {
+                let mut socket = accept_space(listener).await;
+                for id in 1..=5 {
+                    send_space_frame(
+                        &mut socket,
+                        HostFrame::Read {
+                            id,
+                            bot: bot.to_string(),
+                            path: "big.bin".to_owned(),
+                        },
+                    )
+                    .await;
+                }
+                // This Space never reads an answer.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+        let daemon = connect_daemon(address, workspace.path()).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            serve_channel(&config, &[], daemon, runtimes),
+        )
+        .await
+        .expect("a Space that stops reading must not hang the daemon")
+        .expect_err("a Space that stops reading is disconnected");
+        assert!(error.to_string().contains("writer"), "{error}");
+
+        space.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_space_that_stops_sending_ends_the_channel() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = channel_config(workspace.path());
+        let (listener, address) = space_listener().await;
+        let space = tokio::spawn(async move {
+            let socket = accept_space(listener).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(socket);
+        });
+        let daemon = connect_daemon(address, workspace.path()).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_channel(&config, &[], daemon, empty_runtimes()),
+        )
+        .await
+        .expect("a quiet Space must not hang the daemon")
+        .expect_err("a closed channel ends the session");
+        assert!(error.to_string().contains("closed"), "{error}");
+
         let _ = space.await;
     }
 }

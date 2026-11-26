@@ -296,13 +296,13 @@ impl Identity {
 
     /// Claims a pairing for a User before the Computer is recorded.
     ///
-    /// One atomic update wins the code: `owner IS NULL` is the compare-and-set
-    /// that stops two Users from claiming the same machine. The claim is not
-    /// yet final: no Computer token exists, so the machine keeps polling
-    /// pending. The caller records the Computer, then
-    /// [`finalize_pairing`](Self::finalize_pairing); if the record write fails
-    /// it calls [`release_pairing`](Self::release_pairing) so the code works
-    /// again.
+    /// One transaction wins the code (`owner IS NULL` is the compare-and-set
+    /// that stops two Users from claiming the same machine) and reserves the
+    /// machine's token row, unfinalized. The token's primary key is then the
+    /// database's word that no other Computer can take it, and the machine
+    /// keeps polling pending. The caller records the Computer and
+    /// [`finalize_pairing`](Self::finalize_pairing); if either fails it calls
+    /// [`release_pairing`](Self::release_pairing) so the code works again.
     pub async fn reserve_pairing(
         &self,
         code: &str,
@@ -312,11 +312,12 @@ impl Identity {
         self.reserve_pairing_at(now(), code, owner, computer).await
     }
 
-    /// Finishes a claim by recording the machine's token digest.
+    /// Finishes a claim by marking the reserved token final.
     ///
     /// Returns `false` when the claim is gone (rolled back by a failed
     /// command, or by the start-up reconciliation). Idempotent: calling it
-    /// again for the same Computer keeps one token row.
+    /// again for the same Computer keeps one final token row. A pre-v3 claim
+    /// has no reserved row, so this writes the final one to heal it.
     pub async fn finalize_pairing(&self, owner: Id, computer: Id) -> Result<bool, IdentityError> {
         self.finalize_pairing_at(now(), owner, computer).await
     }
@@ -360,7 +361,8 @@ impl Identity {
         let rows = sqlx::query(
             "SELECT c.owner, c.computer, \
              EXISTS(SELECT 1 FROM computer_tokens t \
-                    WHERE t.token_hash = c.token_hash AND t.computer_id = c.computer) AS finalized \
+                    WHERE t.token_hash = c.token_hash AND t.computer_id = c.computer \
+                      AND t.finalized = 1) AS finalized \
              FROM computer_codes c WHERE c.owner IS NOT NULL",
         )
         .fetch_all(&self.pool)
@@ -385,11 +387,12 @@ impl Identity {
     /// Returns the Computer a machine token belongs to.
     pub async fn authenticate_computer(&self, token: &str) -> Result<Option<Id>, IdentityError> {
         let digest = digest(token);
-        let computer: Option<String> =
-            sqlx::query_scalar("SELECT computer_id FROM computer_tokens WHERE token_hash = ?")
-                .bind(digest.as_slice())
-                .fetch_optional(&self.pool)
-                .await?;
+        let computer: Option<String> = sqlx::query_scalar(
+            "SELECT computer_id FROM computer_tokens WHERE token_hash = ? AND finalized = 1",
+        )
+        .bind(digest.as_slice())
+        .fetch_optional(&self.pool)
+        .await?;
 
         computer
             .map(|computer| computer.parse().map_err(|_| IdentityError::Corrupt))
@@ -522,7 +525,7 @@ impl Identity {
                 // finalized the pairing.
                 let finalized: bool = sqlx::query_scalar(
                     "SELECT EXISTS(SELECT 1 FROM computer_tokens \
-                     WHERE token_hash = ? AND computer_id = ?)",
+                     WHERE token_hash = ? AND computer_id = ? AND finalized = 1)",
                 )
                 .bind(token_hash.as_slice())
                 .bind(computer.to_string())
@@ -582,8 +585,9 @@ impl Identity {
         computer: Id,
     ) -> Result<bool, IdentityError> {
         let code_hash = digest(&normalize_code(code));
-        // The compare-and-set is the whole claim: one update wins the row, and
-        // no other statement can run between the check and the write.
+        let mut transaction = self.pool.begin().await?;
+        // The compare-and-set is the claim: one update wins the row, and no
+        // other statement can run between the check and the write.
         let updated = sqlx::query(
             "UPDATE computer_codes SET owner = ?, computer = ? \
              WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
@@ -593,10 +597,47 @@ impl Identity {
         .bind(code_hash.as_slice())
         .bind(now)
         .bind(MAX_CODE_TRIES)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        if updated.rows_affected() != 1 {
+            transaction.rollback().await?;
+            return Ok(false);
+        }
+        let token_hash: Vec<u8> = sqlx::query_scalar(
+            "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
+        )
+        .bind(owner.to_string())
+        .bind(computer.to_string())
+        .fetch_one(&mut *transaction)
+        .await?;
+        // Reserve the machine's token here, before the Computer is published.
+        // The primary key is the uniqueness constraint: if the token already
+        // belongs to another claim or Computer, the reserve fails and the
+        // whole claim rolls back, so no Computer can be recorded with a token
+        // it cannot own.
+        let inserted = sqlx::query(
+            "INSERT INTO computer_tokens (token_hash, computer_id, created_at, finalized) \
+             VALUES (?, ?, ?, 0)",
+        )
+        .bind(token_hash.as_slice())
+        .bind(computer.to_string())
+        .bind(now)
+        .execute(&mut *transaction)
+        .await;
+        match inserted {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                transaction.rollback().await?;
+                return Err(IdentityError::TokenTaken);
+            }
+            Err(error) => {
+                transaction.rollback().await?;
+                return Err(error.into());
+            }
+        }
+        transaction.commit().await?;
 
-        Ok(updated.rows_affected() == 1)
+        Ok(true)
     }
 
     async fn finalize_pairing_at(
@@ -617,28 +658,45 @@ impl Identity {
             transaction.rollback().await?;
             return Ok(false);
         };
-        let inserted = sqlx::query(
-            "INSERT INTO computer_tokens (token_hash, computer_id, created_at) \
-             VALUES (?, ?, ?) ON CONFLICT(token_hash) DO NOTHING",
+        let updated = sqlx::query(
+            "UPDATE computer_tokens SET finalized = 1 WHERE token_hash = ? AND computer_id = ?",
         )
         .bind(token_hash.as_slice())
         .bind(computer.to_string())
-        .bind(now)
         .execute(&mut *transaction)
-        .await?
-        .rows_affected();
-        if inserted != 1 {
-            // Either this Computer already holds the token (the call is
-            // idempotent) or another Computer does. The latter is refused
-            // without saying which Computer has it.
+        .await?;
+        if updated.rows_affected() == 0 {
+            // No token row: either this claim predates the reserve (a version
+            // 2 database's crash window) or the token belongs to another
+            // Computer. The latter is refused without saying which.
             let bound: Option<String> =
                 sqlx::query_scalar("SELECT computer_id FROM computer_tokens WHERE token_hash = ?")
                     .bind(token_hash.as_slice())
                     .fetch_optional(&mut *transaction)
                     .await?;
-            if bound.as_deref() != Some(computer.to_string().as_str()) {
-                transaction.rollback().await?;
-                return Err(IdentityError::ClaimNotFinishable);
+            match bound.as_deref() {
+                None => {
+                    let recovered = sqlx::query(
+                        "INSERT INTO computer_tokens \
+                         (token_hash, computer_id, created_at, finalized) \
+                         VALUES (?, ?, ?, 1) ON CONFLICT(token_hash) DO NOTHING",
+                    )
+                    .bind(token_hash.as_slice())
+                    .bind(computer.to_string())
+                    .bind(now)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                    if recovered != 1 {
+                        transaction.rollback().await?;
+                        return Err(IdentityError::ClaimNotFinishable);
+                    }
+                }
+                Some(bound) if bound == computer.to_string() => {}
+                Some(_) => {
+                    transaction.rollback().await?;
+                    return Err(IdentityError::ClaimNotFinishable);
+                }
             }
         }
         transaction.commit().await?;
@@ -792,6 +850,9 @@ pub enum IdentityError {
     /// already belongs to another Computer.
     #[error("the pairing claim cannot be finished")]
     ClaimNotFinishable,
+    /// The machine's token already belongs to another claim or Computer.
+    #[error("the machine token is already in use")]
+    TokenTaken,
 }
 
 #[cfg(test)]
@@ -818,7 +879,7 @@ mod tests {
     /// Claims and finishes a pairing the way the command does, for tests that
     /// only need a bonded Computer.
     ///
-    /// The command's real order is reserve, append, finalize; these tests have
+    /// The command's real order is reserve, finalize, append; these tests have
     /// no record to append, so the two identity steps run together.
     trait ClaimPairing {
         async fn claim_pairing(
@@ -1025,13 +1086,20 @@ mod tests {
                 .unwrap()
         );
 
-        // The code is consumed, but the machine may not act yet: nothing has
-        // recorded its Computer and no token row exists.
+        // The code is consumed and the token row is reserved, but not final:
+        // the machine may not act yet.
         assert_eq!(
             identity.pairing(&start.device, "poll").await.unwrap(),
             Some(PairingState::Pending)
         );
         assert_eq!(identity.authenticate_computer("token").await.unwrap(), None);
+        let finalized: i64 =
+            sqlx::query_scalar("SELECT finalized FROM computer_tokens WHERE computer_id = ?")
+                .bind(computer.to_string())
+                .fetch_one(&identity.pool)
+                .await
+                .unwrap();
+        assert_eq!(finalized, 0, "the reserve writes the token unfinalized");
         assert_eq!(
             identity.pairing_claims().await.unwrap(),
             vec![PairingClaim {
@@ -1042,6 +1110,13 @@ mod tests {
         );
 
         assert!(identity.finalize_pairing(owner, computer).await.unwrap());
+        let finalized: i64 =
+            sqlx::query_scalar("SELECT finalized FROM computer_tokens WHERE computer_id = ?")
+                .bind(computer.to_string())
+                .fetch_one(&identity.pool)
+                .await
+                .unwrap();
+        assert_eq!(finalized, 1);
         assert_eq!(
             identity.pairing(&start.device, "poll").await.unwrap(),
             Some(PairingState::Approved { computer })
@@ -1374,7 +1449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_finalized_pairing_does_not_steal_another_computers_token() {
+    async fn a_token_held_by_another_computer_cannot_be_reserved() {
         let (_dir, _home, identity) = identity().await;
         let first = identity
             .begin_pairing("laptop", "/ws", "shared-token", "poll")
@@ -1392,21 +1467,30 @@ mod tests {
             .begin_pairing("desktop", "/ws", "shared-token", "poll")
             .await
             .unwrap();
-        let second_computer = Id::new();
         let owner = Id::new();
-        assert!(
-            identity
-                .reserve_pairing(&second.code, owner, second_computer)
-                .await
-                .unwrap()
-        );
+        let second_computer = Id::new();
         assert!(
             matches!(
-                identity.finalize_pairing(owner, second_computer).await,
-                Err(IdentityError::ClaimNotFinishable)
+                identity
+                    .reserve_pairing(&second.code, owner, second_computer)
+                    .await,
+                Err(IdentityError::TokenTaken)
             ),
-            "a token already bound to another Computer cannot be reused"
+            "the token's primary key reserves it for one Computer only"
         );
+        // A failed reserve rolls the claim back: the second code stays usable
+        // and no half-claim is left behind.
+        assert_eq!(
+            identity.pairing(&second.device, "poll").await.unwrap(),
+            Some(PairingState::Pending)
+        );
+        let secondary: Option<String> =
+            sqlx::query_scalar("SELECT owner FROM computer_codes WHERE device_id = ?")
+                .bind(&second.device)
+                .fetch_one(&identity.pool)
+                .await
+                .unwrap();
+        assert_eq!(secondary, None, "the losing reserve leaves no claim");
         assert_eq!(
             identity
                 .authenticate_computer("shared-token")
@@ -1414,6 +1498,47 @@ mod tests {
                 .unwrap(),
             Some(first_computer),
             "the first Computer keeps its token"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reserved_token_cannot_be_reserved_by_another_claim() {
+        let (_dir, _home, identity) = identity().await;
+        let first = identity
+            .begin_pairing("laptop", "/ws", "token", "poll-one")
+            .await
+            .unwrap();
+        let second = identity
+            .begin_pairing("desktop", "/ws", "token", "poll-two")
+            .await
+            .unwrap();
+        let owner = Id::new();
+        let computer = Id::new();
+        assert!(
+            identity
+                .reserve_pairing(&first.code, owner, computer)
+                .await
+                .unwrap()
+        );
+
+        let other_owner = Id::new();
+        let other_computer = Id::new();
+        assert!(
+            matches!(
+                identity
+                    .reserve_pairing(&second.code, other_owner, other_computer)
+                    .await,
+                Err(IdentityError::TokenTaken)
+            ),
+            "an unfinalized reservation already owns the token"
+        );
+        assert_eq!(
+            identity.pairing_claims().await.unwrap(),
+            vec![PairingClaim {
+                owner,
+                computer,
+                finalized: false,
+            }]
         );
     }
 
@@ -1760,5 +1885,64 @@ mod tests {
             identity.authenticate("legacy-token").await.unwrap(),
             Some(account)
         );
+    }
+
+    async fn version_two_database(path: &std::path::Path, token: &str, computer: Id) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true);
+        let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
+        for statement in crate::schema::VERSION_ONE_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        for statement in crate::schema::VERSION_TWO_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 2")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        let token_hash = digest(token);
+        sqlx::query(
+            "INSERT INTO computer_tokens (token_hash, computer_id, created_at) \
+             VALUES (?, ?, 0)",
+        )
+        .bind(token_hash.as_slice())
+        .bind(computer.to_string())
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        connection.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn opening_a_version_two_database_keeps_paired_computers_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let computer = Id::new();
+        version_two_database(&home.db_path(), "paired-token", computer).await;
+
+        let identity = Identity::open(&home).await.unwrap();
+
+        assert_eq!(
+            identity
+                .authenticate_computer("paired-token")
+                .await
+                .unwrap(),
+            Some(computer),
+            "a token written before schema version 3 still authenticates"
+        );
+        let finalized: i64 = sqlx::query_scalar("SELECT finalized FROM computer_tokens")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(finalized, 1, "the migration marks old tokens final");
     }
 }
