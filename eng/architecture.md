@@ -116,6 +116,7 @@ Shared dependency versions are declared once in the root `[workspace.dependencie
 | CLI | [product](../specs/cli/product.md) | [design](../specs/cli/design.md) |
 | Board | [product](../specs/board/product.md) | |
 | Messaging | [chat](../specs/messaging/chat/product.md), [group](../specs/messaging/group/product.md), [message](../specs/messaging/message/product.md), [notification](../specs/messaging/notification/product.md), [search](../specs/messaging/search/product.md) | |
+| Client | [product](../specs/client/product.md) | [design](../specs/client/design.md) |
 
 ## Ownership
 

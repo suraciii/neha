@@ -29,6 +29,9 @@ enum Top {
         /// The loopback port; 0 picks a free one.
         #[arg(long, default_value_t = 7337)]
         port: u16,
+        /// The browser client directory; defaults to NEHA_UI_DIR or ui/dist.
+        #[arg(long)]
+        ui: Option<std::path::PathBuf>,
     },
     /// Join a Space from its invitation link.
     Join {
@@ -165,7 +168,7 @@ enum RunCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     match Cli::parse().command {
-        Top::Serve { port } => serve(port).await,
+        Top::Serve { port, ui } => serve(port, ui).await,
         Top::Join { link, name } => join(&link, &name).await,
         Top::Login { name, server } => login(&name, server).await,
         Top::Whoami => whoami(),
@@ -177,19 +180,46 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(port: u16) -> Result<()> {
+async fn serve(port: u16, ui: Option<std::path::PathBuf>) -> Result<()> {
     let home = Home::from_env()
         .context("NEHA_HOME is not set; set it to the directory that holds this Space")?;
-    let running = neha_space::start(home, port)
+    let ui = ui
+        .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
+        .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
+    if let Some(path) = &ui
+        && !path.join("index.html").is_file()
+    {
+        bail!("the browser client at {} has no index.html", path.display());
+    }
+    let has_ui = ui.is_some();
+    let running = neha_space::start_with_ui(home, port, ui)
         .await
         .context("the Space cannot start")?;
 
     println!("Neha is listening on {}", running.url());
     if let Some(invite) = &running.invite {
         println!("Invite: {invite}");
-        println!("Join with: neha join '{invite}' --name <your name>");
+        if has_ui {
+            if let Some(browser) = running.browser_invite() {
+                println!("Open in a browser: {browser}");
+            }
+            println!("Or join from the CLI: neha join '{invite}' --name <your name>");
+        } else {
+            println!("Join with: neha join '{invite}' --name <your name>");
+            println!("Build ui/ with `pnpm --dir ui build` to use the browser client.");
+        }
+    } else if has_ui {
+        println!("Open {} in a browser.", running.browser_url());
+        println!(
+            "Sign in from the CLI with: neha login --name <name> --server {}",
+            running.url()
+        );
     } else {
-        println!("Sign in with: neha login --name <your name>");
+        println!(
+            "Sign in with: neha login --name <name> --server {}",
+            running.url()
+        );
+        println!("Build ui/ with `pnpm --dir ui build` to use the browser client.");
     }
     println!("Press Ctrl-C to stop.");
 

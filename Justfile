@@ -20,6 +20,15 @@ clippy:
 test:
     cargo test --locked --workspace
 
+# Install the browser client's locked dependencies.
+ui-deps:
+    pnpm --dir ui install --frozen-lockfile
+
+# Check and build the browser client.
+ui-check: ui-deps
+    pnpm --dir ui run check
+    pnpm --dir ui run build
+
 # Build the documentation; any rustdoc warning fails.
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
@@ -40,7 +49,7 @@ check-specs-tests:
     python3 scripts/test_check_specs.py
 
 # The full gate. Pull requests and main run the same recipes.
-ci: check-python-cache check-python check-specs fmt check clippy test doc
+ci: check-python-cache check-python check-specs fmt check clippy test doc ui-check
 
 # Run the gate and retain source provenance, output, and exit status.
 verify evidence_dir:
