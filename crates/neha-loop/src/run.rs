@@ -395,6 +395,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_tool_call_in_a_step_runs_and_returns() {
+        let calls = Ok(ModelReply {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "write_file".to_owned(),
+                    arguments: json!({"path": "a.txt", "content": "a"}).to_string(),
+                },
+                ToolCall {
+                    id: "call-2".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: json!({"path": "a.txt"}).to_string(),
+                },
+            ],
+            usage: Usage {
+                output: 2,
+                ..Usage::default()
+            },
+        });
+        let model = FakeModel::with(vec![calls, reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.succeeded);
+        assert_eq!(recorder.started.len(), 2);
+        assert_eq!(recorder.finished.len(), 2);
+        let requests = model.requests.lock().unwrap();
+        let tool_messages = requests[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == crate::model::Role::Tool)
+            .count();
+        assert_eq!(tool_messages, 2);
+        assert_eq!(
+            requests[1].messages.last().unwrap().tool_call_id.as_deref(),
+            Some("call-2")
+        );
+    }
+
+    #[tokio::test]
     async fn a_model_failure_becomes_a_failure_message() {
         let model = FakeModel::with(vec![Err(ModelFailure {
             code: neha::error::ErrorCode::Unavailable,
