@@ -253,8 +253,7 @@ export class Commands {
             this.following?.handlers.onError?.(
               new ProtocolError(frame.code ?? "error", frame.message ?? "The subscription failed."),
             );
-            this.following = null;
-            this.rejectAll(new ProtocolError(frame.code ?? "error", frame.message ?? "The subscription failed."));
+            // Keep the subscription so the close schedules a resume from the cursor.
             socket.close();
             return;
           }

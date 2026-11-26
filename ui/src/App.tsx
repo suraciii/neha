@@ -76,8 +76,7 @@ export default function App() {
       if (current === next) return;
       if (current && next && "text" in current && "text" in next) {
         if (current.text === next.text && current.file === next.file) return;
-        current.text = next.text;
-        current.file = next.file;
+        draft.previews[chatId] = { text: next.text, file: next.file };
         return;
       }
       if (current && next && "error" in current && "error" in next) return;

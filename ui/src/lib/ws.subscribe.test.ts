@@ -132,6 +132,31 @@ describe("record subscription", () => {
     await commands.close();
   });
 
+  it("reconnects after an id-less subscription error", async () => {
+    vi.useFakeTimers();
+    try {
+      vi.stubGlobal("WebSocket", FakeSocket);
+      const handlers: SubscriptionHandlers = { onSnapshot: vi.fn(), onError: vi.fn() };
+      const commands = new Commands();
+
+      await commands.subscribe(handlers, { cursor: "2" });
+      await Promise.resolve();
+      const first = FakeSocket.instances[0]!;
+      first.message({ type: "error", code: "internal", message: "read failed" });
+
+      await vi.advanceTimersByTimeAsync(1_000);
+      await vi.advanceTimersByTimeAsync(0);
+      const second = FakeSocket.instances[1];
+      expect(second).toBeDefined();
+      expect(second!.sent.find((frame) => frame.type === "subscribe")).toMatchObject({
+        cursor: "5",
+      });
+      await commands.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("resubscribes from the last cursor after the socket closes", async () => {
     vi.useFakeTimers();
     try {

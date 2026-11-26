@@ -296,6 +296,52 @@ describe("App with Files", () => {
     expect(view.container.textContent).not.toContain("old preview");
   });
 
+  it("keeps a live preview when a later load races an existing preview", async () => {
+    space.chats = [space.chat, space.otherChat];
+    space.otherMessages.push({
+      id: "old",
+      chat: "h2",
+      author: { kind: "bot", id: "b1" },
+      acting: "u1",
+      text: "old preview",
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "2",
+      run: null,
+      file: null,
+    });
+    const view = await openChat();
+    await waitFor(() => expect(view.container.textContent).toContain("old preview"));
+
+    let release: (() => void) | undefined;
+    let h2Reads = 0;
+    space.chatDelay = (chatId) => {
+      if (chatId !== "h2") return Promise.resolve();
+      h2Reads += 1;
+      return h2Reads === 1 ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve();
+    };
+    space.handlers?.onEvent?.({
+      seq: "3",
+      kind: "neha.bot.created",
+      version: 1,
+      at: "2026-01-01T00:00:01.000Z",
+      author: { kind: "user", id: "u1" },
+      data: { bot: "b1", chat: "h1", owner: "u1", computer: "p1" },
+    });
+    await waitFor(() => expect(release).toBeDefined());
+    space.handlers?.onEvent?.({
+      seq: "4",
+      kind: "neha.message.added",
+      version: 1,
+      at: "2026-01-01T00:00:02.000Z",
+      author: { kind: "bot", id: "b1" },
+      data: { chat: "h2", text: "new live", file: null, run: null },
+    });
+    release?.();
+
+    await waitFor(() => expect(view.container.textContent).toContain("new live"));
+    expect(view.container.textContent).not.toContain("old preview");
+  });
+
   it("does not unlock the active Chat when another Run finishes", async () => {
     space.messages.push({
       id: "m1",
