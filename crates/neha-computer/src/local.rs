@@ -651,16 +651,16 @@ impl LocalRuntime {
             }
             Mode::Machine { bwrap, folder } => {
                 #[cfg(unix)]
-                let source = folder_mount_source(folder);
+                let source = folder_mount_source();
                 #[cfg(not(unix))]
                 let source = self.root.as_os_str().to_owned();
                 let mut process = sandbox_command(bwrap, &source, &self.root, &self.hidden);
                 // The parent keeps this descriptor close-on-exec, so other
                 // runtimes' folders are never inherited. In the child, after
-                // fork and before exec, clear the flag for this one descriptor
-                // so bwrap can bind `/proc/self/fd/<fd>`: the mount then names
-                // the object this runtime opened, not a path a later rename
-                // could point somewhere else.
+                // fork and before exec, move this runtime's folder descriptor
+                // to a one-digit number and clear its close-on-exec flag, so
+                // bwrap can bind `/proc/self/fd/<fd>` without trusting a path
+                // a later rename could point somewhere else.
                 #[cfg(unix)]
                 {
                     use std::os::fd::AsRawFd as _;
@@ -668,25 +668,35 @@ impl LocalRuntime {
                     let folder_fd = folder.as_raw_fd();
                     // SAFETY: the closure runs in the child between `fork` and
                     // `exec`, where only async-signal-safe calls are allowed;
-                    // `fcntl` is one, it touches only this runtime's own
-                    // descriptor, and it allocates nothing. A failure is
+                    // `dup2` and `fcntl` are, they touch only this child's
+                    // descriptor table, and they allocate nothing. A failure is
                     // returned so `spawn` reports it instead of exec'ing
                     // without the descriptor.
                     unsafe {
                         process.pre_exec(move || {
-                            let cleared = libc::fcntl(folder_fd, libc::F_SETFD, 0);
-                            if cleared < 0 {
+                            if folder_fd != MOUNT_FD && libc::dup2(folder_fd, MOUNT_FD) < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            if libc::fcntl(MOUNT_FD, libc::F_SETFD, 0) < 0 {
                                 return Err(std::io::Error::last_os_error());
                             }
                             Ok(())
                         });
                     }
+                    // The wrapper is our own shell script: it closes the mount
+                    // descriptor first and only then execs the user's command,
+                    // which arrives as a separate argv element and is never
+                    // interpolated into the script.
+                    process
+                        .arg("/bin/sh")
+                        .arg("-c")
+                        .arg(format!("exec {MOUNT_FD}>&-; exec /bin/sh -c \"$1\""))
+                        .arg("neha")
+                        .arg(command);
                 }
-                process
-                    .arg("/bin/sh")
-                    .arg("-c")
-                    .arg(command)
-                    .current_dir(&self.root);
+                #[cfg(not(unix))]
+                process.arg("/bin/sh").arg("-c").arg(command);
+                process.current_dir(&self.root);
                 process
             }
         };
@@ -946,12 +956,18 @@ fn sandbox_args(source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Vec<OsStri
     arguments
 }
 
+/// The one-digit descriptor the shell mounts as the Bot's folder.
+///
+/// POSIX shells only accept a one-digit `IO_NUMBER` (`dash` rejects
+/// `exec 10>&-`), so the child process moves the folder descriptor here before
+/// bwrap starts and the wrapper shell closes it before the user command runs.
+#[cfg(unix)]
+const MOUNT_FD: libc::c_int = 9;
+
 /// Names the opened Bot folder as a path the sandbox can bind.
 #[cfg(unix)]
-fn folder_mount_source(folder: &std::fs::File) -> OsString {
-    use std::os::fd::AsRawFd as _;
-
-    OsString::from(format!("/proc/self/fd/{}", folder.as_raw_fd()))
+fn folder_mount_source() -> OsString {
+    OsString::from(format!("/proc/self/fd/{MOUNT_FD}"))
 }
 
 /// Builds the fenced shell process without starting it.
@@ -3336,14 +3352,20 @@ mod tests {
             let Some(target) = line.split(" -> ").nth(1) else {
                 continue;
             };
-            if target.starts_with("/tmp/") {
-                assert_eq!(
-                    target.trim(),
-                    own.to_string_lossy(),
-                    "the shell inherited a folder it is not mounted for: {text}"
-                );
-            }
+            let target = target.trim();
+            // Only the sandbox's own stdio and /proc enumeration handles may
+            // be open; no host directory, and no mount source descriptor.
+            assert!(
+                target == "/dev/null"
+                    || target.starts_with("pipe:")
+                    || target.starts_with("/proc/"),
+                "the user command inherited a descriptor: {line}"
+            );
         }
+        assert!(
+            !text.contains(own.to_string_lossy().as_ref()),
+            "the Bot's own folder descriptor leaked into the command: {text}"
+        );
         assert!(
             !text.contains(other.to_string_lossy().as_ref()),
             "another Bot's folder leaked into this shell: {text}"
@@ -3366,24 +3388,36 @@ mod tests {
         for _ in 0..2 {
             let result = runtime
                 .execute(Action::Shell {
-                    command: "cat marker.txt && ls -l /proc/self/fd".to_owned(),
+                    command: "cat marker.txt".to_owned(),
                 })
                 .await;
             assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
             assert!(
                 result.output.text.contains("twice"),
-                "{}",
-                result.output.text
-            );
-            assert!(
-                result
-                    .output
-                    .text
-                    .contains(runtime.workspace().to_string_lossy().as_ref()),
-                "the opened folder descriptor is still mounted: {}",
+                "the folder is still mounted on this spawn: {}",
                 result.output.text
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_returns_the_command_exit_code_and_stdout() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let result = runtime
+            .execute(Action::Shell {
+                command: "echo hi; exit 7".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(
+            result.output.text.contains("exit code: 7"),
+            "{}",
+            result.output.text
+        );
+        assert!(result.output.text.contains("hi"), "{}", result.output.text);
     }
 
     #[cfg(unix)]

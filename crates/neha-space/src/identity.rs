@@ -8,6 +8,8 @@
 //! polling secret, the User enters the code, and the Space stores only their
 //! digests.
 
+use std::time::Duration;
+
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -122,7 +124,12 @@ impl Identity {
             .filename(home.db_path())
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal);
+            .synchronous(SqliteSynchronous::Normal)
+            // Pairing writes are short transactions, but two of them can meet
+            // on the writer lock (a claim, a reconciliation, two machines
+            // starting at once). Wait for the other side like the record store
+            // does instead of surfacing SQLITE_BUSY as a 500.
+            .busy_timeout(Duration::from_secs(5));
         let mut connection = sqlx::SqliteConnection::connect_with(&options).await?;
         schema::migrate(&mut connection).await?;
         drop(connection);
@@ -585,59 +592,61 @@ impl Identity {
         computer: Id,
     ) -> Result<bool, IdentityError> {
         let code_hash = digest(&normalize_code(code));
-        let mut transaction = self.pool.begin().await?;
-        // The compare-and-set is the claim: one update wins the row, and no
-        // other statement can run between the check and the write.
-        let updated = sqlx::query(
-            "UPDATE computer_codes SET owner = ?, computer = ? \
-             WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
-        )
-        .bind(owner.to_string())
-        .bind(computer.to_string())
-        .bind(code_hash.as_slice())
-        .bind(now)
-        .bind(MAX_CODE_TRIES)
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() != 1 {
-            transaction.rollback().await?;
-            return Ok(false);
-        }
-        let token_hash: Vec<u8> = sqlx::query_scalar(
-            "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
-        )
-        .bind(owner.to_string())
-        .bind(computer.to_string())
-        .fetch_one(&mut *transaction)
-        .await?;
-        // Reserve the machine's token here, before the Computer is published.
-        // The primary key is the uniqueness constraint: if the token already
-        // belongs to another claim or Computer, the reserve fails and the
-        // whole claim rolls back, so no Computer can be recorded with a token
-        // it cannot own.
-        let inserted = sqlx::query(
-            "INSERT INTO computer_tokens (token_hash, computer_id, created_at, finalized) \
-             VALUES (?, ?, ?, 0)",
-        )
-        .bind(token_hash.as_slice())
-        .bind(computer.to_string())
-        .bind(now)
-        .execute(&mut *transaction)
-        .await;
-        match inserted {
-            Ok(_) => {}
-            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-                transaction.rollback().await?;
-                return Err(IdentityError::TokenTaken);
+        let owner = owner.to_string();
+        let computer = computer.to_string();
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            // The compare-and-set is the claim: one update wins the row, and
+            // no other statement can run between the check and the write.
+            let updated = sqlx::query(
+                "UPDATE computer_codes SET owner = ?, computer = ? \
+                 WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
+            )
+            .bind(&owner)
+            .bind(&computer)
+            .bind(code_hash.as_slice())
+            .bind(now)
+            .bind(MAX_CODE_TRIES)
+            .execute(&mut *connection)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Ok(false);
             }
-            Err(error) => {
-                transaction.rollback().await?;
-                return Err(error.into());
+            let token_hash: Vec<u8> = sqlx::query_scalar(
+                "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
+            )
+            .bind(&owner)
+            .bind(&computer)
+            .fetch_one(&mut *connection)
+            .await?;
+            // Reserve the machine's token here, before the Computer is
+            // published. The primary key is the uniqueness constraint: if the
+            // token already belongs to another claim or Computer, the reserve
+            // fails and the whole claim rolls back, so no Computer can be
+            // recorded with a token it cannot own.
+            let inserted = sqlx::query(
+                "INSERT INTO computer_tokens (token_hash, computer_id, created_at, finalized) \
+                 VALUES (?, ?, ?, 0)",
+            )
+            .bind(token_hash.as_slice())
+            .bind(&computer)
+            .bind(now)
+            .execute(&mut *connection)
+            .await;
+            match inserted {
+                Ok(_) => {}
+                Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                    return Err(IdentityError::TokenTaken);
+                }
+                Err(error) => return Err(error.into()),
             }
-        }
-        transaction.commit().await?;
 
-        Ok(true)
+            Ok(true)
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
     }
 
     async fn finalize_pairing_at(
@@ -646,95 +655,106 @@ impl Identity {
         owner: Id,
         computer: Id,
     ) -> Result<bool, IdentityError> {
-        let mut transaction = self.pool.begin().await?;
-        let token_hash: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
-        )
-        .bind(owner.to_string())
-        .bind(computer.to_string())
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let Some(token_hash) = token_hash else {
-            transaction.rollback().await?;
-            return Ok(false);
-        };
-        let updated = sqlx::query(
-            "UPDATE computer_tokens SET finalized = 1 WHERE token_hash = ? AND computer_id = ?",
-        )
-        .bind(token_hash.as_slice())
-        .bind(computer.to_string())
-        .execute(&mut *transaction)
-        .await?;
-        if updated.rows_affected() == 0 {
-            // No token row: either this claim predates the reserve (a version
-            // 2 database's crash window) or the token belongs to another
-            // Computer. The latter is refused without saying which.
-            let bound: Option<String> =
-                sqlx::query_scalar("SELECT computer_id FROM computer_tokens WHERE token_hash = ?")
-                    .bind(token_hash.as_slice())
-                    .fetch_optional(&mut *transaction)
-                    .await?;
-            match bound.as_deref() {
-                None => {
-                    let recovered = sqlx::query(
-                        "INSERT INTO computer_tokens \
-                         (token_hash, computer_id, created_at, finalized) \
-                         VALUES (?, ?, ?, 1) ON CONFLICT(token_hash) DO NOTHING",
-                    )
-                    .bind(token_hash.as_slice())
-                    .bind(computer.to_string())
-                    .bind(now)
-                    .execute(&mut *transaction)
-                    .await?
-                    .rows_affected();
-                    if recovered != 1 {
-                        transaction.rollback().await?;
-                        return Err(IdentityError::ClaimNotFinishable);
+        let owner = owner.to_string();
+        let computer = computer.to_string();
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            let token_hash: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
+            )
+            .bind(&owner)
+            .bind(&computer)
+            .fetch_optional(&mut *connection)
+            .await?;
+            let Some(token_hash) = token_hash else {
+                return Ok(false);
+            };
+            let updated = sqlx::query(
+                "UPDATE computer_tokens SET finalized = 1 WHERE token_hash = ? AND computer_id = ?",
+            )
+            .bind(token_hash.as_slice())
+            .bind(&computer)
+            .execute(&mut *connection)
+            .await?;
+            if updated.rows_affected() == 0 {
+                // No token row: either this claim predates the reserve (a
+                // version 2 database's crash window) or the token belongs to
+                // another Computer. The latter is refused without saying
+                // which.
+                let bound: Option<String> = sqlx::query_scalar(
+                    "SELECT computer_id FROM computer_tokens WHERE token_hash = ?",
+                )
+                .bind(token_hash.as_slice())
+                .fetch_optional(&mut *connection)
+                .await?;
+                match bound.as_deref() {
+                    None => {
+                        let recovered = sqlx::query(
+                            "INSERT INTO computer_tokens \
+                             (token_hash, computer_id, created_at, finalized) \
+                             VALUES (?, ?, ?, 1) ON CONFLICT(token_hash) DO NOTHING",
+                        )
+                        .bind(token_hash.as_slice())
+                        .bind(&computer)
+                        .bind(now)
+                        .execute(&mut *connection)
+                        .await?
+                        .rows_affected();
+                        if recovered != 1 {
+                            return Err(IdentityError::ClaimNotFinishable);
+                        }
                     }
-                }
-                Some(bound) if bound == computer.to_string() => {}
-                Some(_) => {
-                    transaction.rollback().await?;
-                    return Err(IdentityError::ClaimNotFinishable);
+                    Some(bound) if bound == computer => {}
+                    Some(_) => return Err(IdentityError::ClaimNotFinishable),
                 }
             }
-        }
-        transaction.commit().await?;
 
-        Ok(true)
+            Ok(true)
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
     }
 
     async fn release_pairing_at(&self, owner: Id, computer: Id) -> Result<bool, IdentityError> {
-        let mut transaction = self.pool.begin().await?;
-        let token_hash: Option<Vec<u8>> = sqlx::query_scalar(
-            "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
-        )
-        .bind(owner.to_string())
-        .bind(computer.to_string())
-        .fetch_optional(&mut *transaction)
-        .await?;
-        let Some(token_hash) = token_hash else {
-            transaction.rollback().await?;
-            return Ok(false);
-        };
-        sqlx::query(
-            "UPDATE computer_codes SET owner = NULL, computer = NULL \
-             WHERE owner = ? AND computer = ?",
-        )
-        .bind(owner.to_string())
-        .bind(computer.to_string())
-        .execute(&mut *transaction)
-        .await?;
-        // A claim is only released when its Computer is not recorded, and a
-        // recorded Computer is never released, so a token row here is stale.
-        sqlx::query("DELETE FROM computer_tokens WHERE token_hash = ? AND computer_id = ?")
-            .bind(token_hash.as_slice())
-            .bind(computer.to_string())
-            .execute(&mut *transaction)
+        let owner = owner.to_string();
+        let computer = computer.to_string();
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            let token_hash: Option<Vec<u8>> = sqlx::query_scalar(
+                "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
+            )
+            .bind(&owner)
+            .bind(&computer)
+            .fetch_optional(&mut *connection)
             .await?;
-        transaction.commit().await?;
+            let Some(token_hash) = token_hash else {
+                return Ok(false);
+            };
+            sqlx::query(
+                "UPDATE computer_codes SET owner = NULL, computer = NULL \
+                 WHERE owner = ? AND computer = ?",
+            )
+            .bind(&owner)
+            .bind(&computer)
+            .execute(&mut *connection)
+            .await?;
+            // A claim is only released when its Computer is not recorded, and
+            // a recorded Computer is never released, so a token row here is
+            // stale.
+            sqlx::query("DELETE FROM computer_tokens WHERE token_hash = ? AND computer_id = ?")
+                .bind(token_hash.as_slice())
+                .bind(&computer)
+                .execute(&mut *connection)
+                .await?;
 
-        Ok(true)
+            Ok(true)
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
     }
 
     async fn issue_token(&self, account: Id) -> Result<String, IdentityError> {
@@ -751,6 +771,38 @@ impl Identity {
             .await?;
 
         Ok(token)
+    }
+}
+
+/// Takes the write lock up front for a write transaction.
+///
+/// `sqlx`'s `begin()` starts a deferred transaction. In WAL mode a deferred
+/// transaction that reads first and writes after another writer commits is
+/// refused with SQLITE_BUSY immediately: the busy handler does not retry an
+/// expired snapshot. `BEGIN IMMEDIATE` waits for the writer lock instead (up
+/// to the busy timeout set in [`Identity::open`]).
+async fn begin_immediate(connection: &mut sqlx::SqliteConnection) -> Result<(), IdentityError> {
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await?;
+
+    Ok(())
+}
+
+/// Commits `result`'s transaction, or rolls it back when it carries an error.
+async fn finish_immediate<T>(
+    connection: &mut sqlx::SqliteConnection,
+    result: Result<T, IdentityError>,
+) -> Result<T, IdentityError> {
+    match result {
+        Ok(value) => {
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            Err(error)
+        }
     }
 }
 
@@ -857,6 +909,8 @@ pub enum IdentityError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         Account, CODE_ALPHABET, Identity, IdentityError, MAX_CODE_TRIES, MAX_PENDING_PAIRINGS,
         PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState, digest,
@@ -1817,7 +1871,8 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let options = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5));
         let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
         for statement in crate::schema::VERSION_ONE_STATEMENTS {
             sqlx::query(statement)
@@ -1891,7 +1946,8 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let options = SqliteConnectOptions::new()
             .filename(path)
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .busy_timeout(Duration::from_secs(5));
         let mut connection = SqliteConnection::connect_with(&options).await.unwrap();
         for statement in crate::schema::VERSION_ONE_STATEMENTS {
             sqlx::query(statement)
@@ -1944,5 +2000,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(finalized, 1, "the migration marks old tokens final");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_writers_wait_for_the_database_instead_of_erroring() {
+        let (_dir, _home, identity) = identity().await;
+
+        // The pool holds two connections, and eight writers start at once. A
+        // slow disk without a busy timeout turns that into SQLITE_BUSY
+        // ("database is locked") instead of a wait; this is the shape CI caught
+        // in the claim race.
+        for round in 0..12_i64 {
+            let now = 1_000_000 + round * 1_000;
+            let machines: Vec<String> = (0..8).map(|index| format!("machine-{index}")).collect();
+            let tokens: Vec<String> = (0..8)
+                .map(|index| format!("token-{round}-{index}"))
+                .collect();
+            let polls: Vec<String> = (0..8)
+                .map(|index| format!("poll-{round}-{index}"))
+                .collect();
+            let starts = futures_util::future::join_all((0..8).map(|index| {
+                identity.begin_pairing_at(
+                    now,
+                    &machines[index],
+                    "/ws",
+                    &tokens[index],
+                    &polls[index],
+                )
+            }))
+            .await;
+            let starts: Vec<_> = starts
+                .into_iter()
+                .map(|start| start.expect("a concurrent start must wait, not fail"))
+                .collect();
+
+            let owners: Vec<Id> = (0..8).map(|_| Id::new()).collect();
+            let computers: Vec<Id> = (0..8).map(|_| Id::new()).collect();
+            let reservations =
+                futures_util::future::join_all(starts.iter().zip(&owners).zip(&computers).map(
+                    |((start, owner), computer)| {
+                        identity.reserve_pairing_at(now, &start.code, *owner, *computer)
+                    },
+                ))
+                .await;
+            for reservation in reservations {
+                assert!(
+                    reservation.expect("a concurrent reserve must wait, not fail"),
+                    "every owner gets its own code"
+                );
+            }
+            for (owner, computer) in owners.iter().zip(&computers) {
+                assert!(
+                    identity
+                        .release_pairing(*owner, *computer)
+                        .await
+                        .expect("a concurrent release must wait, not fail")
+                );
+            }
+        }
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert!(rows <= MAX_PENDING_PAIRINGS, "the store stayed bounded");
+        assert!(
+            identity.pairing_claims().await.unwrap().is_empty(),
+            "released claims leave nothing behind"
+        );
     }
 }
