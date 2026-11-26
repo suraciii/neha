@@ -46,10 +46,12 @@ The record holds these kinds for approvals and rules:
 | Kind | What it records |
 | --- | --- |
 | `neha.run.reply` | A step's reply: its content, calls, and usage |
-| `neha.approval.requested` | The Computer, the call's index, the action, its arguments, the summary, the reason, the lasting scope, and whether the action can be undone |
+| `neha.approval.requested` | The Computer, the call's index, the action, its arguments, the summary, the reason, the rule that asked when one did, whether an ambiguous form raised it, the lasting scope, and whether the action can be undone |
 | `neha.approval.decided` | The answer, and the rule a lasting answer added |
 | `neha.rule.added` | A lasting Ask or Allow rule |
 | `neha.rule.removed` | A lasting rule removed |
+
+An approval from a genuine Ask rule or a first use has `ambiguous` false, and a genuine Ask rule names the rule that asked; an ambiguous form has `ambiguous` true and an empty `rule`.
 
 Each is an Authority event, so a reader that does not know one stops and asks for an upgrade.
 

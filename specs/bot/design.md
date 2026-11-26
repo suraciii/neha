@@ -58,19 +58,25 @@ Before a Computer action, the loop asks whether to proceed. A File action asks l
 
 The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
 
-A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix. A path prefix matches a path that equals it or sits below it; `.` is the Workspace root and matches every relative path.
+A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
+
+A path prefix and an action's path are normalized before matching: trim outer whitespace, collapse repeated `/`, and remove `.` components, while keeping the absolute or relative form; `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule.
+
+`RuleAdd` stores the normalized prefix. `.` is the Workspace root: it matches `./a.txt` but no absolute path. A `..` component is never removed and still follows the fail-closed rule.
 
 When an Ask rule and an Allow rule both match, the longer prefix wins, and a rule without a prefix is the shortest. A tie goes to the Ask rule.
 
 A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break is a form a prefix cannot judge. A file path with a `..` component, or an absolute/relative form unlike a rule prefix, is another.
 
-A form a prefix cannot judge asks when the Bot and User have any rule for that tool. With no rule for that tool, the action runs.
+A form a prefix cannot judge asks when the Bot and User have any rule for that tool. With no rule for that tool, the action runs. Such an approval names no rule: its `rule` field is empty, its `ambiguous` field is true, and its Always allow removes no rule.
 
-An Always allow on an Ask rule's approval writes an Allow rule: the approved command's first word for a shell, or the approved action's parent directory for a file tool with a path.
+An Always allow writes an Allow rule from the action itself: the command's first word when the action has a command, or the path's parent directory when it has a path. A relative path at the Workspace root writes `.`.
 
-A relative path at the Workspace root writes `.`. A tool-only Ask rule's answer, such as one for `take_file`, writes a tool-only Allow rule.
+Only an action with neither a command nor a path, such as `take_file`, writes a tool-only Allow rule.
 
-The new Allow rule covers the Ask rule when the Ask rule's command prefix starts with the Allow rule's prefix, or when the Ask rule's path equals the Allow rule's path or sits below it. A tool-only Ask rule is not covered by a prefixed Allow rule. Neha removes a covered Ask rule and keeps an uncovered one.
+The new Allow rule covers the Ask rule when the Ask rule's command prefix starts with the Allow rule's prefix, or when the Ask rule's path equals the Allow rule's path or sits below it. A tool-only Ask rule is not covered by a prefixed Allow rule.
+
+Neha removes the Ask rule the approval named when the new Allow rule covers it. An approval with an empty `rule` removes none, and an uncovered named rule stays.
 
 The approval records the Computer and the call's index. An Allow resumes the run from the record: the step's reply and finished actions replay, the waiting action keeps its recorded id, and no action runs twice. The resumed step binds the answer to that call by index.
 

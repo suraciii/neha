@@ -42,7 +42,7 @@ Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves
 
 ## Approvals
 
-`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. `neha approval show <id>` prints the action's step, call index, action, Chat, asking rule, and full arguments.
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. `neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule.
 

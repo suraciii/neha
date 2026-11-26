@@ -47,6 +47,8 @@ An Always allow covers the same tool and one of these:
 - every path at or below the approved action's directory;
 - every action of a tool with no command or path, such as `take_file`.
 
+An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, and only an action with neither, such as `take_file`, gives a tool-only rule.
+
 For a file at the Workspace root, the covered directory is the Workspace root: relative paths are covered and absolute ones are not. When a rule asks, the card names the scope: `shell commands starting with "printf"`, `files under "logs"`, `files in the Workspace root`, or `all take_file actions`. The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
 
 ## Lasting rules
@@ -64,7 +66,9 @@ An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets
 
 When both match, the more specific rule wins: a rule with a command or path prefix beats one with only the tool, and a longer prefix beats a shorter one. If they are equally specific, the Ask rule wins.
 
-Some forms a prefix cannot judge. A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break asks whenever the Bot and User have any shell rule: `echo hi; rm x` is never covered by an `rm` rule. A file path with `..`, or an absolute/relative form unlike the rule's prefix, asks whenever the Bot and User have any rule for that tool: a `logs` rule does not cover `../logs/x` or `/var/logs/x`. With no rule for the tool, the action runs.
+Some forms a prefix cannot judge. A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break asks whenever the Bot and User have any shell rule: `echo hi; rm x` is never covered by an `rm` rule. A file path with `..`, or an absolute/relative form unlike the rule's prefix, asks whenever the Bot and User have any rule for that tool: a `logs` rule does not cover `../logs/x` or `/var/logs/x`. With no rule for the tool, the action runs. An approval raised by this protection reports `ambiguous` true and names no rule: `neha approval show` shows none, and its Always allow removes no rule.
+
+Before matching, Neha normalizes both the rule prefix and the action path: it trims outer whitespace, collapses repeated `/`, and removes `.` components, while keeping the absolute or relative form. So `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule; `.` matches `./a.txt` but no absolute path. A `..` component is not removed and still follows the fail-closed rule above.
 
 ### A wide Ask rule and an Always allow
 

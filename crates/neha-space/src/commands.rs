@@ -347,13 +347,17 @@ async fn approval_decide(
         // The ask rule the User just answered is obsolete only when the
         // derived allow rule covers everything the ask rule covered; a
         // narrower allow rule lets the wider ask stay for the rest.
-        let overridden = if view.reason == ApprovalReason::Rule {
+        // Only the Ask rule that actually asked can be removed by the answer:
+        // a rule that merely guarded an ambiguous command (or an Allow rule)
+        // stays.
+        let overridden = if view.reason == ApprovalReason::Rule && !view.ambiguous {
             let state = context
                 .state
                 .lock()
                 .map_err(|_| ApiError::internal("state lock"))?;
             view.rule
                 .and_then(|rule| state.rules.iter().find(|view| view.rule == rule))
+                .filter(|ask| ask.effect == RuleEffect::Ask)
                 .filter(|ask| {
                     rule_covers(
                         &tool,
@@ -442,7 +446,8 @@ async fn rule_add(
         .filter(|prefix| !prefix.is_empty());
     let path_prefix = path_prefix
         .map(|prefix| prefix.trim().to_owned())
-        .filter(|prefix| !prefix.is_empty());
+        .filter(|prefix| !prefix.is_empty())
+        .map(|prefix| normalize_path(&prefix));
     if command_prefix.is_some() && path_prefix.is_some() {
         return Err(ApiError::invalid_argument(
             "a rule names a command prefix or a path prefix, not both",
@@ -2272,14 +2277,15 @@ impl Recorder for RunRecorder<'_> {
             // A Hosted Computer has no fence yet (M2-B); it never asks.
             return Ok(Decision::Allow);
         }
-        let (reason, rule) = if first_use {
+        let (reason, rule, ambiguous) = if first_use {
             // The first use of a Local Computer always asks, whatever rules
             // exist: a lasting allow cannot cover it.
-            (ApprovalReason::FirstUseLocal, None)
-        } else if let Some(rule) = ambiguous_rule(call, &tool_rules) {
+            (ApprovalReason::FirstUseLocal, None, false)
+        } else if ambiguous_rule(call, &tool_rules) {
             // A form a prefix rule cannot judge is never allowed by a rule:
-            // with any rule for its tool it goes to the User instead.
-            (ApprovalReason::Rule, Some(rule))
+            // with any rule for its tool it goes to the User instead. No
+            // rule actually matched, so none is named or removed later.
+            (ApprovalReason::Rule, None, true)
         } else {
             match decisive_rule(&matching) {
                 Some(Decision::Wait) => {
@@ -2288,7 +2294,7 @@ impl Recorder for RunRecorder<'_> {
                         .filter(|rule| rule.effect == RuleEffect::Ask)
                         .max_by_key(|rule| rule_specificity(rule))
                         .map(|rule| rule.rule);
-                    (ApprovalReason::Rule, rule)
+                    (ApprovalReason::Rule, rule, false)
                 }
                 Some(Decision::Allow) | None => return Ok(Decision::Allow),
             }
@@ -2318,6 +2324,7 @@ impl Recorder for RunRecorder<'_> {
                     "arguments": call.arguments,
                     "summary": approval_summary(call),
                     "reason": reason,
+                    "ambiguous": ambiguous,
                     "rule": rule,
                     "lasting_scope": lasting_scope,
                     "undoable": undoability(&call.tool),
@@ -2446,11 +2453,11 @@ fn decisive_rule(rules: &[RuleView]) -> Option<Decision> {
 /// second command cannot be judged by a prefix: an ask rule must not be
 /// bypassed with `echo hi; rm x`. A file path with a `..` component or one
 /// whose absolute/relative form differs from a rule's prefix is the same.
-fn ambiguous_rule(call: &LoopCall, rules: &[RuleView]) -> Option<Id> {
+fn ambiguous_rule(call: &LoopCall, rules: &[RuleView]) -> bool {
     if rules.is_empty() {
-        return None;
+        return false;
     }
-    let ambiguous = match call.tool.as_str() {
+    match call.tool.as_str() {
         neha_loop::tools::SHELL => call
             .arguments
             .get("command")
@@ -2465,15 +2472,7 @@ fn ambiguous_rule(call: &LoopCall, rules: &[RuleView]) -> Option<Id> {
             .and_then(Value::as_str)
             .is_some_and(|path| ambiguous_path(path, rules)),
         _ => false,
-    };
-    if !ambiguous {
-        return None;
     }
-
-    rules
-        .iter()
-        .min_by_key(|rule| rule.seq)
-        .map(|rule| rule.rule)
 }
 
 /// Returns whether a shell command uses a form a prefix cannot judge.
@@ -2488,6 +2487,7 @@ fn ambiguous_shell(command: &str) -> bool {
 
 /// Returns whether a path is ambiguous for the rules that exist.
 fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
+    let path = normalize_path(path);
     if path.split('/').any(|component| component == "..") {
         return true;
     }
@@ -2496,7 +2496,7 @@ fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
     rules.iter().any(|rule| {
         rule.path_prefix
             .as_deref()
-            .is_some_and(|prefix| prefix.starts_with('/') != absolute)
+            .is_some_and(|prefix| normalize_path(prefix).starts_with('/') != absolute)
     })
 }
 
@@ -2570,11 +2570,40 @@ fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
     true
 }
 
+/// Normalizes a path the way the daemon reads it: outer whitespace trimmed,
+/// repeated separators folded, `.` components dropped, and a trailing
+/// separator dropped. `..` is kept so callers can refuse it, and an absolute
+/// path stays absolute.
+fn normalize_path(path: &str) -> String {
+    let trimmed = path.trim();
+    let absolute = trimmed.starts_with('/');
+    let components: Vec<&str> = trimmed
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+    let joined = components.join("/");
+    if absolute {
+        if joined.is_empty() {
+            "/".to_owned()
+        } else {
+            format!("/{joined}")
+        }
+    } else if joined.is_empty() {
+        // The relative root: `.` names the Workspace root.
+        ".".to_owned()
+    } else {
+        joined
+    }
+}
+
 /// Compares a path to a lexical prefix on a `/` boundary.
 ///
-/// The prefix `.` names the workspace root: it matches every relative path,
-/// including a bare file name like `notes.txt`.
+/// Both sides are normalized first, so `./logs/x`, `logs//x`, and `logs/./x`
+/// agree with the prefix `logs`. The prefix `.` names the workspace root: it
+/// matches every relative path, including a bare file name like `notes.txt`.
 fn path_matches(path: &str, prefix: &str) -> bool {
+    let path = normalize_path(path);
+    let prefix = normalize_path(prefix);
     if prefix == "/" {
         return path.starts_with('/');
     }
@@ -2585,7 +2614,7 @@ fn path_matches(path: &str, prefix: &str) -> bool {
         return true;
     }
 
-    path.strip_prefix(prefix)
+    path.strip_prefix(&prefix)
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
@@ -2595,6 +2624,8 @@ fn path_matches(path: &str, prefix: &str) -> bool {
 /// `.` covers every relative prefix and no absolute one. A `.` ask is the
 /// relative root itself and is covered only by `.`.
 fn path_covers(derived: &str, ask: &str) -> bool {
+    let derived = normalize_path(derived);
+    let ask = normalize_path(ask);
     if derived == "." {
         return !ask.starts_with('/');
     }
@@ -2608,7 +2639,7 @@ fn path_covers(derived: &str, ask: &str) -> bool {
         return true;
     }
 
-    ask.strip_prefix(derived)
+    ask.strip_prefix(&derived)
         .is_some_and(|rest| rest.starts_with('/'))
 }
 
@@ -2641,6 +2672,7 @@ fn rule_covers(
 
 /// Returns the parent directory of a path, as a rule stores it.
 fn path_parent(path: &str) -> String {
+    let path = normalize_path(path);
     match path.rsplit_once('/') {
         None => ".".to_owned(),
         Some(("", _)) => "/".to_owned(),
@@ -3028,7 +3060,10 @@ fn store_error(error: crate::store::StoreError) -> ApiError {
 mod tests {
     use serde_json::json;
 
-    use super::{LoopCall, path_covers, path_matches, prepare_resume, rule_covers, rule_matches};
+    use super::{
+        LoopCall, ambiguous_path, path_covers, path_matches, path_parent, prepare_resume,
+        rule_covers, rule_matches,
+    };
     use crate::state::RuleView;
     use neha::id::Id;
     use neha::record::RuleEffect;
@@ -3462,6 +3497,48 @@ mod tests {
             &[(Id::new(), "shell", json!({"command": "b"}))],
         );
         assert!(prepare_resume(&std::sync::Mutex::new(state), &run).is_err());
+    }
+
+    #[test]
+    fn a_path_is_normalized_before_it_is_compared() {
+        // One directory, several spellings.
+        for spelling in ["logs/x", "./logs/x", "logs//x", "logs/./x", "  logs/x  "] {
+            assert!(path_matches(spelling, "logs"), "{spelling} is under logs");
+        }
+        assert!(
+            !path_matches("/logs/x", "logs"),
+            "an absolute path is another scope"
+        );
+        assert!(!path_matches("logsx/y", "logs"));
+
+        // `.` is the workspace root and covers relative paths only.
+        for relative in ["a.txt", "./a.txt", "a//./b.txt", " a.txt "] {
+            assert!(path_matches(relative, "."), "{relative} is relative");
+        }
+        assert!(
+            !path_matches("/a.txt", "."),
+            "an absolute path is not under the root"
+        );
+        assert!(path_matches("/a.txt", "/"));
+        assert!(path_covers(".", "./logs"));
+        assert!(path_covers(".", "logs/"));
+        assert!(!path_covers(".", "/logs"));
+
+        // Parents are computed after normalization, so a bare relative file
+        // names the workspace root.
+        assert_eq!(path_parent("./a.txt"), ".");
+        assert_eq!(path_parent("logs//x"), "logs");
+        assert_eq!(path_parent("/a.txt"), "/");
+
+        // `..` still defeats prefix judgement, and absolute/relative forms
+        // must agree with the rule.
+        let ask = ask("read_file", None, Some("logs"));
+        assert!(ambiguous_path("../x", std::slice::from_ref(&ask)));
+        assert!(!ambiguous_path("./logs/x", std::slice::from_ref(&ask)));
+        assert!(
+            ambiguous_path("/logs/x", &[ask]),
+            "an absolute path against a relative rule is ambiguous"
+        );
     }
 
     #[test]

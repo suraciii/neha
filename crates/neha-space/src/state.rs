@@ -230,6 +230,8 @@ pub struct ApprovalView {
     pub summary: String,
     /// Why the run asks.
     pub reason: ApprovalReason,
+    /// Whether a command form defeated the rules and forced the ask.
+    pub ambiguous: bool,
     /// The rule that asked, when a rule did.
     pub rule: Option<Id>,
     /// What an "Always allow" would allow, in words the User reads.
@@ -772,6 +774,7 @@ impl Projection for State {
                     arguments: data.arguments,
                     summary: data.summary,
                     reason: data.reason,
+                    ambiguous: data.ambiguous,
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
                     undoable: data.undoable,

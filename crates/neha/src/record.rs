@@ -624,6 +624,7 @@ mod tests {
             "arguments": {"command": "pwd"},
             "summary": "Run pwd",
             "reason": "first_use_local",
+            "ambiguous": false,
             "lasting_scope": null,
             "undoable": "no",
         });
@@ -644,6 +645,7 @@ mod tests {
         assert_eq!(requested.tool, "shell");
         assert_eq!(requested.summary, "Run pwd");
         assert_eq!(requested.reason, super::ApprovalReason::FirstUseLocal);
+        assert!(!requested.ambiguous);
         assert_eq!(requested.rule, None);
 
         let mut unknown = value;
@@ -1390,6 +1392,10 @@ pub struct ApprovalRequested {
     pub summary: String,
     /// Why this run asks.
     pub reason: ApprovalReason,
+    /// Whether a command form defeated the rules and forced the ask (the
+    /// reason is then `rule`, but no rule actually matched).
+    #[serde(default)]
+    pub ambiguous: bool,
     /// The rule that asked, when a rule did.
     #[serde(default)]
     pub rule: Option<Id>,

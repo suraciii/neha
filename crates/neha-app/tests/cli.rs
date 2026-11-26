@@ -3540,7 +3540,6 @@ async fn a_waiting_approval_survives_a_space_restart() {
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
     let mut computer = local_computer(directory, &base, &script);
-    let folder = computer.workspace.join(&computer.bot);
     let added = run(
         &computer.home,
         &computer.credential,
@@ -3558,10 +3557,9 @@ async fn a_waiting_approval_survives_a_space_restart() {
         ],
     );
     let ask = first_word(&field(&added, "Added rule "));
-    script.call(
-        "shell",
-        serde_json::json!({"command": "printf x >> restarted.txt"}),
-    );
+    // A plain command: with a shell rule, a redirection would be ambiguous and
+    // would ask without naming that rule.
+    script.call("shell", serde_json::json!({"command": "printf restarted"}));
     script.say("The action ran after the restart.");
 
     let sent = run(
@@ -3606,6 +3604,11 @@ async fn a_waiting_approval_survives_a_space_restart() {
         shown.contains(&format!("  rule {ask}")),
         "the pending approval still names its rule:\n{shown}"
     );
+    assert!(shown.contains("  index 0"), "{shown}");
+    assert!(
+        shown.contains("  arguments {\"command\":\"printf restarted\"}"),
+        "{shown}"
+    );
 
     // The answer after the restart resumes the run, and it runs once.
     let allowed = run(
@@ -3618,11 +3621,10 @@ async fn a_waiting_approval_survives_a_space_restart() {
         format!("Allowed {approval} for run {run_id}.")
     );
     let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
-    assert_eq!(shown.matches("shell (succeeded)").count(), 1, "{shown}");
     assert_eq!(
-        std::fs::read_to_string(folder.join("restarted.txt")).unwrap(),
-        "x",
-        "a resumed action runs exactly once"
+        shown.matches("shell (succeeded)").count(),
+        1,
+        "a resumed action runs exactly once:\n{shown}"
     );
     let read = run(
         &computer.home,
@@ -3874,7 +3876,7 @@ async fn a_compound_command_asks_only_when_a_shell_rule_exists() {
     assert!(sent.contains("The compound command ran."), "{sent}");
 
     // A shell rule makes the prefix match after leading whitespace...
-    run(
+    let added = run(
         &computer.home,
         &computer.credential,
         &[
@@ -3890,6 +3892,7 @@ async fn a_compound_command_asks_only_when_a_shell_rule_exists() {
             "printf",
         ],
     );
+    let ask = first_word(&field(&added, "Added rule "));
     script.call("shell", serde_json::json!({"command": "  printf padded"}));
     script.say("The padded command ran.");
     let sent = run(
@@ -3932,6 +3935,17 @@ async fn a_compound_command_asks_only_when_a_shell_rule_exists() {
     assert!(
         shown.starts_with(&format!("Run {run_id}: waiting")),
         "{shown}"
+    );
+    // An ambiguous form is guarded by no single rule, so the approval names
+    // none: the User answers the action themselves.
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(
+        !shown.contains(&format!("  rule {ask}")),
+        "an ambiguous action names no rule:\n{shown}"
     );
     run(
         &computer.home,
