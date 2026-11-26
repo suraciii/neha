@@ -14,6 +14,8 @@ base64 = "0.22"
 eventsource-stream = "0.2"
 futures-util.workspace = true
 neha = { path = "../neha" }
+neha-computer = { path = "../neha-computer" }
+neha-loop = { path = "../neha-loop" }
 rand = "0.9"
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { workspace = true, features = ["derive"] }

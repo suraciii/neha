@@ -668,6 +668,40 @@ mod tests {
                 }),
             )
             .acting(user),
+            EventKind::RunStep => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "tool_calls": 0,
+                }),
+            )
+            .acting(user),
+            EventKind::ActionStarted => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "action": Id::new(),
+                    "tool": "shell",
+                    "arguments": {"command": "true"},
+                }),
+            )
+            .acting(user),
+            EventKind::ActionFinished => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "action": Id::new(),
+                    "status": "succeeded",
+                    "output": "ok",
+                }),
+            )
+            .acting(user),
         }
     }
 

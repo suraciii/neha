@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use neha::id::Id;
-use neha::record::{Author, Event, EventData};
+use neha::record::{ActionStatus, Author, Event, EventData};
 use neha::seq::Seq;
 use neha::time::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -119,6 +119,40 @@ pub struct MessageView {
     pub run: Option<Id>,
 }
 
+/// One completed step of a run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct StepView {
+    /// The step number, starting at one.
+    pub index: u32,
+    /// The usage the Model reported.
+    pub usage: Option<Usage>,
+    /// How many tool calls the step requested.
+    pub tool_calls: u32,
+}
+
+/// One action of a run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ActionView {
+    /// The action identifier.
+    pub id: Id,
+    /// The step that requested it.
+    pub step: u32,
+    /// The tool's name.
+    pub tool: String,
+    /// The tool's arguments.
+    pub arguments: serde_json::Value,
+    /// How the action ended; unknown until it finishes.
+    pub status: ActionStatus,
+    /// The text the Model reads.
+    pub output: String,
+    /// Whether the output dropped bytes.
+    pub truncated: bool,
+    /// How many bytes the output dropped.
+    pub omitted_bytes: u64,
+    /// The failure, when it failed.
+    pub error: Option<String>,
+}
+
 /// A run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunView {
@@ -142,6 +176,10 @@ pub struct RunView {
     pub usage: Option<Usage>,
     /// The failure, when it failed.
     pub error: Option<String>,
+    /// The completed steps, in order.
+    pub steps: Vec<StepView>,
+    /// The actions, in order.
+    pub actions: Vec<ActionView>,
 }
 
 /// The Space's record, projected into memory.
@@ -315,6 +353,8 @@ impl Projection for State {
                         reply: None,
                         usage: None,
                         error: None,
+                        steps: Vec::new(),
+                        actions: Vec::new(),
                     },
                 );
             }
@@ -327,6 +367,50 @@ impl Projection for State {
                 run.reply = data.reply;
                 run.usage = data.usage;
                 run.error = data.error;
+            }
+            EventData::RunStep(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a step must belong to a started run")?;
+                run.steps.push(StepView {
+                    index: data.step,
+                    usage: data.usage,
+                    tool_calls: data.tool_calls,
+                });
+            }
+            EventData::ActionStarted(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("an action must belong to a started run")?;
+                run.actions.push(ActionView {
+                    id: data.action,
+                    step: data.step,
+                    tool: data.tool,
+                    arguments: data.arguments,
+                    status: ActionStatus::Unknown,
+                    output: String::new(),
+                    truncated: false,
+                    omitted_bytes: 0,
+                    error: None,
+                });
+            }
+            EventData::ActionFinished(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a finished action must belong to a started run")?;
+                let action = run
+                    .actions
+                    .iter_mut()
+                    .find(|action| action.id == data.action)
+                    .ok_or("a finished action must have started")?;
+                action.status = data.status;
+                action.output = data.output;
+                action.truncated = data.truncated;
+                action.omitted_bytes = data.omitted_bytes;
+                action.error = data.error;
             }
         }
 

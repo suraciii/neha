@@ -488,7 +488,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                 }
                                 match outcome.pending {
                                     Some(pending) => {
-                                        match commands::finish_run(&server.store, &server.state, &server.model, pending).await {
+                                        match commands::finish_run(&server.store, &server.state, &server.home, &server.model, &server.events, pending).await {
                                             Ok((result, events)) => {
                                                 broadcast(&server, &events);
                                                 result
@@ -1187,6 +1187,83 @@ mod tests {
         });
 
         (format!("http://{addr}/v1"), task)
+    }
+
+    #[derive(Clone)]
+    enum ScriptedReply {
+        Text(String),
+        Tool { name: String, arguments: Value },
+    }
+
+    async fn scripted_provider(
+        script: Vec<ScriptedReply>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let script = Arc::new(script);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let script = Arc::clone(&script);
+                let requests = Arc::clone(&requests);
+                async move {
+                    let index = requests.fetch_add(1, Ordering::SeqCst);
+                    let reply = script
+                        .get(index)
+                        .cloned()
+                        .or_else(|| script.last().cloned())
+                        .expect("a scripted reply");
+                    let body = match reply {
+                        ScriptedReply::Text(text) => {
+                            let chunk = json!({"choices":[{"delta":{"content":text}}]});
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
+                        ScriptedReply::Tool { name, arguments } => {
+                            let chunk = json!({"choices":[{"delta":{"tool_calls":[{
+                                "index": 0,
+                                "id": format!("call-{index}"),
+                                "type": "function",
+                                "function": {
+                                    "name": name,
+                                    "arguments": serde_json::to_string(&arguments).unwrap(),
+                                }
+                            }]}}]});
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task)
+    }
+
+    fn tool(name: &str, arguments: Value) -> ScriptedReply {
+        ScriptedReply::Tool {
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    fn text(text: &str) -> ScriptedReply {
+        ScriptedReply::Text(text.to_owned())
     }
 
     async fn open_socket(running: &Running, token: &str) -> Socket {
@@ -2600,6 +2677,181 @@ mod tests {
         assert!(reported, "an oversized live event must be reported");
         sender.close(None).await.unwrap();
         subscriber.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    async fn tool_bot(socket: &mut Socket, base: String) -> (Id, Id, Id) {
+        command(socket, Id::new(), provider_add(base)).await;
+        let bot = command(
+            socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let bot_id: Id = serde_json::from_value(bot["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let computer: Id = serde_json::from_value(bot["computer"]["id"].clone()).unwrap();
+
+        (bot_id, chat, computer)
+    }
+
+    async fn send(socket: &mut Socket, chat: Id, text: &str) -> Value {
+        command(
+            socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: text.to_owned(),
+            }),
+        )
+        .await
+    }
+
+    async fn show_run(socket: &mut Socket, run: Id) -> Value {
+        command(socket, Id::new(), CommandCall::RunShow { run }).await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_writes_and_reads_a_file_with_tools() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "write_file",
+                json!({"path": "hello.txt", "content": "hello neha"}),
+            ),
+            tool("read_file", json!({"path": "hello.txt"})),
+            text("The file says hello neha."),
+        ])
+        .await;
+        let (bot, chat, computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "write hello.txt and read it back").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert!(result["text"].as_str().unwrap().contains("hello neha"));
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("hello.txt")).unwrap(),
+            "hello neha"
+        );
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert_eq!(shown["steps"].as_array().unwrap().len(), 3);
+        let actions = shown["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0]["tool"], "write_file");
+        assert_eq!(actions[0]["status"], "succeeded");
+        assert_eq!(actions[1]["tool"], "read_file");
+        assert!(
+            actions[1]["output"]
+                .as_str()
+                .unwrap()
+                .contains("hello neha"),
+            "{}",
+            actions[1]["output"]
+        );
+
+        // A restart rebuilds the same run from the record.
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let mut socket = open_socket(&restarted, &token).await;
+        let shown_again = show_run(&mut socket, run).await;
+        assert_eq!(shown_again["steps"], shown["steps"]);
+        assert_eq!(shown_again["actions"], shown["actions"]);
+        let _ = bot;
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_runs_a_shell_command() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("shell", json!({"command": "printf 42"})),
+            text("The command printed 42."),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "run printf 42").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert!(result["text"].as_str().unwrap().contains("42"));
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        let actions = shown["actions"].as_array().unwrap();
+        assert_eq!(actions[0]["tool"], "shell");
+        assert_eq!(actions[0]["status"], "succeeded");
+        assert!(
+            actions[0]["output"].as_str().unwrap().contains("42"),
+            "{}",
+            actions[0]["output"]
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_cannot_leave_the_workspace() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("read_file", json!({"path": "../../outside.txt"})),
+            text("The read was blocked."),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        std::fs::write(running.server_home().join("outside.txt"), "secret").unwrap();
+
+        let result = send(&mut socket, chat, "read outside.txt").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert!(!result["text"].as_str().unwrap().contains("secret"));
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        let action = &shown["actions"][0];
+        assert_eq!(action["tool"], "read_file");
+        assert_eq!(action["status"], "failed");
+        assert!(
+            action["output"].as_str().unwrap().contains("escapes"),
+            "{}",
+            action["output"]
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_keeps_calling_tools_stops_at_the_step_limit() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let mut script = vec![tool("list_files", json!({"path": "."})); 8];
+        script.push(text("I am still here."));
+        let (base, provider_task) = scripted_provider(script).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let failed = send(&mut socket, chat, "keep listing files").await;
+        assert_eq!(failed["status"], "failed");
+        assert!(failed["text"].as_str().unwrap().contains("8 steps"));
+        let after = send(&mut socket, chat, "are you still there?").await;
+        assert_eq!(after["status"], "succeeded");
+        assert_eq!(after["text"], "I am still here.");
+        socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
     }

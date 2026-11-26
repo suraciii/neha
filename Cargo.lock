@@ -1174,6 +1174,8 @@ dependencies = [
  "eventsource-stream",
  "futures-util",
  "neha",
+ "neha-computer",
+ "neha-loop",
  "rand 0.9.5",
  "reqwest",
  "serde",
