@@ -138,6 +138,7 @@ describe("App with approvals", () => {
     space.approvals.push(
       { ...byRule, approval: "a1", ambiguous: true },
       { ...byRule, approval: "a2", ambiguous: false },
+      // The first use of the User's machine comes first, whatever else is true.
       { ...firstUse, approval: "a3", ambiguous: true },
     );
     const view = await openChat();
@@ -145,7 +146,7 @@ describe("App with approvals", () => {
     expect(lines(view, ".approval__reason")).toEqual([
       "This action has a form no rule can judge.",
       "A rule you set asks before this action.",
-      "This action has a form no rule can judge.",
+      "This is the first time Scout uses your Computer.",
     ]);
 
     flush(() => fireEvent.click(element(view, ".locale-switch")));
@@ -186,6 +187,18 @@ describe("App with approvals", () => {
 
     expect(card(view)).toContain("A rule you set asks before this action.");
     expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Always allow", "Deny"]);
+    // The Space said nothing about the scope, so the page names what it can see.
+    expect(element(view, ".approval__scope").textContent).toBe('Always allow covers: files under "."');
+  });
+
+  it("offers no Always allow when nothing can be made lasting", async () => {
+    // The Space gave no scope, and the action is too bare for the page to guess one.
+    space.approvals.push({ ...byRule, tool: "shell", summary: "shell: ", lasting_scope: "" });
+    const view = await openChat();
+
+    expect(card(view)).toContain("A rule you set asks before this action.");
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
+    expect(view.container.querySelector(".approval__scope")).toBeNull();
   });
 
   it("sends Allow once, waits for the Space, and then shows the verdict", async () => {

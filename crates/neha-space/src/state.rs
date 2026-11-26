@@ -756,6 +756,9 @@ impl Projection for State {
                         "an approval must name its run's Bot, Chat, Computer, and User".to_owned(),
                     );
                 }
+                if data.ambiguous && data.reason != ApprovalReason::Rule {
+                    return Err("only a rule ask can be ambiguous".to_owned());
+                }
                 if data.ambiguous && data.rule.is_some() {
                     return Err("an ambiguous approval names no rule".to_owned());
                 }
@@ -1123,6 +1126,23 @@ mod tests {
                 ))
                 .is_err(),
             "an ambiguous approval names no rule"
+        );
+
+        // First use never carries the ambiguity flag.
+        let mut first_use = requested(bot, chat);
+        first_use["approval"] = serde_json::json!(Id::new());
+        first_use["reason"] = serde_json::json!("first_use_local");
+        first_use["ambiguous"] = serde_json::json!(true);
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    first_use,
+                    10,
+                ))
+                .is_err(),
+            "a first use is not an ambiguous rule ask"
         );
     }
 

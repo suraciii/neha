@@ -1086,17 +1086,16 @@ async fn rule(command: RuleCommand) -> Result<()> {
                 },
             )
             .await?;
-            let rule = entity_id(&result, &["rule", "id"])?;
             println!(
                 "{}",
-                rule_add_line(
-                    rule,
+                rule_add_report(
+                    &result,
                     bot,
                     effect.wire(),
                     &tool,
                     command_prefix.as_deref(),
                     path_prefix.as_deref()
-                )
+                )?
             );
         }
         RuleCommand::Remove { rule } => {
@@ -1158,6 +1157,38 @@ fn rule_add_line(
     }
 
     line
+}
+
+/// The line that reports one added rule with the values the Space stored.
+///
+/// The Space normalizes a prefix before it records the rule; printing what the
+/// Space returned shows the rule that actually exists, not the text typed.
+fn rule_add_report(
+    result: &Value,
+    bot: Id,
+    effect: &str,
+    tool: &str,
+    command_prefix: Option<&str>,
+    path_prefix: Option<&str>,
+) -> Result<String> {
+    let rule = entity_id(result, &["rule", "id"])?;
+    let command_prefix = result.get("command_prefix").map_or_else(
+        || command_prefix.map(str::to_owned),
+        |value| value.as_str().map(str::to_owned),
+    );
+    let path_prefix = result.get("path_prefix").map_or_else(
+        || path_prefix.map(str::to_owned),
+        |value| value.as_str().map(str::to_owned),
+    );
+
+    Ok(rule_add_line(
+        rule,
+        bot,
+        effect,
+        tool,
+        command_prefix.as_deref(),
+        path_prefix.as_deref(),
+    ))
 }
 
 /// Refuses a prefix that cannot match the tool it names.
@@ -1226,6 +1257,17 @@ fn find_entity(list: &Value, field: &str, id: Id) -> Result<Option<Value>> {
         .cloned())
 }
 
+/// What an approval view said about an Always allow's reach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LastingScope {
+    /// The view had no field; the CLI may derive a scope from the action.
+    Missing,
+    /// The Space said this action has no lasting scope.
+    Unavailable,
+    /// The Space named the scope.
+    Named(String),
+}
+
 /// One approval as the interactive prompt shows it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ApprovalCard {
@@ -1241,8 +1283,8 @@ struct ApprovalCard {
     ambiguous: bool,
     /// Whether the Space says the action can be undone, when it says.
     undoable: Option<String>,
-    /// What an Always allow would cover, in the Space's words.
-    lasting_scope: Option<String>,
+    /// What an Always allow would cover, as the Space said or left out.
+    lasting_scope: LastingScope,
     /// The arguments the action runs with.
     arguments: Value,
 }
@@ -1257,14 +1299,21 @@ impl ApprovalCard {
             reason: text_of(approval, "reason")?.to_owned(),
             ambiguous: approval["ambiguous"].as_bool().unwrap_or(false),
             undoable: approval["undoable"].as_str().map(str::to_owned),
-            lasting_scope: approval["lasting_scope"].as_str().map(str::to_owned),
+            lasting_scope: match approval.get("lasting_scope") {
+                None => LastingScope::Missing,
+                Some(Value::Null) => LastingScope::Unavailable,
+                Some(Value::String(scope)) if !scope.is_empty() => {
+                    LastingScope::Named(scope.clone())
+                }
+                Some(_) => LastingScope::Unavailable,
+            },
             arguments: approval.get("arguments").cloned().unwrap_or(Value::Null),
         })
     }
 
     /// Returns whether the Space would accept a lasting answer.
-    fn allows_always(&self) -> bool {
-        self.reason == "rule"
+    fn offers_always(&self) -> bool {
+        self.always_scope().is_some()
     }
 
     /// Returns the card's line about undoing the action.
@@ -1285,56 +1334,61 @@ impl ApprovalCard {
 
     /// Returns what an Always allow would cover, when the prompt offers it.
     ///
-    /// The Space names the scope; when it does not, this derives the same
-    /// words locally from the tool and its arguments so the User never grants
-    /// a lasting rule without seeing its reach.
+    /// The Space decides whether a lasting rule is possible: an unavailable
+    /// scope means no Always allow at all. A missing field is derived locally
+    /// from the tool and its arguments, but only when that derivation is
+    /// possible; the User never grants a lasting rule without seeing its
+    /// reach.
     fn always_scope(&self) -> Option<String> {
-        if !self.allows_always() {
+        if self.reason != "rule" {
             return None;
         }
 
-        Some(match &self.lasting_scope {
-            Some(scope) => escape_text(scope),
-            None => self.derived_scope(),
-        })
+        match &self.lasting_scope {
+            LastingScope::Named(scope) => Some(escape_text(scope)),
+            LastingScope::Unavailable => None,
+            LastingScope::Missing => self.derived_scope(),
+        }
     }
 
     /// Derives a lasting scope from the tool and its arguments.
-    fn derived_scope(&self) -> String {
+    fn derived_scope(&self) -> Option<String> {
         match self.tool.as_str() {
             "shell" => self
                 .arguments
                 .get("command")
                 .and_then(Value::as_str)
                 .and_then(|command| command.split_whitespace().next())
-                .map_or_else(
-                    || "all shell actions".to_owned(),
-                    |word| format!("shell commands starting with \"{}\"", escape_text(word)),
-                ),
+                .map(|word| format!("shell commands starting with \"{}\"", escape_text(word))),
             "read_file" | "write_file" | "list_files" | "put_file" => self
                 .arguments
                 .get("path")
                 .and_then(Value::as_str)
-                .map_or_else(|| "files in the Workspace root".to_owned(), file_scope),
-            other => format!("all {} actions", escape_text(other)),
+                .filter(|path| !path.is_empty())
+                .map(file_scope),
+            _ => None,
         }
     }
 
     /// Returns the reason as the card reads it.
     fn reason_text(&self) -> String {
-        match self.reason.as_str() {
-            "first_use_local" => "first use of your Local Computer".to_owned(),
-            // An ambiguous approval has no matching rule to name: saying a
-            // rule asked would tell the User something false.
-            "rule" if self.ambiguous => "a form no rule can judge".to_owned(),
-            "rule" => "a rule you set".to_owned(),
-            other => other.to_owned(),
+        // The first use of a Local Computer is the reason even if something
+        // else is true; then ambiguity wins because no rule can name what
+        // asked.
+        if self.reason == "first_use_local" {
+            "first use of your Local Computer".to_owned()
+        } else if self.ambiguous {
+            "a form no rule can judge".to_owned()
+        } else if self.reason == "rule" {
+            "a rule you set".to_owned()
+        } else {
+            self.reason.clone()
         }
     }
 
     /// Returns the keys the prompt offers.
     fn options(&self) -> &'static str {
-        if self.allows_always() {
+        if self.offers_always() {
             "[a]llow / [A]lways allow / [d]eny / [q]uit"
         } else {
             "[a]llow / [d]eny / [q]uit"
@@ -1343,7 +1397,7 @@ impl ApprovalCard {
 
     /// Returns the answers the prompt accepts.
     fn answers(&self) -> &'static str {
-        if self.allows_always() {
+        if self.offers_always() {
             "a, A, d"
         } else {
             "a, d"
@@ -1413,7 +1467,7 @@ fn read_decision(
             // A terminal that closed cannot answer; leave the run waiting.
             return Ok(Decision::Quit);
         }
-        if let Some(decision) = decision_from_input(&line, card.allows_always()) {
+        if let Some(decision) = decision_from_input(&line, card.offers_always()) {
             return Ok(decision);
         }
         writeln!(output, "answer {}; q quits.", card.answers())?;
@@ -1685,9 +1739,10 @@ mod tests {
     use super::{Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer};
 
     use super::{
-        ApprovalCard, ApprovalCommand, Decision, RuleCommand, RuleEffectChoice, approval_row,
-        decision_from_input, decision_line, escape_text, read_decision, rule_add_line, rule_rows,
-        validate_rule_arguments, waiting_advice, write_approval_details,
+        ApprovalCard, ApprovalCommand, Decision, LastingScope, RuleCommand, RuleEffectChoice,
+        approval_row, decision_from_input, decision_line, escape_text, read_decision,
+        rule_add_line, rule_add_report, rule_rows, validate_rule_arguments, waiting_advice,
+        write_approval_details,
     };
 
     /// Parses a CLI command line.
@@ -1706,7 +1761,7 @@ mod tests {
             reason: reason.to_owned(),
             ambiguous: false,
             undoable: None,
-            lasting_scope: None,
+            lasting_scope: LastingScope::Missing,
             arguments: json!({"command": "printf approved > proof.txt"}),
         }
     }
@@ -2046,8 +2101,8 @@ mod tests {
         assert!(card.ambiguous);
         assert_eq!(card.undoable.as_deref(), Some("no"));
         assert_eq!(
-            card.lasting_scope.as_deref(),
-            Some("shell commands starting with \"printf\"")
+            card.lasting_scope,
+            LastingScope::Named("shell commands starting with \"printf\"".to_owned())
         );
         assert_eq!(card.arguments["command"], "printf hi");
         let rendered = card.render();
@@ -2147,6 +2202,15 @@ mod tests {
         assert!(rendered.contains("reason: a rule you set"), "{rendered}");
         assert!(!rendered.contains("a form no rule can judge"), "{rendered}");
 
+        // Ambiguity also wins for a reason this build does not know.
+        let mut card = approval_card("shell", "future_reason");
+        card.ambiguous = true;
+        assert!(
+            card.render().contains("reason: a form no rule can judge"),
+            "{}",
+            card.render()
+        );
+
         // The first-use reason is unchanged even if the field says ambiguous.
         for ambiguous in [false, true] {
             let mut card = approval_card("shell", "first_use_local");
@@ -2165,7 +2229,7 @@ mod tests {
     fn a_card_shows_what_always_allow_covers() {
         // The Space's scope wins.
         let mut card = approval_card("shell", "rule");
-        card.lasting_scope = Some("shell commands starting with \"git\"".to_owned());
+        card.lasting_scope = LastingScope::Named("shell commands starting with \"git\"".to_owned());
         let rendered = card.render();
         assert!(
             rendered.contains("Always allow covers: shell commands starting with \"git\""),
@@ -2203,19 +2267,96 @@ mod tests {
             "{}",
             card.render()
         );
-        // An unknown tool still names its reach.
+        // An unknown tool without a scope cannot derive one, so no Always
+        // allow is offered.
         let mut card = approval_card("future_tool", "rule");
         card.arguments = serde_json::Value::Null;
         assert!(
-            card.render()
-                .contains("Always allow covers: all future_tool actions"),
+            !card.render().contains("Always allow covers"),
             "{}",
             card.render()
+        );
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
         );
 
         // First use has no Always allow, so it names no lasting scope.
         let rendered = approval_card("shell", "first_use_local").render();
         assert!(!rendered.contains("Always allow covers"), "{rendered}");
+    }
+
+    #[test]
+    fn a_card_offers_always_only_with_a_lasting_scope() {
+        // The Space named a scope: Always allow is offered with that reach.
+        let mut card = approval_card("shell", "rule");
+        card.lasting_scope = LastingScope::Named("shell commands starting with \"git\"".to_owned());
+        assert!(card.options().contains("[A]lways allow"), "{card:?}");
+        assert!(
+            card.render()
+                .contains("Always allow covers: shell commands starting with \"git\""),
+            "{}",
+            card.render()
+        );
+
+        // The Space said this action has no lasting scope (for example a path
+        // the Space refused): no Always allow, and no scope line.
+        let mut card = approval_card("shell", "rule");
+        card.lasting_scope = LastingScope::Unavailable;
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
+        assert!(
+            !card.render().contains("Always allow covers"),
+            "{}",
+            card.render()
+        );
+
+        // A missing field is derived when the action allows it.
+        let card = approval_card("shell", "rule");
+        assert!(card.options().contains("[A]lways allow"), "{card:?}");
+        assert!(
+            card.render()
+                .contains("Always allow covers: shell commands starting with \"printf\""),
+            "{}",
+            card.render()
+        );
+
+        // A missing field that cannot be derived offers no Always allow.
+        let mut card = approval_card("shell", "rule");
+        card.arguments = serde_json::Value::Null;
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
+        assert!(
+            !card.render().contains("Always allow covers"),
+            "{}",
+            card.render()
+        );
+
+        // A view with an explicit null is unavailable, not missing.
+        let view = json!({
+            "approval": Id::new(),
+            "tool": "shell",
+            "summary": "printf hi",
+            "reason": "rule",
+            "ambiguous": false,
+            "undoable": "no",
+            "lasting_scope": null,
+            "arguments": {"command": "printf hi"},
+        });
+        let card = ApprovalCard::from_view(&view).unwrap();
+        assert_eq!(card.lasting_scope, LastingScope::Unavailable);
+        assert!(
+            !card.options().contains("Always allow"),
+            "{}",
+            card.options()
+        );
     }
 
     #[test]
@@ -2433,6 +2574,40 @@ mod tests {
         assert_eq!(
             decision_line(false, approval, None),
             format!("Denied {approval}.")
+        );
+    }
+
+    #[test]
+    fn a_rule_add_reports_the_normalized_prefixes() {
+        let rule = Id::new();
+        let bot = Id::new();
+        // The Space stored "logs" after normalizing the typed "./logs/".
+        let result = json!({
+            "rule": rule,
+            "command_prefix": null,
+            "path_prefix": "logs",
+        });
+        assert_eq!(
+            rule_add_report(&result, bot, "ask", "put_file", None, Some("./logs/")).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: ask put_file (path-prefix \"logs\")")
+        );
+
+        // The same for shell commands: print what the Space kept.
+        let result = json!({
+            "rule": rule,
+            "command_prefix": "git",
+            "path_prefix": null,
+        });
+        assert_eq!(
+            rule_add_report(&result, bot, "allow", "shell", Some("  git  "), None).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: allow shell (command-prefix \"git\")")
+        );
+
+        // A Space answer without the fields falls back to what was typed.
+        let result = json!({"rule": rule});
+        assert_eq!(
+            rule_add_report(&result, bot, "ask", "shell", Some("git"), None).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
         );
     }
 

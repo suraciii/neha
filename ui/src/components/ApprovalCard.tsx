@@ -19,20 +19,24 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const [expanded, setExpanded] = createSignal(false);
   const allowed = () => props.approval.decided === true;
   const denied = () => props.approval.decided === false;
-  // An ambiguous action has no rule behind it, so it cannot claim one.
+  // The first use of the User's machine comes first, as the CLI tells it; an
+  // ambiguous action has no rule behind it, so it cannot claim one.
   const reason = () =>
-    props.approval.ambiguous
-      ? t("chat.approval.reason.ambiguous")
-      : props.approval.reason === "rule"
-        ? t("chat.approval.reason.rule")
-        : t("chat.approval.reason.firstUse", { name: props.botName });
+    props.approval.reason === "first_use_local"
+      ? t("chat.approval.reason.firstUse", { name: props.botName })
+      : props.approval.ambiguous
+        ? t("chat.approval.reason.ambiguous")
+        : t("chat.approval.reason.rule");
   const undo = () =>
     t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
-  // What an Always allow would cover: the Space's words, else this page's guess.
+  // What an Always allow would cover: the Space's words, else this page's
+  // guess. Without either there is nothing to make lasting, so the Space
+  // would refuse it.
   const scope = () => {
     if (props.approval.reason !== "rule") return null;
+    const said = props.approval.lasting_scope?.trim();
     const local = localScope(props.approval);
-    const scope = props.approval.lasting_scope ?? (local ? t(local.key, local.params) : null);
+    const scope = said || (local ? t(local.key, local.params) : null);
     return scope ? t("chat.approval.lastingScope", { scope }) : null;
   };
   const long = () => isLongSummary(props.approval.summary);
@@ -87,7 +91,7 @@ export default function ApprovalCard(props: ApprovalCardProps) {
             >
               {t("chat.approval.allow")}
             </button>
-            <Show when={props.approval.reason === "rule"}>
+            <Show when={scope()}>
               <button
                 class="btn btn--quiet"
                 type="button"

@@ -49,6 +49,10 @@ describe("approvals", () => {
       params: { command: "printf" },
     });
     expect(localScope(shell)).toEqual({ key: "chat.approval.scope.shell", params: { command: "git" } });
+    expect(localScope({ ...shell, tool: "put_file", summary: "put_file: out/report.pdf" })).toEqual({
+      key: "chat.approval.scope.files",
+      params: { path: "out" },
+    });
     // Nothing to derive from says nothing.
     for (const blank of [
       { ...shell, tool: "write_file", summary: "write_file: " },
