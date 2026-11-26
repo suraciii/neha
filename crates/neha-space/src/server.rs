@@ -579,6 +579,25 @@ async fn validate_client_directory(server: &SpaceServer) -> Result<(), ServerErr
             return Err(ServerError::UiOverlapsConfiguration(dir.clone()));
         }
     }
+    // A credential file named in the environment is hidden from Bots like the
+    // saved pairing; a static root that can reach it (or its folder) would
+    // hand the secret to a caller that has not signed in.
+    if let Some(credential) = std::env::var_os("NEHA_CREDENTIAL").map(PathBuf::from) {
+        let credential = resolve_path(&credential)
+            .await
+            .map_err(|_| ServerError::Ui(dir.clone()))?;
+        let parent = credential
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| credential.clone());
+        if root.starts_with(&parent)
+            || parent.starts_with(&root)
+            || credential.starts_with(&root)
+            || root == credential
+        {
+            return Err(ServerError::UiOverlapsConfiguration(dir.clone()));
+        }
+    }
 
     Ok(())
 }
@@ -9705,6 +9724,101 @@ mod tests {
             };
             assert_eq!(path, ui);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_credential_named_in_the_environment_is_hidden_from_the_ui() {
+        if std::env::var_os("NEHA_TEST_CREDENTIAL_CHILD").is_some() {
+            let case = std::env::var("NEHA_TEST_CREDENTIAL_CASE").unwrap();
+            let root = std::env::var_os("NEHA_TEST_HOME").expect("a test home");
+            let ui = std::env::var_os("NEHA_TEST_UI_ROOT").expect("a test UI root");
+            let home = Home::open(root).unwrap();
+            let result = start_with_ui(home, 0, Some(std::path::PathBuf::from(ui))).await;
+            if case == "absent" || case == "independent" {
+                let running = result.expect("an independent UI root starts");
+                assert!(
+                    running.local_ticket.is_none(),
+                    "without HOME or XDG no ticket file is written"
+                );
+                running.shutdown().await;
+            } else {
+                let Err(error) = result else {
+                    panic!("the credential case {case} must be refused");
+                };
+                assert!(
+                    matches!(&error, ServerError::UiOverlapsConfiguration(_)),
+                    "the wrong refusal for {case}: {error:?}"
+                );
+                assert!(
+                    error.to_string().contains("credential"),
+                    "the refusal names the credential directory: {error}"
+                );
+            }
+            println!("CREDENTIAL_CHILD_OK");
+
+            return;
+        }
+
+        let spawn = |case: &str,
+                     ui: &std::path::Path,
+                     home: &std::path::Path,
+                     credential: Option<&std::path::Path>| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg("server::tests::a_credential_named_in_the_environment_is_hidden_from_the_ui")
+                .arg("--nocapture")
+                .env_clear()
+                .env("NEHA_TEST_CREDENTIAL_CHILD", "1")
+                .env("NEHA_TEST_CREDENTIAL_CASE", case)
+                .env("NEHA_TEST_UI_ROOT", ui)
+                .env("NEHA_TEST_HOME", home);
+            if let Some(credential) = credential {
+                command.env("NEHA_CREDENTIAL", credential);
+            }
+            let output = command.output().expect("the child test process starts");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "the child Space failed for {case}: {stdout}\n{stderr}"
+            );
+            assert!(stdout.contains("CREDENTIAL_CHILD_OK"), "{stdout}");
+        };
+        let write_ui = |root: &std::path::Path| {
+            let ui = root.join("ui");
+            std::fs::create_dir_all(&ui).unwrap();
+            std::fs::write(ui.join("index.html"), "<!doctype html><title>Neha</title>").unwrap();
+            ui
+        };
+
+        // The credential file sits directly in the UI root.
+        let inside = tempfile::tempdir().unwrap();
+        let ui = write_ui(inside.path());
+        let home = inside.path().join("home");
+        let credential = ui.join("credential.json");
+        spawn("inside", &ui, &home, Some(&credential));
+
+        // The UI root sits inside the credential's folder.
+        let parent = tempfile::tempdir().unwrap();
+        let ui = write_ui(parent.path());
+        let home = parent.path().join("home");
+        let credential = parent.path().join("credential.json");
+        spawn("parent", &ui, &home, Some(&credential));
+
+        // An independent UI root and a credential elsewhere start normally.
+        let independent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ui = write_ui(independent.path());
+        let home = independent.path().join("home");
+        let credential = elsewhere.path().join("credential.json");
+        spawn("independent", &ui, &home, Some(&credential));
+
+        // Without NEHA_CREDENTIAL nothing changes.
+        let absent = tempfile::tempdir().unwrap();
+        let ui = write_ui(absent.path());
+        let home = absent.path().join("home");
+        spawn("absent", &ui, &home, None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

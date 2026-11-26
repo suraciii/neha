@@ -50,10 +50,17 @@ impl Credential {
     pub fn load() -> Result<Self> {
         // One resolver for the CLI and the daemon's hidden roots: a relative
         // `XDG_CONFIG_HOME` must not put the session under the working
-        // directory, where a Bot can read it.
-        let path = crate::computer::credential_path();
-        crate::computer::migrate_legacy_credential(&path)?;
-        let bytes = fs::read(&path).with_context(|| {
+        // directory, where a Bot can read it. A legacy copy is moved or
+        // removed first; if that cleanup fails, signing in is refused.
+        crate::computer::migrate_legacy_credential()?;
+        let path = crate::computer::credential_path()?;
+
+        Self::load_from(&path)
+    }
+
+    /// Loads a credential from one resolved path.
+    pub(crate) fn load_from(path: &Path) -> Result<Self> {
+        let bytes = fs::read(path).with_context(|| {
             format!(
                 "not signed in: {} is missing; run `neha join <invite link>`",
                 path.display()
@@ -64,8 +71,11 @@ impl Credential {
 
     /// Saves the credential for later commands.
     pub fn save(&self) -> Result<()> {
+        // Saving a new session also clears any old cwd-relative copy, so the
+        // CLI never leaves a readable session behind.
+        crate::computer::migrate_legacy_credential()?;
         write_private(
-            &crate::computer::credential_path(),
+            &crate::computer::credential_path()?,
             &serde_json::to_vec(self)?,
         )
     }
