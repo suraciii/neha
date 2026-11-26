@@ -2398,7 +2398,7 @@ mod tests {
              VALUES (?, ?, 0, 0)",
         )
         .bind(digest("stale-ticket").as_slice())
-        .bind(owner.to_string())
+        .bind(owner.to_string().into_bytes())
         .execute(&identity.pool)
         .await
         .unwrap();
