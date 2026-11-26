@@ -29,11 +29,11 @@ Neha's own agent: a persistent identity with memory and a Computer that takes wo
 _Avoid_: teammate (as a term), agent (when meaning Neha's own), assistant, primary bot
 
 **Computer**:
-The machine a Bot runs on, managed or real; a real Computer runs Neha. Each Bot has its own Computer, chosen by its owner, and several Bots may share one.
+The machine a Bot runs on, Hosted or Local; a Local Computer runs Neha, and the record names its kind `local` or `hosted`. Each Bot has its own Computer, chosen by its owner, and several Bots may share one.
 _Avoid_: host, sandbox (as the umbrella), VM, device
 
 **Workspace**:
-The durable file tree of one Bot. A managed Computer keeps it in the Space, and a real Computer keeps it in a directory on the machine.
+The durable file tree of one Bot. A Hosted Computer keeps it in the Space, and a Local Computer keeps it in a directory on the machine.
 _Avoid_: home, volume, sandbox disk
 
 **Run**:

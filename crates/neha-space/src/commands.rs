@@ -19,7 +19,7 @@ use neha::record::{
     ActionStatus as RecordedActionStatus, Author, Event, EventDraft, EventKind, FileAdded,
 };
 use neha::seq::Seq;
-use neha::surface::{BotCreate, CommandCall, FileSummary, MessageSend, ProviderAdd};
+use neha::surface::{BotComputer, BotCreate, CommandCall, FileSummary, MessageSend, ProviderAdd};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -310,10 +310,21 @@ async fn bot_create(
 
     let bot = Id::new();
     let chat = Id::new();
-    // A Bot either gets a fresh managed Computer or joins a real one the
-    // caller already owns; a real Computer's Bot folder is the machine's.
+    // A named Computer must be one the caller owns: a Local Computer runs on
+    // a machine of theirs, while a Hosted Computer belongs to one Bot alone.
+    // Without a name the Bot prefers the caller's Local Computer and gets its
+    // own Hosted one when there is none.
     let (computer, computer_view, created_workspace) = match arguments.computer {
-        Some(computer) => {
+        Some(BotComputer::Local) => {
+            let view = local_computer(context.state, account.id)?.ok_or_else(|| {
+                ApiError::invalid_argument(
+                    "there is no Local Computer; run `neha computer pair` on this machine",
+                )
+            })?;
+            (view.id, viewed_computer(&view, context.links), None)
+        }
+        Some(BotComputer::Hosted) => fresh_hosted(context, account)?,
+        Some(BotComputer::Id(computer)) => {
             let view = {
                 let state = context
                     .state
@@ -328,27 +339,17 @@ async fn bot_create(
             if view.owner != account.id {
                 return Err(ApiError::not_found("no such Computer"));
             }
-            if view.kind != "real" {
+            if view.kind != "local" {
                 return Err(ApiError::invalid_argument(
-                    "a Bot needs a real Computer; leave the Computer out to get a managed one",
+                    "a Bot's own Computer is Local; leave the Computer out for Hosted",
                 ));
             }
             (computer, viewed_computer(&view, context.links), None)
         }
-        None => {
-            let computer = Id::new();
-            let workspace = context.home.workspace_dir(computer);
-            std::fs::create_dir_all(&workspace)
-                .map_err(|_| ApiError::internal("cannot create the Computer workspace"))?;
-            let view = ComputerView {
-                id: computer,
-                owner: account.id,
-                kind: "managed".to_owned(),
-                online: true,
-                workspace: workspace.to_string_lossy().into_owned(),
-            };
-            (computer, view, Some(workspace))
-        }
+        None => match local_computer(context.state, account.id)? {
+            Some(view) => (view.id, viewed_computer(&view, context.links), None),
+            None => fresh_hosted(context, account)?,
+        },
     };
     let mut drafts = Vec::new();
     if let Some(workspace) = &created_workspace {
@@ -358,7 +359,7 @@ async fn bot_create(
             json!({
                 "computer": computer,
                 "owner": account.id,
-                "kind": "managed",
+                "kind": "hosted",
                 "workspace": workspace.to_string_lossy(),
             }),
         ));
@@ -454,12 +455,14 @@ async fn bot_move(
         }
         (bot_view, from_view, to_view)
     };
-    if to_view.kind != "real" {
-        return Err(ApiError::invalid_argument("a Bot moves to a real Computer"));
-    }
-    if from_view.kind != "real" {
+    if to_view.kind != "local" {
         return Err(ApiError::invalid_argument(
-            "a Bot on a managed Computer cannot move yet; create a Bot on the target Computer",
+            "a Bot moves to a Local Computer",
+        ));
+    }
+    if from_view.kind != "local" {
+        return Err(ApiError::invalid_argument(
+            "a Bot on a Hosted Computer cannot move yet; create a Bot on the target Computer",
         ));
     }
     if bot_view.computer == computer {
@@ -655,14 +658,14 @@ async fn computer_add(
         json!({
             "computer": computer,
             "owner": account.id,
-            "kind": "real",
+            "kind": "local",
             "workspace": workspace,
         }),
     );
     let result = json!(ComputerView {
         id: computer,
         owner: account.id,
-        kind: "real".to_owned(),
+        kind: "local".to_owned(),
         online: false,
         workspace,
     });
@@ -753,9 +756,42 @@ fn list_computers(state: &State, links: &ComputerLinks, owner: Id) -> Result<Val
 /// A real Computer is online only while its channel is up; the projection
 /// cannot know that, so the runtime links answer for it. A managed Computer
 /// runs inside the Space and is always online.
+/// Returns the caller's paired Local Computer, earliest first.
+fn local_computer(state: &Mutex<State>, owner: Id) -> Result<Option<ComputerView>, ApiError> {
+    let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+    let local = state
+        .computer_order
+        .iter()
+        .filter_map(|computer| state.computers.get(computer))
+        .find(|view| view.owner == owner && view.kind == "local")
+        .cloned();
+
+    Ok(local)
+}
+
+/// Creates the workspace of a fresh Hosted Computer.
+fn fresh_hosted(
+    context: &CommandContext<'_>,
+    account: &Account,
+) -> Result<(Id, ComputerView, Option<std::path::PathBuf>), ApiError> {
+    let computer = Id::new();
+    let workspace = context.home.workspace_dir(computer);
+    std::fs::create_dir_all(&workspace)
+        .map_err(|_| ApiError::internal("cannot create the Computer workspace"))?;
+    let view = ComputerView {
+        id: computer,
+        owner: account.id,
+        kind: "hosted".to_owned(),
+        online: true,
+        workspace: workspace.to_string_lossy().into_owned(),
+    };
+
+    Ok((computer, view, Some(workspace)))
+}
+
 fn viewed_computer(computer: &ComputerView, links: &ComputerLinks) -> ComputerView {
     let mut computer = computer.clone();
-    computer.online = computer.kind != "real" || links.online(computer.id);
+    computer.online = computer.kind != "local" || links.online(computer.id);
 
     computer
 }
@@ -1021,7 +1057,7 @@ pub async fn finish_run(
         .ok()
         .and_then(|state| state.computers.get(&computer).map(|view| view.kind.clone()));
     let runtime = match kind.as_deref() {
-        Some("real") => {
+        Some("local") => {
             let Some(link) = links.link(computer) else {
                 let outcome = RunOutcome {
                     text: "I could not start my Computer: it is offline.".to_owned(),

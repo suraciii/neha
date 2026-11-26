@@ -11,7 +11,7 @@ use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
 use neha::seq::Seq;
 use neha::surface::{
-    BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
+    BotComputer, BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
 };
 use neha_space::Home;
 use serde_json::Value;
@@ -132,9 +132,12 @@ enum BotCommand {
     Create {
         /// The Bot's name.
         name: String,
-        /// The real Computer the Bot works on; a managed one when absent.
-        #[arg(long)]
-        computer: Option<Id>,
+        /// Where the Bot works: local, hosted, or a Computer id.
+        ///
+        /// Defaults to the owner's Local Computer when one is paired, and a
+        /// fresh Hosted Computer otherwise.
+        #[arg(long, value_name = "LOCAL|HOSTED|ID")]
+        computer: Option<String>,
     },
     /// Move your Bot to another real Computer you own.
     Move {
@@ -155,20 +158,27 @@ enum BotCommand {
 
 #[derive(Subcommand)]
 enum ComputerCommand {
-    /// Pair this machine to a Space and start its daemon.
+    /// Pair this machine with the Space on this machine.
     Pair {
-        /// The Space URL; defaults to NEHA_SPACE_URL.
+        /// The Space URL; defaults to the ticket file's or the saved Space's.
         #[arg(long)]
         space: Option<String>,
-        /// The directory that holds one folder per Bot.
+        /// The ticket file; defaults to NEHA_HOME/state/local-computer.ticket.
+        #[arg(long)]
+        ticket_file: Option<std::path::PathBuf>,
+        /// The Workspace root that holds one folder per Bot.
         #[arg(long)]
         workspace: Option<std::path::PathBuf>,
-        /// The machine name the Space shows.
+        /// Pair without asking for confirmation.
         #[arg(long)]
-        name: Option<String>,
+        yes: bool,
     },
     /// Start this machine's daemon with its saved pairing.
-    Run,
+    Run {
+        /// The Workspace root that holds one folder per Bot.
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+    },
     /// Add the machine that printed a pairing code to this Space.
     Add {
         /// The pairing code the machine printed.
@@ -299,6 +309,9 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>) -> Result<()> {
         println!("Build ui/ with `pnpm --dir ui build` to use the browser client.");
     }
     println!("Files are stored in {}", running.storage());
+    if let Some(hint) = pairing_hint(running.local_ticket.as_deref()) {
+        println!("{hint}");
+    }
     println!("Press Ctrl-C to stop.");
 
     tokio::signal::ctrl_c()
@@ -465,6 +478,7 @@ async fn bot(command: BotCommand) -> Result<()> {
     let credential = Credential::load()?;
     match command {
         BotCommand::Create { name, computer } => {
+            let computer = computer.as_deref().map(parse_bot_computer).transpose()?;
             let result = client::command(
                 &credential,
                 CommandCall::BotCreate(BotCreate {
@@ -504,13 +518,15 @@ async fn bot(command: BotCommand) -> Result<()> {
             println!(
                 "  Computer: {} ({}, online: {})",
                 id_of(&result["computer"], "id")?,
-                text_of(&result["computer"], "kind")?,
+                computer_kind_label(text_of(&result["computer"], "kind")?),
                 result["computer"]["online"].as_bool().unwrap_or(false)
             );
-            println!(
-                "  Workspace: {}",
-                text_of(&result["computer"], "workspace")?
-            );
+            // A Local Computer's Workspace lives on that machine, so the
+            // Space records no path for it.
+            let workspace = text_of(&result["computer"], "workspace")?;
+            if !workspace.is_empty() {
+                println!("  Workspace: {workspace}");
+            }
         }
         BotCommand::List => {
             let result = client::command(&credential, CommandCall::BotList).await?;
@@ -532,10 +548,11 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
     match command {
         ComputerCommand::Pair {
             space,
+            ticket_file,
             workspace,
-            name,
-        } => computer::pair(space, workspace, name).await?,
-        ComputerCommand::Run => computer::run().await?,
+            yes,
+        } => computer::pair(space, ticket_file, workspace, yes).await?,
+        ComputerCommand::Run { workspace } => computer::run(workspace).await?,
         ComputerCommand::Add { code } => {
             let credential = Credential::load()?;
             let computer = client::command(&credential, CommandCall::ComputerAdd { code }).await?;
@@ -905,6 +922,37 @@ impl Progress {
     }
 }
 
+/// The line that tells the User how to pair this PC, when a ticket is waiting.
+///
+/// A Space with no Admin yet has no ticket, so there is nothing to pair with
+/// until someone joins; the hint is printed only once a ticket exists.
+fn pairing_hint(local_ticket: Option<&std::path::Path>) -> Option<&'static str> {
+    local_ticket.map(|_| "Pair this PC: neha computer pair")
+}
+
+/// Parses the value of `--computer`: `local`, `hosted`, or a Computer id.
+fn parse_bot_computer(text: &str) -> Result<BotComputer> {
+    let text = text.trim();
+    match text {
+        "" => bail!("--computer needs local, hosted, or a Computer id"),
+        "local" => Ok(BotComputer::Local),
+        "hosted" => Ok(BotComputer::Hosted),
+        _ => match text.parse::<Id>() {
+            Ok(computer) => Ok(BotComputer::Id(computer)),
+            Err(_) => bail!("--computer {text:?} is not local, hosted, or a Computer id"),
+        },
+    }
+}
+
+/// The User-facing name of a Computer kind.
+fn computer_kind_label(kind: &str) -> &str {
+    match kind {
+        "local" => "Local",
+        "hosted" => "Hosted",
+        other => other,
+    }
+}
+
 fn provider_key() -> Result<String> {
     if let Ok(key) = std::env::var("NEHA_PROVIDER_KEY")
         && !key.trim().is_empty()
@@ -947,6 +995,117 @@ mod tests {
     use serde_json::json;
 
     use super::{space_file_name, write_run};
+
+    use clap::Parser as _;
+
+    use super::{Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer};
+
+    #[test]
+    fn the_bot_computer_choice_parses_local_hosted_and_an_id() {
+        assert_eq!(
+            parse_bot_computer("local").unwrap(),
+            neha::surface::BotComputer::Local
+        );
+        assert_eq!(
+            parse_bot_computer("hosted").unwrap(),
+            neha::surface::BotComputer::Hosted
+        );
+        let computer = Id::new();
+        assert_eq!(
+            parse_bot_computer(&computer.to_string()).unwrap(),
+            neha::surface::BotComputer::Id(computer)
+        );
+        for value in ["", "managed", "real", "not-a-computer"] {
+            let error = parse_bot_computer(value).unwrap_err().to_string();
+            assert!(
+                error.contains("local, hosted, or a Computer id"),
+                "{value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pairing_hint_waits_for_a_ticket() {
+        assert_eq!(
+            pairing_hint(Some(std::path::Path::new(
+                "/home/ada/.neha/state/local-computer.ticket"
+            ))),
+            Some("Pair this PC: neha computer pair")
+        );
+        assert_eq!(pairing_hint(None), None);
+    }
+
+    #[test]
+    fn a_computer_kind_reads_local_and_hosted() {
+        assert_eq!(computer_kind_label("local"), "Local");
+        assert_eq!(computer_kind_label("hosted"), "Hosted");
+        assert_eq!(computer_kind_label("future"), "future");
+    }
+
+    #[test]
+    fn the_pair_command_takes_the_new_flags() {
+        let cli = Cli::try_parse_from([
+            "neha",
+            "computer",
+            "pair",
+            "--space",
+            "http://127.0.0.1:7337",
+            "--ticket-file",
+            "/tmp/local-computer.ticket",
+            "--workspace",
+            "/home/ada/.neha/workspaces",
+            "--yes",
+        ])
+        .unwrap();
+        match cli.command {
+            Top::Computer {
+                command:
+                    ComputerCommand::Pair {
+                        space,
+                        ticket_file,
+                        workspace,
+                        yes,
+                    },
+            } => {
+                assert_eq!(space.as_deref(), Some("http://127.0.0.1:7337"));
+                assert_eq!(
+                    ticket_file.as_deref(),
+                    Some(std::path::Path::new("/tmp/local-computer.ticket"))
+                );
+                assert_eq!(
+                    workspace.as_deref(),
+                    Some(std::path::Path::new("/home/ada/.neha/workspaces"))
+                );
+                assert!(yes);
+            }
+            _ => panic!("the pair command did not parse"),
+        }
+    }
+
+    #[test]
+    fn the_machine_name_flag_is_gone_and_run_takes_a_workspace() {
+        assert!(
+            Cli::try_parse_from(["neha", "computer", "pair", "--name", "laptop"]).is_err(),
+            "--name is no longer part of pairing"
+        );
+        let cli = Cli::try_parse_from([
+            "neha",
+            "computer",
+            "run",
+            "--workspace",
+            "/home/ada/.neha/workspaces",
+        ])
+        .unwrap();
+        match cli.command {
+            Top::Computer {
+                command: ComputerCommand::Run { workspace },
+            } => assert_eq!(
+                workspace.as_deref(),
+                Some(std::path::Path::new("/home/ada/.neha/workspaces"))
+            ),
+            _ => panic!("the run command did not parse"),
+        }
+    }
 
     /// One run as `run show` reports it.
     fn run_view(status: &str, position: Option<u32>) -> serde_json::Value {

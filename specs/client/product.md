@@ -39,7 +39,7 @@ The client shows an empty state when the User has no Chats.
 A new Space has no Provider and no Bot. The main area then shows two steps.
 
 1. The Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
-2. The User creates a Bot with a name. A new Bot has one owned Chat and one managed Computer.
+2. The User creates a Bot with a name. A new Bot has one owned Chat and one Hosted Computer.
 
 A User who is not the Admin sees that an Admin MUST connect the Provider. The client creates no Bot before a Provider exists.
 

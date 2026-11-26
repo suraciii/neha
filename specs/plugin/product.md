@@ -33,7 +33,7 @@ A Plugin reads and writes the Space's record like a member. Removing a Plugin le
 
 ## Installing
 
-The Admin installs and enables a Plugin on the Space. The owner of a real Computer approves any code a Plugin runs on that Computer.
+The Admin installs and enables a Plugin on the Space. The owner of a Local Computer approves any code a Plugin runs on that Computer.
 
 A reference that starts a program on a Computer counts as code.
 
@@ -45,7 +45,7 @@ A skill is an instruction entry kept in the record, in the Space's library or in
 
 The Admin installs skills on the Space, and a Bot's owner enables them for the Bot. A skill that a Bot wrote itself is not installed; [Bot](../bot/product.md) covers it.
 
-A script that a skill carries runs only as one of the Bot's actions, and the owner of a real Computer approves it before a Bot on that Computer runs it.
+A script that a skill carries runs only as one of the Bot's actions, and the owner of a Local Computer approves it before a Bot on that Computer runs it.
 
 The Admin can set a Space to treat skills as instructions only; then the scripts of a skill never reach a Computer.
 

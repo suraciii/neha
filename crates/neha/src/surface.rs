@@ -149,9 +149,47 @@ pub struct ModelSpec {
 pub struct BotCreate {
     /// The Bot's name.
     pub name: String,
-    /// The real Computer the Bot works on; a managed Computer when absent.
+    /// Where the Bot works.
+    ///
+    /// An absent value means the owner's Local Computer when they have one,
+    /// and a fresh Hosted Computer otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub computer: Option<Id>,
+    pub computer: Option<BotComputer>,
+}
+
+/// The Computer a `bot_create` asks for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BotComputer {
+    /// The owner's paired Local Computer, or Hosted when they have none.
+    Local,
+    /// A fresh Hosted Computer.
+    Hosted,
+    /// One Computer the caller already owns.
+    Id(Id),
+}
+
+impl Serialize for BotComputer {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Local => serializer.serialize_str("local"),
+            Self::Hosted => serializer.serialize_str("hosted"),
+            Self::Id(id) => id.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for BotComputer {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "local" => Ok(Self::Local),
+            "hosted" => Ok(Self::Hosted),
+            _ => value
+                .parse::<Id>()
+                .map(Self::Id)
+                .map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 /// The parameters of `message_send`.
@@ -234,8 +272,8 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotCreate, ClientFrame, CommandCall, MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd,
-        ProviderProtocol, ServerFrame,
+        BotComputer, BotCreate, ClientFrame, CommandCall, MessageSend, ModelSpec, PROTOCOL_VERSION,
+        ProviderAdd, ProviderProtocol, ServerFrame,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -306,11 +344,32 @@ mod tests {
     }
 
     #[test]
-    fn bot_create_carries_a_real_computer() {
+    fn bot_create_carries_a_local_or_hosted_choice() {
+        for (choice, wire) in [
+            (BotComputer::Local, "local"),
+            (BotComputer::Hosted, "hosted"),
+        ] {
+            let command = CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: Some(choice),
+            });
+            let text = serde_json::to_string(&command).unwrap();
+            assert!(text.contains(&format!("\"computer\":\"{wire}\"")), "{text}");
+            assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+        }
+
+        let unknown: Result<CommandCall, _> = serde_json::from_str(
+            "{\"name\":\"bot_create\",\"args\":{\"name\":\"Scout\",\"computer\":\"mainframe\"}}",
+        );
+        assert!(unknown.is_err(), "an unknown choice is refused");
+    }
+
+    #[test]
+    fn bot_create_carries_a_computer_id() {
         let computer = Id::new();
         let command = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
-            computer: Some(computer),
+            computer: Some(BotComputer::Id(computer)),
         });
         let text = serde_json::to_string(&command).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);

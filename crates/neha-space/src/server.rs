@@ -57,6 +57,7 @@ use crate::runs::RunQueue;
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
 use crate::store::{AppendRequest, Projection, Store, StoreError, StoreReader};
+use crate::ticket::{self, PairLimiter, TicketError};
 
 const LOGIN_ATTEMPTS: usize = 5;
 const SOURCE_ATTEMPTS: usize = 20;
@@ -101,6 +102,10 @@ pub struct SpaceServer {
     pub(crate) links: ComputerLinks,
     /// Pairing attempts that are running or recently failed, per account.
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
+    /// Local-ticket pair attempts, counted per source address.
+    pub(crate) pairs: Mutex<PairLimiter>,
+    /// The ticket file this start wrote for its Admin, with its digest.
+    start_ticket: Mutex<Option<crate::ticket::StartTicket>>,
     /// Set once the Space stops: no command may then start new work.
     closed: AtomicBool,
     pub(crate) runs: Arc<RunQueue>,
@@ -170,6 +175,8 @@ impl SpaceServer {
             tool_timeout,
             links: ComputerLinks::new(),
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
+            pairs: Mutex::new(PairLimiter::default()),
+            start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
             runs: Arc::new(RunQueue::new()),
             uploads: Mutex::new(std::collections::HashMap::new()),
@@ -217,6 +224,8 @@ impl SpaceServer {
             .route("/api/me", get(me))
             .route("/api/socket", get(socket))
             .route("/api/computer/socket", get(computer_socket))
+            .route("/api/computer/ticket", post(computer_ticket))
+            .route("/api/computer/pair", post(computer_pair))
             .route("/api/computers/pair", post(computer_pair_start))
             .route("/api/computers/pair/{device}", post(computer_pair_poll))
             .route(
@@ -258,6 +267,8 @@ pub struct Running {
     pub addr: std::net::SocketAddr,
     /// The invitation URL, when the Space has no Admin yet.
     pub invite: Option<String>,
+    /// The local ticket `neha computer pair` reads, when the Space has an Admin.
+    pub local_ticket: Option<PathBuf>,
     /// The per-Space hostname the browser client uses.
     pub browser_host: String,
     home: Home,
@@ -361,6 +372,42 @@ async fn start_with(
     let addr = listener.local_addr()?;
     recover_interrupted(&server.store, &server.state).await?;
     reconcile_pairings(&server).await?;
+    // The record is the truth about Computers: a token whose Computer the
+    // replay does not hold is an orphan from a crash between a pairing's token
+    // write and its append, and must not authenticate anything.
+    let recorded: Vec<Id> = server
+        .state
+        .lock()
+        .map_err(|_| {
+            ServerError::Store(StoreError::Corrupt("the Space state is locked".to_owned()))
+        })?
+        .computers
+        .keys()
+        .copied()
+        .collect();
+    server
+        .identity
+        .forget_unrecorded_computer_tokens(&recorded)
+        .await?;
+    // A local ticket binds one start of the Space: the previous start's
+    // tickets are void before this one issues its own for the Admin.
+    ticket::clear(&server.identity).await?;
+    for path in [
+        ticket::path(&server.home),
+        server.home.root().join("state").join(ticket::TICKET_FILE),
+    ] {
+        ticket::remove_file(&path).await?;
+    }
+    let start_ticket = match server.identity.admin_account().await? {
+        Some(admin) => {
+            let path = ticket::path(&server.home);
+            let url = format!("http://{addr}");
+            let start = ticket::issue_for_start(&server.identity, &path, admin.id, &url).await?;
+            *server.start_ticket.lock().expect("start ticket lock") = Some(start.clone());
+            Some(start)
+        }
+        None => None,
+    };
     server.runs.wake_all(&server);
     let invite = server
         .invite_secret()
@@ -377,6 +424,7 @@ async fn start_with(
     Ok(Running {
         addr,
         invite,
+        local_ticket: start_ticket.map(|start| start.path),
         browser_host: server.browser_host.clone(),
         home: server.home().clone(),
         storage: server.storage.clone(),
@@ -1001,6 +1049,136 @@ async fn computer_pair_poll(
             Ok(Json(PairingReply::Approved { computer }))
         }
         None => Err(ApiError::not_found("no such pairing")),
+    }
+}
+
+#[derive(Serialize)]
+struct LocalTicketBody {
+    ticket: String,
+}
+
+/// Issues a local ticket to a signed-in User.
+///
+/// This is the CLI-credential fallback for `neha computer pair`: the ticket
+/// stays in the response and is never written to the Space's home.
+async fn computer_ticket(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account }: Authed,
+) -> Result<Json<LocalTicketBody>, ApiError> {
+    let ticket = ticket::issue(&server.identity, account.id)
+        .await
+        .map_err(ticket_error)?;
+
+    Ok(Json(LocalTicketBody { ticket }))
+}
+
+#[derive(Deserialize)]
+struct PairTicketRequest {
+    ticket: String,
+}
+
+#[derive(Serialize)]
+struct PairedComputerBody {
+    computer: Id,
+    credential: String,
+}
+
+/// Exchanges a local ticket for a Computer and its credential.
+///
+/// The endpoint needs no login: the ticket is the credential, it works once,
+/// and it belongs to one start of the Space. Attempts are counted per source
+/// address so an unauthenticated caller cannot churn tickets or Computers.
+async fn computer_pair(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    Json(request): Json<PairTicketRequest>,
+) -> Result<Json<PairedComputerBody>, ApiError> {
+    if !server.pairs.lock().expect("pair lock").allows(source.ip()) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing attempts",
+        ));
+    }
+    let start_ticket = server
+        .start_ticket
+        .lock()
+        .expect("start ticket lock")
+        .clone();
+    let owner = ticket::claim(&server.identity, start_ticket.as_ref(), &request.ticket)
+        .await
+        .map_err(ticket_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                ErrorCode::Unauthorized,
+                "the ticket is not valid",
+            )
+        })?;
+
+    // The credential is recorded before the Computer, so a machine never gets
+    // a working token for a Computer the record refuses. A failed append rolls
+    // the token back before the answer.
+    let computer = Id::new();
+    let credential = ticket::secret();
+    server
+        .identity
+        .record_computer_token(computer, &credential)
+        .await
+        .map_err(identity_error)?;
+    let draft = EventDraft::new(
+        EventKind::ComputerCreated,
+        Author::User(owner),
+        serde_json::json!({
+            "computer": computer,
+            "owner": owner,
+            "kind": "local",
+            "workspace": "",
+        }),
+    );
+    let appended = match server
+        .store
+        .append(AppendRequest::new(
+            Id::new(),
+            format!("computer.pair:{computer}"),
+            vec![draft],
+        ))
+        .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            if let Err(cleanup) = server.identity.forget_computer_token(&credential).await {
+                // The start-up reconciliation removes the orphan; report it
+                // now so a failure to roll back is visible.
+                eprintln!("neha: cannot roll back a pairing token: {cleanup}");
+            }
+            return Err(ApiError::internal(error.to_string()));
+        }
+    };
+    {
+        let mut state = server
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("the Space state is locked"))?;
+        for event in &appended.events {
+            state
+                .apply(event)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
+    broadcast(&server, &appended.events);
+
+    Ok(Json(PairedComputerBody {
+        computer,
+        credential,
+    }))
+}
+
+/// Maps a ticket failure to an API error.
+fn ticket_error(error: TicketError) -> ApiError {
+    match error {
+        TicketError::Identity(error) => identity_error(error),
+        TicketError::Io(_) | TicketError::Corrupt(_) => ApiError::internal(error.to_string()),
     }
 }
 
@@ -2074,6 +2252,9 @@ pub enum ServerError {
     /// The browser client directory overlaps the Space home.
     #[error("the browser client at {} overlaps the Space home", .0.display())]
     UiOverlapsHome(PathBuf),
+    /// The local pairing ticket cannot be issued or cleared.
+    #[error("local ticket error: {0}")]
+    Ticket(#[from] TicketError),
 }
 
 #[cfg(test)]
@@ -2091,7 +2272,7 @@ mod tests {
 
     async fn running() -> (tempfile::TempDir, Running, String) {
         let dir = tempfile::tempdir().unwrap();
-        let home = Home::open(dir.path()).unwrap();
+        let home = test_home(dir.path());
         let running = start(home, 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
 
@@ -2102,7 +2283,7 @@ mod tests {
     async fn running_with_config(config: &str) -> (tempfile::TempDir, Running, String) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), config).unwrap();
-        let running = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let running = start(test_home(dir.path()), 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
 
         (dir, running, invite)
@@ -2257,10 +2438,10 @@ mod tests {
     use neha::error::ErrorCode;
     use neha::file::MAX_FILE_BYTES;
     use neha::id::Id;
-    use neha::record::EventKind;
+    use neha::record::{Author, EventDraft, EventKind};
     use neha::seq::Seq;
     use neha::surface::{
-        BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
+        BotComputer, BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
     };
     use serde_json::Value;
     use tokio::net::TcpStream;
@@ -2666,7 +2847,7 @@ mod tests {
         .await;
         let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
         let bot_id: Id = serde_json::from_value(bot["bot"]["id"].clone()).unwrap();
-        assert_eq!(bot["computer"]["kind"], "managed");
+        assert_eq!(bot["computer"]["kind"], "hosted");
 
         let sent = send(&mut socket, chat, "hello").await;
         assert_eq!(sent["status"], "succeeded");
@@ -2961,7 +3142,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_restart_answers_an_interrupted_run() {
-        use neha::record::{Author, EventDraft, EventKind};
+        use neha::record::EventKind;
 
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -3707,7 +3888,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_long_history_streams_in_pages_without_gaps() {
-        use neha::record::{Author, EventDraft, EventKind};
+        use neha::record::EventKind;
 
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -3813,7 +3994,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_event_larger_than_one_frame_is_reported() {
-        use neha::record::{Author, EventDraft, EventKind};
+        use neha::record::EventKind;
 
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -4148,7 +4329,7 @@ mod tests {
         let root = running.server_home();
         socket.close(None).await.unwrap();
         running.shutdown().await;
-        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
         let shown_again = show_run(&mut socket, run).await;
         assert_eq!(shown_again["steps"], shown["steps"]);
@@ -4427,7 +4608,7 @@ mod tests {
         socket.close(None).await.unwrap();
         running.shutdown().await;
 
-        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
         // The working run died with the old process; the waiting one runs now.
         assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
@@ -4466,7 +4647,7 @@ mod tests {
         let root = running.server_home();
         socket.close(None).await.unwrap();
         running.shutdown().await;
-        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
         assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
         assert_eq!(
@@ -4872,7 +5053,7 @@ mod tests {
         socket.close(None).await.unwrap();
         running.shutdown().await;
 
-        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
         assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
         let failed = wait_run(&mut socket, second_run).await;
@@ -4976,7 +5157,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_start_leaves_the_queue_untouched() {
-        use neha::record::{Author, EventDraft, EventKind};
+        use neha::record::EventKind;
 
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -5079,7 +5260,7 @@ mod tests {
             .await
             .unwrap();
         let port = occupied.local_addr().unwrap().port();
-        let result = start(Home::open(directory.path()).unwrap(), port).await;
+        let result = start(test_home(directory.path()), port).await;
         assert!(result.is_err(), "a taken port must refuse the start");
         drop(occupied);
 
@@ -5099,9 +5280,7 @@ mod tests {
         store.close().await.unwrap();
 
         // A start that listens recovers the run the previous process left working.
-        let running = start(Home::open(directory.path()).unwrap(), 0)
-            .await
-            .unwrap();
+        let running = start(test_home(directory.path()), 0).await.unwrap();
         {
             let state = running.server.state.lock().unwrap();
             let recovered = &state.runs[&interrupted_run];
@@ -5119,7 +5298,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn an_old_record_without_a_queued_event_replays() {
-        use neha::record::{Author, EventDraft, EventKind};
+        use neha::record::EventKind;
 
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -5380,7 +5559,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_long_record_of_large_events_catches_up_across_frames() {
-        use neha::record::{Author, EventDraft, EventKind};
+        use neha::record::EventKind;
 
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -6200,7 +6379,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_file_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
-        let first = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let first = start(test_home(dir.path()), 0).await.unwrap();
         let invite = first.invite.clone().unwrap();
         let (mut socket, token) = admin(&first, &invite).await;
         let (_bot, chat, _computer) = create_bot(&mut socket).await;
@@ -6220,7 +6399,7 @@ mod tests {
         socket.close(None).await.unwrap();
         first.shutdown().await;
 
-        let second = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let second = start(test_home(dir.path()), 0).await.unwrap();
         let token = sign_in(&second, "Ada").await;
         let mut socket = open_socket(&second, &token).await;
         assert_eq!(file_list(&mut socket, chat).await, vec![uploaded]);
@@ -6320,7 +6499,7 @@ mod tests {
         let root = running.server_home();
         socket.close(None).await.unwrap();
         running.shutdown().await;
-        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
         assert_eq!(file_list(&mut socket, chat).await.len(), 2);
         let again = download(&restarted, &token, delivered).await;
@@ -6544,7 +6723,7 @@ mod tests {
             // A restart reads the same bytes back from S3.
             socket.close(None).await.unwrap();
             running.shutdown().await;
-            let restarted = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+            let restarted = start(test_home(dir.path()), 0).await.unwrap();
             let token = sign_in(&restarted, "Ada").await;
             let mut socket = open_socket(&restarted, &token).await;
             let response = download(&restarted, &token, file).await;
@@ -6748,7 +6927,7 @@ mod tests {
         )
         .unwrap();
 
-        let Err(error) = start(Home::open(dir.path()).unwrap(), 0).await else {
+        let Err(error) = start(test_home(dir.path()), 0).await else {
             panic!("an invalid configuration must refuse the start");
         };
 
@@ -6896,7 +7075,16 @@ mod tests {
         }
     }
 
+    /// Opens a home whose local ticket stays inside this test's directory.
+    fn test_home(root: &std::path::Path) -> Home {
+        Home::open_with_ticket_directory(root, root.join("config")).unwrap()
+    }
+
     fn add_bot(name: &str, computer: Option<Id>) -> CommandCall {
+        add_bot_on(name, computer.map(BotComputer::Id))
+    }
+
+    fn add_bot_on(name: &str, computer: Option<BotComputer>) -> CommandCall {
         CommandCall::BotCreate(BotCreate {
             name: name.to_owned(),
             computer,
@@ -6924,7 +7112,7 @@ mod tests {
         let code = body["code"].as_str().unwrap().to_owned();
         let added = command(socket, Id::new(), add_computer(&code)).await;
         let computer: Id = serde_json::from_value(added["id"].clone()).unwrap();
-        assert_eq!(added["kind"], "real");
+        assert_eq!(added["kind"], "local");
 
         (computer, token.to_owned())
     }
@@ -6934,7 +7122,7 @@ mod tests {
         let (device, code) = pair_machine(running).await;
         let added = command(socket, Id::new(), add_computer(&code)).await;
         let computer: Id = serde_json::from_value(added["id"].clone()).unwrap();
-        assert_eq!(added["kind"], "real");
+        assert_eq!(added["kind"], "local");
         assert_eq!(added["online"], false);
 
         let approved = poll_pairing(running, &device, &machine_poll()).await;
@@ -7059,7 +7247,12 @@ mod tests {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
         // A managed Computer exists first, so creation order is observable.
-        let managed = command(&mut socket, Id::new(), add_bot("Managed", None)).await;
+        let managed = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Managed", Some(BotComputer::Hosted)),
+        )
+        .await;
         let managed_computer: Id =
             serde_json::from_value(managed["computer"]["id"].clone()).unwrap();
 
@@ -7082,7 +7275,7 @@ mod tests {
 
         let added = command(&mut socket, Id::new(), add_computer(&code)).await;
         let computer: Id = serde_json::from_value(added["id"].clone()).unwrap();
-        assert_eq!(added["kind"], "real");
+        assert_eq!(added["kind"], "local");
         assert_eq!(added["online"], false);
         assert_eq!(added["workspace"], MACHINE_WORKSPACE);
 
@@ -7098,10 +7291,10 @@ mod tests {
         let views = listed.as_array().unwrap();
         assert_eq!(views.len(), 2);
         assert_eq!(views[0]["id"], json!(managed_computer));
-        assert_eq!(views[0]["kind"], "managed");
+        assert_eq!(views[0]["kind"], "hosted");
         assert_eq!(views[0]["online"], true);
         assert_eq!(views[1]["id"], json!(computer));
-        assert_eq!(views[1]["kind"], "real");
+        assert_eq!(views[1]["kind"], "local");
         assert_eq!(views[1]["online"], false);
 
         // The code is used once.
@@ -7266,7 +7459,7 @@ mod tests {
         // The code is usable again through the real command.
         let mut socket = open_socket(&restarted, &token).await;
         let added = command(&mut socket, Id::new(), add_computer(&code)).await;
-        assert_eq!(added["kind"], "real");
+        assert_eq!(added["kind"], "local");
         let approved: Value = poll_pairing(&restarted, &device, &machine_poll())
             .await
             .json()
@@ -7347,7 +7540,7 @@ mod tests {
         // The code is usable again through the real command.
         let mut socket = open_socket(&restarted, &token).await;
         let added = command(&mut socket, Id::new(), add_computer(&code)).await;
-        assert_eq!(added["kind"], "real");
+        assert_eq!(added["kind"], "local");
         socket.close(None).await.unwrap();
         restarted.shutdown().await;
     }
@@ -8003,7 +8196,7 @@ mod tests {
         wait_online(&mut socket, computer).await;
         let shown_bot = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
         assert_eq!(shown_bot["computer"]["id"], json!(computer));
-        assert_eq!(shown_bot["computer"]["kind"], "real");
+        assert_eq!(shown_bot["computer"]["kind"], "local");
         assert_eq!(shown_bot["computer"]["online"], true);
 
         let queued = submit(&mut socket, chat, "run pwd", None).await;
@@ -8151,7 +8344,12 @@ mod tests {
     async fn a_bot_joins_a_real_computer_without_creating_one() {
         let (dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
-        let managed = command(&mut socket, Id::new(), add_bot("Managed", None)).await;
+        let managed = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Managed", Some(BotComputer::Hosted)),
+        )
+        .await;
         let managed_computer: Id =
             serde_json::from_value(managed["computer"]["id"].clone()).unwrap();
         let refused = try_command(
@@ -8169,7 +8367,7 @@ mod tests {
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         assert_eq!(created["bot"]["computer"], json!(computer));
         assert_eq!(created["computer"]["id"], json!(computer));
-        assert_eq!(created["computer"]["kind"], "real");
+        assert_eq!(created["computer"]["kind"], "local");
         let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
         assert_eq!(shown["computer"]["id"], json!(computer));
 
@@ -8227,9 +8425,9 @@ mod tests {
         assert_eq!(moved["bot"]["id"], json!(bot));
         assert_eq!(moved["bot"]["computer"], json!(second));
         assert_eq!(moved["from"]["id"], json!(first));
-        assert_eq!(moved["from"]["kind"], "real");
+        assert_eq!(moved["from"]["kind"], "local");
         assert_eq!(moved["to"]["id"], json!(second));
-        assert_eq!(moved["to"]["kind"], "real");
+        assert_eq!(moved["to"]["kind"], "local");
 
         // Replaying the command answers the recorded result and writes nothing.
         let again = command(
@@ -8277,7 +8475,12 @@ mod tests {
             paired_computer_with_token(&mut socket, &running, &machine_token_n(4)).await;
         let created = command(&mut socket, Id::new(), add_bot("Scout", Some(first))).await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
-        let managed = command(&mut socket, Id::new(), add_bot("Managed", None)).await;
+        let managed = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Managed", Some(BotComputer::Hosted)),
+        )
+        .await;
         let managed_bot: Id = serde_json::from_value(managed["bot"]["id"].clone()).unwrap();
         let managed_computer: Id =
             serde_json::from_value(managed["computer"]["id"].clone()).unwrap();
@@ -8333,7 +8536,7 @@ mod tests {
         match managed_target {
             Err((ErrorCode::InvalidArgument, message)) => {
                 assert!(
-                    message.contains("a Bot moves to a real Computer"),
+                    message.contains("a Bot moves to a Local Computer"),
                     "{message}"
                 );
             }
@@ -8565,7 +8768,7 @@ mod tests {
         assert_eq!(moves[0].data["to"], json!(winner_computer));
 
         // The record replays: a restart keeps the Bot on the winning Computer.
-        let restarted = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
         let restarted_token = sign_in(&restarted, "Ada").await;
         let mut restarted_socket = open_socket(&restarted, &restarted_token).await;
         let shown = command(
@@ -8688,7 +8891,7 @@ mod tests {
         provider_task.abort();
         socket.close(None).await.unwrap();
         running.shutdown().await;
-        let restarted = start(Home::open(root).unwrap(), 0).await.unwrap();
+        let restarted = start(test_home(&root), 0).await.unwrap();
         restarted.shutdown().await;
     }
 
@@ -8809,5 +9012,425 @@ mod tests {
         provider_task.abort();
         admin.close(None).await.unwrap();
         running.shutdown().await;
+    }
+    fn local_ticket_file(dir: &std::path::Path) -> std::path::PathBuf {
+        dir.join("config").join("local-computer.ticket")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_hands_the_admin_a_fresh_local_ticket() {
+        let (dir, running, invite) = running().await;
+        assert!(
+            running.local_ticket.is_none(),
+            "a Space with no Admin has no ticket to hand out"
+        );
+        join(&running, &invite, "Ada", "correct horse battery").await;
+        running.shutdown().await;
+
+        let started = start(test_home(dir.path()), 0).await.unwrap();
+        let path = started
+            .local_ticket
+            .clone()
+            .expect("the Admin gets a ticket");
+        assert_eq!(path, local_ticket_file(dir.path()));
+        let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ticket = body["ticket"].as_str().unwrap().to_owned();
+        assert_eq!(body["url"], started.url());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "only the Space's User can read the ticket");
+        }
+        started.shutdown().await;
+
+        // A ticket binds one start of the Space: the next start replaces it.
+        let next = start(test_home(dir.path()), 0).await.unwrap();
+        let next_body: Value =
+            serde_json::from_str(&std::fs::read_to_string(local_ticket_file(dir.path())).unwrap())
+                .unwrap();
+        assert_ne!(
+            next_body["ticket"],
+            json!(ticket),
+            "a restart replaces the ticket"
+        );
+        let refused = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", next.url()))
+            .json(&json!({"ticket": ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let refused: Value = refused.json().await.unwrap();
+        assert_eq!(refused["message"], "the ticket is not valid");
+        next.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_from_the_endpoint_needs_a_session_and_pairs_once() {
+        let (_dir, running, invite) = running().await;
+        let unauthenticated = reqwest::Client::new()
+            .post(format!("{}/api/computer/ticket", running.url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap().to_owned();
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+
+        let issued = reqwest::Client::new()
+            .post(format!("{}/api/computer/ticket", running.url()))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), reqwest::StatusCode::OK);
+        let issued: Value = issued.json().await.unwrap();
+        let ticket = issued["ticket"].as_str().unwrap().to_owned();
+
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", running.url()))
+            .json(&json!({"ticket": ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), reqwest::StatusCode::OK);
+        let paired: Value = paired.json().await.unwrap();
+        let computer: Id = serde_json::from_value(paired["computer"].clone()).unwrap();
+        let credential = paired["credential"].as_str().unwrap().to_owned();
+
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 10_000)
+            .await
+            .unwrap()
+            .events;
+        let created: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::ComputerCreated)
+            .collect();
+        assert_eq!(created.len(), 1, "one pairing records one Computer");
+        assert_eq!(
+            created[0].data,
+            json!({"computer": computer, "owner": owner, "kind": "local", "workspace": ""})
+        );
+
+        // The credential opens the Computer channel.
+        let mut admin = open_socket(&running, &token).await;
+        let mut device = connect_computer(&running, &credential, computer).await;
+        wait_online(&mut admin, computer).await;
+        let views = command(&mut admin, Id::new(), CommandCall::ComputerList).await;
+        assert_eq!(views[0]["kind"], "local");
+
+        let again = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", running.url()))
+            .json(&json!({"ticket": issued["ticket"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        device.close(None).await.unwrap();
+        admin.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_serve_ticket_file_pairs_once_and_is_deleted() {
+        let (dir, running, invite) = running().await;
+        join(&running, &invite, "Ada", "correct horse battery").await;
+        running.shutdown().await;
+        let started = start(test_home(dir.path()), 0).await.unwrap();
+        let path = started
+            .local_ticket
+            .clone()
+            .expect("the Admin got a ticket");
+        let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let ticket = body["ticket"].as_str().unwrap().to_owned();
+
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", started.url()))
+            .json(&json!({"ticket": ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), reqwest::StatusCode::OK);
+        assert!(
+            !local_ticket_file(dir.path()).exists(),
+            "the file disappears with its ticket"
+        );
+        started.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_the_start_ticket_file_disappears_with_its_ticket() {
+        let (dir, running, invite) = running().await;
+        join(&running, &invite, "Ada", "correct horse battery").await;
+        running.shutdown().await;
+        let started = start(test_home(dir.path()), 0).await.unwrap();
+        let path = started
+            .local_ticket
+            .clone()
+            .expect("the Admin got a ticket");
+        let body: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let start_ticket = body["ticket"].as_str().unwrap().to_owned();
+        let session = sign_in(&started, "Ada").await;
+        let issued = reqwest::Client::new()
+            .post(format!("{}/api/computer/ticket", started.url()))
+            .bearer_auth(&session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), reqwest::StatusCode::OK);
+
+        // A ticket the endpoint issues is not the start ticket: pairing it
+        // must leave the Admin's start file alone.
+        let issued: Value = issued.json().await.unwrap();
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", started.url()))
+            .json(&json!({"ticket": issued["ticket"]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), reqwest::StatusCode::OK);
+        assert!(
+            local_ticket_file(dir.path()).exists(),
+            "another User's ticket does not delete the start ticket"
+        );
+
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", started.url()))
+            .json(&json!({"ticket": start_ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), reqwest::StatusCode::OK);
+        assert!(
+            !local_ticket_file(dir.path()).exists(),
+            "the start ticket deletes its own file"
+        );
+        started.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_forgets_tokens_whose_computer_the_record_lost() {
+        let (dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap().to_owned();
+        let mut admin = open_socket(&running, &token).await;
+        let issued = reqwest::Client::new()
+            .post(format!("{}/api/computer/ticket", running.url()))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        let issued: Value = issued.json().await.unwrap();
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", running.url()))
+            .json(&json!({"ticket": issued["ticket"]}))
+            .send()
+            .await
+            .unwrap();
+        let paired: Value = paired.json().await.unwrap();
+        let computer: Id = serde_json::from_value(paired["computer"].clone()).unwrap();
+        let credential = paired["credential"].as_str().unwrap().to_owned();
+
+        // A token written for a Computer the record never got: the crash
+        // window after a token write and before its append.
+        let orphan = Id::new();
+        running
+            .server
+            .identity
+            .record_computer_token(orphan, "orphan-credential")
+            .await
+            .unwrap();
+        admin.close(None).await.unwrap();
+        running.shutdown().await;
+
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer("orphan-credential")
+                .await
+                .unwrap(),
+            None,
+            "a start forgets an orphan token"
+        );
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer(&credential)
+                .await
+                .unwrap(),
+            Some(computer),
+            "a token for a recorded Computer survives the reconciliation"
+        );
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let mut device = connect_computer(&restarted, &credential, computer).await;
+        wait_online(&mut socket, computer).await;
+        device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_attempts_are_rate_limited_per_address() {
+        let (_dir, running, _invite) = running().await;
+        let client = reqwest::Client::new();
+        for attempt in 0..10 {
+            let response = client
+                .post(format!("{}/api/computer/pair", running.url()))
+                .json(&json!({"ticket": "not-a-ticket"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED,
+                "attempt {attempt}"
+            );
+        }
+        let limited = client
+            .post(format!("{}/api/computer/pair", running.url()))
+            .json(&json!({"ticket": "not-a-ticket"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+        let limited: Value = limited.json().await.unwrap();
+        assert_eq!(limited["message"], "too many pairing attempts");
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_prefers_the_paired_local_computer_and_takes_choices() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+
+        // No Local Computer: the default is a fresh Hosted Computer, and the
+        // Local choice names the command that makes one.
+        let hosted = command(&mut socket, Id::new(), add_bot("First", None)).await;
+        assert_eq!(hosted["computer"]["kind"], "hosted");
+        let missing = try_command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Local", Some(BotComputer::Local)),
+        )
+        .await;
+        match missing {
+            Err((ErrorCode::InvalidArgument, message)) => assert!(
+                message.contains("there is no Local Computer; run `neha computer pair`"),
+                "{message}"
+            ),
+            other => panic!("a missing Local Computer is named: {other:?}"),
+        }
+
+        // Once a machine pairs, an unnamed Bot lands on its Local Computer.
+        let (computer, _machine) = paired_computer(&mut socket, &running).await;
+        let default = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        assert_eq!(default["computer"]["id"], json!(computer));
+        assert_eq!(default["computer"]["kind"], "local");
+        let explicit = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Explicit", Some(BotComputer::Local)),
+        )
+        .await;
+        assert_eq!(explicit["computer"]["id"], json!(computer));
+        let named = command(&mut socket, Id::new(), add_bot("Named", Some(computer))).await;
+        assert_eq!(named["computer"]["id"], json!(computer));
+
+        // An explicit Hosted Computer is one Bot's own.
+        let own = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Own", Some(BotComputer::Hosted)),
+        )
+        .await;
+        assert_eq!(own["computer"]["kind"], "hosted");
+        let hosted_id: Id = serde_json::from_value(own["computer"]["id"].clone()).unwrap();
+        let rejected = try_command(&mut socket, Id::new(), add_bot("Join", Some(hosted_id))).await;
+        match rejected {
+            Err((ErrorCode::InvalidArgument, message)) => assert!(
+                message.contains("leave the Computer out for Hosted"),
+                "{message}"
+            ),
+            other => panic!("a Bot cannot join a Hosted Computer: {other:?}"),
+        }
+
+        let views = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let views = views.as_array().unwrap();
+        assert!(views.iter().any(|view| view["kind"] == "local"));
+        assert!(views.iter().any(|view| view["kind"] == "hosted"));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_old_record_with_old_computer_kinds_replays() {
+        let (dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let old_local = Id::new();
+        let old_hosted = Id::new();
+        running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                "an old record",
+                vec![
+                    EventDraft::new(
+                        EventKind::ComputerCreated,
+                        Author::User(owner),
+                        json!({
+                            "computer": old_local,
+                            "owner": owner,
+                            "kind": "real",
+                            "workspace": "/home/ada/neha",
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::ComputerCreated,
+                        Author::User(owner),
+                        json!({
+                            "computer": old_hosted,
+                            "owner": owner,
+                            "kind": "managed",
+                            "workspace": "/space/workspace",
+                        }),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        running.shutdown().await;
+
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let views = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let views = views.as_array().unwrap();
+        assert!(
+            views
+                .iter()
+                .any(|view| view["id"] == json!(old_local) && view["kind"] == "local")
+        );
+        assert!(
+            views
+                .iter()
+                .any(|view| view["id"] == json!(old_hosted) && view["kind"] == "hosted")
+        );
+        let named = command(&mut socket, Id::new(), add_bot("Scout", Some(old_local))).await;
+        assert_eq!(named["computer"]["id"], json!(old_local));
+        assert_eq!(named["computer"]["kind"], "local");
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
     }
 }

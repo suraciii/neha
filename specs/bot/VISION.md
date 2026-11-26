@@ -12,7 +12,7 @@ A Bot is a persistent identity: a name, a picture, a memory, and a Computer it l
 
 A Bot remembers what it learns in its Chats and Groups and carries it forward. The user shapes its behavior by telling it, and it keeps lasting rules in memory.
 
-A Bot lives on a Computer: a machine of its owner's, or an isolated one Neha provides.
+A Bot lives on a Computer: the Local one where Neha runs, or a Hosted one Neha provides.
 
 The owner sets who else can use the Bot: only the owner, everyone, or specific Users.
 
@@ -26,7 +26,7 @@ Memory belongs to the Bot and not to a Chat, so what it learns with its owner fo
 
 Behavior is shaped in conversation because that is where preferences are discovered; the page holds only what has to be visible and revocable, and the Model a Bot thinks with.
 
-A Bot starts on its owner's own machine because that is where the work is, and the owner turns that machine on once. An isolated Computer is what Neha provides where there is no machine of the owner's own.
+A Bot starts on a Hosted Computer because that works without setup. The owner can create it on the machine where Neha runs when the work is there.
 
 Access is the owner's to give because the Bot is the owner's; what it does for another User, it does under that User's authority.
 
@@ -34,7 +34,7 @@ Access is the owner's to give because the Bot is the owner's; what it does for a
 
 - **A Bot remembers.** Memory belongs to the Bot; what it learns in one conversation it carries to the next.
 - **Behavior is shaped in conversation.** Lasting preferences and rules live in memory; the page holds only name, picture, Computer, access, and Model.
-- **The owner's machine first.** A new Bot lives on a real Computer of its owner, and on a managed one when the owner has none.
+- **A Hosted Computer by default.** A new Bot starts on a Hosted Computer; its owner can create it on the Local Computer where Neha runs instead.
 - **Access is the owner's to give.** The owner decides who else can use the Bot: only the owner, everyone, or specific Users.
 - **Visible while it works.** A User sees that a Bot is working, can redirect it with a Message, and can stop it.
 
@@ -49,3 +49,4 @@ Access is the owner's to give because the Bot is the owner's; what it does for a
 
 - [S1 · Tell the Bot, and it gets done](../USER-STORIES.md#s1--tell-the-bot-and-it-gets-done)
 - [S4 · A Bot on every machine I own](../USER-STORIES.md#s4--a-bot-on-every-machine-i-own)
+- [S6 · A Bot that starts working on this PC](../USER-STORIES.md#s6--a-bot-that-starts-working-on-this-pc)

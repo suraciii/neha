@@ -34,6 +34,12 @@ const DIRECTORIES: [&str; 8] = [
 #[derive(Clone, Debug)]
 pub struct Home {
     root: PathBuf,
+    /// Where the local ticket lives, when a caller names it.
+    ///
+    /// The Space resolves the ticket's configuration directory from the
+    /// environment; a test names one so its Spaces never share the User's
+    /// real `~/.config/neha`.
+    ticket_directory: Option<PathBuf>,
 }
 
 impl Home {
@@ -46,11 +52,38 @@ impl Home {
 
     /// Opens a home, creating the directories it needs.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self, HomeError> {
-        let home = Self { root: root.into() };
+        let home = Self {
+            root: root.into(),
+            ticket_directory: None,
+        };
         home.prepare()?;
         let root = fs::canonicalize(home.root()).unwrap_or(home.root);
 
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            ticket_directory: None,
+        })
+    }
+
+    /// Opens a home whose local ticket lives at `ticket_directory`.
+    ///
+    /// Tests use this to keep the configuration directory inside their own
+    /// temporary home; production resolves it from `XDG_CONFIG_HOME`/`HOME`.
+    #[cfg(test)]
+    pub(crate) fn open_with_ticket_directory(
+        root: impl Into<PathBuf>,
+        ticket_directory: impl Into<PathBuf>,
+    ) -> Result<Self, HomeError> {
+        let mut home = Self::open(root)?;
+        home.ticket_directory = Some(ticket_directory.into());
+
+        Ok(home)
+    }
+
+    /// Returns the ticket directory a caller named, if any.
+    #[must_use]
+    pub(crate) fn ticket_directory(&self) -> Option<&Path> {
+        self.ticket_directory.as_deref()
     }
 
     fn prepare(&self) -> Result<(), HomeError> {

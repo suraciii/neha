@@ -18,6 +18,7 @@ pub mod secrets;
 pub mod server;
 pub mod state;
 pub mod store;
+pub mod ticket;
 
 pub use blobs::{Blobs, BlobsError};
 pub use config::{Config, ConfigError, S3Storage, Storage};

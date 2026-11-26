@@ -151,23 +151,30 @@ target/debug/neha run show <run-id>
 
 `neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
 
-## Put a Bot on a real Computer
+## Put a Bot on a Local Computer
 
-A real Computer is a Neha process that runs outside the Space and connects out to it. It runs a Bot's actions in that Bot's Workspace on the machine. This milestone pairs a machine on the same host as the Space, because the Space listens only on loopback.
+A Local Computer is the machine where Neha runs: a Neha process that connects out to the Space and runs each Bot's actions in that Bot's Workspace on the machine. This milestone pairs the machine that runs the Space, because the Space listens on loopback only.
 
-Open a second terminal and start the machine:
+The Space runs in one terminal. Open another terminal and pair this machine. There is no pairing code: the command gets a pairing ticket from the Space and asks you to confirm.
 
 ```bash
-target/debug/neha computer pair --space http://127.0.0.1:7337
+target/debug/neha computer pair
 ```
 
-It prints a pairing code that lasts up to 10 minutes, then waits. In a third terminal, enter the code from the signed-in CLI and create a Bot on the new Computer. `computer list` also shows managed Computers; use the id on the `real` line:
+Answer `y`. It prints `Paired Computer <id> with <url>.`; use that id below. Then start the daemon and keep this terminal open:
 
 ```bash
-target/debug/neha computer add <code>
+target/debug/neha computer run
+```
+
+In another terminal, list the Computers and create a Bot on the Local one. `computer list` shows `local` for this machine and `hosted` for the Computers the Space runs; the workspace column is empty because the Space records no path for a Local Computer, and the daemon's `Workspace root:` line names it:
+
+```bash
 target/debug/neha computer list
 target/debug/neha bot create Runner --computer <computer-id>
 ```
+
+Without `--computer`, a new Bot goes on your Local Computer while one is paired; the target default is a Hosted Computer.
 
 Ask the new Bot to work:
 
@@ -175,7 +182,7 @@ Ask the new Bot to work:
 target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 ```
 
-The Bot works in its own Workspace on the machine, `~/Neha/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a real Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
+The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a Local Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
 
 ## Send a file
 
@@ -206,7 +213,7 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 ## What this milestone does not do
 
-- The managed Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
+- The Hosted Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
 - A Bot has no approval gate yet. It runs an action as soon as the Model asks for it.
 - One human joins a Space. Group Chats, Boards, approvals, notifications, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, approvals, search, or notifications.

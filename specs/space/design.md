@@ -49,4 +49,4 @@ The Vault and the keys of Providers are encrypted on disk. The key that decrypts
 
 ## Who can read the record
 
-A Space reads its record in clear. The operator of a Space can read the record and what passes through it from a real Computer.
+A Space reads its record in clear. The operator of a Space can read the record and what passes through it from a Local Computer.

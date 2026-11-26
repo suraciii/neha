@@ -26,9 +26,17 @@ A Bot posting a File into a Group is a Bot posting a Message that carries the Fi
 
 ## Computers
 
-A real Computer runs the CLI. `neha computer pair` joins the machine to a Space and prints a pairing code, which a signed-in User enters with `neha computer add`. `neha computer run` starts the machine again after a stop.
+A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on the machine where Neha runs: it reads the ticket the Space wrote, or asks the Space for one as the signed-in User, and prints the new Computer. `neha computer run` starts the machine again after a stop.
 
-`neha computer list` shows the Computers the User owns, managed and real. `neha bot create --computer` starts a new Bot on one of the User's real Computers, and `neha bot move` moves a Bot to another real Computer.
+`neha computer list` shows the Computers the User owns, Local and Hosted. `neha bot create --computer` takes one of these:
+
+| Value | What happens |
+| --- | --- |
+| `local` | The owner's Local Computer; with several, the earliest one recorded |
+| `hosted` | A new Hosted Computer, one for the Bot |
+| A Local Computer id | The Computer with that id |
+
+Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
 
 ## Gaps
 

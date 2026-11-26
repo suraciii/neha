@@ -222,54 +222,39 @@ async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
     bail!("the Space refused ({code}): {message}");
 }
 
-/// What a Space tells a machine when pairing starts.
+/// The pairing a Space gives a Local Computer.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PairingStart {
-    /// The device identifier the machine polls its pairing with.
-    pub device: String,
-    /// The one-time code a signed-in User enters.
-    pub code: String,
+pub struct PairedComputer {
+    /// The Computer the Space created for this machine.
+    pub computer: String,
+    /// The credential this machine serves the Space with.
+    pub credential: String,
 }
 
-/// What a machine learns when it polls its pairing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PairingState {
-    /// No User has entered the code yet.
-    Pending,
-    /// A User entered the code; the Space created this Computer.
-    Approved {
-        /// The identifier of the Computer the Space created.
-        computer: String,
-    },
-}
-
-/// Returns an HTTP client for the pairing routes.
+/// Returns the HTTP client for local pairing exchanges.
 ///
-/// Pairing exchanges carry the machine's own secrets, and a redirect would
-/// hand them to whatever origin the answer names. The routes never redirect,
-/// so the client keeps any redirect answer as the refusal it is.
-fn pairing_client() -> Result<reqwest::Client> {
+/// Both exchanges carry secrets: the one-use ticket, and the machine's new
+/// credential. A redirect would hand them to whatever origin the answer names,
+/// so any redirect is a refusal. This milestone pairs only with a Space on this
+/// machine, so a system proxy must not see the exchange either.
+fn local_pairing_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        // This milestone pairs with a loopback Space only, and the body carries
-        // the machine's own secrets: a system proxy must not see or forward it.
         .no_proxy()
         .build()
         .context("cannot build the pairing HTTP client")
 }
 
-/// Asks a Space to start pairing this machine.
-pub async fn pair_start(
-    space_url: &str,
-    machine: &str,
-    workspace: &str,
-    token: &str,
-    poll_secret: &str,
-) -> Result<PairingStart> {
+/// Asks a signed-in Space for one local pairing ticket.
+///
+/// The ticket is normally in the file `neha serve` wrote. This path covers a
+/// Space that started without an Admin: once a User has signed in, the CLI can
+/// ask the Space for the ticket itself.
+pub async fn request_ticket(space_url: &str, token: &str) -> Result<String> {
     let body: Value = accepted(
-        pairing_client()?
-            .post(pair_start_url(space_url))
-            .json(&pair_request_body(machine, workspace, token, poll_secret))
+        local_pairing_client()?
+            .post(ticket_url(space_url))
+            .bearer_auth(token)
             .send()
             .await
             .context("the Space could not be reached")?,
@@ -279,75 +264,43 @@ pub async fn pair_start(
     .await
     .context("the Space did not answer with JSON")?;
 
-    Ok(PairingStart {
-        device: text_field(&body, "device")?,
-        code: text_field(&body, "code")?,
-    })
+    text_field(&body, "ticket")
 }
 
-/// Asks a Space how the pairing this machine started is doing.
-///
-/// The polling secret travels in the body, not the URL: a request line ends up
-/// in proxy logs and shell history, a body does not.
-pub async fn pair_poll(space_url: &str, device: &str, poll_secret: &str) -> Result<PairingState> {
-    let response = pairing_client()?
-        .post(pair_poll_url(space_url, device))
-        .json(&pair_poll_body(poll_secret))
-        .send()
-        .await
-        .context("the Space could not be reached")?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        bail!("the pairing expired before it was approved; run `neha computer pair` again");
-    }
-    let body: Value = accepted(response)
-        .await?
-        .json()
-        .await
-        .context("the Space did not answer with JSON")?;
-
-    pairing_state(&body)
-}
-
-/// The URL a machine starts its pairing at.
-fn pair_start_url(space_url: &str) -> String {
-    format!("{}/api/computers/pair", space_url.trim_end_matches('/'))
-}
-
-/// The URL a machine polls its pairing at.
-///
-/// The device is URL-safe base64, so it needs no escaping; the secret travels
-/// in the request body.
-fn pair_poll_url(space_url: &str, device: &str) -> String {
-    format!(
-        "{}/api/computers/pair/{device}",
-        space_url.trim_end_matches('/')
+/// Exchanges one local ticket for this machine's Computer and credential.
+pub async fn pair_with_ticket(space_url: &str, ticket: &str) -> Result<PairedComputer> {
+    let body: Value = accepted(
+        local_pairing_client()?
+            .post(pair_url(space_url))
+            .json(&pair_body(ticket))
+            .send()
+            .await
+            .context("the Space could not be reached")?,
     )
-}
+    .await?
+    .json()
+    .await
+    .context("the Space did not answer with JSON")?;
 
-/// The body a machine sends to poll its pairing.
-fn pair_poll_body(poll_secret: &str) -> Value {
-    serde_json::json!({"secret": poll_secret})
-}
-
-/// The body a machine sends to start pairing.
-fn pair_request_body(machine: &str, workspace: &str, token: &str, poll_secret: &str) -> Value {
-    serde_json::json!({
-        "machine": machine,
-        "workspace": workspace,
-        "token": token,
-        "poll_secret": poll_secret,
+    Ok(PairedComputer {
+        computer: text_field(&body, "computer")?,
+        credential: text_field(&body, "credential")?,
     })
 }
 
-/// Reads the pairing state a poll answered with.
-fn pairing_state(answer: &Value) -> Result<PairingState> {
-    match answer.get("state").and_then(Value::as_str) {
-        Some("pending") => Ok(PairingState::Pending),
-        Some("approved") => Ok(PairingState::Approved {
-            computer: text_field(answer, "computer")?,
-        }),
-        _ => bail!("the Space's answer does not describe a pairing"),
-    }
+/// The URL a local ticket is issued at.
+fn ticket_url(space_url: &str) -> String {
+    format!("{}/api/computer/ticket", space_url.trim_end_matches('/'))
+}
+
+/// The URL a local ticket is exchanged at.
+fn pair_url(space_url: &str) -> String {
+    format!("{}/api/computer/pair", space_url.trim_end_matches('/'))
+}
+
+/// The body a machine pairs with: the one-use ticket and nothing else.
+fn pair_body(ticket: &str) -> Value {
+    serde_json::json!({"ticket": ticket})
 }
 
 /// Reads a string field out of a Space's answer.
@@ -625,9 +578,8 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        Credential, PairingState, SignedIn, disposition_name, pair_poll, pair_poll_body,
-        pair_poll_url, pair_request_body, pair_start, pair_start_url, pairing_state,
-        read_for_upload, wait_for_run_within,
+        Credential, PairedComputer, SignedIn, disposition_name, pair_body, pair_url,
+        pair_with_ticket, read_for_upload, request_ticket, ticket_url, wait_for_run_within,
     };
 
     /// The CLI's credential for a Space at this address.
@@ -697,59 +649,20 @@ mod tests {
     }
 
     #[test]
-    fn the_pairing_request_is_the_pinned_body() {
+    fn the_local_pairing_paths_and_body_are_the_pinned_ones() {
         assert_eq!(
-            pair_request_body(
-                "laptop",
-                "/home/ada/.neha/workspace",
-                "machine-token",
-                "poll-secret"
-            ),
-            serde_json::json!({
-                "machine": "laptop",
-                "workspace": "/home/ada/.neha/workspace",
-                "token": "machine-token",
-                "poll_secret": "poll-secret",
-            })
-        );
-    }
-
-    #[test]
-    fn the_pairing_urls_are_the_pinned_paths() {
-        assert_eq!(
-            pair_start_url("http://127.0.0.1:7337/"),
-            "http://127.0.0.1:7337/api/computers/pair"
+            ticket_url("http://127.0.0.1:7337/"),
+            "http://127.0.0.1:7337/api/computer/ticket"
         );
         assert_eq!(
-            pair_poll_url("http://127.0.0.1:7337/", "device-a"),
-            "http://127.0.0.1:7337/api/computers/pair/device-a"
+            pair_url("http://127.0.0.1:7337/"),
+            "http://127.0.0.1:7337/api/computer/pair"
         );
         assert_eq!(
-            pair_poll_body("secret-a"),
-            serde_json::json!({"secret": "secret-a"}),
-            "the polling secret travels in the body, not the URL"
+            pair_body("ticket-a"),
+            serde_json::json!({"ticket": "ticket-a"}),
+            "the pairing body carries the ticket and nothing else"
         );
-        assert!(!pair_poll_url("http://127.0.0.1:7337/", "device-a").contains("secret"));
-    }
-
-    #[test]
-    fn a_poll_answer_says_whether_the_pairing_is_approved() {
-        assert_eq!(
-            pairing_state(&serde_json::json!({"state": "pending"})).unwrap(),
-            PairingState::Pending
-        );
-        assert_eq!(
-            pairing_state(
-                &serde_json::json!({"state": "approved", "computer": "01890a5d-ac96-774b-bcce-b302099a8057"})
-            )
-            .unwrap(),
-            PairingState::Approved {
-                computer: "01890a5d-ac96-774b-bcce-b302099a8057".to_owned(),
-            }
-        );
-        assert!(pairing_state(&serde_json::json!({"state": "approved"})).is_err());
-        assert!(pairing_state(&serde_json::json!({"state": "later"})).is_err());
-        assert!(pairing_state(&serde_json::json!({})).is_err());
     }
 
     #[test]
@@ -854,15 +767,15 @@ mod tests {
         let (address, space) = redirecting_space(format!("http://{target_address}")).await;
         let space_url = format!("http://{address}");
 
-        let started = pair_start(&space_url, "laptop", "/ws", "token", "poll").await;
+        let ticket = request_ticket(&space_url, "token").await;
         assert!(
-            started.is_err(),
-            "a redirecting pairing start must not be accepted"
+            ticket.is_err(),
+            "a redirecting ticket request must not be accepted"
         );
-        let polled = pair_poll(&space_url, "device", "secret").await;
+        let paired = pair_with_ticket(&space_url, "ticket-a").await;
         assert!(
-            polled.is_err(),
-            "a redirecting pairing poll must not be accepted"
+            paired.is_err(),
+            "a redirecting pairing must not be accepted"
         );
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -880,18 +793,21 @@ mod tests {
     /// listener it counts; this child then pairs through the real client. It
     /// returns at once when the normal suite runs it.
     #[tokio::test]
-    async fn a_pairing_client_child_pairs_around_the_proxy() {
+    async fn a_local_pairing_client_child_pairs_around_the_proxy() {
         let Ok(space) = std::env::var("NEHA_PAIRING_CHILD_SPACE") else {
             return;
         };
 
-        let started = pair_start(&space, "laptop", "/ws", "token", "poll")
+        let ticket = request_ticket(&space, "token")
             .await
-            .expect("the direct pairing start must succeed");
-        assert_eq!(started.code, "CODE1234");
+            .expect("the direct ticket request must succeed");
+        assert_eq!(ticket, "ticket-from-space");
         assert_eq!(
-            pair_poll(&space, &started.device, "poll").await.unwrap(),
-            PairingState::Pending
+            pair_with_ticket(&space, "ticket-from-space").await.unwrap(),
+            PairedComputer {
+                computer: "computer-from-space".to_owned(),
+                credential: "credential-from-space".to_owned(),
+            }
         );
     }
 
@@ -925,17 +841,20 @@ mod tests {
                 }
             });
 
-            // A fake Space on loopback that answers both pairing routes.
+            // A fake Space on loopback that answers both local pairing routes.
             let app = Router::new()
                 .route(
-                    "/api/computers/pair",
-                    post(|| async {
-                        Json(json!({"device": "device-from-space", "code": "CODE1234"}))
-                    }),
+                    "/api/computer/ticket",
+                    post(|| async { Json(json!({"ticket": "ticket-from-space"})) }),
                 )
                 .route(
-                    "/api/computers/pair/{device}",
-                    post(|| async { Json(json!({"state": "pending"})) }),
+                    "/api/computer/pair",
+                    post(|| async {
+                        Json(json!({
+                            "computer": "computer-from-space",
+                            "credential": "credential-from-space",
+                        }))
+                    }),
                 );
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let space_address = listener.local_addr().unwrap();
@@ -948,7 +867,7 @@ mod tests {
             let child = tokio::task::spawn_blocking(move || {
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .arg("--exact")
-                    .arg("client::tests::a_pairing_client_child_pairs_around_the_proxy")
+                    .arg("client::tests::a_local_pairing_client_child_pairs_around_the_proxy")
                     .arg("--nocapture")
                     .env("HTTP_PROXY", &proxy_url)
                     .env("HTTPS_PROXY", &proxy_url)

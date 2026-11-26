@@ -84,7 +84,7 @@ Ask in the Chat; the Bot chooses its tools, as with the tools in [Let a Bot work
 | Tool | What it does |
 | --- | --- |
 | `take_file` | Puts a File of the Chat into the Workspace, under the File's name. |
-| `put_file` | Delivers a file as a File on a Message from the Bot: a path in the Workspace, or on a real Computer any file its machine user can read except the Computer's configuration directory. An optional `name` gives the File a name other than the file's. |
+| `put_file` | Delivers a file as a File on a Message from the Bot: a path in the Workspace, or on a Local Computer any file its machine user can read except the Computer's configuration directory. An optional `name` gives the File a name other than the file's. |
 
 `take_file` copies the File. The File stays in the Chat, the Bot can take it again in a later Message, and removing the copy from the Workspace does not remove the File.
 
@@ -122,4 +122,4 @@ An action that breaks a limit returns an error to the Model instead of failing t
 
 - A File is at most 32 MiB. A larger file is refused before anything is recorded: the CLI stops with an error, the browser reports that the file was not sent, and a Bot's `put_file` fails.
 - A Bot takes only a File of the Chat. A File of another Chat fails the action.
-- On a managed Computer, `take_file` and `put_file` follow the path rules in [Let a Bot work on its Computer](tools.md#limits): a path must stay inside the Workspace. On a real Computer, `take_file` writes only in the Bot's Workspace and `put_file` may read any regular file the machine's user can read, except the Computer's configuration directory; [Add a real Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.
+- On a Hosted Computer, `take_file` and `put_file` follow the path rules in [Let a Bot work on its Computer](tools.md#limits): a path must stay inside the Workspace. On a Local Computer, `take_file` writes only in the Bot's Workspace and `put_file` may read any regular file the machine's user can read, except the Computer's configuration directory; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.

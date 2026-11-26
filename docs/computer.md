@@ -1,47 +1,61 @@
-# Add a real Computer
+# Add a Local Computer
 
-This guide connects a Linux machine to a Space as a real Computer. A real Computer runs Neha as its own process, connects out to the Space, and runs each Bot's actions in that Bot's Workspace on the machine. It follows [Quick start](quickstart.md), so the Space, its Admin, a Provider, and a Chat already exist.
+This guide turns the machine that runs a Space into a Local Computer: a Neha process that connects out to the Space and runs each Bot's actions in that Bot's Workspace on the machine. It follows [Quick start](quickstart.md), so the Space, its Admin, a Provider, and a Chat already exist.
 
-This milestone pairs a machine on the same host as the Space, because the Space listens only on loopback. [What this milestone does not do](#what-this-milestone-does-not-do) names that and the other limits.
+This milestone pairs the machine that runs the Space, because the Space listens only on loopback. [What this milestone does not do](#what-this-milestone-does-not-do) names that and the other limits.
 
 ## What you need
 
 - A Linux machine with the Neha CLI. [Building and verification](building.md) covers the build; the examples use `target/debug/neha`.
 - `bubblewrap` on that machine. The daemon runs each shell command in a sandbox it starts; the file tools check their own paths.
-- A Space that the machine can reach at the URL you pair with; in this milestone that is the host that runs the Space.
+- A Space running on the same machine, at an address the Local Computer can reach; in this milestone that is the host that runs the Space.
 - A CLI signed in to the Space. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
 
 ## Pair the machine
 
-Start the machine's process in its own terminal:
-
-```bash
-target/debug/neha computer pair --space http://127.0.0.1:7337
-```
-
-The command prints a pairing code and waits:
+Start the Space with `neha serve` and keep it running. A Space that had an Admin when it started also prints the command that pairs this machine:
 
 ```text
-Pairing code: <code>
+Pair this PC: neha computer pair
 ```
 
-The code is valid for up to 10 minutes. It admits one Computer. The Bot Workspaces go in `~/Neha` by default; pass `--workspace <directory>` to move them, and a directory inside the configuration directory is refused. Set `NEHA_SPACE_URL` to leave out `--space`.
-
-In a second terminal, enter the code from the signed-in CLI:
+Run it in another terminal:
 
 ```bash
-target/debug/neha computer add <code>
+target/debug/neha computer pair
 ```
 
-The command prints the new Computer's id, kind, and workspace. The first terminal then writes the machine's configuration and starts the daemon, which connects out to the Space; keep that terminal open.
+No pairing code is entered. The command reads the ticket the Space wrote in this machine's configuration directory, or, when there is none, asks the Space for one with the signed-in CLI. It then asks for confirmation:
 
-The machine keeps its configuration in `~/.neha/computer.json` with mode 0600, and the Bots' Workspaces in `~/Neha` by default. Set `NEHA_COMPUTER_HOME` to move the configuration; `--workspace` chooses where the Workspaces live. Later starts use the saved pairing:
+```text
+Pair this Computer with the Space at http://127.0.0.1:7337? [y/N]
+```
+
+Answer `y`, and it prints the new Computer:
+
+```text
+Paired Computer <computer-id> with http://127.0.0.1:7337.
+```
+
+The command writes the machine's configuration and stops. Start the daemon, which connects out to the Space:
 
 ```bash
 target/debug/neha computer run
 ```
 
-A saved pairing whose Workspace is inside the configuration directory is refused. Run `computer pair` again, or pair with `--workspace` outside that directory.
+Keep that terminal open. The Space shows the Computer as online while the daemon runs, and the run prints the Workspace root it serves.
+
+The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes a startup ticket, `local-computer.ticket`, in the machine's configuration directory with mode 0600, where Bots cannot read it; a Space that started without one writes none, and the signed-in CLI asks the Space for a ticket.
+
+Only that fallback needs a signed-in CLI. The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one.
+
+Run `neha computer pair` again if the ticket expired or was used, and restart the Space first if it wrote the old one. Pass `--yes` to skip the confirmation, `--space <url>` to name the Space address, and `--ticket-file <path>` to name another ticket file.
+
+The machine keeps its configuration in `~/.config/neha/computer.json` with mode 0600. `$XDG_CONFIG_HOME/neha` replaces that directory when `XDG_CONFIG_HOME` is set, and `NEHA_COMPUTER_HOME` replaces both. The Bots' Workspaces go in `~/.neha/workspaces` by default; pass `--workspace <directory>` to `computer pair` to put them under another root, and a root inside the configuration directory is refused.
+
+An older Neha kept its pairing in `~/.neha/computer.json` and its Workspaces in `~/Neha`. While that file exists, `computer pair` and `computer run` refuse; the old file and the old Workspaces are not read or moved. Remove or rename the old file, then pair again; the old Workspaces stay where they are.
+
+The old file may still hold a valid credential, so keep it private until you delete it.
 
 Re-pairing adds a new Computer; the Bots on the old one stay bound to it, and their Workspaces and queued work stay there. Move a Bot to the new Computer with `neha bot move`; [Moving a Bot](#moving-a-bot) covers the details.
 
@@ -53,13 +67,23 @@ List the Computers you own:
 target/debug/neha computer list
 ```
 
-Each line gives one Computer's id, kind, online state, and workspace. The list holds managed Computers as well; `bot create --computer` accepts only a Computer whose kind is `real`:
+Each line gives one Computer's id, kind, online state, and workspace. The kind is `local` for a paired machine and `hosted` for one the Space runs. The pairing printed the new Computer's id; create a Bot on it:
 
 ```bash
 target/debug/neha bot create Runner --computer <computer-id>
 ```
 
-The output names the new Bot, its Chat, and the Computer. Without `--computer`, the Bot goes on a managed Computer, as before.
+`--computer` takes `local`, `hosted`, or a Computer id:
+
+| Value | What happens |
+| --- | --- |
+| `local` | The owner's Local Computer; with several, the earliest one recorded, which may be an old or offline machine |
+| `hosted` | A new Hosted Computer, one per Bot |
+| A Computer id | The Local Computer with that id |
+
+A Local Computer's workspace column is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none, and `neha bot show` then omits its Workspace line. The root that `neha computer run` prints as `Workspace root:` is the one its actions use.
+
+Without `--computer`, a new Bot starts on your Local Computer when one is paired, and on a Hosted Computer otherwise; the target default is Hosted. A Hosted Computer belongs to its Bot, so naming its id is refused; use `--computer hosted` for a new one.
 
 Ask the Bot to work and check where the work ran:
 
@@ -69,19 +93,19 @@ target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 
 ## The Bot's Workspace and the write fence
 
-The `--workspace` directory, `~/Neha` by default, holds one Workspace folder for each Bot, named by the Bot's id:
+The Workspace root is `~/.neha/workspaces` by default; `--workspace` on `computer pair` chooses another root. The root holds one folder for each Bot, named by the Bot's id:
 
 ```text
-~/Neha/<bot-id>/
+~/.neha/workspaces/<bot-id>/
 ```
 
-The folder is created when the Bot first runs an action. Every action of the Bot starts in its Workspace: a relative path names a file inside it, and `pwd` prints it.
+The folder is created when the Bot first runs an action. Every action of the Bot starts in its Workspace: a relative path names a file inside it, and `pwd` prints it. The `Workspace root:` line from `neha computer run` names the root the daemon actually serves.
 
 The file tools check every write path. A write outside the Workspace fails with `the path is outside this Bot's writable folder`; a `..` climb or a symlink out is refused, and no file is created. The only persistent place a Bot writes on the machine is its Workspace.
 
 The file tools read with the rights of the machine's user. A file read follows a symlink as the machine user's own tools do, and reaches any file that user can read, including files outside the Workspace and files of another Bot on the machine. A directory listing does not follow a symlink that is the path itself, and a FIFO or a device is not read.
 
-The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token.
+The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token. The directory is `~/.config/neha` by default.
 
 The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
 
@@ -93,7 +117,7 @@ A machine whose `bubblewrap` cannot start a sandbox does not serve as a Computer
 
 ## Moving a Bot
 
-Move a Bot from one of your real Computers to another:
+Move a Bot from one of your Local Computers to another:
 
 ```bash
 target/debug/neha bot move <bot-id> --computer <computer-id>
@@ -105,7 +129,7 @@ The old Computer keeps the Bot's folder, so work the Bot did not deliver stays t
 
 A run already under way finishes on the old Computer. A run that starts after the move uses the new Computer, including a request that was still waiting in the queue.
 
-The old Computer may be offline when you move the Bot. If the new Computer is offline too, the move is still recorded, and waiting work runs when it comes back. A Bot on a managed Computer cannot move: create a new Bot on the target Computer instead.
+The old Computer may be offline when you move the Bot. If the new Computer is offline too, the move is still recorded, and waiting work runs when it comes back. A Bot on a Hosted Computer cannot move: create a new Bot on the target Computer instead.
 
 ## While the machine is offline
 
@@ -123,25 +147,30 @@ The machine ends the command it was running when the channel drops, so no action
 
 | Symptom | What to do |
 | --- | --- |
-| `pair` asks for a Space URL | Pass `--space <url>`, or set `NEHA_SPACE_URL`. |
-| `pair` stops before printing a code | Read the error it prints. A workspace directory it cannot create and a Space it cannot reach are the common causes. |
-| `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.neha` by default, and a Workspace inside it is refused. Run `computer pair` again, and pass `--workspace` outside that directory if you want a different place. |
+| `pair` asks for a Space URL | Pass `--space <url>`, or sign in from the CLI so it can ask the Space for a ticket. |
+| `pair` stops before printing a Computer | Read the error it prints. A ticket that expired or was used, a workspace directory it cannot create, and a Space it cannot reach are the common causes. |
+| `pair` or `computer run` reports an older pairing | The old `~/.neha/computer.json` blocks both commands while it exists. Remove or rename it, then run `neha computer pair`; the new pairing goes in `~/.config/neha/computer.json`. The old file may still hold a valid credential, so keep it private. |
+| A `computer list` workspace is empty | A Local Computer's workspace is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none. `neha computer run` prints the real root. |
+| An older record uses `real` or `managed` | An old `real` Computer reads as Local and an old `managed` one as Hosted. No action is needed. |
+| `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.config/neha` by default, and a Workspace inside it is refused. Pair again with `--workspace` outside that directory. |
+| The ticket is not valid | A ticket lasts one pairing and one Space start. Restart the Space, then run `neha computer pair` again; a signed-in CLI can also ask for a ticket when no ticket file is present. |
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory. A Bot cannot read that directory. |
-| A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/Neha/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
-| `add` reports the code is not valid or has expired | The code lasts up to 10 minutes and admits one Computer. Run `pair` again for a new code. |
+| A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. |
 | A write is refused | The path is outside the Bot's Workspace. Write inside the Workspace, or use a relative path. |
 
-[Building and verification](building.md#a-real-computer-sandbox) shows how to install `bubblewrap`.
+[Building and verification](building.md#a-local-computer-sandbox) shows how to install `bubblewrap`.
 
 ## What this milestone does not do
 
-- The Space listens on loopback only, so this milestone pairs a machine on the host that runs the Space. Remote pairing needs a Space reachable over the network.
+- The Space listens on loopback only, so this milestone pairs the machine that runs the Space. A Computer on another machine is not available; `neha computer add` stays for that future flow.
+- There is no command yet to revoke or replace a Computer's credential.
 - Granted folders and the `full-access` switch are not available. A Bot's write range stays its own Workspace, and its owner cannot widen that range.
 - A request cannot choose a working directory. Every run starts in the Bot's Workspace.
-- Moving a Bot from a managed Computer is not available, and carrying its Workspace is not specified.
+- Moving a Bot to or from a Hosted Computer is not available, and carrying its Workspace is not specified.
+- A Hosted Computer runs inside the Space's process; a provider-backed Hosted machine is not available.
 - There is no approval gate. A Bot runs an action as soon as the Model asks for it.
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.
-- Only Linux is supported for a real Computer; the desktop app does not turn a machine into a Computer yet.
+- Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.

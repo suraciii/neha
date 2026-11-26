@@ -61,7 +61,7 @@ As a user with a multi-stage job, I want to assign one Bot to each stage in a Gr
 
 As a user with several machines, I want a Bot that lives on each one and learns it, so that I can get things done on any of them from anywhere.
 
-This is what sets Neha apart. A Bot runs on a managed Computer or on a machine the user owns; on the user's machine, its files, logins, and software are the machine's own. The user reaches it from any client, its screen is a panel in the Chat, and it keeps working when the client is closed.
+This is what sets Neha apart. A Bot runs on a Hosted Computer or on the Local Computer where Neha runs; on the Local one, its files, logins, and software are the machine's own. The user reaches it from any client, its screen is a panel in the Chat, and it keeps working when the client is closed.
 
 - Exercises:
   - Bot
@@ -87,3 +87,19 @@ As a user with a favorite coding harness, I want a Bot that runs on it, so that 
   - Bot loop
 - Starter:
   - "Have codex refactor the auth module and open a pull request."
+
+### S6 · A Bot that starts working on this PC
+
+As a user at my PC, I want to create a Bot on the Local Computer, so that I can ask for a report or a script without setting up a Workspace first.
+
+The Bot starts in its own Workspace on the machine.
+
+- Exercises:
+  - Bot
+  - Computer
+  - Workspace
+  - File
+- Starter:
+  - "Create a Bot on this PC, then write this up as a one-page report and send it to me as a File."
+  - "Make a script that sorts the files in your Workspace."
+  - "Show me where you keep your files."

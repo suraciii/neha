@@ -8,7 +8,7 @@ Owned by bot. A Bot depends on [Computer](../computer/product.md) for where it l
 
 1. A Bot has exactly one owner.
 2. A Bot's memory is its own and goes where the Bot goes.
-3. A new Bot starts on a real Computer of its owner, and otherwise on a managed one.
+3. A new Bot starts on a Hosted Computer. Its owner can create it on the Local Computer where Neha runs instead.
 
 ## Creating a Bot
 
@@ -28,7 +28,7 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 | --- | --- | --- |
 | Name | The Bot's name | The owner |
 | Picture | The Bot's avatar | The owner |
-| Computer | The managed or real Computer it lives on | The owner |
+| Computer | The Hosted or Local Computer it lives on | The owner |
 | Access | Who else can use it: only the owner, everyone, or named Users | The owner |
 | Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner |
 
@@ -106,7 +106,7 @@ These actions always need the acting User's Allow, and a lasting rule never cove
 
 - Changing the Bot's rules or instructions.
 - Accepting a Bot connection from another owner.
-- The first use of a real Computer.
+- The first use of a Local Computer.
 - The first use of an app on a Computer.
 - Paying or spending.
 - Filling a saved credential or card.

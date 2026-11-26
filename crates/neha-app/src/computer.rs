@@ -1,9 +1,9 @@
-//! The machine side of a real Computer: pairing and the channel daemon.
+//! The machine side of a Local Computer: pairing and the channel daemon.
 //!
-//! `neha computer pair` asks a Space to admit this machine, shows the User a
-//! one-time code, and waits until the User enters it. The machine then keeps
-//! its own token in `computer.json` and serves the Space over one outgoing
-//! WebSocket. `neha computer run` serves a saved pairing again.
+//! `neha computer pair` exchanges the one-use ticket `neha serve` wrote for a
+//! credential, and saves it in the configuration directory. `neha computer run`
+//! then serves the Space over one outgoing WebSocket; the Space never connects
+//! to this machine.
 //!
 //! The daemon listens on no port and runs each action with the machine user's
 //! rights, fenced by bubblewrap: a Bot reads what that user reads and writes
@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,6 @@ use neha_computer::{
     ActionStatus, CHANNEL_VERSION, ComputerRuntime as _, DeviceFrame, HostFrame, LocalRuntime,
     MAX_CHANNEL_FRAME_BYTES, ToolOutput,
 };
-use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -36,17 +36,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use crate::client::{self, PairingState};
+use crate::client::{self, Credential};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The runtimes this machine opened, one per Bot, kept across reconnects.
 type Runtimes = Arc<Mutex<HashMap<String, Arc<LocalRuntime>>>>;
 
-/// How often the machine asks its Space how the pairing is doing.
-const PAIR_POLL: Duration = Duration::from_secs(2);
-/// How long a machine waits for its pairing code to be entered.
-const PAIR_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long the daemon waits before it reconnects to its Space.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 /// How long a cancelled action may take to end before its task is dropped.
@@ -97,6 +93,7 @@ struct Config {
 impl Config {
     /// Loads the saved pairing.
     fn load() -> Result<Self> {
+        refuse_older_pairing()?;
         Self::load_from(&config_path()?)
     }
 
@@ -111,67 +108,148 @@ impl Config {
         serde_json::from_slice(&bytes).context("the saved computer configuration is corrupt")
     }
 
-    /// Saves the pairing for later starts.
-    fn save(&self) -> Result<()> {
-        Self::save_to(self, &config_path()?)
-    }
-
     /// Saves the pairing at one path, readable only by this machine user.
     fn save_to(&self, path: &Path) -> Result<()> {
         client::write_private(path, &serde_json::to_vec(self)?)
     }
 }
 
-/// Pairs this machine and then serves the Space until Ctrl-C.
+/// Pairs this machine with the Space on this machine, without a code.
+///
+/// The ticket normally comes from the file `neha serve` wrote. A Space that
+/// started without an Admin writes none; a signed-in CLI asks the Space for one
+/// instead. The pairing is saved in the configuration directory, and
+/// `neha computer run` then serves it.
 pub async fn pair(
     space: Option<String>,
+    ticket_file: Option<PathBuf>,
     workspace: Option<PathBuf>,
-    name: Option<String>,
+    yes: bool,
 ) -> Result<()> {
-    let space_url = space_url(space, std::env::var("NEHA_SPACE_URL").ok())?;
-    let (workspace, default) = match workspace {
+    refuse_older_pairing()?;
+
+    // A Workspace the configuration directory would leak into is refused
+    // before anything reaches a Space.
+    let config_directory = config_directory()?;
+    let (workspace, default_workspace) = match workspace {
         Some(path) => (path, false),
         None => (default_workspace()?, true),
     };
+    refuse_workspace(&config_directory, &workspace)?;
+
+    // Everything up to the confirmation only reads local files. The User must
+    // see the pairing target before any request leaves this machine, and a
+    // ticket or session that names a different Space is refused without one.
+    let credential = Credential::load().ok();
+    let ticket_file = ticket_file.or_else(find_ticket_file);
+    let ticket = match &ticket_file {
+        Some(path) => Some(read_ticket(path)?),
+        None => None,
+    };
+    let saved_url = credential.as_ref().map(saved_session_url);
+    let (space_url, ticket, needs_ticket) = match ticket {
+        Some(ticket) => {
+            if let (Some(ticket_url), Some(explicit)) = (ticket.url.as_deref(), space.as_deref()) {
+                check_ticket_space(ticket_url, explicit)?;
+            }
+            let space_url = target_url(
+                space.as_deref(),
+                ticket.url.as_deref(),
+                saved_url.as_deref(),
+            )?;
+            (space_url, ticket.ticket, false)
+        }
+        None => {
+            let saved = saved_url.as_deref().context(
+                "there is no local pairing ticket; run `neha serve` on this machine, or sign \
+                 in with `neha login`",
+            )?;
+            let space_url = match space.as_deref() {
+                Some(space) => normalized_space_url(space)?,
+                None => saved.to_owned(),
+            };
+            // The fallback asks the Space this session belongs to for a
+            // ticket; sending the session's token anywhere else is refused.
+            check_saved_origin(&space_url, saved)?;
+            (space_url, String::new(), true)
+        }
+    };
+
+    if !confirm_pairing(&space_url, yes)? {
+        println!("Pairing cancelled.");
+        return Ok(());
+    }
+
     std::fs::create_dir_all(&workspace)
         .with_context(|| format!("cannot create {}", workspace.display()))?;
-    if default {
+    if default_workspace {
         client::restrict(&workspace, 0o700)?;
     }
     let workspace = std::fs::canonicalize(&workspace)
         .with_context(|| format!("cannot resolve {}", workspace.display()))?;
-    // The channel credential lives in the configuration directory; a Bot must
-    // never have it under its own writable root.
-    refuse_workspace(&home()?, &workspace)?;
+    refuse_workspace(&config_directory, &workspace)?;
 
-    let token = secret();
-    let poll_secret = secret();
-    let machine = name.unwrap_or_else(machine_name);
-    let start = client::pair_start(
-        &space_url,
-        &machine,
-        workspace.to_string_lossy().as_ref(),
-        &token,
-        &poll_secret,
-    )
-    .await?;
-    println!("Pairing code: {}", start.code);
-    let computer = wait_for_approval(&space_url, &start.device, &poll_secret).await?;
+    let ticket = if needs_ticket {
+        let credential = credential.as_ref().context(
+            "there is no local pairing ticket; run `neha serve` on this machine, or sign in \
+             with `neha login`",
+        )?;
+        client::request_ticket(&space_url, &credential.token)
+            .await
+            .with_context(|| format!("cannot ask the Space at {space_url} for a pairing ticket"))?
+    } else {
+        ticket
+    };
 
+    let paired = client::pair_with_ticket(&space_url, &ticket)
+        .await
+        .with_context(|| format!("this Computer could not pair with the Space at {space_url}"))?;
     let config = Config {
         space_url,
-        computer,
-        token,
+        computer: paired.computer,
+        token: paired.credential,
         workspace,
     };
-    config.save()?;
+    config.save_to(&config_path()?)?;
+    println!(
+        "Paired Computer {} with {}.",
+        config.computer, config.space_url
+    );
 
-    serve(config).await
+    // A used ticket is dead; remove the file so a rerun cannot try it again.
+    // The Space removes it too when it claims the ticket, so a missing file is
+    // success rather than a warning.
+    if let Some(path) = &ticket_file {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "warning: cannot delete the used ticket {}: {error}",
+                path.display()
+            ),
+        }
+    }
+
+    Ok(())
 }
 
 /// Starts the daemon with the saved pairing.
-pub async fn run() -> Result<()> {
-    serve(Config::load()?).await
+pub async fn run(workspace: Option<PathBuf>) -> Result<()> {
+    let mut config = Config::load()?;
+    if let Some(workspace) = workspace {
+        std::fs::create_dir_all(&workspace)
+            .with_context(|| format!("cannot create {}", workspace.display()))?;
+        config.workspace = std::fs::canonicalize(&workspace)
+            .with_context(|| format!("cannot resolve {}", workspace.display()))?;
+    }
+    refuse_workspace(&config_directory()?, &config.workspace)?;
+    println!(
+        "Computer {} is running for {}.",
+        config.computer, config.space_url
+    );
+    println!("Workspace root: {}", config.workspace.display());
+    println!("Press Ctrl-C to stop.");
+    serve(config).await
 }
 
 /// Serves one Space until Ctrl-C, reconnecting after every failure.
@@ -182,7 +260,7 @@ async fn serve(config: Config) -> Result<()> {
     // A saved pairing from before the default moved may still name a workspace
     // inside the configuration directory; serving it would hand that directory
     // to the Bot through its own write root.
-    refuse_workspace(&home()?, &config.workspace)?;
+    refuse_workspace(&config_directory()?, &config.workspace)?;
     // The configuration directory holds this Computer's channel credential.
     // Every Bot runtime hides it from the file tools and the sandbox.
     let hidden = hidden_roots()?;
@@ -212,21 +290,6 @@ fn fence() -> Result<()> {
     LocalRuntime::probe_sandbox().context("this machine cannot fence Bot commands")?;
 
     Ok(())
-}
-
-/// Polls the Space until a User enters the code, and returns the Computer.
-async fn wait_for_approval(space_url: &str, device: &str, poll_secret: &str) -> Result<String> {
-    let deadline = tokio::time::Instant::now() + PAIR_TIMEOUT;
-    loop {
-        match client::pair_poll(space_url, device, poll_secret).await? {
-            PairingState::Approved { computer } => return Ok(computer),
-            PairingState::Pending => {}
-        }
-        if tokio::time::Instant::now() >= deadline {
-            bail!("the pairing code expired; run `neha computer pair` again");
-        }
-        tokio::time::sleep(PAIR_POLL).await;
-    }
 }
 
 /// Holds the channel to the Space until it closes, then returns the failure.
@@ -648,14 +711,6 @@ fn socket_url(space_url: &str) -> Result<String> {
     Ok(format!("{socket}/api/computer/socket"))
 }
 
-/// Returns the Space URL to pair with, refusing a missing or non-loopback one.
-fn space_url(explicit: Option<String>, saved: Option<String>) -> Result<String> {
-    let Some(url) = explicit.or(saved) else {
-        bail!("pass --space <url>, or set NEHA_SPACE_URL");
-    };
-    normalized_space_url(&url)
-}
-
 /// Returns a Space URL without a trailing slash, refusing a non-loopback one.
 ///
 /// This milestone's Space listens on loopback only. Pairing with anything else
@@ -686,47 +741,262 @@ fn normalized_space_url(url: &str) -> Result<String> {
     Ok(parsed.as_str().trim_end_matches('/').to_owned())
 }
 
-/// Returns 32 random bytes as URL-safe base64 without padding.
-fn secret() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rng().fill_bytes(&mut bytes);
-    URL_SAFE_NO_PAD.encode(bytes)
+/// The ticket file a Space writes for this machine.
+const TICKET_NAME: &str = "local-computer.ticket";
+
+/// The ticket a Space wrote for this machine's first pairing.
+struct Ticket {
+    /// The one-use pairing secret.
+    ticket: String,
+    /// The Space URL the ticket file names, when it names one.
+    url: Option<String>,
 }
 
-/// Returns the name this machine is known by, for the Space to show.
-fn machine_name() -> String {
-    std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| "computer".to_owned())
-}
-
-/// Returns the directory that holds this machine's Neha files.
-fn home() -> Result<PathBuf> {
-    home_from(
+/// Returns the configuration directory that holds this machine's Neha files.
+fn config_directory() -> Result<PathBuf> {
+    config_directory_from(
         std::env::var_os("NEHA_COMPUTER_HOME").map(PathBuf::from),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
     )
 }
 
-/// Returns the machine's Neha directory from the two variables it may name.
-fn home_from(computer_home: Option<PathBuf>, user_home: Option<PathBuf>) -> Result<PathBuf> {
+/// Returns the configuration directory from the variables that may name it.
+///
+/// `NEHA_COMPUTER_HOME` wins outright; otherwise the platform's per-user
+/// configuration directory holds `neha`. A relative `XDG_CONFIG_HOME` is
+/// ignored, as the XDG base directory specification requires.
+fn config_directory_from(
+    computer_home: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+) -> Result<PathBuf> {
     if let Some(path) = computer_home {
         return Ok(path);
     }
-    let Some(user_home) = user_home else {
+    let Some(directory) = standard_config_directory(xdg_config_home, user_home) else {
         bail!(
             "HOME is not set; set NEHA_COMPUTER_HOME to the directory that holds this machine's Neha files"
         );
     };
 
-    Ok(user_home.join(".neha"))
+    Ok(directory)
+}
+
+/// Returns the per-user configuration directory the CLI and the Space share.
+///
+/// `NEHA_COMPUTER_HOME` does not move it: the Space writes its ticket there and
+/// the CLI keeps its session credential there.
+fn standard_config_directory(
+    xdg_config_home: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    xdg_config_home
+        .filter(|path| path.is_absolute())
+        .or_else(|| user_home.map(|home| home.join(".config")))
+        .map(|base| base.join("neha"))
 }
 
 /// Returns the path of the saved pairing.
 fn config_path() -> Result<PathBuf> {
-    Ok(home()?.join("computer.json"))
+    Ok(config_directory()?.join("computer.json"))
+}
+
+/// Returns the path a pairing was saved at before the configuration moved.
+fn older_pairing_path(user_home: &Path) -> PathBuf {
+    user_home.join(".neha").join("computer.json")
+}
+
+/// Refuses to pair or serve while a pairing from the old default exists.
+///
+/// The old file is never migrated: it may name a stale Workspace or Computer,
+/// and its credential is authorization material a Bot could reach. The User
+/// removes it and pairs again.
+fn refuse_older_pairing() -> Result<()> {
+    refuse_older_pairing_from(std::env::var_os("HOME").map(PathBuf::from).as_deref())
+}
+
+/// Refuses at a known home, for tests and for the check above.
+fn refuse_older_pairing_from(user_home: Option<&Path>) -> Result<()> {
+    if let Some(user_home) = user_home
+        && older_pairing_path(user_home).exists()
+    {
+        bail!(
+            "an older pairing is at ~/.neha/computer.json; remove it and run `neha computer pair` again"
+        );
+    }
+
+    Ok(())
+}
+
+/// Returns the ticket file to read, in the pinned order.
+///
+/// An explicit `--ticket-file` wins. The Space writes its ticket where the CLI
+/// keeps its own state first, and under its home second; the first file that
+/// exists is used.
+fn find_ticket_file() -> Option<PathBuf> {
+    let directory = config_directory().ok()?;
+    let neha_home = std::env::var_os("NEHA_HOME").map(PathBuf::from);
+
+    first_existing(ticket_candidates_from(&directory, neha_home))
+}
+
+/// Returns the ticket files to try, in the pinned order.
+fn ticket_candidates_from(config_directory: &Path, neha_home: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut candidates = vec![config_directory.join(TICKET_NAME)];
+    if let Some(home) = neha_home {
+        candidates.push(home.join("state").join(TICKET_NAME));
+    }
+
+    candidates
+}
+
+/// Returns the first candidate that exists.
+fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
+    candidates.into_iter().find(|path| path.exists())
+}
+
+/// Reads one ticket file.
+fn read_ticket(path: &Path) -> Result<Ticket> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read the ticket file {}", path.display()))?;
+    parse_ticket(&text).with_context(|| format!("the ticket file {} is not usable", path.display()))
+}
+
+/// Parses a ticket file: one line with the ticket, or JSON with a URL too.
+fn parse_ticket(text: &str) -> Result<Ticket> {
+    let text = text.trim();
+    if text.is_empty() {
+        bail!("the ticket is empty");
+    }
+    if text.starts_with('{') {
+        #[derive(Deserialize)]
+        struct JsonTicket {
+            ticket: String,
+            #[serde(default)]
+            url: Option<String>,
+        }
+        let file: JsonTicket =
+            serde_json::from_str(text).context("the ticket is not a JSON ticket")?;
+        let ticket = file.ticket.trim().to_owned();
+        if ticket.is_empty() {
+            bail!("the JSON ticket is empty");
+        }
+        let url = file
+            .url
+            .map(|url| url.trim().to_owned())
+            .filter(|url| !url.is_empty());
+
+        return Ok(Ticket { ticket, url });
+    }
+
+    Ok(Ticket {
+        ticket: text.lines().next().unwrap_or_default().trim().to_owned(),
+        url: None,
+    })
+}
+
+/// Returns the Space this pairing targets.
+///
+/// An explicit `--space` wins over the URL a ticket file names, which wins over
+/// the Space a signed-in CLI already knows. A ticket from a Space with no URL
+/// in it is enough only when one of the other two is known.
+fn target_url(
+    space: Option<&str>,
+    ticket: Option<&str>,
+    credential: Option<&str>,
+) -> Result<String> {
+    let url = space.or(ticket).or(credential).context(
+        "pass --space, sign in with `neha login`, or run `neha serve` on this machine to \
+         write a ticket",
+    )?;
+    normalized_space_url(url)
+}
+
+/// The URL the saved CLI session belongs to, normalized for messages.
+fn saved_session_url(credential: &Credential) -> String {
+    normalized_space_url(&credential.url)
+        .unwrap_or_else(|_| credential.url.trim_end_matches('/').to_owned())
+}
+
+/// Refuses a ticket that names a different Space than `--space` does.
+fn check_ticket_space(ticket_url: &str, space: &str) -> Result<()> {
+    let ticket = normalized_space_url(ticket_url)?;
+    let space = normalized_space_url(space)?;
+    if ticket != space {
+        bail!("the ticket belongs to {ticket}; pair with that Space or leave out --space");
+    }
+
+    Ok(())
+}
+
+/// Refuses to send the saved session to a Space it does not belong to.
+fn check_saved_origin(space: &str, saved: &str) -> Result<()> {
+    if !same_origin(space, saved)? {
+        bail!("the saved session belongs to {saved}");
+    }
+
+    Ok(())
+}
+
+/// Returns whether two URLs share a scheme, host, and port.
+fn same_origin(left: &str, right: &str) -> Result<bool> {
+    let left =
+        reqwest::Url::parse(left).with_context(|| format!("{left:?} is not an absolute URL"))?;
+    let right =
+        reqwest::Url::parse(right).with_context(|| format!("{right:?} is not an absolute URL"))?;
+
+    Ok(left.scheme() == right.scheme()
+        && left.host_str() == right.host_str()
+        && left.port_or_known_default() == right.port_or_known_default())
+}
+
+/// Prints the pairing target and returns whether the User confirmed it.
+///
+/// A non-interactive run must say `--yes`: silently pairing this machine with
+/// whatever URL a script passed would skip the one decision pairing asks for.
+fn confirm_pairing(space: &str, yes: bool) -> Result<bool> {
+    use std::io::IsTerminal as _;
+
+    if !confirmation_needed(yes, std::io::stdin().is_terminal())? {
+        return Ok(true);
+    }
+    print!("Pair this Computer with the Space at {space}? [y/N] ");
+    std::io::stdout()
+        .flush()
+        .context("cannot write the prompt")?;
+    let mut answer = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut answer)
+        .context("cannot read the answer")?;
+    if read == 0 {
+        return Ok(false);
+    }
+
+    Ok(answer_is_yes(&answer))
+}
+
+/// Returns whether the prompt must be shown, refusing an unattended run.
+///
+/// `--yes` answers the prompt; a non-interactive run without it is an error,
+/// because silently pairing this machine with whatever URL a script passed
+/// would skip the one decision pairing asks for.
+fn confirmation_needed(yes: bool, interactive: bool) -> Result<bool> {
+    if yes {
+        return Ok(false);
+    }
+    if !interactive {
+        bail!(
+            "pairing is not confirmed: stdin is not a terminal; pass --yes to pair without a prompt"
+        );
+    }
+
+    Ok(true)
+}
+
+/// Returns whether a prompt answer means yes.
+fn answer_is_yes(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }
 
 /// Returns the directory that holds one folder per Bot by default.
@@ -734,13 +1004,13 @@ fn default_workspace() -> Result<PathBuf> {
     default_workspace_from(std::env::var_os("HOME").map(PathBuf::from))
 }
 
-/// Returns the default workspace beside the machine user's home.
+/// Returns the default Workspace root beside the machine user's home.
 fn default_workspace_from(user_home: Option<PathBuf>) -> Result<PathBuf> {
     let Some(user_home) = user_home else {
         bail!("HOME is not set; pass --workspace to choose where the Bot Workspaces live");
     };
 
-    Ok(user_home.join("Neha"))
+    Ok(user_home.join(".neha").join("workspaces"))
 }
 
 /// Returns the configuration directory as the runtimes must hide it.
@@ -749,17 +1019,57 @@ fn default_workspace_from(user_home: Option<PathBuf>) -> Result<PathBuf> {
 /// credential in `computer.json`, so neither a Bot's file tools nor its sandbox
 /// may reach it.
 fn hidden_roots() -> Result<Vec<PathBuf>> {
-    let directory = home()?;
-    let directory = std::fs::canonicalize(&directory)
-        .with_context(|| format!("cannot resolve {}", directory.display()))?;
-
-    Ok(vec![directory])
+    Ok(hidden_roots_from(
+        config_directory()?,
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::var_os("NEHA_CREDENTIAL").map(PathBuf::from),
+        std::env::var_os("NEHA_HOME")
+            .map(|home| PathBuf::from(home).join("state").join(TICKET_NAME)),
+    ))
 }
 
-/// Refuses a workspace inside the directory that holds the saved pairing.
+/// Returns the paths a Bot must not reach, resolved and de-duplicated.
 ///
-/// Both paths are resolved, so a symlink between them cannot make the check
-/// miss; the parts that do not exist yet are compared lexically.
+/// The daemon's configuration directory holds the channel credential, and the
+/// CLI keeps its session credential in the per-user configuration directory;
+/// `NEHA_CREDENTIAL` may move that file anywhere. A path that does not exist
+/// is dropped: there is nothing there to hide yet.
+fn hidden_roots_from(
+    config_directory: PathBuf,
+    xdg_config_home: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+    credential: Option<PathBuf>,
+    ticket: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut candidates = vec![config_directory];
+    if let Some(directory) = standard_config_directory(xdg_config_home, user_home) {
+        candidates.push(directory);
+    }
+    candidates.extend(credential);
+    candidates.extend(ticket);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut roots = Vec::new();
+    for candidate in candidates {
+        let Ok(root) = std::fs::canonicalize(&candidate) else {
+            continue;
+        };
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+
+    roots
+}
+
+/// Refuses a Workspace and the configuration directory that contains each
+/// other.
+///
+/// The configuration directory is a hidden root, and a Bot's write root may
+/// neither hold it nor sit inside it. Both paths are resolved, so a symlink
+/// between them cannot make the check miss; the parts that do not exist yet
+/// are compared lexically.
 fn refuse_workspace(config_directory: &Path, workspace: &Path) -> Result<()> {
     let directory = resolved_path(config_directory);
     let workspace = resolved_path(workspace);
@@ -769,6 +1079,14 @@ fn refuse_workspace(config_directory: &Path, workspace: &Path) -> Result<()> {
              choose a workspace outside it",
             workspace.display(),
             directory.display()
+        );
+    }
+    if directory.starts_with(&workspace) {
+        bail!(
+            "the Computer's configuration directory {} is inside the workspace {}; \
+             choose a workspace that does not contain it",
+            directory.display(),
+            workspace.display()
         );
     }
 
@@ -821,9 +1139,11 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        Config, Runtimes, Socket, decode_bytes, default_workspace_from, encode_bytes,
-        execute_frame, folder_for, home_from, normalized_space_url, refuse_workspace, secret,
-        serve_channel, socket_url, space_url, write_receipt,
+        Config, Runtimes, Socket, answer_is_yes, check_saved_origin, check_ticket_space,
+        config_directory_from, confirmation_needed, decode_bytes, default_workspace_from,
+        encode_bytes, execute_frame, first_existing, folder_for, hidden_roots_from,
+        normalized_space_url, parse_ticket, refuse_older_pairing_from, refuse_workspace,
+        same_origin, serve_channel, socket_url, target_url, ticket_candidates_from, write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -867,31 +1187,98 @@ mod tests {
     }
 
     #[test]
-    fn the_machine_directory_comes_from_its_own_variable_first() {
+    fn the_configuration_directory_comes_from_the_environment_in_order() {
+        // NEHA_COMPUTER_HOME wins outright.
         assert_eq!(
-            home_from(
+            config_directory_from(
                 Some(PathBuf::from("/srv/neha")),
+                Some(PathBuf::from("/home/ada/.config")),
                 Some(PathBuf::from("/home/ada"))
             )
             .unwrap(),
             PathBuf::from("/srv/neha")
         );
+        // Then XDG_CONFIG_HOME/neha.
         assert_eq!(
-            home_from(None, Some(PathBuf::from("/home/ada"))).unwrap(),
-            PathBuf::from("/home/ada/.neha")
+            config_directory_from(
+                None,
+                Some(PathBuf::from("/x/config")),
+                Some(PathBuf::from("/home/ada"))
+            )
+            .unwrap(),
+            PathBuf::from("/x/config/neha")
         );
-        let error = home_from(None, None).unwrap_err().to_string();
+        // Then the platform default under $HOME.
+        assert_eq!(
+            config_directory_from(None, None, Some(PathBuf::from("/home/ada"))).unwrap(),
+            PathBuf::from("/home/ada/.config/neha")
+        );
+        // A relative XDG_CONFIG_HOME is ignored, as the XDG spec says.
+        assert_eq!(
+            config_directory_from(
+                None,
+                Some(PathBuf::from("relative/config")),
+                Some(PathBuf::from("/home/ada"))
+            )
+            .unwrap(),
+            PathBuf::from("/home/ada/.config/neha")
+        );
+        let error = config_directory_from(None, None, None)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("NEHA_COMPUTER_HOME"), "{error}");
     }
 
     #[test]
-    fn the_default_workspace_sits_beside_the_user_home() {
+    fn the_default_workspace_root_sits_under_the_user_home() {
         assert_eq!(
             default_workspace_from(Some(PathBuf::from("/home/ada"))).unwrap(),
-            PathBuf::from("/home/ada/Neha")
+            PathBuf::from("/home/ada/.neha/workspaces")
         );
         let error = default_workspace_from(None).unwrap_err().to_string();
         assert!(error.contains("--workspace"), "{error}");
+    }
+
+    #[test]
+    fn an_older_pairing_is_refused_until_it_is_removed() {
+        let directory = tempfile::tempdir().unwrap();
+        let user_home = directory.path();
+        let older = user_home.join(".neha").join("computer.json");
+        std::fs::create_dir_all(older.parent().unwrap()).unwrap();
+        std::fs::write(&older, "{}").unwrap();
+        // Even a new pairing saved at the new place does not make the old
+        // authorization material safe to leave around.
+        let configuration = user_home.join(".config/neha");
+        std::fs::create_dir_all(&configuration).unwrap();
+        std::fs::write(configuration.join("computer.json"), "{}").unwrap();
+
+        let error = refuse_older_pairing_from(Some(user_home))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "an older pairing is at ~/.neha/computer.json; remove it and run `neha computer pair` again"
+        );
+
+        std::fs::remove_file(&older).unwrap();
+        refuse_older_pairing_from(Some(user_home)).unwrap();
+    }
+
+    #[test]
+    fn a_ticket_file_is_one_line_or_json_with_a_url() {
+        let plain = parse_ticket("ticket-a\n").unwrap();
+        assert_eq!(plain.ticket, "ticket-a");
+        assert_eq!(plain.url, None);
+        let json =
+            parse_ticket(r#"{"ticket": "ticket-b", "url": "http://127.0.0.1:7337"}"#).unwrap();
+        assert_eq!(json.ticket, "ticket-b");
+        assert_eq!(json.url.as_deref(), Some("http://127.0.0.1:7337"));
+        let without_url = parse_ticket(r#"{"ticket": "ticket-c"}"#).unwrap();
+        assert_eq!(without_url.url, None);
+        assert!(parse_ticket("").is_err());
+        assert!(parse_ticket("   \n  ").is_err());
+        assert!(parse_ticket(r#"{"ticket": ""}"#).is_err());
+        assert!(parse_ticket("{not json").is_err());
     }
 
     #[test]
@@ -933,28 +1320,183 @@ mod tests {
                 "{error}"
             );
         }
+
+        // The reverse overlap is refused too: a Workspace may not contain the
+        // configuration directory it is supposed to hide.
+        let error = refuse_workspace(&configuration, directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("configuration directory") && error.contains("inside the workspace"),
+            "{error}"
+        );
     }
 
     #[test]
-    fn a_pairing_needs_a_space_url_and_prefers_the_one_given() {
-        let error = space_url(None, None).unwrap_err().to_string();
-        assert!(error.contains("NEHA_SPACE_URL"), "{error}");
+    fn a_pairing_prefers_the_space_then_the_ticket_then_the_credential() {
+        let error = target_url(None, None, None).unwrap_err().to_string();
+        assert!(error.contains("--space"), "{error}");
         assert_eq!(
-            space_url(None, Some("http://127.0.0.1:7337/".to_owned())).unwrap(),
+            target_url(None, Some("http://127.0.0.1:7337/"), None).unwrap(),
             "http://127.0.0.1:7337"
         );
         assert_eq!(
-            space_url(
-                Some("https://localhost:7337".to_owned()),
-                Some("http://127.0.0.1:7337".to_owned())
+            target_url(None, None, Some("http://127.0.0.1:7337")).unwrap(),
+            "http://127.0.0.1:7337"
+        );
+        assert_eq!(
+            target_url(
+                Some("https://localhost:7337"),
+                Some("http://127.0.0.1:7337"),
+                Some("http://127.0.0.1:7338")
             )
             .unwrap(),
             "https://localhost:7337"
         );
-        let error = space_url(Some("space.example".to_owned()), None)
+        // A ticket URL wins over the saved credential's Space.
+        assert_eq!(
+            target_url(
+                None,
+                Some("http://127.0.0.1:7337"),
+                Some("http://127.0.0.1:7338")
+            )
+            .unwrap(),
+            "http://127.0.0.1:7337"
+        );
+        let error = target_url(Some("space.example"), None, None)
             .unwrap_err()
             .to_string();
         assert!(error.contains("URL"), "{error}");
+    }
+
+    #[test]
+    fn the_saved_session_only_pairs_with_its_own_origin() {
+        assert!(same_origin("http://127.0.0.1:7337", "http://127.0.0.1:7337/").unwrap());
+        assert!(same_origin("https://localhost:7337", "https://localhost:7337/").unwrap());
+        // A different port, host, or scheme is a different origin.
+        for (left, right) in [
+            ("http://127.0.0.1:7337", "http://127.0.0.1:7338"),
+            ("http://localhost:7337", "http://127.0.0.1:7337"),
+            ("https://127.0.0.1:7337", "http://127.0.0.1:7337"),
+        ] {
+            assert!(!same_origin(left, right).unwrap(), "{left} vs {right}");
+        }
+
+        check_saved_origin("http://127.0.0.1:7337", "http://127.0.0.1:7337/").unwrap();
+        let error = check_saved_origin("http://127.0.0.1:7338", "http://127.0.0.1:7337")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, "the saved session belongs to http://127.0.0.1:7337");
+    }
+
+    #[test]
+    fn a_ticket_naming_another_space_is_refused() {
+        check_ticket_space("http://127.0.0.1:7337", "http://127.0.0.1:7337/").unwrap();
+        let error = check_ticket_space("http://127.0.0.1:7338", "http://127.0.0.1:7337")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "the ticket belongs to http://127.0.0.1:7338; pair with that Space or leave out --space"
+        );
+    }
+
+    #[test]
+    fn ticket_files_are_tried_in_the_pinned_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration = directory.path().join(".config/neha");
+        let neha_home = directory.path().join("space");
+        std::fs::create_dir_all(&configuration).unwrap();
+        std::fs::create_dir_all(neha_home.join("state")).unwrap();
+        let candidates = ticket_candidates_from(&configuration, Some(neha_home.clone()));
+        assert_eq!(
+            candidates,
+            vec![
+                configuration.join("local-computer.ticket"),
+                neha_home.join("state/local-computer.ticket"),
+            ]
+        );
+
+        // The first existing file wins; the Space home file is the fallback.
+        assert_eq!(first_existing(candidates.clone()), None);
+        std::fs::write(&candidates[1], "ticket-b").unwrap();
+        assert_eq!(
+            first_existing(candidates.clone()),
+            Some(candidates[1].clone())
+        );
+        std::fs::write(&candidates[0], "ticket-a").unwrap();
+        assert_eq!(
+            first_existing(candidates),
+            Some(configuration.join("local-computer.ticket"))
+        );
+    }
+
+    #[test]
+    fn hidden_roots_cover_the_configuration_and_credential_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration = directory.path().join("computer-home");
+        let standard = directory.path().join(".config/neha");
+        let credential = directory.path().join("credential.json");
+        for path in [&configuration, &standard] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(&credential, "{}").unwrap();
+
+        let roots = hidden_roots_from(
+            configuration.clone(),
+            Some(directory.path().join(".config")),
+            None,
+            Some(credential.clone()),
+            None,
+        );
+        let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
+        assert!(roots.contains(&canonical(&configuration)));
+        assert!(roots.contains(&canonical(&standard)));
+        assert!(roots.contains(&canonical(&credential)));
+
+        // A path that does not exist has nothing to hide and is dropped; the
+        // configuration directory is not duplicated when it is also the
+        // platform configuration directory.
+        let missing = directory.path().join("missing.json");
+        let roots = hidden_roots_from(
+            configuration.clone(),
+            Some(directory.path().join(".config")),
+            None,
+            Some(missing),
+            None,
+        );
+        assert_eq!(roots.len(), 2);
+        let roots = hidden_roots_from(
+            standard.clone(),
+            Some(directory.path().join(".config")),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(roots, vec![canonical(&standard)]);
+    }
+
+    #[test]
+    fn pairing_needs_a_terminal_or_an_explicit_yes() {
+        // --yes always pairs without asking, terminal or not.
+        assert!(!confirmation_needed(true, false).unwrap());
+        assert!(!confirmation_needed(true, true).unwrap());
+        // A terminal asks, and the answer decides.
+        assert!(confirmation_needed(false, true).unwrap());
+        // A non-interactive run must not silently confirm.
+        let error = confirmation_needed(false, false).unwrap_err().to_string();
+        assert!(error.contains("--yes"), "{error}");
+        assert!(error.contains("not a terminal"), "{error}");
+    }
+
+    #[test]
+    fn a_confirmation_answer_is_yes_only_when_it_says_so() {
+        for answer in ["y", "Y", "yes", " YES \n"] {
+            assert!(answer_is_yes(answer), "{answer:?}");
+        }
+        for answer in ["", "n", "no", "later", "y n"] {
+            assert!(!answer_is_yes(answer), "{answer:?}");
+        }
     }
 
     #[test]
@@ -1004,17 +1546,6 @@ mod tests {
             "wss://localhost:7337/api/computer/socket"
         );
         assert!(socket_url("ftp://127.0.0.1:7337").is_err());
-    }
-
-    #[test]
-    fn a_secret_is_32_random_bytes_of_url_safe_base64() {
-        let first = secret();
-        let second = secret();
-
-        assert_eq!(first.len(), 43, "32 bytes are 43 base64 characters");
-        assert_ne!(first, second);
-        assert!(!first.contains(['+', '/', '=']), "{first}");
-        assert_eq!(decode_bytes(&first).unwrap().len(), 32);
     }
 
     #[test]

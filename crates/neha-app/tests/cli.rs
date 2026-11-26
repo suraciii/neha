@@ -13,12 +13,28 @@ use axum::routing::{get, post};
 const PASSWORD: &str = "correct horse battery";
 const BIN: &str = env!("CARGO_BIN_EXE_neha");
 
-struct SpaceProcess(Child);
+/// A running `neha serve`, kept alive until it drops.
+struct SpaceProcess {
+    child: Child,
+    lines: mpsc::Receiver<String>,
+    output: String,
+}
+
+impl SpaceProcess {
+    /// Reads this Space's stdout until it prints this line.
+    fn expect_line(&mut self, expected: &str) {
+        let mut output = std::mem::take(&mut self.output);
+        read_until_matching(&self.lines, &mut output, &format!("`{expected}`"), |line| {
+            line == expected
+        });
+        self.output = output;
+    }
+}
 
 impl Drop for SpaceProcess {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -63,6 +79,9 @@ fn serve_once(home: &Path, port: u16) -> Result<(SpaceProcess, String, Option<St
     let mut child = Command::new(BIN)
         .args(["serve", "--port", &port.to_string()])
         .env("NEHA_HOME", home)
+        // The Space writes its one-use pairing ticket into the per-user
+        // configuration directory; keep that inside the fixture.
+        .env("XDG_CONFIG_HOME", home.join("xdg"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -82,6 +101,7 @@ fn serve_once(home: &Path, port: u16) -> Result<(SpaceProcess, String, Option<St
 
     let mut url = None;
     let mut invite = None;
+    let mut output = String::new();
     while url.is_none() || invite.is_none() {
         let line = match received.recv_timeout(Duration::from_secs(10)) {
             Ok(line) => line,
@@ -93,6 +113,8 @@ fn serve_once(home: &Path, port: u16) -> Result<(SpaceProcess, String, Option<St
                 ));
             }
         };
+        output.push_str(&line);
+        output.push('\n');
         if let Some(address) = line.strip_prefix("Neha is listening on ") {
             url = Some(address.to_owned());
         }
@@ -105,7 +127,12 @@ fn serve_once(home: &Path, port: u16) -> Result<(SpaceProcess, String, Option<St
                 Ok(next) if next.starts_with("Invite: ") => {
                     invite = Some(next.trim_start_matches("Invite: ").to_owned());
                 }
-                Ok(_) | Err(_) => break,
+                Ok(next) => {
+                    output.push_str(&next);
+                    output.push('\n');
+                    break;
+                }
+                Err(_) => break,
             }
         }
     }
@@ -121,7 +148,15 @@ fn serve_once(home: &Path, port: u16) -> Result<(SpaceProcess, String, Option<St
         ));
     }
 
-    Ok((SpaceProcess(child), url, invite))
+    Ok((
+        SpaceProcess {
+            child,
+            lines: received,
+            output,
+        },
+        url,
+        invite,
+    ))
 }
 
 /// Sends `GET /healthz` to one advertised address until it answers.
@@ -498,15 +533,15 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
     )
 }
 
-/// Runs a real-Computer test only where this machine can fence a Bot.
+/// Runs a Local-Computer test only where this machine can fence a Bot.
 ///
 /// `NEHA_TEST_BWRAP` is the gate, as for the runtime's own fence tests. Once
 /// it is set, a sandbox that cannot start makes the test fail with
 /// bubblewrap's own error: CI promises the real path, so a broken sandbox
 /// must be red instead of silently skipped.
-fn real_computer_ready() -> bool {
+fn local_computer_ready() -> bool {
     if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
-        eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+        eprintln!("skipping the Local-Computer test: NEHA_TEST_BWRAP is not set");
         return false;
     }
     let probe = tempfile::tempdir().unwrap();
@@ -529,10 +564,10 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
     }
 }
 
-/// Waits for `computer list` to show one Computer online, and returns the
-/// listing that showed it.
+/// Waits for `computer list` to show one Local Computer online, and returns
+/// the listing that showed it.
 fn wait_for_computer_online(home: &Path, credential: &Path, computer: &str) -> String {
-    let wanted = format!("{computer}  real  online  ");
+    let wanted = format!("{computer}  local  online  ");
     let mut listing = String::new();
     wait_until("the Computer to come online", || {
         listing = run(home, credential, &["computer", "list"]);
@@ -542,9 +577,9 @@ fn wait_for_computer_online(home: &Path, credential: &Path, computer: &str) -> S
     listing
 }
 
-/// Waits for `computer list` to show one Computer offline.
+/// Waits for `computer list` to show one Local Computer offline.
 fn wait_for_computer_offline(home: &Path, credential: &Path, computer: &str) {
-    let wanted = format!("{computer}  real  offline  ");
+    let wanted = format!("{computer}  local  offline  ");
     wait_until("the Computer to go offline", || {
         run(home, credential, &["computer", "list"])
             .lines()
@@ -552,14 +587,66 @@ fn wait_for_computer_offline(home: &Path, credential: &Path, computer: &str) {
     });
 }
 
-/// Runs one machine-side `neha computer` command for a configuration
-/// directory, and returns both of its streams.
-fn computer_command(computer_home: &Path, arguments: &[&str]) -> Output {
-    Command::new(BIN)
-        .args(arguments)
-        .env("NEHA_COMPUTER_HOME", computer_home)
-        .output()
-        .expect("neha computer runs")
+/// The machine-side environment one `neha computer` command resolves its
+/// defaults from: the Space home (the pairing ticket lives there), the machine
+/// user's home (the default Workspace root lives there), and the configuration
+/// directory.
+struct MachineEnv {
+    space_home: PathBuf,
+    user_home: PathBuf,
+    computer_home: PathBuf,
+}
+
+impl MachineEnv {
+    /// A machine whose directories all live under `machine`.
+    fn under(space_home: &Path, machine: &Path) -> Self {
+        Self {
+            space_home: space_home.to_path_buf(),
+            user_home: machine.join("user"),
+            computer_home: machine.join("config"),
+        }
+    }
+
+    /// The default Workspace root this machine resolves to.
+    fn workspace_root(&self) -> PathBuf {
+        self.user_home.join(".neha").join("workspaces")
+    }
+
+    /// The pairing this machine saved.
+    fn config_path(&self) -> PathBuf {
+        self.computer_home.join("computer.json")
+    }
+
+    /// Adds this machine's directories to a command.
+    fn apply(&self, command: &mut Command) {
+        command
+            .env("NEHA_HOME", &self.space_home)
+            .env("HOME", &self.user_home)
+            .env("NEHA_COMPUTER_HOME", &self.computer_home)
+            // Keep every default path inside the fixture, not in the runner's
+            // home directory.
+            .env("XDG_CONFIG_HOME", self.computer_home.with_file_name("xdg"));
+    }
+}
+
+/// Runs one machine-side `neha computer` command for a machine, and returns
+/// both of its streams.
+fn computer_command(machine: &MachineEnv, credential: &Path, arguments: &[&str]) -> Output {
+    let mut command = Command::new(BIN);
+    command.args(arguments).env("NEHA_CREDENTIAL", credential);
+    machine.apply(&mut command);
+    command.output().expect("neha computer runs")
+}
+
+/// Returns the path a Space writes its one-use pairing ticket to.
+///
+/// The fixture gives `neha serve` an `XDG_CONFIG_HOME` under the Space's home,
+/// so the ticket is `$XDG_CONFIG_HOME/neha/local-computer.ticket`.
+fn ticket_path(space_home: &Path) -> PathBuf {
+    space_home
+        .join("xdg")
+        .join("neha")
+        .join("local-computer.ticket")
 }
 
 /// A machine-side `neha computer pair` or `neha computer run`, killed on drop.
@@ -570,14 +657,15 @@ struct ComputerDaemon {
 }
 
 impl ComputerDaemon {
-    /// Starts a computer command for this machine's own Neha directory.
-    fn spawn(computer_home: &Path, arguments: &[&str]) -> Self {
-        let mut child = Command::new(BIN)
+    /// Starts a machine-side command for one machine.
+    fn spawn(machine: &MachineEnv, credential: &Path, arguments: &[&str]) -> Self {
+        let mut command = Command::new(BIN);
+        command
             .args(arguments)
-            .env("NEHA_COMPUTER_HOME", computer_home)
-            .stdout(Stdio::piped())
-            .spawn()
-            .expect("neha computer starts");
+            .env("NEHA_CREDENTIAL", credential)
+            .stdout(Stdio::piped());
+        machine.apply(&mut command);
+        let mut child = command.spawn().expect("neha computer starts");
         let lines = line_reader(child.stdout.take().unwrap());
 
         Self {
@@ -596,26 +684,11 @@ impl ComputerDaemon {
         self.output = output;
     }
 
-    /// Reads this daemon's stdout until a line starts with `prefix`, and
-    /// returns that line.
-    fn expect_prefix(&mut self, prefix: &str) -> String {
-        let mut output = std::mem::take(&mut self.output);
-        let line = read_until_matching(
-            &self.lines,
-            &mut output,
-            &format!("a line starting with `{prefix}`"),
-            |line| line.starts_with(prefix),
-        );
-        self.output = output;
-
-        line
-    }
-
     /// Stops the daemon's process without ending it.
     ///
     /// The channel stays open, so the Space still sees the Computer online,
-    /// but nothing the Space sends is ever answered until the daemon is
-    /// killed: that is how a test holds a channel request open.
+    /// but nothing the Space sends is ever answered until it is killed: that
+    /// is how a test holds a channel request open.
     fn pause(&self) {
         let Some(child) = &self.child else {
             return;
@@ -643,73 +716,148 @@ impl Drop for ComputerDaemon {
     }
 }
 
-/// One real Computer paired into a Space, with its daemon running.
+/// Starts a Space with an Admin and, when asked, a Provider, then restarts it
+/// on the same port.
+///
+/// Only a Space that already has an Admin writes the zero-code pairing ticket,
+/// so the restart is what a User does after signing in; keeping the address is
+/// what lets the saved CLI credential keep working.
+fn space_with_admin(directory: &Path, provider: Option<&str>) -> (SpaceProcess, String) {
+    let home = directory.join("home");
+    let credential = directory.join("credential.json");
+    let (server, url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    if let Some(provider) = provider {
+        run(
+            &home,
+            &credential,
+            &[
+                "provider",
+                "add",
+                "--base-url",
+                provider,
+                "--model",
+                "test-model",
+            ],
+        );
+    }
+
+    let port = space_port(&url);
+    drop(server);
+    let (mut server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(
+        restarted_url, url,
+        "the Space restarts on the address its Computers save"
+    );
+    assert!(
+        ticket_path(&home).is_file(),
+        "a Space with an Admin writes the zero-code pairing ticket"
+    );
+    server.expect_line("Pair this PC: neha computer pair");
+
+    (server, url)
+}
+
+/// Returns the ticket file waiting for the next pairing, when the Space wrote
+/// one that no machine has spent yet.
+fn ticket_for_pairing(space_home: &Path) -> Option<String> {
+    let ticket = ticket_path(space_home);
+    ticket
+        .is_file()
+        .then(|| ticket.to_string_lossy().into_owned())
+}
+
+/// One Local Computer paired into a Space, with its daemon running.
 struct PairedComputer {
     daemon: ComputerDaemon,
-    computer_home: PathBuf,
-    /// The machine's workspace, resolved as the daemon resolved it.
-    workspace: PathBuf,
+    machine: MachineEnv,
     computer: String,
-    /// What `computer add` and the first `computer list` printed.
-    added: String,
+    /// The default Workspace root this machine resolves to.
+    workspace: PathBuf,
+    /// What `computer pair` printed.
+    paired: String,
+    /// The `computer list` line that showed it online.
     listed: String,
 }
 
-/// Pairs one more real Computer into a Space that is already serving.
+/// Pairs one more machine into a running Space and starts its daemon.
 ///
-/// Each machine gets its own configuration directory and workspace under
-/// `machine`; the workspace sits beside the configuration directory, never
-/// inside it.
+/// The first pairing consumes the ticket file `neha serve` wrote; a later
+/// machine asks the Space for its own ticket through the signed-in CLI.
 fn pair_computer(home: &Path, credential: &Path, url: &str, machine: &Path) -> PairedComputer {
-    let computer_home = machine.join("computer");
-    let workspace = machine.join("workspace");
-    // The machine shows a code, a signed-in User enters it, and the daemon the
-    // machine then starts connects back to the Space.
-    let mut daemon = ComputerDaemon::spawn(
-        &computer_home,
-        &[
-            "computer",
-            "pair",
-            "--space",
-            url,
-            "--workspace",
-            workspace.to_str().unwrap(),
-        ],
+    pair_computer_to(home, credential, url, machine, None)
+}
+
+/// Like [`pair_computer`], with an explicit Workspace root when one is given.
+///
+/// `None` leaves the root at the machine's default (`$HOME/.neha/workspaces`);
+/// `Some` proves `--workspace` overrides it.
+fn pair_computer_to(
+    home: &Path,
+    credential: &Path,
+    url: &str,
+    machine: &Path,
+    workspace: Option<&Path>,
+) -> PairedComputer {
+    let machine = MachineEnv::under(home, machine);
+    // The first machine spends the ticket the Space wrote; a later machine has
+    // no ticket file and asks the Space for one through the signed-in CLI.
+    let mut arguments = vec!["computer", "pair", "--yes", "--space", url];
+    let ticket = ticket_for_pairing(home);
+    if let Some(ticket) = &ticket {
+        arguments.push("--ticket-file");
+        arguments.push(ticket);
+    }
+    if let Some(workspace) = workspace {
+        arguments.push("--workspace");
+        arguments.push(workspace.to_str().unwrap());
+    }
+    let output = computer_command(&machine, credential, &arguments);
+    assert!(
+        output.status.success(),
+        "`neha computer pair --yes` failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
-    let printed = daemon.expect_prefix("Pairing code: ");
-    let code = printed.trim_start_matches("Pairing code: ").trim();
-    let added = run(home, credential, &["computer", "add", code]);
-    let computer = first_word(&field(&added, "Added Computer "));
-    daemon.expect_line(&format!("Connected to {url}."));
+    let paired = String::from_utf8_lossy(&output.stdout).into_owned();
+    let computer = first_word(&field(&paired, "Paired Computer "));
+    let workspace = std::fs::canonicalize(workspace.unwrap_or(&machine.workspace_root()))
+        .expect("pairing created the Workspace root");
+
+    // Pairing only saves the configuration; serving the Space is its own
+    // command, exactly as a User starts it.
+    let mut daemon = ComputerDaemon::spawn(&machine, credential, &["computer", "run"]);
+    daemon.expect_line(&format!("Computer {computer} is running for {url}."));
+    daemon.expect_line(&format!("Workspace root: {}", workspace.display()));
     let listed = wait_for_computer_online(home, credential, &computer);
-    let workspace = std::fs::canonicalize(&workspace).expect("the daemon's workspace exists");
 
     PairedComputer {
         daemon,
-        computer_home,
-        workspace,
+        machine,
         computer,
-        added,
+        workspace,
+        paired,
         listed,
     }
 }
 
-/// A Space with a paired real Computer, its running daemon, and one Bot on it.
+/// A Space with a paired Local Computer, its running daemon, and one Bot on it.
 ///
 /// The daemon is declared first so it is stopped before the Space it serves:
 /// dropping the Space under a connected daemon would print a channel failure.
-struct RealComputer {
+struct LocalComputer {
     daemon: ComputerDaemon,
     /// The Space the Computer is paired to; dropping it stops the Space.
     _server: SpaceProcess,
     home: PathBuf,
     credential: PathBuf,
-    computer_home: PathBuf,
-    /// The machine's workspace, resolved as the daemon resolved it.
+    machine: MachineEnv,
+    /// The machine's Workspace root, resolved as the daemon resolved it.
     workspace: PathBuf,
     url: String,
-    /// What the pairing and the first commands printed.
-    added: String,
+    /// What pairing and the first commands printed.
+    paired: String,
     listed: String,
     created: String,
     computer: String,
@@ -719,55 +867,50 @@ struct RealComputer {
     directory: tempfile::TempDir,
 }
 
-impl RealComputer {
+impl LocalComputer {
     /// Returns the fixture's scratch directory.
     fn path(&self) -> &Path {
         self.directory.path()
     }
 }
 
-/// Pairs a real Computer into a fresh Space and creates one Bot on it.
+/// Pairs a Local Computer into a fresh Space and creates one Bot on it.
 ///
-/// The pairing, the daemon, and the Bot creation are the paths a User takes.
-/// A `directory` outside `/tmp` keeps the sandbox's fresh `/tmp` out of a
-/// fence assertion.
-fn real_computer(directory: tempfile::TempDir, provider: &str) -> RealComputer {
+/// The pairing and the Bot creation take the paths a User takes, and the Bot
+/// is created without naming a Computer so the default (Local) is itself under
+/// test. A `directory` outside `/tmp` keeps the sandbox's fresh `/tmp` out of
+/// a fence assertion.
+fn local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer {
     let home = directory.path().join("home");
     let credential = directory.path().join("credential.json");
-    let (server, url, invite) = serve(&home);
-    let invite = invite.expect("a fresh Space prints an invitation");
-    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
-    run(
-        &home,
-        &credential,
-        &[
-            "provider",
-            "add",
-            "--base-url",
-            provider,
-            "--model",
-            "test-model",
-        ],
-    );
-
+    let (server, url) = space_with_admin(directory.path(), Some(provider));
     let paired = pair_computer(&home, &credential, &url, &directory.path().join("machine"));
-    let created = run(
-        &home,
-        &credential,
-        &["bot", "create", "Scout", "--computer", &paired.computer],
-    );
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
     let bot = first_word(&field(&created, "Created Bot "));
     let chat = field(&created, "Chat:");
+    assert_eq!(
+        field(&created, "Computer:"),
+        paired.computer,
+        "a Bot created without --computer lands on the paired Local Computer"
+    );
+    assert!(
+        paired
+            .listed
+            .lines()
+            .any(|line| line.starts_with(&format!("{}  local  ", paired.computer))),
+        "`computer list` shows the paired Local Computer: {}",
+        paired.listed
+    );
 
-    RealComputer {
+    LocalComputer {
         daemon: paired.daemon,
         _server: server,
         home,
         credential,
-        computer_home: paired.computer_home,
+        machine: paired.machine,
         workspace: paired.workspace,
         url,
-        added: paired.added,
+        paired: paired.paired,
         listed: paired.listed,
         created,
         computer: paired.computer,
@@ -1278,8 +1421,8 @@ fn an_invitation_without_a_secret_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bot_runs_on_a_real_computer() {
-    if !real_computer_ready() {
+async fn a_bot_runs_on_a_local_computer() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
@@ -1296,24 +1439,29 @@ async fn a_bot_runs_on_a_real_computer() {
     // cannot mask a configuration directory its hidden-root mounts failed to
     // hide: the shell assertion below is about the hidden root itself.
     let directory = tempfile::Builder::new()
-        .prefix("neha-e2e-real-")
+        .prefix("neha-e2e-local-")
         .tempdir_in("/var/tmp")
         .expect("the credential test needs a writable /var/tmp outside /tmp");
-    let computer = real_computer(directory, &base);
-    let workspace = computer.workspace.to_string_lossy().into_owned();
+    let computer = local_computer(directory, &base);
     let folder = computer.workspace.join(&computer.bot);
 
-    // The code the machine printed admitted a real Computer, and its daemon
-    // shows it online with its workspace.
-    assert!(computer.added.contains("(real)."), "{}", computer.added);
-    let listed = format!("{}  real  online  {workspace}", computer.computer);
+    // Pairing without a code admitted this machine as a Local Computer.
     assert!(
-        computer.listed.lines().any(|line| line == listed),
-        "`computer list` must show the paired Computer online: {}",
-        computer.listed
+        computer.paired.contains(&format!(
+            "Paired Computer {} with {}.",
+            computer.computer, computer.url
+        )),
+        "{}",
+        computer.paired
     );
-    // The Bot was created on that Computer, and no managed one.
+    // The Bot was created on the paired Local Computer by default, and its
+    // folder sits under the machine user's default Workspace root.
     assert_eq!(field(&computer.created, "Computer:"), computer.computer);
+    assert_eq!(
+        computer.workspace,
+        std::fs::canonicalize(computer.machine.workspace_root()).unwrap(),
+        "the Local Workspace root defaults to $HOME/.neha/workspaces"
+    );
     let shown = run(
         &computer.home,
         &computer.credential,
@@ -1321,10 +1469,14 @@ async fn a_bot_runs_on_a_real_computer() {
     );
     assert!(
         shown.contains(&format!(
-            "Computer: {} (real, online: true)",
+            "Computer: {} (Local, online: true)",
             computer.computer
         )),
         "{shown}"
+    );
+    assert!(
+        !shown.contains("Workspace:"),
+        "a Local Computer records no workspace path:\n{shown}"
     );
 
     // A relative path names the Bot's own folder: that is its working
@@ -1385,7 +1537,7 @@ async fn a_bot_runs_on_a_real_computer() {
 
     // The channel credential in the Computer's configuration directory is out
     // of the Bot's reach, through the file tools and through the sandbox.
-    let config_path = computer.computer_home.join("computer.json");
+    let config_path = computer.machine.config_path();
     let config: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
     let token = config["token"].as_str().expect("the config holds a token");
@@ -1450,18 +1602,135 @@ async fn a_bot_runs_on_a_real_computer() {
     provider_task.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_computer_pairs_without_a_code_and_takes_the_default_bot() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base);
+
+    // Pairing is zero-code: it printed the Computer it admitted, saved the
+    // configuration privately, and spent the Space's one-use ticket.
+    assert!(
+        computer.paired.contains(&format!(
+            "Paired Computer {} with {}.",
+            computer.computer, computer.url
+        )),
+        "{}",
+        computer.paired
+    );
+    assert!(
+        !computer.paired.contains("Pairing code:"),
+        "zero-code pairing prints no code: {}",
+        computer.paired
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(computer.machine.config_path())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the saved pairing is private to the machine user"
+        );
+    }
+    assert!(
+        !ticket_path(&computer.home).is_file(),
+        "pairing spends the Space's one-use ticket"
+    );
+
+    // `bot create` without a Computer lands on the paired Local Computer, whose
+    // listing and `bot show` name it as Local and say where it works.
+    assert_eq!(field(&computer.created, "Computer:"), computer.computer);
+    let listed = format!("{}  local  online  ", computer.computer);
+    assert!(
+        computer.listed.lines().any(|line| line == listed),
+        "`computer list` shows the Local Computer online: {}",
+        computer.listed
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "show", &computer.bot],
+    );
+    assert!(
+        shown.contains(&format!(
+            "Computer: {} (Local, online: true)",
+            computer.computer
+        )),
+        "{shown}"
+    );
+    assert!(
+        !shown.contains("Workspace:"),
+        "a Local Computer records no workspace path:\n{shown}"
+    );
+
+    // A relative write lands in the Bot's folder under the default Workspace
+    // root: `$HOME/.neha/workspaces/<bot-id>`.
+    let folder = computer.workspace.join(&computer.bot);
+    script.call(
+        "shell",
+        serde_json::json!({"command": "pwd; echo hi > a.txt"}),
+    );
+    script.say("I work under the default Workspace root.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "where do you work?",
+        ],
+    );
+    assert!(
+        sent.contains("I work under the default Workspace root."),
+        "{sent}"
+    );
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.contains(folder.to_str().unwrap()),
+        "the shell runs in the default Bot folder:\n{shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("a.txt")).unwrap(),
+        "hi\n",
+        "the write lands in {}",
+        folder.display()
+    );
+    assert_eq!(
+        computer.workspace,
+        computer.machine.user_home.join(".neha").join("workspaces"),
+        "the default Workspace root is $HOME/.neha/workspaces"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
 #[test]
 fn a_workspace_inside_a_computers_configuration_directory_is_refused() {
     let directory = tempfile::tempdir().unwrap();
-    let computer_home = directory.path().join("computer");
-    let inside = computer_home.join("workspace");
+    let machine = MachineEnv::under(directory.path(), &directory.path().join("machine"));
+    let inside = machine.computer_home.join("workspace");
     let output = computer_command(
-        &computer_home,
+        &machine,
+        &directory.path().join("credential.json"),
         &[
             "computer",
             "pair",
-            "--space",
-            "http://127.0.0.1:1",
+            "--yes",
             "--workspace",
             inside.to_str().unwrap(),
         ],
@@ -1474,8 +1743,8 @@ fn a_workspace_inside_a_computers_configuration_directory_is_refused() {
         "pairing with a workspace in the config directory must fail:\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        !stdout.contains("Pairing code:"),
-        "pairing must fail before it shows a code:\n{stdout}"
+        !stdout.contains("Paired Computer"),
+        "pairing must fail before it saves anything:\n{stdout}"
     );
     assert!(
         stderr.contains("is inside the Computer's configuration directory"),
@@ -1486,22 +1755,26 @@ fn a_workspace_inside_a_computers_configuration_directory_is_refused() {
 #[test]
 fn a_saved_workspace_inside_the_configuration_directory_is_refused_at_start() {
     let directory = tempfile::tempdir().unwrap();
-    let computer_home = directory.path().join("computer");
-    std::fs::create_dir_all(&computer_home).unwrap();
-    // The default workspace of an earlier version lived here; a saved pairing
-    // that names it must refuse to serve today.
+    let machine = MachineEnv::under(directory.path(), &directory.path().join("machine"));
+    std::fs::create_dir_all(&machine.computer_home).unwrap();
+    // A saved pairing that names a workspace inside the configuration
+    // directory must refuse to serve today.
     std::fs::write(
-        computer_home.join("computer.json"),
+        machine.config_path(),
         serde_json::json!({
             "space_url": "http://127.0.0.1:1",
             "computer": "01890a5d-ac96-774b-bcce-b302099a8057",
             "token": "machine-token",
-            "workspace": computer_home.join("workspace"),
+            "workspace": machine.computer_home.join("workspace"),
         })
         .to_string(),
     )
     .unwrap();
-    let output = computer_command(&computer_home, &["computer", "run"]);
+    let output = computer_command(
+        &machine,
+        &directory.path().join("credential.json"),
+        &["computer", "run"],
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -1510,7 +1783,7 @@ fn a_saved_workspace_inside_the_configuration_directory_is_refused_at_start() {
         "serving a saved config must fail:\nstdout: {stdout}\nstderr: {stderr}"
     );
     assert!(
-        !stdout.contains("Connected to"),
+        !stdout.contains("is running for"),
         "the daemon must not connect:\n{stdout}"
     );
     assert!(
@@ -1520,12 +1793,12 @@ fn a_saved_workspace_inside_the_configuration_directory_is_refused_at_start() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bot_on_a_real_computer_writes_only_its_own_folder() {
-    if !real_computer_ready() {
+async fn a_bot_on_a_local_computer_writes_only_its_own_folder() {
+    if !local_computer_ready() {
         return;
     }
     // The workspace sits outside `/tmp`: the sandbox gets a fresh `/tmp`, so
-    // a relative escape has to reach this real folder for the OS to refuse it.
+    // a relative escape has to reach this host folder for the OS to refuse it.
     let directory = tempfile::Builder::new()
         .prefix("neha-e2e-fence-")
         .tempdir_in("/var/tmp")
@@ -1544,7 +1817,7 @@ async fn a_bot_on_a_real_computer_writes_only_its_own_folder() {
         serde_json::json!({"path": "inside.txt", "content": "inside"}),
     );
     script.say("Done trying.");
-    let computer = real_computer(directory, &base);
+    let computer = local_computer(directory, &base);
     let folder = computer.workspace.join(&computer.bot);
     let escaped = computer.workspace.join("escaped.txt");
 
@@ -1594,14 +1867,14 @@ async fn a_bot_on_a_real_computer_writes_only_its_own_folder() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_file_travels_over_a_real_computers_channel() {
-    if !real_computer_ready() {
+async fn a_file_travels_over_a_local_computers_channel() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
     let content = "the quick brown fox\n";
     let directory = tempfile::tempdir().unwrap();
-    let computer = real_computer(directory, &base);
+    let computer = local_computer(directory, &base);
     let folder = computer.workspace.join(&computer.bot);
     let notes = computer.path().join("notes.txt");
     std::fs::write(&notes, content).unwrap();
@@ -1695,13 +1968,13 @@ async fn a_file_travels_over_a_real_computers_channel() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_message_waits_while_a_real_computer_is_offline() {
-    if !real_computer_ready() {
+async fn a_message_waits_while_a_local_computer_is_offline() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = real_computer(directory, &base);
+    let mut computer = local_computer(directory, &base);
 
     // The daemon stops, and the Space shows the Computer offline.
     computer.daemon.kill();
@@ -1723,8 +1996,21 @@ async fn a_message_waits_while_a_real_computer_is_offline() {
     );
 
     // Starting the daemon again reconnects the Computer, and the run goes.
-    let mut restarted = ComputerDaemon::spawn(&computer.computer_home, &["computer", "run"]);
-    restarted.expect_line(&format!("Connected to {}.", computer.url));
+    let mut restarted = ComputerDaemon::spawn(
+        &computer.machine,
+        &computer.credential,
+        &[
+            "computer",
+            "run",
+            "--workspace",
+            computer.workspace.to_str().unwrap(),
+        ],
+    );
+    restarted.expect_line(&format!(
+        "Computer {} is running for {}.",
+        computer.computer, computer.url
+    ));
+    restarted.expect_line(&format!("Workspace root: {}", computer.workspace.display()));
     let (ok, output) = finish(send, lines, output);
     assert!(
         ok,
@@ -1740,7 +2026,7 @@ async fn a_message_waits_while_a_real_computer_is_offline() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_fails_when_its_computer_leaves() {
-    if !real_computer_ready() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
@@ -1749,7 +2035,7 @@ async fn a_run_fails_when_its_computer_leaves() {
     script.call("shell", serde_json::json!({"command": "sleep 2"}));
     script.say("The slow command finished.");
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = real_computer(directory, &base);
+    let mut computer = local_computer(directory, &base);
 
     let (send, stdout, stderr) = spawn_cli(
         &computer.home,
@@ -1833,24 +2119,24 @@ async fn a_run_fails_when_its_computer_leaves() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_offline_real_computer_does_not_block_another_bot() {
-    if !real_computer_ready() {
+async fn an_offline_local_computer_does_not_block_another_bot() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
-    script.say("The managed Bot answered.");
+    script.say("The hosted Bot answered.");
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = real_computer(directory, &base);
+    let mut computer = local_computer(directory, &base);
 
-    // A second Bot works on a managed Computer inside the Space.
+    // A second Bot works on a Hosted Computer inside the Space.
     let created = run(
         &computer.home,
         &computer.credential,
-        &["bot", "create", "Helper"],
+        &["bot", "create", "Helper", "--computer", "hosted"],
     );
     let helper_chat = field(&created, "Chat:");
 
-    // The real Computer leaves, so its Bot's Message waits in the record.
+    // The Local Computer leaves, so its Bot's Message waits in the record.
     computer.daemon.kill();
     wait_for_computer_offline(&computer.home, &computer.credential, &computer.computer);
     let (mut waiting, stdout, _stderr) = spawn_cli(
@@ -1861,13 +2147,13 @@ async fn an_offline_real_computer_does_not_block_another_bot() {
     let mut output = String::new();
     read_until(&stdout, &mut output, "queued (position 1)");
 
-    // The unrelated managed Bot still answers while that run waits.
+    // The unrelated Hosted Bot still answers while that run waits.
     let answered = run(
         &computer.home,
         &computer.credential,
         &["chat", "send", "--chat", &helper_chat, "are you free?"],
     );
-    assert!(answered.contains("The managed Bot answered."), "{answered}");
+    assert!(answered.contains("The hosted Bot answered."), "{answered}");
     assert!(
         waiting.try_wait().unwrap().is_none(),
         "the queued send must still wait behind the offline Computer:\n{output}"
@@ -1880,8 +2166,8 @@ async fn an_offline_real_computer_does_not_block_another_bot() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_real_computers_messages_run_in_the_order_they_were_sent() {
-    if !real_computer_ready() {
+async fn a_local_computers_messages_run_in_the_order_they_were_sent() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
@@ -1891,7 +2177,7 @@ async fn a_real_computers_messages_run_in_the_order_they_were_sent() {
     script.hold("Second reply.");
     script.hold("Third reply.");
     let directory = tempfile::tempdir().unwrap();
-    let computer = real_computer(directory, &base);
+    let computer = local_computer(directory, &base);
 
     let (first, first_lines, _stderr) = spawn_cli(
         &computer.home,
@@ -1954,13 +2240,13 @@ async fn a_real_computers_messages_run_in_the_order_they_were_sent() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_take_lost_with_its_computer_fails_the_run() {
-    if !real_computer_ready() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
     let content = "the quick brown fox\n";
     let directory = tempfile::tempdir().unwrap();
-    let mut computer = real_computer(directory, &base);
+    let mut computer = local_computer(directory, &base);
     let notes = computer.path().join("notes.txt");
     std::fs::write(&notes, content).unwrap();
 
@@ -2074,32 +2360,38 @@ async fn a_file_take_lost_with_its_computer_fails_the_run() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_bot_moves_to_another_real_computer() {
-    if !real_computer_ready() {
+async fn a_bot_moves_to_another_local_computer() {
+    if !local_computer_ready() {
         return;
     }
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let credential = directory.path().join("credential.json");
-    let (server, url, invite) = serve(&home);
-    let invite = invite.expect("a fresh Space prints an invitation");
-    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
-    run(
+    let (server, url) = space_with_admin(directory.path(), Some(&base));
+
+    // Two machines pair into the same Space. Each has its own user home,
+    // configuration directory, and default Workspace root.
+    let a = pair_computer(&home, &credential, &url, &directory.path().join("a"));
+    let b_workspace = directory.path().join("b").join("workspace");
+    let b = pair_computer_to(
         &home,
         &credential,
-        &[
-            "provider",
-            "add",
-            "--base-url",
-            &base,
-            "--model",
-            "test-model",
-        ],
+        &url,
+        &directory.path().join("b"),
+        Some(&b_workspace),
+    );
+    assert_ne!(
+        a.workspace, b.workspace,
+        "the two machines keep separate folders"
+    );
+    assert_eq!(
+        b.workspace,
+        std::fs::canonicalize(&b_workspace).unwrap(),
+        "`--workspace` overrides the default Workspace root"
     );
 
     // The Bot starts on Computer A and writes a working file in its folder.
-    let a = pair_computer(&home, &credential, &url, &directory.path().join("a"));
     let created = run(
         &home,
         &credential,
@@ -2132,15 +2424,8 @@ async fn a_bot_moves_to_another_real_computer() {
     );
     let shown = run(&home, &credential, &["bot", "show", &bot]);
     assert!(
-        shown.contains(&format!("Computer: {} (real, online: true)", a.computer)),
+        shown.contains(&format!("Computer: {} (Local, online: true)", a.computer)),
         "{shown}"
-    );
-
-    // A second real Computer pairs into the same Space.
-    let b = pair_computer(&home, &credential, &url, &directory.path().join("b"));
-    assert_ne!(
-        a.workspace, b.workspace,
-        "the two machines keep separate folders"
     );
 
     // The User moves the Bot from A to B.
@@ -2151,19 +2436,19 @@ async fn a_bot_moves_to_another_real_computer() {
     );
     assert!(
         moved.contains(&format!(
-            "now works on Computer {} (real, online: true)",
+            "now works on Computer {} (local, online: true)",
             b.computer
         )),
         "{moved}"
     );
     let shown = run(&home, &credential, &["bot", "show", &bot]);
     assert!(
-        shown.contains(&format!("Computer: {} (real, online: true)", b.computer)),
+        shown.contains(&format!("Computer: {} (Local, online: true)", b.computer)),
         "`bot show` reports the new Computer:\n{shown}"
     );
     assert!(
-        shown.contains(&format!("Workspace: {}", b.workspace.display())),
-        "`bot show` reports B's workspace:\n{shown}"
+        !shown.contains("Workspace:"),
+        "a Local Computer records no workspace path:\n{shown}"
     );
 
     // The next Message runs in B's fresh folder: the working file stayed on A.
@@ -2223,7 +2508,7 @@ async fn a_bot_moves_to_another_real_computer() {
     wait_for_computer_online(&home, &credential, &b.computer);
     let shown = run(&home, &credential, &["bot", "show", &bot]);
     assert!(
-        shown.contains(&format!("Computer: {} (real, online: true)", b.computer)),
+        shown.contains(&format!("Computer: {} (Local, online: true)", b.computer)),
         "a restart replays the move:\n{shown}"
     );
 
@@ -2255,14 +2540,14 @@ async fn a_bot_moves_to_another_real_computer() {
     );
     assert!(
         moved.contains(&format!(
-            "now works on Computer {} (real, online: true)",
+            "now works on Computer {} (local, online: true)",
             a.computer
         )),
         "{moved}"
     );
     let shown = run(&home, &credential, &["bot", "show", &bot]);
     assert!(
-        shown.contains(&format!("Computer: {} (real, online: true)", a.computer)),
+        shown.contains(&format!("Computer: {} (Local, online: true)", a.computer)),
         "{shown}"
     );
 
@@ -2274,16 +2559,22 @@ async fn a_bot_moves_to_another_real_computer() {
 }
 
 #[test]
-fn a_move_to_an_unknown_or_managed_computer_is_refused() {
+fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let credential = directory.path().join("credential.json");
     let (server, _url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
     run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    // With no Local Computer paired, a Bot created without one is Hosted.
     let created = run(&home, &credential, &["bot", "create", "Scout"]);
     let bot = first_word(&field(&created, "Created Bot "));
-    let managed = field(&created, "Computer:");
+    let hosted = field(&created, "Computer:");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        shown.contains(&format!("Computer: {hosted} (Hosted, online: true)")),
+        "a Bot without a Local Computer is Hosted:\n{shown}"
+    );
 
     // A Computer this User does not own, or one that never existed, is refused.
     let unknown = neha::id::Id::new().to_string();
@@ -2296,25 +2587,137 @@ fn a_move_to_an_unknown_or_managed_computer_is_refused() {
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("no such Computer"), "stderr: {stderr}");
 
-    // A managed Computer is not a move target yet.
+    // A Hosted Computer is not a move target.
     let refused = cli(
         &home,
         &credential,
-        &["bot", "move", &bot, "--computer", &managed],
+        &["bot", "move", &bot, "--computer", &hosted],
     );
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("a Bot moves to a real Computer"),
+        stderr.contains("a Bot moves to a Local Computer"),
         "stderr: {stderr}"
     );
 
     // A refused move leaves the Bot where it was.
     let shown = run(&home, &credential, &["bot", "show", &bot]);
     assert!(
-        shown.contains(&format!("Computer: {managed} (managed, online: true)")),
+        shown.contains(&format!("Computer: {hosted} (Hosted, online: true)")),
         "a refused move must not move the Bot:\n{shown}"
     );
 
     drop(server);
+}
+
+#[test]
+fn a_bot_created_with_computer_hosted_works_in_the_space() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    // `--computer hosted` is a keyword naming a fresh Hosted Computer.
+    let explicit = run(
+        &home,
+        &credential,
+        &["bot", "create", "Other", "--computer", "hosted"],
+    );
+    let bot = first_word(&field(&explicit, "Created Bot "));
+    let hosted = field(&explicit, "Computer:");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        shown.contains(&format!("Computer: {hosted} (Hosted, online: true)")),
+        "{shown}"
+    );
+    let workspace = home.join("computers").join(&hosted).join("workspace");
+    assert!(
+        shown.contains(&format!("Workspace: {}", workspace.display())),
+        "a Hosted Computer names its workspace:\n{shown}"
+    );
+    let listing = run(&home, &credential, &["computer", "list"]);
+    assert!(
+        listing
+            .lines()
+            .any(|line| line.starts_with(&format!("{hosted}  hosted  online  "))),
+        "`computer list` shows the Hosted Computer:\n{listing}"
+    );
+
+    // Without a Local Computer paired, the default is Hosted as well.
+    let fallback = run(&home, &credential, &["bot", "create", "Default"]);
+    let fallback_bot = first_word(&field(&fallback, "Created Bot "));
+    let fallback_computer = field(&fallback, "Computer:");
+    assert_ne!(
+        fallback_computer, hosted,
+        "every Hosted Bot has its own Computer"
+    );
+    let shown = run(&home, &credential, &["bot", "show", &fallback_bot]);
+    assert!(
+        shown.contains(&format!(
+            "Computer: {fallback_computer} (Hosted, online: true)"
+        )),
+        "a Bot without a Local Computer gets a Hosted one:\n{shown}"
+    );
+
+    // `--computer local` explains how to get one.
+    let refused = cli(
+        &home,
+        &credential,
+        &["bot", "create", "Local", "--computer", "local"],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("there is no Local Computer; run `neha computer pair` on this machine"),
+        "stderr: {stderr}"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn an_older_pairing_is_refused_until_the_machine_pairs_again() {
+    let directory = tempfile::tempdir().unwrap();
+    let machine = MachineEnv::under(directory.path(), &directory.path().join("machine"));
+    // An older release saved the pairing beside the user's home; it is not
+    // migrated, and the current configuration directory stays empty.
+    std::fs::create_dir_all(machine.user_home.join(".neha")).unwrap();
+    std::fs::write(
+        machine.user_home.join(".neha").join("computer.json"),
+        serde_json::json!({
+            "space_url": "http://127.0.0.1:1",
+            "computer": "01890a5d-ac96-774b-bcce-b302099a8057",
+            "token": "machine-token",
+            "workspace": machine.user_home.join(".neha").join("workspaces"),
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let credential = directory.path().join("credential.json");
+
+    for arguments in [
+        vec!["computer", "run"],
+        vec!["computer", "pair", "--yes", "--space", "http://127.0.0.1:1"],
+    ] {
+        let output = computer_command(&machine, &credential, &arguments);
+        assert!(
+            !output.status.success(),
+            "`neha {}` must refuse an older pairing: {}",
+            arguments.join(" "),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("an older pairing is at ~/.neha/computer.json"),
+            "`neha {}` must name the older pairing: {stderr}",
+            arguments.join(" ")
+        );
+        assert!(
+            stderr.contains("`neha computer pair` again"),
+            "`neha {}` must say how to replace it: {stderr}",
+            arguments.join(" ")
+        );
+    }
 }

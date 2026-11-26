@@ -6,45 +6,43 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 
 ## Laws
 
-1. A new Bot starts on a real Computer of its owner, and otherwise on a managed one.
-2. A real Computer runs Neha and connects out to the Space.
+1. A new Bot starts on a Hosted Computer, unless its owner creates it on a Local Computer.
+2. A Local Computer runs Neha and connects out to the Space.
 3. A Bot does what its Computer can do.
-4. Where Neha cannot set up an isolated environment, a Space has no managed Computer.
+4. Where Neha cannot set up an isolated environment, a Space has no Hosted Computer.
 
 ## Kinds
 
 | Kind | Who provides it | What it has |
 | --- | --- | --- |
-| Managed | Neha, on the Space's own machine | An isolated environment Neha sets up, with files of its own, a terminal, and a browser |
-| Real | The user, by installing Neha on a machine | The machine's own files, logins, and software |
+| Local | The User, on the machine where Neha runs | The machine's own files, logins, and software |
+| Hosted | Neha, on the Space's own machine | An isolated environment Neha sets up, with files of its own, a terminal, and a browser |
 
 ## Keeping files
 
-A managed Computer keeps its files when it stops and after a recovery.
+A Hosted Computer keeps its Bots' files when it stops and after a recovery.
 
-Recovering or resetting a managed Computer builds a new machine from the last saved files; work since that save is lost.
+Recovering or resetting a Hosted Computer builds a new machine from each Bot's last saved files; work since that save is lost.
 
-A real Computer keeps its files on the machine, and the Space keeps no copy.
+A Local Computer keeps each Bot's Workspace on the machine, and the Space keeps no copy.
 
 ## Assigning a Computer
 
-A Bot's page shows its Computer. The owner picks a managed one or one of the real Computers the owner owns.
+A Bot's page shows its Computer. The owner picks a Hosted Computer, or creates the Bot on the Local Computer where Neha runs.
 
-Only a Bot's owner can move it from one of their real Computers to another real Computer they own. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
+Only a Bot's owner can move it from one of their Local Computers to another Local Computer they own. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
 
 Several Bots can be assigned the same Computer, and then share its files and logins. The Bots on one Computer are not isolated from each other.
 
-## Adding a real Computer
+## Adding a Local Computer
 
-A User adds a real Computer in one of two ways.
+A User adds the Local Computer of the machine where Neha runs. Joining needs no code: the Space issues a local ticket, and the User starts the pairing there and confirms it.
 
-They install Neha on the machine and start its pairing there, and the machine shows a code. A User signed in to the Space approves the pairing with that code. [Identity](../identity/product.md) covers the pairing, and [CLI](../cli/product.md) covers the commands.
+A Local Computer on the machine where Neha runs is the only Local Computer this contract covers. [Identity](../identity/design.md#codes) covers the ticket, and [CLI](../cli/product.md) covers the commands.
+
+The Computer belongs to the User the ticket names; that owner sees it among their Local Computers and can assign their Bots to it, and other Users do not see it.
 
 The machine serves the Space while it runs; after a stop, the User starts it again.
-
-In the desktop app, the User turns on the machine the app runs on. No code is needed, because the User is already signed in. The app asks when the first Bot is created.
-
-The User who added the machine owns that Computer. They see it among their real Computers and can assign their Bots to it; other Users do not see it.
 
 A paired Computer connects out to the Space and shows as online or offline.
 
@@ -54,7 +52,7 @@ A Message sent to a Bot waits while the Computer assigned to it is offline. Wait
 
 ## The panel
 
-A Chat with a Bot shows its Computer's screen as a panel. The panel shows the screen live, what the Bot is doing, and whether the user has control. On a managed Computer, the screen is the browser's.
+A Chat with a Bot shows its Computer's screen as a panel. The panel shows the screen live, what the Bot is doing, and whether the user has control. On a Hosted Computer, the screen is the browser's.
 
 | Action | What happens |
 | --- | --- |
@@ -62,29 +60,29 @@ A Chat with a Bot shows its Computer's screen as a panel. The panel shows the sc
 | Take control | The user gets the keyboard and mouse; every Bot on that screen pauses, and their other work continues |
 | I'm done | The Bots on that screen resume |
 
-On a real Computer, the User who touches its own keyboard or mouse takes control as well. The panel shows it, and I'm done gives the screen back.
+On a Local Computer, the User who touches its own keyboard or mouse takes control as well. The panel shows it, and I'm done gives the screen back.
 
 A Bot can ask the User to take control, for example to sign in.
 
 ## What a Bot can do
 
-A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a managed Computer, a Bot operates the browser. Programs with windows of their own run only on a real Computer.
+A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a Hosted Computer, a Bot operates the browser. Programs with windows of their own run only on a Local Computer.
 
-On a real Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read, except the Computer's own configuration directory, which [design](design.md#isolation) hides from it.
+On a Local Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read, except the Computer's own configuration directory, which [design](design.md#isolation) hides from it.
 
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 
-On a real Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in those folders, and its read range is unchanged. With full access, it writes and deletes what the machine's user can.
+On a Local Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in those folders, and its read range is unchanged. With full access, it writes and deletes what the machine's user can.
 
-A new real Computer starts with granted folders.
+A new Local Computer starts with granted folders.
 
 A Bot delivers a file of its Workspace as a File on a Message it sends, and the File lives in the Space from then on. A Bot also takes a File of its conversation into its Workspace. [Message](../messaging/message/product.md#files) covers Files.
 
 ## Credentials
 
-On a real Computer, a Bot uses the machine's own logins: its browser sessions, its keys, and its configuration, as the user set them up.
+On a Local Computer, a Bot uses the machine's own logins: its browser sessions, its keys, and its configuration, as the user set them up.
 
-On a managed Computer, a Bot gets credentials in one of two ways.
+On a Hosted Computer, a Bot gets credentials in one of two ways.
 
 | Way | What happens |
 | --- | --- |
@@ -95,5 +93,9 @@ A credential never appears in a Chat or a Group.
 
 ## Gaps
 
+- A new Bot starts on the owner's Local Computer when one is paired; the target default is Hosted.
 - Waking a sleeping Computer is not yet specified and is low in priority.
-- Moving a Bot from a managed Computer to a real one is not yet specified, including how its Workspace is carried.
+- Revoking a Computer's credential is not yet specified.
+- A Hosted Computer runs inside the Space's process; a provider-backed Hosted machine is not yet specified.
+- Adding a Computer on another machine is not yet specified.
+- Moving a Bot to or from a Hosted Computer is not yet specified, including how its Workspace is carried.
