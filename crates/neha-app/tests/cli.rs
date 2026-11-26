@@ -1426,6 +1426,12 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     );
     assert!(answered.contains("Done."), "{answered}");
     let workspace = home.join("computers").join(&computer).join("workspace");
+    // The implicit download landed in the Bot's Workspace even though the
+    // shell's current directory was /tmp.
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+        "the quick brown fox\n"
+    );
     assert_eq!(
         std::fs::read_to_string(workspace.join("result.txt")).unwrap(),
         "hosted result"
