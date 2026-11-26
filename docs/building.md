@@ -6,6 +6,7 @@
 - `just` for the recipes in [Justfile](../Justfile).
 - Python 3 for the documentation and hygiene checks in `scripts/`.
 - Node 24 and pnpm 11 for the browser client under `ui/`.
+- Docker, for the local S3 test store.
 
 The Rust workspace has no native dependencies. The browser client's dependencies are installed from its committed lockfile.
 
@@ -25,12 +26,17 @@ just fmt          # formatting check
 just check        # type check
 just clippy       # lints; warnings fail
 just test         # workspace tests
+just test-s3      # neha-space tests with the S3 tests switched on
 just doc          # documentation build; warnings fail
 just check-specs  # links, headings, modal case, presentation
 just ci           # the full gate, including the browser client
 just ui-deps      # install the browser client's locked dependencies
 just ui-check     # type-check, test, and build the browser client
 ```
+
+## S3 test store
+
+The `neha-space` tests include S3 tests that need a local SeaweedFS container; [Storage](storage.md#run-the-s3-tests-locally) gives the container, the bucket, the variables, and the command.
 
 ## Evidence
 

@@ -1,6 +1,6 @@
 # Space
 
-[product.md](product.md) states what a Space is for its Users. This page states where a Space keeps its record, how the record grows, and who can read it.
+[product.md](product.md) states what a Space is for its Users. This page states where a Space keeps its record and the bytes of its Files, how the record grows, and who can read it.
 
 ## Authority
 
@@ -17,11 +17,21 @@ Owned by space. Every other topic depends on a Space to hold its record.
 
 ## Storage
 
-A Space keeps its record in one SQLite database on the Space's machine. A File lives beside it in a content-addressed store: the Space stores one copy of each content, and every File with that content shares it.
+A Space keeps its record in one SQLite database on the Space's machine.
+
+A File's bytes live in the File store, which the Space's configuration names: a directory in the Space's home, or one prefix of an S3-compatible bucket.
+
+An object in the File store is named by its content hash, and the name is the same on every backend. The Space stores one copy of each content, and every File with that content shares it.
 
 The Space writes a File's bytes before the record that names it. The record never names bytes the Space does not hold.
 
-Storage is one seam. The code that reads and writes the record does not name SQLite, and another database can replace it without changing that code.
+The File store only grows: the Space never overwrites an object and never deletes one.
+
+A backup of a Space is its home directory with the objects in the File store. A restore on another machine also needs the Vault's master key.
+
+The operator MAY configure server-side encryption with a KMS key (SSE-KMS) for the objects in an S3-compatible bucket.
+
+Storage is one seam: above it, no directory name and no bucket name appears.
 
 ## Events
 

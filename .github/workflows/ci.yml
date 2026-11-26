@@ -22,6 +22,17 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
+      # Run the S3 tests against the SeaweedFS service started below;
+      # without NEHA_TEST_S3 they would skip.
+      NEHA_TEST_S3: '1'
+      NEHA_TEST_S3_ENDPOINT: 'http://127.0.0.1:8333'
+      NEHA_TEST_S3_BUCKET: 'neha'
+      NEHA_TEST_S3_REGION: 'us-east-1'
+      AWS_ACCESS_KEY_ID: 'neha'
+      AWS_SECRET_ACCESS_KEY: 'neha-secret'
+      # SeaweedFS does not check signatures; the S3 client still signs.
+      # The store the configuration names must win: this URL is a trap.
+      AWS_ENDPOINT_URL: 'http://127.0.0.1:1'
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +60,28 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Start SeaweedFS
+        run: docker run -d --name neha-s3 -p 8333:8333 chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 server -s3 -dir=/data
+
+      - name: Wait for SeaweedFS
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8333/ >/dev/null; then
+              echo "SeaweedFS is ready after $attempt attempt(s)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo 'SeaweedFS did not become ready in time' >&2
+          exit 1
+
+      - name: Create the test bucket
+        run: curl -fsS -X PUT http://127.0.0.1:8333/neha
+
+      - name: Collect SeaweedFS logs
+        if: failure()
+        run: docker logs neha-s3 || true
 
       - name: Run gate with evidence
         run: just verify "$RUNNER_TEMP/verification"

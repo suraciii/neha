@@ -26,6 +26,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 subtle = "2"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "net", "rt", "sync", "time"] }
+toml.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -22,11 +22,13 @@ Neha is one Rust codebase assembled by deliverable. The Space is the server: it 
                  ▼
    ┌──────────────────────────────────────────┐      Model providers
    │ Space: command surface, record, plugins, │ ──►  one adapter per protocol
-   │ approval gate, SQLite, blobs               │
+   │ approval gate, SQLite                    │
    └──────────────────────────────────────────┘
-                 ▲
-                 │ outbound HTTPS, one WebSocket per screen
-   neha computer on a real machine
+        │                     ▲
+        │ bytes of Files      │ outbound HTTPS,
+        ▼                     │ one WebSocket per screen
+   local directory or         neha computer on a real machine
+   one S3 bucket prefix
 ```
 
 The built-in Bot loop runs inside the Space and acts as a Bot through the command surface. [Bot](../specs/bot/design.md) states where work runs.
@@ -51,7 +53,7 @@ The built-in loop's Model calls leave from the Space, never from a Computer. One
 
 ## Record and storage
 
-SQLite is the source of truth. The record is an append-only log plus projections, and one directory holds one Space. [Space](../specs/space/design.md) states the invariants.
+SQLite is the source of truth. The record is an append-only log plus projections, and each Space has one local home directory. File bytes live in a store the operator configures: a directory in that home, or one prefix of an S3-compatible bucket. [Space](../specs/space/design.md) states the invariants.
 
 ## Plugin kernel
 
@@ -101,7 +103,7 @@ Shared dependency versions are declared once in the root `[workspace.dependencie
 - Diagnostics do not leave the Space's machine by default.
 - Design scale is one machine, one process, and hundreds of Users and Bots.
 - An upgrade runs versioned migrations after an automatic backup and promises an upgrade from the previous release only.
-- A backup is a consistent database snapshot plus the files directory, restorable on the same machine.
+- A backup copies the Space home and the objects of its File store, starting from a consistent database snapshot. A restore on another machine also takes the Vault's master key.
 
 ## Where a rule lives
 

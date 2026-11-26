@@ -6,6 +6,7 @@
 
 pub mod blobs;
 pub mod commands;
+pub mod config;
 pub mod home;
 pub mod identity;
 pub mod model;
@@ -16,6 +17,7 @@ pub mod state;
 pub mod store;
 
 pub use blobs::{Blobs, BlobsError};
+pub use config::{Config, ConfigError, S3Storage, Storage};
 pub use home::{Home, HomeError, SCHEMA_VERSION};
 pub use identity::{Account, Identity, IdentityError};
 pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage};

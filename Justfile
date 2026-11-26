@@ -20,6 +20,10 @@ clippy:
 test:
     cargo test --locked --workspace
 
+# Run the Space tests with the S3 tests switched on; the environment comes from docs/storage.md.
+test-s3:
+    cargo test --locked -p neha-space
+
 # Install the browser client's locked dependencies.
 ui-deps:
     pnpm --dir ui install --frozen-lockfile
