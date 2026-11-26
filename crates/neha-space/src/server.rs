@@ -26,7 +26,7 @@ use futures_util::{SinkExt, StreamExt};
 use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{Author, EventDraft, EventKind};
-use neha::surface::{ClientFrame, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
+use neha::surface::{ClientFrame, CommandCall, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -60,11 +60,17 @@ pub struct SpaceServer {
     secrets: Secrets,
     model: ModelClient,
     events: broadcast::Sender<neha::record::Event>,
+    tool_timeout: Duration,
+    chat_runs: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl SpaceServer {
     /// Opens a home and prepares its invitation when it has no account.
     pub async fn open(home: Home) -> Result<Self, ServerError> {
+        Self::open_with(home, neha_computer::local::DEFAULT_TIMEOUT).await
+    }
+
+    async fn open_with(home: Home, tool_timeout: Duration) -> Result<Self, ServerError> {
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
         let invite = if identity.has_accounts().await? {
@@ -89,7 +95,19 @@ impl SpaceServer {
             secrets,
             model,
             events,
+            tool_timeout,
+            chat_runs: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Returns the lock that serializes runs in one Chat.
+    fn chat_lock(&self, chat: Id) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.chat_runs.lock().expect("chat lock");
+        Arc::clone(
+            locks
+                .entry(chat)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
     }
 
     /// Returns the home.
@@ -158,7 +176,16 @@ impl Running {
 
 /// Binds a home on loopback and starts serving it.
 pub async fn start(home: Home, port: u16) -> Result<Running, ServerError> {
-    let server = Arc::new(SpaceServer::open(home).await?);
+    start_with_tool_timeout(home, port, neha_computer::local::DEFAULT_TIMEOUT).await
+}
+
+/// Binds a home on loopback and starts serving it with a tool time limit.
+pub async fn start_with_tool_timeout(
+    home: Home,
+    port: u16,
+    tool_timeout: Duration,
+) -> Result<Running, ServerError> {
+    let server = Arc::new(SpaceServer::open_with(home, tool_timeout).await?);
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     let invite = server
@@ -477,6 +504,12 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         if send(&out, ServerFrame::Accepted { id }).await.is_err() {
                             break;
                         }
+                        let _run_guard = match &command {
+                            CommandCall::MessageSend(message) => {
+                                Some(server.chat_lock(message.chat).lock_owned().await)
+                            }
+                            _ => None,
+                        };
                         let outcome = commands::execute(&server.store, &server.state, &server.home, &server.secrets, &account, id, command).await;
                         let result = match outcome {
                             Ok(outcome) => {
@@ -488,7 +521,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                 }
                                 match outcome.pending {
                                     Some(pending) => {
-                                        match commands::finish_run(&server.store, &server.state, &server.home, &server.model, &server.events, pending).await {
+                                        match commands::finish_run(&server.store, &server.state, &server.home, &server.model, &server.events, server.tool_timeout, pending).await {
                                             Ok((result, events)) => {
                                                 broadcast(&server, &events);
                                                 result
@@ -2759,6 +2792,22 @@ mod tests {
             "{}",
             actions[1]["output"]
         );
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let messages = messages.as_array().unwrap();
+        let user = messages
+            .iter()
+            .find(|message| message["author"]["kind"] == "user")
+            .unwrap();
+        let bot_message = messages
+            .iter()
+            .find(|message| message["author"]["kind"] == "bot")
+            .unwrap();
+        assert_eq!(bot_message["acting"], user["author"]["id"]);
 
         // A restart rebuilds the same run from the record.
         let root = running.server_home();
@@ -2852,6 +2901,87 @@ mod tests {
         assert_eq!(after["status"], "succeeded");
         assert_eq!(after["text"], "I am still here.");
         socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_tool_is_marked_timed_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let running =
+            super::start_with_tool_timeout(home, 0, std::time::Duration::from_millis(300))
+                .await
+                .unwrap();
+        let invite = running.invite.clone().unwrap();
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("shell", json!({"command": "sleep 30"})),
+            text("The command timed out."),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let started = std::time::Instant::now();
+        let result = send(&mut socket, chat, "run sleep 30").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        let action = &shown["actions"][0];
+        assert_eq!(action["tool"], "shell");
+        assert_eq!(action["status"], "timed_out");
+        assert!(
+            action["output"].as_str().unwrap().contains("time limit"),
+            "{}",
+            action["output"]
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_clients_cannot_run_one_chat_at_once() {
+        let (_dir, running, invite) = running().await;
+        let (mut first, token) = admin(&running, &invite).await;
+        let mut second = open_socket(&running, &token).await;
+        let (base, provider_task) =
+            scripted_provider(vec![text("first answer"), text("second answer")]).await;
+        command(&mut first, Id::new(), provider_add(base)).await;
+        let bot = command(
+            &mut first,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        let (left, right) = tokio::join!(
+            send(&mut first, chat, "from the first client"),
+            send(&mut second, chat, "from the second client"),
+        );
+        assert_eq!(left["status"], "succeeded");
+        assert_eq!(right["status"], "succeeded");
+
+        let messages = command(
+            &mut first,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert_eq!(messages[0]["author"]["kind"], "user");
+        assert_eq!(messages[1]["author"]["kind"], "bot");
+        assert_eq!(messages[2]["author"]["kind"], "user");
+        assert_eq!(messages[3]["author"]["kind"], "bot");
+        assert_ne!(messages[1]["text"], messages[3]["text"]);
+        first.close(None).await.unwrap();
+        second.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
     }

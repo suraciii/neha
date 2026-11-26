@@ -139,6 +139,9 @@ enum ChatCommand {
         bot: Option<Id>,
         /// The Message text.
         text: String,
+        /// Print the run's steps and actions while it works.
+        #[arg(long)]
+        follow: bool,
     },
     /// Read a Chat's Messages.
     Read {
@@ -411,7 +414,12 @@ async fn chat(command: ChatCommand) -> Result<()> {
                 println!("{}  Bot {}", id_of(chat, "id")?, id_of(chat, "bot")?);
             }
         }
-        ChatCommand::Send { chat, bot, text } => {
+        ChatCommand::Send {
+            chat,
+            bot,
+            text,
+            follow,
+        } => {
             let chat = match (chat, bot) {
                 (Some(chat), _) => chat,
                 (None, Some(bot)) => {
@@ -428,11 +436,15 @@ async fn chat(command: ChatCommand) -> Result<()> {
                     }
                 }
             };
-            let result = client::command(
-                &credential,
-                CommandCall::MessageSend(MessageSend { chat, text }),
-            )
-            .await?;
+            let command = CommandCall::MessageSend(MessageSend { chat, text });
+            let result = if follow {
+                client::command_following(&credential, command, |event| {
+                    print_progress(event);
+                })
+                .await?
+            } else {
+                client::command(&credential, command).await?
+            };
             println!("{}", text_of(&result, "text")?);
             println!(
                 "  run {} ({})",
@@ -478,10 +490,59 @@ async fn run(command: RunCommand) -> Result<()> {
             if !result["usage"].is_null() {
                 println!("  usage {}", result["usage"]);
             }
+            if let Some(steps) = result["steps"].as_array() {
+                for step in steps {
+                    println!(
+                        "  step {}: {} tool call(s)",
+                        step["index"], step["tool_calls"]
+                    );
+                }
+            }
+            if let Some(actions) = result["actions"].as_array() {
+                for action in actions {
+                    println!(
+                        "  action {}: {} ({})",
+                        action["step"].as_u64().unwrap_or_default(),
+                        action["tool"].as_str().unwrap_or("?"),
+                        action["status"].as_str().unwrap_or("?")
+                    );
+                    if let Some(output) = action["output"].as_str() {
+                        for line in output.lines().take(8) {
+                            println!("    {line}");
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn print_progress(event: &neha::record::Event) {
+    match event.kind.as_str() {
+        "neha.run.step" => {
+            let step = &event.data["step"];
+            let calls = &event.data["tool_calls"];
+            eprintln!("  step {step}: {calls} tool call(s)");
+        }
+        "neha.action.started" => {
+            eprintln!(
+                "  action {} ({}) requested",
+                event.data["tool"].as_str().unwrap_or("?"),
+                event.data["step"]
+            );
+        }
+        "neha.action.finished" => {
+            eprintln!(
+                "  action {} ({}) {}",
+                event.data["tool"].as_str().unwrap_or("?"),
+                event.data["step"],
+                event.data["status"].as_str().unwrap_or("?")
+            );
+        }
+        _ => {}
+    }
 }
 
 fn provider_key() -> Result<String> {

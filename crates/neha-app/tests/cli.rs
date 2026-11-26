@@ -125,6 +125,148 @@ async fn fake_provider() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{addr}/v1"), task)
 }
 
+#[derive(Clone)]
+enum ScriptedReply {
+    Text(String),
+    Tool {
+        name: String,
+        arguments: serde_json::Value,
+    },
+}
+
+async fn scripted_provider(script: Vec<ScriptedReply>) -> (String, tokio::task::JoinHandle<()>) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let script = Arc::new(script);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(move || {
+            let script = Arc::clone(&script);
+            let requests = Arc::clone(&requests);
+            async move {
+                let index = requests.fetch_add(1, Ordering::SeqCst);
+                let reply = script.get(index).cloned().unwrap();
+                let body = match reply {
+                    ScriptedReply::Text(text) => {
+                        format!(
+                            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
+                            serde_json::to_string(&text).unwrap()
+                        )
+                    }
+                    ScriptedReply::Tool { name, arguments } => {
+                        let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
+                            "index": 0,
+                            "id": format!("call-{index}"),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": serde_json::to_string(&arguments).unwrap(),
+                            }
+                        }]}}]});
+                        format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                    }
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), task)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_works_on_its_computer_with_tools() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential: PathBuf = directory.path().join("credential.json");
+    let (base, provider_task) = scripted_provider(vec![
+        ScriptedReply::Tool {
+            name: "write_file".to_owned(),
+            arguments: serde_json::json!({"path": "hello.txt", "content": "hello neha"}),
+        },
+        ScriptedReply::Tool {
+            name: "read_file".to_owned(),
+            arguments: serde_json::json!({"path": "hello.txt"}),
+        },
+        ScriptedReply::Text("The file says hello neha.".to_owned()),
+        ScriptedReply::Tool {
+            name: "shell".to_owned(),
+            arguments: serde_json::json!({"command": "printf 42"}),
+        },
+        ScriptedReply::Text("The command printed 42.".to_owned()),
+    ])
+    .await;
+
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let computer = field(&created, "Computer:");
+    let chat = field(&created, "Chat:");
+
+    let sent = run(&home, &credential, &["chat", "send", "make hello.txt"]);
+    assert!(sent.contains("The file says hello neha."), "{sent}");
+    let run_id = field(&sent, "run ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let shown = run(&home, &credential, &["run", "show", &run_id]);
+    assert!(shown.contains("write_file"), "{shown}");
+    assert!(shown.contains("read_file"), "{shown}");
+    assert!(shown.contains("hello neha"), "{shown}");
+    let workspace = home.join("computers").join(&computer).join("workspace");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("hello.txt")).unwrap(),
+        "hello neha"
+    );
+
+    let followed = cli(
+        &home,
+        &credential,
+        &["chat", "send", "--follow", "run printf 42"],
+    );
+    let stdout = String::from_utf8_lossy(&followed.stdout);
+    let stderr = String::from_utf8_lossy(&followed.stderr);
+    assert!(followed.status.success(), "stderr: {stderr}");
+    assert!(stdout.contains("The command printed 42."), "{stdout}");
+    assert!(stderr.contains("shell"), "stderr: {stderr}");
+    let second_run = field(&stdout, "run ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let shown = run(&home, &credential, &["run", "show", &second_run]);
+    assert!(shown.contains("shell"), "{shown}");
+    assert!(shown.contains("42"), "{shown}");
+
+    let _ = chat;
+    drop(server);
+    provider_task.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_runs_a_space_and_chats_with_a_bot() {
     let directory = tempfile::tempdir().unwrap();

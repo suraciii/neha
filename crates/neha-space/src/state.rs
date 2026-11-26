@@ -417,3 +417,90 @@ impl Projection for State {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use neha::id::Id;
+    use neha::record::{ActionStatus, Author, Event, EventKind, KIND_VERSION};
+    use neha::seq::Seq;
+    use neha::time::Timestamp;
+
+    use super::State;
+    use crate::store::Projection as _;
+
+    fn event(kind: EventKind, data: serde_json::Value, seq: i64) -> Event {
+        Event {
+            seq: Seq::from_i64(seq).unwrap(),
+            kind,
+            version: KIND_VERSION,
+            at: Timestamp::from_microseconds(0).unwrap(),
+            author: Author::Bot(Id::new()),
+            acting: Some(Id::new()),
+            command: Some(Id::new()),
+            data,
+        }
+    }
+
+    #[test]
+    fn a_started_action_is_unknown_until_it_finishes() {
+        let run = Id::new();
+        let action = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::RunStarted,
+                serde_json::json!({
+                    "run": run,
+                    "chat": Id::new(),
+                    "bot": Id::new(),
+                    "command": Id::new(),
+                    "message": Id::new(),
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::RunStep,
+                serde_json::json!({"run": run, "step": 1, "tool_calls": 1}),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::ActionStarted,
+                serde_json::json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": "shell",
+                    "arguments": {"command": "true"},
+                }),
+                3,
+            ))
+            .unwrap();
+
+        let view = state.runs.get(&run).unwrap();
+        assert_eq!(view.steps.len(), 1);
+        assert_eq!(view.actions.len(), 1);
+        assert_eq!(view.actions[0].status, ActionStatus::Unknown);
+
+        state
+            .apply(&event(
+                EventKind::ActionFinished,
+                serde_json::json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "status": "succeeded",
+                    "output": "ok",
+                }),
+                4,
+            ))
+            .unwrap();
+
+        let view = state.runs.get(&run).unwrap();
+        assert_eq!(view.actions[0].status, ActionStatus::Succeeded);
+        assert_eq!(view.actions[0].output, "ok");
+    }
+}

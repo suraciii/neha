@@ -202,6 +202,64 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
     Ok((token, account))
 }
 
+/// Runs one command and returns its result, reporting live events.
+pub async fn command_following(
+    credential: &Credential,
+    command: CommandCall,
+    mut on_event: impl FnMut(&neha::record::Event),
+) -> Result<Value> {
+    let mut socket = connect(credential).await?;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&ClientFrame::Subscribe {
+                id: Id::new(),
+                cursor: None,
+                limit: None,
+            })?
+            .into(),
+        ))
+        .await
+        .context("cannot subscribe to the record")?;
+    socket
+        .send(Message::Text(
+            serde_json::to_string(&ClientFrame::Command {
+                id: Id::new(),
+                command,
+            })?
+            .into(),
+        ))
+        .await
+        .context("cannot send the command")?;
+
+    loop {
+        let Some(message) = socket.next().await else {
+            bail!("the Space closed the connection");
+        };
+        let message = message.context("the Space's stream failed")?;
+        let Message::Text(text) = message else {
+            continue;
+        };
+        match serde_json::from_str::<ServerFrame>(text.as_str()) {
+            Ok(ServerFrame::Confirmed { result, .. }) => return Ok(result),
+            Ok(ServerFrame::Error { code, message, .. }) => {
+                bail!("the Space refused ({code}): {message}");
+            }
+            Ok(ServerFrame::ProtocolError { message }) => {
+                bail!("the Space could not read the command: {message}");
+            }
+            Ok(ServerFrame::Event { event }) => on_event(&event),
+            Ok(
+                ServerFrame::Accepted { .. }
+                | ServerFrame::Committed { .. }
+                | ServerFrame::Snapshot { .. }
+                | ServerFrame::Hello { .. }
+                | ServerFrame::Heartbeat { .. },
+            ) => {}
+            Err(_) => bail!("the Space sent a frame this CLI does not understand"),
+        }
+    }
+}
+
 /// Runs one command and returns its result.
 pub async fn command(credential: &Credential, command: CommandCall) -> Result<Value> {
     let mut socket = connect(credential).await?;

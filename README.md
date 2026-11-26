@@ -8,7 +8,7 @@ This repository holds the product contracts, the engineering design, and the Rus
 
 | Path | Contents |
 | --- | --- |
-| `crates/` | Workspace crates: `neha` (domain and wire types), `neha-space` (the Space), `neha-app` (the `neha` CLI) |
+| `crates/` | Workspace crates: `neha` (domain and wire types), `neha-space` (the Space), `neha-computer` (the Computer runtime seam and local runtime), `neha-loop` (the built-in Bot loop), `neha-app` (the `neha` CLI) |
 | `specs/` | Product contracts: observable behavior, boundaries, invariants |
 | `docs/` | User-facing guidance |
 | `eng/` | Engineering practices |
@@ -30,7 +30,7 @@ just ci
 
 ## Quick start
 
-[Quick start: chat with a Bot](docs/quickstart.md) runs a Space, joins as the Admin, connects a Provider, and chats with a Bot.
+[Quick start: chat with a Bot](docs/quickstart.md) runs a Space, joins as the Admin, connects a Provider, and chats with a Bot. [Let a Bot work on its Computer](docs/tools.md) shows the shell and file tools in the Bot's workspace.
 
 ## Documentation
 

@@ -419,12 +419,13 @@ pub async fn finish_run(
     home: &Home,
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
+    tool_timeout: Duration,
     pending: PendingRun,
 ) -> Result<(Value, Vec<Event>), ApiError> {
     let history = build_history(state, &pending)?;
     let runtime = LocalRuntime::new(home.workspace_dir(pending.bot.computer))
         .map_err(|error| ApiError::internal(error.to_string()))?
-        .with_timeout(tool_timeout());
+        .with_timeout(tool_timeout);
     let space_model = SpaceModel::new(
         model,
         &pending.provider.base_url,
@@ -611,14 +612,6 @@ impl Recorder for RunRecorder<'_> {
         ))
         .await
     }
-}
-
-fn tool_timeout() -> Duration {
-    std::env::var("NEHA_TOOL_TIMEOUT_MS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(neha_computer::local::DEFAULT_TIMEOUT)
 }
 
 fn preflight(
