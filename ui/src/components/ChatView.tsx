@@ -31,13 +31,14 @@ export default function ChatView(props: ChatViewProps) {
   let composer: HTMLTextAreaElement | undefined;
   let picker: HTMLInputElement | undefined;
 
-  createEffect(() => {
-    props.messages.length;
-    props.working;
-    queueMicrotask(() => {
-      if (stream) stream.scrollTop = stream.scrollHeight;
-    });
-  });
+  createEffect(
+    () => ({ count: props.messages.length, working: props.working }),
+    () => {
+      queueMicrotask(() => {
+        if (stream) stream.scrollTop = stream.scrollHeight;
+      });
+    },
+  );
 
   const canSend = () =>
     !props.working && !!props.bot && (draft().trim() !== "" || attachment() !== null);
@@ -249,7 +250,7 @@ export default function ChatView(props: ChatViewProps) {
           class="composer__picker"
           type="file"
           aria-hidden="true"
-          tabIndex={-1}
+          tabindex={-1}
           disabled={!props.bot || props.working}
           onChange={pick}
         />

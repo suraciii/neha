@@ -1,5 +1,4 @@
-import { Show, createSignal, onMount } from "solid-js";
-import { createStore } from "solid-js/store";
+import { Show, createSignal, createStore, onSettled } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
@@ -65,6 +64,25 @@ const emptyState: State = {
 
 export default function App() {
   const [state, setState] = createStore<State>({ ...emptyState });
+  function update(patch: Partial<State>) {
+    setState((draft) => {
+      Object.assign(draft, patch);
+    });
+  }
+  function setPreview(chatId: string, next: Preview) {
+    setState((draft) => {
+      const current = draft.previews[chatId];
+      if (current === next) return;
+      if (current && next && "text" in current && "text" in next) {
+        if (current.text === next.text && current.file === next.file) return;
+        current.text = next.text;
+        current.file = next.file;
+        return;
+      }
+      if (current && next && "error" in current && "error" in next) return;
+      draft.previews[chatId] = next;
+    });
+  }
   const [ready, setReady] = createSignal(false);
   const [authMode, setAuthMode] = createSignal<AuthMode>("login");
   const [authSecret, setAuthSecret] = createSignal("");
@@ -72,7 +90,7 @@ export default function App() {
   const commands = new Commands();
   let runGeneration = 0;
 
-  onMount(() => {
+  onSettled(() => {
     const query = window.matchMedia("(max-width: 900px)");
     setIsMobile(query.matches);
     query.addEventListener("change", (event) => setIsMobile(event.matches));
@@ -101,14 +119,14 @@ export default function App() {
   }
 
   async function enter(account: Account) {
-    setState("account", account);
+    update({ account });
     setReady(true);
     await loadWorkspace();
   }
 
   async function loadWorkspace() {
-    setState("busy", true);
-    setState("error", null);
+    update({ busy: true });
+    update({ error: null });
     try {
       const [providers, models, bots, chats] = await Promise.all([
         commands.command<Provider[]>("provider_list"),
@@ -116,7 +134,7 @@ export default function App() {
         commands.command<Bot[]>("bot_list"),
         commands.command<Chat[]>("chat_list"),
       ]);
-      setState({
+      update({
         providers,
         models,
         bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
@@ -127,15 +145,15 @@ export default function App() {
       const target = active ?? (!isMobile() ? chats[0] : undefined);
       if (target) await selectChat(target);
     } catch (reason) {
-      setState("error", reason);
+      update({ error: reason });
     } finally {
-      setState("busy", false);
+      update({ busy: false });
     }
   }
 
   async function loadPreviews(chats: Chat[]) {
     if (chats.length === 0) {
-      setState("previews", {});
+      update({ previews: {} });
       return;
     }
     const previews: Record<string, Preview> = {};
@@ -148,12 +166,12 @@ export default function App() {
         previews[chat.id] = { error: true };
       }
     }
-    setState("previews", previews);
+    update({ previews });
   }
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
-    setState({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
+    update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
     try {
       const [messages, files, bot] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
@@ -161,7 +179,7 @@ export default function App() {
         commands.command<BotResult>("bot_show", { bot: chat.bot }),
       ]);
       if (generation !== runGeneration) return;
-      setState({
+      update({
         messages,
         files: indexFiles(files),
         activeBot: bot.bot,
@@ -169,7 +187,7 @@ export default function App() {
       });
       await restoreRun(chat, messages, generation);
     } catch (reason) {
-      setState("error", reason);
+      update({ error: reason });
     }
   }
 
@@ -180,7 +198,7 @@ export default function App() {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (generation !== runGeneration) return;
       if (view.status === "running") {
-        setState("working", true);
+        update({ working: true });
         void pollRun(chat, run, generation);
       } else {
         await refreshActive();
@@ -198,12 +216,12 @@ export default function App() {
         const view = await commands.command<RunView>("run_show", { run }, 10_000);
         if (generation !== runGeneration) return;
         if (view.status !== "running") {
-          setState("working", false);
+          update({ working: false });
           if (state.activeChat?.id === chat.id) await refreshActive();
           return;
         }
       } catch {
-        setState("working", false);
+        update({ working: false });
         return;
       }
     }
@@ -217,11 +235,11 @@ export default function App() {
         commands.command<Message[]>("chat_read", { chat: chat.id }),
         commands.command<FileSummary[]>("file_list", { chat: chat.id }),
       ]);
-      setState({ messages, files: indexFiles(files) });
+      update({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
-      if (last) setState("previews", chat.id, previewOf(last));
+      if (last) setPreview(chat.id, previewOf(last));
     } catch (reason) {
-      setState("error", reason);
+      update({ error: reason });
     }
   }
 
@@ -232,15 +250,16 @@ export default function App() {
     if (!chat || !bot || state.working) return false;
     if (!text && !file) return false;
 
-    setState({ working: true, error: null });
+    update({ working: true, error: null });
     let uploaded: FileSummary | null = null;
     if (file) {
       uploaded = await upload(chat.id, file);
       if (!uploaded) {
-        setState("working", false);
+        update({ working: false });
         return false;
       }
-      setState("files", uploaded.id, uploaded);
+      const saved = uploaded;
+      setState((draft) => { draft.files[saved.id] = saved; });
     }
 
     const optimistic: Message = {
@@ -254,8 +273,10 @@ export default function App() {
       run: null,
       file: uploaded?.id ?? null,
     };
-    setState({ messages: [...state.messages, optimistic] });
-    setState("previews", chat.id, previewOf(optimistic));
+    setState((draft) => {
+      draft.messages.push(optimistic);
+    });
+    setPreview(chat.id, previewOf(optimistic));
     try {
       const result = await commands.command<SendResult>(
         "message_send",
@@ -264,13 +285,13 @@ export default function App() {
       );
       await refreshActive();
       if (result.status === "failed") {
-        setState("error", result.error ? result.error : { key: "error.botAnswer" });
+        update({ error: result.error ? result.error : { key: "error.botAnswer" } });
       }
     } catch (reason) {
-      setState("error", reason);
+      update({ error: reason });
       await refreshActive();
     } finally {
-      setState("working", false);
+      update({ working: false });
     }
 
     return true;
@@ -283,13 +304,13 @@ export default function App() {
       params: { name: file.name, limit: MAX_FILE_LABEL },
     });
     if (file.size > MAX_FILE_BYTES) {
-      setState("error", tooLarge());
+      update({ error: tooLarge() });
       return null;
     }
     try {
       return await api.uploadFile(chat, file, file.name, mediaTypeFor(file));
     } catch (reason) {
-      setState("error", reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason));
+      update({ error: reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason) });
       return null;
     }
   }
@@ -301,7 +322,7 @@ export default function App() {
     contextLimit: number;
     maxOutput: number;
   }) {
-    setState({ busy: true, error: null });
+    update({ busy: true, error: null });
     try {
       await commands.command<ProviderResult>("provider_add", {
         protocol: "chat_completions",
@@ -321,23 +342,23 @@ export default function App() {
         commands.command<Provider[]>("provider_list"),
         commands.command<Model[]>("model_list"),
       ]);
-      setState({ providers, models });
+      update({ providers, models });
     } catch (reason) {
-      setState("error", reason);
+      update({ error: reason });
     } finally {
-      setState("busy", false);
+      update({ busy: false });
     }
   }
 
   async function createBot(name: string) {
-    setState({ busy: true, error: null });
+    update({ busy: true, error: null });
     try {
       const result = await commands.command<BotResult>("bot_create", { name });
       const [bots, chats] = await Promise.all([
         commands.command<Bot[]>("bot_list"),
         commands.command<Chat[]>("chat_list"),
       ]);
-      setState({
+      update({
         bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
         chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
       });
@@ -346,15 +367,15 @@ export default function App() {
       const chat = sortedChats.find((candidate) => candidate.id === result.chat.id) ?? chats[0];
       if (chat) await selectChat(chat);
     } catch (reason) {
-      setState("error", reason);
+      update({ error: reason });
     } finally {
-      setState("busy", false);
+      update({ busy: false });
     }
   }
 
   function backToList() {
     runGeneration += 1;
-    setState({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
+    update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
   }
 
   const errorText = () => (state.error ? messageFor(state.error) : null);
@@ -370,7 +391,7 @@ export default function App() {
         }
       >
         {(account) => (
-          <div class="app" classList={{ "app--chat": showChat(), "app--setup": needsSetup() }}>
+          <div class={`app${showChat() ? " app--chat" : ""}${needsSetup() ? " app--setup" : ""}`}>
             <Rail account={account()} />
             <Sidebar
               account={account()}
