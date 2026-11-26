@@ -204,10 +204,6 @@ impl LocalRuntime {
         let workspace_path = opened_path(workspace).map_err(RuntimeError::Io)?;
         let folder_path = workspace_path.join(bot);
         let folder = open_or_create_machine_folder(workspace, bot, &folder_path)?;
-        // bwrap binds this descriptor, so it must survive the sandbox's exec:
-        // the mount then names the object opened and scanned here, not a path
-        // that a later rename could point somewhere else.
-        make_inheritable(&folder).map_err(RuntimeError::Io)?;
         // A hidden root must exist: it is the directory the daemon wrote its
         // own configuration into, and a missing one would mean the tmpfs that
         // hides it cannot be mounted.
@@ -659,6 +655,33 @@ impl LocalRuntime {
                 #[cfg(not(unix))]
                 let source = self.root.as_os_str().to_owned();
                 let mut process = sandbox_command(bwrap, &source, &self.root, &self.hidden);
+                // The parent keeps this descriptor close-on-exec, so other
+                // runtimes' folders are never inherited. In the child, after
+                // fork and before exec, clear the flag for this one descriptor
+                // so bwrap can bind `/proc/self/fd/<fd>`: the mount then names
+                // the object this runtime opened, not a path a later rename
+                // could point somewhere else.
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd as _;
+
+                    let folder_fd = folder.as_raw_fd();
+                    // SAFETY: the closure runs in the child between `fork` and
+                    // `exec`, where only async-signal-safe calls are allowed;
+                    // `fcntl` is one, it touches only this runtime's own
+                    // descriptor, and it allocates nothing. A failure is
+                    // returned so `spawn` reports it instead of exec'ing
+                    // without the descriptor.
+                    unsafe {
+                        process.pre_exec(move || {
+                            let cleared = libc::fcntl(folder_fd, libc::F_SETFD, 0);
+                            if cleared < 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
                 process
                     .arg("/bin/sh")
                     .arg("-c")
@@ -929,26 +952,6 @@ fn folder_mount_source(folder: &std::fs::File) -> OsString {
     use std::os::fd::AsRawFd as _;
 
     OsString::from(format!("/proc/self/fd/{}", folder.as_raw_fd()))
-}
-
-/// Makes a directory descriptor survive `exec`, so bwrap can bind the object
-/// this runtime opened as `/proc/self/fd/<fd>`.
-///
-/// The descriptor is opened with `FD_CLOEXEC`; clearing it once, when the
-/// runtime is built, keeps it open for every shell the runtime starts and
-/// leaves no flag state to restore after a spawn.
-#[cfg(unix)]
-fn make_inheritable(folder: &std::fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd as _;
-
-    // SAFETY: `folder` is a live descriptor owned by the runtime; `F_SETFD`
-    // only writes its descriptor flags. 0 clears `FD_CLOEXEC`.
-    let cleared = unsafe { libc::fcntl(folder.as_raw_fd(), libc::F_SETFD, 0) };
-    if cleared < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-
-    Ok(())
 }
 
 /// Builds the fenced shell process without starting it.
@@ -3307,6 +3310,80 @@ mod tests {
                 .is_err_and(|error| error.to_string().contains("hidden")),
             "{bytes:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_inherits_only_its_own_bot_folder() {
+        let Some((_dir_a, runtime_a)) = machine_runtime() else {
+            return;
+        };
+        let Some((_dir_b, runtime_b)) = machine_runtime() else {
+            return;
+        };
+        let own = runtime_a.workspace().to_path_buf();
+        let other = runtime_b.workspace().to_path_buf();
+        // Files a Bot folder can have; the other runtime is only cached, never
+        // used, so its descriptor must still be close-on-exec.
+        let result = runtime_a
+            .execute(Action::Shell {
+                command: "ls -l /proc/self/fd".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        let text = result.output.text;
+        for line in text.lines() {
+            let Some(target) = line.split(" -> ").nth(1) else {
+                continue;
+            };
+            if target.starts_with("/tmp/") {
+                assert_eq!(
+                    target.trim(),
+                    own.to_string_lossy(),
+                    "the shell inherited a folder it is not mounted for: {text}"
+                );
+            }
+        }
+        assert!(
+            !text.contains(other.to_string_lossy().as_ref()),
+            "another Bot's folder leaked into this shell: {text}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_spawned_again_mounts_the_same_folder() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "marker.txt".to_owned(),
+                content: "twice".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        for _ in 0..2 {
+            let result = runtime
+                .execute(Action::Shell {
+                    command: "cat marker.txt && ls -l /proc/self/fd".to_owned(),
+                })
+                .await;
+            assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+            assert!(
+                result.output.text.contains("twice"),
+                "{}",
+                result.output.text
+            );
+            assert!(
+                result
+                    .output
+                    .text
+                    .contains(runtime.workspace().to_string_lossy().as_ref()),
+                "the opened folder descriptor is still mounted: {}",
+                result.output.text
+            );
+        }
     }
 
     #[cfg(unix)]

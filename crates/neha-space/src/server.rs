@@ -989,9 +989,34 @@ async fn computer_pair_poll(
         .map_err(identity_error)?
     {
         Some(PairingState::Pending) => Ok(Json(PairingReply::Pending)),
-        Some(PairingState::Approved { computer }) => Ok(Json(PairingReply::Approved { computer })),
+        Some(PairingState::Approved { computer }) => {
+            // The token may be final while the record is not: the command that
+            // claims the code finishes the token first and appends the Computer
+            // second, so a crash in between rolls the token back. The machine
+            // must keep polling until the record holds its Computer, or it
+            // would save a pairing that the next start revokes.
+            if !computer_is_recorded(&server, computer)? {
+                return Ok(Json(PairingReply::Pending));
+            }
+            Ok(Json(PairingReply::Approved { computer }))
+        }
         None => Err(ApiError::not_found("no such pairing")),
     }
+}
+
+/// Whether the record holds this Computer.
+///
+/// The pairing poll and the channel handshake both need the answer: the token
+/// is finished before `ComputerCreated` is appended, so anything that trusts
+/// the token alone could hand a machine a pairing the next start's
+/// reconciliation rolls back.
+fn computer_is_recorded(server: &SpaceServer, computer: Id) -> Result<bool, ApiError> {
+    let state = server
+        .state
+        .lock()
+        .map_err(|_| ApiError::internal("the Space state is locked"))?;
+
+    Ok(state.computers.contains_key(&computer))
 }
 
 /// Upgrades a paired Computer's control connection.
@@ -1007,6 +1032,13 @@ async fn computer_socket(
         .await
         .map_err(identity_error)?
         .ok_or_else(unauthorized_computer)?;
+    // A token only opens a channel for a Computer the record holds: until the
+    // append commits, the token may still be rolled back by the start-up
+    // reconciliation, and the hung-up handshake is refused exactly like an
+    // unknown Computer's.
+    if !computer_is_recorded(&server, computer)? {
+        return Err(unauthorized_computer());
+    }
 
     Ok(ws
         .max_message_size(MAX_CHANNEL_FRAME_BYTES)
@@ -6799,15 +6831,23 @@ mod tests {
 
     /// Connects a fake machine with a Computer token, before sending Hello.
     async fn raw_computer(running: &Running, token: &str) -> Socket {
+        try_raw_computer(running, token).await.unwrap()
+    }
+
+    /// Tries the channel handshake without panicking, to assert a refusal.
+    async fn try_raw_computer(
+        running: &Running,
+        token: &str,
+    ) -> Result<Socket, tokio_tungstenite::tungstenite::Error> {
         let mut request = format!("ws://{}/api/computer/socket", running.addr)
             .into_client_request()
             .unwrap();
         request
             .headers_mut()
             .insert("authorization", format!("Bearer {token}").parse().unwrap());
-        let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let (socket, _) = tokio_tungstenite::connect_async(request).await?;
 
-        socket
+        Ok(socket)
     }
 
     /// Sends a Hello frame as a fake machine would.
@@ -6951,6 +6991,105 @@ mod tests {
         let refused = try_command(&mut socket, Id::new(), add_computer(&code)).await;
         assert!(matches!(refused, Err((ErrorCode::InvalidArgument, _))));
 
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_machine_sees_approved_only_after_its_computer_is_recorded() {
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let token = session["token"].as_str().unwrap().to_owned();
+        let mut socket = open_socket(&running, &token).await;
+        let (device, code) = pair_machine(&running).await;
+        let computer = Id::new();
+        // The window the command closes before its append: the code is claimed
+        // and the token is final, but no record names the Computer yet.
+        assert!(
+            running
+                .server
+                .identity
+                .reserve_pairing(&code, owner, computer)
+                .await
+                .unwrap()
+        );
+        assert!(
+            running
+                .server
+                .identity
+                .finalize_pairing(owner, computer)
+                .await
+                .unwrap()
+        );
+
+        // The poll must not hand the machine a pairing it could save...
+        let polled: Value = poll_pairing(&running, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            polled,
+            json!({"state": "pending"}),
+            "an unrecorded Computer must not answer approved"
+        );
+        // ...and its final token must not open a channel yet.
+        assert!(
+            try_raw_computer(&running, &machine_token()).await.is_err(),
+            "a token without a recorded Computer must not upgrade a channel"
+        );
+
+        // The append lands: both doors open with no other change.
+        let draft = neha::record::EventDraft::new(
+            EventKind::ComputerCreated,
+            neha::record::Author::User(owner),
+            json!({
+                "computer": computer,
+                "owner": owner,
+                "kind": "real",
+                "workspace": MACHINE_WORKSPACE,
+            }),
+        );
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                format!("window:{computer}"),
+                vec![draft],
+            ))
+            .await
+            .unwrap();
+        {
+            use crate::store::Projection as _;
+            let mut state = running.server.state.lock().unwrap();
+            for event in &appended.events {
+                state.apply(event).unwrap();
+            }
+        }
+
+        let approved: Value = poll_pairing(&running, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            approved,
+            json!({"state": "approved", "computer": computer}),
+            "once recorded, the machine learns it is approved"
+        );
+        let mut device_socket = raw_computer(&running, &machine_token()).await;
+        send_hello(
+            &mut device_socket,
+            CHANNEL_VERSION,
+            &computer.to_string(),
+            true,
+        )
+        .await;
+        wait_online(&mut socket, computer).await;
+
+        device_socket.close(None).await.unwrap();
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }
