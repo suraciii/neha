@@ -222,6 +222,11 @@ where
 fn byte_failure(error: ByteError) -> ActionResult {
     match error {
         ByteError::Failed(message) => ActionResult::failed(message),
+        ByteError::TimedOut(message) => ActionResult {
+            status: ActionStatus::TimedOut,
+            output: ToolOutput::full(message.clone()),
+            error: Some(message),
+        },
         ByteError::Lost(message) => ActionResult {
             status: ActionStatus::Unknown,
             output: ToolOutput::full(message.clone()),
@@ -373,6 +378,7 @@ mod tests {
         files: Mutex<Vec<(String, Vec<u8>)>>,
         fail_writes: bool,
         lost: bool,
+        slow_writes: bool,
     }
 
     impl FakeRuntime {
@@ -387,6 +393,14 @@ mod tests {
         fn lost() -> Self {
             Self {
                 lost: true,
+                ..Self::default()
+            }
+        }
+
+        /// A Computer that is too slow to take a File.
+        fn slow() -> Self {
+            Self {
+                slow_writes: true,
                 ..Self::default()
             }
         }
@@ -438,6 +452,10 @@ mod tests {
         ) -> impl Future<Output = Result<(), ByteError>> + Send {
             let written = if self.lost {
                 Err(ByteError::Lost("the Computer went offline".to_owned()))
+            } else if self.slow_writes {
+                Err(ByteError::TimedOut(
+                    "the Computer did not answer in time".to_owned(),
+                ))
             } else if self.fail_writes {
                 Err(ByteError::Failed("the workspace is full".to_owned()))
             } else {
@@ -758,6 +776,35 @@ mod tests {
         assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
         assert!(tool_texts(&model)[0].contains("no File"));
         assert!(runtime.files.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_transfer_that_times_out_is_returned_to_the_model() {
+        let id = Id::new();
+        let files = FakeFiles::with(vec![(id, taken_file("report.txt", b"hello"))]);
+        let model = FakeModel::with(vec![
+            call_reply(TAKE_FILE, json!({"file": id})),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::slow();
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            &files,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            outcome.succeeded,
+            "a timeout is a tool answer, not a lost run"
+        );
+        assert_eq!(recorder.finished[0].1, ActionStatus::TimedOut);
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]

@@ -115,6 +115,9 @@ pub enum ByteError {
     /// The Computer tried and refused; the run may continue.
     #[error("{0}")]
     Failed(String),
+    /// The Computer did not answer within its time limit.
+    #[error("{0}")]
+    TimedOut(String),
     /// The answer never came back, so the outcome is unknown.
     #[error("{0}")]
     Lost(String),

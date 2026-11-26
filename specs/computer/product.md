@@ -68,11 +68,11 @@ A Bot can ask the User to take control, for example to sign in.
 
 A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a managed Computer, a Bot operates the browser. Programs with windows of their own run only on a real Computer.
 
-On a real Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read.
+On a real Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read, except the Computer's own configuration directory, which [design](design.md#isolation) hides from it.
 
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 
-On a real Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in those folders and reads what the machine's user can read. With full access, it writes and deletes what the machine's user can.
+On a real Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in those folders, and its read range is unchanged. With full access, it writes and deletes what the machine's user can.
 
 A new real Computer starts with granted folders.
 

@@ -100,7 +100,7 @@ impl ComputerRuntime for RemoteRuntime {
                 Ok(Answer::Gone(message)) => Err(ByteError::Lost(message)),
                 Err(_) => {
                     self.link.cancel(id);
-                    Err(ByteError::Lost(
+                    Err(ByteError::TimedOut(
                         "the Computer did not answer in time".to_owned(),
                     ))
                 }
@@ -136,7 +136,7 @@ impl ComputerRuntime for RemoteRuntime {
                 Ok(Answer::Gone(message)) => Err(ByteError::Lost(message)),
                 Err(_) => {
                     self.link.cancel(id);
-                    Err(ByteError::Lost(
+                    Err(ByteError::TimedOut(
                         "the Computer did not answer in time".to_owned(),
                     ))
                 }
@@ -165,12 +165,12 @@ mod tests {
         RemoteRuntime,
         Arc<ComputerLink>,
         Id,
-        mpsc::UnboundedReceiver<HostFrame>,
+        mpsc::Receiver<HostFrame>,
     ) {
         let links = ComputerLinks::new();
         let computer = Id::new();
         let bot = Id::new();
-        let (frames, outgoing) = mpsc::unbounded_channel();
+        let (frames, outgoing) = mpsc::channel(crate::computer_link::FRAME_QUEUE);
         let link = links.connect(computer, frames);
         let runtime = RemoteRuntime::new(
             Arc::clone(&link),
@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_request_that_never_answers_is_lost() {
+    async fn a_file_request_that_never_answers_times_out() {
         let (runtime, _link, _bot, _outgoing) = remote();
         let runtime = Arc::new(runtime);
 
@@ -381,7 +381,7 @@ mod tests {
         for answer in [read, write] {
             assert_eq!(
                 answer,
-                Err(ByteError::Lost(
+                Err(ByteError::TimedOut(
                     "the Computer did not answer in time".to_owned()
                 ))
             );

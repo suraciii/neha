@@ -10,6 +10,13 @@
 //! hides given root directories from both paths, so a Bot cannot read the
 //! Computer's own channel credential.
 //!
+//! A daemon opens its workspace root with
+//! [`open_workspace`](LocalRuntime::open_workspace), checks the machine with
+//! [`probe_sandbox`](LocalRuntime::probe_sandbox), and opens each Bot's folder
+//! under that verified root with [`machine_at`](LocalRuntime::machine_at). A
+//! real Bot folder is never a symlink, and a folder holding a hard link, a
+//! symlink, or a special file is refused.
+//!
 //! [`channel`] holds the JSON frames a real Computer and its Space exchange.
 
 pub mod action;

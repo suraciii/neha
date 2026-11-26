@@ -14,6 +14,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -24,6 +25,21 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 /// Why a request failed because its Computer left.
 pub const OFFLINE: &str = "the Computer went offline";
+
+/// How many frames may wait for one Computer's WebSocket writer.
+pub const FRAME_QUEUE: usize = 64;
+
+/// How long one frame may wait to enter the queue or leave the socket.
+///
+/// Ten seconds in a release build; the test build uses a short limit so the
+/// blocked-writer paths are asserted without slowing the suite. A frame that
+/// misses its deadline fails its request and closes the channel, so a Computer
+/// that stops reading cannot grow the Space's memory or strand a run.
+pub const FRAME_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(250)
+} else {
+    Duration::from_secs(10)
+};
 
 /// What a request waits for.
 #[derive(Debug)]
@@ -46,7 +62,7 @@ pub struct ComputerLink {
     /// The Computer this channel serves.
     pub computer: Id,
     /// The writer half of the Computer's WebSocket.
-    frames: mpsc::UnboundedSender<HostFrame>,
+    frames: mpsc::Sender<HostFrame>,
     /// The requests whose answers are still owed, by Space-assigned id.
     pending: Mutex<HashMap<u64, Pending>>,
     /// Set once the channel is closing; no new request may then enter.
@@ -57,7 +73,7 @@ pub struct ComputerLink {
 
 impl ComputerLink {
     /// Builds a link over a frame writer.
-    fn new(computer: Id, frames: mpsc::UnboundedSender<HostFrame>) -> Self {
+    fn new(computer: Id, frames: mpsc::Sender<HostFrame>) -> Self {
         let (closer, _) = watch::channel(false);
 
         Self {
@@ -133,8 +149,17 @@ impl ComputerLink {
         }
         // `close` may run between the insert and this check: it drains the map,
         // so a request that lost the race is answered here or by that drain.
-        if self.is_closed() || self.frames.send(frame).is_err() {
+        if self.is_closed() {
             self.cancel(id);
+            return Answer::Gone(OFFLINE.to_owned());
+        }
+        // The writer's queue is bounded: a Computer that stops reading must
+        // not grow the Space's memory. A frame that cannot enter the queue in
+        // time fails this request and closes the channel, so its run ends
+        // instead of waiting forever.
+        let queued = tokio::time::timeout(FRAME_TIMEOUT, self.frames.send(frame)).await;
+        if !matches!(queued, Ok(Ok(()))) {
+            self.close();
             return Answer::Gone(OFFLINE.to_owned());
         }
         match receiver.await {
@@ -262,11 +287,7 @@ impl ComputerLinks {
     }
 
     /// Registers a Computer's new channel, replacing one that still lingers.
-    pub fn connect(
-        &self,
-        computer: Id,
-        frames: mpsc::UnboundedSender<HostFrame>,
-    ) -> Arc<ComputerLink> {
+    pub fn connect(&self, computer: Id, frames: mpsc::Sender<HostFrame>) -> Arc<ComputerLink> {
         let link = Arc::new(ComputerLink::new(computer, frames));
         let replaced = self
             .links
@@ -324,17 +345,17 @@ mod tests {
     use neha_computer::{Action, ActionStatus, ToolOutput};
     use tokio::sync::mpsc;
 
-    use super::{Answer, ComputerLink, ComputerLinks, OFFLINE, answer};
+    use super::{Answer, ComputerLink, ComputerLinks, FRAME_QUEUE, OFFLINE, answer};
 
     fn connected() -> (
         ComputerLinks,
         Id,
         Arc<ComputerLink>,
-        mpsc::UnboundedReceiver<HostFrame>,
+        mpsc::Receiver<HostFrame>,
     ) {
         let links = ComputerLinks::new();
         let computer = Id::new();
-        let (frames, outgoing) = mpsc::unbounded_channel();
+        let (frames, outgoing) = mpsc::channel(FRAME_QUEUE);
         let link = links.connect(computer, frames);
 
         (links, computer, link, outgoing)
@@ -492,7 +513,7 @@ mod tests {
         });
         tokio::task::yield_now().await;
 
-        let (frames, _new_outgoing) = mpsc::unbounded_channel();
+        let (frames, _new_outgoing) = mpsc::channel(FRAME_QUEUE);
         let new = links.connect(computer, frames);
 
         assert!(old.is_closed());
@@ -510,5 +531,50 @@ mod tests {
             links.link(computer),
             Some(link) if Arc::ptr_eq(&link, &new)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_full_send_queue_fails_requests_and_closes_the_link() {
+        let (_links, _computer, link, mut outgoing) = connected();
+        let bot = Id::new();
+
+        // Nobody reads the queue in this test, so the writer's channel fills at
+        // its capacity and the request past it cannot enter before its
+        // deadline. Closing the link then fails every request still waiting.
+        let requests: Vec<_> = (1..=FRAME_QUEUE as u64 + 1)
+            .map(|id| {
+                let link = Arc::clone(&link);
+                async move {
+                    link.act(
+                        id,
+                        bot,
+                        Action::Shell {
+                            command: format!("sleep {id}"),
+                        },
+                    )
+                    .await
+                }
+            })
+            .collect();
+        let answers = futures_util::future::join_all(requests).await;
+
+        assert!(
+            link.is_closed(),
+            "a frame past the deadline closes the link"
+        );
+        assert!(
+            answers
+                .iter()
+                .all(|answer| matches!(answer, Answer::Gone(_))),
+            "every request that was waiting fails when the link closes"
+        );
+        let mut queued = 0;
+        while outgoing.try_recv().is_ok() {
+            queued += 1;
+        }
+        assert_eq!(
+            queued, FRAME_QUEUE,
+            "the send queue never grows past its capacity"
+        );
     }
 }

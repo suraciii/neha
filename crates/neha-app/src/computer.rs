@@ -156,8 +156,10 @@ async fn serve(config: Config) -> Result<()> {
     // The configuration directory holds this Computer's channel credential.
     // Every Bot runtime hides it from the file tools and the sandbox.
     let hidden = hidden_roots()?;
-    // A machine that cannot fence a command never serves as a Computer.
-    fence(&config.workspace, &hidden)?;
+    // A machine that cannot fence a command never serves as a Computer. This
+    // only probes bubblewrap: Bot folders are opened lazily, each through the
+    // workspace root's descriptor.
+    fence()?;
     let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::new()));
     loop {
         tokio::select! {
@@ -176,8 +178,8 @@ async fn serve(config: Config) -> Result<()> {
 }
 
 /// Refuses a machine whose commands bubblewrap cannot fence.
-fn fence(workspace: &Path, hidden: &[PathBuf]) -> Result<()> {
-    LocalRuntime::machine_with_hidden(workspace, hidden.to_vec())?;
+fn fence() -> Result<()> {
+    LocalRuntime::probe_sandbox().context("this machine cannot fence Bot commands")?;
 
     Ok(())
 }
@@ -456,15 +458,22 @@ fn machine(
     runtimes: &Runtimes,
     bot: &str,
 ) -> Result<Arc<LocalRuntime>, String> {
-    let folder = folder_for(&config.workspace, bot)?;
+    // The Bot must be one identifier component; reject anything else before
+    // touching the filesystem.
+    folder_for(&config.workspace, bot)?;
     let mut runtimes = runtimes
         .lock()
         .map_err(|_| "the runtime table is locked".to_owned())?;
     match runtimes.entry(bot.to_owned()) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
+            // Open the workspace root without following a symlink, then walk
+            // the Bot's folder through descriptors: a swapped path component
+            // can never redirect the runtime outside its folder.
+            let root = LocalRuntime::open_workspace(&config.workspace)
+                .map_err(|error| error.to_string())?;
             let runtime = Arc::new(
-                LocalRuntime::machine_with_hidden(folder, hidden.to_vec())
+                LocalRuntime::machine_at(&root, bot, hidden.to_vec())
                     .map_err(|error| error.to_string())?,
             );
             Ok(Arc::clone(entry.insert(runtime)))

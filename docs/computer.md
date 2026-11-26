@@ -43,6 +43,8 @@ target/debug/neha computer run
 
 A saved pairing whose Workspace is inside the configuration directory is refused. Run `computer pair` again, or pair with `--workspace` outside that directory.
 
+Re-pairing adds a new Computer; the Bots on the old one stay bound to it. Their Workspaces and any queued work stay behind, and nothing moves automatically. Create a new Bot on the new Computer with `neha bot create --computer`, or wait for the capability that changes a Bot's Computer.
+
 ## Create a Bot on the machine
 
 List the Computers you own:
@@ -77,13 +79,15 @@ The folder is created when the Bot first runs an action. Every action of the Bot
 
 The file tools check every write path. A write outside the Workspace fails with `the path is outside this Bot's writable folder`; a `..` climb or a symlink out is refused, and no file is created. The only persistent place a Bot writes on the machine is its Workspace.
 
-The file tools read with the rights of the machine's user. `read_file` and `list_files` reach any path that user can read, including files outside the Workspace and files of another Bot on the machine. Those files stay read-only for the Bot's write tools.
+The file tools read with the rights of the machine's user. A file read follows a symlink as the machine user's own tools do, and reaches any file that user can read, including files outside the Workspace and files of another Bot on the machine. A directory listing does not follow a symlink that is the path itself, and a FIFO or a device is not read.
 
-The Computer's own configuration directory is the exception. The daemon hides it from the file tools and the shell, so `read_file` or `list_files` on it fails with `the path is hidden from this Computer`, and a Bot cannot read the saved pairing or its token.
+The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token.
 
 The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
 
 A shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace is writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
+
+The daemon checks a Bot's folder before it serves it. A hard link, a symlink, or a special file in the folder makes the daemon refuse that folder until it is cleaned; keep links and special files out of the Workspace.
 
 A machine whose `bubblewrap` cannot start a sandbox does not serve as a Computer.
 
@@ -107,6 +111,7 @@ The machine ends the command it was running when the channel drops, so no action
 | `pair` stops before printing a code | Read the error it prints. A workspace directory it cannot create and a Space it cannot reach are the common causes. |
 | `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.neha` by default, and a Workspace inside it is refused. Run `computer pair` again, and pass `--workspace` outside that directory if you want a different place. |
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory. A Bot cannot read that directory. |
+| A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/Neha/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
 | `add` reports the code is not valid or has expired | The code lasts 10 minutes and admits one Computer. Run `pair` again for a new code. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. |
@@ -119,6 +124,7 @@ The machine ends the command it was running when the channel drops, so no action
 - The Space listens on loopback only, so this milestone pairs a machine on the host that runs the Space. Remote pairing needs a Space reachable over the network.
 - Granted folders and the `full-access` switch are not available. A Bot's write range stays its own Workspace, and its owner cannot widen that range.
 - A request cannot choose a working directory. Every run starts in the Bot's Workspace.
+- A Bot cannot change its Computer. It stays on the Computer it was created on.
 - There is no approval gate. A Bot runs an action as soon as the Model asks for it.
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.

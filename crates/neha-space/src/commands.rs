@@ -575,20 +575,28 @@ async fn computer_add(
         let _ = context.identity.release_pairing(account.id, computer).await;
         return recorded_outcome(context.store, command_id).await;
     }
-    // Finish the claim by recording the machine's token. A failure here leaves
-    // the record with its Computer and the start-up reconciliation writes the
-    // token, so no machine is left approved without a working token.
-    if let Err(error) = context
+    // Finish the claim by recording the machine's token. Only a token row that
+    // names this Computer makes the pairing real: a claim that vanished, or one
+    // whose token already belongs to another Computer, is a failure even though
+    // the Computer reached the record, so it is never reported as success.
+    match context
         .identity
         .finalize_pairing(account.id, computer)
         .await
     {
-        eprintln!("neha: cannot finish a pairing claim: {error}");
-        context
-            .identity
-            .finalize_pairing(account.id, computer)
-            .await
-            .map_err(identity_error)?;
+        Ok(true) => {}
+        Ok(false) => {
+            eprintln!("neha: a pairing claim vanished before it was finished");
+            let _ = context.identity.release_pairing(account.id, computer).await;
+            return Err(ApiError::internal(
+                "the pairing claim could not be finished",
+            ));
+        }
+        Err(error) => {
+            eprintln!("neha: cannot finish a pairing claim: {error}");
+            let _ = context.identity.release_pairing(account.id, computer).await;
+            return Err(identity_error(error));
+        }
     }
 
     Ok(Outcome {

@@ -1055,13 +1055,50 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         return;
     }
 
-    let (frames, mut outgoing) = mpsc::unbounded_channel::<HostFrame>();
-    let link = server.links.connect(computer, frames);
+    let (sink, mut stream) = socket.split();
+    let (frames, mut outgoing) = mpsc::channel::<HostFrame>(computer_link::FRAME_QUEUE);
+    let link = server.links.connect(computer, frames.clone());
     // When a Computer reconnects, it replaces its old link and this handler
     // must stop: the Space already failed the old link's requests, and two
     // readers acting as one Computer would race each other.
     let mut closing = link.closed_signal();
     server.runs.wake_all(&server);
+    // The writer owns the sending half, so this reader never blocks on a
+    // Computer that stopped reading. Every frame has a deadline; one that
+    // misses it closes the link, which fails its request and wakes this loop.
+    let mut writer = tokio::spawn({
+        let link = Arc::clone(&link);
+        let mut closing = link.closed_signal();
+        let mut sink = sink;
+        async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = closing.changed() => break,
+                    frame = outgoing.recv() => {
+                        let Some(frame) = frame else { break; };
+                        let Ok(text) = serde_json::to_string(&frame) else { break; };
+                        let sent = tokio::time::timeout(
+                            computer_link::FRAME_TIMEOUT,
+                            sink.send(Message::Text(text.into())),
+                        )
+                        .await;
+                        if !matches!(sent, Ok(Ok(()))) {
+                            link.close();
+                            break;
+                        }
+                    }
+                }
+            }
+            // Close from our side so a replaced Computer learns its channel
+            // moved instead of discovering it on its next write.
+            let _ = tokio::time::timeout(
+                computer_link::FRAME_TIMEOUT,
+                sink.send(Message::Close(None)),
+            )
+            .await;
+        }
+    });
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + COMPUTER_PING, COMPUTER_PING);
     let mut last_pong = Instant::now();
@@ -1074,7 +1111,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
                 let _ = changed;
                 break;
             }
-            message = socket.recv() => {
+            message = stream.next() => {
                 let Some(Ok(message)) = message else { break; };
                 let text = match message {
                     Message::Text(text) => text,
@@ -1098,30 +1135,29 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
                     Err(_) => break,
                 }
             }
-            frame = outgoing.recv() => {
-                let Some(frame) = frame else { break; };
-                let Ok(text) = serde_json::to_string(&frame) else { break; };
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    break;
-                }
-            }
             _ = ping.tick() => {
                 if last_pong.elapsed() >= COMPUTER_IDLE {
                     break;
                 }
-                let Ok(text) = serde_json::to_string(&HostFrame::Ping) else { break; };
-                if socket.send(Message::Text(text.into())).await.is_err() {
-                    break;
-                }
+                // A heartbeat must never block the reader: when the queue is
+                // full the Computer is already wedged, and its requests will
+                // fail on their own deadline.
+                let _ = frames.try_send(HostFrame::Ping);
             }
         }
     }
 
-    // Close from our side so a replaced Computer learns its channel moved
-    // instead of discovering it on its next write.
-    let _ = socket.send(Message::Close(None)).await;
     server.links.disconnect(&link);
     server.runs.wake_all(&server);
+    // The writer stops on the link's close signal; give it its deadline, then
+    // drop it if the socket refuses to finish.
+    if tokio::time::timeout(computer_link::FRAME_TIMEOUT, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+        let _ = writer.await;
+    }
 }
 
 /// Returns the value of an RFC 8187 `filename*`: every byte that is not an
@@ -1577,11 +1613,13 @@ async fn reconcile_pairings(server: &Arc<SpaceServer>) -> Result<(), ServerError
                 .is_some_and(|computer| computer.owner == claim.owner)
         };
         if recorded {
-            if !claim.finalized {
-                server
+            if !claim.finalized
+                && !server
                     .identity
                     .finalize_pairing(claim.owner, claim.computer)
-                    .await?;
+                    .await?
+            {
+                eprintln!("neha: a recorded Computer's pairing claim vanished while reconciling");
             }
         } else {
             server
@@ -1781,11 +1819,6 @@ pub(crate) fn identity_error(error: IdentityError) -> ApiError {
         IdentityError::NameTaken | IdentityError::AlreadyInitialized => {
             ApiError::new(StatusCode::CONFLICT, ErrorCode::Conflict, error.to_string())
         }
-        IdentityError::TooManyPendingPairings => ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            ErrorCode::RateLimited,
-            "too many Computers are waiting to pair; approve one or wait for it to expire",
-        ),
         IdentityError::InvalidCredentials => ApiError::new(
             StatusCode::UNAUTHORIZED,
             ErrorCode::Unauthorized,
@@ -6664,6 +6697,7 @@ mod tests {
     use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, WireAction};
     use neha_computer::{ActionStatus, ToolOutput};
 
+    use crate::computer_link::Answer;
     use crate::identity::MAX_PENDING_PAIRINGS;
 
     use super::MAX_PAIRING_FIELD_BYTES;
@@ -7042,6 +7076,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_finishes_a_claim_whose_code_already_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let running = start(home.clone(), 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let (device, code) = pair_machine(&running).await;
+        let computer = Id::new();
+        assert!(
+            running
+                .server
+                .identity
+                .reserve_pairing(&code, owner, computer)
+                .await
+                .unwrap()
+        );
+        let draft = neha::record::EventDraft::new(
+            EventKind::ComputerCreated,
+            neha::record::Author::User(owner),
+            json!({
+                "computer": computer,
+                "owner": owner,
+                "kind": "real",
+                "workspace": MACHINE_WORKSPACE,
+            }),
+        );
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                format!("crash:{computer}"),
+                vec![draft],
+            ))
+            .await
+            .unwrap();
+        {
+            use crate::store::Projection as _;
+            let mut state = running.server.state.lock().unwrap();
+            for event in &appended.events {
+                state.apply(event).unwrap();
+            }
+        }
+        // The claim's code expires in the crash window: the expiry sweeper
+        // must leave a claimed row alone, and the reconciliation finishes it.
+        running
+            .server
+            .identity
+            .expire_pairing_for_test(owner, computer)
+            .await
+            .unwrap();
+        running.shutdown().await;
+
+        let restarted = start(home, 0).await.unwrap();
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            Some(computer),
+            "an expired claim still gets its machine a working token"
+        );
+        assert!(
+            restarted
+                .server
+                .identity
+                .pairing_claims()
+                .await
+                .unwrap()
+                .first()
+                .is_some_and(|claim| claim.finalized)
+        );
+        let poll = poll_pairing(&restarted, &device, &machine_poll()).await;
+        assert_eq!(
+            poll.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "the expired pairing itself is gone"
+        );
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_replayed_computer_add_records_one_computer() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -7073,7 +7192,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn pairing_start_validates_its_fields_and_caps_pending_pairings() {
+    async fn pairing_start_validates_its_fields_and_recycles_the_waiting_quota() {
         let (_dir, running, _invite) = running().await;
         let overlong = "m".repeat(MAX_PAIRING_FIELD_BYTES + 1);
         let overlong_workspace = format!("/{}", "w".repeat(MAX_PAIRING_FIELD_BYTES));
@@ -7119,32 +7238,33 @@ mod tests {
             );
         }
 
+        let mut machines = Vec::new();
         for _ in 0..MAX_PENDING_PAIRINGS {
-            let started = pair_start(
-                &running,
-                &pair_body(
-                    "laptop",
-                    MACHINE_WORKSPACE,
-                    &machine_token(),
-                    &machine_poll(),
-                ),
-            )
-            .await;
-            assert_eq!(started.status(), reqwest::StatusCode::OK);
+            machines.push(pair_machine(&running).await);
         }
-        let capped = pair_start(
-            &running,
-            &pair_body(
-                "laptop",
-                MACHINE_WORKSPACE,
-                &machine_token(),
-                &machine_poll(),
-            ),
-        )
-        .await;
-        assert_eq!(capped.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
-        let capped: Value = capped.json().await.unwrap();
-        assert_eq!(capped["code"], "rate_limited");
+        // A full quota recycles a waiting machine instead of refusing the
+        // legitimate one, so an anonymous caller cannot lock a User out.
+        let newest = pair_machine(&running).await;
+        let mut pending = 0;
+        let mut evicted = 0;
+        for (device, _code) in &machines {
+            let status = poll_pairing(&running, device, &machine_poll())
+                .await
+                .status();
+            match status {
+                reqwest::StatusCode::OK => pending += 1,
+                reqwest::StatusCode::NOT_FOUND => evicted += 1,
+                other => panic!("unexpected poll status: {other}"),
+            }
+        }
+        assert_eq!(evicted, 1, "only one waiting pairing is recycled");
+        assert_eq!(pending, MAX_PENDING_PAIRINGS - 1);
+        let newest: Value = poll_pairing(&running, &newest.0, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(newest, json!({"state": "pending"}));
 
         running.shutdown().await;
     }
@@ -7197,6 +7317,36 @@ mod tests {
             "accounts are counted apart from each other"
         );
         assert!(!attempts.reserve(ada));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_computer_that_stops_reading_is_disconnected() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (computer, machine) = paired_computer(&mut socket, &running).await;
+        let _device = connect_computer(&running, &machine, computer).await;
+        wait_online(&mut socket, computer).await;
+        let link = running
+            .server
+            .links
+            .link(computer)
+            .expect("a connected Computer has a live link");
+
+        // The fake device never reads this frame and it cannot fit through the
+        // socket buffers, so the writer's deadline passes: the request fails,
+        // the link closes and the Computer is taken offline. A stuck Computer
+        // must not grow the Space's memory or strand work.
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            link.write(999, Id::new(), "big.bin", vec![7_u8; 16 * 1024 * 1024]),
+        )
+        .await
+        .expect("a blocked write must fail by its deadline");
+        assert!(matches!(answer, Answer::Gone(_)), "{answer:?}");
+
+        wait_offline(&mut socket, computer).await;
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

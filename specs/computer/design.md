@@ -29,7 +29,7 @@ A machine joins a Space by pairing; [Identity](../identity/design.md) covers the
 
 The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange, and a managed Computer uses the same channel on the Space's own machine.
 
-The Space sends each action with an id, and the Computer answers that id with the action's result. Each action has a time limit, and an action that runs past it ends as timed out.
+The Space sends each action with an id, and the Computer answers that id with the action's result. Each action has a time limit, including one that moves a File's bytes, and an action that runs past its limit ends as timed out.
 
 A connection that ends makes every action in flight unknown. The process reconnects while it runs, and the Space shows the Computer offline until it does.
 
@@ -56,6 +56,8 @@ Bots assigned to one Computer share its files, processes, and logins. The Space 
 On a real Computer, a Bot's default write range is its own Workspace, and it reads with the machine user's rights. The file tools check every write path, and the shell runs in an operating-system sandbox that mounts the machine read-only except that Workspace. A machine that cannot start its sandbox does not serve as a Computer.
 
 A real Computer's configuration directory is hidden from its Bots. The file tools and the shell cannot reach it, so a Bot cannot read the saved pairing or the token the machine keeps.
+
+A Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted.
 
 A real Computer's owner grants what a Bot on it can reach. [product.md](product.md) covers the grants.
 

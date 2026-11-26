@@ -251,6 +251,9 @@ pub enum PairingState {
 fn pairing_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        // This milestone pairs with a loopback Space only, and the body carries
+        // the machine's own secrets: a system proxy must not see or forward it.
+        .no_proxy()
         .build()
         .context("cannot build the pairing HTTP client")
 }
@@ -869,5 +872,107 @@ mod tests {
 
         space.abort();
         target_task.abort();
+    }
+
+    /// Runs only as the child half of `pairing_requests_bypass_a_system_proxy`.
+    ///
+    /// The parent starts a fake Space and points the proxy variables at a
+    /// listener it counts; this child then pairs through the real client. It
+    /// returns at once when the normal suite runs it.
+    #[tokio::test]
+    async fn a_pairing_client_child_pairs_around_the_proxy() {
+        let Ok(space) = std::env::var("NEHA_PAIRING_CHILD_SPACE") else {
+            return;
+        };
+
+        let started = pair_start(&space, "laptop", "/ws", "token", "poll")
+            .await
+            .expect("the direct pairing start must succeed");
+        assert_eq!(started.code, "CODE1234");
+        assert_eq!(
+            pair_poll(&space, &started.device, "poll").await.unwrap(),
+            PairingState::Pending
+        );
+    }
+
+    #[test]
+    fn pairing_requests_bypass_a_system_proxy() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use serde_json::json;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // A proxy that counts every connection it receives.
+            let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = proxy_listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            let proxy = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = proxy_listener.accept().await else {
+                        break;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+
+            // A fake Space on loopback that answers both pairing routes.
+            let app = Router::new()
+                .route(
+                    "/api/computers/pair",
+                    post(|| async {
+                        Json(json!({"device": "device-from-space", "code": "CODE1234"}))
+                    }),
+                )
+                .route(
+                    "/api/computers/pair/{device}",
+                    post(|| async { Json(json!({"state": "pending"})) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let space_address = listener.local_addr().unwrap();
+            let space = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let proxy_url = format!("http://{proxy_address}");
+            let space_url = format!("http://{space_address}");
+            let child = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("client::tests::a_pairing_client_child_pairs_around_the_proxy")
+                    .arg("--nocapture")
+                    .env("HTTP_PROXY", &proxy_url)
+                    .env("HTTPS_PROXY", &proxy_url)
+                    .env("ALL_PROXY", &proxy_url)
+                    .env("NEHA_PAIRING_CHILD_SPACE", &space_url)
+                    .output()
+                    .expect("the child test process starts")
+            })
+            .await
+            .unwrap();
+
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "the child pairing failed: {stdout}\n{stderr}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "the pairing client must not touch the system proxy"
+            );
+            space.abort();
+            proxy.abort();
+        });
     }
 }

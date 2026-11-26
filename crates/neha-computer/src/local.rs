@@ -9,7 +9,7 @@
 //! directory, which holds its channel credential, is passed that way so a Bot
 //! never reaches it.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -75,8 +75,17 @@ enum Mode {
     Machine {
         /// The resolved `bwrap` binary.
         bwrap: PathBuf,
+        /// The Bot's folder, opened without following a symlink and checked
+        /// once. Every write and every listing starts from this descriptor, so
+        /// a swap on disk cannot move the root between calls.
+        folder: std::fs::File,
     },
 }
+
+/// How many entries one Bot folder scan may visit.
+const MAX_SCAN_ENTRIES: usize = 10_000;
+/// How many directories below the Bot folder one scan may descend.
+const MAX_SCAN_DEPTH: usize = 8;
 
 impl LocalRuntime {
     /// Opens a managed workspace, creating it when absent.
@@ -98,10 +107,9 @@ impl LocalRuntime {
 
     /// Opens one Bot's folder on a real machine.
     ///
-    /// Reads reach everything the machine user can read, writes reach only the
-    /// folder, and the shell runs under bubblewrap. The constructor refuses
-    /// when bubblewrap is missing or cannot start a sandbox, so a daemon never
-    /// serves a Computer it cannot fence.
+    /// The folder is opened without following a symlink and is scanned once
+    /// for links and special files. See
+    /// [`machine_at`](LocalRuntime::machine_at) for the form a daemon uses.
     pub fn machine(folder: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
         Self::machine_with_bwrap(folder.into(), find_bwrap(), Vec::new())
     }
@@ -110,15 +118,48 @@ impl LocalRuntime {
     /// reach.
     ///
     /// A hidden root is invisible to both of this Bot's read paths: the file
-    /// tools open a file and resolve the opened descriptor's real path, and
-    /// the shell gets a fresh tmpfs mounted over each root. A write never
-    /// leaves the Bot's folder, and a target that lands under a hidden root is
-    /// refused before it is opened.
+    /// tools resolve the opened descriptor's real path, and the shell gets a
+    /// fresh tmpfs mounted over each root. A write never leaves the Bot's
+    /// folder, and a target that lands under a hidden root is refused before
+    /// it is opened.
     pub fn machine_with_hidden(
         folder: impl Into<PathBuf>,
         hidden: Vec<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         Self::machine_with_bwrap(folder.into(), find_bwrap(), hidden)
+    }
+
+    /// Opens one Bot's folder under a workspace root the caller opened.
+    ///
+    /// `workspace` is a directory descriptor (a daemon opens it with
+    /// `O_DIRECTORY | O_NOFOLLOW`), and `bot` is one path component under it.
+    /// The folder is created when absent and opened with `O_DIRECTORY |
+    /// O_NOFOLLOW`; every symlink on the way is refused. The folder is then
+    /// scanned once, and refused when it holds a hard link, a symlink, or a
+    /// special file.
+    pub fn machine_at(
+        workspace: &std::fs::File,
+        bot: &str,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        Self::machine_at_with(workspace, OsStr::new(bot), find_bwrap(), hidden)
+    }
+
+    /// Opens a machine's workspace root without following a symlink, creating
+    /// it when absent.
+    pub fn open_workspace(workspace: impl AsRef<Path>) -> Result<std::fs::File, RuntimeError> {
+        let workspace = workspace.as_ref();
+        std::fs::create_dir_all(workspace)?;
+        open_directory_path(workspace).map_err(RuntimeError::Io)
+    }
+
+    /// Checks that this machine can start a fenced shell.
+    ///
+    /// A daemon calls this before it serves, so a machine without bubblewrap
+    /// never accepts a Computer.
+    pub fn probe_sandbox() -> Result<(), RuntimeError> {
+        let bwrap = find_bwrap().ok_or_else(no_sandbox)?;
+        probe_bwrap(&bwrap, Path::new("/"), &[]).map_err(RuntimeError::NoSandbox)
     }
 
     /// Opens a real-machine runtime with a specific `bwrap`, for tests.
@@ -128,27 +169,89 @@ impl LocalRuntime {
         hidden: Vec<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let folder = folder.into();
-        std::fs::create_dir_all(&folder)?;
-        let folder = std::fs::canonicalize(&folder)?;
+        let parent = folder
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let name = folder.file_name().ok_or_else(|| {
+            RuntimeError::UnsafeFolder(format!(
+                "{} does not name one folder; clean it and start again (the default is ~/Neha/<bot-id>)",
+                folder.display()
+            ))
+        })?;
+        // The configured parent may be a new path; its final component is
+        // still opened without following a symlink.
+        std::fs::create_dir_all(parent)?;
+        let parent = open_directory_path(parent).map_err(RuntimeError::Io)?;
+
+        Self::machine_at_with(&parent, name, bwrap, hidden)
+    }
+
+    /// Opens a real-machine runtime under a verified workspace root descriptor.
+    #[cfg(unix)]
+    fn machine_at_with(
+        workspace: &std::fs::File,
+        bot: &OsStr,
+        bwrap: Option<PathBuf>,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        if !is_one_component(bot) {
+            return Err(RuntimeError::UnsafeFolder(format!(
+                "{} is not one folder name; clean it and start again (the default is ~/Neha/<bot-id>)",
+                bot.to_string_lossy()
+            )));
+        }
+        let workspace_path = opened_path(workspace).map_err(RuntimeError::Io)?;
+        let folder_path = workspace_path.join(bot);
+        let folder = open_or_create_machine_folder(workspace, bot, &folder_path)?;
         // A hidden root must exist: it is the directory the daemon wrote its
         // own configuration into, and a missing one would mean the tmpfs that
         // hides it cannot be mounted.
         let hidden = hidden
             .into_iter()
-            .map(|root| std::fs::canonicalize(&root))
+            .map(|root| std::fs::canonicalize(&root).map_err(RuntimeError::Io))
             .collect::<Result<Vec<_>, _>>()?;
-        let bwrap = bwrap.ok_or_else(|| {
-            RuntimeError::NoSandbox("bwrap was not found on PATH; install bubblewrap".to_owned())
-        })?;
-        probe_bwrap(&bwrap, &folder, &hidden).map_err(RuntimeError::NoSandbox)?;
+        for root in &hidden {
+            if root.starts_with(&folder_path) {
+                return Err(unsafe_folder(
+                    &folder_path,
+                    format!("it contains the configuration directory {}", root.display()),
+                ));
+            }
+            if folder_path.starts_with(root) {
+                return Err(unsafe_folder(
+                    &folder_path,
+                    format!("it sits inside the hidden directory {}", root.display()),
+                ));
+            }
+        }
+        scan_bot_folder(&folder, &folder_path)?;
+        let bwrap = bwrap.ok_or_else(no_sandbox)?;
+        probe_bwrap(&bwrap, &folder_path, &hidden).map_err(RuntimeError::NoSandbox)?;
 
         Ok(Self {
-            root: folder,
-            mode: Mode::Machine { bwrap },
+            root: folder_path,
+            mode: Mode::Machine { bwrap, folder },
             hidden,
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
         })
+    }
+
+    /// Opens a real-machine runtime under a verified workspace root descriptor.
+    ///
+    /// A real Computer runs only on Unix, where a folder is a descriptor and
+    /// bubblewrap fences its shell; every other platform refuses it.
+    #[cfg(not(unix))]
+    fn machine_at_with(
+        _workspace: &std::fs::File,
+        _bot: &OsStr,
+        _bwrap: Option<PathBuf>,
+        _hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        Err(RuntimeError::NoSandbox(
+            "a real Computer runs only on Unix".to_owned(),
+        ))
     }
 
     /// Kills the process group of the shell that is running, if one is.
@@ -284,7 +387,7 @@ impl LocalRuntime {
 
                 Ok(self.relative(&path))
             }
-            Mode::Machine { .. } => {
+            Mode::Machine { folder, .. } => {
                 // A write cannot leave the Bot's folder, so a hidden root is
                 // only reachable when that folder itself sits under one; that
                 // is a misconfiguration the daemon refuses, and a write is
@@ -292,7 +395,7 @@ impl LocalRuntime {
                 if self.is_hidden(&normalize_path(&self.root.join(input.trim()))) {
                     return Err(ByteError::Failed(hidden_error(input.trim())));
                 }
-                write_machine_file(&self.root, input, bytes)?;
+                write_machine_file(folder, input, bytes)?;
                 Ok(input.trim().to_owned())
             }
         }
@@ -310,27 +413,60 @@ impl LocalRuntime {
         self.hidden.iter().any(|root| path.starts_with(root))
     }
 
-    /// Opens a path for a read, refusing a target under a hidden root.
+    /// Opens a file whose bytes this runtime may read.
     ///
-    /// The hidden check resolves the opened descriptor's real path, not the
-    /// path a caller typed, so a symlink or a swap between resolving and
-    /// opening cannot move a hidden file past it: the descriptor decides.
-    fn open_read(&self, path: &Path) -> Result<std::fs::File, String> {
-        let file = std::fs::File::open(path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-        self.refuse_hidden(&file, path)?;
-
-        Ok(file)
+    /// A managed read is an ordinary open. A real-machine read opens with
+    /// `O_NONBLOCK | O_NOFOLLOW` — a FIFO cannot block it and a symlink is not
+    /// followed — requires a regular file, and refuses a descriptor that
+    /// resolves under a hidden root.
+    fn open_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+        match &self.mode {
+            Mode::Managed => {
+                let file = std::fs::File::open(path)
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+                Ok((file, metadata))
+            }
+            Mode::Machine { .. } => self.open_machine_read(path),
+        }
     }
 
-    /// Opens a directory for listing, refusing a target under a hidden root.
-    fn open_directory(&self, path: &Path) -> Result<(), String> {
-        if self.hidden.is_empty() {
-            return Ok(());
+    /// A real-machine read of one opened regular file.
+    ///
+    /// The open follows a symlink, as the machine user's own tools do: reading
+    /// is limited by the machine user's permissions, not by the write fence.
+    /// The hidden check still sees through it, because it reads the opened
+    /// descriptor's real path. The open is non-blocking and the descriptor
+    /// must hold a regular file, so a FIFO or a device is refused instead of
+    /// waited on.
+    #[cfg(unix)]
+    fn open_machine_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+        use std::os::fd::FromRawFd as _;
+
+        let shown = self.relative(path);
+        let name = c_name(path.as_os_str())
+            .map_err(|message| format!("cannot read {shown}: {message}"))?;
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_CLOEXEC;
+        // SAFETY: `name` is NUL-terminated; a successful return is a fresh
+        // descriptor this function owns.
+        let fd = unsafe { libc::openat(libc::AT_FDCWD, name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(format!("cannot read {shown}: {error}"));
         }
-        let directory = std::fs::File::open(path)
-            .map_err(|error| format!("cannot list {}: {error}", self.relative(path)))?;
-        self.refuse_hidden(&directory, path)
+        // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot read {shown}: {error}"))?;
+        if !metadata.is_file() {
+            return Err(format!("{shown} is not a regular file"));
+        }
+        self.refuse_hidden(&file, path)?;
+
+        Ok((file, metadata))
     }
 
     /// Refuses an opened file or directory that resolves under a hidden root.
@@ -353,15 +489,9 @@ impl LocalRuntime {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
-        let mut file = match self.open_read(&path) {
-            Ok(file) => file,
+        let (mut file, metadata) = match self.open_read(&path) {
+            Ok(opened) => opened,
             Err(error) => return ActionResult::failed(error),
-        };
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) => {
-                return ActionResult::failed(format!("cannot read {}: {error}", path.display()));
-            }
         };
         if !metadata.is_file() {
             return ActionResult::failed(format!("{} is not a file", self.relative(&path)));
@@ -412,35 +542,103 @@ impl LocalRuntime {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
-        if let Err(error) = self.open_directory(&path) {
-            return ActionResult::failed(error);
-        }
-        let entries = match std::fs::read_dir(&path) {
-            Ok(entries) => entries,
-            Err(error) => {
-                return ActionResult::failed(format!(
-                    "cannot list {}: {error}",
-                    self.relative(&path)
-                ));
-            }
+        let lines = match &self.mode {
+            Mode::Managed => match std::fs::read_dir(&path) {
+                Ok(entries) => list_entries(entries),
+                Err(error) => {
+                    return ActionResult::failed(format!(
+                        "cannot list {}: {error}",
+                        self.relative(&path)
+                    ));
+                }
+            },
+            Mode::Machine { .. } => match self.list_machine_directory(&path) {
+                Ok(lines) => lines,
+                Err(error) => return ActionResult::failed(error),
+            },
         };
-        let mut lines = Vec::new();
-        for entry in entries.take(MAX_LIST_ENTRIES) {
-            let Ok(entry) = entry else { continue };
-            let kind = match entry.file_type() {
-                Ok(kind) if kind.is_dir() => "dir ",
-                Ok(kind) if kind.is_symlink() => "link",
-                Ok(_) => "file",
-                Err(_) => "?   ",
-            };
-            lines.push(format!("{kind} {}", entry.file_name().to_string_lossy()));
+
+        ActionResult::succeeded(truncate(lines.join("\n")))
+    }
+
+    /// Lists one directory of a real machine through the descriptor it opened.
+    ///
+    /// The directory is opened once with `O_DIRECTORY | O_NOFOLLOW`, checked
+    /// against the hidden roots, and then walked through that same descriptor:
+    /// a path swapped in between the check and the walk cannot change what is
+    /// listed.
+    #[cfg(unix)]
+    fn list_machine_directory(&self, path: &Path) -> Result<Vec<String>, String> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let shown = self.relative(path);
+        let name = c_name(path.as_os_str())
+            .map_err(|message| format!("cannot list {shown}: {message}"))?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `name` is NUL-terminated; a successful return is a fresh
+        // descriptor this function owns.
+        let fd = unsafe { libc::openat(libc::AT_FDCWD, name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(libc::ELOOP) => {
+                    format!("the path is a symlink, which is not listed: {shown}")
+                }
+                _ => format!("cannot list {shown}: {error}"),
+            });
         }
+        // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
+        let directory = unsafe { std::fs::File::from_raw_fd(fd) };
+        self.refuse_hidden(&directory, path)?;
+        let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+        if duplicate < 0 {
+            return Err(format!(
+                "cannot list {shown}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let stream = unsafe { libc::fdopendir(duplicate) };
+        if stream.is_null() {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: `duplicate` is still ours when `fdopendir` fails.
+            unsafe { libc::close(duplicate) };
+            return Err(format!("cannot list {shown}: {error}"));
+        }
+        let mut lines = Vec::new();
+        let result = (|| -> std::io::Result<()> {
+            while let Some(name) = next_directory_entry(stream)? {
+                if lines.len() == MAX_LIST_ENTRIES {
+                    break;
+                }
+                let kind = match fstatat(&directory, &name) {
+                    Ok(metadata) => match metadata.st_mode & libc::S_IFMT {
+                        libc::S_IFDIR => "dir ",
+                        libc::S_IFLNK => "link",
+                        libc::S_IFREG => "file",
+                        _ => "?   ",
+                    },
+                    Err(_) => "?   ",
+                };
+                lines.push(format!("{kind} {}", name.to_string_lossy()));
+            }
+
+            Ok(())
+        })();
+        // SAFETY: `stream` is the open directory stream created above.
+        unsafe { libc::closedir(stream) };
+        result.map_err(|error| format!("cannot list {shown}: {error}"))?;
         lines.sort();
         if lines.is_empty() {
             lines.push("(empty)".to_owned());
         }
 
-        ActionResult::succeeded(truncate(lines.join("\n")))
+        Ok(lines)
+    }
+
+    /// Lists a directory on a system without real-drive descriptors.
+    #[cfg(not(unix))]
+    fn list_machine_directory(&self, _path: &Path) -> Result<Vec<String>, String> {
+        Err("a real Computer lists only on Unix".to_owned())
     }
 
     /// Builds the shell process for this mode, without starting it.
@@ -451,7 +649,7 @@ impl LocalRuntime {
                 process.arg("-c").arg(command).current_dir(&self.root);
                 process
             }
-            Mode::Machine { bwrap } => {
+            Mode::Machine { bwrap, .. } => {
                 let mut process = sandbox_command(bwrap, &self.root, &self.hidden);
                 process
                     .arg("/bin/sh")
@@ -586,10 +784,7 @@ impl ComputerRuntime for LocalRuntime {
         let resolved = self.resolve_read(path);
         async move {
             let path = resolved.map_err(ByteError::Failed)?;
-            let mut file = self.open_read(&path).map_err(ByteError::Failed)?;
-            let metadata = file.metadata().map_err(|error| {
-                ByteError::Failed(format!("cannot read {}: {error}", path.display()))
-            })?;
+            let (mut file, metadata) = self.open_read(&path).map_err(ByteError::Failed)?;
             if !metadata.is_file() {
                 return Err(ByteError::Failed(format!(
                     "{} is not a file",
@@ -788,17 +983,322 @@ fn without_deleted_suffix(path: PathBuf) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Writes bytes to a relative path inside `root` without following a symlink
-/// or writing a hard link.
+/// Renders the entries of a managed directory, one per line.
+fn list_entries(entries: std::fs::ReadDir) -> Vec<String> {
+    let mut lines = Vec::new();
+    for entry in entries.take(MAX_LIST_ENTRIES) {
+        let Ok(entry) = entry else { continue };
+        let kind = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => "dir ",
+            Ok(kind) if kind.is_symlink() => "link",
+            Ok(_) => "file",
+            Err(_) => "?   ",
+        };
+        lines.push(format!("{kind} {}", entry.file_name().to_string_lossy()));
+    }
+    lines.sort();
+    if lines.is_empty() {
+        lines.push("(empty)".to_owned());
+    }
+
+    lines
+}
+
+/// The error a real-machine constructor returns when bubblewrap is absent.
+fn no_sandbox() -> RuntimeError {
+    RuntimeError::NoSandbox("bwrap was not found on PATH; install bubblewrap".to_owned())
+}
+
+/// Returns whether a name is exactly one normal path component.
+fn is_one_component(name: &OsStr) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(part)) if part == name)
+        && components.next().is_none()
+}
+
+/// Builds the refusal a Bot folder that cannot be served gets.
+fn unsafe_folder(folder_path: &Path, problem: impl std::fmt::Display) -> RuntimeError {
+    RuntimeError::UnsafeFolder(format!(
+        "{problem}; clean {} and start again (the default is ~/Neha/<bot-id>)",
+        folder_path.display()
+    ))
+}
+
+/// Opens the Bot's folder under `workspace`, creating it when absent.
+///
+/// `open_directory_at` never follows a symlink, so neither a Bot folder that
+/// is a symlink nor one that is not a directory is ever served.
+#[cfg(unix)]
+fn open_or_create_machine_folder(
+    workspace: &std::fs::File,
+    name: &OsStr,
+    folder_path: &Path,
+) -> Result<std::fs::File, RuntimeError> {
+    use std::os::fd::AsRawFd as _;
+
+    match open_directory_at(workspace, name) {
+        Ok(folder) => Ok(folder),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name_c = c_name(name).map_err(|message| {
+                unsafe_folder(folder_path, format!("its name is not usable: {message}"))
+            })?;
+            // SAFETY: `workspace` is a live directory descriptor and `name_c`
+            // is NUL-terminated; `mkdirat` takes no ownership of it.
+            let created = unsafe { libc::mkdirat(workspace.as_raw_fd(), name_c.as_ptr(), 0o755) };
+            if created != 0 {
+                let error = std::io::Error::last_os_error();
+                // Another writer may have created it between open and mkdir.
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(RuntimeError::Io(error));
+                }
+            }
+            open_directory_at(workspace, name)
+                .map_err(|error| folder_open_error(workspace, name, error, folder_path))
+        }
+        Err(error) => Err(folder_open_error(workspace, name, error, folder_path)),
+    }
+}
+
+/// Names the reason a Bot folder could not be opened as a directory.
+#[cfg(unix)]
+fn folder_open_error(
+    workspace: &std::fs::File,
+    name: &OsStr,
+    error: std::io::Error,
+    folder_path: &Path,
+) -> RuntimeError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) => unsafe_folder(folder_path, "it is a symlink"),
+        // A symlink opened with `O_DIRECTORY | O_NOFOLLOW` is not a directory,
+        // and Linux may name it either way.
+        Some(libc::ENOTDIR) if is_symlink_at(workspace, name) => {
+            unsafe_folder(folder_path, "it is a symlink")
+        }
+        Some(libc::ENOTDIR) => unsafe_folder(folder_path, "it is not a directory"),
+        _ => RuntimeError::Io(error),
+    }
+}
+
+/// Scans a Bot's folder once, refusing links and special files.
+///
+/// The scan is bounded: at most [`MAX_SCAN_ENTRIES`] entries and
+/// [`MAX_SCAN_DEPTH`] directories below the folder. A folder beyond either
+/// bound is refused rather than trusted.
+#[cfg(unix)]
+fn scan_bot_folder(folder: &std::fs::File, folder_path: &Path) -> Result<(), RuntimeError> {
+    let mut budget = MAX_SCAN_ENTRIES;
+    scan_directory(folder, folder_path, Path::new(""), 0, &mut budget)
+}
+
+/// Scans one directory of a Bot folder, refusing what a write must not meet.
+#[cfg(unix)]
+fn scan_directory(
+    directory: &std::fs::File,
+    folder_path: &Path,
+    relative: &Path,
+    depth: usize,
+    budget: &mut usize,
+) -> Result<(), RuntimeError> {
+    use std::os::fd::AsRawFd as _;
+
+    if depth > MAX_SCAN_DEPTH {
+        return Err(unsafe_folder(
+            folder_path,
+            format!(
+                "it has more than {MAX_SCAN_DEPTH} nested directories: {}",
+                relative.display()
+            ),
+        ));
+    }
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `duplicate` is still ours when `fdopendir` fails.
+        unsafe { libc::close(duplicate) };
+        return Err(RuntimeError::Io(error));
+    }
+    let result = scan_entries(directory, folder_path, relative, depth, budget, stream);
+    // SAFETY: `stream` is the open directory stream created above.
+    unsafe { libc::closedir(stream) };
+
+    result
+}
+
+/// Visits the entries of one open directory, bounded by `budget`.
+#[cfg(unix)]
+fn scan_entries(
+    directory: &std::fs::File,
+    folder_path: &Path,
+    relative: &Path,
+    depth: usize,
+    budget: &mut usize,
+    stream: *mut libc::DIR,
+) -> Result<(), RuntimeError> {
+    while let Some(name) = next_directory_entry(stream).map_err(RuntimeError::Io)? {
+        if *budget == 0 {
+            return Err(unsafe_folder(
+                folder_path,
+                format!("it has more than {MAX_SCAN_ENTRIES} entries"),
+            ));
+        }
+        *budget -= 1;
+        let child = relative.join(&name);
+        let metadata = match fstatat(directory, &name) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(RuntimeError::Io(error)),
+        };
+        match metadata.st_mode & libc::S_IFMT {
+            libc::S_IFLNK => {
+                return Err(unsafe_folder(
+                    folder_path,
+                    format!("it contains a symlink: {}", child.display()),
+                ));
+            }
+            libc::S_IFDIR => {
+                let child_directory = open_directory_at(directory, &name)
+                    .map_err(|error| folder_open_error(directory, &name, error, folder_path))?;
+                scan_directory(&child_directory, folder_path, &child, depth + 1, budget)?;
+            }
+            libc::S_IFREG => {
+                if metadata.st_nlink > 1 {
+                    return Err(unsafe_folder(
+                        folder_path,
+                        format!(
+                            "it contains a hard link ({} links): {}",
+                            metadata.st_nlink,
+                            child.display()
+                        ),
+                    ));
+                }
+            }
+            _ => {
+                return Err(unsafe_folder(
+                    folder_path,
+                    format!("it contains a special file: {}", child.display()),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads one entry from an open directory stream, or `None` at its end.
+#[cfg(unix)]
+fn next_directory_entry(stream: *mut libc::DIR) -> std::io::Result<Option<OsString>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    loop {
+        clear_errno();
+        // SAFETY: `stream` is an open directory stream owned by the caller.
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = std::io::Error::last_os_error();
+            // A cleared errno of 0 means the end of the stream, not a failure.
+            return if error.raw_os_error() == Some(0) {
+                Ok(None)
+            } else {
+                Err(error)
+            };
+        }
+        // SAFETY: `entry` points at a valid entry for the life of `stream`.
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        let name = OsStr::from_bytes(name.to_bytes());
+        if name == "." || name == ".." {
+            continue;
+        }
+        return Ok(Some(name.to_owned()));
+    }
+}
+
+/// Clears the thread's errno before `readdir`, which reports its end that way.
+#[cfg(all(unix, target_os = "linux"))]
+fn clear_errno() {
+    // SAFETY: the thread's errno slot is always valid to write.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+/// Clears the thread's errno before `readdir`, which reports its end that way.
+///
+/// A real Computer runs only on Linux, where the helper above is compiled; on
+/// another Unix the scan never runs and a null `readdir` is treated as the
+/// end.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn clear_errno() {}
+
+/// Stats one entry of a directory without following a symlink.
+#[cfg(unix)]
+fn fstatat(directory: &std::fs::File, name: &OsStr) -> std::io::Result<libc::stat> {
+    use std::os::fd::AsRawFd as _;
+
+    let name = c_name(name)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    // SAFETY: `stat` is a plain C structure owned here.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `directory` is a live descriptor, `name` is NUL-terminated, and
+    // `stat` outlives the call.
+    let found = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if found != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(stat)
+}
+
+/// Opens a directory without following a symlink.
+#[cfg(unix)]
+fn open_directory_path(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("the path contains a NUL byte: {}", path.display()),
+        )
+    })?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated; a successful return is a fresh
+    // descriptor this function owns.
+    let fd = unsafe { libc::open(name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor from `open` and is owned here.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Opens a directory without following a symlink, on a system without them.
+#[cfg(not(unix))]
+fn open_directory_path(_path: &Path) -> std::io::Result<std::fs::File> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "a real Computer runs only on Unix",
+    ))
+}
+
+/// Writes bytes to a relative path inside the Bot's folder descriptor without
+/// following a symlink, writing a hard link, or opening a special file.
 ///
 /// Every component is opened with `O_NOFOLLOW` relative to the descriptor of
 /// its parent, so a shell that swaps in a symlink between two tool calls
 /// cannot move the write out of the folder and there is no check-then-open
-/// window. The target is opened without `O_TRUNC`, checked with `fstat` — a
-/// file this Computer wrote itself has one link — and only then truncated and
-/// written.
+/// window. The target is opened without `O_TRUNC`, checked with `fstat` — it
+/// must be a regular file with one link — and only then truncated and written.
 #[cfg(unix)]
-fn write_machine_file(root: &Path, input: &str, bytes: &[u8]) -> Result<(), ByteError> {
+fn write_machine_file(folder: &std::fs::File, input: &str, bytes: &[u8]) -> Result<(), ByteError> {
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -808,7 +1308,9 @@ fn write_machine_file(root: &Path, input: &str, bytes: &[u8]) -> Result<(), Byte
             "the path does not name a file: {shown}"
         )));
     };
-    let mut directory = open_root(root)?;
+    let mut directory = folder
+        .try_clone()
+        .map_err(|error| ByteError::Failed(format!("cannot use the Bot's folder: {error}")))?;
     for name in components {
         directory = open_or_create_directory(&directory, &name, &shown)?;
     }
@@ -816,6 +1318,9 @@ fn write_machine_file(root: &Path, input: &str, bytes: &[u8]) -> Result<(), Byte
     let metadata = file
         .metadata()
         .map_err(|error| ByteError::Failed(format!("cannot write {shown}: {error}")))?;
+    if !metadata.is_file() {
+        return Err(ByteError::Failed(format!("{shown} is not a regular file")));
+    }
     if metadata.nlink() > 1 {
         return Err(ByteError::Failed(format!(
             "the path is a hard link, which is not written through: {shown}"
@@ -832,36 +1337,14 @@ fn write_machine_file(root: &Path, input: &str, bytes: &[u8]) -> Result<(), Byte
 /// directory and stepped into; the constructor already refuses any other
 /// platform.
 #[cfg(not(unix))]
-fn write_machine_file(_root: &Path, _input: &str, _bytes: &[u8]) -> Result<(), ByteError> {
+fn write_machine_file(
+    _folder: &std::fs::File,
+    _input: &str,
+    _bytes: &[u8],
+) -> Result<(), ByteError> {
     Err(ByteError::Failed(
         "a real Computer writes only on Unix".to_owned(),
     ))
-}
-
-/// Opens the Bot's folder itself as a directory, refusing a symlink there.
-#[cfg(unix)]
-fn open_root(root: &Path) -> Result<std::fs::File, ByteError> {
-    use std::os::fd::FromRawFd as _;
-    use std::os::unix::ffi::OsStrExt as _;
-
-    let name = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|_| {
-        ByteError::Failed(format!(
-            "the Bot's folder path contains a NUL byte: {}",
-            root.display()
-        ))
-    })?;
-    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    // SAFETY: `name` is NUL-terminated; a successful return is a fresh
-    // descriptor this function owns.
-    let fd = unsafe { libc::open(name.as_ptr(), flags) };
-    if fd < 0 {
-        return Err(ByteError::Failed(format!(
-            "cannot open the Bot's folder: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: `fd` is a fresh descriptor from `open` and is owned here.
-    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
 }
 
 /// Splits a real machine's write path into safe components.
@@ -1016,8 +1499,8 @@ fn directory_error(
     }
 }
 
-/// Opens the file a write ends at, without following a symlink and without
-/// truncating it yet.
+/// Opens the file a write ends at, without following a symlink, without
+/// blocking on a FIFO, and without truncating it yet.
 #[cfg(unix)]
 fn open_target_file(
     parent: &std::fs::File,
@@ -1026,8 +1509,31 @@ fn open_target_file(
 ) -> Result<std::fs::File, ByteError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
+    // Refuse a special file before opening it: a write end of a FIFO would
+    // otherwise wait for a reader, and opening a device can have effects.
+    match fstatat(parent, name) {
+        Ok(metadata) => match metadata.st_mode & libc::S_IFMT {
+            libc::S_IFREG => {}
+            libc::S_IFLNK => {
+                return Err(ByteError::Failed(format!(
+                    "the path uses a symlink, which is not written through: {shown}"
+                )));
+            }
+            libc::S_IFDIR => {
+                return Err(ByteError::Failed(format!(
+                    "the path is a directory, not a file: {shown}"
+                )));
+            }
+            _ => {
+                return Err(ByteError::Failed(format!("{shown} is not a regular file")));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
+    }
     let name = c_name(name).map_err(ByteError::Failed)?;
-    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let flags =
+        libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `parent` is a live directory descriptor and `name` is
     // NUL-terminated; a successful return is a fresh descriptor owned here.
     let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o600) };
@@ -1043,6 +1549,8 @@ fn open_target_file(
         Some(libc::EISDIR) => Err(ByteError::Failed(format!(
             "the path is a directory, not a file: {shown}"
         ))),
+        // A FIFO with no reader refuses a non-blocking write this way.
+        Some(libc::ENXIO) => Err(ByteError::Failed(format!("{shown} is not a regular file"))),
         _ => Err(ByteError::Failed(format!("cannot write {shown}: {error}"))),
     }
 }
@@ -1284,6 +1792,10 @@ pub enum RuntimeError {
     /// real Computer would run unfenced.
     #[error("the machine cannot be fenced: {0}")]
     NoSandbox(String),
+    /// The Bot's folder cannot be served because of what it holds or where it
+    /// sits; the message names the folder and what to clean.
+    #[error("{0}")]
+    UnsafeFolder(String),
 }
 
 #[cfg(test)]
@@ -1293,8 +1805,10 @@ mod tests {
 
     use neha::file::MAX_FILE_BYTES;
 
-    use super::{DEFAULT_TIMEOUT, LocalRuntime, Mode};
-    use crate::action::{Action, ActionStatus, ComputerRuntime};
+    use super::{
+        DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, Mode, RuntimeError, open_directory_path,
+    };
+    use crate::action::{Action, ActionStatus, ByteError, ComputerRuntime};
 
     fn omitted_in_text(text: &str) -> u64 {
         let start = text.find("[... ").expect("an omission marker") + 5;
@@ -1309,14 +1823,32 @@ mod tests {
         (directory, runtime)
     }
 
+    /// Returns whether the bubblewrap tests are switched on.
+    fn bwrap_enabled() -> bool {
+        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+            return false;
+        }
+        true
+    }
+
+    /// Makes a FIFO without opening it.
+    #[cfg(unix)]
+    fn make_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo exists");
+        assert!(status.success(), "mkfifo failed");
+    }
+
     /// Returns a real-machine runtime, or `None` when the bwrap tests are off.
     ///
     /// `NEHA_TEST_BWRAP` opens them. Once it is set, a missing or broken
     /// bubblewrap fails the test instead of skipping: the gate promises a
     /// working sandbox.
     fn machine_runtime() -> Option<(tempfile::TempDir, LocalRuntime)> {
-        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
-            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+        if !bwrap_enabled() {
             return None;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -1360,6 +1892,7 @@ mod tests {
             root: std::fs::canonicalize(root).unwrap(),
             mode: Mode::Machine {
                 bwrap: std::path::PathBuf::from("bwrap"),
+                folder: open_directory_path(&std::fs::canonicalize(root).unwrap()).unwrap(),
             },
             hidden: vec![std::fs::canonicalize(hidden).unwrap()],
             timeout: DEFAULT_TIMEOUT,
@@ -2444,5 +2977,273 @@ mod tests {
 
         assert_eq!(result.status, ActionStatus::TimedOut, "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bot_folder_that_is_a_symlink_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, directory.path().join("bot")).unwrap();
+
+        let error =
+            LocalRuntime::machine_with_bwrap(directory.path().join("bot"), None, Vec::new())
+                .err()
+                .expect("a symlinked Bot folder is refused");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
+        assert!(error.to_string().contains("symlink"), "{error}");
+        assert!(error.to_string().contains("clean"), "{error}");
+
+        std::fs::write(directory.path().join("file"), "not a directory").unwrap();
+        let error =
+            LocalRuntime::machine_with_bwrap(directory.path().join("file"), None, Vec::new())
+                .err()
+                .expect("a file that is not a directory is refused");
+        assert!(error.to_string().contains("not a directory"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_workspace_root_opens_without_following_a_symlink() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let root = LocalRuntime::open_workspace(&workspace).unwrap();
+        assert!(workspace.is_dir());
+        drop(root);
+
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, directory.path().join("linked")).unwrap();
+        assert!(
+            LocalRuntime::open_workspace(directory.path().join("linked")).is_err(),
+            "a symlinked workspace root is not followed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_holding_a_hard_link_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bot = directory.path().join("bot");
+        std::fs::create_dir_all(bot.join("sub")).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "host").unwrap();
+        std::fs::hard_link(&outside, bot.join("sub/inside.txt")).unwrap();
+
+        let error = LocalRuntime::machine_with_bwrap(&bot, None, Vec::new())
+            .err()
+            .expect("a folder holding a hard link is refused");
+        assert!(error.to_string().contains("hard link"), "{error}");
+        assert!(error.to_string().contains("clean"), "{error}");
+        assert!(
+            error.to_string().contains("~/Neha/<bot-id>"),
+            "the refusal tells the user what to clean: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_holding_a_symlink_or_a_special_file_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bot = directory.path().join("bot");
+        std::fs::create_dir(&bot).unwrap();
+        std::os::unix::fs::symlink(directory.path().join("elsewhere"), bot.join("link")).unwrap();
+        let error = LocalRuntime::machine_with_bwrap(&bot, None, Vec::new())
+            .err()
+            .expect("a folder holding a symlink is refused");
+        assert!(error.to_string().contains("symlink"), "{error}");
+
+        std::fs::remove_file(bot.join("link")).unwrap();
+        make_fifo(&bot.join("pipe"));
+        let error = LocalRuntime::machine_with_bwrap(&bot, None, Vec::new())
+            .err()
+            .expect("a folder holding a FIFO is refused");
+        assert!(error.to_string().contains("special file"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_nested_past_the_scan_limit_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bot = directory.path().join("bot");
+        let mut deep = bot.clone();
+        for _ in 0..=MAX_SCAN_DEPTH {
+            deep = deep.join("d");
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let error = LocalRuntime::machine_with_bwrap(&bot, None, Vec::new())
+            .err()
+            .expect("a folder nested past the scan limit is refused");
+        assert!(error.to_string().contains("nested"), "{error}");
+    }
+
+    #[test]
+    fn a_hidden_root_inside_the_bot_folder_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let bot = directory.path().join("bot");
+        let hidden = bot.join("config");
+        std::fs::create_dir_all(&hidden).unwrap();
+
+        let error = LocalRuntime::machine_with_bwrap(&bot, None, vec![hidden])
+            .err()
+            .expect("a configuration directory inside the Bot folder is refused");
+        assert!(
+            error.to_string().contains("configuration directory"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_bot_folder_inside_a_hidden_root_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let hidden = directory.path().join("config");
+        let bot = hidden.join("bot");
+        std::fs::create_dir_all(&bot).unwrap();
+
+        let error = LocalRuntime::machine_with_bwrap(&bot, None, vec![hidden])
+            .err()
+            .expect("a Bot folder inside the configuration directory is refused");
+        assert!(error.to_string().contains("hidden directory"), "{error}");
+    }
+
+    #[test]
+    fn a_machine_is_probed_before_it_serves() {
+        if !bwrap_enabled() {
+            return;
+        }
+        LocalRuntime::probe_sandbox().expect("bubblewrap starts one empty sandbox");
+    }
+
+    #[tokio::test]
+    async fn a_workspace_root_descriptor_opens_one_bot_folder() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let root = LocalRuntime::open_workspace(&workspace).unwrap();
+        let runtime = LocalRuntime::machine_at(&root, "bot-id", Vec::new())
+            .expect("the workspace root opens a Bot folder");
+        assert!(workspace.join("bot-id").is_dir());
+
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "hello.txt".to_owned(),
+                content: "hi".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("bot-id/hello.txt")).unwrap(),
+            "hi"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_special_file_does_not_block_a_read_or_a_write() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let fifo = runtime.workspace().join("pipe");
+        make_fifo(&fifo);
+
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.execute(Action::ReadFile {
+                path: "pipe".to_owned(),
+            }),
+        )
+        .await
+        .expect("a FIFO read must not block");
+        assert_eq!(read.status, ActionStatus::Failed);
+        assert!(
+            read.output.text.contains("not a regular file"),
+            "{}",
+            read.output.text
+        );
+
+        let write = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.execute(Action::WriteFile {
+                path: "pipe".to_owned(),
+                content: "pwned".to_owned(),
+            }),
+        )
+        .await
+        .expect("a FIFO write must not block");
+        assert_eq!(write.status, ActionStatus::Failed);
+        assert!(
+            write.output.text.contains("not a regular file"),
+            "{}",
+            write.output.text
+        );
+
+        let bytes = tokio::time::timeout(Duration::from_secs(5), runtime.read_bytes("pipe"))
+            .await
+            .expect("a FIFO byte read must not block");
+        assert!(matches!(bytes, Err(ByteError::Failed(_))), "{bytes:?}");
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.write_bytes("pipe", b"pwned".to_vec()),
+        )
+        .await
+        .expect("a FIFO byte write must not block");
+        assert!(matches!(bytes, Err(ByteError::Failed(_))), "{bytes:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_read_follows_a_symlink_to_a_machine_file() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "readable through a link").unwrap();
+        std::os::unix::fs::symlink(&outside, runtime.workspace().join("link.txt")).unwrap();
+
+        let result = runtime
+            .execute(Action::ReadFile {
+                path: "link.txt".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert_eq!(result.output.text, "readable through a link");
+
+        let bytes = runtime.read_bytes("link.txt").await.unwrap();
+        assert_eq!(bytes, b"readable through a link");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_read_through_a_symlink_still_refuses_a_hidden_root() {
+        let Some((_directory, runtime, hidden)) = machine_runtime_with_hidden() else {
+            return;
+        };
+        let secret = hidden.join("computer.json");
+        std::fs::write(&secret, "credential").unwrap();
+        std::os::unix::fs::symlink(&secret, runtime.workspace().join("link.json")).unwrap();
+
+        let result = runtime
+            .execute(Action::ReadFile {
+                path: "link.json".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(
+            result.output.text.contains("hidden"),
+            "{}",
+            result.output.text
+        );
+
+        let bytes = runtime.read_bytes("link.json").await;
+        assert!(
+            bytes
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains("hidden")),
+            "{bytes:?}"
+        );
     }
 }
