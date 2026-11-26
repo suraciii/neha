@@ -113,8 +113,10 @@ describe("App with approvals", () => {
   it("shows what an Always allow would cover, in the Space's words or this page's", async () => {
     space.approvals.push(
       { ...byRule, approval: "a1", lasting_scope: 'shell commands starting with "git"' },
-      { ...byRule, approval: "a2", tool: "shell", summary: "git status", lasting_scope: null },
-      { ...byRule, approval: "a3", tool: "write_file", summary: "logs/out.txt", lasting_scope: null },
+      { ...byRule, approval: "a2", tool: "shell", summary: "shell: git status", lasting_scope: null },
+      { ...byRule, approval: "a3", tool: "write_file", summary: "write_file: logs/out.txt", lasting_scope: null },
+      // The arguments say where the action lands; the summary only names it.
+      { ...byRule, approval: "a4", tool: "write_file", arguments: { path: "cache/tmp.txt" }, summary: "write_file: logs/out.txt", lasting_scope: null },
     );
     const view = await openChat();
 
@@ -122,13 +124,35 @@ describe("App with approvals", () => {
       'Always allow covers: shell commands starting with "git"',
       'Always allow covers: shell commands starting with "git"',
       'Always allow covers: files under "logs"',
+      'Always allow covers: files under "cache"',
     ]);
 
     // The scope is a promise about the rule, so it leaves with the buttons.
     press(view, "Always allow");
-    await waitFor(() => expect(lines(view, ".approval__scope")).toHaveLength(2));
+    await waitFor(() => expect(lines(view, ".approval__scope")).toHaveLength(3));
     flush(() => fireEvent.click(element(view, ".locale-switch")));
     expect(lines(view, ".approval__scope")[0]).toBe('始终允许的范围：以 "git" 开头的 shell 命令');
+  });
+
+  it("does not blame the User's rule for an action no rule could judge", async () => {
+    space.approvals.push(
+      { ...byRule, approval: "a1", ambiguous: true },
+      { ...byRule, approval: "a2", ambiguous: false },
+      { ...firstUse, approval: "a3", ambiguous: true },
+    );
+    const view = await openChat();
+
+    expect(lines(view, ".approval__reason")).toEqual([
+      "This action has a form no rule can judge.",
+      "A rule you set asks before this action.",
+      "This action has a form no rule can judge.",
+    ]);
+
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
+    expect(lines(view, ".approval__reason").slice(0, 2)).toEqual([
+      "规则无法判断这个操作的形式。",
+      "你设置的规则要求先确认这个动作。",
+    ]);
   });
 
   it("says whether an action can be undone, in the reader's language", async () => {

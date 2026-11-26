@@ -46,9 +46,11 @@ Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path can name a path prefix.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, `list_files`, or `put_file`, can name a path prefix.
 
-At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, for a rule, what Always allow covers. It offers Allow, Always allow, Deny, or leaving it waiting; without a terminal it prints the run and approval ids and exits, for `neha approval allow` to answer.
+At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, for a rule, what Always allow covers. An ambiguous form gives the reason `a form no rule can judge`, not a rule the User set.
+
+It offers Allow, Always allow, Deny, or leaving it waiting; without a terminal it prints the run and approval ids and exits, for `neha approval allow` to answer.
 
 ## Gaps
 

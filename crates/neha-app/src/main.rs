@@ -1009,6 +1009,10 @@ fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> 
     if let Some(rule) = approval["rule"].as_str() {
         writeln!(out, "  rule {rule}")?;
     }
+    // An ambiguous approval cannot name one rule; saying so lets the User
+    // know the answer may create a different lasting rule than expected.
+    let ambiguous = approval["ambiguous"].as_bool().unwrap_or(false);
+    writeln!(out, "  ambiguous {ambiguous}")?;
     if let Some(arguments) = approval.get("arguments") {
         // The whole action, escaped and never clipped, so the User can check
         // exactly what the approval will run.
@@ -1185,9 +1189,9 @@ fn validate_rule_arguments(
         if tool == "shell" {
             bail!("--path-prefix matches file actions; shell uses --command-prefix");
         }
-        if !matches!(tool, "read_file" | "write_file" | "list_files") {
+        if !matches!(tool, "read_file" | "write_file" | "list_files" | "put_file") {
             bail!(
-                "--path-prefix matches file actions (read_file, write_file, list_files); \
+                "--path-prefix matches file actions (read_file, write_file, list_files, put_file); \
                  {tool} is not one"
             );
         }
@@ -1233,6 +1237,8 @@ struct ApprovalCard {
     summary: String,
     /// The reason the Space gave.
     reason: String,
+    /// Whether no rule can judge the action, so the reason cannot name one.
+    ambiguous: bool,
     /// Whether the Space says the action can be undone, when it says.
     undoable: Option<String>,
     /// What an Always allow would cover, in the Space's words.
@@ -1249,6 +1255,7 @@ impl ApprovalCard {
             tool: text_of(approval, "tool")?.to_owned(),
             summary: approval["summary"].as_str().unwrap_or_default().to_owned(),
             reason: text_of(approval, "reason")?.to_owned(),
+            ambiguous: approval["ambiguous"].as_bool().unwrap_or(false),
             undoable: approval["undoable"].as_str().map(str::to_owned),
             lasting_scope: approval["lasting_scope"].as_str().map(str::to_owned),
             arguments: approval.get("arguments").cloned().unwrap_or(Value::Null),
@@ -1317,6 +1324,9 @@ impl ApprovalCard {
     fn reason_text(&self) -> String {
         match self.reason.as_str() {
             "first_use_local" => "first use of your Local Computer".to_owned(),
+            // An ambiguous approval has no matching rule to name: saying a
+            // rule asked would tell the User something false.
+            "rule" if self.ambiguous => "a form no rule can judge".to_owned(),
             "rule" => "a rule you set".to_owned(),
             other => other.to_owned(),
         }
@@ -1694,6 +1704,7 @@ mod tests {
             tool: tool.to_owned(),
             summary: "printf approved > proof.txt".to_owned(),
             reason: reason.to_owned(),
+            ambiguous: false,
             undoable: None,
             lasting_scope: None,
             arguments: json!({"command": "printf approved > proof.txt"}),
@@ -1972,6 +1983,7 @@ mod tests {
         validate_rule_arguments("shell", Some("git"), None).unwrap();
         validate_rule_arguments("read_file", None, Some("/home/ada")).unwrap();
         validate_rule_arguments("write_file", None, Some(".")).unwrap();
+        validate_rule_arguments("put_file", None, Some("logs")).unwrap();
 
         for (tool, command_prefix, path_prefix, expected) in [
             ("shell", Some("git"), Some("/tmp"), "at most one"),
@@ -2025,11 +2037,13 @@ mod tests {
             "tool": "shell",
             "summary": "printf hi",
             "reason": "rule",
+            "ambiguous": true,
             "undoable": "no",
             "lasting_scope": "shell commands starting with \"printf\"",
             "arguments": {"command": "printf hi"},
         });
         let card = ApprovalCard::from_view(&view).unwrap();
+        assert!(card.ambiguous);
         assert_eq!(card.undoable.as_deref(), Some("no"));
         assert_eq!(
             card.lasting_scope.as_deref(),
@@ -2043,6 +2057,10 @@ mod tests {
         );
         assert!(
             rendered.contains("Always allow covers: shell commands starting with \"printf\""),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("reason: a form no rule can judge"),
             "{rendered}"
         );
     }
@@ -2109,6 +2127,38 @@ mod tests {
                 .render()
                 .contains("It is not known whether this action can be undone.")
         );
+    }
+
+    #[test]
+    fn a_card_does_not_blame_a_rule_when_no_rule_can_judge() {
+        // An ambiguous approval has no matching rule: the card must not say a
+        // rule asked, while an ordinary rule approval still names the rule.
+        let mut card = approval_card("shell", "rule");
+        card.ambiguous = true;
+        let rendered = card.render();
+        assert!(
+            rendered.contains("reason: a form no rule can judge"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("a rule you set"), "{rendered}");
+
+        let card = approval_card("shell", "rule");
+        let rendered = card.render();
+        assert!(rendered.contains("reason: a rule you set"), "{rendered}");
+        assert!(!rendered.contains("a form no rule can judge"), "{rendered}");
+
+        // The first-use reason is unchanged even if the field says ambiguous.
+        for ambiguous in [false, true] {
+            let mut card = approval_card("shell", "first_use_local");
+            card.ambiguous = ambiguous;
+            let rendered = card.render();
+            assert!(
+                rendered.contains("reason: first use of your Local Computer"),
+                "{rendered}"
+            );
+            assert!(!rendered.contains("a rule you set"), "{rendered}");
+            assert!(!rendered.contains("a form no rule can judge"), "{rendered}");
+        }
     }
 
     #[test]
@@ -2201,6 +2251,7 @@ mod tests {
     #[test]
     fn approval_show_prints_the_full_arguments() {
         let command = format!("printf '{}' > proof.txt", "a".repeat(400));
+        let rule = Id::new();
         let approval = json!({
             "approval": Id::new(),
             "run": Id::new(),
@@ -2211,6 +2262,8 @@ mod tests {
             "index": 3,
             "tool": "shell",
             "reason": "rule",
+            "rule": rule,
+            "ambiguous": false,
             "summary": "printf long",
             "arguments": {"command": command, "cwd": "logs"},
         });
@@ -2218,9 +2271,43 @@ mod tests {
         write_approval_details(&mut out, &approval).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("  index 3"), "{out}");
+        assert!(out.contains(&format!("  rule {rule}")), "{out}");
+        assert!(out.contains("  ambiguous false"), "{out}");
         let expected = escape_text(&serde_json::to_string(&approval["arguments"]).unwrap());
         assert!(out.contains(&format!("  arguments {expected}")), "{out}");
         assert!(out.contains(&"a".repeat(400)), "the whole command is shown");
+    }
+
+    #[test]
+    fn approval_show_marks_an_ambiguous_approval() {
+        // A rule that cannot judge the action names no single rule; the User
+        // must see that before answering.
+        let mut approval = json!({
+            "approval": Id::new(),
+            "run": Id::new(),
+            "bot": Id::new(),
+            "action": Id::new(),
+            "chat": Id::new(),
+            "step": 1,
+            "index": 0,
+            "tool": "shell",
+            "reason": "rule",
+            "ambiguous": true,
+            "summary": "printf?",
+            "arguments": {"command": "printf? $(date)"},
+        });
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  ambiguous true"), "{out}");
+        assert!(!out.contains("  rule "), "{out}");
+
+        // A view without the field is not called ambiguous.
+        approval.as_object_mut().unwrap().remove("ambiguous");
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  ambiguous false"), "{out}");
     }
 
     #[test]

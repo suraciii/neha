@@ -880,6 +880,16 @@ impl LocalComputer {
         self.directory.path()
     }
 
+    /// Stops the Space and starts it again on the same address, without
+    /// waiting for the Computer to reconnect.
+    fn restart_space_only(&mut self) {
+        let port = space_port(&self.url);
+        drop(self.server.take());
+        let (server, url, _invite) = serve_on(&self.home, port);
+        assert_eq!(url, self.url, "the Space restarts on its own address");
+        self.server = Some(server);
+    }
+
     /// Stops the Space and starts it again on the same address.
     ///
     /// The daemon reconnects by itself, as it does for a User restarting
@@ -3540,6 +3550,7 @@ async fn a_waiting_approval_survives_a_space_restart() {
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
     let mut computer = local_computer(directory, &base, &script);
+    let folder = computer.workspace.join(&computer.bot);
     let added = run(
         &computer.home,
         &computer.credential,
@@ -3553,13 +3564,16 @@ async fn a_waiting_approval_survives_a_space_restart() {
             "--tool",
             "shell",
             "--command-prefix",
-            "printf",
+            "touch",
         ],
     );
     let ask = first_word(&field(&added, "Added rule "));
     // A plain command: with a shell rule, a redirection would be ambiguous and
     // would ask without naming that rule.
-    script.call("shell", serde_json::json!({"command": "printf restarted"}));
+    script.call(
+        "shell",
+        serde_json::json!({"command": "touch restarted.txt"}),
+    );
     script.say("The action ran after the restart.");
 
     let sent = run(
@@ -3606,7 +3620,7 @@ async fn a_waiting_approval_survives_a_space_restart() {
     );
     assert!(shown.contains("  index 0"), "{shown}");
     assert!(
-        shown.contains("  arguments {\"command\":\"printf restarted\"}"),
+        shown.contains("  arguments {\"command\":\"touch restarted.txt\"}"),
         "{shown}"
     );
 
@@ -3625,6 +3639,11 @@ async fn a_waiting_approval_survives_a_space_restart() {
         shown.matches("shell (succeeded)").count(),
         1,
         "a resumed action runs exactly once:\n{shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("restarted.txt")).unwrap(),
+        "",
+        "the resumed action's side effect is there exactly once"
     );
     let read = run(
         &computer.home,
@@ -4021,6 +4040,292 @@ async fn a_tty_card_names_the_scope_and_answers() {
     );
     let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
     assert!(listed.trim().is_empty(), "{listed}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_decided_allow_resumes_after_a_restart_before_the_action() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = local_computer(directory, &base, &script);
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "printf",
+        ],
+    );
+    script.call("shell", serde_json::json!({"command": "printf resumed"}));
+    script.say("It resumed after the restart.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "wait for me"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+
+    // The Computer leaves, so the allow can be decided while the pump cannot
+    // start the action: the restart below then lands before the action.
+    computer.daemon.kill();
+    wait_for_computer_offline(&computer.home, &computer.credential, &computer.computer);
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: running")),
+        "a decided allow leaves the run ready to resume:\n{shown}"
+    );
+    assert!(
+        !shown.contains("action "),
+        "the allow has not started the action yet:\n{shown}"
+    );
+
+    // The Space restarts before the action starts; the decided allow survives.
+    computer.restart_space_only();
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: running")),
+        "a decided allow survives a restart before the action:\n{shown}"
+    );
+    assert!(!shown.contains("error "), "{shown}");
+
+    // Reconnecting the Computer resumes the run: the action starts, runs, and
+    // answers exactly once.
+    let mut daemon = ComputerDaemon::spawn(
+        &computer.machine,
+        &computer.credential,
+        &["computer", "run"],
+    );
+    daemon.expect_line(&format!(
+        "Computer {} is running for {}.",
+        computer.computer, computer.url
+    ));
+    wait_for_computer_online(&computer.home, &computer.credential, &computer.computer);
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert_eq!(
+        shown.matches("shell (succeeded)").count(),
+        1,
+        "a resumed action runs exactly once:\n{shown}"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert_eq!(
+        read.matches("It resumed after the restart.").count(),
+        1,
+        "the resumed step replies exactly once:\n{read}"
+    );
+
+    drop(daemon);
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = local_computer(directory, &base, &script);
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "shell",
+            "--command-prefix",
+            "sleep",
+        ],
+    );
+    // The action is still running when the Space goes away.
+    script.call("shell", serde_json::json!({"command": "sleep 3"}));
+    script.say("The action finished.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "restart mid-action",
+        ],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        allowed.trim(),
+        format!("Allowed {approval} for run {run_id}.")
+    );
+
+    // The approved action starts and stays in flight; a restart now cannot
+    // resume it without running the action twice.
+    wait_until("the approved action to start", || {
+        run(
+            &computer.home,
+            &computer.credential,
+            &["run", "show", &run_id],
+        )
+        .contains("shell (unknown)")
+    });
+    computer.restart_space();
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "failed");
+    assert!(
+        shown.contains("  error the approval could not be resumed"),
+        "a restart after the action started must not resume it:\n{shown}"
+    );
+    assert!(
+        !shown.contains("shell (succeeded)"),
+        "the action must not be reported as finished:\n{shown}"
+    );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    assert!(
+        read.contains("Bot: I could not continue after the approval."),
+        "{read}"
+    );
+    assert!(
+        !read.contains("The action finished."),
+        "the Model's next reply must never be used:\n{read}"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_put_file_rule_asks_by_path_prefix() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let content = "the report\n";
+    let directory = tempfile::tempdir().unwrap();
+    let computer = local_computer(directory, &base, &script);
+    let folder = computer.workspace.join(&computer.bot);
+    std::fs::create_dir_all(folder.join("logs")).unwrap();
+    std::fs::write(folder.join("logs").join("report.txt"), content).unwrap();
+
+    // A path-prefix rule on put_file asks before the delivery.
+    let added = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "put_file",
+            "--path-prefix",
+            "logs",
+        ],
+    );
+    assert!(
+        added.contains(": ask put_file (path-prefix \"logs\")"),
+        "{added}"
+    );
+    let ask = first_word(&field(&added, "Added rule "));
+    script.call(
+        "put_file",
+        serde_json::json!({"path": "logs/report.txt", "name": "report.txt"}),
+    );
+    script.say("Delivered the report.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "send the report"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(
+        listed.contains(&format!(
+            "{approval}  {run_id}  {}  put_file  rule  ",
+            computer.bot
+        )),
+        "a File action is matched by its path rule:\n{listed}"
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains(&format!("  rule {ask}")), "{shown}");
+    assert!(shown.contains("\"path\":\"logs/report.txt\""), "{shown}");
+    assert!(shown.contains("\"name\":\"report.txt\""), "{shown}");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(shown.contains("put_file (succeeded)"), "{shown}");
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let delivered = listed
+        .lines()
+        .find(|line| line.contains("report.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the delivered File is listed")
+        .to_owned();
+    let out = computer.path().join("report.bin");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), content.as_bytes());
 
     drop(computer);
     provider_task.abort();

@@ -10695,6 +10695,41 @@ mod tests {
         )
         .await;
         assert!(matches!(wrong_kind, Err((ErrorCode::InvalidArgument, _))));
+        // A blank prefix is an error, never a silent tool-wide rule.
+        let blank_command = try_command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "shell",
+                Some("   "),
+                None,
+            ),
+        )
+        .await;
+        assert!(matches!(
+            blank_command,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "a command prefix needs a command"
+        ));
+        let blank_path = try_command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                Some("  "),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            blank_path,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "a path prefix needs a path"
+        ));
 
         local.device.close(None).await.unwrap();
         local.provider_task.abort();
@@ -12139,6 +12174,20 @@ mod tests {
         assert_eq!(approval["reason"], "rule");
         assert_eq!(approval["tool"], "read_file");
         let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let lasting = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(lasting, Err((ErrorCode::InvalidArgument, _))),
+            "a path that leaves the Workspace cannot make a lasting rule"
+        );
         decide_approval(&mut local.socket, approval_id, false, false).await;
         assert_eq!(wait_run(&mut local.socket, third).await["status"], "failed");
 
@@ -12543,6 +12592,205 @@ mod tests {
             "the user's Allow rule survives an ambiguous answer"
         );
         assert_eq!(rules.len(), 2, "the original Allow and the derived allow");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_directory_names_that_differ_by_a_space_stay_apart() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": "logs /report.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": "logs /other.txt"})),
+                text("two"),
+                tool("read_file", json!({"path": "logs/other.txt"})),
+                tool("read_file", json!({"path": "logs/report2.txt"})),
+                text("three"),
+                tool("read_file", json!({"path": "logs /more.txt"})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        let wide = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "read_file",
+                None,
+                None,
+            ),
+        )
+        .await;
+        let wide_id: Id = serde_json::from_value(wide["rule"].clone()).unwrap();
+
+        // Always allowing the directory whose name ends in a space keeps that
+        // exact space in the derived rule.
+        let second = run_of(&submit(&mut local.socket, local.chat, "logs space", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["rule"], json!(wide_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        let spaced_rule: Id = serde_json::from_value(decided["rule"].clone()).unwrap();
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        let spaced = rules
+            .iter()
+            .find(|rule| rule["rule"] == json!(spaced_rule))
+            .expect("the derived rule");
+        assert_eq!(spaced["path_prefix"], "logs ");
+        assert_eq!(
+            approval["lasting_scope"], "files under \"logs \"",
+            "the card shows the exact directory"
+        );
+
+        // The `logs ` allow does not cover the `logs` directory.
+        let third = run_of(&submit(&mut local.socket, local.chat, "logs plain", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["rule"], json!(wide_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, third).await["status"], "failed");
+
+        // Allow the plain `logs` directory as well, then the `logs ` allow
+        // must not cover it either.
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::RuleRemove { rule: spaced_rule },
+        )
+        .await;
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "logs again", None).await);
+        let approval = approval_for_run(&mut local.socket, fourth).await;
+        assert_eq!(approval["rule"], json!(wide_id));
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let _decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "succeeded"
+        );
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert!(
+            rules.iter().any(|rule| rule["path_prefix"] == "logs"),
+            "the plain logs allow was derived: {rules:?}"
+        );
+
+        let fifth = run_of(&submit(&mut local.socket, local.chat, "logs space again", None).await);
+        let approval = approval_for_run(&mut local.socket, fifth).await;
+        assert_eq!(
+            approval["rule"],
+            json!(wide_id),
+            "the `logs` allow does not cover the `logs ` directory"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, fifth).await["status"], "failed");
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_all_space_path_is_not_the_workspace_root() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("read_file", json!({"path": "a.txt"})),
+                text("one"),
+                tool("read_file", json!({"path": "   "})),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "start", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // The Workspace root allow must not cover a name made of spaces.
+        command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Allow,
+                "read_file",
+                None,
+                Some("."),
+            ),
+        )
+        .await;
+        let second = run_of(&submit(&mut local.socket, local.chat, "space name", None).await);
+        let shown = wait_status(&mut local.socket, second, "waiting").await;
+        assert_eq!(shown["status"], "waiting", "the path is not the root");
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "rule");
+        assert_eq!(approval["ambiguous"], true);
+        assert_eq!(approval["rule"], Value::Null);
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+
+        // Such a path cannot make a lasting rule either.
+        let lasting = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            lasting,
+            Err((ErrorCode::InvalidArgument, message))
+                if message == "the action path cannot make a lasting rule"
+        ));
+        let decided = decide_approval(&mut local.socket, approval_id, false, false).await;
+        assert_eq!(decided["status"], "denied");
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "failed"
+        );
+
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert_eq!(rules.len(), 1, "no derived rule for an all-space path");
+        assert_eq!(rules[0]["effect"], "allow");
+        assert_eq!(rules[0]["path_prefix"], ".");
 
         local.device.close(None).await.unwrap();
         local.provider_task.abort();

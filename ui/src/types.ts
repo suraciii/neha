@@ -134,8 +134,12 @@ export interface Approval {
   action: string;
   step: number;
   tool: string;
+  // What the Bot asked for, under the tool's own argument names.
+  arguments?: Record<string, unknown> | null;
   summary: string;
   reason: ApprovalReason;
+  // No rule could judge this action's form, so the Space asked instead.
+  ambiguous?: boolean | null;
   rule?: string | null;
   undoable?: Undoable | null;
   // What an Always allow would cover, in the Space's words.

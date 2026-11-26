@@ -1455,6 +1455,7 @@ pub struct RuleRemoved {
     pub rule: Id,
     /// The Bot it constrained.
     pub bot: Id,
-    /// The User who made it.
+    /// The User who removed it; the Bot's owner may remove another User's
+    /// rule, so this is not necessarily the rule's maker.
     pub user: Id,
 }

@@ -441,13 +441,28 @@ async fn rule_add(
     if tool.is_empty() {
         return Err(ApiError::invalid_argument("a rule needs a tool"));
     }
-    let command_prefix = command_prefix
-        .map(|prefix| prefix.trim().to_owned())
-        .filter(|prefix| !prefix.is_empty());
-    let path_prefix = path_prefix
-        .map(|prefix| prefix.trim().to_owned())
-        .filter(|prefix| !prefix.is_empty())
-        .map(|prefix| normalize_path(&prefix));
+    let command_prefix = match command_prefix {
+        Some(prefix) => {
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                return Err(ApiError::invalid_argument(
+                    "a command prefix needs a command",
+                ));
+            }
+            Some(prefix.to_owned())
+        }
+        None => None,
+    };
+    let path_prefix = match path_prefix {
+        Some(prefix) => {
+            let prefix = prefix.trim();
+            if prefix.is_empty() {
+                return Err(ApiError::invalid_argument("a path prefix needs a path"));
+            }
+            Some(lexical_path(prefix))
+        }
+        None => None,
+    };
     if command_prefix.is_some() && path_prefix.is_some() {
         return Err(ApiError::invalid_argument(
             "a rule names a command prefix or a path prefix, not both",
@@ -2487,8 +2502,13 @@ fn ambiguous_shell(command: &str) -> bool {
 
 /// Returns whether a path is ambiguous for the rules that exist.
 fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
-    let path = normalize_path(path);
-    if path.split('/').any(|component| component == "..") {
+    // A path made only of whitespace names something this build cannot judge.
+    let Some(path) = action_path(path) else {
+        return true;
+    };
+    if path.split('/').any(|component| {
+        component == ".." || (!component.is_empty() && component.trim().is_empty())
+    }) {
         return true;
     }
     let absolute = path.starts_with('/');
@@ -2496,7 +2516,7 @@ fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
     rules.iter().any(|rule| {
         rule.path_prefix
             .as_deref()
-            .is_some_and(|prefix| normalize_path(prefix).starts_with('/') != absolute)
+            .is_some_and(|prefix| lexical_path(prefix).starts_with('/') != absolute)
     })
 }
 
@@ -2521,8 +2541,9 @@ fn lasting_scope(call: &LoopCall) -> Option<String> {
         | neha_loop::tools::LIST_FILES
         | neha_loop::tools::PUT_FILE => {
             let path = call.arguments.get("path").and_then(Value::as_str)?;
+            let derived = derived_path(path)?;
 
-            Some(file_scope(&sanitize_text(&path_parent(path))))
+            Some(file_scope(&sanitize_text(&parent_of(&derived))))
         }
         _ => Some(format!("all {} actions", call.tool)),
     }
@@ -2570,14 +2591,15 @@ fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
     true
 }
 
-/// Normalizes a path the way the daemon reads it: outer whitespace trimmed,
-/// repeated separators folded, `.` components dropped, and a trailing
+/// The lexical form of one path, without trimming its input.
+///
+/// Repeated separators are folded, `.` components dropped, and a trailing
 /// separator dropped. `..` is kept so callers can refuse it, and an absolute
-/// path stays absolute.
-fn normalize_path(path: &str) -> String {
-    let trimmed = path.trim();
-    let absolute = trimmed.starts_with('/');
-    let components: Vec<&str> = trimmed
+/// path stays absolute. Component names are otherwise preserved exactly:
+/// `logs ` and `logs` are different directories.
+fn lexical_path(path: &str) -> String {
+    let absolute = path.starts_with('/');
+    let components: Vec<&str> = path
         .split('/')
         .filter(|component| !component.is_empty() && *component != ".")
         .collect();
@@ -2596,14 +2618,54 @@ fn normalize_path(path: &str) -> String {
     }
 }
 
-/// Compares a path to a lexical prefix on a `/` boundary.
+/// Normalizes a raw action path for comparison.
 ///
-/// Both sides are normalized first, so `./logs/x`, `logs//x`, and `logs/./x`
-/// agree with the prefix `logs`. The prefix `.` names the workspace root: it
-/// matches every relative path, including a bare file name like `notes.txt`.
+/// A raw path is trimmed once, as the daemon trims it. A path that is only
+/// whitespace, though, names a directory made of spaces and is not the
+/// Workspace root: it has no comparable lexical form (`None`).
+fn action_path(path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return path.is_empty().then(|| ".".to_owned());
+    }
+
+    Some(lexical_path(trimmed))
+}
+
+/// Normalizes a raw path for deriving a lasting scope.
+///
+/// Derivation trims only the end of the raw path, so a leading space can be a
+/// directory name. The result is already lexical, so it is never trimmed
+/// again: two directories that differ by a trailing space stay distinct.
+fn derived_path(path: &str) -> Option<String> {
+    let trimmed = path.trim_end();
+    if trimmed.trim().is_empty() && !path.is_empty() {
+        return None;
+    }
+
+    Some(lexical_path(trimmed))
+}
+
+/// Returns the parent directory of an already-derived path.
+fn parent_of(path: &str) -> String {
+    match path.rsplit_once('/') {
+        None => ".".to_owned(),
+        Some(("", _)) => "/".to_owned(),
+        Some((parent, _)) => parent.to_owned(),
+    }
+}
+
+/// Compares a raw action path to a stored rule prefix.
+///
+/// The action path is trimmed once as the daemon does; the prefix is already
+/// normalized (RuleAdd normalizes it once, and a derived prefix is built from
+/// normalized components) and is compared as-is. A prefix is never trimmed
+/// again, so `logs ` cannot become `logs`.
 fn path_matches(path: &str, prefix: &str) -> bool {
-    let path = normalize_path(path);
-    let prefix = normalize_path(prefix);
+    let Some(path) = action_path(path) else {
+        return false;
+    };
+    let prefix = lexical_path(prefix);
     if prefix == "/" {
         return path.starts_with('/');
     }
@@ -2624,8 +2686,8 @@ fn path_matches(path: &str, prefix: &str) -> bool {
 /// `.` covers every relative prefix and no absolute one. A `.` ask is the
 /// relative root itself and is covered only by `.`.
 fn path_covers(derived: &str, ask: &str) -> bool {
-    let derived = normalize_path(derived);
-    let ask = normalize_path(ask);
+    let derived = lexical_path(derived);
+    let ask = lexical_path(ask);
     if derived == "." {
         return !ask.starts_with('/');
     }
@@ -2671,12 +2733,12 @@ fn rule_covers(
 }
 
 /// Returns the parent directory of a path, as a rule stores it.
+#[cfg(test)]
 fn path_parent(path: &str) -> String {
-    let path = normalize_path(path);
-    match path.rsplit_once('/') {
-        None => ".".to_owned(),
-        Some(("", _)) => "/".to_owned(),
-        Some((parent, _)) => parent.to_owned(),
+    match derived_path(path) {
+        Some(path) => parent_of(&path),
+        // A path that is only spaces has no parent in the Workspace root.
+        None => lexical_path(path),
     }
 }
 
@@ -2708,8 +2770,20 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
                 .ok_or_else(|| {
                     ApiError::invalid_argument("the action has no path to make a rule from")
                 })?;
+            let derived = derived_path(path).ok_or_else(|| {
+                ApiError::invalid_argument("the action path cannot make a lasting rule")
+            })?;
+            if derived.split('/').any(|component| {
+                component == ".." || (!component.is_empty() && component.trim().is_empty())
+            }) {
+                // A frightening path may be answered once, but it cannot
+                // become a lasting scope: its parent is not meaningful.
+                return Err(ApiError::invalid_argument(
+                    "the action path cannot make a lasting rule",
+                ));
+            }
 
-            Ok((tool, None, Some(path_parent(path))))
+            Ok((tool, None, Some(parent_of(&derived))))
         }
         _ => Ok((tool, None, None)),
     }
@@ -3539,6 +3613,38 @@ mod tests {
             ambiguous_path("/logs/x", &[ask]),
             "an absolute path against a relative rule is ambiguous"
         );
+    }
+
+    #[test]
+    fn paths_that_differ_by_a_space_are_different_directories() {
+        // `logs ` and `logs` are two directories, in both directions.
+        assert!(path_matches("logs /x", "logs "));
+        assert!(!path_matches("logs/x", "logs "));
+        assert!(!path_matches("logs /x", "logs"));
+        assert!(path_matches("logs/x", "logs"));
+        assert!(path_covers("logs ", "logs "));
+        assert!(!path_covers("logs ", "logs"));
+        assert!(!path_covers("logs", "logs "));
+
+        // Derivation keeps the space and never trims a derived component
+        // again; only the raw end of the action path is trimmed.
+        assert_eq!(path_parent("logs /report.txt"), "logs ");
+        assert_eq!(path_parent("logs/report.txt"), "logs");
+        assert_eq!(path_parent("./logs/report.txt  "), "logs");
+
+        // A path or component made only of whitespace is not judgeable: it is
+        // never the Workspace root and it always asks when rules exist.
+        assert!(!path_matches("   ", "."));
+        assert!(!path_matches("   ", "/"));
+        let root = ask("read_file", None, Some("."));
+        assert!(ambiguous_path("   ", std::slice::from_ref(&root)));
+        assert_ne!(path_parent("   "), ".");
+        let tool_wide = ask("read_file", None, None);
+        assert!(ambiguous_path(
+            "logs/   /x",
+            std::slice::from_ref(&tool_wide)
+        ));
+        assert!(!ambiguous_path("logs /x", std::slice::from_ref(&tool_wide)));
     }
 
     #[test]

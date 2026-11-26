@@ -27,13 +27,37 @@ describe("approvals", () => {
   });
 
   it("derives the scope an Always allow would cover", () => {
-    expect(localScope(shell)).toEqual({ key: "chat.approval.scope.shell", params: { command: "git" } });
-    expect(localScope({ ...shell, tool: "read_file", summary: "logs/a.txt" })).toEqual({
+    // The arguments come first; the summary only speaks when they are absent.
+    expect(
+      localScope({ ...shell, arguments: { command: "git status" }, summary: "shell: rm -rf /" }),
+    ).toEqual({ key: "chat.approval.scope.shell", params: { command: "git" } });
+    expect(
+      localScope({
+        ...shell,
+        tool: "write_file",
+        arguments: { path: "logs/out.txt" },
+        summary: "write_file: /etc/passwd",
+      }),
+    ).toEqual({ key: "chat.approval.scope.files", params: { path: "logs" } });
+    // A summary names the action after its tool.
+    expect(localScope({ ...shell, tool: "write_file", summary: "write_file: logs/out.txt" })).toEqual({
       key: "chat.approval.scope.files",
       params: { path: "logs" },
     });
-    expect(localScope({ ...shell, tool: "take_file" })).toBeNull();
-    expect(localScope({ ...shell, summary: "   " })).toBeNull();
+    expect(localScope({ ...shell, summary: "shell: printf hi" })).toEqual({
+      key: "chat.approval.scope.shell",
+      params: { command: "printf" },
+    });
+    expect(localScope(shell)).toEqual({ key: "chat.approval.scope.shell", params: { command: "git" } });
+    // Nothing to derive from says nothing.
+    for (const blank of [
+      { ...shell, tool: "write_file", summary: "write_file: " },
+      { ...shell, tool: "write_file", arguments: { path: 42 }, summary: "write_file:  " },
+      { ...shell, tool: "take_file" },
+      { ...shell, summary: "   " },
+    ]) {
+      expect(localScope(blank)).toBeNull();
+    }
   });
 
   it("finds the directory a path sits in", () => {

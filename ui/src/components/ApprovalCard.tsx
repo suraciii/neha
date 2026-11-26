@@ -19,10 +19,13 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const [expanded, setExpanded] = createSignal(false);
   const allowed = () => props.approval.decided === true;
   const denied = () => props.approval.decided === false;
+  // An ambiguous action has no rule behind it, so it cannot claim one.
   const reason = () =>
-    props.approval.reason === "rule"
-      ? t("chat.approval.reason.rule")
-      : t("chat.approval.reason.firstUse", { name: props.botName });
+    props.approval.ambiguous
+      ? t("chat.approval.reason.ambiguous")
+      : props.approval.reason === "rule"
+        ? t("chat.approval.reason.rule")
+        : t("chat.approval.reason.firstUse", { name: props.botName });
   const undo = () =>
     t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
   // What an Always allow would cover: the Space's words, else this page's guess.

@@ -12,7 +12,7 @@ Only the User the Bot acts for can answer. An Allow runs the action once; an Alw
 
 ## Answer in the Chat
 
-Run `neha chat send` as usual. When the run waits, a terminal shows the approval card: the action's tool, a summary, why the Bot asks, whether the action can be undone, and, for a rule, what Always allow covers. A `shell` or `write_file` action says that it cannot be undone; a `read_file`, `list_files`, or other action says that the undoability is unknown. The summary escapes control characters, and one longer than 4096 bytes says how many bytes it left out. Answer with:
+Run `neha chat send` as usual. When the run waits, a terminal shows the approval card: the action's tool, a summary, why the Bot asks, whether the action can be undone, and, for a rule, what Always allow covers. A `shell` or `write_file` action says that it cannot be undone; a `read_file`, `list_files`, or other action says that the undoability is unknown. An ambiguous form gives the reason `a form no rule can judge`, not a rule you set. The summary escapes control characters, and one longer than 4096 bytes says how many bytes it left out. Answer with:
 
 ```text
 [a]llow / [A]lways allow / [d]eny / [q]uit
@@ -59,6 +59,7 @@ List, add, and remove lasting rules:
 target/debug/neha rule list
 target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-prefix rm
 target/debug/neha rule add --bot <bot-id> --effect allow --tool read_file --path-prefix /home/ada/docs
+target/debug/neha rule add --bot <bot-id> --effect ask --tool put_file --path-prefix /home/ada/reports
 target/debug/neha rule remove <rule-id>
 ```
 
@@ -68,7 +69,9 @@ When both match, the more specific rule wins: a rule with a command or path pref
 
 Some forms a prefix cannot judge. A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break asks whenever the Bot and User have any shell rule: `echo hi; rm x` is never covered by an `rm` rule. A file path with `..`, or an absolute/relative form unlike the rule's prefix, asks whenever the Bot and User have any rule for that tool: a `logs` rule does not cover `../logs/x` or `/var/logs/x`. With no rule for the tool, the action runs. An approval raised by this protection reports `ambiguous` true and names no rule: `neha approval show` shows none, and its Always allow removes no rule.
 
-Before matching, Neha normalizes both the rule prefix and the action path: it trims outer whitespace, collapses repeated `/`, and removes `.` components, while keeping the absolute or relative form. So `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule; `.` matches `./a.txt` but no absolute path. A `..` component is not removed and still follows the fail-closed rule above.
+`neha rule add` trims and normalizes a path prefix once, and the Space stores that form; matching does not trim the stored prefix again. A raw action path is trimmed once, then compared after collapsing repeated `/` and removing `.` components, while keeping the absolute or relative form. So `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule; `.` matches `./a.txt` but no absolute path. A `..` component is not removed and still follows the fail-closed rule above.
+
+A path made only of whitespace is ambiguous when the tool has a rule. A directory name that ends with a space is a scope of its own: `logs` and `logs ` differ.
 
 ### A wide Ask rule and an Always allow
 

@@ -747,8 +747,17 @@ impl Projection for State {
                 if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
                     return Err("an approval must belong to a working run".to_owned());
                 }
-                if data.bot != run.bot || data.chat != run.chat {
-                    return Err("an approval must name its run's Bot and Chat".to_owned());
+                if data.bot != run.bot
+                    || data.chat != run.chat
+                    || data.acting != run.acting
+                    || run.computer != Some(data.computer)
+                {
+                    return Err(
+                        "an approval must name its run's Bot, Chat, Computer, and User".to_owned(),
+                    );
+                }
+                if data.ambiguous && data.rule.is_some() {
+                    return Err("an ambiguous approval names no rule".to_owned());
                 }
                 if self
                     .approvals
@@ -853,16 +862,17 @@ impl Projection for State {
                 if event.acting != Some(data.user)
                     || !matches!(event.author, Author::User(author) if author == data.user)
                 {
-                    return Err("a rule is removed by its User".to_owned());
+                    return Err("a rule is removed by the User who removed it".to_owned());
                 }
                 let position = self
                     .rules
                     .iter()
                     .position(|rule| rule.rule == data.rule)
                     .ok_or("a removed rule must exist")?;
-                let rule = &self.rules[position];
-                if rule.bot != data.bot || rule.user != data.user {
-                    return Err("a removed rule must name its Bot and User".to_owned());
+                // `user` names the remover, not the maker: a Bot's owner may
+                // remove a rule another User made.
+                if self.rules[position].bot != data.bot {
+                    return Err("a removed rule must name its Bot".to_owned());
                 }
                 self.rules.remove(position);
             }
@@ -987,15 +997,22 @@ mod tests {
             "message": Id::new(),
         });
         state
-            .apply(&event(
+            .apply(&acted_event(
                 EventKind::RunQueued,
                 bot_author,
+                owner,
                 run_data.clone(),
                 4,
             ))
             .unwrap();
         state
-            .apply(&event(EventKind::RunStarted, bot_author, run_data, 5))
+            .apply(&acted_event(
+                EventKind::RunStarted,
+                bot_author,
+                owner,
+                run_data,
+                5,
+            ))
             .unwrap();
         let approval = Id::new();
         let action = Id::new();
@@ -1090,6 +1107,96 @@ mod tests {
                 .is_err(),
             "a rule needs an existing Bot"
         );
+
+        // An ambiguous approval is a guard, not a rule hit.
+        let mut confused = requested(bot, chat);
+        confused["approval"] = serde_json::json!(Id::new());
+        confused["ambiguous"] = serde_json::json!(true);
+        confused["rule"] = serde_json::json!(Id::new());
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    confused,
+                    9,
+                ))
+                .is_err(),
+            "an ambiguous approval names no rule"
+        );
+    }
+
+    #[test]
+    fn a_rule_can_be_removed_by_its_bots_owner() {
+        let owner = Id::new();
+        let maker = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let rule = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::BotCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                Author::User(owner),
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+        // Another User made the rule; the Bot's owner removes it. The removal
+        // names the remover, so it need not equal the maker.
+        state
+            .apply(&acted_event(
+                EventKind::RuleAdded,
+                Author::User(maker),
+                maker,
+                serde_json::json!({
+                    "rule": rule,
+                    "bot": bot,
+                    "user": maker,
+                    "effect": "ask",
+                    "tool": "shell",
+                }),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::RuleRemoved,
+                Author::User(owner),
+                owner,
+                serde_json::json!({"rule": rule, "bot": bot, "user": owner}),
+                5,
+            ))
+            .unwrap();
+        assert!(state.rules.iter().all(|view| view.rule != rule));
     }
 
     #[test]

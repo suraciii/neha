@@ -17,16 +17,28 @@ export function undoableOf(approval: Approval): Undoable {
 }
 
 // What an Always allow would cover, as far as this page can tell without the
-// Space's own words.
+// Space's own words: the action's arguments first, else its summary.
 export function localScope(approval: Approval): { key: MessageKey; params: Record<string, string> } | null {
   if (approval.tool === "shell") {
-    const command = approval.summary.trim().split(/\s+/)[0];
+    const command = (text(approval.arguments?.command) ?? detailOf(approval)).trim().split(/\s+/)[0];
     return command ? { key: "chat.approval.scope.shell", params: { command } } : null;
   }
   if (FILE_TOOLS.has(approval.tool)) {
-    return { key: "chat.approval.scope.files", params: { path: parentDirectory(approval.summary) } };
+    const path = text(approval.arguments?.path) ?? detailOf(approval);
+    return path ? { key: "chat.approval.scope.files", params: { path: parentDirectory(path) } } : null;
   }
   return null;
+}
+
+function text(value: unknown): string | null {
+  return typeof value === "string" && value.trim() !== "" ? value : null;
+}
+
+// The summary names the action after its tool, as in "write_file: logs/out.txt".
+function detailOf(approval: Approval): string {
+  const summary = approval.summary.trim();
+  const prefix = `${approval.tool}:`;
+  return summary.startsWith(prefix) ? summary.slice(prefix.length).trim() : summary;
 }
 
 // The directory a path sits in: "." for a bare name, "/" at the root.
