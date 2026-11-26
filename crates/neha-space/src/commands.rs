@@ -286,11 +286,11 @@ async fn approval_decide(
     allow: bool,
     lasting: bool,
 ) -> Result<Outcome, ApiError> {
+    // One answer per approval even when two clients answer at once.
+    let _decisions = context.approvals.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
-    // One answer per approval even when two clients answer at once.
-    let _decisions = context.approvals.lock().await;
     let view = {
         let state = context
             .state
@@ -492,10 +492,10 @@ async fn rule_add(
     command_prefix: Option<String>,
     path_prefix: Option<String>,
 ) -> Result<Outcome, ApiError> {
+    let _decisions = context.approvals.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
-    let _decisions = context.approvals.lock().await;
     let tool = tool.trim().to_owned();
     if tool.is_empty() {
         return Err(ApiError::invalid_argument("a rule needs a tool"));
@@ -648,10 +648,10 @@ async fn rule_remove(
     fingerprint: String,
     rule: Id,
 ) -> Result<Outcome, ApiError> {
+    let _decisions = context.approvals.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
-    let _decisions = context.approvals.lock().await;
     let (view, owned) = {
         let state = context
             .state
@@ -677,13 +677,14 @@ async fn rule_remove(
         json!({"rule": rule, "bot": view.bot, "user": account.id}),
     )
     .acting(account.id);
+    let result = json!({"rule": rule, "user": account.id});
     let appended = append(
         context.store,
         context.state,
         command_id,
         fingerprint,
         vec![draft],
-        Some(json!({"rule": rule, "user": account.id})),
+        Some(result.clone()),
         None,
     )
     .await?;
@@ -693,7 +694,7 @@ async fn rule_remove(
 
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
-        result: json!({"rule": rule}),
+        result,
         queued: None,
         events: appended.events,
     })

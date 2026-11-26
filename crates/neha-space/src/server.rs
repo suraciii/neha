@@ -2715,10 +2715,16 @@ mod tests {
     /// flight without sleeping.
     async fn gated_provider(
         script: Vec<ScriptedReply>,
-    ) -> (String, tokio::task::JoinHandle<()>, Vec<Gate>) {
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        Vec<Gate>,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        use axum::Json;
         use axum::Router;
         use axum::body::Body;
         use axum::http::header::CONTENT_TYPE;
@@ -2739,13 +2745,17 @@ mod tests {
         let waits = Arc::new(waits);
         let script = Arc::new(script);
         let requests = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&recorded);
         let app = Router::new().route(
             "/v1/chat/completions",
-            post(move || {
+            post(move |Json(body): Json<Value>| {
                 let script = Arc::clone(&script);
                 let requests = Arc::clone(&requests);
                 let waits = Arc::clone(&waits);
+                let seen = Arc::clone(&seen);
                 async move {
+                    seen.lock().unwrap().push(body);
                     let index = requests.fetch_add(1, Ordering::SeqCst);
                     let chosen = index.min(script.len().saturating_sub(1));
                     let reply = script.get(chosen).cloned().expect("a scripted reply");
@@ -2858,13 +2868,13 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{addr}/v1"), task, gates)
+        (format!("http://{addr}/v1"), task, gates, recorded)
     }
 
     async fn scripted_provider(
         script: Vec<ScriptedReply>,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let (base, task, _gates) = gated_provider(script).await;
+        let (base, task, _gates, _recorded) = gated_provider(script).await;
 
         (base, task)
     }
@@ -3713,7 +3723,8 @@ mod tests {
     async fn a_retry_while_the_run_works_waits_for_the_first_result() {
         let (_dir, running, invite) = running().await;
         let (mut first_socket, token) = admin(&running, &invite).await;
-        let (base, provider_task, gates) = gated_provider(vec![hold("Hello from fake")]).await;
+        let (base, provider_task, gates, _recorded) =
+            gated_provider(vec![hold("Hello from fake")]).await;
         command(&mut first_socket, Id::new(), provider_base(base)).await;
         let bot = command(
             &mut first_socket,
@@ -4776,7 +4787,7 @@ mod tests {
     async fn a_second_request_waits_for_the_first() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
-        let (base, provider_task, gates) =
+        let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("first answer"), text("second answer")]).await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
@@ -4825,7 +4836,7 @@ mod tests {
         let running = start(home, 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
         let (mut socket, token) = admin(&running, &invite).await;
-        let (base, provider_task, _gates) =
+        let (base, provider_task, _gates, _recorded) =
             gated_provider(vec![hold("first answer"), text("second answer")]).await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
@@ -4864,7 +4875,7 @@ mod tests {
         let running = start(home, 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
         let (mut socket, token) = admin(&running, &invite).await;
-        let (base, provider_task, _gates) =
+        let (base, provider_task, _gates, _recorded) =
             gated_provider(vec![hold("one"), text("two"), text("three")]).await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
@@ -4901,7 +4912,7 @@ mod tests {
     async fn runs_of_different_bots_run_in_parallel() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
-        let (base, provider_task, gates) =
+        let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("first"), hold("second")]).await;
         command(&mut socket, Id::new(), provider_add(base)).await;
         let mut chats = Vec::new();
@@ -4955,7 +4966,7 @@ mod tests {
     async fn queued_runs_start_in_the_order_they_were_recorded() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
-        let (base, provider_task, gates) =
+        let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("one"), text("two"), text("three")]).await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
@@ -5000,7 +5011,7 @@ mod tests {
     async fn a_queued_run_moves_up_as_the_queue_moves() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
-        let (base, provider_task, gates) =
+        let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("one"), hold("two"), text("three")]).await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
@@ -5037,7 +5048,7 @@ mod tests {
     async fn concurrent_requests_keep_their_recorded_order() {
         let (_dir, running, invite) = running().await;
         let (mut admin, token) = admin(&running, &invite).await;
-        let (base, provider_task, gates) =
+        let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("first answer"), text("answer")]).await;
         command(&mut admin, Id::new(), provider_add(base)).await;
         let bot = command(
@@ -5139,7 +5150,7 @@ mod tests {
     async fn a_replayed_command_does_not_hold_the_queue() {
         let (_dir, running, invite) = running().await;
         let (mut admin, token) = admin(&running, &invite).await;
-        let (base, provider_task, gates) =
+        let (base, provider_task, gates, _recorded) =
             gated_provider(vec![hold("first answer"), text("answer")]).await;
         command(&mut admin, Id::new(), provider_add(base)).await;
         let bot = command(
@@ -5254,7 +5265,7 @@ mod tests {
         let running = start(home, 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
         let (mut socket, token) = admin(&running, &invite).await;
-        let (base, provider_task, _gates) =
+        let (base, provider_task, _gates, _recorded) =
             gated_provider(vec![hold("first answer"), text("second answer")]).await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
@@ -12980,6 +12991,196 @@ mod tests {
         local.socket.close(None).await.unwrap();
         running.shutdown().await;
     }
+    fn command_fingerprint(command: &CommandCall) -> String {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(serde_json::to_vec(command).unwrap());
+        format!(
+            "v1:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_command_answers_only_its_owner() {
+        let (_dir, running, invite) = running().await;
+        let (mut admin_socket, _admin_token) = admin(&running, &invite).await;
+        let created = command(&mut admin_socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let made = command(
+            &mut admin_socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Allow, "shell", None, None),
+        )
+        .await;
+        let admin: Id = serde_json::from_value(made["user"].clone()).unwrap();
+        let rule: Id = serde_json::from_value(made["rule"].clone()).unwrap();
+
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace_token).await;
+        let call = CommandCall::RuleRemove { rule };
+        let fingerprint = command_fingerprint(&call);
+        let before = running.server.store.last_seq().await.unwrap();
+        let command_id = Id::new();
+        running
+            .server
+            .store
+            .record_command_result(
+                command_id,
+                &fingerprint,
+                json!({"rule": rule, "user": admin}),
+            )
+            .await
+            .unwrap();
+
+        let owner = try_command(&mut admin_socket, command_id, call.clone()).await;
+        assert_eq!(
+            owner.unwrap().1,
+            json!({"rule": rule, "user": admin}),
+            "the owner replays the exact confirmation"
+        );
+        let other = try_command(&mut grace_socket, command_id, call.clone()).await;
+        assert!(
+            matches!(other, Err((ErrorCode::Forbidden, _))),
+            "another User cannot read the confirmation: {other:?}"
+        );
+
+        // A record made before results carried the owner is refused too.
+        let legacy_id = Id::new();
+        running
+            .server
+            .store
+            .record_command_result(legacy_id, &fingerprint, json!({"rule": rule}))
+            .await
+            .unwrap();
+        for socket in [&mut admin_socket, &mut grace_socket] {
+            let legacy = try_command(socket, legacy_id, call.clone()).await;
+            assert!(
+                matches!(legacy, Err((ErrorCode::Forbidden, _))),
+                "an unowned recorded result is not replayed: {legacy:?}"
+            );
+        }
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a replay writes no events"
+        );
+
+        grace_socket.close(None).await.unwrap();
+        admin_socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resumed_run_rebuilds_the_history_it_first_saw() {
+        let (_dir, running, invite) = running().await;
+        let (base, provider_task, _gates, recorded) = gated_provider(vec![
+            text("A done"),
+            tool("read_file", json!({"path": "a.txt"})),
+            text("C done"),
+            text("B done"),
+        ])
+        .await;
+        let mut socket = admin_socket(&running, &invite).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let machine = machine_token_n(40);
+        let (computer, machine) = paired_computer_with_token(&mut socket, &running, &machine).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let mut device = connect_computer(&running, &machine, computer).await;
+        wait_online(&mut socket, computer).await;
+
+        // A starts; B queues behind it before A's answer exists.
+        let _a = submit(&mut socket, chat, "A task", None).await;
+        let b = run_of(&submit(&mut socket, chat, "B task", None).await);
+        let approval: Id =
+            serde_json::from_value(approval_for_run(&mut socket, b).await["approval"].clone())
+                .unwrap();
+        // C runs while B waits; B must resume on the history it first saw.
+        let c = run_of(&submit(&mut socket, chat, "C task", None).await);
+        assert_eq!(wait_run(&mut socket, c).await["status"], "succeeded");
+        decide_approval(&mut socket, approval, true, false).await;
+        answer_next_action(&mut device, "o").await;
+        assert_eq!(wait_run(&mut socket, b).await["status"], "succeeded");
+
+        let bodies = recorded.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 4, "A, B, C and B's resume each call once");
+        let messages = |body: &serde_json::Value| body["messages"].clone();
+        let initial = messages(&bodies[1]);
+        let resumed = messages(&bodies[3]);
+        assert_eq!(
+            resumed.as_array().unwrap()[..initial.as_array().unwrap().len()],
+            initial.as_array().unwrap()[..],
+            "the resumed history keeps the exact prefix it first saw"
+        );
+        let serialized = initial.to_string();
+        assert!(
+            serialized.contains("A done"),
+            "B's first input includes A's answer"
+        );
+        let resumed_text = resumed.to_string();
+        assert!(
+            !resumed_text.contains("C done"),
+            "C's answer is not part of B's resumed history: {resumed_text}"
+        );
+        assert!(
+            resumed_text.contains("call-1"),
+            "B's own tool call is appended after the prefix"
+        );
+
+        device.close(None).await.unwrap();
+        provider_task.abort();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_remove_replays_one_confirmation() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let made = command(
+            &mut socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Allow, "shell", None, None),
+        )
+        .await;
+        let rule: Id = serde_json::from_value(made["rule"].clone()).unwrap();
+        let call = CommandCall::RuleRemove { rule };
+        let command_id = Id::new();
+        let mut retry = open_socket(&running, &token).await;
+        let (first, second) = tokio::join!(
+            try_command(&mut socket, command_id, call.clone()),
+            try_command(&mut retry, command_id, call.clone())
+        );
+        retry.close(None).await.unwrap();
+        let (_, first) = first.expect("the first removal");
+        let (_, second) = second.expect("the concurrent retry");
+        assert_eq!(
+            first, second,
+            "one command identifier returns one confirmation"
+        );
+        assert!(
+            first["user"].is_string(),
+            "the confirmation says who removed the rule"
+        );
+        let rules = approvals_of(&mut socket, bot).await;
+        assert!(
+            rules.iter().all(|view| view["rule"] != json!(rule)),
+            "the rule is removed once"
+        );
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_rule_add_replays_its_recorded_result() {
         let (_dir, running, invite) = running().await;
