@@ -1,10 +1,12 @@
 //! The built-in Bot loop.
 //!
-//! A run repeats one step at a time: call the Model, record the step, run
+//! A run repeats one step at a time: call the Model, record the reply, run
 //! every tool call the step requested, record each one before and after it
 //! runs, and feed the results back. A tool call runs on the Computer or, for
 //! the two File tools, moves a File between the Space and the Computer. The
-//! loop stops with a final Message, a failure, or a step limit.
+//! Space approves each Computer action before it starts; a run whose action
+//! must wait ends with [`RunOutcome::Waiting`] and resumes from the record.
+//! The loop stops with a final Message, a failure, or a step limit.
 
 use std::future::Future;
 use std::path::Path;
@@ -26,12 +28,14 @@ const MAX_RECORDED_ARGUMENTS: usize = 128 * 1024;
 pub struct RunRequest {
     /// The system instruction.
     pub system: String,
-    /// The Messages before the run.
+    /// The history ends with the results of the [`Resume::done`] calls.
     pub history: Vec<Message>,
     /// The largest Model reply in tokens.
     pub max_output: u32,
     /// How many steps the run may take.
     pub max_steps: usize,
+    /// The step to finish first, when the run resumes after an approval.
+    pub resume: Option<Resume>,
 }
 
 impl RunRequest {
@@ -43,6 +47,7 @@ impl RunRequest {
             history,
             max_output,
             max_steps: 8,
+            resume: None,
         }
     }
 
@@ -52,17 +57,86 @@ impl RunRequest {
         self.max_steps = max_steps;
         self
     }
+
+    /// Resumes the run from a step that waited for an approval.
+    #[must_use]
+    pub fn with_resume(mut self, resume: Resume) -> Self {
+        self.resume = Some(resume);
+        self
+    }
+}
+
+/// A step that waited for an approval and now continues.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resume {
+    /// The step to continue.
+    pub step: u32,
+    /// The text the Model wrote with the step's calls.
+    pub content: Option<String>,
+    /// The step's calls as the record keeps them.
+    pub calls: Vec<RecordedCall>,
+    /// How many calls already have a recorded result. Their results are the
+    /// last `done` Messages of the history; the next call is the approved
+    /// action.
+    pub done: usize,
+    /// The approved action's identifier, which the action keeps when it runs.
+    pub approved_action: Id,
+    /// The usage of the reply that made the step, which the run's usage starts from.
+    pub usage: Usage,
+}
+
+/// A tool call as the record keeps it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedCall {
+    /// The identifier the call's tool result answers under; see [`call_id`].
+    pub call: String,
+    /// The tool's name.
+    pub tool: String,
+    /// The arguments.
+    pub arguments: Value,
+}
+
+/// Whether a Computer action may start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decision {
+    /// The action runs.
+    Allow,
+    /// The action waits for the User; the run ends with [`RunOutcome::Waiting`].
+    Wait,
 }
 
 /// How a run ended.
 #[derive(Clone, Debug, PartialEq)]
-pub struct RunOutcome {
-    /// The final Message text.
-    pub text: String,
-    /// The usage of every step.
-    pub usage: Usage,
-    /// Whether the run reached a final answer.
-    pub succeeded: bool,
+pub enum RunOutcome {
+    /// The run reached a final Message or a failure.
+    Reply {
+        /// The final Message text.
+        text: String,
+        /// The usage of every step.
+        usage: Usage,
+        /// Whether the run reached a final answer.
+        succeeded: bool,
+    },
+    /// A Computer action waits for the User's approval.
+    Waiting {
+        /// The action the run waits for.
+        approval: WaitingApproval,
+    },
+}
+
+/// The action a run waits for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WaitingApproval {
+    /// The step that holds the action.
+    pub step: u32,
+    /// The call's identifier, which its tool result answers under.
+    pub call: String,
+    /// The tool the Model called.
+    pub tool: String,
+    /// The call's arguments as the record keeps them.
+    pub arguments: Value,
+    /// The action's identifier, which the action keeps when it runs.
+    pub action: Id,
 }
 
 /// The record seam the loop writes through.
@@ -74,6 +148,24 @@ pub trait Recorder {
         usage: Usage,
         tool_calls: u32,
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
+
+    /// Records a Model reply before any of its calls runs.
+    fn reply(
+        &mut self,
+        step: u32,
+        content: Option<String>,
+        calls: Vec<RecordedCall>,
+        usage: Usage,
+    ) -> impl Future<Output = Result<(), LoopError>> + Send;
+
+    /// Asks whether one Computer action may start under `action`. Only a
+    /// Computer action is asked for; a File move never is.
+    fn approve(
+        &mut self,
+        step: u32,
+        call: &RecordedCall,
+        action: Id,
+    ) -> impl Future<Output = Result<Decision, LoopError>> + Send;
 
     /// Records an action before it runs.
     fn action_started(
@@ -96,7 +188,7 @@ pub trait Recorder {
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 }
 
-/// Runs one Bot run to its end.
+/// Runs one Bot run to its end, or until a Computer action waits for an approval.
 pub async fn run<R, M, Rec, F>(
     runtime: &R,
     model: &M,
@@ -110,65 +202,121 @@ where
     Rec: Recorder + Send,
     F: FileHost + Sync,
 {
-    let mut messages = Vec::with_capacity(request.history.len() + 8);
-    messages.push(Message::system(request.system));
-    messages.extend(request.history);
-    let mut usage = Usage::default();
-    let max_steps = request.max_steps.min(u32::MAX as usize) as u32;
+    let RunRequest {
+        system,
+        history,
+        max_output,
+        max_steps,
+        resume,
+    } = request;
+    let mut messages = Vec::with_capacity(history.len() + 8);
+    messages.push(Message::system(system));
+    messages.extend(history);
+    let max_steps = max_steps.min(u32::MAX as usize) as u32;
+    // A resumed run finishes the step that waited before it calls the Model,
+    // and its usage starts from that step's reply.
+    let mut resume = resume;
+    let first_step = resume.as_ref().map_or(1, |resume| resume.step);
+    let mut usage = resume
+        .as_ref()
+        .map_or(Usage::default(), |resume| resume.usage);
 
-    for step in 1..=max_steps {
-        let reply = match model
-            .complete(ModelRequest {
-                messages: messages.clone(),
-                tools: tools::specs(),
-                max_output: request.max_output,
-            })
-            .await
-        {
-            Ok(reply) => reply,
-            Err(failure) => {
-                return Ok(failure_outcome(&failure, usage));
+    for step in first_step..=max_steps {
+        let (calls, reply_usage, from, approved) = match resume.take() {
+            // The reply was recorded before the run waited, so it is not
+            // recorded again; its done calls already have their results.
+            Some(resume) => {
+                let Resume {
+                    content,
+                    calls,
+                    done,
+                    approved_action,
+                    usage,
+                    ..
+                } = resume;
+                // The results of the done calls end the history, and the
+                // reply's calls come before them.
+                let at = messages.len() - done.min(messages.len() - 1);
+                messages.insert(
+                    at,
+                    Message::assistant_with_calls(content, model_calls(&calls)),
+                );
+                (resumed_calls(calls), usage, done, Some(approved_action))
+            }
+            None => {
+                let reply = match model
+                    .complete(ModelRequest {
+                        messages: messages.clone(),
+                        tools: tools::specs(),
+                        max_output,
+                    })
+                    .await
+                {
+                    Ok(reply) => reply,
+                    Err(failure) => {
+                        return Ok(failure_outcome(&failure, usage));
+                    }
+                };
+                usage += reply.usage;
+                if reply.tool_calls.is_empty() {
+                    // A step with no actions completes when the Model answers.
+                    recorder.step(step, reply.usage, 0).await?;
+                    return Ok(final_reply(reply.content, usage));
+                }
+                let calls = step_calls(step, &reply.tool_calls);
+                recorder
+                    .reply(
+                        step,
+                        reply.content.clone(),
+                        calls.iter().map(|call| call.recorded.clone()).collect(),
+                        reply.usage,
+                    )
+                    .await?;
+                messages.push(Message::assistant_with_calls(
+                    reply.content,
+                    reply.tool_calls,
+                ));
+                (calls, reply.usage, 0, None)
             }
         };
-        usage += reply.usage;
-        let calls = reply.tool_calls;
-        if calls.is_empty() {
-            // A step with no actions completes when the Model answers.
-            recorder.step(step, reply.usage, 0).await?;
-            let text = reply.content.unwrap_or_default();
-            if text.trim().is_empty() {
-                return Ok(RunOutcome {
-                    text: "The Model returned an empty reply.".to_owned(),
-                    usage,
-                    succeeded: false,
-                });
-            }
-            return Ok(RunOutcome {
-                text,
-                usage,
-                succeeded: true,
-            });
-        }
-
-        messages.push(Message::assistant_with_calls(reply.content, calls.clone()));
-        for (index, call) in calls.iter().enumerate() {
-            let action = Id::new();
-            // A call that will run keeps its real arguments in the record.
-            // Only a call that is refused may be summarized.
-            let parsed = tools::parse(&call.name, &call.arguments);
-            let arguments = match (&parsed, call.arguments.len() > MAX_RECORDED_ARGUMENTS) {
-                (Ok(_), _) => serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone())),
-                (Err(_), true) => {
-                    serde_json::json!({"truncated": true, "bytes": call.arguments.len()})
+        let tool_calls = calls.len() as u32;
+        for (index, call) in calls.into_iter().enumerate().skip(from) {
+            // The action the User approved runs under its recorded identifier
+            // and is not asked for again.
+            let action = if index == from { approved } else { None };
+            let action = match action {
+                Some(action) => action,
+                None => {
+                    // A refused call runs nothing and a File move is the
+                    // Space's own; only a Computer action asks.
+                    let action = Id::new();
+                    let computer = matches!(call.parsed, Ok(tools::Call::Computer(_)));
+                    if computer
+                        && recorder.approve(step, &call.recorded, action).await? == Decision::Wait
+                    {
+                        let recorded = call.recorded;
+                        return Ok(RunOutcome::Waiting {
+                            approval: WaitingApproval {
+                                step,
+                                call: recorded.call,
+                                tool: recorded.tool,
+                                arguments: recorded.arguments,
+                                action,
+                            },
+                        });
+                    }
+                    action
                 }
-                (Err(_), false) => serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone())),
             };
             recorder
-                .action_started(step, action, call.name.clone(), arguments)
+                .action_started(
+                    step,
+                    action,
+                    call.recorded.tool.clone(),
+                    call.recorded.arguments.clone(),
+                )
                 .await?;
-            let result = match parsed {
+            let result = match call.parsed {
                 Ok(tools::Call::Computer(computer_action)) => {
                     runtime.execute(computer_action).await
                 }
@@ -182,20 +330,20 @@ where
                 .action_finished(
                     step,
                     action,
-                    call.name.clone(),
+                    call.recorded.tool,
                     result.status,
                     result.output.clone(),
                     result.error.clone(),
                 )
                 .await?;
             messages.push(Message::tool_result(
-                call_id(call, step, index),
+                call.recorded.call,
                 tool_result_text(&result),
             ));
             if result.status == ActionStatus::Unknown {
                 // The action's result never returned. The record says unknown,
                 // and the run ends here instead of resuming it blindly.
-                return Ok(RunOutcome {
+                return Ok(RunOutcome::Reply {
                     text: "I lost my Computer before the action returned.".to_owned(),
                     usage,
                     succeeded: false,
@@ -203,14 +351,107 @@ where
             }
         }
         // A step completes only after all of its actions were recorded.
-        recorder.step(step, reply.usage, calls.len() as u32).await?;
+        recorder.step(step, reply_usage, tool_calls).await?;
     }
 
-    Ok(RunOutcome {
+    Ok(RunOutcome::Reply {
         text: format!("I stopped after {max_steps} steps without a final answer."),
         usage,
         succeeded: false,
     })
+}
+
+/// One call of a step: whether it can run, and what the record keeps of it.
+struct StepCall {
+    parsed: Result<tools::Call, String>,
+    recorded: RecordedCall,
+}
+
+/// The calls of a Model reply as the step runs them.
+fn step_calls(step: u32, calls: &[ToolCall]) -> Vec<StepCall> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let parsed = tools::parse(&call.name, &call.arguments);
+            StepCall {
+                recorded: RecordedCall {
+                    call: call_id(&call.id, step, index),
+                    tool: call.name.clone(),
+                    arguments: recorded_arguments(&parsed, &call.arguments),
+                },
+                parsed,
+            }
+        })
+        .collect()
+}
+
+/// The recorded calls of a resumed step as the step runs them.
+fn resumed_calls(calls: Vec<RecordedCall>) -> Vec<StepCall> {
+    calls
+        .into_iter()
+        .map(|recorded| {
+            let parsed = tools::parse(&recorded.tool, &recorded.arguments.to_string());
+            StepCall { parsed, recorded }
+        })
+        .collect()
+}
+
+/// The recorded calls of a resumed step as the Model wrote them.
+fn model_calls(calls: &[RecordedCall]) -> Vec<ToolCall> {
+    calls
+        .iter()
+        .map(|recorded| ToolCall {
+            id: recorded.call.clone(),
+            name: recorded.tool.clone(),
+            arguments: recorded.arguments.to_string(),
+        })
+        .collect()
+}
+
+/// Returns the identifier a tool result answers under.
+///
+/// The Model's own identifier when it gave one, and `call-<step>-<index>`
+/// otherwise. The rule depends on nothing else, so the Space rebuilds a
+/// run's Messages from the record with the same identifiers.
+#[must_use]
+pub fn call_id(id: &str, step: u32, index: usize) -> String {
+    if id.is_empty() {
+        format!("call-{step}-{index}")
+    } else {
+        id.to_owned()
+    }
+}
+
+/// What the record keeps of a call's arguments.
+fn recorded_arguments(parsed: &Result<tools::Call, String>, raw: &str) -> Value {
+    // A call that will run keeps its real arguments in the record.
+    // Only a call that is refused may be summarized.
+    match (parsed, raw.len() > MAX_RECORDED_ARGUMENTS) {
+        (Ok(_), _) => serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned())),
+        (Err(_), true) => serde_json::json!({"truncated": true, "bytes": raw.len()}),
+        (Err(_), false) => {
+            serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+        }
+    }
+}
+
+/// The outcome of a final reply.
+fn final_reply(content: Option<String>, usage: Usage) -> RunOutcome {
+    let text = content.unwrap_or_default();
+    if text.trim().is_empty() {
+        RunOutcome::Reply {
+            text: "The Model returned an empty reply.".to_owned(),
+            usage,
+            succeeded: false,
+        }
+    } else {
+        RunOutcome::Reply {
+            text,
+            usage,
+            succeeded: true,
+        }
+    }
 }
 
 /// Turns a File transfer's error into the action's result.
@@ -285,18 +526,10 @@ where
 }
 
 fn failure_outcome(failure: &ModelFailure, usage: Usage) -> RunOutcome {
-    RunOutcome {
+    RunOutcome::Reply {
         text: format!("I could not answer: {}", failure.detail),
         usage: usage + failure.usage,
         succeeded: false,
-    }
-}
-
-fn call_id(call: &ToolCall, step: u32, index: usize) -> String {
-    if call.id.is_empty() {
-        format!("call-{step}-{index}")
-    } else {
-        call.id.clone()
     }
 }
 
@@ -340,7 +573,10 @@ mod tests {
     };
     use serde_json::{Value, json};
 
-    use super::{LoopError, Recorder, RunRequest, run};
+    use super::{
+        Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest,
+        WaitingApproval, call_id, run,
+    };
     use crate::files::{DeliveredFile, FileHost, TakenFile};
     use crate::model::{Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall};
     use crate::tools::{PUT_FILE, TAKE_FILE};
@@ -516,34 +752,78 @@ mod tests {
         }
     }
 
+    /// The record, in the order the loop wrote it.
     #[derive(Default)]
     struct TestRecorder {
         steps: Vec<(u32, Usage, u32)>,
-        started: Vec<(u32, String)>,
+        replies: Vec<(u32, Option<String>, Vec<RecordedCall>, Usage)>,
+        approvals: Vec<(u32, String, Id)>,
+        /// The decisions `approve` returns in order; Allow once it runs out.
+        decisions: VecDeque<Decision>,
+        started: Vec<(u32, String, Id)>,
         finished: Vec<(u32, ActionStatus)>,
-        fail: bool,
+        /// The method that fails, named by its entry in `order`.
+        fail_at: Option<&'static str>,
         order: Vec<&'static str>,
+    }
+
+    impl TestRecorder {
+        /// A record that refuses the first action it is asked about.
+        fn that_waits() -> Self {
+            Self {
+                decisions: VecDeque::from([Decision::Wait]),
+                ..Self::default()
+            }
+        }
+
+        fn record(&mut self, entry: &'static str) -> Result<(), LoopError> {
+            self.order.push(entry);
+            if self.fail_at == Some(entry) {
+                return Err(LoopError::Record("no".to_owned()));
+            }
+            Ok(())
+        }
     }
 
     impl Recorder for TestRecorder {
         async fn step(&mut self, step: u32, usage: Usage, calls: u32) -> Result<(), LoopError> {
-            if self.fail {
-                return Err(LoopError::Record("no".to_owned()));
-            }
-            self.order.push("step");
+            self.record("step")?;
             self.steps.push((step, usage, calls));
             Ok(())
+        }
+
+        async fn reply(
+            &mut self,
+            step: u32,
+            content: Option<String>,
+            calls: Vec<RecordedCall>,
+            usage: Usage,
+        ) -> Result<(), LoopError> {
+            self.record("reply")?;
+            self.replies.push((step, content, calls, usage));
+            Ok(())
+        }
+
+        async fn approve(
+            &mut self,
+            step: u32,
+            call: &RecordedCall,
+            action: Id,
+        ) -> Result<Decision, LoopError> {
+            self.record("approve")?;
+            self.approvals.push((step, call.tool.clone(), action));
+            Ok(self.decisions.pop_front().unwrap_or(Decision::Allow))
         }
 
         async fn action_started(
             &mut self,
             step: u32,
-            _action: Id,
+            action: Id,
             tool: String,
             _arguments: Value,
         ) -> Result<(), LoopError> {
-            self.order.push("action_started");
-            self.started.push((step, tool));
+            self.record("action_started")?;
+            self.started.push((step, tool, action));
             Ok(())
         }
 
@@ -556,9 +836,29 @@ mod tests {
             _output: ToolOutput,
             _error: Option<String>,
         ) -> Result<(), LoopError> {
-            self.order.push("action_finished");
+            self.record("action_finished")?;
             self.finished.push((step, status));
             Ok(())
+        }
+    }
+
+    /// The reply of a run that did not wait.
+    fn reply_outcome(outcome: Result<RunOutcome, LoopError>) -> (String, Usage, bool) {
+        match outcome.unwrap() {
+            RunOutcome::Reply {
+                text,
+                usage,
+                succeeded,
+            } => (text, usage, succeeded),
+            RunOutcome::Waiting { approval } => panic!("the run waited for {approval:?}"),
+        }
+    }
+
+    /// The action a run waited for.
+    fn waiting(outcome: Result<RunOutcome, LoopError>) -> WaitingApproval {
+        match outcome.unwrap() {
+            RunOutcome::Waiting { approval } => approval,
+            RunOutcome::Reply { text, .. } => panic!("the run replied {text:?}"),
         }
     }
 
@@ -596,12 +896,51 @@ mod tests {
         calls_reply(vec![call("call-1", name, arguments)])
     }
 
+    fn recorded(id: &str, tool: &str, arguments: Value) -> RecordedCall {
+        RecordedCall {
+            call: id.to_owned(),
+            tool: tool.to_owned(),
+            arguments,
+        }
+    }
+
+    /// Resumes the second step, which waited on the call after `done`.
+    fn resume(calls: Vec<RecordedCall>, done: usize, approved_action: Id) -> Resume {
+        Resume {
+            step: 2,
+            content: None,
+            calls,
+            done,
+            approved_action,
+            usage: Usage {
+                uncached_input: 3,
+                output: 7,
+                ..Usage::default()
+            },
+        }
+    }
+
     fn taken_file(name: &str, bytes: &[u8]) -> TakenFile {
         TakenFile {
             name: name.to_owned(),
             media_type: "text/plain".to_owned(),
             bytes: bytes.to_vec(),
         }
+    }
+
+    /// The `(tool_call_id, content)` of every tool Message in a request.
+    fn tool_messages(request: &ModelRequest) -> Vec<(String, String)> {
+        request
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .map(|message| {
+                (
+                    message.tool_call_id.clone().unwrap(),
+                    message.content.clone().unwrap(),
+                )
+            })
+            .collect()
     }
 
     /// The text each tool call of the first step returned to the Model.
@@ -622,21 +961,24 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (text, usage, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert_eq!(outcome.text, "hello");
-        assert!(outcome.succeeded);
-        assert_eq!(outcome.usage.output, 1);
+        assert_eq!(text, "hello");
+        assert!(succeeded);
+        assert_eq!(usage.output, 1);
         assert_eq!(recorder.steps.len(), 1);
         assert!(recorder.started.is_empty());
+        assert!(recorder.replies.is_empty(), "a final answer has no calls");
+        assert!(recorder.approvals.is_empty());
     }
 
     #[tokio::test]
@@ -652,24 +994,32 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert_eq!(outcome.text, "done");
-        assert!(outcome.succeeded);
+        assert_eq!(text, "done");
+        assert!(succeeded);
         assert_eq!(recorder.started.len(), 1);
         assert_eq!(recorder.started[0].1, "write_file");
         assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
         assert_eq!(
             recorder.order,
-            ["action_started", "action_finished", "step", "step"]
+            [
+                "reply",
+                "approve",
+                "action_started",
+                "action_finished",
+                "step",
+                "step",
+            ]
         );
         let actions = runtime.actions.lock().unwrap();
         assert_eq!(
@@ -686,6 +1036,325 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_action_that_waits_is_not_started() {
+        let model = FakeModel::with(vec![call_reply(
+            "shell",
+            json!({"command": "rm -rf build"}),
+        )]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::that_waits();
+
+        let approval = waiting(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            approval,
+            WaitingApproval {
+                step: 1,
+                call: "call-1".to_owned(),
+                tool: "shell".to_owned(),
+                arguments: json!({"command": "rm -rf build"}),
+                action: recorder.approvals[0].2,
+            }
+        );
+        assert_eq!(recorder.order, ["reply", "approve"]);
+        assert!(recorder.started.is_empty());
+        assert!(recorder.steps.is_empty(), "the step did not complete");
+        assert!(runtime.actions.lock().unwrap().is_empty());
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_is_recorded_before_its_actions_are_approved() {
+        let model = FakeModel::with(vec![
+            Ok(ModelReply {
+                content: Some("let me look".to_owned()),
+                tool_calls: vec![call("call-7", "read_file", json!({"path": "a.txt"}))],
+                usage: Usage {
+                    output: 3,
+                    ..Usage::default()
+                },
+            }),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert_eq!(
+            recorder.replies,
+            [(
+                1,
+                Some("let me look".to_owned()),
+                vec![recorded("call-7", "read_file", json!({"path": "a.txt"}))],
+                Usage {
+                    output: 3,
+                    ..Usage::default()
+                },
+            )]
+        );
+        // The action the Space approves is the one that starts.
+        assert_eq!(recorder.approvals.len(), 1);
+        assert_eq!(
+            recorder.approvals[0],
+            (1, "read_file".to_owned(), recorder.started[0].2)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_hold_an_approval_stops_the_loop() {
+        let model = FakeModel::with(vec![call_reply("shell", json!({"command": "ls"}))]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder {
+            fail_at: Some("approve"),
+            ..TestRecorder::default()
+        };
+
+        let error = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            &files,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await;
+
+        assert!(matches!(error, Err(LoopError::Record(_))));
+        assert_eq!(recorder.order, ["reply", "approve"]);
+        assert!(recorder.started.is_empty());
+        assert!(runtime.actions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_step_runs_the_approved_action_under_its_id() {
+        let approved_action = Id::new();
+        let calls = vec![
+            recorded(
+                "call-1",
+                "write_file",
+                json!({"path": "a.txt", "content": "a"}),
+            ),
+            recorded("call-2", "read_file", json!({"path": "a.txt"})),
+            recorded("call-3", "list_files", json!({"path": "."})),
+        ];
+        // The Space rebuilt the first call's result at the end of the history.
+        let history = vec![Message::tool_result("call-1", "wrote a.txt")];
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, usage, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", history, 100).with_resume(resume(
+                    calls,
+                    1,
+                    approved_action,
+                )),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert!(recorder.replies.is_empty(), "the reply was recorded before");
+        // The approved action keeps its id and is not asked for again.
+        assert_eq!(
+            recorder.started[0],
+            (2, "read_file".to_owned(), approved_action)
+        );
+        assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
+        // A later action asks, and runs under the id it was asked with.
+        assert_eq!(recorder.approvals.len(), 1);
+        assert_eq!(recorder.approvals[0].1, "list_files");
+        assert_eq!(recorder.started[1].2, recorder.approvals[0].2);
+        assert_eq!(
+            recorder.order,
+            [
+                "action_started",
+                "action_finished",
+                "approve",
+                "action_started",
+                "action_finished",
+                "step",
+                "step",
+            ]
+        );
+        // Step numbering continues from the resumed step.
+        assert_eq!(
+            recorder.steps,
+            [
+                (2, resume(Vec::new(), 0, approved_action).usage, 3),
+                (3, reply("done").unwrap().usage, 0),
+            ]
+        );
+        assert_eq!(
+            usage,
+            resume(Vec::new(), 0, approved_action).usage + reply("done").unwrap().usage
+        );
+        assert_eq!(
+            *runtime.actions.lock().unwrap(),
+            [
+                Action::ReadFile {
+                    path: "a.txt".to_owned(),
+                },
+                Action::ListFiles {
+                    path: ".".to_owned(),
+                },
+            ]
+        );
+        // The Model sees the reply's calls, then every result in order.
+        let requests = model.requests.lock().unwrap();
+        let messages = &requests[0].messages;
+        assert_eq!(
+            messages[1].tool_calls,
+            [
+                ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "write_file".to_owned(),
+                    arguments: json!({"path": "a.txt", "content": "a"}).to_string(),
+                },
+                ToolCall {
+                    id: "call-2".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: json!({"path": "a.txt"}).to_string(),
+                },
+                ToolCall {
+                    id: "call-3".to_owned(),
+                    name: "list_files".to_owned(),
+                    arguments: json!({"path": "."}).to_string(),
+                },
+            ]
+        );
+        assert_eq!(
+            tool_messages(&requests[0]),
+            [
+                ("call-1".to_owned(), "wrote a.txt".to_owned()),
+                ("call-2".to_owned(), "42".to_owned()),
+                ("call-3".to_owned(), "42".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_call_of_a_resumed_step_asks_again() {
+        let approved_action = Id::new();
+        let calls = vec![
+            recorded(
+                "call-1",
+                "write_file",
+                json!({"path": "a.txt", "content": "a"}),
+            ),
+            recorded("call-2", "shell", json!({"command": "rm -rf build"})),
+        ];
+        let model = FakeModel::with(Vec::new());
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::that_waits();
+
+        let approval = waiting(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100).with_resume(resume(
+                    calls,
+                    0,
+                    approved_action,
+                )),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            approval,
+            WaitingApproval {
+                step: 2,
+                call: "call-2".to_owned(),
+                tool: "shell".to_owned(),
+                arguments: json!({"command": "rm -rf build"}),
+                action: recorder.approvals[0].2,
+            }
+        );
+        assert_ne!(approval.action, approved_action);
+        assert_eq!(
+            recorder.started,
+            [(2, "write_file".to_owned(), approved_action)]
+        );
+        assert_eq!(recorder.finished.len(), 1);
+        assert_eq!(
+            recorder.order,
+            ["action_started", "action_finished", "approve"]
+        );
+        assert!(recorder.steps.is_empty(), "the step did not complete");
+        assert!(model.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_call_the_model_left_without_an_id_answers_under_its_position() {
+        assert_eq!(call_id("", 3, 0), "call-3-0");
+        assert_eq!(call_id("call-9", 1, 2), "call-9");
+        assert_eq!(call_id("call-3-0", 3, 0), "call-3-0");
+    }
+
+    #[tokio::test]
+    async fn the_space_can_rebuild_the_id_of_an_id_less_call() {
+        let model = FakeModel::with(vec![
+            calls_reply(vec![call("", "list_files", json!({"path": "."}))]),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        let recorded = &recorder.replies[0].2[0];
+        assert_eq!(recorded.call, "call-1-0");
+        assert_eq!(
+            tool_messages(&model.requests.lock().unwrap()[1]),
+            [("call-1-0".to_owned(), "42".to_owned())]
+        );
+        assert_eq!(call_id(&recorded.call, 1, 0), "call-1-0");
+    }
+
+    #[tokio::test]
     async fn an_action_whose_result_never_returned_ends_the_run() {
         let model = FakeModel::with(vec![
             call_reply(
@@ -698,21 +1367,19 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
-
-        assert!(!outcome.succeeded);
-        assert_eq!(
-            outcome.text,
-            "I lost my Computer before the action returned."
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
         );
+
+        assert!(!succeeded);
+        assert_eq!(text, "I lost my Computer before the action returned.");
         assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
     }
@@ -728,17 +1395,18 @@ mod tests {
         let runtime = FakeRuntime::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (_, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert!(outcome.succeeded);
+        assert!(succeeded);
         assert_eq!(
             *runtime.files.lock().unwrap(),
             vec![("report.txt".to_owned(), b"hello".to_vec())]
@@ -746,6 +1414,7 @@ mod tests {
         assert!(runtime.actions.lock().unwrap().is_empty());
         assert_eq!(recorder.started[0].1, TAKE_FILE);
         assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
+        assert!(recorder.approvals.is_empty(), "a File move never asks");
         assert_eq!(
             tool_texts(&model),
             ["took report.txt (5 bytes) as report.txt"]
@@ -762,17 +1431,18 @@ mod tests {
         let runtime = FakeRuntime::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert_eq!(outcome.text, "done");
+        assert_eq!(text, "done");
         assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
         assert!(tool_texts(&model)[0].contains("no File"));
         assert!(runtime.files.lock().unwrap().is_empty());
@@ -789,20 +1459,18 @@ mod tests {
         let runtime = FakeRuntime::slow();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            outcome.succeeded,
-            "a timeout is a tool answer, not a lost run"
+        let (_, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
         );
+
+        assert!(succeeded, "a timeout is a tool answer, not a lost run");
         assert_eq!(recorder.finished[0].1, ActionStatus::TimedOut);
         assert_eq!(model.requests.lock().unwrap().len(), 2);
     }
@@ -821,23 +1489,25 @@ mod tests {
             let runtime = FakeRuntime::with_file("out/report.txt", b"hello");
             let mut recorder = TestRecorder::default();
 
-            let outcome = run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await
-            .unwrap();
+            let (_, _, succeeded) = reply_outcome(
+                run(
+                    &runtime,
+                    &model,
+                    &mut recorder,
+                    &files,
+                    RunRequest::new("system", Vec::new(), 100),
+                )
+                .await,
+            );
 
-            assert!(outcome.succeeded);
+            assert!(succeeded);
             assert_eq!(
                 *files.puts.lock().unwrap(),
                 vec![(name.to_owned(), b"hello".to_vec())]
             );
             assert!(runtime.actions.lock().unwrap().is_empty());
             assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
+            assert!(recorder.approvals.is_empty(), "a File move never asks");
             assert_eq!(
                 tool_texts(&model),
                 [format!("delivered {name} as file {}", files.delivered)]
@@ -864,22 +1534,25 @@ mod tests {
         let runtime = FakeRuntime::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert_eq!(outcome.text, "done");
+        assert_eq!(text, "done");
         assert_eq!(
             recorder.order,
             [
+                "reply",
                 "action_started",
                 "action_finished",
+                "approve",
                 "action_started",
                 "action_finished",
                 "action_started",
@@ -892,7 +1565,7 @@ mod tests {
             recorder
                 .started
                 .iter()
-                .map(|(_, tool)| tool.as_str())
+                .map(|(_, tool, _)| tool.as_str())
                 .collect::<Vec<_>>(),
             [TAKE_FILE, "write_file", PUT_FILE]
         );
@@ -904,7 +1577,15 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ActionStatus::Succeeded; 3]
         );
-        // Only write_file runs through the Computer.
+        // Only write_file is a Computer action: it alone is approved and run.
+        assert_eq!(
+            recorder
+                .approvals
+                .iter()
+                .map(|(_, tool, _)| tool.as_str())
+                .collect::<Vec<_>>(),
+            ["write_file"]
+        );
         assert_eq!(
             *runtime.actions.lock().unwrap(),
             [Action::WriteFile {
@@ -948,17 +1629,18 @@ mod tests {
         };
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert_eq!(outcome.text, "done");
+        assert_eq!(text, "done");
         assert_eq!(
             recorder
                 .finished
@@ -985,21 +1667,19 @@ mod tests {
         let runtime = FakeRuntime::lost();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
-
-        assert!(!outcome.succeeded);
-        assert_eq!(
-            outcome.text,
-            "I lost my Computer before the action returned."
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
         );
+
+        assert!(!succeeded);
+        assert_eq!(text, "I lost my Computer before the action returned.");
         assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         assert!(runtime.files.lock().unwrap().is_empty());
@@ -1016,21 +1696,19 @@ mod tests {
         runtime.lost = true;
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
-
-        assert!(!outcome.succeeded);
-        assert_eq!(
-            outcome.text,
-            "I lost my Computer before the action returned."
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
         );
+
+        assert!(!succeeded);
+        assert_eq!(text, "I lost my Computer before the action returned.");
         assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
         assert!(
@@ -1065,17 +1743,18 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (_, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert!(outcome.succeeded);
+        assert!(succeeded);
         assert_eq!(recorder.started.len(), 2);
         assert_eq!(recorder.finished.len(), 2);
         let requests = model.requests.lock().unwrap();
@@ -1101,19 +1780,24 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (_, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert!(outcome.succeeded);
+        assert!(succeeded);
         assert_eq!(recorder.started[0].1, "no_such_tool");
         assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
+        assert!(
+            recorder.approvals.is_empty(),
+            "a call that runs nothing asks nobody"
+        );
         let requests = model.requests.lock().unwrap();
         let tool_message = requests[1]
             .messages
@@ -1141,18 +1825,23 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (_, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert!(outcome.succeeded);
+        assert!(succeeded);
         assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
+        assert!(
+            recorder.approvals.is_empty(),
+            "a call that runs nothing asks nobody"
+        );
         let requests = model.requests.lock().unwrap();
         let tool_message = requests[1]
             .messages
@@ -1184,19 +1873,20 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100),
-        )
-        .await
-        .unwrap();
+        let (text, usage, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
 
-        assert!(!outcome.succeeded);
-        assert!(outcome.text.contains("down"));
-        assert_eq!(outcome.usage.budgeted(), 52);
+        assert!(!succeeded);
+        assert!(text.contains("down"));
+        assert_eq!(usage.budgeted(), 52);
         assert!(recorder.steps.is_empty());
     }
 
@@ -1210,18 +1900,19 @@ mod tests {
         let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
-        let outcome = run(
-            &runtime,
-            &model,
-            &mut recorder,
-            &files,
-            RunRequest::new("system", Vec::new(), 100).with_max_steps(2),
-        )
-        .await
-        .unwrap();
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100).with_max_steps(2),
+            )
+            .await,
+        );
 
-        assert!(!outcome.succeeded);
-        assert!(outcome.text.contains("2 steps"));
+        assert!(!succeeded);
+        assert!(text.contains("2 steps"));
         assert_eq!(recorder.steps.len(), 2);
         assert_eq!(recorder.started.len(), 2);
     }
@@ -1232,7 +1923,7 @@ mod tests {
         let runtime = FakeRuntime::default();
         let files = FakeFiles::default();
         let mut recorder = TestRecorder {
-            fail: true,
+            fail_at: Some("step"),
             ..TestRecorder::default()
         };
 

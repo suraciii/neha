@@ -39,6 +39,20 @@ An event has a kind, a version, an author, and data. A kind belongs to one Plugi
 
 A reader keeps every event. A kind it does not know that decides who can read or act makes it stop and ask for an upgrade.
 
+## Approval events
+
+The record holds these kinds for approvals and rules:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.run.reply` | A step's reply: its content, calls, and usage |
+| `neha.approval.requested` | A Computer action waiting for the acting User's decision |
+| `neha.approval.decided` | The acting User's Allow or Deny for one approval |
+| `neha.rule.added` | A lasting Ask or Allow rule |
+| `neha.rule.removed` | A lasting rule removed |
+
+Each is an Authority event, so a reader that does not know one stops and asks for an upgrade.
+
 ## Projections
 
 A projection is built from the record and can be built again from it. Building a projection runs no tool and sends no message.

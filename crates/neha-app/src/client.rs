@@ -422,7 +422,8 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// Polls one run until it ends, reports each view, and returns the last one.
+/// Polls one run until it ends or waits for an approval, reporting each view,
+/// and returns the last one.
 ///
 /// The Space confirms the command that starts a run when it queues the run,
 /// so the run's result comes from the record, not from that command.
@@ -456,7 +457,13 @@ async fn wait_for_run_within(
         .await
         .map_err(|_| run_timeout(timeout))??;
         on_view(&view);
-        if matches!(view["status"].as_str(), Some("succeeded" | "failed")) {
+        // A waiting run has not ended; the caller answers the approval and
+        // asks again. It is reported like a terminal view so the wait does
+        // not turn a decision into a timeout.
+        if matches!(
+            view["status"].as_str(),
+            Some("succeeded" | "failed" | "waiting")
+        ) {
             return Ok(view);
         }
         tokio::time::sleep(RUN_POLL.min(left(deadline, timeout)?)).await;
@@ -629,6 +636,74 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    /// Serves a Space that answers every command with a waiting run view.
+    async fn waiting_space(listener: tokio::net::TcpListener, run: Id, approval: Id) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            let Some(Ok(message)) = socket.next().await else {
+                break;
+            };
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            match frame["type"].as_str() {
+                Some("hello") => {
+                    let greeting =
+                        serde_json::json!({"type": "hello", "version": PROTOCOL_VERSION});
+                    socket
+                        .send(Message::Text(greeting.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                Some("command") => {
+                    let result = serde_json::json!({
+                        "id": run,
+                        "status": "waiting",
+                        "approval": approval,
+                    });
+                    let reply = serde_json::json!({
+                        "type": "confirmed",
+                        "id": frame["id"].clone(),
+                        "result": result,
+                    });
+                    socket
+                        .send(Message::Text(reply.to_string().into()))
+                        .await
+                        .unwrap();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_waiting_run_returns_before_the_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let run = Id::new();
+        let approval = Id::new();
+        let space = tokio::spawn(waiting_space(listener, run, approval));
+        let started = std::time::Instant::now();
+
+        let view =
+            wait_for_run_within(&credential_at(address), run, Duration::from_secs(5), |_| {})
+                .await
+                .unwrap();
+
+        assert_eq!(view["status"], "waiting");
+        assert_eq!(
+            view["approval"].as_str(),
+            Some(approval.to_string().as_str())
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "a waiting run ends the wait immediately, not at the deadline"
+        );
+        space.abort();
     }
 
     #[test]

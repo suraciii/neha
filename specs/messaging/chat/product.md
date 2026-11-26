@@ -40,7 +40,7 @@ Working takes precedence over Unread, and Waiting over both.
 
 ## Answering
 
-The User answers a Question or an Approval in the Chat where it landed. The answer is a Message in that Chat.
+The User answers a Question or an Approval in the Chat where it landed. A Question's answer is a Message in that Chat, and an Approval's answer is recorded as its decision.
 
 A Bot's question or approval is answered only by the User it acts for.
 

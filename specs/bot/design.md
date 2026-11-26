@@ -52,6 +52,20 @@ A Hosted Computer's recovery, reset, or replacement stops its runs between two a
 
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 
+## Approvals
+
+Before a Computer action, the loop asks whether to proceed; a File's taking or delivery is not a Computer action, so it never asks.
+
+The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User, or when a lasting Ask rule matches. The first use is never covered by a lasting rule.
+
+A rule names one tool, with how the command starts for a shell or a directory for a file tool. When an Ask rule and an Allow rule both match one action, the more specific rule wins: a prefix beats the tool alone, a longer prefix beats a shorter one, and equally specific rules go to the Ask rule.
+
+An Always allow on an Ask rule's approval writes an Allow rule from the command's first word for a shell, or from the action's parent directory for a file tool. It removes the Ask rule that asked when the new Allow rule is at least as broad: the same prefix, or a shorter one. Otherwise the Ask rule stays.
+
+An Allow resumes the run from the record: the step's reply and finished actions replay, the waiting action keeps its recorded id, and no action runs twice. A Deny fails the run, and the Bot says why.
+
+A run that waits for an approval keeps no place in the Bot's queue, so a later request for the same Bot runs. A Space restart keeps an undecided approval waiting, resumes an allowed one, and fails a denied one.
+
 ## Instructions and data
 
 A lasting rule is an instruction to the Bot within the authority of the User who gave it.
@@ -81,3 +95,9 @@ A Message from the User the Bot acts for that answers the run's request steers t
 Runs of different Bots run in parallel.
 
 A handoff from one Bot to another carries the authority of the User the first Bot acted for, and never more.
+
+## Gaps
+
+- The Model does not ask for an approval on its own; only a built-in trigger or a lasting Ask rule asks.
+- Cancelling an approval and an unattended approval's expiry are not yet available.
+- An independent reviewer of approvals is not yet specified.

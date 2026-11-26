@@ -93,6 +93,8 @@ Ask the Bot to work and check where the work ran:
 target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 ```
 
+The first action on this Local Computer asks for approval in the Chat: the Bot waits until you Allow, Always allow, or Deny. [Approvals](approvals.md) covers the card and the commands.
+
 ## The Bot's Workspace and the write fence
 
 The Workspace root is `~/.neha/workspaces` by default; `--workspace` on `computer pair` chooses another root. The root holds one folder for each Bot, named by the Bot's id:
@@ -155,6 +157,7 @@ The machine ends the command it was running when the channel drops, so no action
 | A `computer list` workspace is empty | A Local Computer's workspace is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none. `neha computer run` prints the real root. |
 | An older record uses `real` or `managed` | An old `real` Computer reads as Local and an old `managed` one as Hosted. No action is needed. |
 | `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.config/neha` by default, and a Workspace inside it is refused. Pair again with `--workspace` outside that directory. |
+| `chat send` stops with a run waiting for approval | Answer the card in a terminal, or use `neha approval allow <approval-id>` from the ids it printed. [Approvals](approvals.md) covers it. |
 | The ticket is not valid | A ticket lasts one pairing and one Space start. Restart the Space, then run `neha computer pair` again; a signed-in CLI can also ask for a ticket when no ticket file is present. |
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory. A Bot cannot read that directory. |
 | A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
@@ -172,7 +175,8 @@ The machine ends the command it was running when the channel drops, so no action
 - A request cannot choose a working directory. Every run starts in the Bot's Workspace.
 - Moving a Bot to or from a Hosted Computer is not available, and carrying its Workspace is not specified.
 - A Hosted Computer runs inside the Space's process; a provider-backed Hosted machine is not available.
-- There is no approval gate. A Bot runs an action as soon as the Model asks for it.
+- A Hosted Computer does not ask before an action yet; [Approvals](approvals.md) covers the gate for a Local Computer.
+- An approval of a run no User is with does not expire yet, and a Question, a Group approval, and an independent reviewer are not available.
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.
 - Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.

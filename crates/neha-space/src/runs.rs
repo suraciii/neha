@@ -118,7 +118,15 @@ impl RunQueue {
             let mut bots: Vec<Id> = state
                 .runs
                 .values()
-                .filter(|run| run.status == RunStatus::Queued)
+                .filter(|run| {
+                    run.status == RunStatus::Queued
+                        || state
+                            .resumable_run(run.bot)
+                            .is_some_and(|view| view.id == run.id)
+                        || state
+                            .denied_run(run.bot)
+                            .is_some_and(|view| view.id == run.id)
+                })
                 .map(|run| run.bot)
                 .collect();
             bots.sort_unstable();
@@ -190,86 +198,186 @@ async fn work(
             _ = wake.notified() => {}
         }
         // A wake stands for the whole backlog: keep working while the record
-        // still holds a run of this Bot that waits.
+        // holds work of this Bot. A waiting run does not hold the pump: it is
+        // skipped until the acting User answers.
         loop {
-            // The Bot's admit lock covers choosing a run, snapshotting the
+            // The Bot's admit lock covers choosing the work, snapshotting the
             // Computer it starts on, and recording `RunStarted`. A `bot_moved`
             // takes the same lock, so the record's order decides which Computer
-            // the run uses: a run started before the move keeps the old one, and
+            // a run uses: a run started before the move keeps the old one, and
             // one started after it uses the new one. The lock is released before
             // any wait and before the run itself, so commands and the run never
             // block each other.
             let admit = server.runs.admit(bot).await;
-            let Some(run) = next_queued(&server, bot) else {
+            let work = {
+                let state = server.state.lock().ok();
+                state.and_then(|state| {
+                    if let Some(run) = state.resumable_run(bot) {
+                        // An allowed run keeps the place it began with, even
+                        // when its Computer is away: its action must not run
+                        // anywhere else.
+                        return computer_online(&state, &server.links, run)
+                            .then(|| Work::Resume(run.clone()));
+                    }
+                    if let Some(run) = state.denied_run(bot) {
+                        return Some(Work::Deny(run.clone()));
+                    }
+                    next_queued(&state, bot, &server.links).map(Work::Queued)
+                })
+            };
+            let Some(work) = work else {
                 drop(admit);
                 break;
             };
-            let pending = match commands::resume_pending(&server.state, &server.secrets, &run).await
-            {
-                Ok(pending) => pending,
-                Err(error) => {
+            match work {
+                Work::Deny(run) => {
                     drop(admit);
-                    let reason = error.to_string();
-                    if let Err(failure) = commands::fail_queued_run(
+                    if let Err(error) = commands::fail_denied_run(
                         &server.store,
                         &server.state,
                         &server.events,
                         &run,
-                        &reason,
                     )
                     .await
                     {
-                        eprintln!("neha: cannot fail queued run {}: {failure}", run.id);
+                        eprintln!("neha: cannot record a denied run {}: {error}", run.id);
                         return;
                     }
-                    continue;
                 }
-            };
-            #[cfg(test)]
-            pause_before_start(bot).await;
-            if commands::start_run(&server.store, &server.state, &server.events, &pending)
-                .await
-                .is_err()
-            {
-                drop(admit);
-                return;
-            }
-            drop(admit);
-            match commands::finish_run(
-                &server.store,
-                &server.state,
-                &server.home,
-                &server.blobs,
-                &server.model,
-                &server.events,
-                server.tool_timeout,
-                &server.links,
-                pending,
-            )
-            .await
-            {
-                Ok((_result, events)) => {
-                    for event in events {
-                        let _ = server.events.send(event);
+                Work::Resume(run) => {
+                    drop(admit);
+                    match commands::resume_run(
+                        &server.store,
+                        &server.state,
+                        &server.home,
+                        &server.blobs,
+                        &server.model,
+                        &server.secrets,
+                        &server.events,
+                        server.tool_timeout,
+                        &server.links,
+                        &run,
+                    )
+                    .await
+                    {
+                        Ok(commands::Finished::Completed(events)) => {
+                            for event in events {
+                                let _ = server.events.send(event);
+                            }
+                        }
+                        // The run may wait again on a later action.
+                        Ok(commands::Finished::Waiting) => {}
+                        Err(error) => {
+                            eprintln!("neha: a resumed run could not finish: {error}");
+                            return;
+                        }
                     }
                 }
-                Err(error) => {
-                    // The run stays in the record; the next start reports it.
-                    eprintln!("neha: a run could not finish: {error}");
-                    return;
+                Work::Queued(run) => {
+                    let pending = match commands::resume_pending(
+                        &server.state,
+                        &server.secrets,
+                        &run,
+                    )
+                    .await
+                    {
+                        Ok(pending) => pending,
+                        Err(error) => {
+                            drop(admit);
+                            let reason = error.to_string();
+                            if let Err(failure) = commands::fail_queued_run(
+                                &server.store,
+                                &server.state,
+                                &server.events,
+                                &run,
+                                &reason,
+                            )
+                            .await
+                            {
+                                eprintln!("neha: cannot fail queued run {}: {failure}", run.id);
+                                return;
+                            }
+                            continue;
+                        }
+                    };
+                    #[cfg(test)]
+                    pause_before_start(bot).await;
+                    if commands::start_run(&server.store, &server.state, &server.events, &pending)
+                        .await
+                        .is_err()
+                    {
+                        drop(admit);
+                        return;
+                    }
+                    drop(admit);
+                    match commands::finish_run(
+                        &server.store,
+                        &server.state,
+                        &server.home,
+                        &server.blobs,
+                        &server.model,
+                        &server.events,
+                        server.tool_timeout,
+                        &server.links,
+                        pending,
+                    )
+                    .await
+                    {
+                        Ok(commands::Finished::Completed(events)) => {
+                            for event in events {
+                                let _ = server.events.send(event);
+                            }
+                        }
+                        Ok(commands::Finished::Waiting) => {}
+                        Err(error) => {
+                            // The run stays in the record; the next start reports it.
+                            eprintln!("neha: a run could not finish: {error}");
+                            return;
+                        }
+                    }
                 }
             }
         }
     }
 }
 
-/// Returns the waiting run of a Bot that the record holds first.
+/// The work one turn of a pump does.
+enum Work {
+    /// Continue a run whose approval was allowed.
+    Resume(RunView),
+    /// Fail a run whose approval was denied.
+    Deny(RunView),
+    /// Start the earliest queued run.
+    Queued(RunView),
+}
+
+/// Returns whether the Computer a run works on can take the run now.
+fn computer_online(
+    state: &crate::state::State,
+    links: &crate::computer_link::ComputerLinks,
+    run: &RunView,
+) -> bool {
+    let Some(computer) = run.computer else {
+        return true;
+    };
+    let local = state
+        .computers
+        .get(&computer)
+        .is_some_and(|view| view.kind == "local");
+
+    !local || links.online(computer)
+}
+
+/// Returns the earliest queued run of a Bot whose Computer can start it.
 ///
 /// A real Computer that is offline holds the queue: the run keeps its place in
 /// the record and its pump waits for the channel, so a later run never
-/// overtakes it.
-fn next_queued(server: &SpaceServer, bot: Id) -> Option<RunView> {
-    let state = server.state.lock().ok()?;
+/// overtakes it. A waiting run is not queued and never holds the pump.
+fn next_queued(
+    state: &crate::state::State,
+    bot: Id,
+    links: &crate::computer_link::ComputerLinks,
+) -> Option<RunView> {
     let run = state
         .runs
         .values()
@@ -277,11 +385,11 @@ fn next_queued(server: &SpaceServer, bot: Id) -> Option<RunView> {
         .min_by_key(|run| run.seq)?
         .clone();
     let computer = state.bots.get(&bot).map(|bot| bot.computer)?;
-    let real = state
+    let local = state
         .computers
         .get(&computer)
         .is_some_and(|view| view.kind == "local");
-    if real && !server.links.online(computer) {
+    if local && !links.online(computer) {
         return None;
     }
 

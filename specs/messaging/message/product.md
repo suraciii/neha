@@ -24,10 +24,12 @@ A Card has a kind. Neha provides four kinds, and a Plugin can add more.
 
 | Kind | What it holds | What the user does with it |
 | --- | --- | --- |
-| Approval | An action and its details | Allows or denies |
+| Approval | An action and its details | Allows, always allows, or denies |
 | Question | A question and its options | Answers |
 | Page | A document or report | Opens it |
 | Dashboard | Live figures | Reads them |
+
+An Approval card names one action of one run. It shows the action's tool, a summary, why the Bot asks, and whether the action can be undone. It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
 
 ## Files
 

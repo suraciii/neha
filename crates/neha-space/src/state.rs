@@ -3,11 +3,11 @@
 //! A Space rebuilds this state by replaying its record. Commands append
 //! events, then apply the same events to keep the projection current.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use neha::id::Id;
-use neha::record::{ActionStatus, Author, Event, EventData};
+use neha::record::{ActionStatus, ApprovalReason, Author, Event, EventData, RuleEffect, RunReply};
 use neha::seq::Seq;
 use neha::time::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -183,10 +183,74 @@ pub struct RunView {
     pub usage: Option<Usage>,
     /// The failure, when it failed.
     pub error: Option<String>,
+    /// The approval the run waits on, while it is undecided.
+    pub approval: Option<Id>,
+    /// The Computer the run started on, from the projection's replay.
+    ///
+    /// A move after the start does not change it: the run keeps the Computer
+    /// it began on. It is not part of the wire view.
+    #[serde(skip)]
+    pub computer: Option<Id>,
     /// The completed steps, in order.
     pub steps: Vec<StepView>,
     /// The actions, in order.
     pub actions: Vec<ActionView>,
+}
+
+/// An action a run waits to run until its acting User answers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalView {
+    /// The approval.
+    pub approval: Id,
+    /// The run that waits.
+    pub run: Id,
+    /// The Bot.
+    pub bot: Id,
+    /// The Chat.
+    pub chat: Id,
+    /// The User the Bot acts for; they answer.
+    pub acting: Id,
+    /// The action that waits.
+    pub action: Id,
+    /// The step.
+    pub step: u32,
+    /// The tool-call identifier.
+    pub call: String,
+    /// The tool's name.
+    pub tool: String,
+    /// The arguments the action runs with.
+    pub arguments: serde_json::Value,
+    /// A short text a User reads.
+    pub summary: String,
+    /// Why the run asks.
+    pub reason: ApprovalReason,
+    /// The rule that asked, when a rule did.
+    pub rule: Option<Id>,
+    /// The answer, once the acting User gave one.
+    pub decided: Option<bool>,
+    /// The cursor of `approval.requested`.
+    pub seq: Seq,
+}
+
+/// A lasting rule a User gave a Bot.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RuleView {
+    /// The rule.
+    pub rule: Id,
+    /// The Bot it constrains.
+    pub bot: Id,
+    /// The User who made it.
+    pub user: Id,
+    /// Whether matching actions ask or run without asking.
+    pub effect: RuleEffect,
+    /// The tool name.
+    pub tool: String,
+    /// The shell command prefix a matching shell action starts with.
+    pub command_prefix: Option<String>,
+    /// The path prefix a matching file action's path starts with.
+    pub path_prefix: Option<String>,
+    /// The cursor of `rule.added`.
+    pub seq: Seq,
 }
 
 /// The Space's record, projected into memory.
@@ -212,6 +276,14 @@ pub struct State {
     pub files: Vec<FileView>,
     /// The runs, by identifier.
     pub runs: HashMap<Id, RunView>,
+    /// The approvals in the order the record asked them.
+    pub approvals: Vec<ApprovalView>,
+    /// The lasting rules in the order the record added them.
+    pub rules: Vec<RuleView>,
+    /// The (Bot, acting User) pairs whose first Local use a User allowed.
+    pub first_use_allowed: HashSet<(Id, Id)>,
+    /// The Model's replies per run, in the order the record holds them.
+    pub replies: HashMap<Id, Vec<RunReply>>,
 }
 
 impl State {
@@ -225,6 +297,96 @@ impl State {
     #[must_use]
     pub fn owned_bot(&self, bot: Id, owner: Id) -> Option<&BotView> {
         self.bots.get(&bot).filter(|bot| bot.owner == owner)
+    }
+
+    /// Returns whether a Bot's first Local use for a User was allowed.
+    #[must_use]
+    pub fn first_use_allowed(&self, bot: Id, acting: Id) -> bool {
+        self.first_use_allowed.contains(&(bot, acting))
+    }
+
+    /// Returns an approval by identifier.
+    #[must_use]
+    pub fn approval(&self, approval: Id) -> Option<&ApprovalView> {
+        self.approvals.iter().find(|view| view.approval == approval)
+    }
+
+    /// Returns the approvals the User may answer, oldest first.
+    #[must_use]
+    pub fn approvals_for(&self, acting: Id, chat: Option<Id>) -> Vec<&ApprovalView> {
+        self.approvals
+            .iter()
+            .filter(|view| view.acting == acting && view.decided.is_none())
+            .filter(|view| chat.is_none_or(|chat| view.chat == chat))
+            .collect()
+    }
+
+    /// Returns the run of one Bot that waits on an undecided approval, oldest first.
+    #[must_use]
+    pub fn waiting_run(&self, bot: Id) -> Option<&RunView> {
+        self.runs
+            .values()
+            .filter(|run| run.bot == bot && run.status == RunStatus::Waiting)
+            .min_by_key(|run| run.seq)
+    }
+
+    /// Returns the rules of one Bot.
+    #[must_use]
+    pub fn rules_of(&self, bot: Id) -> Vec<&RuleView> {
+        self.rules.iter().filter(|rule| rule.bot == bot).collect()
+    }
+
+    /// Returns the replies the record holds for one run.
+    #[must_use]
+    pub fn run_replies(&self, run: Id) -> &[RunReply] {
+        self.replies.get(&run).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the latest approval of one run.
+    #[must_use]
+    pub fn latest_approval(&self, run: Id) -> Option<&ApprovalView> {
+        self.approvals
+            .iter()
+            .filter(|view| view.run == run)
+            .max_by_key(|view| view.seq)
+    }
+
+    /// Returns whether a run may resume: its approval was allowed and the
+    /// approved action has not started.
+    #[must_use]
+    pub fn is_resumable(&self, run: &RunView) -> bool {
+        run.status == RunStatus::Running
+            && self.latest_approval(run.id).is_some_and(|approval| {
+                approval.decided == Some(true)
+                    && !run
+                        .actions
+                        .iter()
+                        .any(|action| action.id == approval.action)
+            })
+    }
+
+    /// Returns a run of one Bot whose approved action has not started yet.
+    ///
+    /// Such a run is ready to resume; see [`State::is_resumable`].
+    #[must_use]
+    pub fn resumable_run(&self, bot: Id) -> Option<&RunView> {
+        self.runs
+            .values()
+            .filter(|run| run.bot == bot && self.is_resumable(run))
+            .min_by_key(|run| run.seq)
+    }
+
+    /// Returns a run of one Bot that waits on a denied approval.
+    #[must_use]
+    pub fn denied_run(&self, bot: Id) -> Option<&RunView> {
+        self.runs
+            .values()
+            .filter(|run| run.bot == bot && run.status == RunStatus::Waiting)
+            .filter(|run| {
+                self.latest_approval(run.id)
+                    .is_some_and(|approval| approval.decided == Some(false))
+            })
+            .min_by_key(|run| run.seq)
     }
 
     /// Returns a File in a Chat the User owns.
@@ -471,6 +633,8 @@ impl Projection for State {
                         reply: None,
                         usage: None,
                         error: None,
+                        approval: None,
+                        computer: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
                     },
@@ -478,8 +642,12 @@ impl Projection for State {
             }
             EventData::RunStarted(data) => {
                 let acting = event.acting.ok_or("a run names the User it acts for")?;
+                let computer = self.bots.get(&data.bot).map(|bot| bot.computer);
                 match self.runs.entry(data.run) {
-                    Entry::Occupied(mut run) => run.get_mut().status = RunStatus::Running,
+                    Entry::Occupied(mut run) => {
+                        run.get_mut().status = RunStatus::Running;
+                        run.get_mut().computer = computer;
+                    }
                     // A record this version wrote before it queued runs holds only
                     // the start event; it still creates the run it started.
                     Entry::Vacant(run) => {
@@ -495,6 +663,8 @@ impl Projection for State {
                             reply: None,
                             usage: None,
                             error: None,
+                            approval: None,
+                            computer,
                             steps: Vec::new(),
                             actions: Vec::new(),
                         });
@@ -510,6 +680,7 @@ impl Projection for State {
                 run.reply = data.reply;
                 run.usage = data.usage;
                 run.error = data.error;
+                run.approval = None;
             }
             EventData::RunStep(data) => {
                 let run = self
@@ -554,6 +725,102 @@ impl Projection for State {
                 action.truncated = data.truncated;
                 action.omitted_bytes = data.omitted_bytes;
                 action.error = data.error;
+            }
+            EventData::RunReply(data) => {
+                if !self.runs.contains_key(&data.run) {
+                    return Err("a reply must belong to a started run".to_owned());
+                }
+                self.replies.entry(data.run).or_default().push(data);
+            }
+            EventData::ApprovalRequested(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("an approval must belong to a started run")?;
+                if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
+                    return Err("an approval must belong to a working run".to_owned());
+                }
+                if self
+                    .approvals
+                    .iter()
+                    .any(|view| view.approval == data.approval)
+                {
+                    return Err("an approval is recorded once".to_owned());
+                }
+                run.status = RunStatus::Waiting;
+                run.approval = Some(data.approval);
+                self.approvals.push(ApprovalView {
+                    approval: data.approval,
+                    run: data.run,
+                    bot: data.bot,
+                    chat: data.chat,
+                    acting: data.acting,
+                    action: data.action,
+                    step: data.step,
+                    call: data.call,
+                    tool: data.tool,
+                    arguments: data.arguments,
+                    summary: data.summary,
+                    reason: data.reason,
+                    rule: data.rule,
+                    decided: None,
+                    seq: event.seq,
+                });
+            }
+            EventData::ApprovalDecided(data) => {
+                let position = self
+                    .approvals
+                    .iter()
+                    .position(|view| view.approval == data.approval)
+                    .ok_or("a decided approval must have been requested")?;
+                if self.approvals[position].decided.is_some() {
+                    return Err("an approval is decided once".to_owned());
+                }
+                if self.approvals[position].run != data.run {
+                    return Err("a decided approval must name its run".to_owned());
+                }
+                let (allow, reason, bot, acting) = {
+                    let approval = &mut self.approvals[position];
+                    approval.decided = Some(data.allow);
+
+                    (data.allow, approval.reason, approval.bot, approval.acting)
+                };
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a decided approval must belong to a started run")?;
+                if run.approval == Some(data.approval) {
+                    run.approval = None;
+                }
+                if allow {
+                    run.status = RunStatus::Running;
+                    if reason == ApprovalReason::FirstUseLocal {
+                        self.first_use_allowed.insert((bot, acting));
+                    }
+                }
+            }
+            EventData::RuleAdded(data) => {
+                if self.rules.iter().any(|rule| rule.rule == data.rule) {
+                    return Err("a rule is recorded once".to_owned());
+                }
+                self.rules.push(RuleView {
+                    rule: data.rule,
+                    bot: data.bot,
+                    user: data.user,
+                    effect: data.effect,
+                    tool: data.tool,
+                    command_prefix: data.command_prefix,
+                    path_prefix: data.path_prefix,
+                    seq: event.seq,
+                });
+            }
+            EventData::RuleRemoved(data) => {
+                let position = self
+                    .rules
+                    .iter()
+                    .position(|rule| rule.rule == data.rule)
+                    .ok_or("a removed rule must exist")?;
+                self.rules.remove(position);
             }
         }
 

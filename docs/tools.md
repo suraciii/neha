@@ -77,5 +77,5 @@ The local runtime enforces these limits, and an action that breaks one returns a
 ## What the milestone does not do
 
 - The Computer is not isolated. The runtime executes real commands in a workspace directory with the Space user's permissions; it is a development and local-use implementation. Do not run a Space exposed to other machines or with prompts you do not trust.
-- There is no approval gate yet. A Bot runs an action as soon as the Model asks for it. The approval rules in [Bot](../specs/bot/product.md) arrive with their own milestone.
+- An unattended approval does not expire yet, and a Hosted Computer does not ask before an action. [Approvals](approvals.md) covers the gate that works on a Local Computer.
 - A Local Computer runs the same tools in the Bot's Workspace on that machine. The file tools check write paths, and the shell runs in a sandbox that allows persistent writes only there; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers the range and [offline behavior](computer.md#while-the-machine-is-offline).

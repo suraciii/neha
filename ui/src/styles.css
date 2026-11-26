@@ -375,6 +375,22 @@ code,
   min-height: 34px;
   padding: 0;
 }
+.btn--quiet {
+  border-color: var(--line-strong);
+  background: var(--raised);
+  color: var(--ink-2);
+}
+.btn--quiet:hover:not(:disabled) {
+  border-color: var(--ink-4);
+  background: var(--sunken);
+}
+.btn--danger {
+  border-color: #e7c6be;
+  color: var(--danger);
+}
+.btn--danger:hover:not(:disabled) {
+  background: var(--danger-soft);
+}
 
 .link-btn {
   display: inline-flex;
@@ -742,6 +758,10 @@ code,
   color: var(--accent-2);
 }
 
+.state-text--waiting {
+  color: var(--attention);
+}
+
 .chat__actions {
   display: flex;
   align-items: center;
@@ -982,6 +1002,53 @@ code,
   margin: 0 2px 6px;
   color: var(--ink-3);
   font-size: var(--text-sm);
+}
+
+/* An action the Bot waits to run until the User answers. */
+.approval .msg__body {
+  max-width: min(100%, 560px);
+  padding: 10px 13px;
+  border: 1px solid var(--attention-line);
+  border-radius: 14px 14px 14px 4px;
+  background: var(--raised);
+}
+.approval__summary {
+  display: block;
+  margin-top: 6px;
+  padding: 6px 10px;
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  font-family: var(--font-mono);
+  font-size: var(--text-md);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.approval__reason {
+  margin-top: 8px;
+  color: var(--ink-3);
+  font-size: var(--text-md);
+}
+.approval__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+.approval__actions .btn {
+  min-height: 32px;
+  padding: 0 12px;
+}
+.approval__verdict {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  color: var(--success);
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+.approval__verdict--denied {
+  color: var(--danger);
 }
 
 .composer__input {

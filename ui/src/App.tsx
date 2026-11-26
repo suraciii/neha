@@ -12,9 +12,11 @@ import { MAX_FILE_BYTES,
 import { Commands, ProtocolError } from "./lib/ws";
 import type {
   Account,
+  Approval,
   Bot,
   Chat,
   Computer,
+  Decision,
   FileSummary,
   Message,
   Model,
@@ -30,6 +32,9 @@ import type {
 
 type AuthMode = "join" | "login" | "missing-invite";
 
+// Where the followed Run is: in the queue, working, or waiting for an approval.
+type RunStep = "queued" | "running" | "waiting";
+
 interface State {
   account: Account | null;
   providers: Provider[];
@@ -40,14 +45,21 @@ interface State {
   activeChat: Chat | null;
   messages: Message[];
   files: Record<string, FileSummary>;
+  // The active Chat's approval cards, oldest first: those still waiting and
+  // the ones answered on this page.
+  approvals: Approval[];
   activeBot: Bot | null;
   activeComputer: Computer | null;
   // A command (upload or send) is in flight; the composer waits for it.
   submitting: boolean;
   // The followed Run is running; the Chat shows the Bot working.
   working: boolean;
+  // The followed Run waits for an approval.
+  waiting: boolean;
   // The followed Run waits; the Chat shows the place it holds.
   queue: RunProgress | null;
+  // The approval whose answer is on its way to the Space.
+  deciding: string | null;
   busy: boolean;
   error: unknown | null;
 }
@@ -62,11 +74,14 @@ const emptyState: State = {
   activeChat: null,
   messages: [],
   files: {},
+  approvals: [],
   activeBot: null,
   activeComputer: null,
   submitting: false,
   working: false,
+  waiting: false,
   queue: null,
+  deciding: null,
   busy: false,
   error: null,
 };
@@ -103,8 +118,9 @@ export default function App() {
   let previewLoad = 0;
 
   // The Run this page follows: the newest one it submitted, or the one its Chat
-  // was already running when it opened. It only moves forward, queued → running.
-  let followed: { run: string; step: "queued" | "running" } | null = null;
+  // was already running when it opened. It only moves forward, queued → running,
+  // and back to running once an approval it waited for is granted.
+  let followed: { run: string; step: RunStep } | null = null;
   // Runs the record already reported finished: a late command result or answer
   // must not revive them.
   const settledRuns = new Set<string>();
@@ -125,16 +141,17 @@ export default function App() {
   }
 
   // Follows one Run and shows the furthest state the page knows for it.
-  function followRun(run: string, step: "queued" | "running", position?: number) {
+  function followRun(run: string, step: RunStep, position?: number) {
     if (settledRuns.has(run)) return;
     followed = { run, step };
-    if (step === "queued") update({ working: false, queue: { status: "queued", position } });
-    else update({ working: true, queue: null });
+    if (step === "queued") update({ working: false, waiting: false, queue: { status: "queued", position } });
+    else if (step === "running") update({ working: true, waiting: false, queue: null });
+    else update({ working: false, waiting: true, queue: null });
   }
 
   // Moves the followed Run forward. An answer older than the record cannot move
-  // it back, and a better place for the same wait still shows.
-  function advanceRun(run: string, step: "queued" | "running", position?: number) {
+  // it back to the queue, and a better place for the same wait still shows.
+  function advanceRun(run: string, step: RunStep, position?: number) {
     if (settledRuns.has(run)) return;
     const current = followed;
     if (!current) {
@@ -142,19 +159,19 @@ export default function App() {
       return;
     }
     if (current.run !== run) return;
-    const rank = (value: "queued" | "running") => (value === "queued" ? 0 : 1);
-    if (rank(current.step) > rank(step)) return;
     if (current.step === step) {
       // The same wait, a better place.
       if (step === "queued") update({ queue: { status: "queued", position } });
       return;
     }
+    // Only an approval sends a Run back to working; the queue never comes again.
+    if (step === "queued") return;
     followRun(run, step, position);
   }
 
   function clearFollowed() {
     followed = null;
-    update({ working: false, queue: null });
+    update({ working: false, waiting: false, queue: null });
   }
 
   // The record says this Run ended. Only the Run still followed may settle the
@@ -164,11 +181,16 @@ export default function App() {
     if (isFollowing(run)) clearFollowed();
   }
 
+  function isUnfinished(status: RunView["status"]): status is RunStep {
+    return status === "queued" || status === "running" || status === "waiting";
+  }
+
   // Applies one record answer about the followed Run. The caller always asks
   // about that Run, so a finished answer settles the Chat.
   function applyRunView(view: RunView) {
     if (view.status === "queued") advanceRun(view.id, "queued", view.position);
     else if (view.status === "running") advanceRun(view.id, "running");
+    else if (view.status === "waiting") advanceRun(view.id, "waiting");
     else finishFollowing(view.id);
   }
 
@@ -271,8 +293,68 @@ export default function App() {
       }
       return;
     }
+    if (event.kind === "neha.approval.requested") {
+      const approval = approvalRequested(event);
+      if (!approval || state.activeChat?.id !== approval.chat) return;
+      showApproval(approval);
+      // The Run stops here until the User answers, and no longer holds a place.
+      if (isFollowing(approval.run)) advanceRun(approval.run, "waiting");
+      else if (!followed) followRun(approval.run, "waiting");
+      else if (followed.step === "queued") void refreshRunPlace(followed.run);
+    }
+    if (event.kind === "neha.approval.decided") {
+      const approval = typeof data.approval === "string" ? data.approval : null;
+      if (approval && run) applyDecision(approval, run, data.allow === true);
+      return;
+    }
     if (chat && state.activeChat?.id === chat) {
       queueRefresh();
+    }
+  }
+
+  // Puts a new approval card in the Chat, in the order the approvals arrived.
+  function showApproval(approval: Approval) {
+    setState((draft) => {
+      if (draft.approvals.some((known) => known.approval === approval.approval)) return;
+      draft.approvals.push(approval);
+      draft.approvals.sort(byApproval);
+    });
+  }
+
+  // Records the User's answer on its card.
+  function answerApproval(approval: string, allow: boolean) {
+    setState((draft) => {
+      const known = draft.approvals.find((card) => card.approval === approval);
+      if (known) known.decided = allow;
+    });
+  }
+
+  // Applies a decision the page heard about. A granted approval lets the Run
+  // work again; a denied one is over for this page, and the record finishes it.
+  function applyDecision(approval: string, run: string, allowed: boolean) {
+    answerApproval(approval, allowed);
+    if (!isFollowing(run)) return;
+    if (allowed) advanceRun(run, "running");
+    else clearFollowed();
+  }
+
+  // Answers one approval. The card waits for the Space and keeps the verdict.
+  async function decideApproval(approval: Approval, allow: boolean, lasting: boolean) {
+    if (state.deciding) return;
+    const generation = runGeneration;
+    update({ deciding: approval.approval, error: null });
+    try {
+      const decision = await commands.command<Decision>("approval_decide", {
+        approval: approval.approval,
+        allow,
+        lasting,
+      });
+      if (generation !== runGeneration) return;
+      applyDecision(decision.approval, decision.run, decision.status === "allowed");
+    } catch (reason) {
+      if (generation === runGeneration) update({ error: reason });
+    } finally {
+      if (generation === runGeneration) update({ deciding: null });
     }
   }
 
@@ -387,17 +469,19 @@ export default function App() {
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
     followed = null;
-    update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, submitting: false, working: false, queue: null, error: null });
+    update({ activeChat: chat, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, deciding: null, error: null });
     try {
-      const [messages, files, bot] = await Promise.all([
+      const [messages, files, approvals, bot] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
         commands.command<FileSummary[]>("file_list", { chat: chat.id }),
+        commands.command<Approval[]>("approval_list", { chat: chat.id }),
         commands.command<BotResult>("bot_show", { bot: chat.bot }),
       ]);
       if (generation !== runGeneration) return;
       update({
         messages,
         files: indexFiles(files),
+        approvals: mergeApprovals(approvals, state.approvals),
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
@@ -413,7 +497,7 @@ export default function App() {
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
-      if (view.status === "queued" || view.status === "running") {
+      if (isUnfinished(view.status)) {
         // A waiting Run is unfinished too: show its place and follow it.
         advanceRun(run, view.status, view.position);
       } else {
@@ -445,12 +529,13 @@ export default function App() {
   async function refreshActive(chat: Chat, generation: number) {
     if (!isCurrentChat(chat, generation)) return;
     try {
-      const [messages, files] = await Promise.all([
+      const [messages, files, approvals] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
         commands.command<FileSummary[]>("file_list", { chat: chat.id }),
+        commands.command<Approval[]>("approval_list", { chat: chat.id }),
       ]);
       if (!isCurrentChat(chat, generation)) return;
-      update({ messages, files: indexFiles(files) });
+      update({ messages, files: indexFiles(files), approvals: mergeApprovals(approvals, state.approvals) });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
       await reconcileRun(chat, messages, generation);
@@ -605,7 +690,7 @@ export default function App() {
   function backToList() {
     runGeneration += 1;
     followed = null;
-    update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, submitting: false, working: false, queue: null, error: null });
+    update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, deciding: null, error: null });
   }
 
   const errorText = () => (state.error ? messageFor(state.error) : null);
@@ -664,11 +749,15 @@ export default function App() {
                   computer={state.activeComputer}
                   messages={state.messages}
                   files={state.files}
+                  approvals={state.approvals}
                   submitting={state.submitting}
                   working={state.working}
+                  waiting={state.waiting}
                   queue={state.queue}
+                  deciding={state.deciding}
                   error={errorText()}
                   onSend={sendMessage}
+                  onDecide={decideApproval}
                   onBack={backToList}
                 />
               </Show>
@@ -697,6 +786,60 @@ function Boot() {
 // What the sidebar shows for a Chat's last Message.
 function previewOf(message: Message): Preview {
   return { text: message.text, file: message.file !== null };
+}
+
+// Whether the User answered this approval.
+function isAnswered(approval: Approval): boolean {
+  return approval.decided === true || approval.decided === false;
+}
+
+// Approvals arrive in order of their identifiers, which carry the time.
+function byApproval(left: Approval, right: Approval): number {
+  return left.approval.localeCompare(right.approval);
+}
+
+// The cards a refresh keeps: what the Space still lists, and the ones this
+// page answered, which the Space no longer lists.
+function mergeApprovals(listed: Approval[], shown: Approval[]): Approval[] {
+  const merged = new Map<string, Approval>();
+  for (const approval of shown) {
+    if (isAnswered(approval)) merged.set(approval.approval, approval);
+  }
+  for (const approval of listed) {
+    if (!merged.has(approval.approval)) merged.set(approval.approval, approval);
+  }
+  return [...merged.values()].sort(byApproval);
+}
+
+// The approval a `neha.approval.requested` event carries, when it is whole.
+function approvalRequested(event: RecordEvent): Approval | null {
+  const data = event.data;
+  const text = (key: string): string | null => {
+    const value = data[key];
+    return typeof value === "string" ? value : null;
+  };
+  const approval = text("approval");
+  const run = text("run");
+  const bot = text("bot");
+  const chat = text("chat");
+  const action = text("action");
+  const tool = text("tool");
+  const summary = text("summary");
+  const reason = data.reason;
+  if (!approval || !run || !bot || !chat || !action || !tool || !summary) return null;
+  if (reason !== "first_use_local" && reason !== "rule") return null;
+  return {
+    approval,
+    run,
+    bot,
+    chat,
+    action,
+    step: typeof data.step === "number" ? data.step : 0,
+    tool,
+    summary,
+    reason,
+    rule: typeof data.rule === "string" ? data.rule : null,
+  };
 }
 
 // Names an upload failure the Space or the network reported.

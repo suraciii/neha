@@ -3,7 +3,8 @@ import { For, Show, createEffect, createSignal } from "solid-js";
 import { locale, t } from "../i18n";
 import { dayLabel, timeOfDay } from "../lib/format";
 import { formatBytes } from "../lib/files";
-import type { Account, Bot, Computer, FileSummary, Message, RunProgress } from "../types";
+import type { Account, Approval, Bot, Computer, FileSummary, Message, RunProgress } from "../types";
+import ApprovalCard from "./ApprovalCard";
 import Avatar from "./Avatar";
 import FileCard from "./FileCard";
 import Icon from "./Icon";
@@ -15,15 +16,22 @@ interface ChatViewProps {
   computer: Computer | null;
   messages: Message[];
   files: Record<string, FileSummary>;
+  // The Chat's approval cards: those still waiting and the ones answered here.
+  approvals: Approval[];
   // A command is in flight; the composer waits for its answer.
   submitting: boolean;
   // The followed Run is running; the Bot is working.
   working: boolean;
+  // The followed Run waits for an approval.
+  waiting: boolean;
   // The followed Run waits; the Chat shows the place it holds.
   queue: RunProgress | null;
+  // The approval whose answer is on its way to the Space.
+  deciding: string | null;
   error: string | null;
   // Resolves false when nothing left the composer, which keeps its Message.
   onSend: (text: string, file: File | null) => Promise<boolean>;
+  onDecide: (approval: Approval, allow: boolean, lasting: boolean) => void;
   onBack: () => void;
 }
 
@@ -107,6 +115,10 @@ export default function ChatView(props: ChatViewProps) {
             <span class={props.computer?.online ? "state-text state-text--online" : "state-text"}>
               {props.computer?.online ? t("chat.online") : t("chat.offline")}
             </span>
+            <Show when={props.waiting}>
+              <span class="chat__dot" />
+              <span class="state-text state-text--waiting">{t("chat.waiting")}</span>
+            </Show>
           </p>
         </div>
         <LocaleSwitch class="chat__locale" />
@@ -127,7 +139,7 @@ export default function ChatView(props: ChatViewProps) {
 
       <div class="chat__stream" ref={stream}>
         <Show
-          when={props.messages.length > 0}
+          when={props.messages.length > 0 || props.approvals.length > 0}
           fallback={
             <div class="chat__empty">
               <p class="eyebrow">{t("chat.new.eyebrow")}</p>
@@ -186,6 +198,17 @@ export default function ChatView(props: ChatViewProps) {
                 </>
               );
             }}
+          </For>
+
+          <For each={props.approvals}>
+            {(approval) => (
+              <ApprovalCard
+                approval={approval}
+                botName={props.bot?.name ?? "Bot"}
+                pending={props.deciding === approval.approval}
+                onDecide={props.onDecide}
+              />
+            )}
           </For>
 
           <Show when={props.working}>

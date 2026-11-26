@@ -40,6 +40,14 @@ It finds the startup ticket the Space wrote under the machine's Neha configurati
 
 Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
 
+## Approvals
+
+`neha approval list` shows the approvals that wait for the User, and `neha approval allow <id>` or `neha approval deny <id>` answers one. `neha approval allow <id> --always` also makes the action's kind a lasting Allow rule.
+
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool, with how the command starts for a shell or a directory for a file action.
+
+At a terminal, `neha chat send` shows a waiting approval and offers Allow, Always allow, Deny, or leaving it waiting; without a terminal it prints the run and approval ids and exits, for `neha approval allow` to answer.
+
 ## Gaps
 
 - The command surface is not yet specified; it follows the topics as their product contracts settle.

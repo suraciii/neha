@@ -88,11 +88,21 @@ A Bot asks for information, a decision, or an approval in the Chat or Group wher
 
 ## Asking before an action
 
-A Bot does what it was asked without asking. It asks before an action that goes beyond the request, an action the User said to ask about, an action the Computer's owner requires asking for, and an action that its tool asks about by default.
+A Bot does what it was asked without asking. It asks before the first action it runs on a Local Computer, once for each Bot and acting User, and before an action a lasting Ask rule names.
 
-The User it acts for answers with Allow or Deny. In a Chat, the User can make an Allow last for that kind of action by saying so, and the Bot keeps it as a lasting rule.
+Only the User the Bot acts for answers the approval. An Allow runs the action once, and an Always allow also covers later actions of that kind.
+
+An Always allow covers actions with the same tool and either a shell command that starts the same way or a file path in the same directory. The first use of a Local Computer offers no Always allow, and no lasting rule covers it.
+
+An Ask rule makes the Bot ask before a kind of action, and an Allow rule lets it proceed without asking.
+
+When an Ask rule and an Allow rule both match an action, the more specific rule wins: a rule with a command or path prefix beats one with only the tool, and a longer prefix beats a shorter one. Equally specific, the Ask rule wins.
+
+Choosing Always allow writes an Allow rule from the shell command's first word or the file action's parent directory. When that rule covers the Ask rule that asked, the Ask rule is removed; otherwise it stays. A rule covers another when it is as broad or broader: the same prefix, or a shorter one.
 
 While a Bot waits for an answer, its other work goes on.
+
+A Deny ends the run, and the Bot says that it stopped.
 
 A request from a run the User started has no time limit. By default, a request from a run no User is with expires after 30 minutes; the Space can change that period.
 
@@ -144,4 +154,9 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 
 ## Gaps
 
+- A Question, an unattended approval's expiry, a Group approval, and cancelling an approval are not yet available.
+- The approval triggers other than the first use of a Local Computer are not yet available.
+- A Hosted Computer does not ask before an action yet.
+- The Bot's page does not show approvals yet.
+- An independent reviewer of approvals is not yet specified.
 - A template shared across Spaces is not yet specified.

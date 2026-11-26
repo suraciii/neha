@@ -58,6 +58,8 @@ type CommandName =
   | "chat_list"
   | "chat_read"
   | "file_list"
+  | "approval_list"
+  | "approval_decide"
   | "message_send"
   | "run_show";
 
