@@ -61,7 +61,7 @@ const VERSION_THREE_STATEMENTS: [&str; 1] =
 /// A local pairing ticket is stored only by its digest, for one start of the
 /// Space; the clear table starts empty on every start.
 const VERSION_FOUR_STATEMENTS: [&str; 1] = ["CREATE TABLE IF NOT EXISTS computer_tickets (\
-        ticket_hash BLOB PRIMARY KEY, owner TEXT NOT NULL, \
+        ticket_hash BLOB PRIMARY KEY, owner BLOB NOT NULL, \
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)"];
 
 /// Creates or upgrades the Space database.
@@ -321,6 +321,14 @@ mod tests {
 
         assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
         assert!(table_exists(&mut connection, "computer_tickets").await);
+        assert!(table_exists(&mut connection, "computer_codes").await);
+        let owner_type: String = sqlx::query_scalar(
+            "SELECT type FROM pragma_table_info('computer_tickets') WHERE name = 'owner'",
+        )
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+        assert_eq!(owner_type.to_uppercase(), "BLOB");
         assert!(VERSION_FOUR_STATEMENTS.len() == 1);
         let token: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM computer_tokens WHERE computer_id = 'computer' AND finalized = 1",

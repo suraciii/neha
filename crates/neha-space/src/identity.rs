@@ -433,7 +433,7 @@ impl Identity {
         ttl: Duration,
     ) -> Result<[u8; 32], IdentityError> {
         let ticket_hash = digest(ticket);
-        let owner_text = owner.to_string();
+        let owner_bytes = owner.to_string().into_bytes();
         let mut connection = self.pool.acquire().await?;
         begin_immediate(&mut connection).await?;
         let result = async {
@@ -445,7 +445,7 @@ impl Identity {
                 .await?;
             let held: i64 =
                 sqlx::query_scalar("SELECT COUNT(*) FROM computer_tickets WHERE owner = ?")
-                    .bind(&owner_text)
+                    .bind(&owner_bytes)
                     .fetch_one(&mut *connection)
                     .await?;
             if held >= MAX_LOCAL_TICKETS_PER_OWNER {
@@ -455,7 +455,7 @@ impl Identity {
                      SELECT ticket_hash FROM computer_tickets WHERE owner = ? \
                      ORDER BY created_at ASC, rowid ASC LIMIT ?)",
                 )
-                .bind(&owner_text)
+                .bind(&owner_bytes)
                 .bind(excess)
                 .execute(&mut *connection)
                 .await?;
@@ -465,7 +465,7 @@ impl Identity {
                  VALUES (?, ?, ?, ?)",
             )
             .bind(ticket_hash.as_slice())
-            .bind(&owner_text)
+            .bind(&owner_bytes)
             .bind(now)
             .bind(expires_at)
             .execute(&mut *connection)
@@ -496,7 +496,7 @@ impl Identity {
                 .bind(now)
                 .execute(&mut *connection)
                 .await?;
-            let owner: Option<String> =
+            let owner: Option<Vec<u8>> =
                 sqlx::query_scalar("SELECT owner FROM computer_tickets WHERE ticket_hash = ?")
                     .bind(ticket_hash.as_slice())
                     .fetch_optional(&mut *connection)
@@ -504,6 +504,7 @@ impl Identity {
             let Some(owner) = owner else {
                 return Ok(None);
             };
+            let owner = String::from_utf8(owner).map_err(|_| IdentityError::Corrupt)?;
             let deleted = sqlx::query("DELETE FROM computer_tickets WHERE ticket_hash = ?")
                 .bind(ticket_hash.as_slice())
                 .execute(&mut *connection)
@@ -2368,7 +2369,7 @@ mod tests {
         }
 
         let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_tickets WHERE owner = ?")
-            .bind(owner.to_string())
+            .bind(owner.to_string().into_bytes())
             .fetch_one(&identity.pool)
             .await
             .unwrap();
@@ -2397,7 +2398,7 @@ mod tests {
              VALUES (?, ?, 0, 0)",
         )
         .bind(digest("stale-ticket").as_slice())
-        .bind(owner.to_string())
+        .bind(owner.to_string().into_bytes())
         .execute(&identity.pool)
         .await
         .unwrap();
