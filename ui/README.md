@@ -28,6 +28,10 @@ pnpm --dir ui build
 
 `neha serve` serves `ui/dist` by default. Pass `--ui <directory>` or set `NEHA_UI_DIR` to serve another build.
 
+## Live updates
+
+The client loads its view, then follows the record over the same WebSocket from a cursor. The cursor lives in local storage, so a reload resumes instead of replaying the whole record. Chat, File, Run, and preview changes arrive as record events; the client does not poll.
+
 ## Language
 
 The client supports English (en-US) and Simplified Chinese (zh-CN). The switch lives on the sign-in card, the setup header, the Chat list footer, and the Chat header. The first visit follows the browser language; the chosen locale is kept in local storage and never changes the record.

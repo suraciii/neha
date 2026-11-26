@@ -1,4 +1,4 @@
-import { Show, createSignal, createStore, onSettled } from "solid-js";
+import { Show, createSignal, createStore, onCleanup, onSettled } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
@@ -22,6 +22,7 @@ import type {
   ProviderResult,
   BotResult,
   Preview,
+  RecordEvent,
   RunProgress,
   RunView,
   SendResult,
@@ -78,8 +79,7 @@ export default function App() {
       if (current === next) return;
       if (current && next && "text" in current && "text" in next) {
         if (current.text === next.text && current.file === next.file) return;
-        current.text = next.text;
-        current.file = next.file;
+        draft.previews[chatId] = { text: next.text, file: next.file };
         return;
       }
       if (current && next && "error" in current && "error" in next) return;
@@ -92,7 +92,11 @@ export default function App() {
   const [isMobile, setIsMobile] = createSignal(false);
   const commands = new Commands();
   let runGeneration = 0;
-  let queuePoll = 0;
+  let following = false;
+  let activeRun: string | null = null;
+  let refreshTimer: number | null = null;
+  let refreshAgain = false;
+  let previewLoad = 0;
 
   // Whether the Chat on screen still belongs to this piece of work.
   function isCurrentChat(chat: Chat, generation: number): boolean {
@@ -115,6 +119,142 @@ export default function App() {
     void boot();
   });
 
+  onCleanup(() => {
+    if (refreshTimer !== null) {
+      window.clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    void commands.close();
+  });
+
+  async function startFollowing() {
+    if (following) return;
+    following = true;
+    try {
+      await commands.subscribe(
+        {
+          onSnapshot: (_events, cursor, resumed) => {
+            saveCursor(cursor);
+            if (resumed) queueRefresh();
+          },
+          onEvent: (event) => {
+            saveCursor(event.seq);
+            handleRecordEvent(event);
+          },
+          onCursor: saveCursor,
+          onError: (reason) => update({ error: reason }),
+        },
+        { cursor: readCursor() },
+      );
+    } catch (reason) {
+      following = false;
+      update({ error: reason });
+    }
+  }
+
+  function handleRecordEvent(event: RecordEvent) {
+    const data = event.data ?? {};
+    const chat = typeof data.chat === "string" ? data.chat : null;
+    if (
+      event.kind === "neha.bot.created" ||
+      event.kind === "neha.chat.created" ||
+      event.kind === "neha.computer.created" ||
+      event.kind === "neha.provider.added"
+    ) {
+      void loadWorkspace();
+      return;
+    }
+    if (event.kind === "neha.message.added" && chat) {
+      const text = typeof data.text === "string" ? data.text : "";
+      const file = typeof data.file === "string";
+      setPreview(chat, { text, file });
+    }
+    const run = typeof data.run === "string" ? data.run : null;
+    if (event.kind === "neha.run.finished") {
+      const known = activeRun ?? latestRunForActiveChat();
+      // RunFinished carries no Chat. Only the active Chat's Run may unlock it.
+      if (!run || run !== known) {
+        // A Run of this Bot ahead of ours may have ended and left a better place.
+        if (activeRun !== null && state.queue?.status === "queued") void refreshRunPlace(activeRun);
+        return;
+      }
+      activeRun = null;
+      update({ working: false, queue: null });
+      queueRefresh();
+      return;
+    }
+    if (run && chat && state.activeChat?.id === chat) {
+      if (event.kind === "neha.run.queued") {
+        // The command result may hold an older place than the record does.
+        if (run === activeRun) void refreshRunPlace(run);
+        return;
+      }
+      if (event.kind === "neha.run.started") {
+        if (run === activeRun) {
+          update({ working: true, queue: { status: "running" } });
+        } else if (activeRun !== null) {
+          // Another Run of this Bot left the queue; read the place we hold now.
+          if (state.queue?.status === "queued") void refreshRunPlace(activeRun);
+        } else {
+          // Another client started this Run; follow it from the record.
+          activeRun = run;
+          update({ working: true, queue: { status: "running" } });
+        }
+        return;
+      }
+    }
+    if (chat && state.activeChat?.id === chat) {
+      queueRefresh();
+      return;
+    }
+    if (event.kind.startsWith("neha.run.") && state.working) queueRefresh();
+  }
+
+  function latestRunForActiveChat(): string | null {
+    const chat = state.activeChat;
+    if (!chat) return null;
+    return [...state.messages].reverse().find((message) => message.chat === chat.id && message.run)?.run ?? null;
+  }
+
+  // Reads the place of the Run this page tracks, once, from the record.
+  async function refreshRunPlace(run: string) {
+    const generation = runGeneration;
+    try {
+      const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      if (generation !== runGeneration || activeRun !== run) return;
+      if (view.status === "queued") {
+        update({ working: true, queue: { status: "queued", position: view.position } });
+      } else if (view.status === "running") {
+        update({ working: true, queue: { status: "running" } });
+      } else {
+        activeRun = null;
+        update({ working: false, queue: null });
+        queueRefresh();
+      }
+    } catch {
+      // A Run that is gone leaves the finish event to settle the Chat.
+    }
+  }
+
+  // Coalesces the record reads a burst of events asks for.
+  function queueRefresh() {
+    if (refreshTimer !== null) {
+      refreshAgain = true;
+      return;
+    }
+    refreshTimer = window.setTimeout(() => {
+      refreshTimer = null;
+      const chat = state.activeChat;
+      const refresh = chat ? refreshActive(chat, runGeneration) : Promise.resolve();
+      void refresh.finally(() => {
+        if (refreshAgain) {
+          refreshAgain = false;
+          queueRefresh();
+        }
+      });
+    }, 50);
+  }
+
   async function boot() {
     try {
       const account = await api.me();
@@ -130,6 +270,7 @@ export default function App() {
   async function enter(account: Account) {
     update({ account });
     setReady(true);
+    void startFollowing();
     await loadWorkspace();
   }
 
@@ -161,10 +302,12 @@ export default function App() {
   }
 
   async function loadPreviews(chats: Chat[]) {
+    const generation = ++previewLoad;
     if (chats.length === 0) {
-      update({ previews: {} });
+      if (generation === previewLoad) update({ previews: {} });
       return;
     }
+    const before = new Map(chats.map((chat) => [chat.id, state.previews[chat.id]]));
     const previews: Record<string, Preview> = {};
     for (const chat of chats) {
       try {
@@ -175,11 +318,21 @@ export default function App() {
         previews[chat.id] = { error: true };
       }
     }
-    update({ previews });
+    if (generation !== previewLoad) return;
+    setState((draft) => {
+      for (const chat of chats) {
+        // A live event may have written a newer preview while this read ran.
+        const next = previews[chat.id];
+        if (next !== undefined && draft.previews[chat.id] === before.get(chat.id)) {
+          draft.previews[chat.id] = next;
+        }
+      }
+    });
   }
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
+    activeRun = null;
     update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, queue: null, error: null });
     try {
       const [messages, files, bot] = await Promise.all([
@@ -196,38 +349,52 @@ export default function App() {
       });
       await restoreRun(chat, messages, generation);
     } catch (reason) {
-      update({ error: reason });
+      if (isCurrentChat(chat, generation)) update({ error: reason });
     }
   }
 
   async function restoreRun(chat: Chat, messages: Message[], generation: number) {
     const run = [...messages].reverse().find((message) => message.run)?.run;
-    if (!run || generation !== runGeneration) return;
-    void pollRun(chat, run, generation);
+    if (!run || !isCurrentChat(chat, generation)) return;
+    try {
+      const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      if (!isCurrentChat(chat, generation)) return;
+      if (view.status === "queued") {
+        // A waiting Run still counts: the Chat shows its place and keeps the composer.
+        activeRun = run;
+        update({ working: true, queue: { status: "queued", position: view.position } });
+      } else if (view.status === "running") {
+        activeRun = run;
+        update({ working: true, queue: { status: "running" } });
+      } else {
+        activeRun = null;
+        update({ working: false, queue: null });
+        await refreshActive(chat, generation);
+      }
+    } catch {
+      // A Run that is already gone leaves the recorded Messages in place.
+    }
   }
 
-  async function pollRun(chat: Chat, run: string, generation: number) {
-    const poll = ++queuePoll;
-    while (isCurrentChat(chat, generation) && poll === queuePoll) {
-      try {
-        const view = await commands.command<RunView>("run_show", { run }, 10_000);
-        if (!isCurrentChat(chat, generation) || poll !== queuePoll) return;
-        if (view.status === "queued" || view.status === "running") {
-          update({ queue: { status: view.status, position: view.position } });
-        } else {
-          update({ queue: null });
-          if (view.status === "failed") {
-            update({ error: view.error ?? { key: "error.botAnswer" } });
-          }
-          await refreshActive(chat, generation);
-          return;
-        }
-      } catch {
-        if (!isCurrentChat(chat, generation) || poll !== queuePoll) return;
-        update({ queue: null });
-        return;
+  async function reconcileRun(chat: Chat, messages: Message[], generation: number) {
+    const run = [...messages].reverse().find((message) => message.run)?.run;
+    if (!run || !isCurrentChat(chat, generation)) return;
+    try {
+      const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      if (!isCurrentChat(chat, generation)) return;
+      if (view.status === "queued") {
+        activeRun = run;
+        update({ working: true, queue: { status: "queued", position: view.position } });
+      } else if (view.status === "running") {
+        activeRun = run;
+        update({ working: true, queue: { status: "running" } });
+      } else {
+        activeRun = null;
+        update({ working: false, queue: null });
       }
-      await new Promise((resolve) => setTimeout(resolve, 700));
+    } catch {
+      activeRun = null;
+      update({ working: false, queue: null });
     }
   }
 
@@ -242,6 +409,7 @@ export default function App() {
       update({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
+      await reconcileRun(chat, messages, generation);
     } catch (reason) {
       if (isCurrentChat(chat, generation)) update({ error: reason });
     }
@@ -288,12 +456,13 @@ export default function App() {
       const result = await commands.command<SendResult>(
         "message_send",
         uploaded ? { chat: chat.id, text, file: uploaded.id } : { chat: chat.id, text },
-        180_000,
       );
-      // The Message is accepted once the Space queues its run.
+      // The Space accepted the Message into its Bot's queue. The Chat stays
+      // working until the record reports the Run finished or failed.
       if (!isCurrentChat(chat, generation)) return true;
-      update({ working: false, queue: { status: result.status, position: result.position } });
-      void pollRun(chat, result.run, generation);
+      activeRun = result.run;
+      update({ working: true, queue: { status: result.status, position: result.position } });
+      queueRefresh();
     } catch (reason) {
       if (!isCurrentChat(chat, generation)) return true;
       update({ working: false, error: reason });
@@ -382,6 +551,7 @@ export default function App() {
 
   function backToList() {
     runGeneration += 1;
+    activeRun = null;
     update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, queue: null, error: null });
   }
 
@@ -519,4 +689,30 @@ function messageFor(reason: unknown): string {
   if (reason instanceof TypeError) return t("error.unreachable");
   if (typeof reason === "string") return reason;
   return t("error.generic");
+}
+
+const CURSOR_KEY = "neha.record.cursor";
+const MAX_CURSOR = "9223372036854775807";
+
+function isCursor(value: string | null): value is string {
+  if (!value || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  return value.length < MAX_CURSOR.length || (value.length === MAX_CURSOR.length && value <= MAX_CURSOR);
+}
+
+function readCursor(): string | null {
+  try {
+    const value = localStorage.getItem(CURSOR_KEY);
+    return isCursor(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCursor(cursor: string) {
+  if (!isCursor(cursor)) return;
+  try {
+    localStorage.setItem(CURSOR_KEY, cursor);
+  } catch {
+    // A browser that blocks storage still follows events for this page.
+  }
 }
