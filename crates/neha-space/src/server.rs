@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -49,6 +50,7 @@ use crate::config::{Config, ConfigError, Storage};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError};
 use crate::model::{ModelClient, ModelError};
+use crate::runs::RunQueue;
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
 use crate::store::{AppendRequest, Projection, Store, StoreError, StoreReader};
@@ -61,19 +63,21 @@ const HEARTBEAT: Duration = Duration::from_secs(30);
 
 /// A Space ready to answer clients.
 pub struct SpaceServer {
-    home: Home,
-    store: Store,
+    pub(crate) home: Home,
+    pub(crate) store: Store,
     identity: Identity,
-    blobs: Blobs,
+    pub(crate) blobs: Blobs,
     storage: Storage,
     invite: Mutex<Option<Invite>>,
     login: Mutex<LoginLimiter>,
-    state: Mutex<SpaceState>,
-    secrets: Secrets,
-    model: ModelClient,
-    events: broadcast::Sender<neha::record::Event>,
-    tool_timeout: Duration,
-    chat_runs: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
+    pub(crate) state: Mutex<SpaceState>,
+    pub(crate) secrets: Secrets,
+    pub(crate) model: ModelClient,
+    pub(crate) events: broadcast::Sender<neha::record::Event>,
+    pub(crate) tool_timeout: Duration,
+    /// Set once the Space stops: no command may then start new work.
+    closed: AtomicBool,
+    runs: Arc<RunQueue>,
     uploads: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
     ui: Option<PathBuf>,
     session_cookie: String,
@@ -121,7 +125,6 @@ impl SpaceServer {
         };
         let mut state = SpaceState::default();
         store.replay(&mut state).await?;
-        recover_interrupted(&store, &mut state).await?;
         let secrets = Secrets::load(&home)?;
         let model = ModelClient::new()?;
         let (events, _) = broadcast::channel(256);
@@ -139,7 +142,8 @@ impl SpaceServer {
             model,
             events,
             tool_timeout,
-            chat_runs: Mutex::new(std::collections::HashMap::new()),
+            closed: AtomicBool::new(false),
+            runs: Arc::new(RunQueue::new()),
             uploads: Mutex::new(std::collections::HashMap::new()),
             ui,
             session_cookie,
@@ -147,7 +151,6 @@ impl SpaceServer {
         })
     }
 
-    /// Returns the lock that serializes runs in one Chat.
     /// Returns the lock that serializes uploads in one Chat.
     ///
     /// Two uploads of the same bytes must not both record a File; a Bot's run
@@ -161,13 +164,14 @@ impl SpaceServer {
         )
     }
 
-    fn chat_lock(&self, chat: Id) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.chat_runs.lock().expect("chat lock");
-        Arc::clone(
-            locks
-                .entry(chat)
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-        )
+    /// Returns whether the Space has stopped accepting work.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Refuses new work, then lets the queue drain.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
     }
 
     /// Returns the home.
@@ -227,6 +231,7 @@ pub struct Running {
     pub browser_host: String,
     home: Home,
     storage: Storage,
+    server: Arc<SpaceServer>,
     task: JoinHandle<()>,
 }
 
@@ -271,7 +276,13 @@ impl Running {
     }
 
     /// Stops the server.
+    ///
+    /// It refuses new work first, then stops the queues, so a command that
+    /// arrives during the stop cannot start a run. A run still working is
+    /// abandoned the way it was before a stop.
     pub async fn shutdown(self) {
+        self.server.close();
+        self.server.runs.shutdown().await;
         self.task.abort();
         let _ = self.task.await;
     }
@@ -313,8 +324,12 @@ async fn start_with(
     }
     let server = Arc::new(SpaceServer::open_with_ui(home, ui, tool_timeout).await?);
     validate_client_directory(&server).await?;
+    // The port is bound before anything is written or woken: a start that
+    // cannot listen must not make a run, reach a Provider, or record a failure.
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
+    recover_interrupted(&server.store, &server.state).await?;
+    server.runs.resume(&server);
     let invite = server
         .invite_secret()
         .map(|secret| format!("http://{addr}/invite#{secret}"));
@@ -333,6 +348,7 @@ async fn start_with(
         browser_host: server.browser_host.clone(),
         home: server.home().clone(),
         storage: server.storage.clone(),
+        server,
         task,
     })
 }
@@ -960,12 +976,36 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         ));
                     }
                     Ok(ClientFrame::Command { id, command }) => {
+                        if server.is_closed() {
+                            let _ = send(&out, ServerFrame::Error { id: Some(id), code: ErrorCode::Unavailable, message: "the Space is stopping".to_owned() }).await;
+                            break;
+                        }
                         if send(&out, ServerFrame::Accepted { id }).await.is_err() {
                             break;
                         }
-                        let _run_guard = match &command {
-                            CommandCall::MessageSend(message) => {
-                                Some(server.chat_lock(message.chat).lock_owned().await)
+                        // A recorded command answers from the record; it must not
+                        // hold the Bot's place while it waits for the run's result.
+                        let replayed = match &command {
+                            CommandCall::MessageSend(_) => {
+                                matches!(server.store.command(id).await, Ok(Some(_)))
+                            }
+                            _ => false,
+                        };
+                        // Taking the next place and recording it happen under the
+                        // Bot's admit lock, so concurrent Messages confirm places
+                        // that are unique and in the record's order. Two first
+                        // submissions of one id may both miss the record and take
+                        // the lock; the second then finds the record and waits for
+                        // its result. That tiny race settles on the same answer.
+                        let admit = match &command {
+                            CommandCall::MessageSend(message) if !replayed => {
+                                let bot = server.state.lock().ok().and_then(|state| {
+                                    state.chats.get(&message.chat).map(|chat| chat.bot)
+                                });
+                                match bot {
+                                    Some(bot) => Some(server.runs.admit(bot).await),
+                                    None => None,
+                                }
                             }
                             _ => None,
                         };
@@ -973,26 +1013,18 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         let result = match outcome {
                             Ok(outcome) => {
                                 broadcast(&server, &outcome.events);
+                                // The pump is woken before any frame whose failure
+                                // ends this loop: a lost answer must not lose the run.
+                                if let Some(bot) = outcome.queued {
+                                    server.runs.enqueue(&server, bot);
+                                }
+                                drop(admit);
                                 if let Some(seq) = outcome.committed
                                     && send(&out, ServerFrame::Committed { id, seq }).await.is_err()
                                 {
                                     break;
                                 }
-                                match outcome.pending {
-                                    Some(pending) => {
-                                        match commands::finish_run(&server.store, &server.state, &server.home, &server.blobs, &server.model, &server.events, server.tool_timeout, pending).await {
-                                            Ok((result, events)) => {
-                                                broadcast(&server, &events);
-                                                result
-                                            }
-                                            Err(error) => {
-                                                let _ = send(&out, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    None => outcome.result,
-                                }
+                                outcome.result
                             }
                             Err(error) => {
                                 let _ = send(&out, ServerFrame::Error { id: Some(id), code: error.code(), message: error.to_string() }).await;
@@ -1253,14 +1285,20 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
 ///
 /// A one-shot run is answered or failed; it is never silently dropped. The
 /// Bot says the work was interrupted and the command that started the run
-/// receives that failure as its result.
-async fn recover_interrupted(store: &Store, state: &mut SpaceState) -> Result<(), StoreError> {
-    let interrupted: Vec<_> = state
-        .runs
-        .values()
-        .filter(|run| run.status == crate::state::RunStatus::Running)
-        .cloned()
-        .collect();
+/// receives that failure as its result. This runs after the Space owns its
+/// port and before it serves, so a start that cannot listen writes nothing.
+async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result<(), StoreError> {
+    let interrupted: Vec<_> = {
+        let state = state
+            .lock()
+            .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
+        state
+            .runs
+            .values()
+            .filter(|run| run.status == crate::state::RunStatus::Running)
+            .cloned()
+            .collect()
+    };
     for run in interrupted {
         let message = Id::new();
         let text = "I was interrupted before I could answer.";
@@ -1304,6 +1342,9 @@ async fn recover_interrupted(store: &Store, state: &mut SpaceState) -> Result<()
                     ),
             )
             .await?;
+        let mut state = state
+            .lock()
+            .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
         for event in &appended.events {
             state.apply(event).map_err(StoreError::Corrupt)?;
         }
@@ -1769,9 +1810,33 @@ mod tests {
         (format!("http://{addr}/v1"), task)
     }
 
+    /// Holds a scripted reply until the test opens its gate.
+    #[derive(Debug)]
+    struct Gate(std::sync::Arc<tokio::sync::watch::Sender<bool>>);
+
+    impl Gate {
+        fn open(&self) {
+            let _ = self.0.send(true);
+        }
+    }
+
+    async fn wait_for_gate(mut gate: tokio::sync::watch::Receiver<bool>) {
+        loop {
+            if *gate.borrow_and_update() {
+                break;
+            }
+            if gate.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+
     #[derive(Clone)]
     enum ScriptedReply {
         Text(String),
+        Hold {
+            text: String,
+        },
         Tool {
             name: String,
             arguments: Value,
@@ -1800,9 +1865,12 @@ mod tests {
         },
     }
 
-    async fn scripted_provider(
+    /// A scripted Provider whose replies run in order; a `Hold` reply waits
+    /// for the test to open the returned gate, so a test can keep a run in
+    /// flight without sleeping.
+    async fn gated_provider(
         script: Vec<ScriptedReply>,
-    ) -> (String, tokio::task::JoinHandle<()>) {
+    ) -> (String, tokio::task::JoinHandle<()>, Vec<Gate>) {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1812,6 +1880,18 @@ mod tests {
         use axum::response::Response;
         use axum::routing::post;
 
+        let mut gates = Vec::new();
+        let mut waits: Vec<Option<tokio::sync::watch::Receiver<bool>>> = Vec::new();
+        for reply in &script {
+            if matches!(reply, ScriptedReply::Hold { .. }) {
+                let (sender, receiver) = tokio::sync::watch::channel(false);
+                gates.push(Gate(Arc::new(sender)));
+                waits.push(Some(receiver));
+            } else {
+                waits.push(None);
+            }
+        }
+        let waits = Arc::new(waits);
         let script = Arc::new(script);
         let requests = Arc::new(AtomicUsize::new(0));
         let app = Router::new().route(
@@ -1819,15 +1899,19 @@ mod tests {
             post(move || {
                 let script = Arc::clone(&script);
                 let requests = Arc::clone(&requests);
+                let waits = Arc::clone(&waits);
                 async move {
                     let index = requests.fetch_add(1, Ordering::SeqCst);
-                    let reply = script
-                        .get(index)
-                        .cloned()
-                        .or_else(|| script.last().cloned())
-                        .expect("a scripted reply");
+                    let chosen = index.min(script.len().saturating_sub(1));
+                    let reply = script.get(chosen).cloned().expect("a scripted reply");
                     let body = match reply {
                         ScriptedReply::Text(text) => {
+                            let chunk = json!({"choices":[{"delta":{"content":text}}]});
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
+                        ScriptedReply::Hold { text } => {
+                            let gate = waits[chosen].clone().expect("a Hold reply has a gate");
+                            wait_for_gate(gate).await;
                             let chunk = json!({"choices":[{"delta":{"content":text}}]});
                             format!("data: {chunk}\n\ndata: [DONE]\n\n")
                         }
@@ -1929,7 +2013,21 @@ mod tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        (format!("http://{addr}/v1"), task)
+        (format!("http://{addr}/v1"), task, gates)
+    }
+
+    async fn scripted_provider(
+        script: Vec<ScriptedReply>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let (base, task, _gates) = gated_provider(script).await;
+
+        (base, task)
+    }
+
+    fn hold(text: &str) -> ScriptedReply {
+        ScriptedReply::Hold {
+            text: text.to_owned(),
+        }
     }
 
     fn tool(name: &str, arguments: Value) -> ScriptedReply {
@@ -2080,19 +2178,10 @@ mod tests {
         let bot_id: Id = serde_json::from_value(bot["bot"]["id"].clone()).unwrap();
         assert_eq!(bot["computer"]["kind"], "managed");
 
-        let sent = command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: "hello".to_owned(),
-                file: None,
-            }),
-        )
-        .await;
+        let sent = send(&mut socket, chat, "hello").await;
         assert_eq!(sent["status"], "succeeded");
         assert_eq!(sent["text"], "Hello from fake");
-        let run: Id = serde_json::from_value(sent["run"].clone()).unwrap();
+        let run = run_of(&sent);
 
         let messages = command(
             &mut socket,
@@ -2446,9 +2535,9 @@ mod tests {
             .unwrap();
         store.close().await.unwrap();
 
-        let server = SpaceServer::open(home).await.unwrap();
+        let running = start(home, 0).await.unwrap();
         {
-            let state = server.state.lock().unwrap();
+            let state = running.server.state.lock().unwrap();
             let recovered = &state.runs[&run];
 
             assert_eq!(recovered.status, crate::state::RunStatus::Failed);
@@ -2459,9 +2548,15 @@ mod tests {
                 "I was interrupted before I could answer."
             );
         }
-        let recorded = server.store.command(command).await.unwrap().unwrap();
+        let recorded = running
+            .server
+            .store
+            .command(command)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(recorded.result.unwrap()["status"], "failed");
-        server.store.close().await.unwrap();
+        running.shutdown().await;
     }
 
     async fn raw_http(addr: std::net::SocketAddr, request: &str) -> String {
@@ -2648,26 +2743,8 @@ mod tests {
         .await;
         let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
 
-        command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: "hello".to_owned(),
-                file: None,
-            }),
-        )
-        .await;
-        command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: "again".to_owned(),
-                file: None,
-            }),
-        )
-        .await;
+        send(&mut socket, chat, "hello").await;
+        send(&mut socket, chat, "again").await;
 
         {
             let requests = seen.lock().unwrap();
@@ -2752,10 +2829,16 @@ mod tests {
         });
 
         let first = command(&mut socket, send, message.clone()).await;
-        let second = command(&mut socket, send, message).await;
+        assert_eq!(first["status"], "queued");
+        let run = run_of(&first);
+        let shown = wait_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
 
-        assert_eq!(first, second);
-        assert_eq!(first["status"], "succeeded");
+        // A replay after the run ended answers with the run's final result and
+        // never queues a second run.
+        let second = command(&mut socket, send, message).await;
+        assert_eq!(second["run"], first["run"]);
+        assert_eq!(second["status"], "succeeded");
         let messages = command(
             &mut socket,
             Id::new(),
@@ -2763,8 +2846,7 @@ mod tests {
         )
         .await;
         assert_eq!(messages.as_array().unwrap().len(), 2);
-        let run: Id = serde_json::from_value(first["run"].clone()).unwrap();
-        let shown = command(&mut socket, Id::new(), CommandCall::RunShow { run }).await;
+        let shown = show_run(&mut socket, run).await;
         assert_eq!(shown["status"], "succeeded");
         socket.close(None).await.unwrap();
         provider_task.abort();
@@ -2775,7 +2857,7 @@ mod tests {
     async fn a_retry_while_the_run_works_waits_for_the_first_result() {
         let (_dir, running, invite) = running().await;
         let (mut first_socket, token) = admin(&running, &invite).await;
-        let (base, provider_task) = slow_provider().await;
+        let (base, provider_task, gates) = gated_provider(vec![hold("Hello from fake")]).await;
         command(&mut first_socket, Id::new(), provider_base(base)).await;
         let bot = command(
             &mut first_socket,
@@ -2787,7 +2869,23 @@ mod tests {
         .await;
         let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
         let command_id = Id::new();
-        first_socket
+        let queued = command(
+            &mut first_socket,
+            command_id,
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "hello".to_owned(),
+                file: None,
+            }),
+        )
+        .await;
+        assert_eq!(queued["status"], "queued");
+        let run = run_of(&queued);
+        wait_status(&mut first_socket, run, "running").await;
+
+        // The run still works; a replay of its command waits for the result.
+        let mut second_socket = open_socket(&running, &token).await;
+        second_socket
             .send(Message::Text(
                 serde_json::to_string(&ClientFrame::Command {
                     id: command_id,
@@ -2802,42 +2900,43 @@ mod tests {
             ))
             .await
             .unwrap();
-        let first_frame = next_frame(&mut first_socket).await;
-        let second_frame = next_frame(&mut first_socket).await;
-        assert!(matches!(first_frame, ServerFrame::Accepted { .. }));
-        assert!(matches!(second_frame, ServerFrame::Committed { .. }));
-
-        let mut second_socket = open_socket(&running, &token).await;
-        let result = command(
-            &mut second_socket,
-            command_id,
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: "hello".to_owned(),
-                file: None,
-            }),
-        )
-        .await;
-        assert_eq!(result["status"], "succeeded");
-
         loop {
-            match next_frame(&mut first_socket).await {
-                ServerFrame::Confirmed { .. } => break,
+            match next_frame(&mut second_socket).await {
+                ServerFrame::Accepted { id } => {
+                    assert_eq!(id, command_id);
+                    break;
+                }
                 ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        gates[0].open();
+        let result = loop {
+            match next_frame(&mut second_socket).await {
+                ServerFrame::Confirmed { id, result } => {
+                    assert_eq!(id, command_id);
+                    break result;
+                }
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. }
                 | ServerFrame::Accepted { .. }
                 | ServerFrame::Committed { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }
-        }
+        };
+        assert_eq!(result["status"], "succeeded");
+
         let messages = command(
-            &mut second_socket,
+            &mut first_socket,
             Id::new(),
             CommandCall::ChatRead { chat, from: None },
         )
         .await;
         assert_eq!(messages.as_array().unwrap().len(), 2);
         first_socket.close(None).await.unwrap();
-        second_socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
     }
@@ -2858,16 +2957,7 @@ mod tests {
         .await;
         let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
 
-        let result = command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: "hello".to_owned(),
-                file: None,
-            }),
-        )
-        .await;
+        let result = send(&mut socket, chat, "hello").await;
 
         assert_eq!(result["status"], "failed");
         let messages = command(
@@ -2883,8 +2973,8 @@ mod tests {
                 .unwrap()
                 .contains("could not answer")
         );
-        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
-        let shown = command(&mut socket, Id::new(), CommandCall::RunShow { run }).await;
+        let run = run_of(&result);
+        let shown = show_run(&mut socket, run).await;
         assert_eq!(shown["status"], "failed");
         socket.close(None).await.unwrap();
         provider_task.abort();
@@ -2936,36 +3026,6 @@ mod tests {
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
-    }
-
-    async fn slow_provider() -> (String, tokio::task::JoinHandle<()>) {
-        use axum::Router;
-        use axum::body::Body;
-        use axum::http::header::CONTENT_TYPE;
-        use axum::response::Response;
-        use axum::routing::post;
-
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"content\":\"Hello from fake\"}}]}\n\n",
-            "data: [DONE]\n\n",
-        );
-        let app = Router::new().route(
-            "/v1/chat/completions",
-            post(move || async move {
-                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                Response::builder()
-                    .header(CONTENT_TYPE, "text/event-stream")
-                    .body(Body::from(body))
-                    .unwrap()
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
-        (format!("http://{addr}/v1"), task)
     }
 
     async fn failing_provider() -> (String, tokio::task::JoinHandle<()>) {
@@ -3409,21 +3469,109 @@ mod tests {
         (bot_id, chat, computer)
     }
 
-    async fn send(socket: &mut Socket, chat: Id, text: &str) -> Value {
+    /// Sends a Message and returns the command's queued run.
+    async fn submit(socket: &mut Socket, chat: Id, text: &str, file: Option<Id>) -> Value {
         command(
             socket,
             Id::new(),
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: text.to_owned(),
-                file: None,
+                file,
             }),
         )
         .await
     }
 
+    fn run_of(result: &Value) -> Id {
+        serde_json::from_value(result["run"].clone()).expect("a run identifier")
+    }
+
+    /// Waits until a run is in a status and returns its view.
+    async fn wait_status(socket: &mut Socket, run: Id, status: &str) -> Value {
+        for _ in 0..500 {
+            let shown = show_run(socket, run).await;
+            if shown["status"] == status {
+                return shown;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run {run} never became {status}");
+    }
+
+    /// Waits until a run ends and returns its view.
+    async fn wait_run(socket: &mut Socket, run: Id) -> Value {
+        for _ in 0..500 {
+            let shown = show_run(socket, run).await;
+            if matches!(shown["status"].as_str(), Some("succeeded" | "failed")) {
+                return shown;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("run {run} did not finish");
+    }
+
+    /// Waits for the run a command queued and returns the result a client used
+    /// to receive when a command ran its run before confirming.
+    async fn finish(socket: &mut Socket, chat: Id, queued: Value) -> Value {
+        let run = run_of(&queued);
+        let shown = wait_run(socket, run).await;
+        let messages = command(
+            socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let reply = shown["reply"].clone();
+        let text = messages
+            .as_array()
+            .and_then(|messages| {
+                messages
+                    .iter()
+                    .find(|message| message["id"] == reply)
+                    .map(|message| message["text"].clone())
+            })
+            .unwrap_or(Value::Null);
+        json!({
+            "run": run,
+            "message": shown["message"],
+            "status": shown["status"],
+            "reply": shown["reply"],
+            "text": text,
+            "usage": shown["usage"],
+        })
+    }
+
+    async fn send(socket: &mut Socket, chat: Id, text: &str) -> Value {
+        let queued = submit(socket, chat, text, None).await;
+        finish(socket, chat, queued).await
+    }
+
+    async fn send_file(socket: &mut Socket, chat: Id, file: Id) -> Value {
+        let queued = submit(socket, chat, "", Some(file)).await;
+        finish(socket, chat, queued).await
+    }
+
     async fn show_run(socket: &mut Socket, run: Id) -> Value {
         command(socket, Id::new(), CommandCall::RunShow { run }).await
+    }
+
+    /// Reads the record of a stopped Space.
+    async fn record(root: &std::path::Path) -> Vec<neha::record::Event> {
+        let store = Store::open(&Home::open(root).unwrap()).await.unwrap();
+        let events = store.events_from(Seq::ZERO, 10_000).await.unwrap().events;
+        store.close().await.unwrap();
+
+        events
+    }
+
+    /// Returns the cursor of the one event of a kind that names a run.
+    fn event_seq(events: &[neha::record::Event], kind: EventKind, run: Id) -> Seq {
+        events
+            .iter()
+            .find(|event| event.kind == kind && event.data["run"] == json!(run))
+            .unwrap_or_else(|| panic!("no {kind:?} event of run {run}"))
+            .seq
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3622,7 +3770,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn two_clients_cannot_run_one_chat_at_once() {
+    async fn two_clients_on_one_chat_take_turns() {
         let (_dir, running, invite) = running().await;
         let (mut first, token) = admin(&running, &invite).await;
         let mut second = open_socket(&running, &token).await;
@@ -3645,6 +3793,7 @@ mod tests {
         );
         assert_eq!(left["status"], "succeeded");
         assert_eq!(right["status"], "succeeded");
+        assert_ne!(run_of(&left), run_of(&right));
 
         let messages = command(
             &mut first,
@@ -3652,16 +3801,894 @@ mod tests {
             CommandCall::ChatRead { chat, from: None },
         )
         .await;
-        let messages = messages.as_array().unwrap();
+        let messages = messages.as_array().unwrap().clone();
         assert_eq!(messages.len(), 4, "{messages:?}");
-        assert_eq!(messages[0]["author"]["kind"], "user");
-        assert_eq!(messages[1]["author"]["kind"], "bot");
-        assert_eq!(messages[2]["author"]["kind"], "user");
-        assert_eq!(messages[3]["author"]["kind"], "bot");
-        assert_ne!(messages[1]["text"], messages[3]["text"]);
+        let user = messages
+            .iter()
+            .find(|message| message["author"]["kind"] == "user")
+            .unwrap();
+        let bot = messages
+            .iter()
+            .find(|message| message["author"]["kind"] == "bot")
+            .unwrap();
+        assert_eq!(bot["acting"], user["author"]["id"]);
+        let mut replies: Vec<String> = messages
+            .iter()
+            .filter(|message| message["author"]["kind"] == "bot")
+            .map(|message| message["text"].as_str().unwrap().to_owned())
+            .collect();
+        replies.sort();
+        assert_eq!(replies, ["first answer", "second answer"]);
+
+        // One Bot runs one run at a time: the second run starts after the first ends.
+        let root = running.server_home();
         first.close(None).await.unwrap();
         second.close(None).await.unwrap();
         provider_task.abort();
+        running.shutdown().await;
+        let store = Store::open(&Home::open(&root).unwrap()).await.unwrap();
+        let events = store.events_from(Seq::ZERO, 1000).await.unwrap().events;
+        store.close().await.unwrap();
+        let seq_of = |kind: EventKind, run: Id| {
+            events
+                .iter()
+                .find(|event| event.kind == kind && event.data["run"] == json!(run))
+                .unwrap_or_else(|| panic!("{kind:?} of run {run}"))
+                .seq
+        };
+        let (first_run, second_run) = if seq_of(EventKind::RunStarted, run_of(&left))
+            < seq_of(EventKind::RunStarted, run_of(&right))
+        {
+            (run_of(&left), run_of(&right))
+        } else {
+            (run_of(&right), run_of(&left))
+        };
+        assert!(
+            seq_of(EventKind::RunStarted, second_run) > seq_of(EventKind::RunFinished, first_run)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_request_waits_for_the_first() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates) =
+            gated_provider(vec![hold("first answer"), text("second answer")]).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let first = submit(&mut socket, chat, "first", None).await;
+        assert_eq!(first["status"], "queued");
+        assert_eq!(first["position"], 1);
+        let first_run = run_of(&first);
+        wait_status(&mut socket, first_run, "running").await;
+
+        // The first run still works, so the second waits behind it.
+        let second = submit(&mut socket, chat, "second", None).await;
+        assert_eq!(second["status"], "queued");
+        assert_eq!(second["position"], 2);
+        let second_run = run_of(&second);
+        let shown = show_run(&mut socket, second_run).await;
+        assert_eq!(shown["status"], "queued");
+        assert_eq!(shown["position"], 2);
+        assert_eq!(show_run(&mut socket, first_run).await["status"], "running");
+
+        gates[0].open();
+        assert_eq!(
+            wait_run(&mut socket, first_run).await["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            wait_run(&mut socket, second_run).await["status"],
+            "succeeded"
+        );
+
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+        let events = record(&root).await;
+        assert!(
+            event_seq(&events, EventKind::RunStarted, second_run)
+                > event_seq(&events, EventKind::RunFinished, first_run),
+            "the second run must start after the first one ends"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_run_starts_after_a_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().expect("a fresh Space invites");
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (base, provider_task, _gates) =
+            gated_provider(vec![hold("first answer"), text("second answer")]).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let first = submit(&mut socket, chat, "first", None).await;
+        let first_run = run_of(&first);
+        wait_status(&mut socket, first_run, "running").await;
+        let second = submit(&mut socket, chat, "second", None).await;
+        let second_run = run_of(&second);
+        assert_eq!(second["status"], "queued");
+        assert_eq!(second["position"], 2);
+
+        // The Space stops with one run working and one waiting.
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+
+        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let mut socket = open_socket(&restarted, &token).await;
+        // The working run died with the old process; the waiting one runs now.
+        assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
+        let shown = wait_run(&mut socket, second_run).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert!(
+            shown.get("position").is_none(),
+            "a run that ended has no place in the queue"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_woken_worker_drains_the_whole_backlog() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().expect("a fresh Space invites");
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (base, provider_task, _gates) =
+            gated_provider(vec![hold("one"), text("two"), text("three")]).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let first = submit(&mut socket, chat, "first", None).await;
+        let first_run = run_of(&first);
+        wait_status(&mut socket, first_run, "running").await;
+        let second = submit(&mut socket, chat, "second", None).await;
+        let third = submit(&mut socket, chat, "third", None).await;
+        assert_eq!(second["position"], 2);
+        assert_eq!(third["position"], 3);
+        let (second_run, third_run) = (run_of(&second), run_of(&third));
+
+        // The restart wakes each Bot once; one wake must work the whole backlog.
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let mut socket = open_socket(&restarted, &token).await;
+        assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
+        assert_eq!(
+            wait_run(&mut socket, second_run).await["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            wait_run(&mut socket, third_run).await["status"],
+            "succeeded"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn runs_of_different_bots_run_in_parallel() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates) =
+            gated_provider(vec![hold("first"), hold("second")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let mut chats = Vec::new();
+        for name in ["First", "Second"] {
+            let bot = command(
+                &mut socket,
+                Id::new(),
+                CommandCall::BotCreate(BotCreate {
+                    name: name.to_owned(),
+                }),
+            )
+            .await;
+            chats.push(serde_json::from_value::<Id>(bot["chat"]["id"].clone()).unwrap());
+        }
+
+        let first = submit(&mut socket, chats[0], "one", None).await;
+        let second = submit(&mut socket, chats[1], "two", None).await;
+        let (first_run, second_run) = (run_of(&first), run_of(&second));
+
+        let mut overlapped = false;
+        for _ in 0..200 {
+            let left = show_run(&mut socket, first_run).await;
+            let right = show_run(&mut socket, second_run).await;
+            if left["status"] == "running" && right["status"] == "running" {
+                overlapped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            overlapped,
+            "runs of different Bots must work at the same time"
+        );
+        gates[0].open();
+        gates[1].open();
+        assert_eq!(
+            wait_run(&mut socket, first_run).await["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            wait_run(&mut socket, second_run).await["status"],
+            "succeeded"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn queued_runs_start_in_the_order_they_were_recorded() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates) =
+            gated_provider(vec![hold("one"), text("two"), text("three")]).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let first = submit(&mut socket, chat, "first", None).await;
+        let first_run = run_of(&first);
+        wait_status(&mut socket, first_run, "running").await;
+        let second = submit(&mut socket, chat, "second", None).await;
+        let third = submit(&mut socket, chat, "third", None).await;
+        assert_eq!(second["position"], 2);
+        assert_eq!(third["position"], 3);
+        let runs = [first_run, run_of(&second), run_of(&third)];
+        gates[0].open();
+        for run in runs {
+            assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        }
+
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+        let events = record(&root).await;
+        let queued = runs.map(|run| event_seq(&events, EventKind::RunQueued, run));
+        let started = runs.map(|run| event_seq(&events, EventKind::RunStarted, run));
+        assert!(
+            queued.windows(2).all(|pair| pair[0] < pair[1]),
+            "the record holds the runs in arrival order"
+        );
+        assert!(
+            started.is_sorted(),
+            "the runs start in the order the record queued them"
+        );
+        for pair in runs.windows(2) {
+            assert!(
+                event_seq(&events, EventKind::RunStarted, pair[1])
+                    > event_seq(&events, EventKind::RunFinished, pair[0]),
+                "a run starts only after the run before it ends"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_run_moves_up_as_the_queue_moves() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates) =
+            gated_provider(vec![hold("one"), hold("two"), text("three")]).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let first = submit(&mut socket, chat, "first", None).await;
+        let first_run = run_of(&first);
+        wait_status(&mut socket, first_run, "running").await;
+        let second = submit(&mut socket, chat, "second", None).await;
+        let third = submit(&mut socket, chat, "third", None).await;
+        let (second_run, third_run) = (run_of(&second), run_of(&third));
+        assert_eq!(show_run(&mut socket, second_run).await["position"], 2);
+        assert_eq!(show_run(&mut socket, third_run).await["position"], 3);
+
+        // The run at the head ends; the next one works and the last one moves up.
+        gates[0].open();
+        assert_eq!(
+            wait_run(&mut socket, first_run).await["status"],
+            "succeeded"
+        );
+        wait_status(&mut socket, second_run, "running").await;
+        let shown = show_run(&mut socket, third_run).await;
+        assert_eq!(shown["status"], "queued");
+        assert_eq!(shown["position"], 2);
+
+        gates[1].open();
+        for run in [second_run, third_run] {
+            assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        }
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_requests_keep_their_recorded_order() {
+        let (_dir, running, invite) = running().await;
+        let (mut admin, token) = admin(&running, &invite).await;
+        let (base, provider_task, gates) =
+            gated_provider(vec![hold("first answer"), text("answer")]).await;
+        command(&mut admin, Id::new(), provider_add(base)).await;
+        let bot = command(
+            &mut admin,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        // The first run holds the Bot's work while the burst takes its places.
+        let first = submit(&mut admin, chat, "first", None).await;
+        let first_run = run_of(&first);
+        wait_status(&mut admin, first_run, "running").await;
+
+        let mut sockets = Vec::new();
+        for _ in 0..8 {
+            sockets.push(open_socket(&running, &token).await);
+        }
+        let mut requests = Vec::new();
+        for mut socket in sockets {
+            requests.push(tokio::spawn(async move {
+                command(
+                    &mut socket,
+                    Id::new(),
+                    CommandCall::MessageSend(MessageSend {
+                        chat,
+                        text: "burst".to_owned(),
+                        file: None,
+                    }),
+                )
+                .await
+            }));
+        }
+        let mut placed: Vec<(u64, Id)> = Vec::new();
+        for request in requests {
+            let queued = request.await.unwrap();
+            assert_eq!(queued["status"], "queued");
+            placed.push((
+                queued["position"].as_u64().expect("a place in the queue"),
+                run_of(&queued),
+            ));
+        }
+        let mut places: Vec<u64> = placed.iter().map(|(place, _)| *place).collect();
+        places.sort_unstable();
+        assert_eq!(
+            places,
+            (2..=9).collect::<Vec<_>>(),
+            "each confirmation must name its own place"
+        );
+
+        gates[0].open();
+        assert_eq!(wait_run(&mut admin, first_run).await["status"], "succeeded");
+        for (_, run) in &placed {
+            assert_eq!(wait_run(&mut admin, *run).await["status"], "succeeded");
+        }
+
+        let root = running.server_home();
+        admin.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+        let events = record(&root).await;
+        // The record orders the burst by the place each command confirmed.
+        let mut by_queue: Vec<(Seq, u64, Id)> = placed
+            .iter()
+            .map(|(place, run)| (event_seq(&events, EventKind::RunQueued, *run), *place, *run))
+            .collect();
+        by_queue.sort_unstable();
+        assert_eq!(
+            by_queue
+                .iter()
+                .map(|(_, place, _)| *place)
+                .collect::<Vec<_>>(),
+            (2..=9).collect::<Vec<_>>(),
+            "the record's order must be the places the commands confirmed"
+        );
+        let started: Vec<Seq> = by_queue
+            .iter()
+            .map(|(_, _, run)| event_seq(&events, EventKind::RunStarted, *run))
+            .collect();
+        assert!(started.is_sorted(), "the runs start in the record's order");
+        assert!(
+            started[0] > event_seq(&events, EventKind::RunFinished, first_run),
+            "the burst starts after the run that held the Bot"
+        );
+        for window in by_queue.windows(2) {
+            assert!(
+                event_seq(&events, EventKind::RunFinished, window[0].2)
+                    < event_seq(&events, EventKind::RunStarted, window[1].2),
+                "one Bot runs one run at a time"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_command_does_not_hold_the_queue() {
+        let (_dir, running, invite) = running().await;
+        let (mut admin, token) = admin(&running, &invite).await;
+        let (base, provider_task, gates) =
+            gated_provider(vec![hold("first answer"), text("answer")]).await;
+        command(&mut admin, Id::new(), provider_add(base)).await;
+        let bot = command(
+            &mut admin,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let command_id = Id::new();
+        let first = command(
+            &mut admin,
+            command_id,
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "first".to_owned(),
+                file: None,
+            }),
+        )
+        .await;
+        let first_run = run_of(&first);
+        wait_status(&mut admin, first_run, "running").await;
+
+        // A replay of the queued command waits for the run's result.
+        let mut replay_socket = open_socket(&running, &token).await;
+        replay_socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: command_id,
+                    command: CommandCall::MessageSend(MessageSend {
+                        chat,
+                        text: "first".to_owned(),
+                        file: None,
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            match next_frame(&mut replay_socket).await {
+                ServerFrame::Accepted { id } => {
+                    assert_eq!(id, command_id);
+                    break;
+                }
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+        let replay = tokio::spawn(async move {
+            loop {
+                match next_frame(&mut replay_socket).await {
+                    ServerFrame::Confirmed { id, result } => {
+                        assert_eq!(id, command_id);
+
+                        return result;
+                    }
+                    ServerFrame::Heartbeat { .. }
+                    | ServerFrame::Event { .. }
+                    | ServerFrame::Snapshot { .. }
+                    | ServerFrame::Accepted { .. }
+                    | ServerFrame::Committed { .. } => {}
+                    other => panic!("unexpected frame {other:?}"),
+                }
+            }
+        });
+
+        // The Bot still takes a new request: the replay holds no place.
+        let mut next_socket = open_socket(&running, &token).await;
+        let next = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            command(
+                &mut next_socket,
+                Id::new(),
+                CommandCall::MessageSend(MessageSend {
+                    chat,
+                    text: "next".to_owned(),
+                    file: None,
+                }),
+            ),
+        )
+        .await
+        .expect("a replay must not hold the Bot's queue");
+        assert_eq!(next["status"], "queued");
+        assert_eq!(next["position"], 2);
+
+        gates[0].open();
+        let replayed = replay.await.unwrap();
+        assert_eq!(replayed["status"], "succeeded");
+        assert_eq!(replayed["run"], first["run"]);
+        assert_eq!(wait_run(&mut admin, first_run).await["status"], "succeeded");
+        assert_eq!(
+            wait_run(&mut admin, run_of(&next)).await["status"],
+            "succeeded"
+        );
+        admin.close(None).await.unwrap();
+        next_socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_run_that_cannot_resume_is_failed() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().expect("a fresh Space invites");
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (base, provider_task, _gates) =
+            gated_provider(vec![hold("first answer"), text("second answer")]).await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let first = submit(&mut socket, chat, "first", None).await;
+        let first_run = run_of(&first);
+        wait_status(&mut socket, first_run, "running").await;
+        let command_id = Id::new();
+        let second = command(
+            &mut socket,
+            command_id,
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "second".to_owned(),
+                file: None,
+            }),
+        )
+        .await;
+        assert_eq!(second["status"], "queued");
+        let second_run = run_of(&second);
+
+        // Take away the key the waiting run needs after the restart.
+        let home = Home::open(directory.path()).unwrap();
+        for entry in std::fs::read_dir(home.root().join("secrets")).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with("provider-") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+
+        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let mut socket = open_socket(&restarted, &token).await;
+        assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
+        let failed = wait_run(&mut socket, second_run).await;
+        assert_eq!(failed["status"], "failed");
+
+        // A retry of the command answers with the same failure at once and
+        // records nothing new.
+        let before = restarted.server.store.last_seq().await.unwrap();
+        let retried = command(
+            &mut socket,
+            command_id,
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "second".to_owned(),
+                file: None,
+            }),
+        )
+        .await;
+        assert_eq!(retried["run"], second["run"]);
+        assert_eq!(retried["status"], "failed");
+        assert_eq!(
+            restarted.server.store.last_seq().await.unwrap(),
+            before,
+            "a retried command must not write again"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shutdown_rejects_a_late_command() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        let root = running.server_home();
+        let before = running.server.store.last_seq().await.unwrap();
+
+        // The client keeps its socket while the Space stops.
+        running.shutdown().await;
+        let _ = socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: Id::new(),
+                    command: CommandCall::MessageSend(MessageSend {
+                        chat,
+                        text: "late".to_owned(),
+                        file: None,
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await;
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("the Space answers or closes");
+        match refused {
+            Some(Ok(Message::Text(text))) => {
+                let frame: ServerFrame = serde_json::from_str(text.as_str()).unwrap();
+                assert!(
+                    matches!(
+                        frame,
+                        ServerFrame::Error {
+                            code: ErrorCode::Unavailable,
+                            ..
+                        }
+                    ),
+                    "a stopped Space accepted a command: {frame:?}"
+                );
+            }
+            Some(Ok(_)) => panic!("the Space sent a non-text frame"),
+            Some(Err(error)) => panic!("the socket failed: {error}"),
+            None => panic!("the Space neither answered nor closed"),
+        }
+
+        provider_task.abort();
+        let store = Store::open(&Home::open(&root).unwrap()).await.unwrap();
+        let page = store.events_from(before, 10).await.unwrap();
+        assert!(
+            page.events.is_empty(),
+            "the stopped Space wrote {:?}",
+            page.events
+                .iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>()
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_start_leaves_the_queue_untouched() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let provider = Id::new();
+        let model = Id::new();
+        let user = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let (message, run) = (Id::new(), Id::new());
+        let (interrupted_message, interrupted_run) = (Id::new(), Id::new());
+        let command_id = Id::new();
+        crate::secrets::Secrets::load(&home)
+            .unwrap()
+            .store_provider_key(provider, "sk-test")
+            .unwrap();
+        std::fs::create_dir_all(home.workspace_dir(computer)).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::ProviderAdded,
+                Author::User(user),
+                json!({
+                    "provider": provider,
+                    "protocol": "chat_completions",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "models": [{
+                        "id": model,
+                        "name": "test-model",
+                        "context_limit": 128_000,
+                        "max_output": 8_192,
+                        "reads_images": false,
+                    }],
+                    "default_model": model,
+                }),
+            ),
+            EventDraft::new(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                json!({"computer": computer, "owner": user, "kind": "managed", "workspace": home.workspace_dir(computer).to_string_lossy()}),
+            ),
+            EventDraft::new(
+                EventKind::BotCreated,
+                Author::User(user),
+                json!({"bot": bot, "owner": user, "name": "Scout", "computer": computer, "chat": chat}),
+            ),
+            EventDraft::new(
+                EventKind::ChatCreated,
+                Author::User(user),
+                json!({"chat": chat, "owner": user, "bot": bot}),
+            ),
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({"message": message, "chat": chat, "text": "hello", "run": run}),
+            ),
+            EventDraft::new(
+                EventKind::RunQueued,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "message": message,
+                    "command": command_id,
+                }),
+            )
+            .acting(user),
+            // A run the previous process left working: a start recovers it.
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({
+                    "message": interrupted_message,
+                    "chat": chat,
+                    "text": "older",
+                    "run": interrupted_run,
+                }),
+            ),
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": interrupted_run,
+                    "chat": chat,
+                    "bot": bot,
+                    "message": interrupted_message,
+                    "command": command_id,
+                }),
+            )
+            .acting(user),
+        ];
+        let seeded = store
+            .append(AppendRequest::new(command_id, "seed", drafts))
+            .await
+            .unwrap();
+        let seed_end = seeded.events.last().unwrap().seq;
+        store.close().await.unwrap();
+
+        // A start that cannot listen must not waken the record.
+        let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let result = start(Home::open(directory.path()).unwrap(), port).await;
+        assert!(result.is_err(), "a taken port must refuse the start");
+        drop(occupied);
+
+        let store = Store::open(&home).await.unwrap();
+        for _ in 0..30 {
+            let page = store.events_from(seed_end, 100).await.unwrap();
+            assert!(
+                page.events.is_empty(),
+                "a failed start wrote {:?}",
+                page.events
+                    .iter()
+                    .map(|event| event.kind)
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        store.close().await.unwrap();
+
+        // A start that listens recovers the run the previous process left working.
+        let running = start(Home::open(directory.path()).unwrap(), 0)
+            .await
+            .unwrap();
+        {
+            let state = running.server.state.lock().unwrap();
+            let recovered = &state.runs[&interrupted_run];
+            assert_eq!(recovered.status, crate::state::RunStatus::Failed);
+            let reply = recovered.reply.expect("an interrupted run answers");
+            let answer = state
+                .messages
+                .iter()
+                .find(|message| message.id == reply)
+                .expect("the interruption Message");
+            assert_eq!(answer.text, "I was interrupted before I could answer.");
+        }
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_old_record_without_a_queued_event_replays() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let identity = crate::identity::Identity::open(&home).await.unwrap();
+        let account = identity
+            .add_account_for_test("Ada", "correct horse battery")
+            .await
+            .unwrap();
+        drop(identity);
+        let user = account.id;
+        let (bot, computer, chat) = (Id::new(), Id::new(), Id::new());
+        let (message, run, command) = (Id::new(), Id::new(), Id::new());
+        let store = Store::open(&home).await.unwrap();
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(user),
+                json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventDraft::new(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                json!({"computer": computer, "owner": user, "kind": "managed", "workspace": "/tmp/workspace"}),
+            ),
+            EventDraft::new(
+                EventKind::BotCreated,
+                Author::User(user),
+                json!({"bot": bot, "owner": user, "name": "Scout", "computer": computer, "chat": chat}),
+            ),
+            EventDraft::new(
+                EventKind::ChatCreated,
+                Author::User(user),
+                json!({"chat": chat, "owner": user, "bot": bot}),
+            ),
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({"message": message, "chat": chat, "text": "hello", "run": run}),
+            ),
+            // Before runs were queued, a start was all the record held for a run.
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "message": message,
+                    "command": command,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunFinished,
+                Author::Bot(bot),
+                json!({"run": run, "status": "succeeded", "reply": message}),
+            )
+            .acting(user),
+        ];
+        let appended = store
+            .append(AppendRequest::new(command, "old record", drafts))
+            .await
+            .unwrap();
+        let started = appended
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::RunStarted)
+            .expect("the start event")
+            .seq;
+        store.close().await.unwrap();
+
+        let running = start(home, 0).await.unwrap();
+        let token = sign_in(&running, "Ada").await;
+        let mut socket = open_socket(&running, &token).await;
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert_eq!(shown["seq"], json!(started));
+        assert!(
+            shown.get("position").is_none(),
+            "only a waiting run has a place in a queue"
+        );
+        socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 
@@ -4368,16 +5395,7 @@ mod tests {
         // A Message carries the File with no text.
         let (base, provider_task) = scripted_provider(vec![text("Hello from fake")]).await;
         command(&mut socket, Id::new(), provider_add(base)).await;
-        let sent = command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: String::new(),
-                file: Some(file),
-            }),
-        )
-        .await;
+        let sent = send_file(&mut socket, chat, file).await;
         assert_eq!(sent["status"], "succeeded");
         let messages = command(
             &mut socket,
@@ -4732,16 +5750,7 @@ mod tests {
         .await;
         command(&mut socket, Id::new(), provider_add(base)).await;
 
-        let result = command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat,
-                text: String::new(),
-                file: Some(taken),
-            }),
-        )
-        .await;
+        let result = send_file(&mut socket, chat, taken).await;
         assert_eq!(result["status"], "succeeded");
 
         let workspace = running
@@ -5068,16 +6077,7 @@ mod tests {
             ])
             .await;
             command(&mut socket, Id::new(), provider_add(base)).await;
-            let result = command(
-                &mut socket,
-                Id::new(),
-                CommandCall::MessageSend(MessageSend {
-                    chat,
-                    text: String::new(),
-                    file: Some(taken),
-                }),
-            )
-            .await;
+            let result = send_file(&mut socket, chat, taken).await;
             assert_eq!(result["status"], "succeeded");
 
             // The Workspace copy is the Bot's; the File the Chat got back is bytes

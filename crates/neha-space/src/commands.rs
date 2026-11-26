@@ -1,8 +1,9 @@
 //! Command handlers.
 //!
 //! A handler validates the caller, writes the command's events, and returns
-//! what the client should see. A Message that starts a run also hands back
-//! the work the server must finish before it confirms the command.
+//! what the client should see. A Message that starts a run admits the run to
+//! its Bot's queue and confirms the command with the run's place, while the
+//! Space finishes the run in the background.
 //!
 //! A command that is already recorded never writes or creates anything
 //! again: its recorded result is the answer.
@@ -33,6 +34,7 @@ use neha_computer::{ActionStatus, LocalRuntime, ToolOutput};
 use neha_loop::{DeliveredFile, FileHost, LoopError, Recorder, RunOutcome, RunRequest, TakenFile};
 
 const RESULT_RUNNING: &str = "running";
+const RESULT_QUEUED: &str = "queued";
 const RUN_POLL: Duration = Duration::from_millis(100);
 /// What a command wrote and whether work follows.
 pub struct Outcome {
@@ -40,8 +42,8 @@ pub struct Outcome {
     pub committed: Option<Seq>,
     /// The result to confirm now, when no work follows.
     pub result: Value,
-    /// A run the server must finish before confirming.
-    pub pending: Option<PendingRun>,
+    /// The Bot whose queue a run entered, when this command queued one.
+    pub queued: Option<Id>,
     /// The events this command just wrote.
     pub events: Vec<Event>,
 }
@@ -56,7 +58,7 @@ pub struct FileUpload {
     pub bytes: Vec<u8>,
 }
 
-/// A one-shot run waiting for its Model reply.
+/// A run the queue is about to work.
 pub struct PendingRun {
     /// The run.
     pub run: Id,
@@ -184,7 +186,16 @@ pub async fn execute(
                 .get(&run)
                 .filter(|run| run.acting == account.id)
                 .ok_or_else(|| ApiError::not_found("no such run"))?;
-            bounded_run(run)
+            let mut value = bounded_run(run)?;
+            if run.status == RunStatus::Queued {
+                let ahead = state
+                    .active_runs(run.bot)
+                    .into_iter()
+                    .filter(|other| other.seq < run.seq)
+                    .count();
+                value["position"] = json!(ahead + 1);
+            }
+            Ok(value)
         }),
     }
 }
@@ -271,7 +282,7 @@ async fn provider_add(
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
         result,
-        pending: None,
+        queued: None,
         events: appended.events,
     })
 }
@@ -351,7 +362,7 @@ async fn bot_create(
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
         result,
-        pending: None,
+        queued: None,
         events: appended.events,
     })
 }
@@ -369,11 +380,19 @@ async fn message_send(
         return existing_outcome(store, command_id, record).await;
     }
 
-    let (bot, model, provider, api_key) =
-        preflight(state, arguments.chat, account.id, secrets, arguments.file)?;
+    let (bot, ..) = preflight(state, arguments.chat, account.id, secrets, arguments.file)?;
     if arguments.file.is_none() && arguments.text.trim().is_empty() {
         return Err(ApiError::invalid_argument("a Message needs text or a File"));
     }
+    // The run joins the queue behind the Bot's active runs. It is counted
+    // before the append so the confirmed place matches the record order.
+    let position = {
+        let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+        u32::try_from(state.active_runs(bot.id).len())
+            .ok()
+            .and_then(|active| active.checked_add(1))
+            .ok_or_else(|| ApiError::internal("too many runs are active"))?
+    };
 
     let message = Id::new();
     let run = Id::new();
@@ -389,13 +408,23 @@ async fn message_send(
     let drafts = vec![
         EventDraft::new(EventKind::MessageAdded, Author::User(account.id), added),
         EventDraft::new(
-            EventKind::RunStarted,
+            EventKind::RunQueued,
             Author::Bot(bot.id),
-            json!({"run": run, "chat": arguments.chat, "bot": bot.id, "message": message, "command": command_id}),
+            json!({
+                "run": run,
+                "chat": arguments.chat,
+                "bot": bot.id,
+                "message": message,
+                "command": command_id,
+            }),
         )
         .acting(account.id),
     ];
-    let provisional = json!({"message": message, "run": run, "status": RESULT_RUNNING});
+    let provisional = json!({
+        "run": run,
+        "status": RESULT_QUEUED,
+        "position": position,
+    });
     let appended = append(
         store,
         state,
@@ -413,23 +442,136 @@ async fn message_send(
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
         result: provisional,
-        pending: Some(PendingRun {
-            run,
-            chat: ChatView {
-                id: arguments.chat,
-                owner: account.id,
-                bot: bot.id,
-            },
-            bot,
-            acting: account.id,
-            message,
-            command: command_id,
-            model,
-            provider,
-            api_key,
-        }),
+        queued: Some(bot.id),
         events: appended.events,
     })
+}
+
+/// Records that the Bot starts a queued run and streams the event.
+pub async fn start_run(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    pending: &PendingRun,
+) -> Result<(), ApiError> {
+    let draft = EventDraft::new(
+        EventKind::RunStarted,
+        Author::Bot(pending.bot.id),
+        json!({
+            "run": pending.run,
+            "chat": pending.chat.id,
+            "bot": pending.bot.id,
+            "message": pending.message,
+            "command": pending.command,
+        }),
+    )
+    .acting(pending.acting);
+    let appended = append(
+        store,
+        state,
+        Id::new(),
+        format!("run.start:{}", pending.run),
+        vec![draft],
+        None,
+        None,
+    )
+    .await?;
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+
+    Ok(())
+}
+
+/// Rebuilds the work of a run that was still waiting when the Space stopped.
+///
+/// The Chat, the Provider, or its key may be gone; the caller records the run
+/// as failed then, so a restored queue never keeps a run that cannot start.
+pub async fn resume_pending(
+    state: &Mutex<State>,
+    secrets: &Secrets,
+    run: &crate::state::RunView,
+) -> Result<PendingRun, ApiError> {
+    let (bot, model, provider, api_key) = preflight(state, run.chat, run.acting, secrets, None)?;
+    let chat = {
+        let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .chats
+            .get(&run.chat)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such Chat"))?
+    };
+
+    Ok(PendingRun {
+        run: run.id,
+        chat,
+        bot,
+        acting: run.acting,
+        message: run.message,
+        command: run.command,
+        model,
+        provider,
+        api_key,
+    })
+}
+
+/// Records a queued run that cannot start as failed, confirming its command.
+///
+/// The Bot answers in the Chat and the run ends, so a restart never leaves the
+/// waiting run and its command hanging.
+pub async fn fail_queued_run(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    run: &crate::state::RunView,
+    reason: &str,
+) -> Result<(), ApiError> {
+    let reply = Id::new();
+    let text = format!("I could not start my run: {reason}");
+    let usage = neha::usage::Usage::default();
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::MessageAdded,
+            Author::Bot(run.bot),
+            json!({"message": reply, "chat": run.chat, "text": text, "run": run.id}),
+        )
+        .acting(run.acting),
+        EventDraft::new(
+            EventKind::RunFinished,
+            Author::Bot(run.bot),
+            json!({
+                "run": run.id,
+                "status": RunStatus::Failed,
+                "reply": reply,
+                "usage": usage,
+                "error": reason,
+            }),
+        )
+        .acting(run.acting),
+    ];
+    let result = json!({
+        "run": run.id,
+        "message": run.message,
+        "status": RunStatus::Failed,
+        "reply": reply,
+        "text": text,
+        "usage": usage,
+    });
+    let appended = append(
+        store,
+        state,
+        Id::new(),
+        format!("run.fail:{}", run.id),
+        drafts,
+        None,
+        Some((run.command, result)),
+    )
+    .await?;
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+
+    Ok(())
 }
 
 /// Stores a File's bytes and records the File in a Chat the account owns.
@@ -475,7 +617,7 @@ pub async fn file_upload(
         return Ok(Outcome {
             committed: None,
             result: serde_json::to_value(recorded).map_err(json_error)?,
-            pending: None,
+            queued: None,
             events: Vec::new(),
         });
     }
@@ -521,7 +663,7 @@ pub async fn file_upload(
     Ok(Outcome {
         committed: Some(event.seq),
         result: serde_json::to_value(summary).map_err(json_error)?,
-        pending: None,
+        queued: None,
         events: appended.events,
     })
 }
@@ -912,6 +1054,7 @@ fn bounded_run(run: &crate::state::RunView) -> Result<Value, ApiError> {
         "acting": run.acting,
         "command": run.command,
         "message": run.message,
+        "seq": run.seq,
         "status": run.status,
         "reply": run.reply,
         "usage": run.usage,
@@ -1022,7 +1165,7 @@ fn read(
     Ok(Outcome {
         committed: None,
         result,
-        pending: None,
+        queued: None,
         events: Vec::new(),
     })
 }
@@ -1050,7 +1193,7 @@ async fn existing_outcome(
     record: CommandRecord,
 ) -> Result<Outcome, ApiError> {
     let result = match record.result {
-        Some(result) if !is_running(&result) => result,
+        Some(result) if !is_unsettled(&result) => result,
         Some(_) => await_completion(store, command_id).await?,
         None => await_completion(store, command_id).await?,
     };
@@ -1058,7 +1201,7 @@ async fn existing_outcome(
     Ok(Outcome {
         committed: Some(record.last_seq),
         result,
-        pending: None,
+        queued: None,
         events: Vec::new(),
     })
 }
@@ -1079,7 +1222,7 @@ async fn await_completion(store: &Store, command_id: Id) -> Result<Value, ApiErr
             return Err(ApiError::conflict("the command is not recorded"));
         };
         if let Some(result) = record.result
-            && !is_running(&result)
+            && !is_unsettled(&result)
         {
             return Ok(result);
         }
@@ -1088,8 +1231,15 @@ async fn await_completion(store: &Store, command_id: Id) -> Result<Value, ApiErr
     Err(ApiError::conflict("the command is still running"))
 }
 
-fn is_running(result: &Value) -> bool {
-    result["status"].as_str() == Some(RESULT_RUNNING)
+/// Returns whether a recorded result is a placeholder a later append replaces.
+///
+/// A replay of the command waits for the settled result, so a client that
+/// retries after a lost answer still reads what the run ended with.
+fn is_unsettled(result: &Value) -> bool {
+    matches!(
+        result["status"].as_str(),
+        Some(RESULT_RUNNING | RESULT_QUEUED)
+    )
 }
 
 fn fingerprint(command: &CommandCall) -> Result<String, ApiError> {

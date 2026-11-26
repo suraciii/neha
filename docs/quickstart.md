@@ -117,6 +117,40 @@ target/debug/neha run show <run-id>
 
 A Bot can also write files, read them back, and run shell commands in its Computer's workspace. [Let a Bot work on its Computer](tools.md) shows how.
 
+## A Bot does one thing at a time
+
+A Bot works on one request at a time. A request that arrives while the Bot works waits in a queue.
+
+The browser client shows the waiting request and how many requests are ahead of it. The run in progress holds the first place in the queue, so the CLI prints `queued (position 2)` for the request behind it. If the CLI observes the run in progress, it prints `running`; it prints the Bot's reply when the run ends.
+
+Send a request that keeps the Bot busy, such as a shell command that waits:
+
+```bash
+target/debug/neha chat send "Run 'sleep 5' in the shell, then tell me the exit code."
+```
+
+Wait until the first terminal prints `running`, then send a second request from another terminal while the first command runs:
+
+```bash
+target/debug/neha chat send "Then list the open questions."
+```
+
+If the second command prints `queued (position 1)`, the first run had already ended; send the request sooner to see it wait at position 2.
+
+The second command prints `queued (position 2)` and later the Bot's reply. Its last line names the run:
+
+```text
+  run <run-id> (succeeded)
+```
+
+Read that run from the record:
+
+```bash
+target/debug/neha run show <run-id>
+```
+
+`neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
+
 ## Send a file
 
 A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it:

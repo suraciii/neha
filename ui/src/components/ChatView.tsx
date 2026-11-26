@@ -3,7 +3,7 @@ import { For, Show, createEffect, createSignal } from "solid-js";
 import { locale, t } from "../i18n";
 import { dayLabel, timeOfDay } from "../lib/format";
 import { formatBytes } from "../lib/files";
-import type { Account, Bot, Computer, FileSummary, Message } from "../types";
+import type { Account, Bot, Computer, FileSummary, Message, RunProgress } from "../types";
 import Avatar from "./Avatar";
 import FileCard from "./FileCard";
 import Icon from "./Icon";
@@ -16,6 +16,7 @@ interface ChatViewProps {
   messages: Message[];
   files: Record<string, FileSummary>;
   working: boolean;
+  queue: RunProgress | null;
   error: string | null;
   // Resolves false when nothing left the composer, which keeps its Message.
   onSend: (text: string, file: File | null) => Promise<boolean>;
@@ -42,6 +43,17 @@ export default function ChatView(props: ChatViewProps) {
 
   const canSend = () =>
     !props.working && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+
+  // What the Chat says about the run it waits for, if it waits for one.
+  const queueLabel = (): string | null => {
+    const queue = props.queue;
+    if (!queue) return null;
+    if (queue.status === "running") return t("chat.queue.running");
+    // The running run holds place 1, so place N has N - 1 requests ahead.
+    const ahead = Math.max((queue.position ?? 1) - 1, 0);
+    if (ahead === 0) return t("chat.queue.queued");
+    return t(ahead === 1 ? "chat.queue.waiting.one" : "chat.queue.waiting.many", { count: ahead });
+  };
 
   async function send(event?: SubmitEvent) {
     event?.preventDefault();
@@ -207,6 +219,13 @@ export default function ChatView(props: ChatViewProps) {
                 <Icon name="x" size="sm" />
               </button>
             </div>
+          )}
+        </Show>
+        <Show when={queueLabel()}>
+          {(label) => (
+            <p class="composer__queue" role="status">
+              {label()}
+            </p>
           )}
         </Show>
         <textarea

@@ -978,6 +978,12 @@ code,
   box-shadow: 0 0 0 3px var(--accent-wash);
 }
 
+.composer__queue {
+  margin: 0 2px 6px;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+}
+
 .composer__input {
   display: block;
   width: 100%;

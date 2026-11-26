@@ -22,6 +22,7 @@ import type {
   ProviderResult,
   BotResult,
   Preview,
+  RunProgress,
   RunView,
   SendResult,
 } from "./types";
@@ -41,6 +42,7 @@ interface State {
   activeBot: Bot | null;
   activeComputer: Computer | null;
   working: boolean;
+  queue: RunProgress | null;
   busy: boolean;
   error: unknown | null;
 }
@@ -58,6 +60,7 @@ const emptyState: State = {
   activeBot: null,
   activeComputer: null,
   working: false,
+  queue: null,
   busy: false,
   error: null,
 };
@@ -89,6 +92,12 @@ export default function App() {
   const [isMobile, setIsMobile] = createSignal(false);
   const commands = new Commands();
   let runGeneration = 0;
+  let queuePoll = 0;
+
+  // Whether the Chat on screen still belongs to this piece of work.
+  function isCurrentChat(chat: Chat, generation: number): boolean {
+    return generation === runGeneration && state.activeChat?.id === chat.id;
+  }
 
   onSettled(() => {
     const query = window.matchMedia("(max-width: 900px)");
@@ -171,7 +180,7 @@ export default function App() {
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
-    update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
+    update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, queue: null, error: null });
     try {
       const [messages, files, bot] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
@@ -194,52 +203,47 @@ export default function App() {
   async function restoreRun(chat: Chat, messages: Message[], generation: number) {
     const run = [...messages].reverse().find((message) => message.run)?.run;
     if (!run || generation !== runGeneration) return;
-    try {
-      const view = await commands.command<RunView>("run_show", { run }, 10_000);
-      if (generation !== runGeneration) return;
-      if (view.status === "running") {
-        update({ working: true });
-        void pollRun(chat, run, generation);
-      } else {
-        await refreshActive();
-      }
-    } catch {
-      // A Run that is already gone leaves the recorded Messages in place.
-    }
+    void pollRun(chat, run, generation);
   }
 
   async function pollRun(chat: Chat, run: string, generation: number) {
-    while (generation === runGeneration) {
-      await new Promise((resolve) => setTimeout(resolve, 1_500));
-      if (generation !== runGeneration) return;
+    const poll = ++queuePoll;
+    while (isCurrentChat(chat, generation) && poll === queuePoll) {
       try {
         const view = await commands.command<RunView>("run_show", { run }, 10_000);
-        if (generation !== runGeneration) return;
-        if (view.status !== "running") {
-          update({ working: false });
-          if (state.activeChat?.id === chat.id) await refreshActive();
+        if (!isCurrentChat(chat, generation) || poll !== queuePoll) return;
+        if (view.status === "queued" || view.status === "running") {
+          update({ queue: { status: view.status, position: view.position } });
+        } else {
+          update({ queue: null });
+          if (view.status === "failed") {
+            update({ error: view.error ?? { key: "error.botAnswer" } });
+          }
+          await refreshActive(chat, generation);
           return;
         }
       } catch {
-        update({ working: false });
+        if (!isCurrentChat(chat, generation) || poll !== queuePoll) return;
+        update({ queue: null });
         return;
       }
+      await new Promise((resolve) => setTimeout(resolve, 700));
     }
   }
 
-  async function refreshActive() {
-    const chat = state.activeChat;
-    if (!chat) return;
+  async function refreshActive(chat: Chat, generation: number) {
+    if (!isCurrentChat(chat, generation)) return;
     try {
       const [messages, files] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
         commands.command<FileSummary[]>("file_list", { chat: chat.id }),
       ]);
+      if (!isCurrentChat(chat, generation)) return;
       update({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
     } catch (reason) {
-      update({ error: reason });
+      if (isCurrentChat(chat, generation)) update({ error: reason });
     }
   }
 
@@ -249,11 +253,14 @@ export default function App() {
     const bot = state.activeBot;
     if (!chat || !bot || state.working) return false;
     if (!text && !file) return false;
+    const generation = runGeneration;
 
     update({ working: true, error: null });
     let uploaded: FileSummary | null = null;
     if (file) {
-      uploaded = await upload(chat.id, file);
+      uploaded = await upload(chat, file, generation);
+      // The reader moved on; the accepted File belongs to the old Chat.
+      if (!isCurrentChat(chat, generation)) return true;
       if (!uploaded) {
         update({ working: false });
         return false;
@@ -283,22 +290,21 @@ export default function App() {
         uploaded ? { chat: chat.id, text, file: uploaded.id } : { chat: chat.id, text },
         180_000,
       );
-      await refreshActive();
-      if (result.status === "failed") {
-        update({ error: result.error ? result.error : { key: "error.botAnswer" } });
-      }
+      // The Message is accepted once the Space queues its run.
+      if (!isCurrentChat(chat, generation)) return true;
+      update({ working: false, queue: { status: result.status, position: result.position } });
+      void pollRun(chat, result.run, generation);
     } catch (reason) {
-      update({ error: reason });
-      await refreshActive();
-    } finally {
-      update({ working: false });
+      if (!isCurrentChat(chat, generation)) return true;
+      update({ working: false, error: reason });
+      await refreshActive(chat, generation);
     }
 
     return true;
   }
 
   // Uploads one File, or shows why that failed and resolves null.
-  async function upload(chat: string, file: File): Promise<FileSummary | null> {
+  async function upload(chat: Chat, file: File, generation: number): Promise<FileSummary | null> {
     const tooLarge = () => ({
       key: "error.fileTooLarge",
       params: { name: file.name, limit: MAX_FILE_LABEL },
@@ -308,8 +314,9 @@ export default function App() {
       return null;
     }
     try {
-      return await api.uploadFile(chat, file, file.name, mediaTypeFor(file));
+      return await api.uploadFile(chat.id, file, file.name, mediaTypeFor(file));
     } catch (reason) {
+      if (!isCurrentChat(chat, generation)) return null;
       update({ error: reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason) });
       return null;
     }
@@ -375,7 +382,7 @@ export default function App() {
 
   function backToList() {
     runGeneration += 1;
-    update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
+    update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, queue: null, error: null });
   }
 
   const errorText = () => (state.error ? messageFor(state.error) : null);
@@ -435,6 +442,7 @@ export default function App() {
                   messages={state.messages}
                   files={state.files}
                   working={state.working}
+                  queue={state.queue}
                   error={errorText()}
                   onSend={sendMessage}
                   onBack={backToList}

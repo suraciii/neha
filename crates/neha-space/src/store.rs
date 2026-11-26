@@ -656,6 +656,18 @@ mod tests {
                     "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
                 }),
             ),
+            EventKind::RunQueued => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "chat": Id::new(),
+                    "bot": Id::new(),
+                    "command": Id::new(),
+                    "message": Id::new(),
+                }),
+            )
+            .acting(user),
             EventKind::RunStarted => EventDraft::new(
                 kind,
                 Author::Bot(Id::new()),

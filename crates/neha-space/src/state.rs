@@ -4,6 +4,7 @@
 //! events, then apply the same events to keep the projection current.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use neha::id::Id;
 use neha::record::{ActionStatus, Author, Event, EventData};
@@ -172,6 +173,8 @@ pub struct RunView {
     pub command: Id,
     /// The Message that started it.
     pub message: Id,
+    /// The cursor of the event that queued it.
+    pub seq: Seq,
     /// Its status.
     pub status: RunStatus,
     /// The Bot's reply Message, when it succeeded.
@@ -262,6 +265,21 @@ impl State {
             .iter()
             .filter(|file| file.chat == chat && file.seq > after)
             .collect()
+    }
+
+    /// Returns the runs of a Bot that wait or work, in the record's order.
+    #[must_use]
+    pub fn active_runs(&self, bot: Id) -> Vec<&RunView> {
+        let mut runs: Vec<&RunView> = self
+            .runs
+            .values()
+            .filter(|run| {
+                run.bot == bot && matches!(run.status, RunStatus::Queued | RunStatus::Running)
+            })
+            .collect();
+        runs.sort_by_key(|run| run.seq);
+
+        runs
     }
 
     /// Builds the Model history for a Chat, oldest first.
@@ -416,8 +434,14 @@ impl Projection for State {
                     run: data.run,
                 });
             }
-            EventData::RunStarted(data) => {
+            EventData::RunQueued(data) => {
                 let acting = event.acting.ok_or("a run names the User it acts for")?;
+                if !self.bots.contains_key(&data.bot) {
+                    return Err("a queued run must belong to an existing Bot".to_owned());
+                }
+                if !self.chats.contains_key(&data.chat) {
+                    return Err("a queued run must belong to an existing Chat".to_owned());
+                }
                 self.runs.insert(
                     data.run,
                     RunView {
@@ -427,7 +451,8 @@ impl Projection for State {
                         acting,
                         command: data.command,
                         message: data.message,
-                        status: RunStatus::Running,
+                        seq: event.seq,
+                        status: RunStatus::Queued,
                         reply: None,
                         usage: None,
                         error: None,
@@ -435,6 +460,31 @@ impl Projection for State {
                         actions: Vec::new(),
                     },
                 );
+            }
+            EventData::RunStarted(data) => {
+                let acting = event.acting.ok_or("a run names the User it acts for")?;
+                match self.runs.entry(data.run) {
+                    Entry::Occupied(mut run) => run.get_mut().status = RunStatus::Running,
+                    // A record this version wrote before it queued runs holds only
+                    // the start event; it still creates the run it started.
+                    Entry::Vacant(run) => {
+                        run.insert(RunView {
+                            id: data.run,
+                            chat: data.chat,
+                            bot: data.bot,
+                            acting,
+                            command: data.command,
+                            message: data.message,
+                            seq: event.seq,
+                            status: RunStatus::Running,
+                            reply: None,
+                            usage: None,
+                            error: None,
+                            steps: Vec::new(),
+                            actions: Vec::new(),
+                        });
+                    }
+                }
             }
             EventData::RunFinished(data) => {
                 let run = self
@@ -503,7 +553,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::State;
+    use super::{RunStatus, State};
     use crate::store::Projection as _;
 
     fn event(kind: EventKind, author: Author, data: serde_json::Value, seq: i64) -> Event {
@@ -746,5 +796,159 @@ mod tests {
         let view = state.runs.get(&run).unwrap();
         assert_eq!(view.actions[0].status, ActionStatus::Succeeded);
         assert_eq!(view.actions[0].output, "ok");
+    }
+
+    /// Builds a Bot and its Chat so a run has a place to be queued.
+    fn bot_chat(state: &mut State, owner: Id, bot: Id, chat: Id, computer: Id) {
+        let user = Author::User(owner);
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                user,
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "managed",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::BotCreated,
+                user,
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                user,
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_queued_run_waits_its_turn() {
+        let owner = Id::new();
+        let bot_id = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let (first, second) = (Id::new(), Id::new());
+        let command = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::UserJoined,
+                Author::User(owner),
+                serde_json::json!({"display_name": "Ada", "is_admin": true}),
+                0,
+            ))
+            .unwrap();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        let bot = Author::Bot(bot_id);
+        for (seq, run) in [(4, first), (5, second)] {
+            state
+                .apply(&event(
+                    EventKind::RunQueued,
+                    bot,
+                    serde_json::json!({
+                        "run": run,
+                        "chat": chat,
+                        "bot": bot_id,
+                        "command": command,
+                        "message": Id::new(),
+                    }),
+                    seq,
+                ))
+                .unwrap();
+        }
+        state
+            .apply(&event(
+                EventKind::RunStarted,
+                bot,
+                serde_json::json!({
+                    "run": first,
+                    "chat": chat,
+                    "bot": bot_id,
+                    "command": command,
+                    "message": Id::new(),
+                }),
+                6,
+            ))
+            .unwrap();
+
+        let first = &state.runs[&first];
+        assert_eq!(first.status, RunStatus::Running);
+        assert_eq!(first.seq, Seq::from_i64(4).unwrap());
+        let active = state.active_runs(bot_id);
+        assert_eq!(
+            active.iter().map(|run| run.seq).collect::<Vec<_>>(),
+            [Seq::from_i64(4).unwrap(), Seq::from_i64(5).unwrap()]
+        );
+        assert_eq!(active[1].status, RunStatus::Queued);
+
+        // A run queued for a Chat the record does not hold cannot be placed.
+        let orphan = event(
+            EventKind::RunQueued,
+            bot,
+            serde_json::json!({
+                "run": Id::new(),
+                "chat": Id::new(),
+                "bot": bot_id,
+                "command": command,
+                "message": Id::new(),
+            }),
+            7,
+        );
+        assert!(state.apply(&orphan).is_err());
+    }
+
+    #[test]
+    fn an_old_record_without_a_queued_event_still_replays() {
+        // A record written before runs were queued holds only the start event;
+        // the run it starts must still appear after a replay.
+        let owner = Id::new();
+        let bot_id = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let (run, command, message) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        state
+            .apply(&event(
+                EventKind::MessageAdded,
+                Author::User(owner),
+                message_added(chat, "hello", None),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::RunStarted,
+                Author::Bot(bot_id),
+                serde_json::json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot_id,
+                    "command": command,
+                    "message": message,
+                }),
+                5,
+            ))
+            .unwrap();
+
+        let view = state.runs.get(&run).unwrap();
+        assert_eq!(view.status, RunStatus::Running);
+        assert_eq!(view.seq, Seq::from_i64(5).unwrap());
+        assert_eq!(state.active_runs(bot_id), vec![view]);
     }
 }

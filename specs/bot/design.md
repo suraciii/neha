@@ -70,10 +70,12 @@ A lasting rule from a User does not cover an action the Computer's owner require
 
 ## Runs
 
-A Bot runs one run at a time for one User in one conversation.
+A Bot executes one run at a time.
 
-A Message from that User that answers the run's request steers the run. Another request from the same User waits for a run of its own.
+While a Bot executes a run, a later request for that Bot waits in a queue, in the order the Space recorded it.
 
-Runs for different Users, and runs in different conversations, run in parallel.
+A Message from the User the Bot acts for that answers the run's request steers the run.
+
+Runs of different Bots run in parallel.
 
 A handoff from one Bot to another carries the authority of the User the first Bot acted for, and never more.
