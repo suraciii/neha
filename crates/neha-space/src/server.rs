@@ -72,6 +72,7 @@ pub struct SpaceServer {
     events: broadcast::Sender<neha::record::Event>,
     tool_timeout: Duration,
     chat_runs: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
+    uploads: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
     ui: Option<PathBuf>,
     session_cookie: String,
     browser_host: String,
@@ -123,6 +124,7 @@ impl SpaceServer {
             events,
             tool_timeout,
             chat_runs: Mutex::new(std::collections::HashMap::new()),
+            uploads: Mutex::new(std::collections::HashMap::new()),
             ui,
             session_cookie,
             browser_host,
@@ -130,6 +132,19 @@ impl SpaceServer {
     }
 
     /// Returns the lock that serializes runs in one Chat.
+    /// Returns the lock that serializes uploads in one Chat.
+    ///
+    /// Two uploads of the same bytes must not both record a File; a Bot's run
+    /// holds its own lock and never waits on this one.
+    fn upload_lock(&self, chat: Id) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.uploads.lock().expect("upload lock");
+        Arc::clone(
+            locks
+                .entry(chat)
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    }
+
     fn chat_lock(&self, chat: Id) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.chat_runs.lock().expect("chat lock");
         Arc::clone(
@@ -749,6 +764,8 @@ async fn file_upload(
             ));
         }
     };
+    let upload_lock = server.upload_lock(chat);
+    let _upload = upload_lock.lock().await;
     let outcome = commands::file_upload(
         &server.store,
         &server.state,
@@ -4089,6 +4106,41 @@ mod tests {
             .unwrap();
 
         session["token"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_identical_uploads_record_one_file() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+        let uploads: Vec<_> = (0..8)
+            .map(|_| {
+                upload(
+                    &running,
+                    &token,
+                    chat,
+                    "notes.txt",
+                    "text/plain",
+                    b"read me".to_vec(),
+                )
+            })
+            .collect();
+        let responses = futures_util::future::join_all(uploads).await;
+        let mut ids = Vec::new();
+        for response in responses {
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let file: Value = response.json().await.unwrap();
+            ids.push(serde_json::from_value::<Id>(file["id"].clone()).unwrap());
+        }
+
+        assert!(
+            ids.windows(2).all(|pair| pair[0] == pair[1]),
+            "every upload answers with the same File: {ids:?}"
+        );
+        let files = file_list(&mut socket, chat).await;
+        assert_eq!(files.len(), 1, "{files:?}");
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
