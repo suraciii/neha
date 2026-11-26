@@ -191,15 +191,28 @@ impl ModelClient {
     /// range. A rejected or oversized request is not retried.
     pub async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatReply, ModelError> {
         let mut attempt = 0_u32;
+        let mut reported = Usage::default();
         loop {
             match self.attempt(&request).await {
-                Ok(reply) => return Ok(reply),
+                Ok(mut reply) => {
+                    reply.usage += reported;
+                    return Ok(reply);
+                }
                 Err(error) if error.retryable() && attempt + 1 < self.policy.max_attempts => {
+                    reported += error.usage().unwrap_or_default();
                     let delay = error.retry_after().unwrap_or_else(|| self.backoff(attempt));
                     tokio::time::sleep(delay.min(self.policy.max_delay)).await;
                     attempt += 1;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    if reported == Usage::default() {
+                        return Err(error);
+                    }
+                    return Err(ModelError::Retried {
+                        usage: reported + error.usage().unwrap_or_default(),
+                        source: Box::new(error),
+                    });
+                }
             }
         }
     }
@@ -678,6 +691,14 @@ pub enum ModelError {
         /// The usage it reported.
         usage: Usage,
     },
+    /// The call failed after earlier attempts reported usage.
+    #[error("{source}")]
+    Retried {
+        /// The usage every attempt reported.
+        usage: Usage,
+        /// The failure that ended the call.
+        source: Box<ModelError>,
+    },
     /// The Provider's stream did not fit the protocol.
     #[error("the Provider's reply did not fit the protocol")]
     Protocol,
@@ -708,6 +729,7 @@ impl ModelError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             Self::RateLimited { retry_after } | Self::Server { retry_after } => *retry_after,
+            Self::Retried { source, .. } => source.retry_after(),
             _ => None,
         }
     }
@@ -732,6 +754,7 @@ impl ModelError {
             Self::Server { .. } | Self::Transport | Self::StreamEnded { .. } => {
                 ErrorCode::Unavailable
             }
+            Self::Retried { source, .. } => source.code(),
             Self::ContextTooLarge
             | Self::Empty
             | Self::Protocol
@@ -981,6 +1004,50 @@ mod tests {
             }
             other => panic!("expected a truncated stream, got {other:?}"),
         }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_retry_keeps_the_usage_of_every_attempt() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    let attempt = seen.fetch_add(1, Ordering::SeqCst);
+                    let body = if attempt == 0 {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":12}}\n\n",
+                        )
+                    } else {
+                        concat!(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\n",
+                            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":2}}\n\n",
+                            "data: [DONE]\n\n",
+                        )
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(reply.text, "complete");
+        assert_eq!(reply.usage.uncached_input, 48);
+        assert_eq!(reply.usage.output, 14);
         task.abort();
     }
 

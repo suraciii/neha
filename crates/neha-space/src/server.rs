@@ -1233,9 +1233,26 @@ mod tests {
     #[derive(Clone)]
     enum ScriptedReply {
         Text(String),
-        Tool { name: String, arguments: Value },
-        RawTool { name: String, arguments: String },
-        TruncatedTool { name: String, arguments: Value },
+        Tool {
+            name: String,
+            arguments: Value,
+        },
+        RawTool {
+            name: String,
+            arguments: String,
+        },
+        TruncatedTool {
+            name: String,
+            arguments: Value,
+        },
+        StreamEndedUsage {
+            text: String,
+        },
+        TextWithUsage {
+            text: String,
+            prompt: u64,
+            completion: u64,
+        },
     }
 
     async fn scripted_provider(
@@ -1289,6 +1306,26 @@ mod tests {
                                 "function": {"name": name, "arguments": arguments},
                             }]}}]});
                             format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
+                        ScriptedReply::StreamEndedUsage { text } => {
+                            let chunk = json!({"choices":[{"delta":{"content":text}}]});
+                            let usage = json!({"choices":[],"usage":{
+                                "prompt_tokens": 40,
+                                "completion_tokens": 12,
+                            }});
+                            format!("data: {chunk}\n\ndata: {usage}\n\n")
+                        }
+                        ScriptedReply::TextWithUsage {
+                            text,
+                            prompt,
+                            completion,
+                        } => {
+                            let chunk = json!({"choices":[{"delta":{"content":text}}]});
+                            let usage = json!({"choices":[],"usage":{
+                                "prompt_tokens": prompt,
+                                "completion_tokens": completion,
+                            }});
+                            format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
                         }
                         ScriptedReply::TruncatedTool { name, arguments } => {
                             let chunk = json!({"choices":[{
@@ -3398,5 +3435,55 @@ mod tests {
             arguments.len()
         );
         store.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retried_model_call_keeps_every_attempt_usage() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            ScriptedReply::StreamEndedUsage {
+                text: "partial".to_owned(),
+            },
+            ScriptedReply::TextWithUsage {
+                text: "second complete".to_owned(),
+                prompt: 8,
+                completion: 2,
+            },
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "answer me").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["text"], "second complete");
+        assert_eq!(result["usage"]["uncached_input"], 48);
+        assert_eq!(result["usage"]["output"], 14);
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["usage"]["uncached_input"], 48);
+        assert_eq!(shown["usage"]["output"], 14);
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let bot_messages: Vec<_> = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["author"]["kind"] == "bot")
+            .collect();
+        assert_eq!(
+            bot_messages.len(),
+            1,
+            "the partial attempt never becomes a Message"
+        );
+        assert_eq!(bot_messages[0]["text"], "second complete");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
     }
 }
