@@ -310,6 +310,15 @@ impl LocalRuntime {
         }
         let mut roots = Vec::new();
         for grant in grants {
+            let dbg = std::fs::canonicalize(grant.trim());
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/neha-debug-grants")
+                .and_then(|mut f| {
+                    use std::io::Write as _;
+                    writeln!(f, "grant input={grant:?} canonical={dbg:?}")
+                });
             let Ok(root) = std::fs::canonicalize(grant.trim()) else {
                 // The Space may hold a grant from another machine or a folder
                 // that has since gone. It must not take the whole runtime down:
@@ -323,6 +332,14 @@ impl LocalRuntime {
                 continue;
             }
             if self.is_hidden(&root) || self.is_denied(&root) {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/neha-debug-grants")
+                    .and_then(|mut f| {
+                        use std::io::Write as _;
+                        writeln!(f, "  skipped hidden root={}", root.display())
+                    });
                 return Err(RuntimeError::Access(format!(
                     "the granted folder is hidden from this Computer: {}",
                     root.display()
@@ -331,6 +348,14 @@ impl LocalRuntime {
             // A grant that contains a hidden root would re-expose it after the
             // hidden tmpfs is mounted.
             if self.hidden.iter().any(|hidden| hidden.starts_with(&root)) {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open("/tmp/neha-debug-grants")
+                    .and_then(|mut f| {
+                        use std::io::Write as _;
+                        writeln!(f, "  skipped ancestor root={}", root.display())
+                    });
                 return Err(RuntimeError::Access(format!(
                     "the granted folder contains a hidden path: {}",
                     root.display()
@@ -1183,23 +1208,28 @@ fn sandbox_args(
             arguments.push(root.as_os_str().to_owned());
         }
     }
-    arguments.extend(
-        [
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/dev/shm",
-            "--unshare-pid",
-            "--die-with-parent",
-        ]
-        .into_iter()
-        .map(OsString::from),
-    );
-    if !full_access {
+    if full_access {
+        // Full access keeps the machine's own /dev, /proc and /tmp: it is the
+        // daemon process's file view, not a fresh sandbox. The hidden roots
+        // above still mask the Computer's configuration and credential.
+        arguments.push(OsString::from("--die-with-parent"));
+    } else {
+        arguments.extend(
+            [
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/dev/shm",
+                "--unshare-pid",
+                "--die-with-parent",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
         arguments.push(OsString::from("--bind"));
         arguments.push(source.to_owned());
         arguments.push(folder.to_owned());
@@ -4120,6 +4150,28 @@ mod tests {
             std::fs::read_to_string(granted.join("shell.txt")).unwrap(),
             "shell\n"
         );
+    }
+
+    #[tokio::test]
+    async fn full_access_keeps_the_machines_own_tmp() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(true, &[])
+            .unwrap();
+        let marker = format!("neha-full-{}", std::process::id());
+        let result = runtime
+            .execute(Action::Shell {
+                command: format!("printf full > /tmp/{marker}"),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        let written = std::fs::read_to_string(format!("/tmp/{marker}")).unwrap();
+        assert_eq!(written, "full");
+        std::fs::remove_file(format!("/tmp/{marker}")).unwrap();
     }
 
     #[tokio::test]

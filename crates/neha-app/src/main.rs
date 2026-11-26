@@ -649,6 +649,18 @@ async fn bot(command: BotCommand) -> Result<()> {
             } else {
                 let mut checked = Vec::new();
                 for path in grants {
+                    // The Space only accepts an absolute path with no `..`;
+                    // check the input before canonicalize would paper over it.
+                    if !path.is_absolute() {
+                        bail!("a grant must be an absolute path: {}", path.display());
+                    }
+                    if path.to_string_lossy().contains('\0')
+                        || path
+                            .components()
+                            .any(|part| matches!(part, std::path::Component::ParentDir))
+                    {
+                        bail!("a grant must not use `..` or a NUL: {}", path.display());
+                    }
                     let folder = std::fs::canonicalize(&path).with_context(|| {
                         format!("the grant folder does not exist: {}", path.display())
                     })?;

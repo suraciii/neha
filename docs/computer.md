@@ -189,9 +189,9 @@ neha bot update <bot-id> --full-access on
 neha bot update <bot-id> --clear-grants
 ```
 
-`--grant` adds one extra folder the Bot may write; repeat it for more. The folder must already exist on this machine. `--full-access on` gives the Bot the daemon process's own write rights and removes the shell fence; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
+`--grant` adds one extra folder the Bot may write; repeat it for more. The folder must already exist on this machine. `--full-access on` gives the Bot the daemon process's own write rights and removes the write fence, so its shell sees the machine's own `/tmp`, `/dev`, and process view; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
 
-When a Bot's action would write outside its Workspace and the granted folders, the run waits for the owner's approval instead of running the action. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. The Computer's configuration directory stays hidden even with full access.
+When a Bot's action would write outside its Workspace and the granted folders, the run waits for the owner's approval instead of running the action. This covers a file path the Space can see and a run that named a working directory; a shell that writes somewhere else is refused by the fence rather than turned into a request. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. The Computer's configuration directory stays hidden even with full access.
 
 A run can start its actions in another directory with `neha chat send --cwd`:
 
@@ -199,4 +199,4 @@ A run can start its actions in another directory with `neha chat send --cwd`:
 neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
 ```
 
-Without `--cwd` the run starts in the Bot's Workspace. The directory is recorded with the run and appears on an approval card. It must be absolute. Reading still follows the machine user's rights, except the Computer's own configuration directory, which stays hidden.
+Without `--cwd` the run starts in the Bot's Workspace. The directory is recorded with the run and appears on an approval card. It must be absolute. Choosing a directory does not make it writable: writes still need the Workspace, a grant, or full access. Reading still follows the machine user's rights, except the Computer's own configuration directory, which stays hidden.

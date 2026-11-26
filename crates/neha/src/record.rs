@@ -1450,6 +1450,9 @@ pub struct ApprovalRequested {
     /// What an "Always allow" would allow, in words the User reads.
     #[serde(default)]
     pub lasting_scope: Option<String>,
+    /// The folder a grant answer covers, when the reason is a grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_folder: Option<String>,
     /// Whether the action can still be undone after it runs.
     pub undoable: Undoability,
 }

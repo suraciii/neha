@@ -731,6 +731,14 @@ fn machine(
     // The Bot must be one identifier component; reject anything else before
     // touching the filesystem.
     folder_for(&config.workspace, bot)?;
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/neha-debug-daemon")
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            writeln!(f, "machine bot={bot} access={access:?}")
+        });
     let key = RuntimeKey {
         bot: bot.to_owned(),
         full_access: access.full_access,

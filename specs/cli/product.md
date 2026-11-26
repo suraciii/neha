@@ -54,7 +54,9 @@ A path that is not absolute is refused.
 
 ## Approvals
 
-`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. `neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, a lasting rule, or a folder the owner has not granted.
+
+`neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 

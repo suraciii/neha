@@ -1628,6 +1628,117 @@ fn an_invitation_without_a_secret_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_write_outside_the_grants_waits_for_the_owner() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-grant-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch directory outside /tmp");
+    let outside_dir = tempfile::Builder::new()
+        .prefix("neha-e2e-grant-folder-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch folder outside the Computer workspace");
+    let outside = outside_dir.path().join("outside.txt");
+    let computer = bare_local_computer(directory, &base);
+    approve_first_use(
+        &computer.home,
+        &computer.credential,
+        &computer.chat,
+        &script,
+    );
+
+    script.call(
+        "write_file",
+        serde_json::json!({
+            "path": outside.to_string_lossy(),
+            "content": "first",
+        }),
+    );
+    script.say("I wrote it.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write outside"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(shown.contains("grant"), "{shown}");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert_eq!(
+        run(
+            &computer.home,
+            &computer.credential,
+            &["run", "show", &run_id]
+        )
+        .lines()
+        .next(),
+        Some(format!("Run {run_id}: succeeded").as_str())
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "first");
+
+    // Always allow grants the folder; a later write runs without a card.
+    script.call(
+        "write_file",
+        serde_json::json!({
+            "path": outside.to_string_lossy(),
+            "content": "second",
+        }),
+    );
+    script.say("Second write.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write again"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval, "--always"],
+    );
+    assert_eq!(
+        run(
+            &computer.home,
+            &computer.credential,
+            &["run", "show", &run_id]
+        )
+        .lines()
+        .next(),
+        Some(format!("Run {run_id}: succeeded").as_str())
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "second");
+
+    script.call(
+        "write_file",
+        serde_json::json!({
+            "path": outside.to_string_lossy(),
+            "content": "third",
+        }),
+    );
+    script.say("Third write.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write once more"],
+    );
+    assert!(sent.contains("Third write."), "{sent}");
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "third");
+
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_bot_owner_grants_access_and_a_run_can_name_its_directory() {
     if !local_computer_ready() {
         return;
@@ -1640,6 +1751,22 @@ async fn a_bot_owner_grants_access_and_a_run_can_name_its_directory() {
     let granted = directory.path().join("granted");
     std::fs::create_dir(&granted).unwrap();
     let computer = local_computer(directory, &base, &script);
+
+    // The Space refuses a non-absolute grant and one that spells `..`; the CLI
+    // checks the input before canonicalize would hide its shape.
+    for bad in ["relative/path", "/var/tmp/../var/tmp"] {
+        let refused = cli(
+            &computer.home,
+            &computer.credential,
+            &["bot", "update", &computer.bot, "--grant", bad],
+        );
+        assert!(!refused.status.success(), "accepted {bad}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("absolute") || stderr.contains("`..`"),
+            "stderr: {stderr}"
+        );
+    }
 
     let updated = run(
         &computer.home,

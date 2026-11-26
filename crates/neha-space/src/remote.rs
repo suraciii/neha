@@ -94,6 +94,14 @@ impl ComputerRuntime for RemoteRuntime {
             {
                 access.write_roots.push(folder);
             }
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("/tmp/neha-debug")
+                .and_then(|mut f| {
+                    use std::io::Write as _;
+                    writeln!(f, "remote access={:?}", access)
+                });
             let answer = tokio::time::timeout(
                 self.timeout,
                 self.link

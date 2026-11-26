@@ -249,6 +249,8 @@ pub struct ApprovalView {
     pub rule: Option<Id>,
     /// What an "Always allow" would allow, in words the User reads.
     pub lasting_scope: Option<String>,
+    /// The folder a grant answer covers, when the reason is a grant.
+    pub grant_folder: Option<String>,
     /// Whether the action can still be undone after it runs.
     pub undoable: Undoability,
     /// The answer, once the acting User gave one.
@@ -847,6 +849,7 @@ impl Projection for State {
                     ambiguous: data.ambiguous,
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
+                    grant_folder: data.grant_folder,
                     undoable: data.undoable,
                     decided: None,
                     seq: event.seq,
@@ -880,7 +883,7 @@ impl Projection for State {
                         approval.bot,
                         approval.acting,
                         approval.computer,
-                        approval.lasting_scope.clone(),
+                        approval.grant_folder.clone(),
                     )
                 };
                 let run = self
@@ -895,8 +898,14 @@ impl Projection for State {
                     if reason == ApprovalReason::FirstUseLocal {
                         self.first_use_allowed.insert((bot, acting, computer));
                     }
-                    if reason == ApprovalReason::Grant && !data.lasting {
-                        run.once_grant = scope;
+                    if reason == ApprovalReason::Grant {
+                        // The owner answered a grant card, which names the
+                        // Bot, the folder, and the machine: that also answers
+                        // the first use of this machine.
+                        self.first_use_allowed.insert((bot, acting, computer));
+                        if !data.lasting {
+                            run.once_grant = scope;
+                        }
                     }
                 }
             }

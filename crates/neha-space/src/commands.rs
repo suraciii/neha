@@ -349,28 +349,15 @@ async fn approval_decide(
     // A lasting answer records the derived rule in the same transaction, and
     // the decision names it.
     let lasting_grant = if lasting && view.reason == ApprovalReason::Grant {
-        let state = context
-            .state
-            .lock()
-            .map_err(|_| ApiError::internal("state lock"))?;
-        let bot = state
-            .bots
-            .get(&view.bot)
-            .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
-        let run = state
-            .runs
-            .get(&view.run)
-            .ok_or_else(|| ApiError::internal("the run is gone"))?;
-        let call = LoopCall {
-            call: view.call.clone(),
-            tool: view.tool.clone(),
-            arguments: view.arguments.clone(),
-            refused: None,
-        };
-        grant_folder(bot, run.cwd.as_deref(), &call).map(|(folder, _)| folder)
+        view.grant_folder.clone()
     } else {
         None
     };
+    if lasting && view.reason == ApprovalReason::Grant && view.lasting_scope.is_none() {
+        return Err(ApiError::invalid_argument(
+            "this grant cannot become lasting",
+        ));
+    }
     if lasting && view.reason == ApprovalReason::Grant && lasting_grant.is_none() {
         return Err(ApiError::invalid_argument(
             "the action has no folder that can become a lasting grant",
@@ -403,7 +390,14 @@ async fn approval_decide(
         "status": if allow { "allowed" } else { "denied" },
     });
     if let Some(rule) = lasting_rule {
-        let (tool, command_prefix, path_prefix) = derived_rule(&view)?;
+        let cwd = {
+            let state = context
+                .state
+                .lock()
+                .map_err(|_| ApiError::internal("state lock"))?;
+            state.runs.get(&view.run).and_then(|run| run.cwd.clone())
+        };
+        let (tool, command_prefix, path_prefix) = derived_rule(&view, cwd.as_deref())?;
         result["rule"] = json!(rule);
         // The ask rule the User just answered is obsolete only when the
         // derived allow rule covers everything the ask rule covered; a
@@ -2602,7 +2596,7 @@ impl Recorder for RunRecorder<'_> {
                 .collect();
             let matching: Vec<RuleView> = tool_rules
                 .iter()
-                .filter(|rule| rule_matches(rule, call))
+                .filter(|rule| rule_matches_at(rule, call, self.log.cwd.as_deref()))
                 .cloned()
                 .collect();
             (local, first_use, computer, matching, tool_rules, run, bot)
@@ -2619,7 +2613,7 @@ impl Recorder for RunRecorder<'_> {
             // The first use of a Local Computer always asks, whatever rules
             // exist: a lasting allow cannot cover it.
             (ApprovalReason::FirstUseLocal, None, false)
-        } else if ambiguous_rule(call, &tool_rules) {
+        } else if ambiguous_rule_at(call, &tool_rules, self.log.cwd.as_deref()) {
             // A form a prefix rule cannot judge is never allowed by a rule:
             // with any rule for its tool it goes to the User instead. No
             // rule actually matched, so none is named or removed later.
@@ -2639,7 +2633,7 @@ impl Recorder for RunRecorder<'_> {
         };
         let index = self.call_index(step, call)?;
         let lasting_scope = match reason {
-            ApprovalReason::Rule => lasting_scope(call),
+            ApprovalReason::Rule => lasting_scope_at(call, self.log.cwd.as_deref()),
             ApprovalReason::Grant => grant
                 .as_ref()
                 .map(|(folder, scope)| format!("{scope} under {folder}")),
@@ -2667,6 +2661,7 @@ impl Recorder for RunRecorder<'_> {
                     "ambiguous": ambiguous,
                     "rule": rule,
                     "lasting_scope": lasting_scope,
+                    "grant_folder": grant.as_ref().map(|(folder, _)| folder.clone()),
                     "undoable": undoability(&call.tool),
                 }),
             )])
@@ -2793,7 +2788,7 @@ fn decisive_rule(rules: &[RuleView]) -> Option<Decision> {
 /// second command cannot be judged by a prefix: an ask rule must not be
 /// bypassed with `echo hi; rm x`. A file path with a `..` component or one
 /// whose absolute/relative form differs from a rule's prefix is the same.
-fn ambiguous_rule(call: &LoopCall, rules: &[RuleView]) -> bool {
+fn ambiguous_rule_at(call: &LoopCall, rules: &[RuleView], cwd: Option<&str>) -> bool {
     if rules.is_empty() {
         return false;
     }
@@ -2810,7 +2805,7 @@ fn ambiguous_rule(call: &LoopCall, rules: &[RuleView]) -> bool {
             .arguments
             .get("path")
             .and_then(Value::as_str)
-            .is_some_and(|path| ambiguous_path(path, rules)),
+            .is_some_and(|path| ambiguous_path_at(path, rules, cwd)),
         _ => false,
     }
 }
@@ -2826,9 +2821,28 @@ fn ambiguous_shell(command: &str) -> bool {
 }
 
 /// Returns whether a path is ambiguous for the rules that exist.
+#[cfg(test)]
 fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
-    // A path made only of whitespace names something this build cannot judge.
-    let Some(path) = action_path(path) else {
+    ambiguous_path_at(path, rules, None)
+}
+
+fn ambiguous_path_at(path: &str, rules: &[RuleView], cwd: Option<&str>) -> bool {
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/neha-debug-ambig")
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            writeln!(
+                f,
+                "ambig input={path:?} cwd={cwd:?} rules={:?}",
+                rules
+                    .iter()
+                    .map(|r| (&r.tool, &r.path_prefix))
+                    .collect::<Vec<_>>()
+            )
+        });
+    let Some(path) = resolve_action_path(path, cwd) else {
         return true;
     };
     if path.split('/').any(|component| {
@@ -2838,15 +2852,29 @@ fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
     }
     let absolute = path.starts_with('/');
 
-    rules.iter().any(|rule| {
+    let result = rules.iter().any(|rule| {
         rule.path_prefix
             .as_deref()
             .is_some_and(|prefix| lexical_path(prefix).starts_with('/') != absolute)
-    })
+    });
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/neha-debug-ambig")
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            writeln!(f, "  resolved={path:?} absolute={absolute} result={result}")
+        });
+    result
 }
 
 /// What an "Always allow" would cover, in words a User reads.
+#[cfg(test)]
 fn lasting_scope(call: &LoopCall) -> Option<String> {
+    lasting_scope_at(call, None)
+}
+
+fn lasting_scope_at(call: &LoopCall, cwd: Option<&str>) -> Option<String> {
     match call.tool.as_str() {
         neha_loop::tools::SHELL => {
             let command = call
@@ -2865,7 +2893,7 @@ fn lasting_scope(call: &LoopCall) -> Option<String> {
         | neha_loop::tools::WRITE_FILE
         | neha_loop::tools::LIST_FILES
         | neha_loop::tools::PUT_FILE => {
-            let scope = lasting_rule_path(&call.arguments)?;
+            let scope = lasting_rule_path_at(&call.arguments, cwd)?;
 
             Some(file_scope(&sanitize_text(&scope)))
         }
@@ -2891,7 +2919,12 @@ fn undoability(tool: &str) -> Undoability {
 }
 
 /// Returns whether a lasting rule covers one action.
+#[cfg(test)]
 fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
+    rule_matches_at(rule, call, None)
+}
+
+fn rule_matches_at(rule: &RuleView, call: &LoopCall, cwd: Option<&str>) -> bool {
     if rule.tool != call.tool {
         return false;
     }
@@ -2909,7 +2942,7 @@ fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
             return false;
         };
 
-        return path_matches(path, prefix);
+        return path_matches_at(path, prefix, cwd);
     }
 
     true
@@ -2960,6 +2993,27 @@ fn action_path(path: &str) -> Option<String> {
     Some(lexical_path(trimmed))
 }
 
+/// The target a raw action path names for this run.
+///
+/// With no named working directory a relative path is still relative to the
+/// Bot's Workspace, as it always was. When the run named one, a relative path
+/// is resolved against that directory before rules, the card, or a lasting
+/// scope look at it; the Space then judges the same target the daemon uses.
+fn resolve_action_path(path: &str, cwd: Option<&str>) -> Option<String> {
+    let path = action_path(path)?;
+    if path.starts_with('/') {
+        return Some(path);
+    }
+    let Some(cwd) = cwd else {
+        return Some(path);
+    };
+    let base = action_path(cwd)?;
+    Some(lexical_path(&format!(
+        "{}/{path}",
+        base.trim_end_matches('/')
+    )))
+}
+
 /// The directory a lasting path rule for this action would cover.
 ///
 /// The approval card (`lasting_scope`) and the decision's rule (`derived_rule`)
@@ -2967,12 +3021,17 @@ fn action_path(path: &str) -> Option<String> {
 /// Space writes cannot drift. `None` means the path cannot become a lasting
 /// scope: it is missing or empty, it is all whitespace, or it is a path with
 /// `..` or all-space components.
+#[cfg(test)]
 fn lasting_rule_path(arguments: &serde_json::Value) -> Option<String> {
+    lasting_rule_path_at(arguments, None)
+}
+
+fn lasting_rule_path_at(arguments: &serde_json::Value, cwd: Option<&str>) -> Option<String> {
     let path = arguments
         .get("path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())?;
-    let derived = action_path(path)?;
+    let derived = resolve_action_path(path, cwd)?;
     if derived.split('/').any(|component| {
         component == ".." || (!component.is_empty() && component.trim().is_empty())
     }) {
@@ -2997,8 +3056,13 @@ fn parent_of(path: &str) -> String {
 /// normalized (RuleAdd normalizes it once, and a derived prefix is built from
 /// normalized components) and is compared as-is. A prefix is never trimmed
 /// again, so `logs ` cannot become `logs`.
+#[cfg(test)]
 fn path_matches(path: &str, prefix: &str) -> bool {
-    let Some(path) = action_path(path) else {
+    path_matches_at(path, prefix, None)
+}
+
+fn path_matches_at(path: &str, prefix: &str, cwd: Option<&str>) -> bool {
+    let Some(path) = resolve_action_path(path, cwd) else {
         return false;
     };
     let prefix = lexical_path(prefix);
@@ -3079,7 +3143,10 @@ fn path_parent(path: &str) -> String {
 }
 
 /// Derives the lasting rule an "Always allow" makes from the action.
-fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<String>), ApiError> {
+fn derived_rule(
+    view: &ApprovalView,
+    cwd: Option<&str>,
+) -> Result<(String, Option<String>, Option<String>), ApiError> {
     let tool = view.tool.clone();
     match view.tool.as_str() {
         neha_loop::tools::SHELL => {
@@ -3111,7 +3178,7 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
             }
             // The card and the rule share one computation, so the scope shown
             // is exactly the scope recorded.
-            let scope = lasting_rule_path(&view.arguments).ok_or_else(|| {
+            let scope = lasting_rule_path_at(&view.arguments, cwd).ok_or_else(|| {
                 // A frightening path may be answered once, but it cannot
                 // become a lasting scope: its parent is not meaningful.
                 ApiError::invalid_argument("the action path cannot make a lasting rule")
@@ -3134,29 +3201,32 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
     if bot.full_access {
         return None;
     }
-    let target = match call.tool.as_str() {
+    let (folder, scope) = match call.tool.as_str() {
         neha_loop::tools::WRITE_FILE | neha_loop::tools::PUT_FILE => {
             let path = call.arguments.get("path").and_then(Value::as_str)?;
-            if Path::new(path).is_absolute() {
+            let target = if Path::new(path).is_absolute() {
                 action_path(path)?
             } else {
                 let cwd = cwd?;
                 action_path(&format!("{}/{path}", cwd.trim_end_matches('/')))?
+            };
+            if under_grants(&target, &bot.grants) {
+                return None;
             }
+            (parent_of(&target), "writes")
         }
         neha_loop::tools::SHELL => {
             // A shell can write anywhere; its working directory is the only
             // target the Space can name before it runs.
-            let cwd = cwd?;
-            action_path(cwd)?
+            let cwd = action_path(cwd?)?;
+            if under_grants(&cwd, &bot.grants) {
+                return None;
+            }
+            (cwd, "writes")
         }
         _ => return None,
     };
-    if under_grants(&target, &bot.grants) {
-        return None;
-    }
-    let folder = parent_of(&target);
-    Some((folder, "writes".to_owned()))
+    Some((folder, scope.to_owned()))
 }
 
 /// Returns whether a normalized path lies in one of the granted folders.
@@ -3193,7 +3263,9 @@ fn approval_summary(call: &LoopCall, cwd: Option<&str>) -> String {
                 .and_then(Value::as_str)
                 .map(|path| {
                     // Show the path the daemon will actually read or write.
-                    action_path(path).unwrap_or_else(|| path.trim().to_owned())
+                    resolve_action_path(path, cwd)
+                        .or_else(|| action_path(path))
+                        .unwrap_or_else(|| path.trim().to_owned())
                 })
         }
         neha_loop::tools::TAKE_FILE => call
@@ -3568,7 +3640,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        LoopCall, ambiguous_path, path_covers, path_matches, path_parent, prepare_resume,
+        LoopCall, ambiguous_path, ambiguous_path_at, lasting_rule_path_at, path_covers,
+        path_matches, path_matches_at, path_parent, prepare_resume, resolve_action_path,
         rule_covers, rule_matches,
     };
     use crate::state::RuleView;
@@ -4130,6 +4203,36 @@ mod tests {
             std::slice::from_ref(&tool_wide)
         ));
         assert!(!ambiguous_path("logs /x", std::slice::from_ref(&tool_wide)));
+    }
+
+    #[test]
+    fn an_explicit_directory_binds_relative_paths_to_it() {
+        assert_eq!(
+            resolve_action_path("notes.txt", Some("/data/work")),
+            Some("/data/work/notes.txt".to_owned())
+        );
+        assert_eq!(
+            resolve_action_path("notes.txt", None),
+            Some("notes.txt".to_owned())
+        );
+        assert!(path_matches_at(
+            "notes.txt",
+            "/data/work",
+            Some("/data/work")
+        ));
+        assert!(!path_matches_at("notes.txt", ".", Some("/data/work")));
+        // A rule relative to the Workspace cannot judge a path in a named
+        // directory, so the action asks instead of running on the rule.
+        let ask = ask("write_file", None, Some("."));
+        assert!(ambiguous_path_at(
+            "notes.txt",
+            std::slice::from_ref(&ask),
+            Some("/data/work")
+        ));
+        assert_eq!(
+            lasting_rule_path_at(&json!({"path": "notes.txt"}), Some("/data/work")),
+            Some("/data/work".to_owned())
+        );
     }
 
     #[test]
