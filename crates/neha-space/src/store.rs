@@ -121,6 +121,12 @@ enum WriteRequest {
     },
 }
 
+/// A cloneable reader over the record.
+#[derive(Clone)]
+pub struct StoreReader {
+    pool: SqlitePool,
+}
+
 /// A Space's record.
 pub struct Store {
     writer: mpsc::Sender<WriteRequest>,
@@ -171,26 +177,15 @@ impl Store {
     /// An event whose kind this version does not know is skipped when it is
     /// presentation, and stops the read when it is an authority event.
     pub async fn events_from(&self, cursor: Seq, limit: usize) -> Result<EventPage, StoreError> {
-        let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
-        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "{EVENTS} WHERE seq > ? ORDER BY seq LIMIT ?"
-        )))
-        .bind(cursor.as_i64())
-        .bind(limit)
-        .fetch_all(&self.reader)
-        .await?;
+        read_events(&self.reader, cursor, limit).await
+    }
 
-        let mut events = Vec::with_capacity(rows.len());
-        let mut next = cursor;
-        for row in &rows {
-            let seq = Seq::from_i64(row.try_get("seq")?).ok_or_else(|| corrupt("negative seq"))?;
-            if let Some(event) = decode_event(row)? {
-                events.push(event);
-            }
-            next = seq;
+    /// Returns a reader that can read the record without the writer.
+    #[must_use]
+    pub fn reader(&self) -> StoreReader {
+        StoreReader {
+            pool: self.reader.clone(),
         }
-
-        Ok(EventPage { events, next })
     }
 
     /// Returns the cursor of the last recorded event.
@@ -440,6 +435,40 @@ async fn load_range(
     Ok(events)
 }
 
+impl StoreReader {
+    /// Reads a bounded page after a cursor.
+    pub async fn events_from(&self, cursor: Seq, limit: usize) -> Result<EventPage, StoreError> {
+        read_events(&self.pool, cursor, limit).await
+    }
+}
+
+async fn read_events(
+    pool: &SqlitePool,
+    cursor: Seq,
+    limit: usize,
+) -> Result<EventPage, StoreError> {
+    let limit = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{EVENTS} WHERE seq > ? ORDER BY seq LIMIT ?"
+    )))
+    .bind(cursor.as_i64())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let mut events = Vec::with_capacity(rows.len());
+    let mut next = cursor;
+    for row in &rows {
+        let seq = Seq::from_i64(row.try_get("seq")?).ok_or_else(|| corrupt("negative seq"))?;
+        if let Some(event) = decode_event(row)? {
+            events.push(event);
+        }
+        next = seq;
+    }
+
+    Ok(EventPage { events, next })
+}
+
 fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Event>, StoreError> {
     let kind_text: String = row.try_get("kind")?;
     let class: String = row.try_get("class")?;
@@ -463,6 +492,15 @@ fn decode_event(row: &sqlx::sqlite::SqliteRow) -> Result<Option<Event>, StoreErr
     let command = parse_id(row.try_get("command")?)?;
     let data_text: String = row.try_get("data")?;
     let data = serde_json::from_str(&data_text).map_err(|_| corrupt("event data is not JSON"))?;
+    if version != kind.supported_version() {
+        return Err(StoreError::UpgradeRequired {
+            kind: kind.as_str().to_owned(),
+        });
+    }
+    kind.validate_author(author, acting)
+        .map_err(|error| corrupt(&error.to_string()))?;
+    kind.decode(&data)
+        .map_err(|error| corrupt(&error.to_string()))?;
 
     Ok(Some(Event {
         seq,
@@ -714,6 +752,62 @@ mod tests {
         assert_eq!(page.events, recorded.events);
         assert_eq!(page.next, recorded.events[0].seq);
         store.close().await.unwrap();
+    }
+
+    struct Collector(Vec<Event>);
+
+    impl Projection for Collector {
+        fn apply(&mut self, event: &Event) -> Result<(), String> {
+            self.0.push(event.clone());
+            Ok(())
+        }
+    }
+
+    async fn connect_raw(home: &Home) -> sqlx::SqliteConnection {
+        sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(home.db_path())
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replay_stops_at_a_future_version_of_a_known_kind() {
+        let (_dir, home, store) = open().await;
+        store
+            .append(request(vec![draft(EventKind::UserJoined)]))
+            .await
+            .unwrap();
+        let mut connection = connect_raw(&home).await;
+        sqlx::query("UPDATE events SET version = 2 WHERE seq = 1")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        let mut collector = Collector(Vec::new());
+        let error = store.replay(&mut collector).await;
+
+        assert!(matches!(error, Err(StoreError::UpgradeRequired { .. })));
+    }
+
+    #[tokio::test]
+    async fn replay_stops_at_an_author_that_does_not_fit_the_kind() {
+        let (_dir, home, store) = open().await;
+        let message = draft(EventKind::MessageAdded);
+        store.append(request(vec![message])).await.unwrap();
+        let mut connection = connect_raw(&home).await;
+        sqlx::query("UPDATE events SET author = ? WHERE seq = 1")
+            .bind(serde_json::to_string(&Author::Bot(Id::new())).unwrap())
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        let mut collector = Collector(Vec::new());
+        let error = store.replay(&mut collector).await;
+
+        assert!(matches!(error, Err(StoreError::Corrupt(_))));
     }
 
     #[tokio::test]

@@ -244,7 +244,7 @@ fn map_status(
         401 | 403 => ModelError::Unauthorized,
         429 => ModelError::RateLimited { retry_after },
         413 => ModelError::ContextTooLarge,
-        500..=599 => ModelError::Server,
+        500..=599 => ModelError::Server { retry_after },
         _ if body.to_lowercase().contains("context") => ModelError::ContextTooLarge,
         _ => ModelError::Request(body.to_owned()),
     }
@@ -344,7 +344,10 @@ pub enum ModelError {
     ContextTooLarge,
     /// The Provider failed.
     #[error("the Provider failed")]
-    Server,
+    Server {
+        /// The delay the Provider named.
+        retry_after: Option<Duration>,
+    },
     /// The connection failed.
     #[error("the Provider could not be reached")]
     Transport,
@@ -368,7 +371,7 @@ impl ModelError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Server | Self::Transport | Self::Empty
+            Self::RateLimited { .. } | Self::Server { .. } | Self::Transport | Self::Empty
         )
     }
 
@@ -376,7 +379,7 @@ impl ModelError {
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
-            Self::RateLimited { retry_after } => *retry_after,
+            Self::RateLimited { retry_after } | Self::Server { retry_after } => *retry_after,
             _ => None,
         }
     }
@@ -387,7 +390,7 @@ impl ModelError {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
             Self::RateLimited { .. } => ErrorCode::RateLimited,
-            Self::Server | Self::Transport => ErrorCode::Unavailable,
+            Self::Server { .. } | Self::Transport => ErrorCode::Unavailable,
             Self::ContextTooLarge
             | Self::Empty
             | Self::Protocol
@@ -565,6 +568,48 @@ mod tests {
         let reply = client.chat(request(&base, "sk-test")).await.unwrap();
 
         assert_eq!(reply.text, "second");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_five_hundred_with_retry_after_is_retried_immediately() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            [(axum::http::header::RETRY_AFTER, "0")],
+                            "later",
+                        )
+                            .into_response();
+                    }
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(reply.text, "recovered");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         task.abort();
     }

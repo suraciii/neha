@@ -41,7 +41,7 @@ use crate::identity::{Account, Identity, IdentityError};
 use crate::model::{ModelClient, ModelError};
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
-use crate::store::{AppendRequest, Projection, Store, StoreError};
+use crate::store::{AppendRequest, Projection, Store, StoreError, StoreReader};
 
 const LOGIN_ATTEMPTS: usize = 5;
 const SOURCE_ATTEMPTS: usize = 20;
@@ -459,24 +459,13 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             task.abort();
                         }
                         let receiver = server.events.subscribe();
-                        let cursor = cursor.unwrap_or(neha::seq::Seq::ZERO);
-                        match snapshot_page(&server.store, cursor, limit).await {
-                            Ok((next, events)) => {
-                                if send(&out, ServerFrame::Snapshot { cursor: next, events }).await.is_err() {
-                                    break;
-                                }
-                                forwarder = Some(spawn_forwarder(receiver, out.clone(), next));
-                            }
-                            Err(_) => {
-                                if send(&out, ServerFrame::Error {
-                                    id: None,
-                                    code: ErrorCode::Internal,
-                                    message: "the record could not be read".to_owned(),
-                                }).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
+                        forwarder = Some(spawn_forwarder(
+                            receiver,
+                            server.store.reader(),
+                            out.clone(),
+                            cursor.unwrap_or(neha::seq::Seq::ZERO),
+                            limit,
+                        ));
                     }
                     Ok(ClientFrame::Command { id, command }) => {
                         if send(&out, ServerFrame::Accepted { id }).await.is_err() {
@@ -559,32 +548,60 @@ fn broadcast(server: &SpaceServer, events: &[neha::record::Event]) {
 
 fn spawn_forwarder(
     mut receiver: broadcast::Receiver<neha::record::Event>,
+    reader: StoreReader,
     out: mpsc::Sender<ServerFrame>,
-    mut cursor: neha::seq::Seq,
+    cursor: neha::seq::Seq,
+    limit: Option<usize>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut cursor = match catch_up(&reader, &out, cursor, limit).await {
+            Ok(cursor) => cursor,
+            Err(StreamError::Oversized(event)) => {
+                let _ = out
+                    .send(ServerFrame::ProtocolError {
+                        message: format!("event {event} is larger than the frame limit"),
+                    })
+                    .await;
+                return;
+            }
+            Err(StreamError::Store | StreamError::Closed) => {
+                let _ = out
+                    .send(ServerFrame::Error {
+                        id: None,
+                        code: ErrorCode::Internal,
+                        message: "the record could not be read".to_owned(),
+                    })
+                    .await;
+                return;
+            }
+        };
         loop {
             match receiver.recv().await {
                 Ok(event) => {
                     if event.seq <= cursor {
                         continue;
                     }
-                    cursor = event.seq;
+                    let seq = event.seq;
                     if out.send(ServerFrame::Event { event }).await.is_err() {
                         break;
                     }
+                    cursor = seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let _ = out
-                        .send(ServerFrame::Error {
-                            id: None,
-                            code: ErrorCode::Unavailable,
-                            message:
-                                "the subscription fell behind; reconnect and resume from the cursor"
-                                    .to_owned(),
-                        })
-                        .await;
-                    break;
+                    match catch_up(&reader, &out, cursor, limit).await {
+                        Ok(next) => cursor = next,
+                        Err(StreamError::Oversized(event)) => {
+                            let _ = out
+                                .send(ServerFrame::ProtocolError {
+                                    message: format!(
+                                        "event {event} is larger than the frame limit"
+                                    ),
+                                })
+                                .await;
+                            break;
+                        }
+                        Err(StreamError::Store | StreamError::Closed) => break,
+                    }
                 }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
@@ -592,39 +609,78 @@ fn spawn_forwarder(
     })
 }
 
-/// Reads a page that fits one frame, trimming events from its end when needed.
-async fn snapshot_page(
-    store: &Store,
+#[derive(Debug)]
+enum StreamError {
+    Store,
+    Oversized(neha::seq::Seq),
+    Closed,
+}
+
+/// Sends every recorded page that fits a frame, then returns the cursor.
+async fn catch_up(
+    reader: &StoreReader,
+    out: &mpsc::Sender<ServerFrame>,
     cursor: neha::seq::Seq,
     limit: Option<usize>,
-) -> Result<(neha::seq::Seq, Vec<neha::record::Event>), StoreError> {
+) -> Result<neha::seq::Seq, StreamError> {
     let page_size = limit.unwrap_or(256).clamp(1, 256);
-    let page = store.events_from(cursor, page_size).await?;
-    let complete = page.events.len();
-    let mut next = page.next;
-    let mut events = page.events;
-    while !events.is_empty() {
-        let candidate = if events.len() == complete {
-            next
-        } else {
-            events.last().map(|event| event.seq).unwrap_or(cursor)
-        };
-        let frame = ServerFrame::Snapshot {
-            cursor: candidate,
-            events: events.clone(),
-        };
-        if serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() + 4096 <= MAX_FRAME_BYTES) {
-            next = candidate;
-            break;
+    let mut cursor = cursor;
+    let mut sent = false;
+    loop {
+        let page = reader
+            .events_from(cursor, page_size)
+            .await
+            .map_err(|error| {
+                eprintln!("neha: subscription read failed: {error}");
+                StreamError::Store
+            })?;
+        if page.events.is_empty() {
+            if !sent {
+                out.send(ServerFrame::Snapshot {
+                    cursor,
+                    events: Vec::new(),
+                })
+                .await
+                .map_err(|_| StreamError::Closed)?;
+            }
+            return Ok(cursor);
         }
-        events.pop();
-        next = events.last().map(|event| event.seq).unwrap_or(cursor);
+        let complete = page.events.len();
+        let first = page.events[0].seq;
+        let mut events = page.events;
+        let mut next = page.next;
+        while !events.is_empty() {
+            let candidate = if events.len() == complete {
+                next
+            } else {
+                events.last().map(|event| event.seq).unwrap_or(cursor)
+            };
+            let frame = ServerFrame::Snapshot {
+                cursor: candidate,
+                events: events.clone(),
+            };
+            if serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() + 4096 <= MAX_FRAME_BYTES) {
+                next = candidate;
+                break;
+            }
+            events.pop();
+            next = events.last().map(|event| event.seq).unwrap_or(cursor);
+        }
+        if events.is_empty() {
+            return Err(StreamError::Oversized(first));
+        }
+        out.send(ServerFrame::Snapshot {
+            cursor: next,
+            events,
+        })
+        .await
+        .map_err(|_| StreamError::Closed)?;
+        sent = true;
+        if complete < page_size {
+            return Ok(next);
+        }
+        cursor = next;
     }
-    if events.is_empty() {
-        return Ok((cursor, events));
-    }
-
-    Ok((next, events))
 }
 
 /// An authenticated account.
@@ -917,7 +973,7 @@ mod tests {
     use serde_json::json;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use super::{Running, SpaceServer, start};
+    use super::{Running, SpaceServer, StreamError, catch_up, start};
     use crate::home::Home;
     use crate::store::{AppendRequest, Store};
 
@@ -1163,7 +1219,9 @@ mod tests {
                 ServerFrame::Committed { seq, .. } => committed = Some(seq),
                 ServerFrame::Confirmed { result, .. } => return Ok((committed, result)),
                 ServerFrame::Error { code, message, .. } => return Err((code, message)),
-                ServerFrame::Heartbeat { .. } | ServerFrame::Event { .. } => {}
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }
         }
@@ -1955,7 +2013,9 @@ mod tests {
         loop {
             match next_frame(&mut first_socket).await {
                 ServerFrame::Confirmed { .. } => break,
-                ServerFrame::Heartbeat { .. } => {}
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Accepted { .. }
+                | ServerFrame::Committed { .. } => {}
                 other => panic!("unexpected frame {other:?}"),
             }
         }
@@ -2265,5 +2325,159 @@ mod tests {
         second.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_history_streams_in_pages_without_gaps() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let author = Id::new();
+        let chat = Id::new();
+        let drafts = (0..259)
+            .map(|index| {
+                EventDraft::new(
+                    EventKind::MessageAdded,
+                    Author::User(author),
+                    json!({
+                        "message": Id::new(),
+                        "chat": chat,
+                        "text": format!("old {index}"),
+                        "run": null,
+                    }),
+                )
+            })
+            .collect();
+        store
+            .append(AppendRequest::new(Id::new(), "seed", drafts))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let (mut socket, _token) = admin(&running, &invite).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let history = 1 + 259 + 3;
+
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: Id::new(),
+                    command: CommandCall::BotCreate(BotCreate {
+                        name: "Live".to_owned(),
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut seen = std::collections::BTreeSet::new();
+        let mut snapshots = 0;
+        let last = history + 3;
+        while seen.last().copied().unwrap_or(0) < last {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(10), next_frame(&mut socket))
+                    .await
+                    .expect("the stream keeps sending");
+            match frame {
+                ServerFrame::Snapshot { events, .. } => {
+                    snapshots += 1;
+                    for event in events {
+                        seen.insert(event.seq.as_i64());
+                    }
+                }
+                ServerFrame::Event { event } => {
+                    seen.insert(event.seq.as_i64());
+                }
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Accepted { .. }
+                | ServerFrame::Committed { .. }
+                | ServerFrame::Confirmed { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+
+        assert!(snapshots >= 2, "the history needs more than one page");
+        assert_eq!(
+            seen.into_iter().collect::<Vec<_>>(),
+            (1..=last).collect::<Vec<_>>(),
+            "the stream skipped a recorded event"
+        );
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_event_larger_than_one_frame_is_reported() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let user = Id::new();
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "seed",
+                vec![
+                    EventDraft::new(
+                        EventKind::UserJoined,
+                        Author::User(user),
+                        json!({"display_name": "Ada", "is_admin": true}),
+                    ),
+                    EventDraft::new(
+                        EventKind::MessageAdded,
+                        Author::User(user),
+                        json!({
+                            "message": Id::new(),
+                            "chat": Id::new(),
+                            "text": "x".repeat(neha::surface::MAX_FRAME_BYTES + 1024),
+                            "run": null,
+                        }),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let reader = store.reader();
+        let (out, mut frames) = tokio::sync::mpsc::channel(8);
+
+        let first = catch_up(&reader, &out, neha::seq::Seq::ZERO, None)
+            .await
+            .unwrap();
+        let second = catch_up(&reader, &out, first, None).await;
+
+        assert_eq!(first, neha::seq::Seq::from_i64(1).unwrap());
+        assert!(matches!(second, Err(StreamError::Oversized(_))));
+        assert!(matches!(
+            frames.try_recv(),
+            Ok(ServerFrame::Snapshot { .. })
+        ));
+        assert!(frames.try_recv().is_err());
+        store.close().await.unwrap();
     }
 }

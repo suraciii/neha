@@ -286,7 +286,10 @@ impl EventKind {
                     return Err(EventDataError::Author);
                 }
             }
-            Self::MessageAdded => {}
+            Self::MessageAdded => match (author, acting) {
+                (Author::User(_), None) | (Author::Bot(_), Some(_)) => {}
+                _ => return Err(EventDataError::Author),
+            },
             Self::RunStarted | Self::RunFinished => {
                 if !matches!(author, Author::Bot(_)) || acting.is_none() {
                     return Err(EventDataError::Author);
