@@ -2102,6 +2102,7 @@ async fn fail_interrupted(
                 run.command,
                 serde_json::json!({
                     "run": run.id,
+                    "message": run.message,
                     "status": "failed",
                     "reply": message,
                     "text": text,

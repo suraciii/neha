@@ -1877,6 +1877,7 @@ async fn finish_recovered_final(
     ];
     let confirmation = serde_json::json!({
         "run": run.id,
+        "message": run.message,
         "status": if succeeded { "succeeded" } else { "failed" },
         "reply": message,
         "text": text,
@@ -2720,9 +2721,14 @@ pub(crate) fn prepare_recovery(
                 "step {next_step}'s actions do not line up with its calls"
             ));
         }
-        if call.refused.is_some() {
+        if call.refused.is_some()
+            && !(action.finished && action.status == RecordedActionStatus::Failed)
+        {
+            // A refused call never runs, but the loop records its refusal as a
+            // failed result so the Model can read it; a replay keeps that
+            // result. A bare started refused action is not a safe replay.
             return Err(format!(
-                "step {next_step}'s recorded call was refused but has an action"
+                "step {next_step}'s refused call has no recorded failure"
             ));
         }
     }
