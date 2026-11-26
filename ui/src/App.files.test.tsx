@@ -157,7 +157,7 @@ describe("App with Files", () => {
     const card = element<HTMLAnchorElement>(view, ".file-card");
     expect(card.getAttribute("href")).toBe("/api/files/f9");
     expect(card.textContent).toContain("report.pdf");
-    expect(card.textContent).toContain("2.0 MB");
+    expect(card.textContent).toContain("2.0 MiB");
     expect(view.container.querySelector(".msg__text")?.textContent).toBe("Here it is.");
   });
 
@@ -230,5 +230,26 @@ describe("App with Files", () => {
 
     fireEvent.click(element(view, ".locale-switch"));
     expect(alertText(view)).toBe("文件上传失败，请重试。");
+  });
+
+  it("previews a Message that carries only a File, in the reader's language", async () => {
+    space.messages.push({
+      id: "m1",
+      chat: "h1",
+      author: { kind: "user", id: "u1" },
+      acting: null,
+      text: "",
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "1",
+      run: null,
+      file: "f1",
+    });
+    const view = await openChat();
+
+    await waitFor(() =>
+      expect(element<HTMLElement>(view, ".conv__preview").textContent).toBe("Sent a File"),
+    );
+    fireEvent.click(element(view, ".locale-switch--foot"));
+    expect(element<HTMLElement>(view, ".conv__preview").textContent).toBe("已发送文件");
   });
 });

@@ -17,7 +17,9 @@ Owned by space. Every other topic depends on a Space to hold its record.
 
 ## Storage
 
-A Space keeps its record in one SQLite database on the Space's machine. A File lives beside it in a content-addressed store.
+A Space keeps its record in one SQLite database on the Space's machine. A File lives beside it in a content-addressed store: the Space stores one copy of each content, and every File with that content shares it.
+
+The Space writes a File's bytes before the record that names it. The record never names bytes the Space does not hold.
 
 Storage is one seam. The code that reads and writes the record does not name SQLite, and another database can replace it without changing that code.
 

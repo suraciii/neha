@@ -8,10 +8,11 @@ Owned by cli. Every topic's behavior is reachable through the command surface, s
 
 ## Laws
 
-1. The GUI, the CLI, and a Bot's loop reach a Space through the command surface and nothing else.
+1. The GUI, the CLI, and a Bot's loop reach a Space through the command surface for every action.
 2. A command runs once, however many times its caller sends it.
 3. A caller and a Space agree on a version before the first command.
 4. A command, its events, and the work it starts are stored together or not at all.
+5. A command names a File by its id, and a File's bytes travel over HTTP beside the command surface.
 
 ## The command surface
 

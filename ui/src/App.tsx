@@ -143,7 +143,7 @@ export default function App() {
       try {
         const messages = await commands.command<Message[]>("chat_read", { chat: chat.id });
         const last = messages.at(-1);
-        previews[chat.id] = last ? { text: last.text } : null;
+        previews[chat.id] = last ? previewOf(last) : null;
       } catch {
         previews[chat.id] = { error: true };
       }
@@ -219,7 +219,7 @@ export default function App() {
       ]);
       setState({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
-      if (last) setState("previews", chat.id, { text: last.text });
+      if (last) setState("previews", chat.id, previewOf(last));
     } catch (reason) {
       setState("error", reason);
     }
@@ -255,7 +255,7 @@ export default function App() {
       file: uploaded?.id ?? null,
     };
     setState({ messages: [...state.messages, optimistic] });
-    setState("previews", chat.id, { text });
+    setState("previews", chat.id, previewOf(optimistic));
     try {
       const result = await commands.command<SendResult>(
         "message_send",
@@ -439,6 +439,11 @@ function Boot() {
       <span>{t("boot.opening")}</span>
     </div>
   );
+}
+
+// What the sidebar shows for a Chat's last Message.
+function previewOf(message: Message): Preview {
+  return { text: message.text, file: message.file !== null };
 }
 
 // Names an upload failure the Space or the network reported.

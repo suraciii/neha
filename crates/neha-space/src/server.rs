@@ -4092,6 +4092,71 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_uploads_with_its_session_cookie() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+        // Sign in the way the browser does, on the host its page is served
+        // from: the token arrives as a cookie and the request carries the
+        // page's own Origin.
+        let page = running.browser_url();
+        let login = reqwest::Client::new()
+            .post(format!("{page}/api/login"))
+            .header("origin", page.clone())
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), reqwest::StatusCode::OK);
+        let cookie = login
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .expect("a sign-in sets the session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+
+        let upload = |origin: String| {
+            let cookie = cookie.clone();
+            let url = running.browser_url();
+            async move {
+                reqwest::Client::new()
+                    .post(format!("{url}/api/chats/{chat}/files"))
+                    .query(&[("name", "notes.txt"), ("media_type", "text/plain")])
+                    .header("cookie", cookie)
+                    .header("origin", origin)
+                    .body("read me")
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let accepted = upload(page.clone()).await;
+        assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+        let file: Value = accepted.json().await.unwrap();
+        let id: Id = serde_json::from_value(file["id"].clone()).unwrap();
+
+        let download = reqwest::Client::new()
+            .get(format!("{page}/api/files/{id}"))
+            .header("cookie", cookie.clone())
+            .header("origin", page.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(download.status(), reqwest::StatusCode::OK);
+        assert_eq!(download.bytes().await.unwrap().as_ref(), b"read me");
+
+        let foreign = upload("http://evil.example".to_owned()).await;
+        assert_eq!(foreign.status(), reqwest::StatusCode::FORBIDDEN);
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_file_is_sent_with_a_message_and_downloaded() {
         let (_dir, running, invite) = running().await;
         let (mut socket, token) = admin(&running, &invite).await;
@@ -4328,22 +4393,107 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_file_the_space_cannot_hold_is_refused() {
+    async fn a_retried_upload_records_one_file() {
         let (_dir, running, invite) = running().await;
         let (mut socket, token) = admin(&running, &invite).await;
         let (_bot, chat, _computer) = create_bot(&mut socket).await;
 
-        // Larger than the server's default body limit, and still a File.
-        let large = upload(
+        let first: Value = upload(
             &running,
             &token,
             chat,
             "notes.txt",
             "text/plain",
-            vec![b'x'; 100 * 1024],
+            b"read me".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let retried: Value = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"read me".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+
+        // A retry answers with the File it recorded the first time.
+        assert_eq!(retried, first);
+        assert_eq!(file_list(&mut socket, chat).await, vec![first]);
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_the_blob_store_cannot_hold_records_no_file() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+        let blobs = running.server_home().join("blobs");
+        let writable = std::fs::metadata(&blobs).unwrap().permissions();
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"read me".to_vec(),
         )
         .await;
-        assert_eq!(large.status(), reqwest::StatusCode::OK);
+        std::fs::set_permissions(&blobs, writable).unwrap();
+
+        // The bytes could not be written, so no File is recorded.
+        assert_eq!(refused.status(), reqwest::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(file_list(&mut socket, chat).await.is_empty());
+
+        // Once the store can write again the same upload succeeds.
+        let stored = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"read me".to_vec(),
+        )
+        .await;
+        assert_eq!(stored.status(), reqwest::StatusCode::OK);
+        assert_eq!(file_list(&mut socket, chat).await.len(), 1);
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_at_the_size_limit_is_kept_and_one_byte_more_is_refused() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+        // Exactly the limit is a File, even though it is far larger than the
+        // server's default body limit.
+        let at_limit: Value = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            vec![b'x'; MAX_FILE_BYTES as usize],
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(at_limit["size"], MAX_FILE_BYTES);
 
         let over = upload(
             &running,
@@ -4384,15 +4534,13 @@ mod tests {
             .unwrap();
         assert_eq!(missing_type.status(), reqwest::StatusCode::BAD_REQUEST);
 
-        // Only the valid File was recorded or stored.
-        assert_eq!(file_list(&mut socket, chat).await.len(), 1);
+        // Only the File at the limit was recorded or stored.
+        assert_eq!(file_list(&mut socket, chat).await, vec![at_limit]);
         let stored = std::fs::read_dir(running.server_home().join("blobs"))
             .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != "tmp")
             .count();
-        assert_eq!(
-            stored, 2,
-            "one digest directory beside the scratch directory"
-        );
+        assert_eq!(stored, 1, "the refused upload left no bytes behind");
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }
@@ -4537,6 +4685,111 @@ mod tests {
         socket.close(None).await.unwrap();
         provider_task.abort();
         restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_taken_file_stays_downloadable_after_its_workspace_copy_is_gone() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, computer) = create_bot(&mut socket).await;
+        let uploaded: Value = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"read me".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+
+        let (base, provider_task) = scripted_provider(vec![
+            tool("take_file", json!({"file": file})),
+            text("I read the notes."),
+        ])
+        .await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let result = send(&mut socket, chat, "take the notes").await;
+        assert_eq!(result["status"], "succeeded");
+
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert_eq!(
+            std::fs::read(workspace.join("notes.txt")).unwrap(),
+            b"read me"
+        );
+        std::fs::remove_file(workspace.join("notes.txt")).unwrap();
+
+        // The Workspace copy belongs to the Bot; the Space still holds the
+        // File, whatever happens to that copy.
+        assert!(!workspace.join("notes.txt").exists());
+        let response = download(&running, &token, file).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
+        assert_eq!(file_list(&mut socket, chat).await, vec![uploaded]);
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_cannot_take_a_file_of_another_chat() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+        let uploaded: Value = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"read me".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+
+        let (base, provider_task) = scripted_provider(vec![
+            tool("take_file", json!({"file": file})),
+            text("That File is not mine to take."),
+        ])
+        .await;
+        let (_other_bot, other_chat, other_computer) = tool_bot(&mut socket, base).await;
+        let result = send(&mut socket, other_chat, "take my notes").await;
+        assert_eq!(result["status"], "succeeded");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["actions"][0]["tool"], "take_file");
+        assert_eq!(shown["actions"][0]["status"], "failed");
+
+        // The File of the first Chat is untouched: still listed, still
+        // downloadable, and never copied into the other Chat or Workspace.
+        assert_eq!(file_list(&mut socket, chat).await, vec![uploaded]);
+        let response = download(&running, &token, file).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
+        assert!(file_list(&mut socket, other_chat).await.is_empty());
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(other_computer.to_string())
+            .join("workspace");
+        assert!(
+            !workspace.join("notes.txt").exists(),
+            "a File of another Chat never reaches this Workspace"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

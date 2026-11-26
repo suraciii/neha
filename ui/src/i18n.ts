@@ -54,6 +54,7 @@ const en = {
   "sidebar.startChat": "Start a Chat with {name}",
   "sidebar.newChat": "New Chat",
   "sidebar.openChat": "Open Chat",
+  "sidebar.file": "Sent a File",
   "sidebar.online": "Space online",
 
   "rail.chats": "Chats",
@@ -190,6 +191,7 @@ const zh: Record<MessageKey, string> = {
   "sidebar.startChat": "和{name}打个招呼",
   "sidebar.newChat": "新 Chat",
   "sidebar.openChat": "打开 Chat",
+  "sidebar.file": "已发送文件",
   "sidebar.online": "Space 在线",
 
   "rail.chats": "Chats",

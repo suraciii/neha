@@ -112,4 +112,4 @@ export interface RunView {
   usage: unknown;
 }
 
-export type Preview = { text: string } | { error: true } | null;
+export type Preview = { text: string; file: boolean } | { error: true } | null;

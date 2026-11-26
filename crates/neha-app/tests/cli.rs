@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::response::Response;
-use axum::routing::post;
+use axum::routing::{get, post};
 
 const PASSWORD: &str = "correct horse battery";
 const BIN: &str = env!("CARGO_BIN_EXE_neha");
@@ -133,6 +133,18 @@ async fn fake_provider() -> (String, tokio::task::JoinHandle<()>) {
     });
 
     (format!("http://{addr}/v1"), task)
+}
+
+/// A Space that serves one File's bytes and names it in no header.
+async fn unnamed_file_server(bytes: &'static [u8]) -> (String, tokio::task::JoinHandle<()>) {
+    let app = Router::new().route("/api/files/{file}", get(move || async move { bytes }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}"), task)
 }
 
 #[derive(Clone, Debug)]
@@ -546,6 +558,62 @@ async fn a_file_travels_between_a_user_and_a_bot() {
 
     drop(server);
     provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_download_needs_a_space_name_only_when_the_destination_is_implicit() {
+    let directory = tempfile::tempdir().unwrap();
+    let credential = directory.path().join("credential.json");
+    let (space, space_task) = unnamed_file_server(b"the unnamed bytes").await;
+    std::fs::write(
+        &credential,
+        serde_json::json!({
+            "url": space,
+            "token": "test-token",
+            "account": {
+                "id": neha::id::Id::new().to_string(),
+                "display_name": "Ada",
+                "is_admin": true,
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let file = neha::id::Id::new().to_string();
+
+    // A path named with --out is the destination, so the missing name is fine.
+    let out = directory.path().join("explicit.bin");
+    let got = cli_in(
+        Some(directory.path()),
+        directory.path(),
+        &credential,
+        &["file", "get", &file, "--out", out.to_str().unwrap()],
+    );
+    assert!(
+        got.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), b"the unnamed bytes");
+    assert!(
+        String::from_utf8_lossy(&got.stdout).contains("explicit.bin"),
+        "stdout: {}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+
+    // Without --out the name would become the destination, so the CLI asks for one.
+    let got = cli_in(
+        Some(directory.path()),
+        directory.path(),
+        &credential,
+        &["file", "get", &file],
+    );
+    assert!(!got.status.success());
+    let stderr = String::from_utf8_lossy(&got.stderr);
+    assert!(stderr.contains("did not name the File"), "{stderr}");
+    assert!(stderr.contains("--out"), "{stderr}");
+
+    space_task.abort();
 }
 
 #[test]

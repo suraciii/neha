@@ -456,14 +456,36 @@ pub async fn file_upload(
     FileAdded::check_name(&name)
         .and_then(|()| FileAdded::check_media_type(&media_type))
         .map_err(|error| ApiError::invalid_argument(error.to_string()))?;
-    let file = Id::new();
+    // The bytes are written before the record that names them, so the record
+    // never names bytes the Space does not hold.
+    let sha256 = blobs.put(&bytes).await?;
+    // A retried upload answers with the File it already recorded: the same
+    // bytes, name, and type in the same Chat are the same File.
+    let recorded = {
+        let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .files_of(chat, None)
+            .into_iter()
+            .find(|view| {
+                view.sha256 == sha256 && view.name == name && view.media_type == media_type
+            })
+            .cloned()
+    };
+    if let Some(recorded) = recorded {
+        return Ok(Outcome {
+            committed: None,
+            result: serde_json::to_value(recorded).map_err(json_error)?,
+            pending: None,
+            events: Vec::new(),
+        });
+    }
     let data = FileAdded {
-        file,
+        file: Id::new(),
         chat,
         name,
         media_type,
         size: bytes.len() as u64,
-        sha256: blobs.put(&bytes).await?,
+        sha256,
     };
     let draft = EventDraft::new(
         EventKind::FileAdded,

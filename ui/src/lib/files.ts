@@ -10,10 +10,10 @@ export function mediaTypeFor(file: File): string {
   return file.type || "application/octet-stream";
 }
 
-// A size for a reader: 20 B, 1.5 KB, 32 MB.
+// A size for a reader: 20 B, 1.5 KiB, 32 MiB.
 export function formatBytes(size: number): string {
   if (size < 1024) return `${size} B`;
-  const units = ["KB", "MB", "GB"];
+  const units = ["KiB", "MiB", "GiB"];
   let value = size / 1024;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) {

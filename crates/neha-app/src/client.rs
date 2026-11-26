@@ -245,11 +245,11 @@ pub async fn upload_file(credential: &Credential, chat: Id, path: &Path) -> Resu
         .context("the Space's answer does not describe a File")
 }
 
-/// Downloads one File and returns its name and bytes.
+/// Downloads one File and returns the name the Space gave it and its bytes.
 ///
-/// The name becomes a path on this machine, so it has to be one path
-/// component; anything else from the Space is refused.
-pub async fn download_file(credential: &Credential, file: Id) -> Result<(String, Vec<u8>)> {
+/// The name is only a suggestion for a destination: the caller decides
+/// whether it needs one, and an explicit path ignores it.
+pub async fn download_file(credential: &Credential, file: Id) -> Result<(Option<String>, Vec<u8>)> {
     let response = accepted(
         reqwest::Client::new()
             .get(format!("{}/api/files/{file}", credential.url))
@@ -263,22 +263,13 @@ pub async fn download_file(credential: &Credential, file: Id) -> Result<(String,
         .headers()
         .get(reqwest::header::CONTENT_DISPOSITION)
         .and_then(|value| value.to_str().ok())
-        .and_then(disposition_name)
-        .context("the Space did not name the File; pass --out")?;
-    if !is_one_component(&name) {
-        bail!("the Space named the File {name:?}, which is not a file name; pass --out");
-    }
+        .and_then(disposition_name);
     let bytes = response
         .bytes()
         .await
         .context("the Space's answer was cut short")?;
 
     Ok((name, bytes.to_vec()))
-}
-
-/// Whether a name can be one path component, wherever this CLI runs.
-fn is_one_component(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 /// Reads a File for upload, refusing one larger than the Space holds.
@@ -562,20 +553,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::{FollowFilter, disposition_name, is_one_component, read_for_upload};
-
-    #[test]
-    fn a_file_name_decides_its_media_type() {
-        let media_type = |name: &str| neha::file::media_type_for(name);
-
-        assert_eq!(media_type("notes.txt"), "text/plain");
-        assert_eq!(media_type("main.rs"), "text/plain");
-        assert_eq!(media_type("data.json"), "application/json");
-        assert_eq!(media_type("photo.JPG"), "image/jpeg");
-        assert_eq!(media_type("paper.pdf"), "application/pdf");
-        assert_eq!(media_type("archive.bin"), "application/octet-stream");
-        assert_eq!(media_type("Makefile"), "application/octet-stream");
-    }
+    use super::{FollowFilter, disposition_name, read_for_upload};
 
     #[test]
     fn a_file_larger_than_the_limit_is_refused_before_upload() {
@@ -611,14 +589,6 @@ mod tests {
             disposition_name("attachment; filename*=UTF-8''%zz").as_deref(),
             None
         );
-    }
-
-    #[test]
-    fn only_a_single_path_component_is_a_file_name() {
-        assert!(is_one_component("报告 v2.txt"));
-        for name in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
-            assert!(!is_one_component(name), "{name:?}");
-        }
     }
 
     fn event(kind: EventKind, data: serde_json::Value, seq: i64) -> Event {

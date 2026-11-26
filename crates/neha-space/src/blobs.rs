@@ -8,6 +8,7 @@
 
 use std::path::Path;
 
+use neha::file::is_sha256;
 use opendal::services::Fs;
 use opendal::{ErrorKind, Operator};
 use sha2::{Digest, Sha256};
@@ -40,7 +41,7 @@ impl Blobs {
     /// Bytes that are already stored are not written again.
     pub async fn put(&self, bytes: &[u8]) -> Result<String, BlobsError> {
         let sha256 = digest(bytes);
-        let key = key(&sha256);
+        let key = key(&sha256)?;
         match self.operator.stat(&key).await {
             Ok(_) => return Ok(sha256),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -57,7 +58,7 @@ impl Blobs {
     /// Reads the bytes stored under one digest of the record.
     pub async fn get(&self, sha256: &str) -> Result<Vec<u8>, BlobsError> {
         self.operator
-            .read(&key(sha256))
+            .read(&key(sha256)?)
             .await
             .map(|buffer| buffer.to_vec())
             .map_err(BlobsError::Backend)
@@ -65,8 +66,12 @@ impl Blobs {
 }
 
 /// Returns where a digest's bytes live: two hex digits, then the digest.
-fn key(sha256: &str) -> String {
-    format!("{}/{}", &sha256[..2], sha256)
+fn key(sha256: &str) -> Result<String, BlobsError> {
+    if !is_sha256(sha256) {
+        return Err(BlobsError::MalformedDigest(sha256.to_owned()));
+    }
+
+    Ok(format!("{}/{}", &sha256[..2], sha256))
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -85,11 +90,14 @@ pub enum BlobsError {
     /// A read or write failed.
     #[error("the blob store failed: {0}")]
     Backend(#[source] opendal::Error),
+    /// A digest of the record is not a SHA-256.
+    #[error("a File's digest is not a SHA-256: {0}")]
+    MalformedDigest(String),
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Blobs;
+    use super::{Blobs, BlobsError};
 
     // The SHA-256 of `abc`, from FIPS 180-2.
     const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -127,5 +135,26 @@ mod tests {
             "a stored blob leaves no scratch file"
         );
         assert!(blobs.get(&"00".repeat(32)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_malformed_digest_is_an_error_not_a_panic() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = Blobs::open(root.path()).unwrap();
+
+        for digest in [
+            String::new(),
+            "ab".to_owned(),
+            "ab".repeat(31),
+            "AB".repeat(32),
+        ] {
+            assert!(
+                matches!(
+                    blobs.get(&digest).await,
+                    Err(BlobsError::MalformedDigest(_))
+                ),
+                "{digest:?} must be refused, not sliced"
+            );
+        }
     }
 }

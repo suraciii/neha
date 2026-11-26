@@ -576,10 +576,12 @@ async fn file(command: FileCommand) -> Result<()> {
     match command {
         FileCommand::Get { file, out } => {
             let (name, bytes) = client::download_file(&credential, file).await?;
+            // An explicit file path is the destination; only an implicit one
+            // needs the name the Space gave the File.
             let path = match &out {
-                Some(path) if path.is_dir() => path.join(&name),
-                Some(path) => path.clone(),
-                None => std::path::PathBuf::from(&name),
+                Some(path) if !path.is_dir() => path.clone(),
+                Some(directory) => directory.join(space_file_name(name.as_deref())?),
+                None => std::path::PathBuf::from(space_file_name(name.as_deref())?),
             };
             if let Some(parent) = path.parent()
                 && !parent.as_os_str().is_empty()
@@ -602,6 +604,27 @@ async fn file(command: FileCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Reads the name the Space gave a File, as one path component.
+///
+/// Only an implicit destination, or a `--out` directory, needs this name.
+fn space_file_name(name: Option<&str>) -> Result<String> {
+    let Some(name) = name else {
+        bail!("the Space did not name the File; pass --out with the path you want");
+    };
+    if !is_one_component(name) {
+        bail!(
+            "the Space named the File {name:?}, which is not a file name; pass --out with the path you want"
+        );
+    }
+
+    Ok(name.to_owned())
+}
+
+/// Whether a name can be one path component, wherever this CLI runs.
+fn is_one_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 async fn run(command: RunCommand) -> Result<()> {
@@ -713,4 +736,25 @@ fn text_of<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .with_context(|| format!("the answer has no {field}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::space_file_name;
+
+    #[test]
+    fn a_space_name_is_a_file_name_only_when_it_is_one_path_component() {
+        assert_eq!(space_file_name(Some("报告 v2.txt")).unwrap(), "报告 v2.txt");
+        for name in [
+            None,
+            Some(""),
+            Some("."),
+            Some(".."),
+            Some("a/b"),
+            Some("a\\b"),
+            Some("a\0b"),
+        ] {
+            assert!(space_file_name(name).is_err(), "{name:?}");
+        }
+    }
 }
