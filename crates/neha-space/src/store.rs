@@ -116,6 +116,12 @@ enum WriteRequest {
         request: AppendRequest,
         reply: oneshot::Sender<Result<AppendResult, StoreError>>,
     },
+    RecordCommand {
+        command: Id,
+        fingerprint: String,
+        result: serde_json::Value,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -241,6 +247,29 @@ impl Store {
         }))
     }
 
+    /// Records a command's result without appending events.
+    ///
+    /// An idempotent command that changed nothing still owes its caller the
+    /// same answer on a retry.
+    pub async fn record_command_result(
+        &self,
+        command: Id,
+        fingerprint: impl Into<String>,
+        result: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let (reply, answer) = oneshot::channel();
+        self.writer
+            .send(WriteRequest::RecordCommand {
+                command,
+                fingerprint: fingerprint.into(),
+                result,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterGone)?;
+        answer.await.map_err(|_| StoreError::WriterGone)?
+    }
+
     /// Stops the writer and closes the record.
     pub async fn close(mut self) -> Result<(), StoreError> {
         let (reply, answer) = oneshot::channel();
@@ -266,6 +295,15 @@ fn spawn_writer(
                 WriteRequest::Append { request, reply } => {
                     let _ = reply.send(append(&mut connection, request).await);
                 }
+                WriteRequest::RecordCommand {
+                    command,
+                    fingerprint,
+                    result,
+                    reply,
+                } => {
+                    let _ = reply
+                        .send(record_command(&mut connection, command, fingerprint, result).await);
+                }
                 WriteRequest::Shutdown { reply } => {
                     let _ = reply.send(());
                     break;
@@ -275,6 +313,40 @@ fn spawn_writer(
     });
 
     (writer, task)
+}
+
+async fn record_command(
+    connection: &mut SqliteConnection,
+    command: Id,
+    fingerprint: String,
+    result: serde_json::Value,
+) -> Result<(), StoreError> {
+    let mut transaction = connection.begin().await?;
+    let existing = sqlx::query("SELECT fingerprint, result FROM commands WHERE command_id = ?")
+        .bind(command.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+    if let Some(row) = existing {
+        let stored: String = row.try_get("fingerprint")?;
+        if stored != fingerprint {
+            return Err(StoreError::IdempotencyConflict(command));
+        }
+        transaction.commit().await?;
+        return Ok(());
+    }
+    let stored = serde_json::to_string(&result).map_err(|_| corrupt("command result"))?;
+    sqlx::query(
+        "INSERT INTO commands (command_id, fingerprint, first_seq, last_seq, result) \
+         VALUES (?, ?, 0, 0, ?)",
+    )
+    .bind(command.to_string())
+    .bind(fingerprint)
+    .bind(stored)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(())
 }
 
 async fn append(

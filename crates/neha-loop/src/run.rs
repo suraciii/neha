@@ -267,7 +267,11 @@ where
                 };
                 usage += reply.usage;
                 if reply.tool_calls.is_empty() {
-                    // A step with no actions completes when the Model answers.
+                    // A step with no actions completes when the Model answers,
+                    // but its reply still belongs in the record.
+                    recorder
+                        .reply(step, reply.content.clone(), Vec::new(), reply.usage)
+                        .await?;
                     recorder.step(step, reply.usage, 0).await?;
                     return Ok(final_reply(reply.content, usage));
                 }
@@ -1019,7 +1023,18 @@ mod tests {
         assert_eq!(usage.output, 1);
         assert_eq!(recorder.steps.len(), 1);
         assert!(recorder.started.is_empty());
-        assert!(recorder.replies.is_empty(), "a final answer has no calls");
+        assert_eq!(
+            recorder.replies,
+            [(
+                1,
+                Some("hello".to_owned()),
+                Vec::new(),
+                Usage {
+                    output: 1,
+                    ..Usage::default()
+                }
+            )]
+        );
         assert!(recorder.approvals.is_empty());
     }
 
@@ -1060,6 +1075,7 @@ mod tests {
                 "action_started",
                 "action_finished",
                 "step",
+                "reply",
                 "step",
             ]
         );
@@ -1147,15 +1163,26 @@ mod tests {
         assert_eq!(text, "done");
         assert_eq!(
             recorder.replies,
-            [(
-                1,
-                Some("let me look".to_owned()),
-                vec![recorded("call-7", "read_file", json!({"path": "a.txt"}))],
-                Usage {
-                    output: 3,
-                    ..Usage::default()
-                },
-            )]
+            [
+                (
+                    1,
+                    Some("let me look".to_owned()),
+                    vec![recorded("call-7", "read_file", json!({"path": "a.txt"}))],
+                    Usage {
+                        output: 3,
+                        ..Usage::default()
+                    },
+                ),
+                (
+                    2,
+                    Some("done".to_owned()),
+                    Vec::new(),
+                    Usage {
+                        output: 1,
+                        ..Usage::default()
+                    },
+                )
+            ]
         );
         // The action the Space approves is the one that starts.
         assert_eq!(recorder.approvals.len(), 1);
@@ -1226,7 +1253,19 @@ mod tests {
 
         assert_eq!(text, "done");
         assert!(succeeded);
-        assert!(recorder.replies.is_empty(), "the reply was recorded before");
+        assert_eq!(
+            recorder.replies,
+            [(
+                3,
+                Some("done".to_owned()),
+                Vec::new(),
+                Usage {
+                    output: 1,
+                    ..Usage::default()
+                }
+            )],
+            "the resumed step's final reply is recorded"
+        );
         // The approved action keeps its id and is not asked for again.
         assert_eq!(
             recorder.started[0],
@@ -1246,6 +1285,7 @@ mod tests {
                 "action_started",
                 "action_finished",
                 "step",
+                "reply",
                 "step",
             ]
         );
@@ -1874,6 +1914,7 @@ mod tests {
                 "action_started",
                 "action_finished",
                 "step",
+                "reply",
                 "step",
             ]
         );

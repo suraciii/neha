@@ -177,6 +177,9 @@ pub struct RunView {
     pub message: Id,
     /// The cursor of the event that queued it.
     pub seq: Seq,
+    /// The cursor of the event that started it, when it started.
+    #[serde(skip)]
+    pub started: Option<Seq>,
     /// Its status.
     pub status: RunStatus,
     /// The Bot's reply Message, when it succeeded.
@@ -453,6 +456,19 @@ impl State {
         runs
     }
 
+    /// Builds the Model history for a Chat up to a cursor.
+    ///
+    /// A resumed run rebuilds the history it saw when it started, not the
+    /// Conversation that continued while it waited.
+    #[must_use]
+    pub fn history_until(&self, chat: Id, until: Seq) -> Vec<(Author, String)> {
+        self.messages
+            .iter()
+            .filter(|message| message.chat == chat && message.seq <= until)
+            .map(|message| (message.author, self.model_text(message)))
+            .collect()
+    }
+
     /// Builds the Model history for a Chat, oldest first.
     ///
     /// A Message that carries a File ends with a line that names the File, so
@@ -636,6 +652,7 @@ impl Projection for State {
                         command: data.command,
                         message: data.message,
                         seq: event.seq,
+                        started: None,
                         status: RunStatus::Queued,
                         reply: None,
                         usage: None,
@@ -653,6 +670,7 @@ impl Projection for State {
                 match self.runs.entry(data.run) {
                     Entry::Occupied(mut run) => {
                         run.get_mut().status = RunStatus::Running;
+                        run.get_mut().started = Some(event.seq);
                         run.get_mut().computer = computer;
                     }
                     // A record this version wrote before it queued runs holds only
@@ -666,6 +684,7 @@ impl Projection for State {
                             command: data.command,
                             message: data.message,
                             seq: event.seq,
+                            started: Some(event.seq),
                             status: RunStatus::Running,
                             reply: None,
                             usage: None,
