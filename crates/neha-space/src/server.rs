@@ -431,6 +431,12 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                 break;
             };
             if text.len() > MAX_FRAME_BYTES {
+                let notice = ServerFrame::ProtocolError {
+                    message: "a frame exceeded the 1 MiB limit".to_owned(),
+                };
+                if let Ok(text) = serde_json::to_string(&notice) {
+                    let _ = sink.send(Message::Text(text.into())).await;
+                }
                 break;
             }
             if sink.send(Message::Text(text.into())).await.is_err() {
@@ -582,7 +588,16 @@ fn spawn_forwarder(
                         continue;
                     }
                     let seq = event.seq;
-                    if out.send(ServerFrame::Event { event }).await.is_err() {
+                    let frame = ServerFrame::Event { event };
+                    if !frame_fits(&frame) {
+                        let _ = out
+                            .send(ServerFrame::ProtocolError {
+                                message: format!("event {seq} is larger than the frame limit"),
+                            })
+                            .await;
+                        break;
+                    }
+                    if out.send(frame).await.is_err() {
                         break;
                     }
                     cursor = seq;
@@ -616,6 +631,10 @@ enum StreamError {
     Closed,
 }
 
+fn frame_fits(frame: &ServerFrame) -> bool {
+    serde_json::to_vec(frame).is_ok_and(|bytes| bytes.len() + 4096 <= MAX_FRAME_BYTES)
+}
+
 /// Sends every recorded page that fits a frame, then returns the cursor.
 async fn catch_up(
     reader: &StoreReader,
@@ -635,6 +654,10 @@ async fn catch_up(
                 StreamError::Store
             })?;
         if page.events.is_empty() {
+            if page.next > cursor {
+                cursor = page.next;
+                continue;
+            }
             if !sent {
                 out.send(ServerFrame::Snapshot {
                     cursor,
@@ -659,7 +682,7 @@ async fn catch_up(
                 cursor: candidate,
                 events: events.clone(),
             };
-            if serde_json::to_vec(&frame).is_ok_and(|bytes| bytes.len() + 4096 <= MAX_FRAME_BYTES) {
+            if frame_fits(&frame) {
                 next = candidate;
                 break;
             }
@@ -2479,5 +2502,105 @@ mod tests {
         ));
         assert!(frames.try_recv().is_err());
         store.close().await.unwrap();
+    }
+
+    async fn huge_provider() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let content = "x".repeat(neha::surface::MAX_FRAME_BYTES + 1024);
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n\
+             data: [DONE]\n\n"
+        );
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_live_event_is_reported_to_the_subscriber() {
+        let (_dir, running, invite) = running().await;
+        let (mut sender, token) = admin(&running, &invite).await;
+        let (base, provider_task) = huge_provider().await;
+        command(&mut sender, Id::new(), provider_base(base)).await;
+        let bot = command(
+            &mut sender,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+
+        let mut subscriber = open_socket(&running, &token).await;
+        subscriber
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: Some(100),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = next_frame(&mut subscriber).await;
+        sender
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command {
+                    id: Id::new(),
+                    command: CommandCall::MessageSend(MessageSend {
+                        chat,
+                        text: "answer with a huge reply".to_owned(),
+                    }),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+
+        let mut reported = false;
+        for _ in 0..50 {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                next_frame(&mut subscriber),
+            )
+            .await
+            .expect("the subscriber is never left waiting silently");
+            if let ServerFrame::ProtocolError { message } = frame {
+                assert!(message.contains("larger than the frame limit"), "{message}");
+                reported = true;
+                break;
+            }
+        }
+
+        assert!(reported, "an oversized live event must be reported");
+        sender.close(None).await.unwrap();
+        subscriber.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
     }
 }
