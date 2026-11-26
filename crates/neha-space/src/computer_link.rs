@@ -20,7 +20,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
 use neha_computer::channel::{DeviceFrame, HostFrame};
 use neha_computer::{Action, ActionResult, ActionStatus};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// Why a request failed because its Computer left.
 pub const OFFLINE: &str = "the Computer went offline";
@@ -51,17 +51,32 @@ pub struct ComputerLink {
     pending: Mutex<HashMap<u64, Pending>>,
     /// Set once the channel is closing; no new request may then enter.
     closed: AtomicBool,
+    /// Tells the connection handler that the channel is going away.
+    closer: watch::Sender<bool>,
 }
 
 impl ComputerLink {
     /// Builds a link over a frame writer.
     fn new(computer: Id, frames: mpsc::UnboundedSender<HostFrame>) -> Self {
+        let (closer, _) = watch::channel(false);
+
         Self {
             computer,
             frames,
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
+            closer,
         }
+    }
+
+    /// Returns a receiver that turns `true` once the channel is closing.
+    ///
+    /// The connection handler watches it: a link that a reconnect replaced, or
+    /// one the Space disconnected, must stop reading and close its socket
+    /// instead of lingering as a second connection for the same Computer.
+    #[must_use]
+    pub fn closed_signal(&self) -> watch::Receiver<bool> {
+        self.closer.subscribe()
     }
 
     /// Runs one action on the Computer and waits for its result.
@@ -144,6 +159,9 @@ impl ComputerLink {
     /// Fails every pending request and refuses new ones.
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // `send_replace` also works when no handler subscribed yet: it stores
+        // the value, so a later subscriber still sees the closed channel.
+        let _ = self.closer.send_replace(true);
         let pending: Vec<Pending> = self
             .pending
             .lock()
@@ -465,12 +483,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reconnect_replaces_the_old_channel_and_its_cleanup_keeps_the_new_one() {
+    async fn a_reconnect_replaces_the_old_channel_and_fails_its_work() {
         let (links, computer, old, _old_outgoing) = connected();
+        let signal = old.closed_signal();
+        let waiting = tokio::spawn({
+            let old = Arc::clone(&old);
+            async move { old.read(4, Id::new(), "/etc/hostname").await }
+        });
+        tokio::task::yield_now().await;
+
         let (frames, _new_outgoing) = mpsc::unbounded_channel();
         let new = links.connect(computer, frames);
-        assert!(old.is_closed());
 
+        assert!(old.is_closed());
+        assert!(*signal.borrow(), "the old handler is told to stop reading");
+        assert!(matches!(
+            waiting.await.unwrap(),
+            Answer::Gone(message) if message == OFFLINE
+        ));
         assert!(
             !links.disconnect(&old),
             "the old channel no longer speaks for the Computer"

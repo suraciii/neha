@@ -4,19 +4,23 @@
 //! mode everything stays inside one workspace directory: not isolated, not
 //! transported, and only for a Space on the same machine. In real mode it is
 //! one Bot's view of a real machine: reads reach what the machine user can
-//! read, writes reach one folder, and the shell runs under bubblewrap.
+//! read, writes reach one folder, and the shell runs under bubblewrap. Hidden
+//! roots are the exception to both reads and writes: the Computer's own
+//! directory, which holds its channel credential, is passed that way so a Bot
+//! never reaches it.
 
 use std::ffi::OsString;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::AsyncReadExt as _;
 use tokio::process::Command;
 
-use crate::action::{Action, ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
+use crate::action::{Action, ActionResult, ActionStatus, ByteError, ComputerRuntime, ToolOutput};
 use crate::output::{HEAD_BYTES, TAIL_BYTES, truncate};
 
 /// The time a shell command may run before its process group is killed.
@@ -49,7 +53,18 @@ pub struct LocalRuntime {
     /// folder on a real machine.
     root: PathBuf,
     mode: Mode,
+    /// The directories a real Bot must not read or write: the Computer's own
+    /// configuration directory, which holds its channel credential. Resolved,
+    /// so an opened file's real path can be compared against them.
+    hidden: Vec<PathBuf>,
     timeout: Duration,
+    /// The process group id of the shell that is running, or 0.
+    ///
+    /// A channel that goes away must kill the work it asked for, and it cannot
+    /// see the child: this slot is the hook. [`cancel_in_flight`] reads it.
+    ///
+    /// [`cancel_in_flight`]: LocalRuntime::cancel_in_flight
+    in_flight: AtomicU32,
 }
 
 /// Which kind of machine a runtime drives.
@@ -75,7 +90,9 @@ impl LocalRuntime {
         Ok(Self {
             root: workspace,
             mode: Mode::Managed,
+            hidden: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
+            in_flight: AtomicU32::new(0),
         })
     }
 
@@ -86,27 +103,69 @@ impl LocalRuntime {
     /// when bubblewrap is missing or cannot start a sandbox, so a daemon never
     /// serves a Computer it cannot fence.
     pub fn machine(folder: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
-        Self::machine_with_bwrap(folder, find_bwrap())
+        Self::machine_with_bwrap(folder.into(), find_bwrap(), Vec::new())
+    }
+
+    /// Opens one Bot's folder on a real machine, with directories it must not
+    /// reach.
+    ///
+    /// A hidden root is invisible to both of this Bot's read paths: the file
+    /// tools open a file and resolve the opened descriptor's real path, and
+    /// the shell gets a fresh tmpfs mounted over each root. A write never
+    /// leaves the Bot's folder, and a target that lands under a hidden root is
+    /// refused before it is opened.
+    pub fn machine_with_hidden(
+        folder: impl Into<PathBuf>,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        Self::machine_with_bwrap(folder.into(), find_bwrap(), hidden)
     }
 
     /// Opens a real-machine runtime with a specific `bwrap`, for tests.
     fn machine_with_bwrap(
         folder: impl Into<PathBuf>,
         bwrap: Option<PathBuf>,
+        hidden: Vec<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let folder = folder.into();
         std::fs::create_dir_all(&folder)?;
         let folder = std::fs::canonicalize(&folder)?;
+        // A hidden root must exist: it is the directory the daemon wrote its
+        // own configuration into, and a missing one would mean the tmpfs that
+        // hides it cannot be mounted.
+        let hidden = hidden
+            .into_iter()
+            .map(|root| std::fs::canonicalize(&root))
+            .collect::<Result<Vec<_>, _>>()?;
         let bwrap = bwrap.ok_or_else(|| {
             RuntimeError::NoSandbox("bwrap was not found on PATH; install bubblewrap".to_owned())
         })?;
-        probe_bwrap(&bwrap, &folder).map_err(RuntimeError::NoSandbox)?;
+        probe_bwrap(&bwrap, &folder, &hidden).map_err(RuntimeError::NoSandbox)?;
 
         Ok(Self {
             root: folder,
             mode: Mode::Machine { bwrap },
+            hidden,
             timeout: DEFAULT_TIMEOUT,
+            in_flight: AtomicU32::new(0),
         })
+    }
+
+    /// Kills the process group of the shell that is running, if one is.
+    ///
+    /// A caller whose channel closed has no result to wait for: this ends the
+    /// work instead of leaving it running. The running [`execute`] sees its
+    /// child die and returns its normal failed or timed-out result. Returns
+    /// whether a shell was running.
+    ///
+    /// [`execute`]: ComputerRuntime::execute
+    pub fn cancel_in_flight(&self) -> bool {
+        let pid = self.in_flight.swap(0, Ordering::SeqCst);
+        if pid == 0 {
+            return false;
+        }
+        kill_group(Some(pid));
+        true
     }
 
     /// Changes the shell time limit.
@@ -193,58 +252,6 @@ impl LocalRuntime {
         Ok(normalize_path(&self.requested(input)?))
     }
 
-    /// Resolves a write on a real machine: the target, or the nearest existing
-    /// parent of a new file, must canonicalize inside the Bot's folder, and a
-    /// symlink is never written through.
-    fn resolve_machine_write(&self, input: &str) -> Result<PathBuf, String> {
-        let requested = normalize_path(&self.requested(input)?);
-        let shown = self.relative(&requested);
-        let mut existing = requested.clone();
-        let mut missing: Vec<OsString> = Vec::new();
-        loop {
-            match std::fs::symlink_metadata(&existing) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() {
-                        return Err(format!(
-                            "the path uses a symlink, which is not written through: {shown}"
-                        ));
-                    }
-                    if !missing.is_empty() && !metadata.is_dir() {
-                        return Err(format!("{} is not a directory", self.relative(&existing)));
-                    }
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let Some(name) = existing.file_name() else {
-                        return Err(format!("{shown} cannot be written"));
-                    };
-                    missing.push(name.to_owned());
-                    existing.pop();
-                }
-                Err(error) => {
-                    return Err(format!(
-                        "cannot resolve {}: {error}",
-                        self.relative(&existing)
-                    ));
-                }
-            }
-        }
-        let canonical = std::fs::canonicalize(&existing)
-            .map_err(|error| format!("cannot resolve {}: {error}", self.relative(&existing)))?;
-        if !canonical.starts_with(&self.root) {
-            return Err(outside_folder(&shown));
-        }
-        let mut target = canonical;
-        for name in missing.into_iter().rev() {
-            target.push(name);
-        }
-        if !target.starts_with(&self.root) {
-            return Err(outside_folder(&shown));
-        }
-
-        Ok(target)
-    }
-
     /// Resolves a read for this mode's rules.
     fn resolve_read(&self, input: &str) -> Result<PathBuf, String> {
         match &self.mode {
@@ -253,11 +260,41 @@ impl LocalRuntime {
         }
     }
 
-    /// Resolves a write for this mode's rules.
-    fn resolve_write(&self, input: &str) -> Result<PathBuf, String> {
+    /// Writes bytes to a relative path, following this mode's write rules.
+    ///
+    /// Returns the path to show a reader (relative to the write root). A
+    /// managed workspace keeps its check-then-write path; a real machine writes
+    /// only through directory file descriptors, so no symlink is followed and
+    /// no check-to-open window exists.
+    fn write_to_root(&self, input: &str, bytes: &[u8]) -> Result<String, ByteError> {
         match &self.mode {
-            Mode::Managed => self.resolve_managed(input),
-            Mode::Machine { .. } => self.resolve_machine_write(input),
+            Mode::Managed => {
+                let path = self.resolve_managed(input).map_err(ByteError::Failed)?;
+                if let Some(parent) = path.parent()
+                    && let Err(error) = std::fs::create_dir_all(parent)
+                {
+                    return Err(ByteError::Failed(format!(
+                        "cannot create {}: {error}",
+                        parent.display()
+                    )));
+                }
+                std::fs::write(&path, bytes).map_err(|error| {
+                    ByteError::Failed(format!("cannot write {}: {error}", path.display()))
+                })?;
+
+                Ok(self.relative(&path))
+            }
+            Mode::Machine { .. } => {
+                // A write cannot leave the Bot's folder, so a hidden root is
+                // only reachable when that folder itself sits under one; that
+                // is a misconfiguration the daemon refuses, and a write is
+                // refused here before any descriptor is opened.
+                if self.is_hidden(&normalize_path(&self.root.join(input.trim()))) {
+                    return Err(ByteError::Failed(hidden_error(input.trim())));
+                }
+                write_machine_file(&self.root, input, bytes)?;
+                Ok(input.trim().to_owned())
+            }
         }
     }
 
@@ -268,12 +305,59 @@ impl LocalRuntime {
             .into_owned()
     }
 
+    /// Returns whether a path lies under one of this runtime's hidden roots.
+    fn is_hidden(&self, path: &Path) -> bool {
+        self.hidden.iter().any(|root| path.starts_with(root))
+    }
+
+    /// Opens a path for a read, refusing a target under a hidden root.
+    ///
+    /// The hidden check resolves the opened descriptor's real path, not the
+    /// path a caller typed, so a symlink or a swap between resolving and
+    /// opening cannot move a hidden file past it: the descriptor decides.
+    fn open_read(&self, path: &Path) -> Result<std::fs::File, String> {
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        self.refuse_hidden(&file, path)?;
+
+        Ok(file)
+    }
+
+    /// Opens a directory for listing, refusing a target under a hidden root.
+    fn open_directory(&self, path: &Path) -> Result<(), String> {
+        if self.hidden.is_empty() {
+            return Ok(());
+        }
+        let directory = std::fs::File::open(path)
+            .map_err(|error| format!("cannot list {}: {error}", self.relative(path)))?;
+        self.refuse_hidden(&directory, path)
+    }
+
+    /// Refuses an opened file or directory that resolves under a hidden root.
+    fn refuse_hidden(&self, opened: &std::fs::File, path: &Path) -> Result<(), String> {
+        if self.hidden.is_empty() {
+            return Ok(());
+        }
+        let shown = path.display();
+        let real = opened_path(opened)
+            .map_err(|error| format!("cannot verify what {shown} names: {error}"))?;
+        if self.is_hidden(&without_deleted_suffix(real)) {
+            return Err(hidden_error(shown));
+        }
+
+        Ok(())
+    }
+
     fn read_file(&self, path: &str) -> ActionResult {
         let path = match self.resolve_read(path) {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
-        let metadata = match std::fs::metadata(&path) {
+        let mut file = match self.open_read(&path) {
+            Ok(file) => file,
+            Err(error) => return ActionResult::failed(error),
+        };
+        let metadata = match file.metadata() {
             Ok(metadata) => metadata,
             Err(error) => {
                 return ActionResult::failed(format!("cannot read {}: {error}", path.display()));
@@ -285,11 +369,12 @@ impl LocalRuntime {
         let length = metadata.len();
         let mut bytes = Vec::new();
         let read: std::io::Result<Option<Vec<u8>>> = if length <= MAX_READ_BYTES as u64 {
-            std::fs::File::open(&path)
-                .and_then(|file| file.take(MAX_READ_BYTES as u64).read_to_end(&mut bytes))
+            (&mut file)
+                .take(MAX_READ_BYTES as u64)
+                .read_to_end(&mut bytes)
                 .map(|_| None)
         } else {
-            read_head_and_tail(&path, length, &mut bytes)
+            read_head_and_tail(&mut file, length, &mut bytes)
         };
         let tail = match read {
             Ok(Some(tail)) => tail,
@@ -313,22 +398,12 @@ impl LocalRuntime {
                 "the content is larger than {MAX_WRITE_BYTES} bytes"
             ));
         }
-        let path = match self.resolve_write(path) {
-            Ok(path) => path,
-            Err(error) => return ActionResult::failed(error),
-        };
-        if let Some(parent) = path.parent()
-            && let Err(error) = std::fs::create_dir_all(parent)
-        {
-            return ActionResult::failed(format!("cannot create {}: {error}", parent.display()));
-        }
-        match std::fs::write(&path, content) {
-            Ok(()) => ActionResult::succeeded(ToolOutput::full(format!(
-                "wrote {} bytes to {}",
-                content.len(),
-                self.relative(&path)
+        match self.write_to_root(path, content.as_bytes()) {
+            Ok(shown) => ActionResult::succeeded(ToolOutput::full(format!(
+                "wrote {} bytes to {shown}",
+                content.len()
             ))),
-            Err(error) => ActionResult::failed(format!("cannot write {}: {error}", path.display())),
+            Err(error) => ActionResult::failed(error.to_string()),
         }
     }
 
@@ -337,6 +412,9 @@ impl LocalRuntime {
             Ok(path) => path,
             Err(error) => return ActionResult::failed(error),
         };
+        if let Err(error) = self.open_directory(&path) {
+            return ActionResult::failed(error);
+        }
         let entries = match std::fs::read_dir(&path) {
             Ok(entries) => entries,
             Err(error) => {
@@ -374,7 +452,7 @@ impl LocalRuntime {
                 process
             }
             Mode::Machine { bwrap } => {
-                let mut process = sandbox_command(bwrap, &self.root);
+                let mut process = sandbox_command(bwrap, &self.root, &self.hidden);
                 process
                     .arg("/bin/sh")
                     .arg("-c")
@@ -415,6 +493,7 @@ impl LocalRuntime {
             Err(error) => return ActionResult::failed(format!("cannot start a shell: {error}")),
         };
         let pid = child.id();
+        let _in_flight = InFlight::start(&self.in_flight, pid);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_task = stdout.map(|stdout| tokio::spawn(read_bounded(stdout)));
@@ -503,22 +582,32 @@ impl ComputerRuntime for LocalRuntime {
     fn read_bytes(
         &self,
         path: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ByteError>> + Send {
         let resolved = self.resolve_read(path);
         async move {
-            let path = resolved?;
-            let metadata = std::fs::metadata(&path)
-                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            let path = resolved.map_err(ByteError::Failed)?;
+            let mut file = self.open_read(&path).map_err(ByteError::Failed)?;
+            let metadata = file.metadata().map_err(|error| {
+                ByteError::Failed(format!("cannot read {}: {error}", path.display()))
+            })?;
             if !metadata.is_file() {
-                return Err(format!("{} is not a file", path.display()));
+                return Err(ByteError::Failed(format!(
+                    "{} is not a file",
+                    path.display()
+                )));
             }
             if metadata.len() > neha::file::MAX_FILE_BYTES {
-                return Err(format!(
+                return Err(ByteError::Failed(format!(
                     "the file is larger than {} bytes",
                     neha::file::MAX_FILE_BYTES
-                ));
+                )));
             }
-            std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|error| {
+                ByteError::Failed(format!("cannot read {}: {error}", path.display()))
+            })?;
+
+            Ok(bytes)
         }
     }
 
@@ -531,23 +620,16 @@ impl ComputerRuntime for LocalRuntime {
         &self,
         path: &str,
         bytes: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
-        let resolved = self.resolve_write(path);
+    ) -> impl std::future::Future<Output = Result<(), ByteError>> + Send {
+        let path = path.to_owned();
         async move {
             if bytes.len() as u64 > neha::file::MAX_FILE_BYTES {
-                return Err(format!(
+                return Err(ByteError::Failed(format!(
                     "the content is larger than {} bytes",
                     neha::file::MAX_FILE_BYTES
-                ));
+                )));
             }
-            let path = resolved?;
-            if let Some(parent) = path.parent()
-                && let Err(error) = std::fs::create_dir_all(parent)
-            {
-                return Err(format!("cannot create {}: {error}", parent.display()));
-            }
-            std::fs::write(&path, bytes)
-                .map_err(|error| format!("cannot write {}: {error}", path.display()))
+            self.write_to_root(&path, &bytes).map(|_shown| ())
         }
     }
 }
@@ -562,7 +644,7 @@ fn find_bwrap() -> Option<PathBuf> {
 
 /// Starts one empty sandbox, so a Computer never serves a machine where
 /// bubblewrap is installed but cannot run.
-fn probe_bwrap(bwrap: &Path, folder: &Path) -> Result<(), String> {
+fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), String> {
     let version = std::process::Command::new(bwrap)
         .arg("--version")
         .stdin(Stdio::null())
@@ -572,7 +654,7 @@ fn probe_bwrap(bwrap: &Path, folder: &Path) -> Result<(), String> {
         return Err("bwrap --version failed; install a working bubblewrap".to_owned());
     }
     let output = std::process::Command::new(bwrap)
-        .args(sandbox_args(folder))
+        .args(sandbox_args(folder, hidden))
         .arg("/bin/sh")
         .arg("-c")
         .arg("true")
@@ -589,26 +671,43 @@ fn probe_bwrap(bwrap: &Path, folder: &Path) -> Result<(), String> {
     ))
 }
 
-/// The bubblewrap arguments that fence one real shell: the machine
-/// read-only, the Bot's folder writable, a fresh `/tmp`, and the folder as the
-/// working directory.
-fn sandbox_args(folder: &Path) -> Vec<OsString> {
+/// The bubblewrap arguments that fence one real shell.
+///
+/// The machine is read-only, `/dev` is a minimal device set of the sandbox's
+/// own (with its own `/dev/shm`), `/tmp` is fresh, the PID namespace is
+/// private, the sandbox dies with its daemon, and the Bot's folder is the one
+/// writable place and the working directory. Each hidden root gets a fresh
+/// empty tmpfs, so the Computer's own directory and its credential are absent
+/// from the sandbox. The network is not unshared: a real Computer uses its
+/// machine's network as before.
+fn sandbox_args(folder: &Path, hidden: &[PathBuf]) -> Vec<OsString> {
     let folder = folder.as_os_str();
-    let mut arguments: Vec<OsString> = [
-        "--ro-bind",
-        "/",
-        "/",
-        "--dev-bind",
-        "/dev",
-        "/dev",
-        "--proc",
-        "/proc",
-        "--tmpfs",
-        "/tmp",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect();
+    let mut arguments: Vec<OsString> = ["--ro-bind", "/", "/"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    // The tmpfs mounts come before /tmp's: a hidden root inside /tmp must be
+    // mounted while the host's /tmp is still what the sandbox sees.
+    for root in hidden {
+        arguments.push(OsString::from("--tmpfs"));
+        arguments.push(root.as_os_str().to_owned());
+    }
+    arguments.extend(
+        [
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/dev/shm",
+            "--unshare-pid",
+            "--die-with-parent",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
     arguments.push(OsString::from("--bind"));
     arguments.push(folder.to_owned());
     arguments.push(folder.to_owned());
@@ -620,9 +719,9 @@ fn sandbox_args(folder: &Path) -> Vec<OsString> {
 }
 
 /// Builds the fenced shell process without starting it.
-fn sandbox_command(bwrap: &Path, folder: &Path) -> Command {
+fn sandbox_command(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Command {
     let mut process = Command::new(bwrap);
-    process.args(sandbox_args(folder));
+    process.args(sandbox_args(folder, hidden));
     process
 }
 
@@ -646,9 +745,329 @@ fn normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
-/// The one refusal a real write outside the Bot's folder gets.
-fn outside_folder(shown: &str) -> String {
-    format!("the path is outside this Bot's writable folder: {shown}")
+/// The message a real-mode read or write returns for a hidden path.
+///
+/// It names the path but never carries any of its bytes: a refused read must
+/// not put the credential it protects into the model's context.
+fn hidden_error(shown: impl std::fmt::Display) -> String {
+    format!("the path is hidden from this Computer: {shown}")
+}
+
+/// Resolves the real path of an opened file or directory.
+///
+/// On Linux the descriptor itself names the file, so a path that changed
+/// between resolution and opening cannot hide what was actually opened. A
+/// machine without `/proc` cannot answer, and its reads are refused rather
+/// than checked against a name.
+#[cfg(target_os = "linux")]
+fn opened_path(opened: &std::fs::File) -> std::io::Result<PathBuf> {
+    use std::os::fd::AsRawFd as _;
+
+    std::fs::read_link(format!("/proc/self/fd/{}", opened.as_raw_fd()))
+}
+
+/// Refuses to guess an opened file's real path on a system without `/proc`.
+#[cfg(not(target_os = "linux"))]
+fn opened_path(_opened: &std::fs::File) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this system does not name an opened file's path",
+    ))
+}
+
+/// Drops the ` (deleted)` marker `/proc/self/fd` adds to an unlinked file, so
+/// a root that still names the file's place is still recognized.
+fn without_deleted_suffix(path: PathBuf) -> PathBuf {
+    let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return path;
+    };
+    let Some(name) = name.strip_suffix(" (deleted)") else {
+        return path;
+    };
+
+    path.with_file_name(name)
+}
+
+/// Writes bytes to a relative path inside `root` without following a symlink
+/// or writing a hard link.
+///
+/// Every component is opened with `O_NOFOLLOW` relative to the descriptor of
+/// its parent, so a shell that swaps in a symlink between two tool calls
+/// cannot move the write out of the folder and there is no check-then-open
+/// window. The target is opened without `O_TRUNC`, checked with `fstat` — a
+/// file this Computer wrote itself has one link — and only then truncated and
+/// written.
+#[cfg(unix)]
+fn write_machine_file(root: &Path, input: &str, bytes: &[u8]) -> Result<(), ByteError> {
+    use std::io::Write as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (shown, mut components) = write_components(input).map_err(ByteError::Failed)?;
+    let Some(last) = components.pop() else {
+        return Err(ByteError::Failed(format!(
+            "the path does not name a file: {shown}"
+        )));
+    };
+    let mut directory = open_root(root)?;
+    for name in components {
+        directory = open_or_create_directory(&directory, &name, &shown)?;
+    }
+    let mut file = open_target_file(&directory, &last, &shown)?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ByteError::Failed(format!("cannot write {shown}: {error}")))?;
+    if metadata.nlink() > 1 {
+        return Err(ByteError::Failed(format!(
+            "the path is a hard link, which is not written through: {shown}"
+        )));
+    }
+    file.set_len(0)
+        .and_then(|()| file.write_all(bytes))
+        .map_err(|error| ByteError::Failed(format!("cannot write {shown}: {error}")))
+}
+
+/// Writes bytes to a relative path inside a real machine's folder.
+///
+/// A real Computer only exists on Unix, where its folder can be opened as a
+/// directory and stepped into; the constructor already refuses any other
+/// platform.
+#[cfg(not(unix))]
+fn write_machine_file(_root: &Path, _input: &str, _bytes: &[u8]) -> Result<(), ByteError> {
+    Err(ByteError::Failed(
+        "a real Computer writes only on Unix".to_owned(),
+    ))
+}
+
+/// Opens the Bot's folder itself as a directory, refusing a symlink there.
+#[cfg(unix)]
+fn open_root(root: &Path) -> Result<std::fs::File, ByteError> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let name = std::ffi::CString::new(root.as_os_str().as_bytes()).map_err(|_| {
+        ByteError::Failed(format!(
+            "the Bot's folder path contains a NUL byte: {}",
+            root.display()
+        ))
+    })?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `name` is NUL-terminated; a successful return is a fresh
+    // descriptor this function owns.
+    let fd = unsafe { libc::open(name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(ByteError::Failed(format!(
+            "cannot open the Bot's folder: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: `fd` is a fresh descriptor from `open` and is owned here.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Splits a real machine's write path into safe components.
+///
+/// A real Computer writes only through its folder, so an absolute path or a
+/// `..` is refused before any descriptor is opened.
+#[cfg(unix)]
+fn write_components(input: &str) -> Result<(String, Vec<OsString>), String> {
+    let shown = input.trim();
+    if shown.is_empty() {
+        return Err("the path is empty".to_owned());
+    }
+    let path = Path::new(shown);
+    if path.is_absolute() {
+        return Err(format!(
+            "the path is absolute; a real Computer writes only inside the Bot's folder: {shown}"
+        ));
+    }
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => components.push(part.to_owned()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(format!(
+                    "the path uses `..`, which a real Computer does not write through: {shown}"
+                ));
+            }
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(format!(
+                    "the path is absolute; a real Computer writes only inside the Bot's folder: {shown}"
+                ));
+            }
+        }
+    }
+    if components.is_empty() {
+        return Err(format!("the path does not name a file: {shown}"));
+    }
+
+    Ok((shown.to_owned(), components))
+}
+
+#[cfg(unix)]
+fn c_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, String> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| format!("the path contains a NUL byte: {}", name.to_string_lossy()))
+}
+
+/// Opens one subdirectory of `parent` without following a symlink.
+#[cfg(unix)]
+fn open_directory_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = c_name(name)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent` is a live directory descriptor and `name` is
+    // NUL-terminated; a successful return is a fresh descriptor this function
+    // owns.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Opens one subdirectory of `parent`, creating it when absent.
+#[cfg(unix)]
+fn open_or_create_directory(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    shown: &str,
+) -> Result<std::fs::File, ByteError> {
+    use std::os::fd::AsRawFd as _;
+
+    match open_directory_at(parent, name) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let name_c = c_name(name).map_err(ByteError::Failed)?;
+            // SAFETY: `parent` is a live directory descriptor and `name_c` is
+            // NUL-terminated; `mkdirat` takes no ownership of it.
+            let created = unsafe { libc::mkdirat(parent.as_raw_fd(), name_c.as_ptr(), 0o755) };
+            if created != 0 {
+                let error = std::io::Error::last_os_error();
+                // Another writer may have created it between open and mkdir.
+                if error.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(ByteError::Failed(format!(
+                        "cannot create {} in the Bot's folder: {error}",
+                        name.to_string_lossy()
+                    )));
+                }
+            }
+            open_directory_at(parent, name)
+                .map_err(|error| directory_error(parent, name, shown, &error))
+        }
+        Err(error) => Err(directory_error(parent, name, shown, &error)),
+    }
+}
+
+/// Returns whether one directory entry is a symlink, without following it.
+#[cfg(unix)]
+fn is_symlink_at(parent: &std::fs::File, name: &std::ffi::OsStr) -> bool {
+    use std::os::fd::AsRawFd as _;
+
+    let Ok(name) = c_name(name) else {
+        return false;
+    };
+    // SAFETY: `parent` is a live directory descriptor, `name` is
+    // NUL-terminated, and `stat` is a plain C structure owned here.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: the pointers above outlive the call and name a live descriptor
+    // and a NUL-terminated path.
+    let found = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+
+    found == 0 && (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK
+}
+
+#[cfg(unix)]
+fn directory_error(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    shown: &str,
+    error: &std::io::Error,
+) -> ByteError {
+    match error.raw_os_error() {
+        Some(libc::ELOOP) => ByteError::Failed(format!(
+            "the path uses a symlink, which is not written through: {shown}"
+        )),
+        // A symlink opened with `O_DIRECTORY | O_NOFOLLOW` is not a directory,
+        // and either error may name it; the message says symlink for both.
+        Some(libc::ENOTDIR) if is_symlink_at(parent, name) => ByteError::Failed(format!(
+            "the path uses a symlink, which is not written through: {shown}"
+        )),
+        Some(libc::ENOTDIR) => ByteError::Failed(format!(
+            "cannot write {shown}: {} is not a directory",
+            name.to_string_lossy()
+        )),
+        _ => ByteError::Failed(format!("cannot write {shown}: {error}")),
+    }
+}
+
+/// Opens the file a write ends at, without following a symlink and without
+/// truncating it yet.
+#[cfg(unix)]
+fn open_target_file(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+    shown: &str,
+) -> Result<std::fs::File, ByteError> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = c_name(name).map_err(ByteError::Failed)?;
+    let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent` is a live directory descriptor and `name` is
+    // NUL-terminated; a successful return is a fresh descriptor owned here.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd >= 0 {
+        // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
+        return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ELOOP) => Err(ByteError::Failed(format!(
+            "the path uses a symlink, which is not written through: {shown}"
+        ))),
+        Some(libc::EISDIR) => Err(ByteError::Failed(format!(
+            "the path is a directory, not a file: {shown}"
+        ))),
+        _ => Err(ByteError::Failed(format!("cannot write {shown}: {error}"))),
+    }
+}
+
+/// Marks the shell whose process group is running until it is gone.
+struct InFlight<'a> {
+    slot: &'a AtomicU32,
+    pid: u32,
+}
+
+impl<'a> InFlight<'a> {
+    fn start(slot: &'a AtomicU32, pid: Option<u32>) -> Self {
+        let pid = pid.unwrap_or(0);
+        slot.store(pid, Ordering::SeqCst);
+        Self { slot, pid }
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        // A cancel may have taken the slot first; only clear our own pid.
+        let _ = self
+            .slot
+            .compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -809,12 +1228,13 @@ async fn drain(
     }
 }
 
+/// Reads the head and the tail of an opened file, which the caller already
+/// checked against the hidden roots.
 fn read_head_and_tail(
-    path: &Path,
+    file: &mut std::fs::File,
     length: u64,
     bytes: &mut Vec<u8>,
 ) -> std::io::Result<Option<Vec<u8>>> {
-    let mut file = std::fs::File::open(path)?;
     let head = HEAD_BYTES.min(length as usize);
     bytes.resize(head, 0);
     file.read_exact(bytes)?;
@@ -868,11 +1288,12 @@ pub enum RuntimeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU32;
     use std::time::Duration;
 
     use neha::file::MAX_FILE_BYTES;
 
-    use super::LocalRuntime;
+    use super::{DEFAULT_TIMEOUT, LocalRuntime, Mode};
     use crate::action::{Action, ActionStatus, ComputerRuntime};
 
     fn omitted_in_text(text: &str) -> u64 {
@@ -903,6 +1324,47 @@ mod tests {
             .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
 
         Some((directory, runtime))
+    }
+
+    /// Returns a real-machine runtime that hides one directory outside `/tmp`,
+    /// or `None` when the bwrap tests are off.
+    ///
+    /// `/var/tmp` stays visible in the sandbox, so a hidden root there proves
+    /// the sandbox hides it; a root under the replaced `/tmp` would prove
+    /// nothing.
+    fn machine_runtime_with_hidden() -> Option<(tempfile::TempDir, LocalRuntime, std::path::PathBuf)>
+    {
+        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+            return None;
+        }
+        let directory = outside_tempdir();
+        let hidden = directory.path().join("computer");
+        std::fs::create_dir(&hidden).unwrap();
+        let runtime = LocalRuntime::machine_with_hidden(
+            directory.path().join("bot"),
+            vec![std::path::PathBuf::from(&hidden)],
+        )
+        .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
+
+        Some((directory, runtime, hidden))
+    }
+
+    /// Builds a real-machine runtime for the file tools alone.
+    ///
+    /// The file tools never start a sandbox, so a test of their hidden-root
+    /// rules does not need bubblewrap; the shell rules have their own gated
+    /// test. Both paths are resolved, as the constructor resolves them.
+    fn file_runtime(root: &std::path::Path, hidden: &std::path::Path) -> LocalRuntime {
+        LocalRuntime {
+            root: std::fs::canonicalize(root).unwrap(),
+            mode: Mode::Machine {
+                bwrap: std::path::PathBuf::from("bwrap"),
+            },
+            hidden: vec![std::fs::canonicalize(hidden).unwrap()],
+            timeout: DEFAULT_TIMEOUT,
+            in_flight: AtomicU32::new(0),
+        }
     }
 
     /// A temporary directory outside `/tmp`, which the sandbox replaces with a
@@ -1044,11 +1506,15 @@ mod tests {
         std::os::unix::fs::symlink(&created_outside, &dangling).unwrap();
 
         for path in ["escape/outside.txt", "dangling"] {
-            let error = runtime.read_bytes(path).await.unwrap_err();
+            let error = runtime.read_bytes(path).await.unwrap_err().to_string();
             assert!(error.contains("symlink"), "{path}: {error}");
         }
         for path in ["escape/created-by-link.txt", "dangling"] {
-            let error = runtime.write_bytes(path, b"x".to_vec()).await.unwrap_err();
+            let error = runtime
+                .write_bytes(path, b"x".to_vec())
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("symlink"), "{path}: {error}");
         }
         assert!(!directory.path().join("created-by-link.txt").exists());
@@ -1060,9 +1526,13 @@ mod tests {
         let (_dir, runtime) = runtime();
         std::fs::create_dir(runtime.workspace().join("dir")).unwrap();
 
-        let error = runtime.read_bytes("dir").await.unwrap_err();
+        let error = runtime.read_bytes("dir").await.unwrap_err().to_string();
         assert!(error.contains("not a file"), "{error}");
-        let error = runtime.read_bytes("missing.txt").await.unwrap_err();
+        let error = runtime
+            .read_bytes("missing.txt")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("cannot read"), "{error}");
     }
 
@@ -1079,12 +1549,17 @@ mod tests {
                 .unwrap();
         }
 
-        let error = runtime.read_bytes("over.bin").await.unwrap_err();
+        let error = runtime
+            .read_bytes("over.bin")
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("larger than"), "{error}");
         let error = runtime
             .write_bytes("over.bin", vec![0; MAX_FILE_BYTES as usize + 1])
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("larger than"), "{error}");
         assert_eq!(
             std::fs::metadata(runtime.workspace().join("over.bin"))
@@ -1275,6 +1750,33 @@ mod tests {
         assert!(result.output.text.contains("bytes omitted"));
     }
 
+    #[tokio::test]
+    async fn cancel_in_flight_kills_the_running_shell() {
+        let (_dir, runtime) = runtime();
+        let runtime = std::sync::Arc::new(runtime.with_timeout(Duration::from_secs(30)));
+        assert!(!runtime.cancel_in_flight(), "nothing runs yet");
+
+        let running = tokio::spawn({
+            let runtime = std::sync::Arc::clone(&runtime);
+            async move {
+                runtime
+                    .execute(Action::Shell {
+                        command: "sleep 30".to_owned(),
+                    })
+                    .await
+            }
+        });
+        // The shell needs a moment to exist before it can be cancelled.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(runtime.cancel_in_flight(), "the running shell is cancelled");
+
+        let started = std::time::Instant::now();
+        let result = running.await.unwrap();
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let _ = runtime.cancel_in_flight();
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_machine_without_a_working_bubblewrap_is_refused() {
@@ -1283,17 +1785,19 @@ mod tests {
         use super::RuntimeError;
 
         let directory = tempfile::tempdir().unwrap();
-        let error = LocalRuntime::machine_with_bwrap(directory.path().join("bot"), None)
-            .err()
-            .expect("a missing bwrap must refuse the machine");
+        let error =
+            LocalRuntime::machine_with_bwrap(directory.path().join("bot"), None, Vec::new())
+                .err()
+                .expect("a missing bwrap must refuse the machine");
         assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
 
         let fake = directory.path().join("bwrap");
         std::fs::write(&fake, "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = LocalRuntime::machine_with_bwrap(directory.path().join("bot2"), Some(fake))
-            .err()
-            .expect("a bwrap that cannot start a sandbox must refuse the machine");
+        let error =
+            LocalRuntime::machine_with_bwrap(directory.path().join("bot2"), Some(fake), Vec::new())
+                .err()
+                .expect("a bwrap that cannot start a sandbox must refuse the machine");
         assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
     }
 
@@ -1316,11 +1820,23 @@ mod tests {
             "hello neha"
         );
 
-        // A relative path stays in the folder, through `.` and `..` that do
-        // not leave it.
+        // Overwriting truncates: a shorter write replaces the whole file.
         let written = runtime
             .execute(Action::WriteFile {
-                path: "notes/../top.txt".to_owned(),
+                path: "notes/hello.txt".to_owned(),
+                content: "hi".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("notes/hello.txt")).unwrap(),
+            "hi"
+        );
+
+        // `.` is allowed and creates the parent directories on the way.
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "./top.txt".to_owned(),
                 content: "top".to_owned(),
             })
             .await;
@@ -1330,31 +1846,31 @@ mod tests {
             "top"
         );
 
-        // An absolute path inside the folder names the same files, for reading
-        // and for writing.
+        // An absolute path reads the machine; a real Computer never writes one.
         let absolute = folder.join("notes/hello.txt");
         let read = runtime
             .execute(Action::ReadFile {
                 path: absolute.to_string_lossy().into_owned(),
             })
             .await;
-        assert_eq!(read.output.text, "hello neha");
-        let absolute_target = folder.join("notes/absolute.txt");
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "hi");
         let written = runtime
             .execute(Action::WriteFile {
-                path: absolute_target.to_string_lossy().into_owned(),
+                path: absolute.to_string_lossy().into_owned(),
                 content: "absolute".to_owned(),
             })
             .await;
-        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
-        assert_eq!(
-            std::fs::read_to_string(&absolute_target).unwrap(),
-            "absolute"
+        assert_eq!(written.status, ActionStatus::Failed, "{written:?}");
+        assert!(
+            written.output.text.contains("absolute"),
+            "{}",
+            written.output.text
         );
 
         let listed = runtime
             .execute(Action::ListFiles {
-                path: folder.to_string_lossy().into_owned(),
+                path: ".".to_owned(),
             })
             .await;
         assert!(
@@ -1375,8 +1891,7 @@ mod tests {
             return;
         };
         let outside = directory.path().join("outside.txt");
-        let absolute = outside.to_string_lossy().into_owned();
-        for path in ["../outside.txt", "nested/../../outside.txt", &absolute] {
+        for path in ["../outside.txt", "nested/../../outside.txt"] {
             let result = runtime
                 .execute(Action::WriteFile {
                     path: path.to_owned(),
@@ -1385,11 +1900,23 @@ mod tests {
                 .await;
             assert_eq!(result.status, ActionStatus::Failed, "{path}");
             assert!(
-                result.output.text.contains("writable folder"),
+                result.output.text.contains("`..`"),
                 "{path}: {}",
                 result.output.text
             );
         }
+        let result = runtime
+            .execute(Action::WriteFile {
+                path: outside.to_string_lossy().into_owned(),
+                content: "pwned".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed);
+        assert!(
+            result.output.text.contains("absolute"),
+            "{}",
+            result.output.text
+        );
         assert!(!outside.exists(), "a refused write leaves no file");
     }
 
@@ -1438,9 +1965,50 @@ mod tests {
         let error = runtime
             .write_bytes("escape/created.bin", b"pwned".to_vec())
             .await
-            .unwrap_err();
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("symlink"), "{error}");
         assert!(!directory.path().join("created.bin").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_tool_refuses_to_write_a_hard_link() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "host content").unwrap();
+        let linked = runtime.workspace().join("linked.txt");
+        std::fs::hard_link(&outside, &linked).unwrap();
+
+        let result = runtime
+            .execute(Action::WriteFile {
+                path: "linked.txt".to_owned(),
+                content: "pwned".to_owned(),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed);
+        assert!(
+            result.output.text.contains("hard link"),
+            "{}",
+            result.output.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "host content",
+            "the host inode was written"
+        );
+
+        let error = runtime
+            .write_bytes("linked.txt", b"pwned".to_vec())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("hard link"), "{error}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "host content");
+        // The link is still there: a refusal changes nothing.
+        assert_eq!(std::fs::metadata(&linked).unwrap().len(), 12);
     }
 
     #[tokio::test]
@@ -1510,15 +2078,177 @@ mod tests {
         let error = runtime
             .write_bytes("../pwned.bin", b"x".to_vec())
             .await
-            .unwrap_err();
-        assert!(error.contains("writable folder"), "{error}");
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`..`"), "{error}");
         assert!(!directory.path().join("pwned.bin").exists());
         let error = runtime
             .write_bytes(&outside.to_string_lossy(), b"x".to_vec())
             .await
-            .unwrap_err();
-        assert!(error.contains("writable folder"), "{error}");
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("absolute"), "{error}");
         assert_eq!(std::fs::read(&outside).unwrap(), b"take me");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_file_tool_refuses_a_hidden_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let hidden = directory.path().join("computer");
+        std::fs::create_dir(&hidden).unwrap();
+        let credential = hidden.join("computer.json");
+        std::fs::write(&credential, "channel-secret-must-not-leak").unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let visible = directory.path().join("visible.txt");
+        std::fs::write(&visible, "readable").unwrap();
+        let runtime = file_runtime(&root, &hidden);
+
+        // A hidden root is refused by both read paths, and its bytes never
+        // come back in the refusal.
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: credential.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Failed, "{read:?}");
+        assert!(
+            read.output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            read.output.text
+        );
+        assert!(!read.output.text.contains("channel-secret-must-not-leak"));
+        let error = runtime
+            .read_bytes(&credential.to_string_lossy())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the path is hidden from this Computer"),
+            "{error}"
+        );
+        assert!(!error.contains("channel-secret-must-not-leak"));
+        let listed = runtime
+            .execute(Action::ListFiles {
+                path: hidden.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(listed.status, ActionStatus::Failed, "{listed:?}");
+        assert!(
+            listed
+                .output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            listed.output.text
+        );
+        assert!(!listed.output.text.contains("computer.json"));
+
+        // A normal machine file next to the hidden root is still readable.
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: visible.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "readable");
+
+        // A symlink in the Bot's folder is caught after the open: the check
+        // follows the opened descriptor, not the path the caller typed.
+        std::os::unix::fs::symlink(&hidden, root.join("leak")).unwrap();
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: "leak/computer.json".to_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Failed, "{read:?}");
+        assert!(
+            read.output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            read.output.text
+        );
+        assert!(!read.output.text.contains("channel-secret-must-not-leak"));
+    }
+
+    #[tokio::test]
+    async fn a_machine_write_refuses_a_hidden_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        // A write can only reach a hidden root through a misconfigured folder;
+        // that is what the daemon refuses, and the write refuses it as well.
+        let runtime = file_runtime(&root, &root);
+
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "notes.txt".to_owned(),
+                content: "pwned".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Failed, "{written:?}");
+        assert!(
+            written
+                .output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            written.output.text
+        );
+        assert!(!root.join("notes.txt").exists());
+        let error = runtime
+            .write_bytes("notes.bin", b"pwned".to_vec())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the path is hidden from this Computer"),
+            "{error}"
+        );
+        assert!(!root.join("notes.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_cannot_read_a_hidden_root() {
+        let Some((directory, runtime, hidden)) = machine_runtime_with_hidden() else {
+            return;
+        };
+        let credential = hidden.join("computer.json");
+        std::fs::write(&credential, "channel-secret-must-not-leak").unwrap();
+        let visible = directory.path().join("visible.txt");
+        std::fs::write(&visible, "readable").unwrap();
+
+        let hidden_read = runtime
+            .execute(Action::Shell {
+                command: format!("cat {}", credential.display()),
+            })
+            .await;
+        assert_eq!(hidden_read.status, ActionStatus::Failed, "{hidden_read:?}");
+        assert!(
+            !hidden_read
+                .output
+                .text
+                .contains("channel-secret-must-not-leak"),
+            "the sandbox read the credential: {}",
+            hidden_read.output.text
+        );
+
+        // The shell still reads the machine outside the hidden root.
+        let visible_read = runtime
+            .execute(Action::Shell {
+                command: format!("cat {}", visible.display()),
+            })
+            .await;
+        assert_eq!(
+            visible_read.status,
+            ActionStatus::Succeeded,
+            "{visible_read:?}"
+        );
+        assert!(visible_read.output.text.contains("readable"));
     }
 
     #[tokio::test]
@@ -1615,6 +2345,88 @@ mod tests {
 
         assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
         assert!(!sink.exists(), "the sandbox escaped through a symlink");
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_has_its_own_dev_shm() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        if !std::path::Path::new("/dev/shm").is_dir() {
+            eprintln!("skipping: this machine has no /dev/shm");
+            return;
+        }
+        let id = std::process::id();
+        let host = format!("/dev/shm/neha-host-{id}");
+        let sandbox = format!("/dev/shm/neha-sandbox-{id}");
+        std::fs::write(&host, "host bytes").unwrap();
+        let result = runtime
+            .execute(Action::Shell {
+                command: format!("cat {host} 2>/dev/null; printf sandbox > {sandbox}"),
+            })
+            .await;
+        let _ = std::fs::remove_file(&host);
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            !result.output.text.contains("host bytes"),
+            "the host /dev/shm is visible in the sandbox: {}",
+            result.output.text
+        );
+        assert!(
+            !std::path::Path::new(&sandbox).exists(),
+            "the sandbox wrote the host's /dev/shm"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_has_its_own_pid_namespace() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let host = std::fs::read_link("/proc/self/ns/pid").expect("the host has a pid namespace");
+        let result = runtime
+            .execute(Action::Shell {
+                command: "readlink /proc/self/ns/pid".to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            !result
+                .output
+                .text
+                .contains(&host.to_string_lossy().into_owned()),
+            "the sandbox shares the host's PID namespace: {}",
+            result.output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_cannot_signal_a_host_process() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let mut host = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("the host spawns a sleep");
+        let pid = host.id();
+        let result = runtime
+            .execute(Action::Shell {
+                command: format!("kill -0 {pid}"),
+            })
+            .await;
+        let _ = host.kill();
+        let _ = host.wait();
+
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(
+            result.output.text.contains("No such process")
+                || result.output.text.contains("not permitted"),
+            "{}",
+            result.output.text
+        );
     }
 
     #[tokio::test]

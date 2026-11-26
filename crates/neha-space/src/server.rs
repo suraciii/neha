@@ -63,12 +63,21 @@ const SOURCE_ATTEMPTS: usize = 20;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_NAMES: usize = 1024;
 const HEARTBEAT: Duration = Duration::from_secs(30);
-/// How many pairings may wait for a User at once.
-const MAX_PENDING_PAIRINGS: usize = 16;
-/// How many failed pairing attempts one User may make in a window.
+/// How many pairing attempts one User may have in a window.
 const PAIRING_ATTEMPTS: usize = 10;
-/// The window failed pairing attempts are counted over.
+/// The window pairing attempts are counted over.
 const PAIRING_WINDOW: Duration = Duration::from_secs(60);
+/// The longest machine name or workspace a pairing start accepts, in bytes.
+const MAX_PAIRING_FIELD_BYTES: usize = 256;
+/// How long a Computer may take to send its Hello.
+///
+/// Ten seconds in a release build; the test build uses a short limit so the
+/// timeout is asserted without slowing the suite.
+const COMPUTER_HELLO: Duration = if cfg!(test) {
+    Duration::from_millis(200)
+} else {
+    Duration::from_secs(10)
+};
 /// How often the Space pings a Computer's channel.
 const COMPUTER_PING: Duration = Duration::from_secs(15);
 /// How long a Computer may stay silent before the channel is dropped.
@@ -90,8 +99,8 @@ pub struct SpaceServer {
     pub(crate) tool_timeout: Duration,
     /// The live channel of each connected real Computer.
     pub(crate) links: ComputerLinks,
-    /// Pairings that are waiting for a User, and pairing failures.
-    pub(crate) pairings: tokio::sync::Mutex<PairingBook>,
+    /// Pairing attempts that are running or recently failed, per account.
+    pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
     /// Set once the Space stops: no command may then start new work.
     closed: AtomicBool,
     runs: Arc<RunQueue>,
@@ -160,7 +169,7 @@ impl SpaceServer {
             events,
             tool_timeout,
             links: ComputerLinks::new(),
-            pairings: tokio::sync::Mutex::new(PairingBook::default()),
+            pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
             closed: AtomicBool::new(false),
             runs: Arc::new(RunQueue::new()),
             uploads: Mutex::new(std::collections::HashMap::new()),
@@ -209,7 +218,7 @@ impl SpaceServer {
             .route("/api/socket", get(socket))
             .route("/api/computer/socket", get(computer_socket))
             .route("/api/computers/pair", post(computer_pair_start))
-            .route("/api/computers/pair/{device}", get(computer_pair_poll))
+            .route("/api/computers/pair/{device}", post(computer_pair_poll))
             .route(
                 "/api/chats/{chat}/files",
                 post(file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
@@ -351,6 +360,7 @@ async fn start_with(
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
     recover_interrupted(&server.store, &server.state).await?;
+    reconcile_pairings(&server).await?;
     server.runs.wake_all(&server);
     let invite = server
         .invite_secret()
@@ -900,41 +910,53 @@ async fn computer_pair_start(
     Json(request): Json<PairStartRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let machine = request.machine.trim();
-    if machine.is_empty() {
-        return Err(ApiError::invalid_argument("the machine needs a name"));
+    if !is_pairing_text(machine) {
+        return Err(ApiError::invalid_argument(
+            "the machine name is not usable: it must be at most 256 bytes and carry no control characters",
+        ));
     }
     let workspace = request.workspace.trim();
-    if !Path::new(workspace).is_absolute() {
+    if !Path::new(workspace).is_absolute() || !is_pairing_text(workspace) {
         return Err(ApiError::invalid_argument(
-            "the workspace must be an absolute path",
+            "the workspace is not usable: it must be an absolute path of at most 256 bytes with no control characters",
         ));
     }
-    if !is_base64_secret(&request.token) || !is_base64_secret(&request.poll_secret) {
+    if !is_pairing_secret(&request.token) || !is_pairing_secret(&request.poll_secret) {
         return Err(ApiError::invalid_argument(
-            "the token and poll_secret must be base64",
+            "the token and poll_secret must be 32 bytes of URL-safe base64",
         ));
     }
-    let mut pairings = server.pairings.lock().await;
-    pairings.begin()?;
     let start = server
         .identity
         .begin_pairing(machine, workspace, &request.token, &request.poll_secret)
         .await
         .map_err(identity_error)?;
-    pairings.started(start.device.clone());
 
     Ok(Json(
         serde_json::json!({"device": start.device, "code": start.code}),
     ))
 }
 
-/// Returns whether a value is an unpadded URL-safe base64 secret.
-fn is_base64_secret(value: &str) -> bool {
-    !value.is_empty() && URL_SAFE_NO_PAD.decode(value).is_ok()
+/// Returns whether a pairing field is usable: bounded, non-empty, no controls.
+///
+/// Pairing is the only unauthenticated write, and both values reach a terminal
+/// and the record: a newline or an ANSI escape could forge either. The refusal
+/// never echoes the value back.
+fn is_pairing_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PAIRING_FIELD_BYTES
+        && !value.chars().any(char::is_control)
+}
+
+/// Returns whether a value is a 32-byte URL-safe base64 secret.
+fn is_pairing_secret(value: &str) -> bool {
+    URL_SAFE_NO_PAD
+        .decode(value)
+        .is_ok_and(|bytes| bytes.len() == 32)
 }
 
 #[derive(Deserialize)]
-struct PairPollQuery {
+struct PairPollRequest {
     secret: String,
 }
 
@@ -953,17 +975,16 @@ enum PairingReply {
 
 /// Answers a machine's pairing poll.
 ///
-/// A poll never changes the pairing: it is `pending` until a User enters the
-/// code and the pairing expires, after which the Space no longer knows it.
+/// The poll is a POST: the polling secret is a secret, and a request line ends
+/// up in proxy logs and browser history. A poll never changes the pairing.
 async fn computer_pair_poll(
     State(server): State<Arc<SpaceServer>>,
     PathParams(device): PathParams<String>,
-    query: Result<Query<PairPollQuery>, QueryRejection>,
+    Json(request): Json<PairPollRequest>,
 ) -> Result<Json<PairingReply>, ApiError> {
-    let Query(query) = query.map_err(|_| ApiError::invalid_argument("the poll needs a secret"))?;
     match server
         .identity
-        .pairing(&device, &query.secret)
+        .pairing(&device, &request.secret)
         .await
         .map_err(identity_error)?
     {
@@ -1009,16 +1030,20 @@ fn unauthorized_computer() -> ApiError {
 /// ways until the connection drops, the Computer stays silent for too long, or
 /// the Computer breaks the protocol.
 async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>, computer: Id) {
-    let hello = match socket.recv().await {
-        Some(Ok(Message::Text(text))) => match serde_json::from_str::<DeviceFrame>(text.as_str()) {
-            Ok(DeviceFrame::Hello {
-                version,
-                computer: named,
-                workspace: _,
-                sandbox,
-            }) => Some((version, named, sandbox)),
-            _ => None,
-        },
+    // A connection that never greets is not the Computer we paired: it must
+    // not hold a task open while waiting for a frame that may never come.
+    let hello = match tokio::time::timeout(COMPUTER_HELLO, socket.recv()).await {
+        Ok(Some(Ok(Message::Text(text)))) => {
+            match serde_json::from_str::<DeviceFrame>(text.as_str()) {
+                Ok(DeviceFrame::Hello {
+                    version,
+                    computer: named,
+                    workspace: _,
+                    sandbox,
+                }) => Some((version, named, sandbox)),
+                _ => None,
+            }
+        }
         _ => None,
     };
     // A daemon that cannot fence its machine never runs, and a connection that
@@ -1032,12 +1057,23 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
 
     let (frames, mut outgoing) = mpsc::unbounded_channel::<HostFrame>();
     let link = server.links.connect(computer, frames);
+    // When a Computer reconnects, it replaces its old link and this handler
+    // must stop: the Space already failed the old link's requests, and two
+    // readers acting as one Computer would race each other.
+    let mut closing = link.closed_signal();
     server.runs.wake_all(&server);
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + COMPUTER_PING, COMPUTER_PING);
     let mut last_pong = Instant::now();
     loop {
+        if *closing.borrow() {
+            break;
+        }
         tokio::select! {
+            changed = closing.changed() => {
+                let _ = changed;
+                break;
+            }
             message = socket.recv() => {
                 let Some(Ok(message)) = message else { break; };
                 let text = match message {
@@ -1081,6 +1117,9 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         }
     }
 
+    // Close from our side so a replaced Computer learns its channel moved
+    // instead of discovering it on its next write.
+    let _ = socket.send(Message::Close(None)).await;
     server.links.disconnect(&link);
     server.runs.wake_all(&server);
 }
@@ -1515,6 +1554,46 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
     }
 }
 
+/// Heals a pairing a crash left between its claim and its Computer's record.
+///
+/// `computer_add` claims the code, appends the Computer and its command result,
+/// then finishes the claim by writing the machine's token. A crash between the
+/// steps leaves one of two states, and this settles both before the Space
+/// accepts connections:
+///
+/// - the claim has no recorded Computer: roll it back, so the code works again
+///   and the machine keeps polling pending;
+/// - the record has the Computer but the claim is not finished: write the
+///   token, so the machine becomes approved and can authenticate.
+async fn reconcile_pairings(server: &Arc<SpaceServer>) -> Result<(), ServerError> {
+    for claim in server.identity.pairing_claims().await? {
+        let recorded = {
+            let state = server.state.lock().map_err(|_| {
+                ServerError::Store(StoreError::Corrupt("the Space state is locked".to_owned()))
+            })?;
+            state
+                .computers
+                .get(&claim.computer)
+                .is_some_and(|computer| computer.owner == claim.owner)
+        };
+        if recorded {
+            if !claim.finalized {
+                server
+                    .identity
+                    .finalize_pairing(claim.owner, claim.computer)
+                    .await?;
+            }
+        } else {
+            server
+                .identity
+                .release_pairing(claim.owner, claim.computer)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Finishes runs the previous Space run left working.
 ///
 /// A one-shot run is answered or failed; it is never silently dropped. The
@@ -1702,6 +1781,11 @@ pub(crate) fn identity_error(error: IdentityError) -> ApiError {
         IdentityError::NameTaken | IdentityError::AlreadyInitialized => {
             ApiError::new(StatusCode::CONFLICT, ErrorCode::Conflict, error.to_string())
         }
+        IdentityError::TooManyPendingPairings => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many Computers are waiting to pair; approve one or wait for it to expire",
+        ),
         IdentityError::InvalidCredentials => ApiError::new(
             StatusCode::UNAUTHORIZED,
             ErrorCode::Unauthorized,
@@ -1780,68 +1864,71 @@ impl LoginLimiter {
     }
 }
 
-/// The Space's memory of pairing attempts.
+/// The Space's memory of pairing attempts that are running or failed.
 ///
-/// The record holds the pairings that started; this book tracks only what the
-/// Space must refuse: more waiting pairings than it accepts, and too many
-/// failed codes from one account. Both are emptied as they age out, so a
-/// denial never outlives its window.
+/// A pairing code is cheap to guess at if a caller may fire attempts in
+/// parallel: two connections could both read a count below the limit and both
+/// proceed. An attempt therefore takes its place before any asynchronous work
+/// starts, and releases it once the attempt ends. Only failed attempts stay
+/// counted for the window; a success frees its place at once.
+///
+/// The book lives in memory, so it resets when the Space restarts. Each
+/// account has its own count; unrelated accounts never block one another.
 #[derive(Default)]
-pub struct PairingBook {
-    /// Pairings a machine started and no User approved, by device.
-    pending: HashMap<String, Instant>,
-    /// Failed approve attempts by account, inside the window.
+pub struct PairingAttempts {
+    /// Attempts that started and have not settle()d yet, by account.
+    running: HashMap<Id, Vec<Instant>>,
+    /// Failed attempts by account, inside the window.
     failures: HashMap<Id, Vec<Instant>>,
 }
 
-impl PairingBook {
-    /// Reserves room for one more waiting pairing.
-    pub(crate) fn begin(&mut self) -> Result<(), ApiError> {
+impl PairingAttempts {
+    /// Takes one attempt place for an account before its lookup runs.
+    ///
+    /// Returns `false` when the account already has a full window of attempts
+    /// or failed ones. The caller must call [`settle`](Self::settle) whatever
+    /// the attempt's outcome, or its place stays taken until the window moves.
+    pub(crate) fn reserve(&mut self, account: Id) -> bool {
         self.prune();
-        if self.pending.len() >= MAX_PENDING_PAIRINGS {
-            return Err(ApiError::new(
-                StatusCode::TOO_MANY_REQUESTS,
-                ErrorCode::RateLimited,
-                "too many Computers are waiting to pair; approve or wait for one to expire",
-            ));
+        let attempts = self.failures.get(&account).map_or(0, Vec::len)
+            + self.running.get(&account).map_or(0, Vec::len);
+        if attempts >= PAIRING_ATTEMPTS {
+            return false;
         }
-
-        Ok(())
-    }
-
-    /// Remembers a pairing a machine started.
-    pub(crate) fn started(&mut self, device: String) {
-        self.pending.insert(device, Instant::now());
-    }
-
-    /// Forgets a pairing a User approved.
-    pub(crate) fn approved(&mut self, device: &str) {
-        self.pending.remove(device);
-    }
-
-    /// Returns whether an account may try another pairing code.
-    pub(crate) fn attempt_allowed(&mut self, account: Id) -> bool {
-        self.prune();
-
-        self.failures
-            .get(&account)
-            .is_none_or(|attempts| attempts.len() < PAIRING_ATTEMPTS)
-    }
-
-    /// Counts one failed pairing attempt for an account.
-    pub(crate) fn record_failure(&mut self, account: Id) {
-        self.failures
+        self.running
             .entry(account)
             .or_default()
             .push(Instant::now());
+
+        true
     }
 
-    /// Drops pairings and failures that aged out of their window.
+    /// Releases the place [`reserve`](Self::reserve) took.
+    ///
+    /// A failed attempt stays counted for the window; a successful one or one
+    /// whose lookup failed for a reason the User did not cause frees the place.
+    pub(crate) fn settle(&mut self, account: Id, failed: bool) {
+        if let Some(running) = self.running.get_mut(&account) {
+            running.pop();
+            if running.is_empty() {
+                self.running.remove(&account);
+            }
+        }
+        if failed {
+            self.failures
+                .entry(account)
+                .or_default()
+                .push(Instant::now());
+        }
+    }
+
+    /// Drops attempts and failures that aged out of their window.
     fn prune(&mut self) {
         let now = Instant::now();
-        let pairing_ttl = Duration::from_secs(crate::identity::PAIRING_TTL_SECS.unsigned_abs());
-        self.pending
-            .retain(|_, started| now.duration_since(*started) < pairing_ttl);
+        self.running.retain(|_, attempts| {
+            attempts.retain(|at| now.duration_since(*at) < PAIRING_WINDOW);
+            !attempts.is_empty()
+        });
         self.failures.retain(|_, attempts| {
             attempts.retain(|at| now.duration_since(*at) < PAIRING_WINDOW);
             !attempts.is_empty()
@@ -6577,32 +6664,56 @@ mod tests {
     use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, WireAction};
     use neha_computer::{ActionStatus, ToolOutput};
 
-    use super::MAX_PENDING_PAIRINGS;
+    use crate::identity::MAX_PENDING_PAIRINGS;
+
+    use super::MAX_PAIRING_FIELD_BYTES;
 
     /// The workspace a fake real Computer reports.
     const MACHINE_WORKSPACE: &str = "/home/ada/.neha/workspace";
 
     fn machine_token() -> String {
-        URL_SAFE_NO_PAD.encode(b"fake-machine-token")
+        URL_SAFE_NO_PAD.encode([7_u8; 32])
     }
 
     fn machine_poll() -> String {
-        URL_SAFE_NO_PAD.encode(b"fake-poll-secret")
+        URL_SAFE_NO_PAD.encode([9_u8; 32])
+    }
+
+    /// The body a fake machine sends to start pairing.
+    fn pair_body(machine: &str, workspace: &str, token: &str, poll_secret: &str) -> Value {
+        json!({
+            "machine": machine,
+            "workspace": workspace,
+            "token": token,
+            "poll_secret": poll_secret,
+        })
+    }
+
+    async fn pair_start(running: &Running, body: &Value) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/api/computers/pair", running.url()))
+            .json(body)
+            .send()
+            .await
+            .unwrap()
     }
 
     /// Starts pairing a fake machine over HTTP and returns its device and code.
     async fn pair_machine(running: &Running) -> (String, String) {
-        let response = reqwest::Client::new()
-            .post(format!("{}/api/computers/pair", running.url()))
-            .json(&json!({
-                "machine": "laptop",
-                "workspace": MACHINE_WORKSPACE,
-                "token": machine_token(),
-                "poll_secret": machine_poll(),
-            }))
-            .send()
-            .await
-            .unwrap();
+        pair_machine_as(running, "laptop", MACHINE_WORKSPACE).await
+    }
+
+    /// Starts pairing a fake machine with the given name and workspace.
+    async fn pair_machine_as(
+        running: &Running,
+        machine: &str,
+        workspace: &str,
+    ) -> (String, String) {
+        let response = pair_start(
+            running,
+            &pair_body(machine, workspace, &machine_token(), &machine_poll()),
+        )
+        .await;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let body: Value = response.json().await.unwrap();
         let device = body["device"].as_str().unwrap().to_owned();
@@ -6615,10 +6726,8 @@ mod tests {
 
     async fn poll_pairing(running: &Running, device: &str, secret: &str) -> reqwest::Response {
         reqwest::Client::new()
-            .get(format!(
-                "{}/api/computers/pair/{device}?secret={secret}",
-                running.url()
-            ))
+            .post(format!("{}/api/computers/pair/{device}", running.url()))
+            .json(&json!({"secret": secret}))
             .send()
             .await
             .unwrap()
@@ -6813,57 +6922,281 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_rolls_back_a_claim_that_recorded_no_computer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let running = start(home.clone(), 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let token = session["token"].as_str().unwrap().to_owned();
+        let (device, code) = pair_machine(&running).await;
+        // The command claimed the code, then a crash stopped it before the
+        // Computer reached the record.
+        assert!(
+            running
+                .server
+                .identity
+                .reserve_pairing(&code, owner, Id::new())
+                .await
+                .unwrap()
+        );
+        running.shutdown().await;
+
+        let restarted = start(home, 0).await.unwrap();
+        let pending: Value = poll_pairing(&restarted, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            pending,
+            json!({"state": "pending"}),
+            "a claim without a recorded Computer is rolled back"
+        );
+        // The code is usable again through the real command.
+        let mut socket = open_socket(&restarted, &token).await;
+        let added = command(&mut socket, Id::new(), add_computer(&code)).await;
+        assert_eq!(added["kind"], "real");
+        let approved: Value = poll_pairing(&restarted, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(approved["state"], "approved");
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_finishes_a_claim_that_recorded_its_computer() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let running = start(home.clone(), 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let owner: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let (device, code) = pair_machine(&running).await;
+        let computer = Id::new();
+        assert!(
+            running
+                .server
+                .identity
+                .reserve_pairing(&code, owner, computer)
+                .await
+                .unwrap()
+        );
+        // The command appended its Computer, then the crash came before it
+        // could write the machine's token.
+        let draft = neha::record::EventDraft::new(
+            EventKind::ComputerCreated,
+            neha::record::Author::User(owner),
+            json!({
+                "computer": computer,
+                "owner": owner,
+                "kind": "real",
+                "workspace": MACHINE_WORKSPACE,
+            }),
+        );
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                format!("crash:{computer}"),
+                vec![draft],
+            ))
+            .await
+            .unwrap();
+        {
+            use crate::store::Projection as _;
+            let mut state = running.server.state.lock().unwrap();
+            for event in &appended.events {
+                state.apply(event).unwrap();
+            }
+        }
+        running.shutdown().await;
+
+        let restarted = start(home, 0).await.unwrap();
+        let approved: Value = poll_pairing(&restarted, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            approved,
+            json!({"state": "approved", "computer": computer}),
+            "a recorded Computer finishes its claim at start"
+        );
+        assert_eq!(
+            restarted
+                .server
+                .identity
+                .authenticate_computer(&machine_token())
+                .await
+                .unwrap(),
+            Some(computer),
+            "the machine can authenticate once the claim is finished"
+        );
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replayed_computer_add_records_one_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (device, code) = pair_machine(&running).await;
+        let command_id = Id::new();
+        let first = command(&mut socket, command_id, add_computer(&code)).await;
+        let second = command(&mut socket, command_id, add_computer(&code)).await;
+        assert_eq!(first, second, "a replay answers from the record");
+        let computer: Id = serde_json::from_value(first["id"].clone()).unwrap();
+        let approved: Value = poll_pairing(&running, &device, &machine_poll())
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(approved["computer"], json!(computer));
+
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let events = record(&root).await;
+        let created = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::ComputerCreated
+                    && event.data["computer"] == json!(computer)
+            })
+            .count();
+        assert_eq!(created, 1, "the replay must not record a second Computer");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn pairing_start_validates_its_fields_and_caps_pending_pairings() {
         let (_dir, running, _invite) = running().await;
-        let client = reqwest::Client::new();
-        let url = format!("{}/api/computers/pair", running.url());
+        let overlong = "m".repeat(MAX_PAIRING_FIELD_BYTES + 1);
+        let overlong_workspace = format!("/{}", "w".repeat(MAX_PAIRING_FIELD_BYTES));
+        let short_token = URL_SAFE_NO_PAD.encode([7_u8; 31]);
+        let long_token = URL_SAFE_NO_PAD.encode([7_u8; 33]);
+        let ansi_machine = "laptop\u{1b}[31mforged";
         let cases = [
-            json!({"machine": "  ", "workspace": MACHINE_WORKSPACE,
-                   "token": machine_token(), "poll_secret": machine_poll()}),
-            json!({"machine": "laptop", "workspace": "relative/dir",
-                   "token": machine_token(), "poll_secret": machine_poll()}),
-            json!({"machine": "laptop", "workspace": MACHINE_WORKSPACE,
-                   "token": "not base64!", "poll_secret": machine_poll()}),
-            json!({"machine": "laptop", "workspace": MACHINE_WORKSPACE,
-                   "token": machine_token(), "poll_secret": ""}),
+            pair_body("  ", MACHINE_WORKSPACE, &machine_token(), &machine_poll()),
+            pair_body("laptop", "relative/dir", &machine_token(), &machine_poll()),
+            pair_body("laptop", MACHINE_WORKSPACE, "not base64!", &machine_poll()),
+            pair_body("laptop", MACHINE_WORKSPACE, &machine_token(), ""),
+            pair_body(
+                &overlong,
+                MACHINE_WORKSPACE,
+                &machine_token(),
+                &machine_poll(),
+            ),
+            pair_body(
+                "laptop",
+                &overlong_workspace,
+                &machine_token(),
+                &machine_poll(),
+            ),
+            pair_body(
+                ansi_machine,
+                MACHINE_WORKSPACE,
+                &machine_token(),
+                &machine_poll(),
+            ),
+            pair_body("laptop", "/tmp/ws\n/tmp", &machine_token(), &machine_poll()),
+            pair_body("laptop", MACHINE_WORKSPACE, &short_token, &machine_poll()),
+            pair_body("laptop", MACHINE_WORKSPACE, &machine_token(), &long_token),
         ];
         for body in cases {
-            let refused = client.post(&url).json(&body).send().await.unwrap();
+            let refused = pair_start(&running, &body).await;
             assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
             let refused: Value = refused.json().await.unwrap();
             assert_eq!(refused["code"], "invalid_argument");
+            let message = refused["message"].as_str().unwrap();
+            assert!(
+                !message.contains("forged") && !message.contains(&overlong),
+                "a refusal must not echo the refused value: {message}"
+            );
         }
 
         for _ in 0..MAX_PENDING_PAIRINGS {
-            let started = client
-                .post(&url)
-                .json(&json!({
-                    "machine": "laptop",
-                    "workspace": MACHINE_WORKSPACE,
-                    "token": machine_token(),
-                    "poll_secret": machine_poll(),
-                }))
-                .send()
-                .await
-                .unwrap();
+            let started = pair_start(
+                &running,
+                &pair_body(
+                    "laptop",
+                    MACHINE_WORKSPACE,
+                    &machine_token(),
+                    &machine_poll(),
+                ),
+            )
+            .await;
             assert_eq!(started.status(), reqwest::StatusCode::OK);
         }
-        let capped = client
-            .post(&url)
-            .json(&json!({
-                "machine": "laptop",
-                "workspace": MACHINE_WORKSPACE,
-                "token": machine_token(),
-                "poll_secret": machine_poll(),
-            }))
-            .send()
-            .await
-            .unwrap();
+        let capped = pair_start(
+            &running,
+            &pair_body(
+                "laptop",
+                MACHINE_WORKSPACE,
+                &machine_token(),
+                &machine_poll(),
+            ),
+        )
+        .await;
         assert_eq!(capped.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
         let capped: Value = capped.json().await.unwrap();
         assert_eq!(capped["code"], "rate_limited");
 
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pairing_start_accepts_the_longest_fields() {
+        let (_dir, running, _invite) = running().await;
+        let machine = "m".repeat(MAX_PAIRING_FIELD_BYTES);
+        let workspace = format!("/{}", "w".repeat(MAX_PAIRING_FIELD_BYTES - 1));
+        assert_eq!(workspace.len(), MAX_PAIRING_FIELD_BYTES);
+
+        let started = pair_start(
+            &running,
+            &pair_body(&machine, &workspace, &machine_token(), &machine_poll()),
+        )
+        .await;
+
+        assert_eq!(started.status(), reqwest::StatusCode::OK);
+        running.shutdown().await;
+    }
+
+    #[test]
+    fn pairing_attempts_are_reserved_atomically_and_settled_by_outcome() {
+        let mut attempts = super::PairingAttempts::default();
+        let ada = Id::new();
+        let grace = Id::new();
+
+        // A successful attempt frees its place at once: ten bursts of ten may
+        // all start, one at a time.
+        for _ in 0..10 {
+            for _ in 0..10 {
+                assert!(attempts.reserve(ada));
+            }
+            for _ in 0..10 {
+                attempts.settle(ada, false);
+            }
+        }
+        // A failed one stays counted: after ten failures the window is full.
+        for _ in 0..10 {
+            assert!(attempts.reserve(ada));
+            attempts.settle(ada, true);
+        }
+        assert!(
+            !attempts.reserve(ada),
+            "a full window admits no more attempts"
+        );
+        // Another account has its own window.
+        assert!(
+            attempts.reserve(grace),
+            "accounts are counted apart from each other"
+        );
+        assert!(!attempts.reserve(ada));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6880,6 +7213,84 @@ mod tests {
             "an account may fail ten pairing attempts a minute"
         );
 
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_pairing_attempts_cannot_exceed_the_limit() {
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap().to_owned();
+        let attempts = 20;
+
+        // One command per connection: twenty commands would not overlap on one
+        // socket, and overlap is what the reservation must survive.
+        let mut tasks = Vec::new();
+        for _ in 0..attempts {
+            let mut socket = open_socket(&running, &token).await;
+            tasks.push(tokio::spawn(async move {
+                try_command(&mut socket, Id::new(), add_computer("ZZZZZZZZ")).await
+            }));
+        }
+        let mut refused = 0;
+        let mut limited = 0;
+        for result in futures_util::future::join_all(tasks).await {
+            match result.unwrap() {
+                Err((ErrorCode::InvalidArgument, _)) => refused += 1,
+                Err((ErrorCode::RateLimited, _)) => limited += 1,
+                other => panic!("unexpected pairing answer: {other:?}"),
+            }
+        }
+
+        assert_eq!(refused, 10, "a burst gets exactly the window's attempts");
+        assert_eq!(limited, attempts - 10);
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_channel_that_never_greets_is_closed() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (computer, machine) = paired_computer(&mut socket, &running).await;
+        let mut silent = raw_computer(&running, &machine).await;
+
+        let started = std::time::Instant::now();
+        assert!(
+            closed(&mut silent).await,
+            "a channel that never sends Hello must be closed"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the Hello timeout must close it promptly, took {:?}",
+            started.elapsed()
+        );
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        assert!(
+            !online_of(&listed, computer),
+            "a channel that never greeted is not online"
+        );
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconnect_closes_the_replaced_socket() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (computer, machine) = paired_computer(&mut socket, &running).await;
+        let mut first = connect_computer(&running, &machine, computer).await;
+        wait_online(&mut socket, computer).await;
+
+        // The same Computer opens a second channel: the Space keeps the new
+        // one and closes the old connection instead of serving both.
+        let mut second = connect_computer(&running, &machine, computer).await;
+        assert!(closed(&mut first).await, "the replaced socket must close");
+        wait_online(&mut socket, computer).await;
+
+        second.close(None).await.unwrap();
+        wait_offline(&mut socket, computer).await;
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }

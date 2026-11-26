@@ -38,6 +38,12 @@ pub const PAIRING_TTL_SECS: i64 = 600;
 /// How many tries a pairing code allows before it is void.
 pub const MAX_CODE_TRIES: i64 = 5;
 
+/// How many pairings may wait for a User at once.
+///
+/// A machine whose code nobody entered holds a slot until the code expires;
+/// the cap keeps an unauthenticated caller from filling the store with rows.
+pub const MAX_PENDING_PAIRINGS: i64 = 16;
+
 /// The bytes of random device identifier a pairing starts with.
 const DEVICE_BYTES: usize = 16;
 
@@ -90,6 +96,17 @@ pub struct PairingRequest {
     pub machine: String,
     /// The folder on the machine the Computer uses.
     pub workspace: String,
+}
+
+/// A pairing a User claimed, as the start-up reconciliation sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingClaim {
+    /// The User who entered the code.
+    pub owner: Id,
+    /// The Computer the claim is for.
+    pub computer: Id,
+    /// Whether the machine's token was recorded (`finalize_pairing` ran).
+    pub finalized: bool,
 }
 
 /// The Space's accounts, their tokens, and its paired Computers.
@@ -276,18 +293,73 @@ impl Identity {
         self.pairing_request_at(now(), code).await
     }
 
-    /// Bonds a pairing to a User and a Computer.
+    /// Claims a pairing for a User before the Computer is recorded.
     ///
-    /// The claim is one transaction: it marks the code used and records the
-    /// machine's token digest for the Computer. Returns `false` when the code
-    /// is unknown, already used, expired, or out of tries.
-    pub async fn claim_pairing(
+    /// One atomic update wins the code: `owner IS NULL` is the compare-and-set
+    /// that stops two Users from claiming the same machine. The claim is not
+    /// yet final: no Computer token exists, so the machine keeps polling
+    /// pending. The caller records the Computer, then
+    /// [`finalize_pairing`](Self::finalize_pairing); if the record write fails
+    /// it calls [`release_pairing`](Self::release_pairing) so the code works
+    /// again.
+    pub async fn reserve_pairing(
         &self,
         code: &str,
         owner: Id,
         computer: Id,
     ) -> Result<bool, IdentityError> {
-        self.claim_pairing_at(now(), code, owner, computer).await
+        self.reserve_pairing_at(now(), code, owner, computer).await
+    }
+
+    /// Finishes a claim by recording the machine's token digest.
+    ///
+    /// Returns `false` when the claim is gone (rolled back by a failed
+    /// command, or by the start-up reconciliation). Idempotent: calling it
+    /// again for the same Computer keeps one token row.
+    pub async fn finalize_pairing(&self, owner: Id, computer: Id) -> Result<bool, IdentityError> {
+        self.finalize_pairing_at(now(), owner, computer).await
+    }
+
+    /// Rolls a claim back so the code can be claimed again.
+    ///
+    /// A failed command's claim left no record, so the machine must stay
+    /// pending and the code must remain usable. Any token row written for the
+    /// claim is removed as well, so authentication never names a Computer the
+    /// record does not hold.
+    pub async fn release_pairing(&self, owner: Id, computer: Id) -> Result<bool, IdentityError> {
+        self.release_pairing_at(owner, computer).await
+    }
+
+    /// Returns every pairing that a User claimed, final or not.
+    ///
+    /// The Space reconciles these with its record at start: a claim whose
+    /// Computer is not recorded is rolled back, and a recorded Computer whose
+    /// claim is not final is finished. That closes both crash windows between
+    /// claiming a code, appending the record, and writing the token.
+    pub async fn pairing_claims(&self) -> Result<Vec<PairingClaim>, IdentityError> {
+        let rows = sqlx::query(
+            "SELECT c.owner, c.computer, \
+             EXISTS(SELECT 1 FROM computer_tokens t \
+                    WHERE t.token_hash = c.token_hash AND t.computer_id = c.computer) AS finalized \
+             FROM computer_codes c WHERE c.owner IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut claims = Vec::with_capacity(rows.len());
+        for row in rows {
+            let owner: Option<String> = row.try_get("owner")?;
+            let computer: Option<String> = row.try_get("computer")?;
+            let (Some(owner), Some(computer)) = (owner, computer) else {
+                return Err(IdentityError::Corrupt);
+            };
+            claims.push(PairingClaim {
+                owner: owner.parse().map_err(|_| IdentityError::Corrupt)?,
+                computer: computer.parse().map_err(|_| IdentityError::Corrupt)?,
+                finalized: row.try_get("finalized")?,
+            });
+        }
+
+        Ok(claims)
     }
 
     /// Returns the Computer a machine token belongs to.
@@ -318,24 +390,59 @@ impl Identity {
         let poll_hash = digest(poll_secret);
         let token_hash = digest(token);
         let expires_at = now.saturating_add(PAIRING_TTL_SECS.saturating_mul(1_000_000));
-        sqlx::query(
-            "INSERT INTO computer_codes (\
-             device_id, code_hash, poll_hash, token_hash, machine, workspace, \
-             owner, computer, created_at, expires_at, tries) \
-             VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0)",
-        )
-        .bind(&device)
-        .bind(code_hash.as_slice())
-        .bind(poll_hash.as_slice())
-        .bind(token_hash.as_slice())
-        .bind(machine)
-        .bind(workspace)
-        .bind(now)
-        .bind(expires_at)
-        .execute(&self.pool)
-        .await?;
+        // One write transaction holds the quota check and the insert together:
+        // `BEGIN IMMEDIATE` takes the write lock up front, so two machines
+        // starting at once cannot both read a count under the cap and insert.
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let inserted = async {
+            // An expired pairing can never be approved again, so its row stops
+            // holding a place in the quota.
+            sqlx::query("DELETE FROM computer_codes WHERE expires_at <= ?")
+                .bind(now)
+                .execute(&mut *connection)
+                .await?;
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM computer_codes WHERE owner IS NULL AND expires_at > ?",
+            )
+            .bind(now)
+            .fetch_one(&mut *connection)
+            .await?;
+            if waiting >= MAX_PENDING_PAIRINGS {
+                return Err(IdentityError::TooManyPendingPairings);
+            }
+            sqlx::query(
+                "INSERT INTO computer_codes (\
+                 device_id, code_hash, poll_hash, token_hash, machine, workspace, \
+                 owner, computer, created_at, expires_at, tries) \
+                 VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0)",
+            )
+            .bind(&device)
+            .bind(code_hash.as_slice())
+            .bind(poll_hash.as_slice())
+            .bind(token_hash.as_slice())
+            .bind(machine)
+            .bind(workspace)
+            .bind(now)
+            .bind(expires_at)
+            .execute(&mut *connection)
+            .await?;
 
-        Ok(PairingStart { device, code })
+            Ok(())
+        }
+        .await;
+        match inserted {
+            Ok(()) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(PairingStart { device, code })
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn pairing_at(
@@ -345,7 +452,7 @@ impl Identity {
         poll_secret: &str,
     ) -> Result<Option<PairingState>, IdentityError> {
         let row = sqlx::query(
-            "SELECT poll_hash, owner, computer, expires_at FROM computer_codes \
+            "SELECT poll_hash, token_hash, owner, computer, expires_at FROM computer_codes \
              WHERE device_id = ?",
         )
         .bind(device)
@@ -364,20 +471,37 @@ impl Identity {
             return Ok(None);
         }
 
+        // A pairing outlives its usefulness with its code: even an approved
+        // row stops answering once the pairing expired. The Computer and its
+        // token stay usable; only the poll answer goes away.
+        let expires_at: i64 = row.try_get("expires_at")?;
+        if now >= expires_at {
+            return Ok(None);
+        }
+        let token_hash: Vec<u8> = row.try_get("token_hash")?;
         let owner: Option<String> = row.try_get("owner")?;
         let computer: Option<String> = row.try_get("computer")?;
         match (owner, computer) {
             (Some(_), Some(computer)) => {
-                let computer = computer.parse().map_err(|_| IdentityError::Corrupt)?;
-                Ok(Some(PairingState::Approved { computer }))
-            }
-            (None, None) => {
-                let expires_at: i64 = row.try_get("expires_at")?;
-                if now >= expires_at {
-                    return Ok(None);
+                let computer: Id = computer.parse().map_err(|_| IdentityError::Corrupt)?;
+                // A claim that was not finished has no token row: the machine
+                // stays pending until the Space recorded its Computer and
+                // finalized the pairing.
+                let finalized: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM computer_tokens \
+                     WHERE token_hash = ? AND computer_id = ?)",
+                )
+                .bind(token_hash.as_slice())
+                .bind(computer.to_string())
+                .fetch_one(&self.pool)
+                .await?;
+                if finalized {
+                    Ok(Some(PairingState::Approved { computer }))
+                } else {
+                    Ok(Some(PairingState::Pending))
                 }
-                Ok(Some(PairingState::Pending))
             }
+            (None, None) => Ok(Some(PairingState::Pending)),
             _ => Err(IdentityError::Corrupt),
         }
     }
@@ -417,7 +541,7 @@ impl Identity {
         }))
     }
 
-    async fn claim_pairing_at(
+    async fn reserve_pairing_at(
         &self,
         now: i64,
         code: &str,
@@ -425,7 +549,8 @@ impl Identity {
         computer: Id,
     ) -> Result<bool, IdentityError> {
         let code_hash = digest(&normalize_code(code));
-        let mut transaction = self.pool.begin().await?;
+        // The compare-and-set is the whole claim: one update wins the row, and
+        // no other statement can run between the check and the write.
         let updated = sqlx::query(
             "UPDATE computer_codes SET owner = ?, computer = ? \
              WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
@@ -435,25 +560,72 @@ impl Identity {
         .bind(code_hash.as_slice())
         .bind(now)
         .bind(MAX_CODE_TRIES)
-        .execute(&mut *transaction)
+        .execute(&self.pool)
         .await?;
-        if updated.rows_affected() != 1 {
+
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn finalize_pairing_at(
+        &self,
+        now: i64,
+        owner: Id,
+        computer: Id,
+    ) -> Result<bool, IdentityError> {
+        let mut transaction = self.pool.begin().await?;
+        let token_hash: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
+        )
+        .bind(owner.to_string())
+        .bind(computer.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(token_hash) = token_hash else {
             transaction.rollback().await?;
             return Ok(false);
-        }
-        let token_hash: Vec<u8> =
-            sqlx::query_scalar("SELECT token_hash FROM computer_codes WHERE code_hash = ?")
-                .bind(code_hash.as_slice())
-                .fetch_one(&mut *transaction)
-                .await?;
+        };
         sqlx::query(
-            "INSERT INTO computer_tokens (token_hash, computer_id, created_at) VALUES (?, ?, ?)",
+            "INSERT OR IGNORE INTO computer_tokens (token_hash, computer_id, created_at) \
+             VALUES (?, ?, ?)",
         )
         .bind(token_hash.as_slice())
         .bind(computer.to_string())
         .bind(now)
         .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
+
+        Ok(true)
+    }
+
+    async fn release_pairing_at(&self, owner: Id, computer: Id) -> Result<bool, IdentityError> {
+        let mut transaction = self.pool.begin().await?;
+        let token_hash: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT token_hash FROM computer_codes WHERE owner = ? AND computer = ?",
+        )
+        .bind(owner.to_string())
+        .bind(computer.to_string())
+        .fetch_optional(&mut *transaction)
+        .await?;
+        let Some(token_hash) = token_hash else {
+            transaction.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query(
+            "UPDATE computer_codes SET owner = NULL, computer = NULL \
+             WHERE owner = ? AND computer = ?",
+        )
+        .bind(owner.to_string())
+        .bind(computer.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        // A claim is only released when its Computer is not recorded, and a
+        // recorded Computer is never released, so a token row here is stale.
+        sqlx::query("DELETE FROM computer_tokens WHERE token_hash = ? AND computer_id = ?")
+            .bind(token_hash.as_slice())
+            .bind(computer.to_string())
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
 
         Ok(true)
@@ -568,13 +740,16 @@ pub enum IdentityError {
     /// A stored value does not decode.
     #[error("identity record is corrupt")]
     Corrupt,
+    /// Too many machines wait for a User to enter their code.
+    #[error("too many pairings are waiting for a User")]
+    TooManyPendingPairings,
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Account, CODE_ALPHABET, Identity, IdentityError, MAX_CODE_TRIES, PAIRING_TTL_SECS,
-        PairingRequest, PairingState, digest,
+        Account, CODE_ALPHABET, Identity, IdentityError, MAX_CODE_TRIES, MAX_PENDING_PAIRINGS,
+        PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState, digest,
     };
     use crate::home::Home;
     use base64::Engine as _;
@@ -589,6 +764,54 @@ mod tests {
         let identity = Identity::open(&home).await.unwrap();
 
         (dir, home, identity)
+    }
+
+    /// Claims and finishes a pairing the way the command does, for tests that
+    /// only need a bonded Computer.
+    ///
+    /// The command's real order is reserve, append, finalize; these tests have
+    /// no record to append, so the two identity steps run together.
+    trait ClaimPairing {
+        async fn claim_pairing(
+            &self,
+            code: &str,
+            owner: Id,
+            computer: Id,
+        ) -> Result<bool, IdentityError>;
+        async fn claim_pairing_at(
+            &self,
+            now: i64,
+            code: &str,
+            owner: Id,
+            computer: Id,
+        ) -> Result<bool, IdentityError>;
+    }
+
+    impl ClaimPairing for Identity {
+        async fn claim_pairing(
+            &self,
+            code: &str,
+            owner: Id,
+            computer: Id,
+        ) -> Result<bool, IdentityError> {
+            if !self.reserve_pairing(code, owner, computer).await? {
+                return Ok(false);
+            }
+            self.finalize_pairing(owner, computer).await
+        }
+
+        async fn claim_pairing_at(
+            &self,
+            now: i64,
+            code: &str,
+            owner: Id,
+            computer: Id,
+        ) -> Result<bool, IdentityError> {
+            if !self.reserve_pairing_at(now, code, owner, computer).await? {
+                return Ok(false);
+            }
+            self.finalize_pairing(owner, computer).await
+        }
     }
 
     #[tokio::test]
@@ -737,6 +960,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reserved_pairing_is_pending_until_it_is_finalized() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+        let owner = Id::new();
+        let computer = Id::new();
+
+        assert!(
+            identity
+                .reserve_pairing(&start.code, owner, computer)
+                .await
+                .unwrap()
+        );
+
+        // The code is consumed, but the machine may not act yet: nothing has
+        // recorded its Computer and no token row exists.
+        assert_eq!(
+            identity.pairing(&start.device, "poll").await.unwrap(),
+            Some(PairingState::Pending)
+        );
+        assert_eq!(identity.authenticate_computer("token").await.unwrap(), None);
+        assert_eq!(
+            identity.pairing_claims().await.unwrap(),
+            vec![PairingClaim {
+                owner,
+                computer,
+                finalized: false,
+            }]
+        );
+
+        assert!(identity.finalize_pairing(owner, computer).await.unwrap());
+        assert_eq!(
+            identity.pairing(&start.device, "poll").await.unwrap(),
+            Some(PairingState::Approved { computer })
+        );
+        assert_eq!(
+            identity.authenticate_computer("token").await.unwrap(),
+            Some(computer),
+            "only the final step admits the machine"
+        );
+        assert!(
+            identity
+                .pairing_claims()
+                .await
+                .unwrap()
+                .first()
+                .is_some_and(|claim| claim.finalized)
+        );
+    }
+
+    #[tokio::test]
+    async fn releasing_a_reserved_pairing_makes_the_code_usable_again() {
+        let (_dir, _home, identity) = identity().await;
+        let start = identity
+            .begin_pairing("laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+        let owner = Id::new();
+        let computer = Id::new();
+        assert!(
+            identity
+                .reserve_pairing(&start.code, owner, computer)
+                .await
+                .unwrap()
+        );
+
+        assert!(identity.release_pairing(owner, computer).await.unwrap());
+
+        assert_eq!(
+            identity.pairing(&start.device, "poll").await.unwrap(),
+            Some(PairingState::Pending),
+            "a released claim leaves the machine waiting, not approved"
+        );
+        assert_eq!(identity.authenticate_computer("token").await.unwrap(), None);
+        assert!(identity.pairing_claims().await.unwrap().is_empty());
+        assert!(
+            identity
+                .pairing_request(&start.code)
+                .await
+                .unwrap()
+                .is_some(),
+            "the User may enter the code again"
+        );
+        assert!(
+            identity
+                .reserve_pairing(&start.code, Id::new(), Id::new())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn a_typed_code_ignores_case_and_surrounding_space() {
         let (_dir, _home, identity) = identity().await;
         let start = identity
@@ -787,6 +1104,139 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn an_approved_pairing_expires_with_its_code() {
+        let (_dir, _home, identity) = identity().await;
+        let now = 1_000_000_i64;
+        let start = identity
+            .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .await
+            .unwrap();
+        let computer = Id::new();
+        assert!(
+            identity
+                .claim_pairing_at(now, &start.code, Id::new(), computer)
+                .await
+                .unwrap()
+        );
+        let expires_at = now + PAIRING_TTL_SECS * 1_000_000;
+        assert_eq!(
+            identity
+                .pairing_at(expires_at - 1, &start.device, "poll")
+                .await
+                .unwrap(),
+            Some(PairingState::Approved { computer })
+        );
+        assert_eq!(
+            identity
+                .pairing_at(expires_at, &start.device, "poll")
+                .await
+                .unwrap(),
+            None,
+            "an expired pairing is not approved or pending, it is gone"
+        );
+        assert_eq!(
+            identity.authenticate_computer("token").await.unwrap(),
+            Some(computer),
+            "the Computer and its token outlive the pairing row"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_waiting_pairing_quota_is_kept_in_the_database() {
+        let (_dir, _home, identity) = identity().await;
+        let now = 1_000_000_i64;
+        let mut starts = Vec::new();
+        for _ in 0..MAX_PENDING_PAIRINGS {
+            starts.push(
+                identity
+                    .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let refused = identity
+            .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .await;
+        assert!(
+            matches!(refused, Err(IdentityError::TooManyPendingPairings)),
+            "a caller cannot fill the store with waiting pairings"
+        );
+
+        // An approved pairing leaves the waiting count, so one more may start.
+        assert!(
+            identity
+                .claim_pairing_at(now, &starts[0].code, Id::new(), Id::new())
+                .await
+                .unwrap()
+        );
+        assert!(
+            identity
+                .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_a_pairing_clears_expired_rows() {
+        let (_dir, _home, identity) = identity().await;
+        let now = 1_000_000_i64;
+        for _ in 0..MAX_PENDING_PAIRINGS {
+            identity
+                .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+                .await
+                .unwrap();
+        }
+        let later = now + PAIRING_TTL_SECS * 1_000_000;
+
+        let start = identity
+            .begin_pairing_at(later, "laptop", "/ws", "token", "poll")
+            .await
+            .expect("expired pairings stop holding the quota");
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "expired rows are deleted, the new one is kept");
+        assert_eq!(
+            identity
+                .pairing_at(later, &start.device, "poll")
+                .await
+                .unwrap(),
+            Some(PairingState::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn two_machines_cannot_start_past_the_quota_at_once() {
+        let (_dir, _home, identity) = identity().await;
+        let now = 1_000_000_i64;
+        for _ in 0..MAX_PENDING_PAIRINGS - 1 {
+            identity
+                .begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+                .await
+                .unwrap();
+        }
+
+        let (first, second) = tokio::join!(
+            identity.begin_pairing_at(now, "one", "/ws", "token", "poll"),
+            identity.begin_pairing_at(now, "two", "/ws", "token", "poll"),
+        );
+        let started = usize::from(first.is_ok()) + usize::from(second.is_ok());
+        let refused = usize::from(matches!(first, Err(IdentityError::TooManyPendingPairings)))
+            + usize::from(matches!(second, Err(IdentityError::TooManyPendingPairings)));
+        assert_eq!(started, 1, "only one of the two may take the last place");
+        assert_eq!(refused, 1);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, MAX_PENDING_PAIRINGS);
     }
 
     #[tokio::test]

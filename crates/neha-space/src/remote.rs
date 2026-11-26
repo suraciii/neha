@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use neha::id::Id;
-use neha_computer::{Action, ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
+use neha_computer::{Action, ActionResult, ActionStatus, ByteError, ComputerRuntime, ToolOutput};
 
 use crate::computer_link::{Answer, ComputerLink};
 
@@ -85,7 +85,7 @@ impl ComputerRuntime for RemoteRuntime {
     fn read_bytes(
         &self,
         path: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ByteError>> + Send {
         let path = path.to_owned();
         async move {
             let id = self.next_id();
@@ -93,13 +93,16 @@ impl ComputerRuntime for RemoteRuntime {
                 tokio::time::timeout(self.timeout, self.link.read(id, self.bot, &path)).await;
             match answer {
                 Ok(Answer::Bytes(bytes)) => Ok(bytes),
-                Ok(Answer::ActionResult(_)) => {
-                    Err("the Computer answered a File take with an action result".to_owned())
-                }
-                Ok(Answer::Failed(message) | Answer::Gone(message)) => Err(message),
+                Ok(Answer::ActionResult(_)) => Err(ByteError::Failed(
+                    "the Computer answered a File take with an action result".to_owned(),
+                )),
+                Ok(Answer::Failed(message)) => Err(ByteError::Failed(message)),
+                Ok(Answer::Gone(message)) => Err(ByteError::Lost(message)),
                 Err(_) => {
                     self.link.cancel(id);
-                    Err("the Computer did not answer in time".to_owned())
+                    Err(ByteError::Lost(
+                        "the Computer did not answer in time".to_owned(),
+                    ))
                 }
             }
         }
@@ -110,7 +113,7 @@ impl ComputerRuntime for RemoteRuntime {
         &self,
         path: &str,
         bytes: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), ByteError>> + Send {
         let path = path.to_owned();
         async move {
             let id = self.next_id();
@@ -124,13 +127,18 @@ impl ComputerRuntime for RemoteRuntime {
                 Ok(Answer::ActionResult(result)) if result.status == ActionStatus::Succeeded => {
                     Ok(())
                 }
-                Ok(Answer::ActionResult(result)) => Err(result
-                    .error
-                    .unwrap_or_else(|| "the Computer refused the File".to_owned())),
-                Ok(Answer::Failed(message) | Answer::Gone(message)) => Err(message),
+                Ok(Answer::ActionResult(result)) => {
+                    Err(ByteError::Failed(result.error.unwrap_or_else(|| {
+                        "the Computer refused the File".to_owned()
+                    })))
+                }
+                Ok(Answer::Failed(message)) => Err(ByteError::Failed(message)),
+                Ok(Answer::Gone(message)) => Err(ByteError::Lost(message)),
                 Err(_) => {
                     self.link.cancel(id);
-                    Err("the Computer did not answer in time".to_owned())
+                    Err(ByteError::Lost(
+                        "the Computer did not answer in time".to_owned(),
+                    ))
                 }
             }
         }
@@ -146,7 +154,7 @@ mod tests {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use neha::id::Id;
     use neha_computer::channel::{DeviceFrame, HostFrame};
-    use neha_computer::{Action, ActionStatus, ComputerRuntime, ToolOutput};
+    use neha_computer::{Action, ActionStatus, ByteError, ComputerRuntime, ToolOutput};
     use tokio::sync::mpsc;
 
     use super::{RemoteRuntime, TIMEOUT_GRACE};
@@ -296,6 +304,10 @@ mod tests {
             let runtime = Arc::clone(&runtime);
             async move { runtime.read_bytes("notes.txt").await }
         });
+        let write = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.write_bytes("out.bin", b"hello".to_vec()).await }
+        });
         tokio::task::yield_now().await;
         link.close();
 
@@ -306,7 +318,74 @@ mod tests {
             "an action whose answer never returned is unknown"
         );
         assert_eq!(result.error.as_deref(), Some(OFFLINE));
-        assert_eq!(read.await.unwrap(), Err(OFFLINE.to_owned()));
+        assert_eq!(
+            read.await.unwrap(),
+            Err(ByteError::Lost(OFFLINE.to_owned())),
+            "a File take whose channel went away is lost, not refused"
+        );
+        assert_eq!(
+            write.await.unwrap(),
+            Err(ByteError::Lost(OFFLINE.to_owned())),
+            "a File delivery whose channel went away is lost, not refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_file_request_is_failed_not_lost() {
+        let (runtime, link, _bot, mut outgoing) = remote();
+        let runtime = Arc::new(runtime);
+
+        let reader = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.read_bytes("missing.txt").await }
+        });
+        let HostFrame::Read { id, .. } = outgoing.recv().await.unwrap() else {
+            panic!("expected a read frame");
+        };
+        link.deliver(id, Answer::Failed("cannot read missing.txt".to_owned()));
+        assert_eq!(
+            reader.await.unwrap(),
+            Err(ByteError::Failed("cannot read missing.txt".to_owned()))
+        );
+
+        let writer = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.write_bytes("out.bin", b"hello".to_vec()).await }
+        });
+        let HostFrame::Write { id, .. } = outgoing.recv().await.unwrap() else {
+            panic!("expected a write frame");
+        };
+        link.deliver(id, Answer::Failed("the folder is full".to_owned()));
+        assert_eq!(
+            writer.await.unwrap(),
+            Err(ByteError::Failed("the folder is full".to_owned()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_request_that_never_answers_is_lost() {
+        let (runtime, _link, _bot, _outgoing) = remote();
+        let runtime = Arc::new(runtime);
+
+        let reader = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.read_bytes("notes.txt").await }
+        });
+        let writer = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.write_bytes("out.bin", b"hello".to_vec()).await }
+        });
+
+        let read = reader.await.unwrap().map(|_bytes| ());
+        let write = writer.await.unwrap();
+        for answer in [read, write] {
+            assert_eq!(
+                answer,
+                Err(ByteError::Lost(
+                    "the Computer did not answer in time".to_owned()
+                ))
+            );
+        }
     }
 
     #[test]

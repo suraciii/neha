@@ -36,9 +36,9 @@ Several Bots can be assigned the same Computer, and then share its files and log
 
 A User adds a real Computer in one of two ways.
 
-They install Neha on the machine and run `neha computer pair --space <url>` there, and the machine shows a pairing code. A client signed in to the Space enters the code with `neha computer add <code>`. [Identity](../identity/product.md) covers the pairing.
+They install Neha on the machine and start its pairing there, and the machine shows a code. A User signed in to the Space approves the pairing with that code. [Identity](../identity/product.md) covers the pairing, and [CLI](../cli/product.md) covers the commands.
 
-The machine serves the Space while it runs, and `neha computer run` starts it again after a stop.
+The machine serves the Space while it runs; after a stop, the User starts it again.
 
 In the desktop app, the User turns on the machine the app runs on. No code is needed, because the User is already signed in. The app asks when the first Bot is created.
 
@@ -68,7 +68,7 @@ A Bot can ask the User to take control, for example to sign in.
 
 A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a managed Computer, a Bot operates the browser. Programs with windows of their own run only on a real Computer.
 
-On a real Computer, a Bot starts in a folder of its own on that machine, and its default write range is that folder. It reads what the machine's user can read.
+On a real Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read.
 
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 

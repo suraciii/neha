@@ -243,6 +243,18 @@ pub enum PairingState {
     },
 }
 
+/// Returns an HTTP client for the pairing routes.
+///
+/// Pairing exchanges carry the machine's own secrets, and a redirect would
+/// hand them to whatever origin the answer names. The routes never redirect,
+/// so the client keeps any redirect answer as the refusal it is.
+fn pairing_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("cannot build the pairing HTTP client")
+}
+
 /// Asks a Space to start pairing this machine.
 pub async fn pair_start(
     space_url: &str,
@@ -252,7 +264,7 @@ pub async fn pair_start(
     poll_secret: &str,
 ) -> Result<PairingStart> {
     let body: Value = accepted(
-        reqwest::Client::new()
+        pairing_client()?
             .post(pair_start_url(space_url))
             .json(&pair_request_body(machine, workspace, token, poll_secret))
             .send()
@@ -271,9 +283,13 @@ pub async fn pair_start(
 }
 
 /// Asks a Space how the pairing this machine started is doing.
+///
+/// The polling secret travels in the body, not the URL: a request line ends up
+/// in proxy logs and shell history, a body does not.
 pub async fn pair_poll(space_url: &str, device: &str, poll_secret: &str) -> Result<PairingState> {
-    let response = reqwest::Client::new()
-        .get(pair_poll_url(space_url, device, poll_secret))
+    let response = pairing_client()?
+        .post(pair_poll_url(space_url, device))
+        .json(&pair_poll_body(poll_secret))
         .send()
         .await
         .context("the Space could not be reached")?;
@@ -296,12 +312,18 @@ fn pair_start_url(space_url: &str) -> String {
 
 /// The URL a machine polls its pairing at.
 ///
-/// The device and the secret are URL-safe base64, so they need no escaping.
-fn pair_poll_url(space_url: &str, device: &str, poll_secret: &str) -> String {
+/// The device is URL-safe base64, so it needs no escaping; the secret travels
+/// in the request body.
+fn pair_poll_url(space_url: &str, device: &str) -> String {
     format!(
-        "{}/api/computers/pair/{device}?secret={poll_secret}",
+        "{}/api/computers/pair/{device}",
         space_url.trim_end_matches('/')
     )
+}
+
+/// The body a machine sends to poll its pairing.
+fn pair_poll_body(poll_secret: &str) -> Value {
+    serde_json::json!({"secret": poll_secret})
 }
 
 /// The body a machine sends to start pairing.
@@ -600,8 +622,9 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
 
     use super::{
-        Credential, PairingState, SignedIn, disposition_name, pair_poll_url, pair_request_body,
-        pair_start_url, pairing_state, read_for_upload, wait_for_run_within,
+        Credential, PairingState, SignedIn, disposition_name, pair_poll, pair_poll_body,
+        pair_poll_url, pair_request_body, pair_start, pair_start_url, pairing_state,
+        read_for_upload, wait_for_run_within,
     };
 
     /// The CLI's credential for a Space at this address.
@@ -695,9 +718,15 @@ mod tests {
             "http://127.0.0.1:7337/api/computers/pair"
         );
         assert_eq!(
-            pair_poll_url("http://127.0.0.1:7337/", "device-a", "secret-a"),
-            "http://127.0.0.1:7337/api/computers/pair/device-a?secret=secret-a"
+            pair_poll_url("http://127.0.0.1:7337/", "device-a"),
+            "http://127.0.0.1:7337/api/computers/pair/device-a"
         );
+        assert_eq!(
+            pair_poll_body("secret-a"),
+            serde_json::json!({"secret": "secret-a"}),
+            "the polling secret travels in the body, not the URL"
+        );
+        assert!(!pair_poll_url("http://127.0.0.1:7337/", "device-a").contains("secret"));
     }
 
     #[test]
@@ -775,5 +804,70 @@ mod tests {
             started.elapsed()
         );
         space.abort();
+    }
+
+    /// Serves a 302 to `location` for every request.
+    async fn redirecting_space(
+        location: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::http::header::LOCATION;
+        use axum::response::IntoResponse;
+        use axum::routing::any;
+
+        let app = Router::new().fallback(any(move || {
+            let location = location.clone();
+            async move { (StatusCode::FOUND, [(LOCATION, location)]).into_response() }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn pairing_requests_do_not_follow_redirects() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A redirect target that counts every connection it receives.
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let target_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = target.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let (address, space) = redirecting_space(format!("http://{target_address}")).await;
+        let space_url = format!("http://{address}");
+
+        let started = pair_start(&space_url, "laptop", "/ws", "token", "poll").await;
+        assert!(
+            started.is_err(),
+            "a redirecting pairing start must not be accepted"
+        );
+        let polled = pair_poll(&space_url, "device", "secret").await;
+        assert!(
+            polled.is_err(),
+            "a redirecting pairing poll must not be accepted"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "pairing requests must not follow a redirect"
+        );
+
+        space.abort();
+        target_task.abort();
     }
 }

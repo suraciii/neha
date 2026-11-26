@@ -7,7 +7,7 @@
 - Python 3 for the documentation and hygiene checks in `scripts/`.
 - Node 24 and pnpm 11 for the browser client under `ui/`.
 - Docker, for the local S3 test store.
-- `bubblewrap` on Linux, for the sandbox a real Computer runs Bot actions in.
+- `bubblewrap` on Linux, for the sandbox a real Computer runs its shell commands in.
 
 The Rust workspace has no native dependencies. The browser client's dependencies are installed from its committed lockfile.
 
@@ -41,7 +41,7 @@ The `neha-space` tests include S3 tests that need a local SeaweedFS container; [
 
 ## A real Computer sandbox
 
-The machine-side process of a real Computer runs Bot actions in a `bubblewrap` sandbox on Linux. Install the package with the system's package manager:
+The machine-side process of a real Computer runs shell commands in a `bubblewrap` sandbox on Linux. Its file tools check write paths themselves and never start a command. Install the package with the system's package manager:
 
 ```bash
 sudo apt install bubblewrap      # Debian, Ubuntu

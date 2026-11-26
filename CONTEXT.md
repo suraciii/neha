@@ -33,7 +33,7 @@ The machine a Bot runs on, managed or real; a real Computer runs Neha. Each Bot 
 _Avoid_: host, sandbox (as the umbrella), VM, device
 
 **Workspace**:
-The durable file tree a Bot works in. A managed Computer keeps it in the Space, and a real Computer keeps it on its own disk.
+The durable file tree of one Bot. A managed Computer keeps it in the Space, and a real Computer keeps it in a directory on the machine.
 _Avoid_: home, volume, sandbox disk
 
 **Run**:

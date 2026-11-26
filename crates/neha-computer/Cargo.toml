@@ -20,7 +20,8 @@ serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
-# The workspace forbids unsafe code; this crate narrows that to one libc
-# call that kills a whole process group, and nothing else.
+# The workspace forbids unsafe code; this crate narrows that to the libc calls
+# a Computer needs: killing a shell's whole process group, and writing through
+# directory file descriptors so no symlink or hard link is followed.
 [lints.rust]
 unsafe_code = "allow"

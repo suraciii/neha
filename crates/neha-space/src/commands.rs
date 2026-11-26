@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{
     ActionStatus as RecordedActionStatus, Author, Event, EventDraft, EventKind, FileAdded,
@@ -29,12 +30,12 @@ use crate::identity::{Account, Identity, PairingRequest};
 use crate::model::{ModelClient, SpaceModel};
 use crate::remote::{RemoteRuntime, TIMEOUT_GRACE};
 use crate::secrets::Secrets;
-use crate::server::{ApiError, PairingBook, identity_error};
+use crate::server::{ApiError, PairingAttempts, identity_error};
 use crate::state::{BotView, ChatView, ComputerView, ModelView, ProviderView, RunStatus, State};
 use crate::store::{AppendRequest, AppendResult, CommandRecord, Projection, Store};
 
 use neha_computer::{
-    Action, ActionResult, ActionStatus, ComputerRuntime, LocalRuntime, ToolOutput,
+    Action, ActionResult, ActionStatus, ByteError, ComputerRuntime, LocalRuntime, ToolOutput,
 };
 use neha_loop::{DeliveredFile, FileHost, LoopError, Recorder, RunOutcome, RunRequest, TakenFile};
 
@@ -100,7 +101,7 @@ pub struct CommandContext<'a> {
     /// The live Computer channels.
     pub links: &'a ComputerLinks,
     /// The Space's pairing attempts.
-    pub pairings: &'a tokio::sync::Mutex<PairingBook>,
+    pub pairings: &'a tokio::sync::Mutex<PairingAttempts>,
 }
 
 /// Runs one command for an account.
@@ -506,32 +507,27 @@ async fn computer_add(
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
-    if !context.pairings.lock().await.attempt_allowed(account.id) {
+    // Take the attempt's place before any lookup: two connections cannot both
+    // read a count below the limit and then both proceed.
+    if !context.pairings.lock().await.reserve(account.id) {
         return Err(rate_limited(
             "too many pairing attempts; wait a minute and try again",
         ));
     }
-    let Some(PairingRequest {
-        device, workspace, ..
-    }) = context
-        .identity
-        .pairing_request(&code)
-        .await
-        .map_err(identity_error)?
-    else {
-        context.pairings.lock().await.record_failure(account.id);
-        return Err(invalid_pairing_code());
+    // Only a refused code stays counted as a failure; a successful approval,
+    // or a lookup that failed for a reason the User did not cause, frees the
+    // place at once.
+    let (workspace, computer) = match approve_pairing(context, account, &code).await {
+        Ok(approved) => {
+            context.pairings.lock().await.settle(account.id, false);
+            approved
+        }
+        Err(error) => {
+            let failed = error.code() == ErrorCode::InvalidArgument;
+            context.pairings.lock().await.settle(account.id, failed);
+            return Err(error);
+        }
     };
-    let computer = Id::new();
-    if !context
-        .identity
-        .claim_pairing(&code, account.id, computer)
-        .await
-        .map_err(identity_error)?
-    {
-        context.pairings.lock().await.record_failure(account.id);
-        return Err(invalid_pairing_code());
-    }
 
     let draft = EventDraft::new(
         EventKind::ComputerCreated,
@@ -550,7 +546,7 @@ async fn computer_add(
         online: false,
         workspace,
     });
-    let appended = append(
+    let appended = match append(
         context.store,
         context.state,
         command_id,
@@ -559,12 +555,41 @@ async fn computer_add(
         Some(result.clone()),
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            // The record did not take the Computer, so the claim must not
+            // stay: the machine keeps polling pending and the User may enter
+            // the code again. A release that also fails is healed by the next
+            // start's reconciliation, which rolls back claims with no record.
+            if let Err(release) = context.identity.release_pairing(account.id, computer).await {
+                eprintln!("neha: cannot release a pairing claim: {release}");
+            }
+            return Err(error);
+        }
+    };
     if appended.existing {
+        // A replayed command already recorded its Computer; this claim cannot
+        // be the one the record names, so give it back.
+        let _ = context.identity.release_pairing(account.id, computer).await;
         return recorded_outcome(context.store, command_id).await;
     }
-    // The pairing approved, so it stops holding a pending slot.
-    context.pairings.lock().await.approved(&device);
+    // Finish the claim by recording the machine's token. A failure here leaves
+    // the record with its Computer and the start-up reconciliation writes the
+    // token, so no machine is left approved without a working token.
+    if let Err(error) = context
+        .identity
+        .finalize_pairing(account.id, computer)
+        .await
+    {
+        eprintln!("neha: cannot finish a pairing claim: {error}");
+        context
+            .identity
+            .finalize_pairing(account.id, computer)
+            .await
+            .map_err(identity_error)?;
+    }
 
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
@@ -572,6 +597,37 @@ async fn computer_add(
         queued: None,
         events: appended.events,
     })
+}
+
+/// Looks a pairing code up and claims it for this User.
+///
+/// Returns the machine's workspace and the Computer identifier the command will
+/// record. A code that is unknown, expired, used, or out of tries is refused
+/// with the same message so the caller learns nothing about it.
+async fn approve_pairing(
+    context: &CommandContext<'_>,
+    account: &Account,
+    code: &str,
+) -> Result<(String, Id), ApiError> {
+    let Some(PairingRequest { workspace, .. }) = context
+        .identity
+        .pairing_request(code)
+        .await
+        .map_err(identity_error)?
+    else {
+        return Err(invalid_pairing_code());
+    };
+    let computer = Id::new();
+    if !context
+        .identity
+        .reserve_pairing(code, account.id, computer)
+        .await
+        .map_err(identity_error)?
+    {
+        return Err(invalid_pairing_code());
+    }
+
+    Ok((workspace, computer))
 }
 
 /// Returns the Computers a User owns, in creation order.
@@ -979,7 +1035,7 @@ impl ComputerRuntime for RunRuntime {
     fn read_bytes(
         &self,
         path: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ByteError>> + Send {
         let path = path.to_owned();
         async move {
             match self {
@@ -994,7 +1050,7 @@ impl ComputerRuntime for RunRuntime {
         &self,
         path: &str,
         bytes: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), ByteError>> + Send {
         let path = path.to_owned();
         async move {
             match self {

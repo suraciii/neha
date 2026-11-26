@@ -23,7 +23,7 @@ The command surface is the set of commands a Space accepts and the events it sen
 
 A real Computer is reached through the CLI: the binary that runs `neha computer pair` is the daemon that `neha computer run` starts.
 
-The daemon listens on no network port. It holds one outgoing connection and no record, and it runs the actions the Space sends with the machine's rights.
+The daemon holds no record and runs the actions the Space sends with the machine's rights. [Computer](../computer/design.md#the-channel) covers the connection it makes and what crosses it.
 
 The `neha computer add` and `neha computer list` commands, and `neha bot create --computer`, are part of the command surface.
 

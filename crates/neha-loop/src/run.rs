@@ -11,7 +11,7 @@ use std::path::Path;
 
 use neha::id::Id;
 use neha::usage::Usage;
-use neha_computer::{ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
+use neha_computer::{ActionResult, ActionStatus, ByteError, ComputerRuntime, ToolOutput};
 use serde_json::Value;
 use thiserror::Error;
 
@@ -213,6 +213,23 @@ where
     })
 }
 
+/// Turns a File transfer's error into the action's result.
+///
+/// A lost answer means whether the bytes moved is unknown, so the run ends the
+/// way any lost action does instead of asking the Model and finishing as if
+/// nothing happened. A refusal is an ordinary failed tool result the Model can
+/// read and work around.
+fn byte_failure(error: ByteError) -> ActionResult {
+    match error {
+        ByteError::Failed(message) => ActionResult::failed(message),
+        ByteError::Lost(message) => ActionResult {
+            status: ActionStatus::Unknown,
+            output: ToolOutput::full(message.clone()),
+            error: Some(message),
+        },
+    }
+}
+
 /// Puts one File into the Workspace under its name.
 async fn take_file<R, F>(runtime: &R, files: &F, file: Id) -> ActionResult
 where
@@ -226,7 +243,7 @@ where
     let path = workspace_name(&taken.name, &file);
     let bytes = taken.bytes.len();
     if let Err(error) = runtime.write_bytes(&path, taken.bytes).await {
-        return ActionResult::failed(error);
+        return byte_failure(error);
     }
     ActionResult::succeeded(ToolOutput::full(format!(
         "took {} ({bytes} bytes) as {path}",
@@ -242,7 +259,7 @@ where
 {
     let bytes = match runtime.read_bytes(path).await {
         Ok(bytes) => bytes,
-        Err(error) => return ActionResult::failed(error),
+        Err(error) => return byte_failure(error),
     };
     let name = match name {
         Some(name) => name,
@@ -313,7 +330,9 @@ mod tests {
 
     use neha::id::Id;
     use neha::usage::Usage;
-    use neha_computer::{Action, ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
+    use neha_computer::{
+        Action, ActionResult, ActionStatus, ByteError, ComputerRuntime, ToolOutput,
+    };
     use serde_json::{Value, json};
 
     use super::{LoopError, Recorder, RunRequest, run};
@@ -391,7 +410,10 @@ mod tests {
         }
 
         #[allow(clippy::manual_async_fn)]
-        fn read_bytes(&self, path: &str) -> impl Future<Output = Result<Vec<u8>, String>> + Send {
+        fn read_bytes(
+            &self,
+            path: &str,
+        ) -> impl Future<Output = Result<Vec<u8>, ByteError>> + Send {
             let found = self
                 .files
                 .lock()
@@ -399,7 +421,13 @@ mod tests {
                 .iter()
                 .find(|(stored, _)| stored == path)
                 .map(|(_, bytes)| bytes.clone());
-            async move { found.ok_or_else(|| format!("cannot read {path}")) }
+            let lost = self.lost;
+            async move {
+                if lost {
+                    return Err(ByteError::Lost("the Computer went offline".to_owned()));
+                }
+                found.ok_or_else(|| ByteError::Failed(format!("cannot read {path}")))
+            }
         }
 
         #[allow(clippy::manual_async_fn)]
@@ -407,9 +435,11 @@ mod tests {
             &self,
             path: &str,
             bytes: Vec<u8>,
-        ) -> impl Future<Output = Result<(), String>> + Send {
-            let written = if self.fail_writes {
-                Err("the workspace is full".to_owned())
+        ) -> impl Future<Output = Result<(), ByteError>> + Send {
+            let written = if self.lost {
+                Err(ByteError::Lost("the Computer went offline".to_owned()))
+            } else if self.fail_writes {
+                Err(ByteError::Failed("the workspace is full".to_owned()))
             } else {
                 self.files.lock().unwrap().push((path.to_owned(), bytes));
                 Ok(())
@@ -895,6 +925,71 @@ mod tests {
         assert!(texts[1].contains("cannot read missing.txt"), "{}", texts[1]);
         assert!(texts[2].contains("cannot take this File"), "{}", texts[2]);
         assert!(files.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn take_file_that_loses_its_computer_ends_the_run_unknown() {
+        let id = Id::new();
+        let files = FakeFiles::with(vec![(id, taken_file("report.txt", b"hello"))]);
+        let model = FakeModel::with(vec![
+            call_reply(TAKE_FILE, json!({"file": id})),
+            reply("the Model must not be asked again"),
+        ]);
+        let runtime = FakeRuntime::lost();
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            &files,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.succeeded);
+        assert_eq!(
+            outcome.text,
+            "I lost my Computer before the action returned."
+        );
+        assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(runtime.files.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn put_file_that_loses_its_computer_ends_the_run_unknown() {
+        let files = FakeFiles::default();
+        let model = FakeModel::with(vec![
+            call_reply(PUT_FILE, json!({"path": "out/report.txt"})),
+            reply("the Model must not be asked again"),
+        ]);
+        let mut runtime = FakeRuntime::with_file("out/report.txt", b"hello");
+        runtime.lost = true;
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            &files,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(!outcome.succeeded);
+        assert_eq!(
+            outcome.text,
+            "I lost my Computer before the action returned."
+        );
+        assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+        assert!(
+            files.puts.lock().unwrap().is_empty(),
+            "a lost transfer delivers nothing"
+        );
     }
 
     #[tokio::test]

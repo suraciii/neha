@@ -1,6 +1,7 @@
 //! The actions a Computer can run and what they return.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 /// One action a Bot asks its Computer to run.
 ///
@@ -103,21 +104,43 @@ impl ActionResult {
     }
 }
 
+/// Why a File byte transfer did not finish.
+///
+/// An action's outcome is always a value, even when no value is possible: a
+/// [`Failed`](Self::Failed) transfer was answered and the run may continue,
+/// while a [`Lost`](Self::Lost) one never got its answer, so whether the bytes
+/// moved is unknown and the run must stop.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ByteError {
+    /// The Computer tried and refused; the run may continue.
+    #[error("{0}")]
+    Failed(String),
+    /// The answer never came back, so the outcome is unknown.
+    #[error("{0}")]
+    Lost(String),
+}
+
 /// The seam every Computer implementation provides.
 pub trait ComputerRuntime {
     /// Runs one action.
     fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send;
 
     /// Reads a file's bytes from the workspace.
+    ///
+    /// [`ByteError::Lost`] means the answer never came back and whether the
+    /// bytes moved is unknown; the caller must end the run.
     fn read_bytes(
         &self,
         path: &str,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, ByteError>> + Send;
 
     /// Writes bytes to a file in the workspace, creating its parent directories.
+    ///
+    /// [`ByteError::Lost`] means the answer never came back and whether the
+    /// bytes moved is unknown; the caller must end the run.
     fn write_bytes(
         &self,
         path: &str,
         bytes: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<(), String>> + Send;
+    ) -> impl std::future::Future<Output = Result<(), ByteError>> + Send;
 }
