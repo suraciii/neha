@@ -24,13 +24,15 @@ A Bot's progress never starts a Notification.
 
 ## Needs attention
 
-A User sees a Needs attention view: one list of Questions, Approvals, failed work, and work an offline Computer blocks.
+A User sees a Needs attention view: the Questions and Approvals waiting on them, the runs that failed, the Group Messages that mention them, and the work an offline Computer blocks.
 
-Opening an item opens its Chat or Group at the Message that waits.
+The view lists only what the User can read.
+
+Opening an item opens its source Message in its Chat or Group.
 
 The view is a projection of the record, not a second stream of Messages.
 
-A Notification points at the same item.
+A Notification for an item in the view points at that item.
 
 ## Default levels
 

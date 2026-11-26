@@ -85,11 +85,11 @@ Structured content in a Message that is more than text: an approval request, a q
 _Avoid_: block, widget, embed, canvas
 
 **Task**:
-A Card with a state, an owner, an assignee, and optional tags and dependencies; its Thread is the work log. A Task is made when work needs to be claimed, handed off, or waited on.
+A Card with a state, an owner, an optional assignee, and optional tags and dependencies; its Thread is the work log. A Task is made when work needs to be claimed, handed off, or waited on.
 _Avoid_: ticket, issue, work item, job
 
 **Board**:
-A named view that selects Tasks by the Groups and Bots it includes. A Board holds no Task of its own.
+A named view over selected Chats and Groups, with optional filters and a roster of Bots that claim its Tasks. A Board holds no Task of its own.
 _Avoid_: kanban, project, workspace (as a board)
 
 **Schedule**:
@@ -101,7 +101,7 @@ A standing instruction that tells a Bot to start work when a condition is met.
 _Avoid_: routine, trigger, automation, job
 
 **Skill**:
-A reusable set of instructions for how to do a task. A skill tells a Bot how and adds no authority. A skill is content kept in the record; a Plugin distributes it.
+A reusable set of instructions for how to do a task. A skill tells a Bot how and adds no authority. A skill is an instruction kept in the record, in a Space's library or a Bot's; a Plugin distributes it.
 _Avoid_: recipe, playbook, macro, workflow
 
 **Kernel**:

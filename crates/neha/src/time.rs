@@ -7,20 +7,20 @@
 use std::fmt;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// An instant in UTC at microsecond precision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Timestamp(jiff::Timestamp);
 
 impl Timestamp {
+    /// The instant before the first event.
+    pub const UNIX_EPOCH: Self = Self(jiff::Timestamp::UNIX_EPOCH);
+
     /// Returns the current instant, truncated to microseconds.
     #[must_use]
     pub fn now() -> Self {
-        let now = jiff::Timestamp::now();
-
-        Self::from_microseconds(now.as_microsecond()).expect("a timestamp is a valid instant")
+        Self::truncate(jiff::Timestamp::now())
     }
 
     /// Builds an instant from microseconds since the Unix epoch.
@@ -34,6 +34,12 @@ impl Timestamp {
     pub fn as_microseconds(self) -> i64 {
         self.0.as_microsecond()
     }
+
+    fn truncate(value: jiff::Timestamp) -> Self {
+        jiff::Timestamp::from_microsecond(value.as_microsecond())
+            .ok()
+            .map_or(Self::UNIX_EPOCH, Self)
+    }
 }
 
 impl fmt::Display for Timestamp {
@@ -46,7 +52,21 @@ impl FromStr for Timestamp {
     type Err = jiff::Error;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        text.parse::<jiff::Timestamp>().map(Self)
+        text.parse::<jiff::Timestamp>().map(Self::truncate)
+    }
+}
+
+impl Serialize for Timestamp {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Timestamp {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+
+        text.parse().map_err(serde::de::Error::custom)
     }
 }
 
@@ -71,6 +91,20 @@ mod tests {
                 .unwrap()
                 .as_microseconds(),
             GOLDEN_MICROSECONDS
+        );
+    }
+
+    #[test]
+    fn finer_precision_is_truncated_to_microseconds() {
+        let parsed: Timestamp = "2025-11-25T23:18:24.123456789Z"
+            .parse()
+            .expect("a nanosecond timestamp parses");
+
+        assert_eq!(parsed.as_microseconds(), GOLDEN_MICROSECONDS);
+        assert_eq!(parsed.to_string(), GOLDEN);
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            format!("\"{GOLDEN}\"")
         );
     }
 

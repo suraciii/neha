@@ -2,13 +2,13 @@
 
 A Rust workspace. [specs/VISION.md](specs/VISION.md) defines the product vision, and [CONTEXT.md](CONTEXT.md) defines its language.
 
-This repository holds the product contracts and the engineering design; it contains no product behavior.
+This repository holds the product contracts, the engineering design, and the Rust workspace that implements the first milestone.
 
 ## Layout
 
 | Path | Contents |
 | --- | --- |
-| `crates/` | Workspace crates; `crates/neha/` is the current library crate |
+| `crates/` | Workspace crates: `neha` (domain and wire types), `neha-space` (the Space), `neha-app` (the `neha` CLI) |
 | `specs/` | Product contracts: observable behavior, boundaries, invariants |
 | `docs/` | User-facing guidance |
 | `eng/` | Engineering practices |
@@ -27,6 +27,10 @@ just ci
 ```
 
 `just verify <directory>` runs the same gate and retains its evidence outside the repository.
+
+## Quick start
+
+[Quick start: chat with a Bot](docs/quickstart.md) runs a Space, joins as the Admin, connects a Provider, and chats with a Bot.
 
 ## Documentation
 

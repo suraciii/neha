@@ -1,11 +1,10 @@
 //! Record sequence numbers.
 //!
 //! The Space assigns a global, monotonically increasing sequence number to
-//! every record event. It crosses the wire as a decimal string and serves as
-//! a cursor for reading the record.
+//! every record event. It crosses the wire as a canonical decimal string and
+//! serves as a cursor for reading the record.
 
 use std::fmt;
-use std::num::ParseIntError;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -47,9 +46,19 @@ impl FromStr for Seq {
     type Err = SeqError;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let value: i64 = text.parse()?;
+        if text.is_empty() {
+            return Err(SeqError::Empty);
+        }
+        if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(SeqError::NotDecimal);
+        }
+        if text.len() > 1 && text.starts_with('0') {
+            return Err(SeqError::LeadingZero);
+        }
 
-        Self::from_i64(value).ok_or(SeqError::Negative(value))
+        text.parse::<i64>()
+            .map(Self)
+            .map_err(|_| SeqError::NotDecimal)
     }
 }
 
@@ -67,15 +76,18 @@ impl<'de> Deserialize<'de> for Seq {
     }
 }
 
-/// A sequence number that is not a non-negative decimal integer.
+/// Text that is not a canonical non-negative decimal integer.
 #[derive(Debug, thiserror::Error)]
 pub enum SeqError {
-    /// The text is not a decimal integer.
-    #[error("sequence number is not a decimal integer: {0}")]
-    NotDecimal(#[from] ParseIntError),
-    /// The text is a negative value.
-    #[error("sequence number is negative: {0}")]
-    Negative(i64),
+    /// The text is empty.
+    #[error("sequence number is empty")]
+    Empty,
+    /// The text is not a decimal integer, or it is out of range.
+    #[error("sequence number is not a decimal integer")]
+    NotDecimal,
+    /// The text has a leading zero.
+    #[error("sequence number has a leading zero")]
+    LeadingZero,
 }
 
 #[cfg(test)]
@@ -101,9 +113,21 @@ mod tests {
     }
 
     #[test]
-    fn negative_and_malformed_values_are_rejected() {
-        assert!("-1".parse::<Seq>().is_err());
-        assert!("abc".parse::<Seq>().is_err());
+    fn non_canonical_decimal_text_is_rejected() {
+        for text in [
+            "",
+            "+1",
+            "007",
+            "-0",
+            " 1",
+            "1 ",
+            "abc",
+            "9223372036854775808",
+        ] {
+            assert!(text.parse::<Seq>().is_err(), "{text:?} must be rejected");
+        }
+        assert_eq!("0".parse::<Seq>().unwrap(), Seq::ZERO);
+        assert_eq!("4812".parse::<Seq>().unwrap().as_i64(), 4812);
     }
 
     #[test]

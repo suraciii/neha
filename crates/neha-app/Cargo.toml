@@ -1,0 +1,32 @@
+[package]
+name = "neha-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "neha"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util.workspace = true
+neha = { path = "../neha" }
+neha-space = { path = "../neha-space" }
+reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
+rpassword = "7"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio-tungstenite = "0.29"
+
+[dev-dependencies]
+axum = { version = "0.8", features = ["http1", "tokio"] }
+tempfile = "3"
+
+[lints]
+workspace = true

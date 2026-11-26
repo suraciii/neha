@@ -28,23 +28,25 @@ The record holds a run: its requests, its steps, the actions the Bot took, and w
 
 A summary the Bot writes is a record event. The history a Model sees is a projection of the record, and the record keeps every original Message.
 
-A Bot's memory is a set of entries in the record that belong to the Bot. Each entry names the scope it applies to. The system prompt is rebuilt for every request from the entries that apply to the acting User and the conversation.
+A Bot's memory is a set of entries in the record that belong to the Bot. Each entry records its author, where it came from, and the scope it applies to. The system prompt is rebuilt for every request from the entries that apply to the acting User and the conversation.
 
 ## Steps and actions
 
 A step holds one Model call and the actions that call requests. A completed step never runs again; the record gives its result back to the context. A step interrupted before it completes runs again from its start.
 
+The resumed step replays the results of the actions it already recorded, then continues from the first action it did not record.
+
 An action is recorded before it runs and after it returns. A started action never runs twice.
 
-An action whose result never returns is unknown. The loop checks its effect on the Computer, or asks the User, and never repeats it without that check.
+An action whose result never returns is unknown. The loop checks its effect on the Computer, or asks the User, and does not run that started action again.
 
 ## Waiting and resuming
 
 A loop stops a run when the Bot's Computer goes offline and resumes it when the Computer is back. A Message sent to an offline Computer waits in the record.
 
-A run stops at a step boundary when it waits for an Approval or an answer, when its Computer goes offline, or when a User takes control of its screen. It resumes from the last completed step when the cause ends.
+A run stops between two actions when it waits for an Approval or an answer, when its Computer goes offline, or when a User takes control of its screen. It resumes after the last recorded action, and a recorded action never runs again.
 
-A managed Computer's recovery, reset, or replacement stops its runs at a step boundary before its saved workspace is replaced.
+A managed Computer's recovery, reset, or replacement stops its runs between two actions before its saved workspace is replaced.
 
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 

@@ -36,7 +36,9 @@ A Group's row in the sidebar shows the Group's name, its members, the latest Mes
 
 An Approval or a Question appears in the Group where the request was made. Every member sees it; the User the Bot acts for answers it, and the others see who it waits for.
 
-An answer given in a Group covers one action. A lasting rule is given in a Chat, never in a Group.
+An Approval shows the action, a redacted summary, and whether the action can be undone. A sensitive value never appears.
+
+An Allow given in a Group covers one action. A lasting rule is given in a Chat, never in a Group.
 
 ## Leaving and end
 

@@ -9,5 +9,8 @@
 pub mod error;
 pub mod event;
 pub mod id;
+pub mod record;
 pub mod seq;
+pub mod surface;
 pub mod time;
+pub mod usage;

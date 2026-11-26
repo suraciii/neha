@@ -61,9 +61,11 @@ The Admin connects the Space's model providers. [Model](../model/product.md) cov
 
 The Admin sets a usage budget for the Space or for one Bot, over a day, a month, or no period.
 
-Usage a run records counts against the budget. [Model](../model/product.md) covers usage.
+A budget counts normalized tokens: uncached input, cache reads, cache writes, and output. [Model](../model/design.md) covers the one normalized form of usage.
 
-When the budget is reached, no new run starts, and a run in progress stops at its next step boundary. The Bot says so as a Message.
+A Space budget and a Bot budget both apply, and the stricter one stops work.
+
+When the budget is reached, no new run starts, and a run in progress stops between two actions. The Bot says so as a Message.
 
 A Space with no budget set places no limit.
 

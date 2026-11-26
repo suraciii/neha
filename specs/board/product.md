@@ -13,13 +13,13 @@ Owned by board. A Board depends on [Group](../messaging/group/product.md) and [C
 
 ## Boards
 
-A Space has any number of Boards. A Board has a name, the Chats and Groups it includes, the Bots that can claim from it, and optional tags.
+A Space has any number of Boards. A Board has a name, the Chats and Groups it includes, the Bots that can claim from it, and optional filters.
 
-A User adds a Board to a Group to see its Tasks there. A Group can show more than one Board.
+A User adds a Board to a Group, which adds the Group to the Board's scope. A Group can show more than one Board.
 
-A Board shows a Task when the Task's conversation is included in the Board and the User can read it.
+A Board shows a Task when its conversation is in the Board's scope, the Task matches the Board's filters, and the User can read it.
 
-A Bot on a Board's roster can claim its ready Tasks. The roster gives no authority beyond what the Bot's owner and its Computer grant.
+A Bot on a Board's roster can claim its ready unassigned Tasks. The roster gives no authority beyond what the Bot's owner and its Computer grant.
 
 The User who creates a Board manages it. The owner of a Group manages the Boards shown there.
 
@@ -37,6 +37,10 @@ A Task is a Card in a Message. Its Thread is the work log, and its state is a fi
 
 A User or a Bot turns a Message into a Task. The Message becomes the Task's Card, and its Thread becomes the work log.
 
+An assignee is optional. A Task's assignee is a Bot its owner owns.
+
+Only the assignee can claim an assigned Task; a roster never overrides that.
+
 Assigning a ready Task to a Bot posts a Message in the Task's conversation that addresses the Bot.
 
 ## States
@@ -53,7 +57,7 @@ Assigning a ready Task to a Bot posts a Message in the Task's conversation that 
 
 A need that completes moves its dependents from waiting to ready. A need that fails or is canceled leaves its dependents waiting.
 
-A claim moves a ready Task to claimed. Releasing a claim, or letting its lease expire, moves the Task back to ready.
+A claim moves a ready Task to claimed. Releasing a claim, or letting its lease expire, moves the Task back to ready. The owner can cancel a Task that is waiting, ready, or claimed.
 
 A claimed Task becomes completed, failed, or blocked. A failed Task can become ready again.
 
@@ -61,9 +65,9 @@ The owner of a Task can reopen a completed Task by moving it to ready. A cancele
 
 ## Claims
 
-A claim is a lease with an epoch. Only the newest claim can change a Task's state.
+A claim is a lease with an epoch and a token. Only the newest claim can change a Task's state.
 
-A claim ends when the work ends or when its lease expires. A Bot whose claim expired cannot complete the Task.
+A claim ends when the work ends, when the Task becomes blocked or canceled, or when its lease expires. A lease expires by the clock alone, and a stale token changes nothing.
 
 A Bot claims a Task only when it can write in the Task's conversation. Writing a Message is not claiming.
 
@@ -71,6 +75,6 @@ A Bot claims a Task only when it can write in the Task's conversation. Writing a
 
 A Task becomes blocked when its work needs a person: a Question or an Approval.
 
-The answer is in the Task's Thread, and the usual approval rules apply. Only the answer moves the Task back to ready.
+The answer is in the Task's Thread, and the usual approval rules apply. A Question's answer or an Approval's Allow moves the Task back to ready; a Deny moves it to failed, and the action never runs.
 
 A Bot cannot unblock a Task by itself.
