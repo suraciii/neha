@@ -69,8 +69,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bubblewrap
 
-      - name: Check the fence sandbox
-        run: bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
+      # Ubuntu 24.04 restricts unprivileged user namespaces by default, and
+      # bubblewrap here is not setuid. The gate runs the fence tests, so it
+      # lifts the restriction for this runner only.
+      - name: Allow the fence sandbox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
 
       - name: Start SeaweedFS
         run: docker run -d --name neha-s3 -p 8333:8333 chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 server -s3 -dir=/data
