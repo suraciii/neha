@@ -19,6 +19,7 @@ A managed Computer depends on [Space](../space/product.md) for the workspace it 
 7. The end of the control stream to the Space ends every process the Computer started during it, except a process a Bot started in background mode.
 8. A Bot's command runs on pipes with its output and error kept apart, and ending it ends its whole process tree.
 9. A workspace holds no record, memory, or credential.
+10. The Space holds every File, and a lost Workspace loses no File.
 
 ## The channel
 
@@ -69,6 +70,10 @@ A workspace over the Space's size limit is not saved. The User is told, and the 
 A restore accepts only relative paths of directories and regular files, and writes nothing outside the workspace.
 
 Saves of one Computer happen one at a time. A run that starts during a save waits for it.
+
+## Files
+
+A File crosses between a Workspace and the Space only as a copy: a Bot takes bytes into its Workspace and delivers bytes out of it. A copy in a Workspace is working material, and [Space](../space/design.md#storage) holds the File. A Computer that is lost, reset, or destroyed takes no File of a conversation with it.
 
 ## Online and offline
 

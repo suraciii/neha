@@ -8,8 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorCode;
 use crate::id::Id;
-use crate::record::Event;
+use crate::record::{Author, Event};
 use crate::seq::Seq;
+use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -70,6 +71,11 @@ pub enum CommandCall {
     },
     /// Lists the caller's Chats.
     ChatList,
+    /// Lists a Chat's Files.
+    FileList {
+        /// The Chat.
+        chat: Id,
+    },
     /// Reads a Chat's Messages.
     ChatRead {
         /// The Chat.
@@ -136,8 +142,11 @@ pub struct BotCreate {
 pub struct MessageSend {
     /// The Chat to post in.
     pub chat: Id,
-    /// The Message text.
+    /// The Message text, empty only when the Message carries a File.
     pub text: String,
+    /// The File the Message carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Id>,
 }
 
 /// A frame the Space sends.
@@ -252,13 +261,26 @@ mod tests {
 
     #[test]
     fn a_message_send_round_trips() {
-        let command = CommandCall::MessageSend(MessageSend {
-            chat: Id::new(),
+        let chat = Id::new();
+        let plain = CommandCall::MessageSend(MessageSend {
+            chat,
             text: "hello".to_owned(),
+            file: None,
         });
-        let text = serde_json::to_string(&command).unwrap();
+        let text = serde_json::to_string(&plain).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), plain);
+        assert!(
+            !text.contains("\"file\""),
+            "a Message without a File omits it"
+        );
 
-        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+        let file = CommandCall::MessageSend(MessageSend {
+            chat,
+            text: String::new(),
+            file: Some(Id::new()),
+        });
+        let text = serde_json::to_string(&file).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), file);
     }
 
     #[test]
@@ -302,4 +324,30 @@ mod tests {
         assert!(text.contains("\"type\":\"event\""));
         assert!(text.contains("\"kind\":\"neha.message.added\""));
     }
+}
+
+/// One File as a client reads it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileSummary {
+    /// The File.
+    pub id: Id,
+    /// The Chat it belongs to.
+    pub chat: Id,
+    /// Its name.
+    pub name: String,
+    /// Its media type.
+    pub media_type: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its lowercase hex SHA-256.
+    pub sha256: String,
+    /// Who sent it.
+    pub author: Author,
+    /// The User a Bot acted for, when a Bot sent it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acting: Option<Id>,
+    /// When the record holds it.
+    pub at: Timestamp,
+    /// The cursor of the event that recorded it.
+    pub seq: Seq,
 }

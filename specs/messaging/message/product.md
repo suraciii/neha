@@ -2,7 +2,7 @@
 
 ## Authority
 
-Owned by messaging. A Message depends on [Space](../../space/product.md) to hold its Files and on [User](../../../CONTEXT.md) and [Bot](../../bot/product.md) as its authors.
+Owned by messaging. A Message depends on [Space](../../space/product.md) to hold its Files, and on [User](../../../CONTEXT.md) and [Bot](../../bot/product.md) as its authors. [Computer](../../computer/product.md) gives a Bot the Workspace it moves Files through.
 
 ## Laws
 
@@ -31,11 +31,25 @@ A Card has a kind. Neha provides four kinds, and a Plugin can add more.
 
 ## Files
 
-A Message names a File by its id, and the record keeps the File's name, type, and size.
+A Message carries at most one File. A Message names the File by its id, and the record keeps the File's name, type, and size.
 
-A File lives in the Space. A Message with a File reads the same from every client.
+A File belongs to the Chat or Group it was sent in. The Files of a Chat or Group form one list, in the order the Space recorded them. [Search](../search/product.md) covers finding a File by its name.
+
+A File enters the conversation when the Space stores its bytes. A Message can carry it, and a File that no Message carries stays in the list. [Space](../../space/product.md) covers the bytes.
+
+A File lives in the Space. A Message with a File reads the same from every client, and any client that reads the Message downloads the same File.
 
 A File is readable wherever a Message carrying it is readable.
+
+A File moves in three ways:
+
+| Who | Move | What happens |
+| --- | --- | --- |
+| A User | Sends | A Message carries one File, with or without text |
+| A Bot | Delivers | A Message from the Bot carries a file of its Workspace as a File |
+| A Bot | Takes | The Space writes a copy of a File of the conversation into the Bot's Workspace under the File's name. The File stays in the conversation, and a File of another conversation is refused. |
+
+A File is at most 32 MiB. The Space refuses a larger file, tells the sender, and records no File and no Message.
 
 ## Threads
 

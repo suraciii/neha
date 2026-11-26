@@ -4,12 +4,12 @@
 
 ## Authority
 
-Owned by client. The Space serves the client, and the command surface carries every action a client takes.
+Owned by client. The Space serves the client, and the command surface carries every action a client takes except the transfer of a File's bytes.
 
 ## Laws
 
 1. A browser client reaches a Space through the Space's origin only.
-2. The Space serves files only from the configured client directory.
+2. The Space serves client files only from the configured client directory, and a File's bytes only from its File store.
 3. A same-origin request carries the session cookie; a foreign origin requires a Bearer token.
 4. The session cookie is `HttpOnly` and `SameSite=Strict`, and its name is unique to the Space's home.
 5. The client holds no second copy of the record; the Space's record is the source of truth.
@@ -22,7 +22,7 @@ The Space listens on `127.0.0.1` and serves the browser client from a hostname s
 
 A path that does not name a file returns `index.html`, because the client has one entry point. A missing or escaping entry point is a start error, not a partial page.
 
-The Space does not serve its home directory or any file outside the client directory. A client directory that contains the Space home, or sits inside it, is a start error.
+The Space does not serve its home directory or any file outside the client directory, except a File's bytes from the File store. A client directory that contains the Space home, or sits inside it, is a start error.
 
 ## Sessions
 

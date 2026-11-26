@@ -19,7 +19,10 @@ export default function Sidebar(props: SidebarProps) {
   const botFor = (chat: Chat) => props.bots.find((bot) => bot.id === chat.bot);
   const preview = (chat: Chat) => {
     const recorded = props.previews[chat.id];
-    if (recorded && "text" in recorded) return recorded.text;
+    if (recorded && "text" in recorded) {
+      if (recorded.text) return recorded.text;
+      return recorded.file ? t("sidebar.file") : "";
+    }
     if (recorded && "error" in recorded) return t("sidebar.openChat");
     const bot = botFor(chat);
     return bot ? t("sidebar.startChat", { name: bot.name }) : t("sidebar.newChat");

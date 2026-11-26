@@ -1,7 +1,8 @@
 //! The Space's home directory.
 //!
-//! `NEHA_HOME` names one Space. The home holds the record, secrets, Computer
-//! workspaces, logs, and the scratch directories a running Space needs.
+//! `NEHA_HOME` names one Space. The home holds the record, secrets, File
+//! bytes, Computer workspaces, logs, and the scratch directories a running
+//! Space needs.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,7 +13,7 @@ use thiserror::Error;
 /// The schema version this build writes.
 pub use crate::schema::SCHEMA_VERSION;
 
-const DIRECTORIES: [&str; 7] = [
+const DIRECTORIES: [&str; 8] = [
     "db",
     "secrets",
     "state",
@@ -20,6 +21,7 @@ const DIRECTORIES: [&str; 7] = [
     "cache",
     "logs",
     "computers",
+    "blobs",
 ];
 
 /// One Space's home directory.
@@ -74,6 +76,12 @@ impl Home {
         self.root
             .join("db")
             .join(format!("neha-{}.sqlite3", crate::schema::SCHEMA_VERSION))
+    }
+
+    /// Returns the directory that holds the bytes of Files.
+    #[must_use]
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join("blobs")
     }
 
     /// Returns the directory for a Computer's workspace.
@@ -141,6 +149,7 @@ mod tests {
         assert!(home.root().join("db").is_dir());
         assert!(home.root().join("secrets").is_dir());
         assert!(home.root().join("computers").is_dir());
+        assert!(home.blobs_dir().is_dir());
         assert!(!home.root().join("tmp").join("leftover").exists());
         assert!(home.db_path().starts_with(home.root().join("db")));
     }

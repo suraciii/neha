@@ -70,7 +70,7 @@ On a real Computer, the owner sets its access: granted folders, or full access. 
 
 A new real Computer starts with granted folders.
 
-A File a Bot produces is attached to a Message and lives in the Space from then on.
+A Bot delivers a file of its Workspace as a File on a Message it sends, and the File lives in the Space from then on. A Bot also takes a File of its conversation into its Workspace. [Message](../messaging/message/product.md#files) covers Files.
 
 ## Credentials
 

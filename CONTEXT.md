@@ -33,7 +33,7 @@ The machine a Bot runs on, managed or real; a real Computer runs Neha. Each Bot 
 _Avoid_: host, sandbox (as the umbrella), VM, device
 
 **Workspace**:
-The durable file tree a managed Computer keeps in the Space. A real Computer's disk holds its files instead.
+The durable file tree a Bot works in. A managed Computer keeps it in the Space, and a real Computer keeps it on its own disk.
 _Avoid_: home, volume, sandbox disk
 
 **Run**:
@@ -77,7 +77,7 @@ A single-level reply chain under a Message. Under a Task, it is the work log.
 _Avoid_: nested thread, thread (as a Chat or Group)
 
 **File**:
-An image, document, or other artifact attached to a Message. A File lives in the Space, whatever Computer produced it.
+An image, document, or other artifact the Space holds for a Chat or Group. A File lives in the Space, whatever Computer produced it. A Message can carry a File, and a File belongs to the Chat or Group it was sent in.
 _Avoid_: attachment, artifact, upload, block
 
 **Card**:

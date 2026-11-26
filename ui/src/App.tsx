@@ -6,14 +6,17 @@ import ChatView from "./components/ChatView";
 import Rail from "./components/Rail";
 import SetupView from "./components/SetupView";
 import Sidebar from "./components/Sidebar";
-import { t } from "./i18n";
+import { t, type MessageKey } from "./i18n";
 import { api, ApiError } from "./lib/api";
+import { MAX_FILE_BYTES,
+  MAX_FILE_LABEL, formatBytes, indexFiles, mediaTypeFor } from "./lib/files";
 import { Commands, ProtocolError } from "./lib/ws";
 import type {
   Account,
   Bot,
   Chat,
   Computer,
+  FileSummary,
   Message,
   Model,
   Provider,
@@ -35,6 +38,7 @@ interface State {
   previews: Record<string, Preview>;
   activeChat: Chat | null;
   messages: Message[];
+  files: Record<string, FileSummary>;
   activeBot: Bot | null;
   activeComputer: Computer | null;
   working: boolean;
@@ -51,6 +55,7 @@ const emptyState: State = {
   previews: {},
   activeChat: null,
   messages: [],
+  files: {},
   activeBot: null,
   activeComputer: null,
   working: false,
@@ -138,7 +143,7 @@ export default function App() {
       try {
         const messages = await commands.command<Message[]>("chat_read", { chat: chat.id });
         const last = messages.at(-1);
-        previews[chat.id] = last ? { text: last.text } : null;
+        previews[chat.id] = last ? previewOf(last) : null;
       } catch {
         previews[chat.id] = { error: true };
       }
@@ -148,15 +153,17 @@ export default function App() {
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
-    setState({ activeChat: chat, messages: [], activeBot: null, activeComputer: null, working: false, error: null });
+    setState({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
     try {
-      const [messages, bot] = await Promise.all([
+      const [messages, files, bot] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
+        commands.command<FileSummary[]>("file_list", { chat: chat.id }),
         commands.command<BotResult>("bot_show", { bot: chat.bot }),
       ]);
       if (generation !== runGeneration) return;
       setState({
         messages,
+        files: indexFiles(files),
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
@@ -206,36 +213,55 @@ export default function App() {
     const chat = state.activeChat;
     if (!chat) return;
     try {
-      const messages = await commands.command<Message[]>("chat_read", { chat: chat.id });
-      setState("messages", messages);
+      const [messages, files] = await Promise.all([
+        commands.command<Message[]>("chat_read", { chat: chat.id }),
+        commands.command<FileSummary[]>("file_list", { chat: chat.id }),
+      ]);
+      setState({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
-      if (last) setState("previews", chat.id, { text: last.text });
+      if (last) setState("previews", chat.id, previewOf(last));
     } catch (reason) {
       setState("error", reason);
     }
   }
 
-  async function sendMessage(text: string) {
+  // Resolves false when nothing left the composer, so it keeps the Message.
+  async function sendMessage(text: string, file: File | null): Promise<boolean> {
     const chat = state.activeChat;
     const bot = state.activeBot;
-    if (!chat || !bot || state.working) return;
-    const trimmed = text.trim();
-    if (!trimmed) return;
+    if (!chat || !bot || state.working) return false;
+    if (!text && !file) return false;
+
+    setState({ working: true, error: null });
+    let uploaded: FileSummary | null = null;
+    if (file) {
+      uploaded = await upload(chat.id, file);
+      if (!uploaded) {
+        setState("working", false);
+        return false;
+      }
+      setState("files", uploaded.id, uploaded);
+    }
 
     const optimistic: Message = {
       id: `optimistic-${Date.now()}`,
       chat: chat.id,
       author: { kind: "user", id: state.account?.id ?? "" },
       acting: null,
-      text: trimmed,
+      text,
       at: new Date().toISOString(),
       seq: "optimistic",
       run: null,
+      file: uploaded?.id ?? null,
     };
-    setState({ messages: [...state.messages, optimistic], working: true, error: null });
-    setState("previews", chat.id, { text: trimmed });
+    setState({ messages: [...state.messages, optimistic] });
+    setState("previews", chat.id, previewOf(optimistic));
     try {
-      const result = await commands.command<SendResult>("message_send", { chat: chat.id, text: trimmed }, 180_000);
+      const result = await commands.command<SendResult>(
+        "message_send",
+        uploaded ? { chat: chat.id, text, file: uploaded.id } : { chat: chat.id, text },
+        180_000,
+      );
       await refreshActive();
       if (result.status === "failed") {
         setState("error", result.error ? result.error : { key: "error.botAnswer" });
@@ -245,6 +271,26 @@ export default function App() {
       await refreshActive();
     } finally {
       setState("working", false);
+    }
+
+    return true;
+  }
+
+  // Uploads one File, or shows why that failed and resolves null.
+  async function upload(chat: string, file: File): Promise<FileSummary | null> {
+    const tooLarge = () => ({
+      key: "error.fileTooLarge",
+      params: { name: file.name, limit: MAX_FILE_LABEL },
+    });
+    if (file.size > MAX_FILE_BYTES) {
+      setState("error", tooLarge());
+      return null;
+    }
+    try {
+      return await api.uploadFile(chat, file, file.name, mediaTypeFor(file));
+    } catch (reason) {
+      setState("error", reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason));
+      return null;
     }
   }
 
@@ -308,7 +354,7 @@ export default function App() {
 
   function backToList() {
     runGeneration += 1;
-    setState({ activeChat: null, messages: [], activeBot: null, activeComputer: null, working: false, error: null });
+    setState({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
   }
 
   const errorText = () => (state.error ? messageFor(state.error) : null);
@@ -336,7 +382,8 @@ export default function App() {
             />
             <main class="main">
               <Show
-                when={showChat()}
+                when={showChat() ? state.activeChat?.id : null}
+                keyed
                 fallback={
                   <Show
                     when={needsSetup()}
@@ -365,9 +412,10 @@ export default function App() {
                   bot={state.activeBot}
                   computer={state.activeComputer}
                   messages={state.messages}
+                  files={state.files}
                   working={state.working}
                   error={errorText()}
-                  onSend={(text) => void sendMessage(text)}
+                  onSend={sendMessage}
                   onBack={backToList}
                 />
               </Show>
@@ -393,6 +441,19 @@ function Boot() {
   );
 }
 
+// What the sidebar shows for a Chat's last Message.
+function previewOf(message: Message): Preview {
+  return { text: message.text, file: message.file !== null };
+}
+
+// Names an upload failure the Space or the network reported.
+function uploadFailure(reason: unknown): unknown {
+  if (reason instanceof ApiError && reason.code !== "unauthorized" && reason.code !== "not_found") {
+    return { key: "error.upload" };
+  }
+  return reason;
+}
+
 function messageFor(reason: unknown): string {
   if (
     reason !== null &&
@@ -400,7 +461,8 @@ function messageFor(reason: unknown): string {
     "key" in reason &&
     typeof (reason as { key?: unknown }).key === "string"
   ) {
-    return t((reason as { key: Parameters<typeof t>[0] }).key);
+    const { key, params } = reason as { key: MessageKey; params?: Record<string, string | number> };
+    return t(key, params);
   }
   if (reason instanceof ProtocolError) {
     if (reason.code === "unauthorized") return t("error.session");

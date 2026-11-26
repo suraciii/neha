@@ -83,16 +83,41 @@ impl Identity {
             return Err(IdentityError::AlreadyInitialized);
         }
 
+        self.insert_account(&display_name, password, true).await
+    }
+
+    /// Adds an account beyond the Admin, as an invitation will; for tests.
+    #[cfg(test)]
+    pub(crate) async fn add_account_for_test(
+        &self,
+        display_name: &str,
+        password: &str,
+    ) -> Result<Account, IdentityError> {
+        let display_name = validate_display_name(display_name)?;
+        validate_password(password)?;
+        self.insert_account(&display_name, password, false)
+            .await
+            .map(|(account, _)| account)
+    }
+
+    /// Inserts an account and returns it with a device token.
+    async fn insert_account(
+        &self,
+        display_name: &str,
+        password: &str,
+        is_admin: bool,
+    ) -> Result<(Account, String), IdentityError> {
         let id = Id::new();
         let password_hash = hash_password(password)?;
         let created_at = Timestamp::now().as_microseconds();
         let inserted = sqlx::query(
             "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
-             VALUES (?, ?, ?, 1, ?)",
+             VALUES (?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
-        .bind(&display_name)
+        .bind(display_name)
         .bind(password_hash)
+        .bind(is_admin)
         .bind(created_at)
         .execute(&self.pool)
         .await;
@@ -108,8 +133,8 @@ impl Identity {
         Ok((
             Account {
                 id,
-                display_name,
-                is_admin: true,
+                display_name: display_name.to_owned(),
+                is_admin,
             },
             token,
         ))

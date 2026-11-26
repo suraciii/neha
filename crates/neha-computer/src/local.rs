@@ -328,6 +328,54 @@ impl ComputerRuntime for LocalRuntime {
             }
         }
     }
+
+    #[allow(clippy::manual_async_fn)]
+    fn read_bytes(
+        &self,
+        path: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+        let resolved = self.resolve(path);
+        async move {
+            let path = resolved?;
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            if metadata.len() > neha::file::MAX_FILE_BYTES {
+                return Err(format!(
+                    "the file is larger than {} bytes",
+                    neha::file::MAX_FILE_BYTES
+                ));
+            }
+            std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn write_bytes(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let resolved = self.resolve(path);
+        async move {
+            if bytes.len() as u64 > neha::file::MAX_FILE_BYTES {
+                return Err(format!(
+                    "the content is larger than {} bytes",
+                    neha::file::MAX_FILE_BYTES
+                ));
+            }
+            let path = resolved?;
+            if let Some(parent) = path.parent()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                return Err(format!("cannot create {}: {error}", parent.display()));
+            }
+            std::fs::write(&path, bytes)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))
+        }
+    }
 }
 
 #[derive(Default)]
@@ -545,6 +593,8 @@ pub enum RuntimeError {
 mod tests {
     use std::time::Duration;
 
+    use neha::file::MAX_FILE_BYTES;
+
     use super::LocalRuntime;
     use crate::action::{Action, ActionStatus, ComputerRuntime};
 
@@ -641,6 +691,112 @@ mod tests {
         assert_eq!(result.status, ActionStatus::Failed);
         assert!(result.output.text.contains("symlink"));
         assert!(!outside.exists(), "the write followed a dangling symlink");
+    }
+
+    #[tokio::test]
+    async fn bytes_are_written_and_read_with_parent_directories() {
+        let (_dir, runtime) = runtime();
+        let bytes = vec![0_u8, 1, 2, 255];
+        runtime
+            .write_bytes("out/report.bin", bytes.clone())
+            .await
+            .unwrap();
+
+        let read = runtime.read_bytes("out/report.bin").await.unwrap();
+        assert_eq!(read, bytes);
+        assert!(runtime.workspace().join("out").is_dir());
+
+        // An absolute path inside the workspace names the same file.
+        let absolute = runtime.workspace().join("out/report.bin");
+        let read = runtime
+            .read_bytes(&absolute.to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(read, bytes);
+    }
+
+    #[tokio::test]
+    async fn byte_transfers_stay_inside_the_workspace() {
+        let (directory, runtime) = runtime();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "secret").unwrap();
+        for path in ["../outside.txt", &outside.to_string_lossy()] {
+            assert!(runtime.read_bytes(path).await.is_err(), "read {path}");
+            assert!(
+                runtime.write_bytes(path, b"pwned".to_vec()).await.is_err(),
+                "write {path}"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn byte_transfers_refuse_a_symlink() {
+        let (directory, runtime) = runtime();
+        std::fs::write(directory.path().join("outside.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(directory.path(), runtime.workspace().join("escape")).unwrap();
+        let dangling = runtime.workspace().join("dangling");
+        let created_outside = directory.path().join("created-outside.txt");
+        std::os::unix::fs::symlink(&created_outside, &dangling).unwrap();
+
+        for path in ["escape/outside.txt", "dangling"] {
+            let error = runtime.read_bytes(path).await.unwrap_err();
+            assert!(error.contains("symlink"), "{path}: {error}");
+        }
+        for path in ["escape/created-by-link.txt", "dangling"] {
+            let error = runtime.write_bytes(path, b"x".to_vec()).await.unwrap_err();
+            assert!(error.contains("symlink"), "{path}: {error}");
+        }
+        assert!(!directory.path().join("created-by-link.txt").exists());
+        assert!(!created_outside.exists());
+    }
+
+    #[tokio::test]
+    async fn read_bytes_refuses_what_is_not_a_file() {
+        let (_dir, runtime) = runtime();
+        std::fs::create_dir(runtime.workspace().join("dir")).unwrap();
+
+        let error = runtime.read_bytes("dir").await.unwrap_err();
+        assert!(error.contains("not a file"), "{error}");
+        let error = runtime.read_bytes("missing.txt").await.unwrap_err();
+        assert!(error.contains("cannot read"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn byte_transfers_refuse_more_than_the_file_limit() {
+        let (_dir, runtime) = runtime();
+        for (name, length) in [
+            ("at-limit.bin", MAX_FILE_BYTES),
+            ("over.bin", MAX_FILE_BYTES + 1),
+        ] {
+            std::fs::File::create(runtime.workspace().join(name))
+                .unwrap()
+                .set_len(length)
+                .unwrap();
+        }
+
+        let error = runtime.read_bytes("over.bin").await.unwrap_err();
+        assert!(error.contains("larger than"), "{error}");
+        let error = runtime
+            .write_bytes("over.bin", vec![0; MAX_FILE_BYTES as usize + 1])
+            .await
+            .unwrap_err();
+        assert!(error.contains("larger than"), "{error}");
+        assert_eq!(
+            std::fs::metadata(runtime.workspace().join("over.bin"))
+                .unwrap()
+                .len(),
+            MAX_FILE_BYTES + 1,
+            "a refused write leaves the file alone"
+        );
+
+        let at_limit = vec![0_u8; MAX_FILE_BYTES as usize];
+        runtime
+            .write_bytes("writable.bin", at_limit.clone())
+            .await
+            .unwrap();
+        assert_eq!(runtime.read_bytes("at-limit.bin").await.unwrap(), at_limit);
     }
 
     #[tokio::test]

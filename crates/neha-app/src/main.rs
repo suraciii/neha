@@ -3,7 +3,7 @@
 mod client;
 
 use anyhow::{Context as _, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
 use neha::seq::Seq;
 use neha::surface::{
@@ -72,6 +72,11 @@ enum Top {
         #[command(subcommand)]
         command: ChatCommand,
     },
+    /// Download Files.
+    File {
+        #[command(subcommand)]
+        command: FileCommand,
+    },
     /// Read a run.
     Run {
         #[command(subcommand)]
@@ -132,7 +137,8 @@ enum BotCommand {
 enum ChatCommand {
     /// List your Chats.
     List,
-    /// Send a Message and wait for the Bot's reply.
+    /// Send a Message, with an optional File, and wait for the Bot's reply.
+    #[command(group(ArgGroup::new("payload").required(true).args(["text", "file"])))]
     Send {
         /// The Chat identifier.
         #[arg(long)]
@@ -140,11 +146,23 @@ enum ChatCommand {
         /// The Bot whose Chat to use instead of --chat.
         #[arg(long)]
         bot: Option<Id>,
-        /// The Message text.
-        text: String,
+        /// The Message text; leave it out when --file carries the Message.
+        text: Option<String>,
+        /// A file to upload and send with the Message.
+        #[arg(long)]
+        file: Option<std::path::PathBuf>,
         /// Print the run's steps and actions while it works.
         #[arg(long)]
         follow: bool,
+    },
+    /// List a Chat's Files.
+    Files {
+        /// The Chat identifier.
+        #[arg(long)]
+        chat: Option<Id>,
+        /// The Bot whose Chat to use instead of --chat.
+        #[arg(long)]
+        bot: Option<Id>,
     },
     /// Read a Chat's Messages.
     Read {
@@ -153,6 +171,18 @@ enum ChatCommand {
         /// Start after this cursor.
         #[arg(long)]
         from: Option<Seq>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FileCommand {
+    /// Download a File.
+    Get {
+        /// The File identifier.
+        file: Id,
+        /// Where to write it; an existing directory receives the File under its name.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
     },
 }
 
@@ -176,6 +206,7 @@ async fn main() -> Result<()> {
         Top::Model { command } => model(command).await,
         Top::Bot { command } => bot(command).await,
         Top::Chat { command } => chat(command).await,
+        Top::File { command } => file(command).await,
         Top::Run { command } => run(command).await,
     }
 }
@@ -448,25 +479,19 @@ async fn chat(command: ChatCommand) -> Result<()> {
             chat,
             bot,
             text,
+            file,
             follow,
         } => {
-            let chat = match (chat, bot) {
-                (Some(chat), _) => chat,
-                (None, Some(bot)) => {
-                    let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
-                    id_of(&shown["chat"], "id")?
-                }
-                (None, None) => {
-                    let chats = client::command(&credential, CommandCall::ChatList).await?;
-                    let chats = chats.as_array().context("no Chats in the answer")?;
-                    match chats.as_slice() {
-                        [chat] => id_of(chat, "id")?,
-                        [] => bail!("this Space has no Chat; create a Bot first"),
-                        _ => bail!("pass --chat or --bot; this Space has several Chats"),
-                    }
-                }
+            let chat = resolve_chat(&credential, chat, bot).await?;
+            let uploaded = match &file {
+                Some(path) => Some(client::upload_file(&credential, chat, path).await?),
+                None => None,
             };
-            let command = CommandCall::MessageSend(MessageSend { chat, text });
+            let command = CommandCall::MessageSend(MessageSend {
+                chat,
+                text: text.unwrap_or_default(),
+                file: uploaded.as_ref().map(|file| file.id),
+            });
             let result = if follow {
                 client::command_following(&credential, command, |event| {
                     print_progress(event);
@@ -481,6 +506,22 @@ async fn chat(command: ChatCommand) -> Result<()> {
                 id_of(&result, "run")?,
                 text_of(&result, "status")?
             );
+            if let Some(file) = uploaded {
+                println!("  file {} ({})", file.id, file.name);
+            }
+        }
+        ChatCommand::Files { chat, bot } => {
+            let chat = resolve_chat(&credential, chat, bot).await?;
+            let result = client::command(&credential, CommandCall::FileList { chat }).await?;
+            for file in result.as_array().context("no Files in the answer")? {
+                println!(
+                    "{}  {}  {} bytes  {}",
+                    id_of(file, "id")?,
+                    text_of(file, "name")?,
+                    file["size"].as_u64().unwrap_or_default(),
+                    text_of(file, "media_type")?
+                );
+            }
         }
         ChatCommand::Read { chat, from } => {
             let result = client::command(&credential, CommandCall::ChatRead { chat, from }).await?;
@@ -489,16 +530,101 @@ async fn chat(command: ChatCommand) -> Result<()> {
                     "bot" => "Bot",
                     _ => "User",
                 };
+                let text = text_of(message, "text")?;
+                let seq = message["seq"].as_str().unwrap_or_default();
+                // A File alone is a Message, so the line can end at the colon.
                 println!(
-                    "[{}] {author}: {}",
-                    message["seq"].as_str().unwrap_or_default(),
-                    text_of(message, "text")?
+                    "{}",
+                    if text.is_empty() {
+                        format!("[{seq}] {author}:")
+                    } else {
+                        format!("[{seq}] {author}: {text}")
+                    }
                 );
+                if let Some(file) = message["file"].as_str() {
+                    println!("  file {file}");
+                }
             }
         }
     }
 
     Ok(())
+}
+
+/// Returns the Chat a command acts on: the one named, the Bot's, or the only one.
+async fn resolve_chat(credential: &Credential, chat: Option<Id>, bot: Option<Id>) -> Result<Id> {
+    match (chat, bot) {
+        (Some(chat), _) => Ok(chat),
+        (None, Some(bot)) => {
+            let shown = client::command(credential, CommandCall::BotShow { bot }).await?;
+            id_of(&shown["chat"], "id")
+        }
+        (None, None) => {
+            let chats = client::command(credential, CommandCall::ChatList).await?;
+            let chats = chats.as_array().context("no Chats in the answer")?;
+            match chats.as_slice() {
+                [chat] => id_of(chat, "id"),
+                [] => bail!("this Space has no Chat; create a Bot first"),
+                _ => bail!("pass --chat or --bot; this Space has several Chats"),
+            }
+        }
+    }
+}
+
+async fn file(command: FileCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        FileCommand::Get { file, out } => {
+            let (name, bytes) = client::download_file(&credential, file).await?;
+            // An explicit file path is the destination; only an implicit one
+            // needs the name the Space gave the File.
+            let path = match &out {
+                Some(path) if !path.is_dir() => path.clone(),
+                Some(directory) => directory.join(space_file_name(name.as_deref())?),
+                None => std::path::PathBuf::from(space_file_name(name.as_deref())?),
+            };
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create {}", parent.display()))?;
+            }
+            // An implicit destination never replaces a file the User already has.
+            if out.is_none() && path.exists() {
+                bail!(
+                    "{} already exists; pass --out with the path you want",
+                    path.display()
+                );
+            }
+            std::fs::write(&path, &bytes)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            let shown = std::fs::canonicalize(&path).unwrap_or(path);
+            println!("Wrote {} ({} bytes).", shown.display(), bytes.len());
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads the name the Space gave a File, as one path component.
+///
+/// Only an implicit destination, or a `--out` directory, needs this name.
+fn space_file_name(name: Option<&str>) -> Result<String> {
+    let Some(name) = name else {
+        bail!("the Space did not name the File; pass --out with the path you want");
+    };
+    if !is_one_component(name) {
+        bail!(
+            "the Space named the File {name:?}, which is not a file name; pass --out with the path you want"
+        );
+    }
+
+    Ok(name.to_owned())
+}
+
+/// Whether a name can be one path component, wherever this CLI runs.
+fn is_one_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
 }
 
 async fn run(command: RunCommand) -> Result<()> {
@@ -610,4 +736,25 @@ fn text_of<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .get(field)
         .and_then(Value::as_str)
         .with_context(|| format!("the answer has no {field}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::space_file_name;
+
+    #[test]
+    fn a_space_name_is_a_file_name_only_when_it_is_one_path_component() {
+        assert_eq!(space_file_name(Some("报告 v2.txt")).unwrap(), "报告 v2.txt");
+        for name in [
+            None,
+            Some(""),
+            Some("."),
+            Some(".."),
+            Some("a/b"),
+            Some("a\\b"),
+            Some("a\0b"),
+        ] {
+            assert!(space_file_name(name).is_err(), "{name:?}");
+        }
+    }
 }

@@ -115,6 +115,17 @@ target/debug/neha run show <run-id>
 
 A Bot can also write files, read them back, and run shell commands in its Computer's workspace. [Let a Bot work on its Computer](tools.md) shows how.
 
+## Send a file
+
+A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it:
+
+```bash
+printf 'remember the milk\n' > notes.txt
+target/debug/neha chat send --file notes.txt "Read the attached file and tell me what it says."
+```
+
+[Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.
+
 ## Restart and sign in again
 
 Stop the Space with Ctrl-C. Start it again with the same `NEHA_HOME`:
@@ -135,6 +146,6 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 - The managed Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
 - A Bot has no approval gate yet. It runs an action as soon as the Model asks for it.
-- One human joins a Space. Group Chats, Files, Boards, approvals, notifications, and search arrive in later milestones.
+- One human joins a Space. Group Chats, Boards, approvals, notifications, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, approvals, search, or notifications.
 - The browser client does not stream a reply. It shows a working state until the Run finishes.

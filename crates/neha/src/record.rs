@@ -9,6 +9,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::event::EventClass;
+use crate::file::{MAX_FILE_BYTES, is_sha256};
 use crate::id::Id;
 use crate::seq::Seq;
 use crate::time::Timestamp;
@@ -45,6 +46,9 @@ pub enum EventKind {
     /// A Message was added to a Chat or Group.
     #[serde(rename = "neha.message.added")]
     MessageAdded,
+    /// A File was added to a Chat or Group.
+    #[serde(rename = "neha.file.added")]
+    FileAdded,
     /// A run started.
     #[serde(rename = "neha.run.started")]
     RunStarted,
@@ -73,6 +77,7 @@ impl EventKind {
             Self::ComputerCreated => "neha.computer.created",
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
+            Self::FileAdded => "neha.file.added",
             Self::RunStarted => "neha.run.started",
             Self::RunFinished => "neha.run.finished",
             Self::RunStep => "neha.run.step",
@@ -85,7 +90,9 @@ impl EventKind {
     #[must_use]
     pub const fn class(self) -> EventClass {
         match self {
-            Self::MessageAdded | Self::RunStarted | Self::RunFinished => EventClass::Presentation,
+            Self::MessageAdded | Self::FileAdded | Self::RunStarted | Self::RunFinished => {
+                EventClass::Presentation
+            }
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunStep | Self::ActionStarted | Self::ActionFinished => EventClass::Authority,
@@ -109,6 +116,7 @@ impl FromStr for EventKind {
             "neha.computer.created" => Ok(Self::ComputerCreated),
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
+            "neha.file.added" => Ok(Self::FileAdded),
             "neha.run.started" => Ok(Self::RunStarted),
             "neha.run.finished" => Ok(Self::RunFinished),
             "neha.run.step" => Ok(Self::RunStep),
@@ -185,9 +193,10 @@ pub struct Event {
 
 #[cfg(test)]
 mod tests {
-    use super::EventDraft;
-    use super::EventKind;
+    use super::{Author, EventData, EventDraft, EventKind, FileAdded, FileError};
     use crate::event::EventClass;
+    use crate::file::MAX_FILE_BYTES;
+    use crate::id::Id;
 
     #[test]
     fn wire_names_round_trip() {
@@ -198,6 +207,7 @@ mod tests {
             EventKind::ComputerCreated,
             EventKind::ChatCreated,
             EventKind::MessageAdded,
+            EventKind::FileAdded,
             EventKind::RunStarted,
             EventKind::RunFinished,
             EventKind::RunStep,
@@ -207,12 +217,14 @@ mod tests {
 
         for kind in kinds {
             assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
+            assert_eq!(serde_json::to_value(kind).unwrap(), kind.as_str());
         }
     }
 
     #[test]
     fn message_and_run_events_are_presentation() {
         assert_eq!(EventKind::MessageAdded.class(), EventClass::Presentation);
+        assert_eq!(EventKind::FileAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStarted.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStep.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
@@ -236,6 +248,113 @@ mod tests {
         .acting(user);
 
         assert_eq!(draft.acting, Some(user));
+    }
+
+    fn file(name: &str, media_type: &str, size: u64, sha256: &str) -> FileAdded {
+        FileAdded {
+            file: Id::new(),
+            chat: Id::new(),
+            name: name.to_owned(),
+            media_type: media_type.to_owned(),
+            size,
+            sha256: sha256.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_file_added_round_trips() {
+        let data = file("report.csv", "text/csv", 2048, &"ab".repeat(32));
+        let value = serde_json::to_value(&data).unwrap();
+
+        assert_eq!(
+            EventKind::FileAdded.decode(&value).unwrap(),
+            EventData::FileAdded(data)
+        );
+
+        let mut unknown = value.clone();
+        unknown["path"] = serde_json::json!("/tmp/report.csv");
+        assert!(EventKind::FileAdded.decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn a_file_keeps_the_bounds_a_space_accepts() {
+        let digest = "ab".repeat(32);
+        let edge = file(&"a".repeat(255), &"m".repeat(127), MAX_FILE_BYTES, &digest);
+        assert_eq!(edge.validate(), Ok(()));
+
+        let long_name = file(&"a".repeat(256), "text/plain", 1, &digest);
+        assert_eq!(long_name.validate(), Err(FileError::Name));
+        for name in ["", "a/b", "a\\b", "a\0b", ".", ".."] {
+            assert_eq!(
+                file(name, "text/plain", 1, &digest).validate(),
+                Err(FileError::Name)
+            );
+        }
+
+        let long_type = file("a.txt", &"m".repeat(128), 1, &digest);
+        assert_eq!(long_type.validate(), Err(FileError::MediaType));
+        for media_type in ["", "text/plain\n", "tëxt/plain"] {
+            assert_eq!(
+                file("a.txt", media_type, 1, &digest).validate(),
+                Err(FileError::MediaType)
+            );
+        }
+
+        let large = file(
+            "a.bin",
+            "application/octet-stream",
+            MAX_FILE_BYTES + 1,
+            &digest,
+        );
+        assert_eq!(large.validate(), Err(FileError::Size));
+
+        for sha256 in ["ab".repeat(31), "AB".repeat(32), "not a digest".to_owned()] {
+            assert_eq!(
+                file("a.txt", "text/plain", 1, &sha256).validate(),
+                Err(FileError::Digest)
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_out_of_bounds_never_reaches_the_record() {
+        let draft = EventDraft::new(
+            EventKind::FileAdded,
+            Author::User(Id::new()),
+            serde_json::to_value(file("../secret", "text/plain", 1, &"ab".repeat(32))).unwrap(),
+        );
+
+        assert!(draft.validate().is_err());
+    }
+
+    #[test]
+    fn a_file_event_takes_the_authors_a_message_takes() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        for kind in [EventKind::MessageAdded, EventKind::FileAdded] {
+            assert!(kind.validate_author(user, None).is_ok());
+            assert!(kind.validate_author(bot, Some(Id::new())).is_ok());
+            assert!(kind.validate_author(user, Some(Id::new())).is_err());
+            assert!(kind.validate_author(bot, None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_message_may_carry_a_file() {
+        let chat = Id::new();
+        let file = Id::new();
+        let carried = serde_json::json!({"message": Id::new(), "chat": chat, "text": "see attached", "file": file});
+        let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&carried).unwrap()
+        else {
+            panic!("expected a Message");
+        };
+        assert_eq!(data.file, Some(file));
+
+        let plain = serde_json::json!({"message": Id::new(), "chat": chat, "text": "hi"});
+        let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&plain).unwrap() else {
+            panic!("expected a Message");
+        };
+        assert_eq!(data.file, None);
     }
 }
 
@@ -266,6 +385,8 @@ pub enum EventData {
     ChatCreated(ChatCreated),
     /// A Message was added.
     MessageAdded(MessageAdded),
+    /// A File was added.
+    FileAdded(FileAdded),
     /// A run started.
     RunStarted(RunStarted),
     /// A run finished.
@@ -297,6 +418,12 @@ impl EventKind {
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
+            Self::FileAdded => {
+                let data: FileAdded = decode(data)?;
+                data.validate()?;
+
+                EventData::FileAdded(data)
+            }
             Self::RunStarted => EventData::RunStarted(decode(data)?),
             Self::RunFinished => EventData::RunFinished(decode(data)?),
             Self::RunStep => EventData::RunStep(decode(data)?),
@@ -319,7 +446,7 @@ impl EventKind {
                     return Err(EventDataError::Author);
                 }
             }
-            Self::MessageAdded => match (author, acting) {
+            Self::MessageAdded | Self::FileAdded => match (author, acting) {
                 (Author::User(_), None) | (Author::Bot(_), Some(_)) => {}
                 _ => return Err(EventDataError::Author),
             },
@@ -464,9 +591,102 @@ pub struct MessageAdded {
     pub chat: Id,
     /// Its text.
     pub text: String,
+    /// The File it carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Id>,
     /// The run it belongs to.
     #[serde(default)]
     pub run: Option<Id>,
+}
+
+/// The largest name a File carries.
+const MAX_FILE_NAME_BYTES: usize = 255;
+/// The largest media type a File carries.
+const MAX_MEDIA_TYPE_BYTES: usize = 127;
+
+/// The data of `neha.file.added`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FileAdded {
+    /// The File identifier.
+    pub file: Id,
+    /// The Chat it belongs to.
+    pub chat: Id,
+    /// Its name, which is never a path.
+    pub name: String,
+    /// Its media type.
+    pub media_type: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its lowercase hex SHA-256.
+    pub sha256: String,
+}
+
+/// A File does not fit the bounds a Space accepts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FileError {
+    /// The name is empty, too long, or a path.
+    #[error("a File name must be 1 to 255 bytes and must not be a path")]
+    Name,
+    /// The media type is empty, too long, or not printable ASCII.
+    #[error("a File's media type must be 1 to 127 bytes of printable ASCII")]
+    MediaType,
+    /// The size is over the largest File a Space accepts.
+    #[error("a File must be at most 32 MiB")]
+    Size,
+    /// The digest is not a lowercase hex SHA-256.
+    #[error("a File's sha256 must be 64 lowercase hexadecimal digits")]
+    Digest,
+}
+
+impl From<FileError> for EventDataError {
+    fn from(error: FileError) -> Self {
+        Self::Data(error.to_string())
+    }
+}
+
+impl FileAdded {
+    /// Checks the name of a File before the Space holds its bytes.
+    pub fn check_name(name: &str) -> Result<(), FileError> {
+        if name.is_empty()
+            || name.len() > MAX_FILE_NAME_BYTES
+            || name.contains(['/', '\\', '\0'])
+            || name == "."
+            || name == ".."
+        {
+            return Err(FileError::Name);
+        }
+
+        Ok(())
+    }
+
+    /// Checks the media type of a File before the Space holds its bytes.
+    pub fn check_media_type(media_type: &str) -> Result<(), FileError> {
+        if media_type.is_empty()
+            || media_type.len() > MAX_MEDIA_TYPE_BYTES
+            || !media_type
+                .bytes()
+                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        {
+            return Err(FileError::MediaType);
+        }
+
+        Ok(())
+    }
+
+    /// Checks that the File fits the bounds every Space accepts.
+    pub fn validate(&self) -> Result<(), FileError> {
+        Self::check_name(&self.name)?;
+        Self::check_media_type(&self.media_type)?;
+        if self.size > MAX_FILE_BYTES {
+            return Err(FileError::Size);
+        }
+        if !is_sha256(&self.sha256) {
+            return Err(FileError::Digest);
+        }
+
+        Ok(())
+    }
 }
 
 /// The data of `neha.run.started`.

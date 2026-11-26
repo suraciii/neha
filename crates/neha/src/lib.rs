@@ -4,10 +4,12 @@
 //! `specs/`. `eng/architecture.md` records which crate owns what.
 //!
 //! This crate holds the record's shared vocabulary: identifiers, sequence
-//! numbers, timestamps, stable error codes, and event classification.
+//! numbers, timestamps, stable error codes, event classification, and
+//! the bounds a File must fit.
 
 pub mod error;
 pub mod event;
+pub mod file;
 pub mod id;
 pub mod record;
 pub mod seq;
