@@ -55,6 +55,14 @@ While a Run is active, the Chat shows that the Bot is working and does not accep
 
 A failed Run leaves a Bot Message that states the failure. The Chat keeps the Message in its place.
 
+## Language
+
+The client supports English (en-US) and Simplified Chinese (zh-CN).
+
+A first visit follows the browser language. The User can switch language from the sign-in card and from the signed-in client. The choice belongs to the browser and never changes the record.
+
+Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provider, Model. Dates follow the active locale; times use a 24-hour clock in both locales.
+
 ## Page states
 
 Every page distinguishes loading, empty, ready, and failed. An error states what failed and what the User can do next.

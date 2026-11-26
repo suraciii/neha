@@ -1,8 +1,10 @@
 import { Show, createSignal } from "solid-js";
 
+import { t } from "../i18n";
 import { api, ApiError } from "../lib/api";
 import type { Account } from "../types";
 import Brand from "./Brand";
+import LocaleSwitch from "./LocaleSwitch";
 
 type Mode = "join" | "login" | "missing-invite";
 
@@ -16,7 +18,7 @@ export default function AuthView(props: AuthViewProps) {
   const [displayName, setDisplayName] = createSignal("");
   const [password, setPassword] = createSignal("");
   const [pending, setPending] = createSignal(false);
-  const [error, setError] = createSignal<string | null>(null);
+  const [error, setError] = createSignal<unknown>(null);
 
   const isJoin = () => props.mode === "join";
 
@@ -32,7 +34,7 @@ export default function AuthView(props: AuthViewProps) {
       history.replaceState(null, "", "/");
       props.onAuthed(account);
     } catch (reason) {
-      setError(messageFor(reason));
+      setError(reason);
     } finally {
       setPending(false);
     }
@@ -43,52 +45,48 @@ export default function AuthView(props: AuthViewProps) {
       <section class="auth__intro">
         <Brand />
         <div class="auth__copy">
-          <p class="eyebrow">Neha · Visual design, implemented</p>
-          <h1>Put work in the hands of a team you can see.</h1>
-          <p class="auth__lede">
-            A Bot is a teammate. It has its own Computer, memory, and identity. Work lands in the Chat, and
-            authority always stays with you.
-          </p>
+          <p class="eyebrow">{t("brand.eyebrow")}</p>
+          <h1>{t("auth.headline")}</h1>
+          <p class="auth__lede">{t("auth.lede")}</p>
         </div>
         <ul class="auth__points">
           <li>
             <span class="auth__point-dot" />
-            One Space, on this machine
+            {t("auth.point.space")}
           </li>
           <li>
             <span class="auth__point-dot" />
-            Your Provider, your Models
+            {t("auth.point.provider")}
           </li>
           <li>
             <span class="auth__point-dot" />
-            A managed Computer for each Bot
+            {t("auth.point.computer")}
           </li>
         </ul>
       </section>
 
       <section class="auth__card-wrap">
         <div class="auth__card">
+          <div class="auth__locale">
+            <LocaleSwitch />
+          </div>
           <Show when={props.mode === "missing-invite"}>
-            <p class="eyebrow">Invitation required</p>
-            <h2>Open the whole invitation link</h2>
+            <p class="eyebrow">{t("auth.missing.eyebrow")}</p>
+            <h2>{t("auth.missing.title")}</h2>
             <p class="muted">
-              The link printed by <code>neha serve</code> carries a secret after the <code>#</code>. Paste the
-              complete link into this browser.
+              {t("auth.missing.lead")} <code>neha serve</code> {t("auth.missing.mid")} <code>#</code>
+              {t("auth.missing.tail")}
             </p>
           </Show>
 
           <Show when={props.mode !== "missing-invite"}>
-            <p class="eyebrow">{isJoin() ? "Admin invitation" : "Welcome back"}</p>
-            <h2>{isJoin() ? "Join this Space" : "Sign in to Neha"}</h2>
-            <p class="auth__hint">
-              {isJoin()
-                ? "Become the Admin of this Space. The invitation works once, while the Space runs."
-                : "Use the account that already belongs to this Space."}
-            </p>
+            <p class="eyebrow">{isJoin() ? t("auth.join.eyebrow") : t("auth.login.eyebrow")}</p>
+            <h2>{isJoin() ? t("auth.join.title") : t("auth.login.title")}</h2>
+            <p class="auth__hint">{isJoin() ? t("auth.join.hint") : t("auth.login.hint")}</p>
 
             <form class="form" onSubmit={submit}>
               <label class="field">
-                <span class="field__label">Display name</span>
+                <span class="field__label">{t("auth.name")}</span>
                 <input
                   class="input"
                   name="display_name"
@@ -100,7 +98,7 @@ export default function AuthView(props: AuthViewProps) {
                 />
               </label>
               <label class="field">
-                <span class="field__label">Password</span>
+                <span class="field__label">{t("auth.password")}</span>
                 <input
                   class="input"
                   name="password"
@@ -110,24 +108,24 @@ export default function AuthView(props: AuthViewProps) {
                   value={password()}
                   onInput={(event) => setPassword(event.currentTarget.value)}
                 />
-                <span class="field__hint">At least eight bytes. A short phrase is enough.</span>
+                <span class="field__hint">{t("auth.password.hint")}</span>
               </label>
 
               <Show when={error()}>
-                <p class="form__error" role="alert">
-                  {error()}
-                </p>
+                {(reason) => (
+                  <p class="form__error" role="alert">
+                    {messageFor(reason())}
+                  </p>
+                )}
               </Show>
 
               <button class="btn btn--primary btn--wide" type="submit" disabled={pending()}>
-                {pending() ? "Working…" : isJoin() ? "Join Space" : "Sign in"}
+                {pending() ? t("auth.working") : isJoin() ? t("auth.join.action") : t("auth.login.action")}
               </button>
             </form>
           </Show>
 
-          <p class="auth__fine">
-            The Space listens on this machine only. The browser keeps the session in an HttpOnly cookie.
-          </p>
+          <p class="auth__fine">{t("auth.fine")}</p>
         </div>
       </section>
     </div>
@@ -136,12 +134,16 @@ export default function AuthView(props: AuthViewProps) {
 
 function messageFor(reason: unknown): string {
   if (reason instanceof ApiError) {
-    if (reason.code === "not_found") return "This invitation is not usable. Start a new Space or ask the Admin.";
-    if (reason.code === "unauthorized") return "The display name or password is not correct.";
-    if (reason.code === "rate_limited") return "Too many sign-in attempts. Wait a few minutes.";
-    if (reason.code === "conflict") return "This Space already has an Admin. Sign in instead.";
-    return reason.message;
+    if (reason.code === "not_found") return t("error.invitation");
+    if (reason.code === "unauthorized") return t("error.credentials");
+    if (reason.code === "rate_limited") return t("error.rate");
+    if (reason.code === "conflict") return t("error.conflict");
+    if (reason.code === "invalid_argument" && /password/i.test(reason.message)) {
+      return t("error.password");
+    }
+    if (reason.code === "invalid_argument") return t("error.invalid");
+    return t("error.generic");
   }
-  if (reason instanceof TypeError) return "The browser cannot reach this Space. Is `neha serve` still running?";
-  return "The Space cannot complete this request.";
+  if (reason instanceof TypeError) return t("error.unreachable");
+  return t("error.generic");
 }
