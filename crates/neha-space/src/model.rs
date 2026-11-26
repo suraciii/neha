@@ -738,9 +738,10 @@ impl ModelError {
     #[must_use]
     pub fn usage(&self) -> Option<Usage> {
         match self {
-            Self::StreamEnded { usage } | Self::Truncated { usage } | Self::Filtered { usage } => {
-                Some(*usage)
-            }
+            Self::StreamEnded { usage }
+            | Self::Truncated { usage }
+            | Self::Filtered { usage }
+            | Self::Retried { usage, .. } => Some(*usage),
             _ => None,
         }
     }

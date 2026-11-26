@@ -1245,6 +1245,12 @@ mod tests {
             name: String,
             arguments: Value,
         },
+        TruncatedToolWithUsage {
+            name: String,
+            arguments: Value,
+            prompt: u64,
+            completion: u64,
+        },
         StreamEndedUsage {
             text: String,
         },
@@ -1306,6 +1312,30 @@ mod tests {
                                 "function": {"name": name, "arguments": arguments},
                             }]}}]});
                             format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
+                        ScriptedReply::TruncatedToolWithUsage {
+                            name,
+                            arguments,
+                            prompt,
+                            completion,
+                        } => {
+                            let chunk = json!({"choices":[{
+                                "delta": {"tool_calls":[{
+                                    "index": 0,
+                                    "id": format!("call-{index}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": serde_json::to_string(&arguments).unwrap(),
+                                    },
+                                }]},
+                                "finish_reason": "length",
+                            }]});
+                            let usage = json!({"choices":[],"usage":{
+                                "prompt_tokens": prompt,
+                                "completion_tokens": completion,
+                            }});
+                            format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
                         }
                         ScriptedReply::StreamEndedUsage { text } => {
                             let chunk = json!({"choices":[{"delta":{"content":text}}]});
@@ -3482,6 +3512,43 @@ mod tests {
             "the partial attempt never becomes a Message"
         );
         assert_eq!(bot_messages[0]["text"], "second complete");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_retry_keeps_every_attempt_usage() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            ScriptedReply::StreamEndedUsage {
+                text: "partial".to_owned(),
+            },
+            ScriptedReply::TruncatedToolWithUsage {
+                name: "write_file".to_owned(),
+                arguments: json!({"path": "never.txt", "content": "never"}),
+                prompt: 8,
+                completion: 2,
+            },
+        ])
+        .await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "answer me").await;
+
+        assert_eq!(result["status"], "failed");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "failed");
+        assert_eq!(shown["usage"]["uncached_input"], 48);
+        assert_eq!(shown["usage"]["output"], 14);
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert!(!workspace.join("never.txt").exists());
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
