@@ -453,6 +453,19 @@ impl State {
         runs
     }
 
+    /// Builds the Model history for a Chat up to a cursor.
+    ///
+    /// A resumed run rebuilds the history it saw when it started, not the
+    /// Conversation that continued while it waited.
+    #[must_use]
+    pub fn history_until(&self, chat: Id, until: Seq) -> Vec<(Author, String)> {
+        self.messages
+            .iter()
+            .filter(|message| message.chat == chat && message.seq <= until)
+            .map(|message| (message.author, self.model_text(message)))
+            .collect()
+    }
+
     /// Builds the Model history for a Chat, oldest first.
     ///
     /// A Message that carries a File ends with a line that names the File, so

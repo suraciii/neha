@@ -116,6 +116,8 @@ pub struct CommandContext<'a> {
     /// Serializes answers and rule changes, so two clients cannot decide one
     /// approval or add one rule twice.
     pub approvals: &'a tokio::sync::Mutex<()>,
+    /// The live event stream a command may broadcast on.
+    pub events: &'a tokio::sync::broadcast::Sender<Event>,
 }
 
 /// Runs one command for an account.
@@ -284,8 +286,8 @@ async fn approval_decide(
     allow: bool,
     lasting: bool,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
     }
     // One answer per approval even when two clients answer at once.
     let _decisions = context.approvals.lock().await;
@@ -339,6 +341,7 @@ async fn approval_decide(
     let mut result = json!({
         "approval": approval,
         "run": view.run,
+        "user": account.id,
         "status": if allow { "allowed" } else { "denied" },
     });
     if let Some(rule) = lasting_rule {
@@ -411,6 +414,24 @@ async fn approval_decide(
     if appended.existing {
         return recorded_outcome(context.store, command_id).await;
     }
+    if !allow {
+        // A denied action ends its run now, not when the Bot's pump happens to
+        // be free: another run may hold the Bot, and the User must not see a
+        // decided approval whose run still says waiting.
+        let run = {
+            let state = context
+                .state
+                .lock()
+                .map_err(|_| ApiError::internal("state lock"))?;
+            state.runs.get(&view.run).cloned()
+        };
+        if let Some(run) = run
+            && let Err(error) =
+                fail_denied_run(context.store, context.state, context.events, &run).await
+        {
+            eprintln!("neha: cannot record a denied run {}: {error}", run.id);
+        }
+    }
 
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
@@ -433,8 +454,8 @@ async fn rule_add(
     command_prefix: Option<String>,
     path_prefix: Option<String>,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
     }
     let _decisions = context.approvals.lock().await;
     let tool = tool.trim().to_owned();
@@ -534,13 +555,22 @@ async fn rule_add(
         }),
     )
     .acting(account.id);
+    let result = json!({
+        "rule": rule,
+        "bot": bot,
+        "user": account.id,
+        "effect": effect,
+        "tool": tool,
+        "command_prefix": command_prefix,
+        "path_prefix": path_prefix,
+    });
     let appended = append(
         context.store,
         context.state,
         command_id,
         fingerprint,
         vec![draft],
-        None,
+        Some(result.clone()),
         None,
     )
     .await?;
@@ -550,16 +580,6 @@ async fn rule_add(
     let Some(event) = appended.events.first() else {
         return Err(ApiError::internal("the rule was not recorded"));
     };
-    let result = json!({
-        "rule": rule,
-        "bot": bot,
-        "user": account.id,
-        "effect": effect,
-        "tool": tool,
-        "command_prefix": command_prefix,
-        "path_prefix": path_prefix,
-        "seq": event.seq,
-    });
 
     Ok(Outcome {
         committed: Some(event.seq),
@@ -577,8 +597,8 @@ async fn rule_remove(
     fingerprint: String,
     rule: Id,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
     }
     let _decisions = context.approvals.lock().await;
     let (view, owned) = {
@@ -612,7 +632,7 @@ async fn rule_remove(
         command_id,
         fingerprint,
         vec![draft],
-        Some(json!({"rule": rule})),
+        Some(json!({"rule": rule, "user": account.id})),
         None,
     )
     .await?;
@@ -1717,7 +1737,7 @@ fn prepare_resume(
     }
 
     let mut messages = Vec::new();
-    for (author, text) in state.history(run.chat) {
+    for (author, text) in state.history_until(run.chat, run.seq) {
         messages.push(match author {
             Author::User(_) => neha_loop::Message::user(text),
             Author::Bot(_) => neha_loop::Message::assistant(text),
@@ -2026,10 +2046,29 @@ fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {
         return neha::usage::Usage::default();
     };
 
-    run.steps
+    let completed: std::collections::HashSet<u32> = run
+        .steps
+        .iter()
+        .filter(|step| step.usage.is_some())
+        .map(|step| step.index)
+        .collect();
+    let mut total = run
+        .steps
         .iter()
         .filter_map(|step| step.usage)
-        .fold(neha::usage::Usage::default(), |total, usage| total + usage)
+        .fold(neha::usage::Usage::default(), |total, usage| total + usage);
+    // A reply whose step never completed (the run waited, or failed before
+    // recording the step) still spent the Model's usage.
+    for reply in state.run_replies(run.id) {
+        if completed.contains(&reply.step) {
+            continue;
+        }
+        if let Some(usage) = reply.usage {
+            total += usage;
+        }
+    }
+
+    total
 }
 
 fn completion_drafts(
@@ -3092,6 +3131,34 @@ async fn existing_outcome(
         queued: None,
         events: Vec::new(),
     })
+}
+
+/// Returns a recorded command's outcome, but only to the User who ran it.
+async fn replay_owned(
+    store: &Store,
+    command_id: Id,
+    fingerprint: &str,
+    account: &Account,
+) -> Result<Option<Outcome>, ApiError> {
+    let Some(record) = existing(store, command_id, fingerprint).await? else {
+        return Ok(None);
+    };
+    if let Some(user) = record
+        .result
+        .as_ref()
+        .and_then(|result| result.get("user"))
+        .and_then(Value::as_str)
+    {
+        let user = user
+            .parse::<Id>()
+            .map_err(|_| ApiError::internal("a recorded command has an invalid User"))?;
+        if user != account.id {
+            return Err(ApiError::forbidden(
+                "a recorded command belongs to another User",
+            ));
+        }
+    }
+    Ok(Some(existing_outcome(store, command_id, record).await?))
 }
 
 async fn recorded_outcome(store: &Store, command_id: Id) -> Result<Outcome, ApiError> {

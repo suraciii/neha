@@ -1648,6 +1648,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             links: &server.links,
                             pairings: &server.pairings,
                             approvals: &server.approvals,
+                            events: &server.events,
                         };
                         let outcome = commands::execute(&context, &account, id, command).await;
                         let result = match outcome {
@@ -10180,6 +10181,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            events: &server.events,
         }
     }
 
@@ -10564,6 +10566,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            events: &server.events,
         };
         let stranger = crate::identity::Account {
             id: Id::new(),
@@ -12901,6 +12904,24 @@ mod tests {
         local.device.close(None).await.unwrap();
         local.provider_task.abort();
         local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_add_replays_its_recorded_result() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let command_id = Id::new();
+        let call = add_rule(bot, neha::record::RuleEffect::Allow, "shell", None, None);
+        let first = command(&mut socket, command_id, call.clone()).await;
+        let second = command(&mut socket, command_id, call).await;
+        assert_eq!(
+            first, second,
+            "a recorded rule add must confirm the same result on retry"
+        );
+
+        socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 }
