@@ -313,29 +313,26 @@ impl LocalRuntime {
             // Open first, then judge the descriptor. A path replaced between a
             // check and the open could otherwise point the grant somewhere
             // else; every later write and shell bind uses this descriptor.
-            let Ok(file) = std::fs::File::open(grant.trim()) else {
-                // The Space may hold a grant from another machine or a folder
-                // that has since gone. It must not take the whole runtime down:
-                // that grant simply grants nothing here.
-                continue;
-            };
+            // Open without blocking and require a directory. A path swapped or
+            // turned into a FIFO after the Space's check must not stall the
+            // daemon here.
             #[cfg(unix)]
-            let mut file = file;
-            // The shell moves the Bot's folder descriptor to a fixed one-digit
-            // number. A grant that landed there is moved to another descriptor
-            // so the two mounts can never name each other.
-            #[cfg(unix)]
-            while {
-                use std::os::fd::AsRawFd as _;
-                file.as_raw_fd() == MOUNT_FD
-            } {
-                match file.try_clone() {
-                    Ok(next) => file = next,
-                    Err(_) => break,
+            let file = {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_DIRECTORY)
+                    .open(grant.trim())
+                {
+                    Ok(file) => file,
+                    Err(_) => continue,
                 }
-            }
+            };
             #[cfg(not(unix))]
-            let file = file;
+            let file = match std::fs::File::open(grant.trim()) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
             let Ok(metadata) = file.metadata() else {
                 continue;
             };
@@ -343,14 +340,42 @@ impl LocalRuntime {
                 continue;
             }
             #[cfg(unix)]
-            let root = {
+            let mut file = file;
+            // The shell moves the Bot's folder descriptor to a fixed one-digit
+            // number. A grant that landed there is moved to another descriptor
+            // so the two mounts can never name each other.
+            #[cfg(unix)]
+            {
                 use std::os::fd::AsRawFd as _;
-                std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
-                    .or_else(|_| std::fs::canonicalize(grant.trim()))
-                    .map_err(RuntimeError::Io)?
+                let mut moved = true;
+                while file.as_raw_fd() == MOUNT_FD {
+                    match file.try_clone() {
+                        Ok(next) => file = next,
+                        Err(_) => {
+                            moved = false;
+                            break;
+                        }
+                    }
+                }
+                if !moved {
+                    // Without a safe descriptor this grant cannot be mounted.
+                    continue;
+                }
+            }
+            #[cfg(unix)]
+            let Some(root) = ({
+                use std::os::fd::AsRawFd as _;
+                std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+            }) else {
+                // The opened directory has no readable identity; do not fall
+                // back to a path that may name something else.
+                continue;
             };
             #[cfg(not(unix))]
-            let root = std::fs::canonicalize(grant.trim()).map_err(RuntimeError::Io)?;
+            let root = match std::fs::canonicalize(grant.trim()) {
+                Ok(root) => root,
+                Err(_) => continue,
+            };
             if self.is_hidden(&root) || self.is_denied(&root) {
                 return Err(RuntimeError::Access(format!(
                     "the granted folder is hidden from this Computer: {}",
@@ -871,6 +896,11 @@ impl LocalRuntime {
                 ) = self
                     .grants
                     .iter()
+                    // A grant the Bot's folder scan would refuse is not mounted
+                    // writable for the shell: a hard link or symlink in it
+                    // could otherwise change a file outside the grant. The
+                    // file tools keep their own per-write checks.
+                    .filter(|(root, file)| scan_bot_folder(file, root).is_ok())
                     .map(|(root, file)| {
                         use std::os::fd::AsRawFd as _;
                         (
@@ -4150,6 +4180,30 @@ mod tests {
             std::fs::read_to_string(granted.join("shell.txt")).unwrap(),
             "shell\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hard_link_in_a_grant_is_not_writable_by_the_shell() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let granted = directory.path().join("granted");
+        std::fs::create_dir(&granted).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "safe").unwrap();
+        std::fs::hard_link(&outside, granted.join("link.txt")).unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(false, &[granted.to_string_lossy().into_owned()])
+            .unwrap();
+        let result = runtime
+            .execute(Action::Shell {
+                command: format!("printf changed > {}/link.txt", granted.display()),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "safe");
     }
 
     #[tokio::test]
