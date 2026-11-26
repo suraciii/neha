@@ -1,4 +1,4 @@
-import { For, Show } from "solid-js";
+import { For, Show, createMemo } from "solid-js";
 
 import { t } from "../i18n";
 import type { Account, Bot, Chat, Preview } from "../types";
@@ -56,21 +56,21 @@ export default function Sidebar(props: SidebarProps) {
         >
           <For each={props.chats}>
             {(chat) => {
-              const bot = botFor(chat);
+              const bot = createMemo(() => botFor(chat));
+              const line = createMemo(() => preview(chat));
               return (
                 <button
-                  class="conv"
-                  classList={{ "is-active": props.activeChat?.id === chat.id }}
+                  class={`conv${props.activeChat?.id === chat.id ? " is-active" : ""}`}
                   type="button"
                   onClick={() => props.onSelect(chat)}
                 >
-                  <Avatar name={bot?.name ?? "Bot"} />
+                  <Avatar name={bot()?.name ?? "Bot"} />
                   <span class="conv__text">
                     <span class="conv__top">
-                      <span class="conv__name">{bot?.name ?? "Bot"}</span>
+                      <span class="conv__name">{bot()?.name ?? "Bot"}</span>
                       <span class="conv__meta">{t("chat.title")}</span>
                     </span>
-                    <span class="conv__preview">{preview(chat)}</span>
+                    <span class="conv__preview">{line()}</span>
                   </span>
                 </button>
               );

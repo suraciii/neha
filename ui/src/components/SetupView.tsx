@@ -205,7 +205,7 @@ export default function SetupView(props: SetupViewProps) {
               <button
                 class="link-btn"
                 type="button"
-                aria-expanded={showAdvanced()}
+                aria-expanded={showAdvanced() ? "true" : "false"}
                 onClick={() => setShowAdvanced((open) => !open)}
               >
                 <Icon name={showAdvanced() ? "chevron-up" : "chevron-down"} size="sm" />

@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { flush } from "solid-js";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App";
@@ -127,7 +128,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
-  setLocale("en-US");
+  flush(() => setLocale("en-US"));
 });
 
 describe("App with Files", () => {
@@ -195,7 +196,7 @@ describe("App with Files", () => {
     );
     attach(view, new File(["hello"], "notes.txt", { type: "text/plain" }));
     await waitFor(() => expect(view.container.querySelector(".attachment")).toBeTruthy());
-    fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: "please summarize" } });
+    flush(() => fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: "please summarize" } }));
     fireEvent.submit(element(view, "form.composer"));
 
     await waitFor(() => expect(alertText(view)).toBe("notes.txt is larger than 32 MiB."));
@@ -228,7 +229,7 @@ describe("App with Files", () => {
     expect(space.sent).toEqual([]);
     await waitFor(() => expect(view.container.querySelector(".attachment")?.textContent).toContain("notes.txt"));
 
-    fireEvent.click(element(view, ".locale-switch"));
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
     expect(alertText(view)).toBe("文件上传失败，请重试。");
   });
 
@@ -249,7 +250,7 @@ describe("App with Files", () => {
     await waitFor(() =>
       expect(element<HTMLElement>(view, ".conv__preview").textContent).toBe("Sent a File"),
     );
-    fireEvent.click(element(view, ".locale-switch--foot"));
+    flush(() => fireEvent.click(element(view, ".locale-switch--foot")));
     expect(element<HTMLElement>(view, ".conv__preview").textContent).toBe("已发送文件");
   });
 });

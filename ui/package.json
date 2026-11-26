@@ -11,17 +11,18 @@
     "check": "tsc --noEmit && vitest run"
   },
   "dependencies": {
-    "solid-js": "1.9.20"
+    "@solidjs/web": "2.0.4",
+    "solid-js": "2.0.4"
   },
   "devDependencies": {
-    "@solidjs/testing-library": "^0.8.10",
+    "@solidjs/testing-library": "1.0.0-rc.2",
+    "@solidjs/vite-plugin": "3.0.1",
     "@types/fontkit": "^2.0.9",
     "@types/node": "^26.6.7",
     "fontkit": "^3.0.0",
     "jsdom": "26.1.0",
     "typescript": "5.9.3",
-    "vite": "7.3.8",
-    "vite-plugin-solid": "2.11.17",
-    "vitest": "3.2.7"
+    "vite": "8.3.8",
+    "vitest": "4.1.12"
   }
 }

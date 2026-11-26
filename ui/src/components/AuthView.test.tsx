@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { flush } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setLocale } from "../i18n";
@@ -29,7 +30,7 @@ describe("AuthView", () => {
       );
     });
 
-    fireEvent.click(view.container.querySelector(".locale-switch")!);
+    flush(() => fireEvent.click(view.container.querySelector(".locale-switch")!));
     expect(view.container.querySelector('[role="alert"]')?.textContent).toBe(
       "The display name or password is not correct.",
     );
