@@ -2,23 +2,20 @@
 //!
 //! A run repeats one step at a time: call the Model, record the reply, run
 //! every tool call the step requested, record each one before and after it
-//! runs, and feed the results back. A tool call runs on the Computer or, for
-//! the two File tools, moves a File between the Space and the Computer. The
+//! runs, and feed the results back. A tool call runs on the Computer. The
 //! Space approves each action before it starts; a run whose action must wait
 //! ends with [`RunOutcome::Waiting`] and resumes from the record.
 //! The loop stops with a final Message, a failure, or a step limit.
 
 use std::collections::HashSet;
 use std::future::Future;
-use std::path::Path;
 
 use neha::id::Id;
 use neha::usage::Usage;
-use neha_computer::{ActionResult, ActionStatus, ByteError, ComputerRuntime, ToolOutput};
+use neha_computer::{ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::files::{FileHost, workspace_name};
 use crate::model::{Message, Model, ModelFailure, ModelRequest, ToolCall};
 use crate::tools;
 
@@ -212,18 +209,16 @@ pub trait Recorder {
 }
 
 /// Runs one Bot run to its end, or until a Computer action waits for an approval.
-pub async fn run<R, M, Rec, F>(
+pub async fn run<R, M, Rec>(
     runtime: &R,
     model: &M,
     recorder: &mut Rec,
-    files: &F,
     request: RunRequest,
 ) -> Result<RunOutcome, LoopError>
 where
     R: ComputerRuntime + Sync,
     M: Model + Sync,
     Rec: Recorder + Send,
-    F: FileHost + Sync,
 {
     let RunRequest {
         system,
@@ -359,10 +354,6 @@ where
                 let result = match call.parsed {
                     Ok(tools::Call::Computer(computer_action)) => {
                         runtime.execute(computer_action).await
-                    }
-                    Ok(tools::Call::TakeFile { file }) => take_file(runtime, files, file).await,
-                    Ok(tools::Call::PutFile { path, name }) => {
-                        put_file(runtime, files, &path, name).await
                     }
                     Err(error) => ActionResult::failed(error),
                 };
@@ -520,77 +511,6 @@ fn final_reply(content: Option<String>, usage: Usage) -> RunOutcome {
     }
 }
 
-/// Turns a File transfer's error into the action's result.
-///
-/// A lost answer means whether the bytes moved is unknown, so the run ends the
-/// way any lost action does instead of asking the Model and finishing as if
-/// nothing happened. A refusal is an ordinary failed tool result the Model can
-/// read and work around.
-fn byte_failure(error: ByteError) -> ActionResult {
-    match error {
-        ByteError::Failed(message) => ActionResult::failed(message),
-        ByteError::TimedOut(message) => ActionResult {
-            status: ActionStatus::TimedOut,
-            output: ToolOutput::full(message.clone()),
-            error: Some(message),
-        },
-        ByteError::Lost(message) => ActionResult {
-            status: ActionStatus::Unknown,
-            output: ToolOutput::full(message.clone()),
-            error: Some(message),
-        },
-    }
-}
-
-/// Puts one File into the Workspace under its name.
-async fn take_file<R, F>(runtime: &R, files: &F, file: Id) -> ActionResult
-where
-    R: ComputerRuntime,
-    F: FileHost,
-{
-    let taken = match files.take(file).await {
-        Ok(taken) => taken,
-        Err(error) => return ActionResult::failed(error),
-    };
-    let path = workspace_name(&taken.name, &file);
-    let bytes = taken.bytes.len();
-    if let Err(error) = runtime.write_bytes(&path, taken.bytes).await {
-        return byte_failure(error);
-    }
-    ActionResult::succeeded(ToolOutput::full(format!(
-        "took {} ({bytes} bytes) as {path}",
-        taken.name
-    )))
-}
-
-/// Delivers one Workspace file as a File of the Chat.
-async fn put_file<R, F>(runtime: &R, files: &F, path: &str, name: Option<String>) -> ActionResult
-where
-    R: ComputerRuntime,
-    F: FileHost,
-{
-    let bytes = match runtime.read_bytes(path).await {
-        Ok(bytes) => bytes,
-        Err(error) => return byte_failure(error),
-    };
-    let name = match name {
-        Some(name) => name,
-        None => {
-            let Some(file_name) = Path::new(path).file_name() else {
-                return ActionResult::failed("the path has no file name");
-            };
-            file_name.to_string_lossy().into_owned()
-        }
-    };
-    match files.put(name, bytes).await {
-        Ok(delivered) => ActionResult::succeeded(ToolOutput::full(format!(
-            "delivered {} as file {}",
-            delivered.name, delivered.id
-        ))),
-        Err(error) => ActionResult::failed(error),
-    }
-}
-
 fn failure_outcome(failure: &ModelFailure, usage: Usage) -> RunOutcome {
     RunOutcome::Reply {
         text: format!("I could not answer: {}", failure.detail),
@@ -646,9 +566,7 @@ mod tests {
         Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest,
         WaitingApproval, call_id, run,
     };
-    use crate::files::{DeliveredFile, FileHost, TakenFile};
     use crate::model::{Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall};
-    use crate::tools::{PUT_FILE, TAKE_FILE};
 
     #[derive(Default)]
     struct FakeModel {
@@ -687,25 +605,10 @@ mod tests {
     }
 
     impl FakeRuntime {
-        fn with_file(path: &str, bytes: &[u8]) -> Self {
-            Self {
-                files: Mutex::new(vec![(path.to_owned(), bytes.to_vec())]),
-                ..Self::default()
-            }
-        }
-
         /// A Computer that goes away before it answers.
         fn lost() -> Self {
             Self {
                 lost: true,
-                ..Self::default()
-            }
-        }
-
-        /// A Computer that is too slow to take a File.
-        fn slow() -> Self {
-            Self {
-                slow_writes: true,
                 ..Self::default()
             }
         }
@@ -768,56 +671,6 @@ mod tests {
                 Ok(())
             };
             async move { written }
-        }
-    }
-
-    /// The Space's Files of one Chat.
-    #[derive(Default)]
-    struct FakeFiles {
-        files: Mutex<Vec<(Id, TakenFile)>>,
-        puts: Mutex<Vec<(String, Vec<u8>)>>,
-        delivered: Id,
-        refuse_put: bool,
-    }
-
-    impl FakeFiles {
-        fn with(files: Vec<(Id, TakenFile)>) -> Self {
-            Self {
-                files: Mutex::new(files),
-                ..Self::default()
-            }
-        }
-    }
-
-    impl FileHost for FakeFiles {
-        #[allow(clippy::manual_async_fn)]
-        fn take(&self, file: Id) -> impl Future<Output = Result<TakenFile, String>> + Send {
-            let taken = self
-                .files
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(id, _)| *id == file)
-                .map(|(_, taken)| taken.clone());
-            async move { taken.ok_or_else(|| format!("there is no File {file} in this Chat")) }
-        }
-
-        #[allow(clippy::manual_async_fn)]
-        fn put(
-            &self,
-            name: String,
-            bytes: Vec<u8>,
-        ) -> impl Future<Output = Result<DeliveredFile, String>> + Send {
-            let delivered = if self.refuse_put {
-                Err("the Chat cannot take this File".to_owned())
-            } else {
-                self.puts.lock().unwrap().push((name.clone(), bytes));
-                Ok(DeliveredFile {
-                    id: self.delivered,
-                    name,
-                })
-            };
-            async move { delivered }
         }
     }
 
@@ -991,14 +844,6 @@ mod tests {
         }
     }
 
-    fn taken_file(name: &str, bytes: &[u8]) -> TakenFile {
-        TakenFile {
-            name: name.to_owned(),
-            media_type: "text/plain".to_owned(),
-            bytes: bytes.to_vec(),
-        }
-    }
-
     /// The `(tool_call_id, content)` of every tool Message in a request.
     fn tool_messages(request: &ModelRequest) -> Vec<(String, String)> {
         request
@@ -1014,22 +859,10 @@ mod tests {
             .collect()
     }
 
-    /// The text each tool call of the first step returned to the Model.
-    fn tool_texts(model: &FakeModel) -> Vec<String> {
-        let requests = model.requests.lock().unwrap();
-        requests[1]
-            .messages
-            .iter()
-            .filter(|message| message.role == Role::Tool)
-            .map(|message| message.content.clone().unwrap())
-            .collect()
-    }
-
     #[tokio::test]
     async fn a_final_answer_ends_the_run() {
         let model = FakeModel::with(vec![reply("hello")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, usage, succeeded) = reply_outcome(
@@ -1037,7 +870,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1073,7 +905,6 @@ mod tests {
             reply("done"),
         ]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, _, succeeded) = reply_outcome(
@@ -1081,7 +912,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1125,7 +955,6 @@ mod tests {
             json!({"command": "rm -rf build"}),
         )]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::that_waits();
 
         let approval = waiting(
@@ -1133,7 +962,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1171,7 +999,6 @@ mod tests {
             reply("done"),
         ]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, _, _) = reply_outcome(
@@ -1179,7 +1006,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1221,7 +1047,6 @@ mod tests {
     async fn a_record_that_cannot_hold_an_approval_stops_the_loop() {
         let model = FakeModel::with(vec![call_reply("shell", json!({"command": "ls"}))]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder {
             fail_at: Some("approve"),
             ..TestRecorder::default()
@@ -1231,7 +1056,6 @@ mod tests {
             &runtime,
             &model,
             &mut recorder,
-            &files,
             RunRequest::new("system", Vec::new(), 100),
         )
         .await;
@@ -1258,7 +1082,6 @@ mod tests {
         let history = vec![Message::tool_result("call-1", "wrote a.txt")];
         let model = FakeModel::with(vec![reply("done")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, usage, succeeded) = reply_outcome(
@@ -1266,7 +1089,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", history, 100).with_resume(resume(
                     calls,
                     1,
@@ -1383,7 +1205,6 @@ mod tests {
         ];
         let model = FakeModel::with(Vec::new());
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::that_waits();
 
         let approval = waiting(
@@ -1391,7 +1212,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100).with_resume(resume(
                     calls,
                     0,
@@ -1427,84 +1247,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_move_that_waits_is_not_started() {
-        let files = FakeFiles::default();
-        let model = FakeModel::with(vec![call_reply(
-            PUT_FILE,
-            json!({"path": "out/report.txt", "name": "answer.txt"}),
-        )]);
-        let runtime = FakeRuntime::with_file("out/report.txt", b"hello");
-        let mut recorder = TestRecorder::that_waits();
-
-        let approval = waiting(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert_eq!(
-            approval,
-            WaitingApproval {
-                step: 1,
-                index: 0,
-                call: "call-1".to_owned(),
-                tool: "put_file".to_owned(),
-                arguments: json!({"path": "out/report.txt", "name": "answer.txt"}),
-                action: recorder.approvals[0].2,
-            }
-        );
-        assert_eq!(recorder.order, ["reply", "approve"]);
-        assert!(recorder.started.is_empty());
-        assert!(files.puts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_resumed_file_move_runs_once_under_the_approved_action() {
-        let approved_action = Id::new();
-        let calls = vec![recorded(
-            "call-1",
-            PUT_FILE,
-            json!({"path": "out/report.txt"}),
-        )];
-        let files = FakeFiles::default();
-        let model = FakeModel::with(vec![reply("done")]);
-        let runtime = FakeRuntime::with_file("out/report.txt", b"hello");
-        let mut recorder = TestRecorder::default();
-
-        let (text, _, _) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100).with_resume(resume(
-                    calls,
-                    0,
-                    approved_action,
-                )),
-            )
-            .await,
-        );
-
-        assert_eq!(text, "done");
-        assert_eq!(
-            *files.puts.lock().unwrap(),
-            [("report.txt".to_owned(), b"hello".to_vec())]
-        );
-        assert_eq!(
-            recorder.started,
-            [(2, "put_file".to_owned(), approved_action)]
-        );
-        assert!(recorder.approvals.is_empty());
-        assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
-    }
-
-    #[tokio::test]
     async fn a_refused_call_stays_refused_after_a_resume() {
         // The Model repeated a field. The strict parse refuses the call, but
         // the JSON the record keeps has lost the duplicate and would parse.
@@ -1519,7 +1261,6 @@ mod tests {
             },
         ])]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::that_waits();
 
         let approval = waiting(
@@ -1527,7 +1268,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1548,7 +1288,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100).with_resume(resume(
                     calls,
                     0,
@@ -1599,7 +1338,6 @@ mod tests {
         }];
         let model = FakeModel::with(vec![reply("done")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, _, _) = reply_outcome(
@@ -1607,7 +1345,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100).with_resume(resume(
                     calls,
                     0,
@@ -1643,14 +1380,12 @@ mod tests {
                 call(ids[1], "read_file", json!({"path": "b.txt"})),
             ])]);
             let runtime = FakeRuntime::default();
-            let files = FakeFiles::default();
             let mut recorder = TestRecorder::default();
 
             let error = run(
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await;
@@ -1684,7 +1419,6 @@ mod tests {
         ];
         let model = FakeModel::with(vec![reply("done")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, _usage, succeeded) = reply_outcome(
@@ -1692,7 +1426,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", history, 100).with_resume(Resume {
                     step: 2,
                     content: Some("working".to_owned()),
@@ -1727,14 +1460,12 @@ mod tests {
         ];
         let model = FakeModel::with(Vec::new());
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let error = run(
             &runtime,
             &model,
             &mut recorder,
-            &files,
             RunRequest::new("system", Vec::new(), 100).with_resume(resume(calls, 0, Id::new())),
         )
         .await;
@@ -1758,7 +1489,6 @@ mod tests {
             reply("done"),
         ]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         reply_outcome(
@@ -1766,7 +1496,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1791,7 +1520,6 @@ mod tests {
             reply("the Model must not be asked again"),
         ]);
         let runtime = FakeRuntime::lost();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, _, succeeded) = reply_outcome(
@@ -1799,7 +1527,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -1809,362 +1536,6 @@ mod tests {
         assert_eq!(text, "I lost my Computer before the action returned.");
         assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
         assert_eq!(model.requests.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn take_file_puts_a_file_into_the_workspace() {
-        let id = Id::new();
-        let files = FakeFiles::with(vec![(id, taken_file("report.txt", b"hello"))]);
-        let model = FakeModel::with(vec![
-            call_reply(TAKE_FILE, json!({"file": id})),
-            reply("done"),
-        ]);
-        let runtime = FakeRuntime::default();
-        let mut recorder = TestRecorder::default();
-
-        let (_, _, succeeded) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert!(succeeded);
-        assert_eq!(
-            *runtime.files.lock().unwrap(),
-            vec![("report.txt".to_owned(), b"hello".to_vec())]
-        );
-        assert!(runtime.actions.lock().unwrap().is_empty());
-        assert_eq!(recorder.started[0].1, TAKE_FILE);
-        assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
-        assert_eq!(
-            recorder.approvals,
-            [(1, TAKE_FILE.to_owned(), recorder.started[0].2)]
-        );
-        assert_eq!(
-            tool_texts(&model),
-            ["took report.txt (5 bytes) as report.txt"]
-        );
-    }
-
-    #[tokio::test]
-    async fn take_file_of_an_unknown_file_is_returned_to_the_model() {
-        let files = FakeFiles::default();
-        let model = FakeModel::with(vec![
-            call_reply(TAKE_FILE, json!({"file": Id::new()})),
-            reply("done"),
-        ]);
-        let runtime = FakeRuntime::default();
-        let mut recorder = TestRecorder::default();
-
-        let (text, _, _) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert_eq!(text, "done");
-        assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
-        assert!(tool_texts(&model)[0].contains("no File"));
-        assert!(runtime.files.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_file_transfer_that_times_out_is_returned_to_the_model() {
-        let id = Id::new();
-        let files = FakeFiles::with(vec![(id, taken_file("report.txt", b"hello"))]);
-        let model = FakeModel::with(vec![
-            call_reply(TAKE_FILE, json!({"file": id})),
-            reply("done"),
-        ]);
-        let runtime = FakeRuntime::slow();
-        let mut recorder = TestRecorder::default();
-
-        let (_, _, succeeded) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert!(succeeded, "a timeout is a tool answer, not a lost run");
-        assert_eq!(recorder.finished[0].1, ActionStatus::TimedOut);
-        assert_eq!(model.requests.lock().unwrap().len(), 2);
-    }
-
-    #[tokio::test]
-    async fn put_file_delivers_a_workspace_file() {
-        for (arguments, name) in [
-            (json!({"path": "out/report.txt"}), "report.txt"),
-            (
-                json!({"path": "out/report.txt", "name": "answer.txt"}),
-                "answer.txt",
-            ),
-        ] {
-            let files = FakeFiles::default();
-            let model = FakeModel::with(vec![call_reply(PUT_FILE, arguments), reply("done")]);
-            let runtime = FakeRuntime::with_file("out/report.txt", b"hello");
-            let mut recorder = TestRecorder::default();
-
-            let (_, _, succeeded) = reply_outcome(
-                run(
-                    &runtime,
-                    &model,
-                    &mut recorder,
-                    &files,
-                    RunRequest::new("system", Vec::new(), 100),
-                )
-                .await,
-            );
-
-            assert!(succeeded);
-            assert_eq!(
-                *files.puts.lock().unwrap(),
-                vec![(name.to_owned(), b"hello".to_vec())]
-            );
-            assert!(runtime.actions.lock().unwrap().is_empty());
-            assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
-            assert_eq!(
-                recorder.approvals,
-                [(1, PUT_FILE.to_owned(), recorder.started[0].2)]
-            );
-            assert_eq!(
-                tool_texts(&model),
-                [format!("delivered {name} as file {}", files.delivered)]
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn file_tools_and_computer_tools_run_in_record_order() {
-        let id = Id::new();
-        let files = FakeFiles::with(vec![(id, taken_file("in.txt", b"in"))]);
-        let model = FakeModel::with(vec![
-            calls_reply(vec![
-                call("call-1", TAKE_FILE, json!({"file": id})),
-                call(
-                    "call-2",
-                    "write_file",
-                    json!({"path": "note.txt", "content": "note"}),
-                ),
-                call("call-3", PUT_FILE, json!({"path": "in.txt"})),
-            ]),
-            reply("done"),
-        ]);
-        let runtime = FakeRuntime::default();
-        let mut recorder = TestRecorder::default();
-
-        let (text, _, _) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert_eq!(text, "done");
-        // Every call that can run asks before it starts, File moves included.
-        assert_eq!(
-            recorder.order,
-            [
-                "reply",
-                "approve",
-                "action_started",
-                "action_finished",
-                "approve",
-                "action_started",
-                "action_finished",
-                "approve",
-                "action_started",
-                "action_finished",
-                "step",
-                "reply",
-                "step",
-            ]
-        );
-        assert_eq!(
-            recorder
-                .started
-                .iter()
-                .map(|(_, tool, _)| tool.as_str())
-                .collect::<Vec<_>>(),
-            [TAKE_FILE, "write_file", PUT_FILE]
-        );
-        assert_eq!(
-            recorder
-                .finished
-                .iter()
-                .map(|(_, status)| *status)
-                .collect::<Vec<_>>(),
-            [ActionStatus::Succeeded; 3]
-        );
-        assert_eq!(
-            recorder
-                .approvals
-                .iter()
-                .map(|(_, tool, _)| tool.as_str())
-                .collect::<Vec<_>>(),
-            [TAKE_FILE, "write_file", PUT_FILE]
-        );
-        // Each action keeps the identifier it was asked under.
-        assert_eq!(
-            recorder
-                .approvals
-                .iter()
-                .map(|(_, _, action)| *action)
-                .collect::<Vec<_>>(),
-            recorder
-                .started
-                .iter()
-                .map(|(_, _, action)| *action)
-                .collect::<Vec<_>>()
-        );
-        // Only write_file runs on the Computer.
-        assert_eq!(
-            *runtime.actions.lock().unwrap(),
-            [Action::WriteFile {
-                path: "note.txt".to_owned(),
-                content: "note".to_owned(),
-            }]
-        );
-        // take_file wrote in.txt, and put_file delivered what it found there.
-        assert_eq!(
-            *files.puts.lock().unwrap(),
-            [("in.txt".to_owned(), b"in".to_vec())]
-        );
-        assert_eq!(
-            tool_texts(&model),
-            [
-                "took in.txt (2 bytes) as in.txt".to_owned(),
-                "42".to_owned(),
-                format!("delivered in.txt as file {}", files.delivered),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_file_move_is_returned_to_the_model_and_the_run_goes_on() {
-        let id = Id::new();
-        let files = FakeFiles {
-            refuse_put: true,
-            ..FakeFiles::with(vec![(id, taken_file("in.txt", b"in"))])
-        };
-        let model = FakeModel::with(vec![
-            calls_reply(vec![
-                call("call-1", TAKE_FILE, json!({"file": id})),
-                call("call-2", PUT_FILE, json!({"path": "missing.txt"})),
-                call("call-3", PUT_FILE, json!({"path": "present.txt"})),
-            ]),
-            reply("done"),
-        ]);
-        let runtime = FakeRuntime {
-            fail_writes: true,
-            ..FakeRuntime::with_file("present.txt", b"present")
-        };
-        let mut recorder = TestRecorder::default();
-
-        let (text, _, _) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert_eq!(text, "done");
-        assert_eq!(
-            recorder
-                .finished
-                .iter()
-                .map(|(_, status)| *status)
-                .collect::<Vec<_>>(),
-            [ActionStatus::Failed; 3]
-        );
-        let texts = tool_texts(&model);
-        assert!(texts[0].contains("the workspace is full"), "{}", texts[0]);
-        assert!(texts[1].contains("cannot read missing.txt"), "{}", texts[1]);
-        assert!(texts[2].contains("cannot take this File"), "{}", texts[2]);
-        assert!(files.puts.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn take_file_that_loses_its_computer_ends_the_run_unknown() {
-        let id = Id::new();
-        let files = FakeFiles::with(vec![(id, taken_file("report.txt", b"hello"))]);
-        let model = FakeModel::with(vec![
-            call_reply(TAKE_FILE, json!({"file": id})),
-            reply("the Model must not be asked again"),
-        ]);
-        let runtime = FakeRuntime::lost();
-        let mut recorder = TestRecorder::default();
-
-        let (text, _, succeeded) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert!(!succeeded);
-        assert_eq!(text, "I lost my Computer before the action returned.");
-        assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
-        assert_eq!(model.requests.lock().unwrap().len(), 1);
-        assert!(runtime.files.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn put_file_that_loses_its_computer_ends_the_run_unknown() {
-        let files = FakeFiles::default();
-        let model = FakeModel::with(vec![
-            call_reply(PUT_FILE, json!({"path": "out/report.txt"})),
-            reply("the Model must not be asked again"),
-        ]);
-        let mut runtime = FakeRuntime::with_file("out/report.txt", b"hello");
-        runtime.lost = true;
-        let mut recorder = TestRecorder::default();
-
-        let (text, _, succeeded) = reply_outcome(
-            run(
-                &runtime,
-                &model,
-                &mut recorder,
-                &files,
-                RunRequest::new("system", Vec::new(), 100),
-            )
-            .await,
-        );
-
-        assert!(!succeeded);
-        assert_eq!(text, "I lost my Computer before the action returned.");
-        assert_eq!(recorder.finished[0].1, ActionStatus::Unknown);
-        assert_eq!(model.requests.lock().unwrap().len(), 1);
-        assert!(
-            files.puts.lock().unwrap().is_empty(),
-            "a lost transfer delivers nothing"
-        );
     }
 
     #[tokio::test]
@@ -2190,7 +1561,6 @@ mod tests {
         });
         let model = FakeModel::with(vec![calls, reply("done")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (_, _, succeeded) = reply_outcome(
@@ -2198,7 +1568,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -2227,7 +1596,6 @@ mod tests {
             reply("the tool did not exist"),
         ]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (_, _, succeeded) = reply_outcome(
@@ -2235,7 +1603,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -2277,7 +1644,6 @@ mod tests {
         }
         let model = FakeModel::with(vec![reply_with_bad_arguments, reply("bad call")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (_, _, succeeded) = reply_outcome(
@@ -2285,7 +1651,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -2325,7 +1690,6 @@ mod tests {
             },
         })]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, usage, succeeded) = reply_outcome(
@@ -2333,7 +1697,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100),
             )
             .await,
@@ -2352,7 +1715,6 @@ mod tests {
             call_reply("list_files", json!({"path": "."})),
         ]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder::default();
 
         let (text, _, succeeded) = reply_outcome(
@@ -2360,7 +1722,6 @@ mod tests {
                 &runtime,
                 &model,
                 &mut recorder,
-                &files,
                 RunRequest::new("system", Vec::new(), 100).with_max_steps(2),
             )
             .await,
@@ -2376,7 +1737,6 @@ mod tests {
     async fn a_recorder_failure_stops_the_loop() {
         let model = FakeModel::with(vec![reply("hello")]);
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let mut recorder = TestRecorder {
             fail_at: Some("step"),
             ..TestRecorder::default()
@@ -2386,7 +1746,6 @@ mod tests {
             &runtime,
             &model,
             &mut recorder,
-            &files,
             RunRequest::new("system", Vec::new(), 100),
         )
         .await;
@@ -2406,7 +1765,6 @@ mod tests {
     fn a_run_can_be_spawned() {
         fn is_send<T: Send>(_: &T) {}
         let runtime = FakeRuntime::default();
-        let files = FakeFiles::default();
         let model = FakeModel::with(Vec::new());
         let mut recorder = TestRecorder::default();
 
@@ -2414,7 +1772,6 @@ mod tests {
             &runtime,
             &model,
             &mut recorder,
-            &files,
             RunRequest::new("system", Vec::new(), 100),
         ));
     }

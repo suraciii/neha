@@ -20,6 +20,8 @@ Owned by cli. The CLI depends on every topic for its behavior. No topic depends 
 
 A Bot posting a File into a Group is a Bot posting a Message that carries the File, through the CLI.
 
+A Bot's shell runs the same CLI with a short-lived run token instead of a sign-in. `neha file get <id>` brings a File into the Workspace. `neha chat send --file <path>` sends one to the Chat as the Bot.
+
 ## Running a Space
 
 `neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
@@ -60,7 +62,7 @@ A path that is not absolute is refused.
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, `list_files`, or `put_file`, can name a path prefix.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
 
 At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, when the card offers it, for a rule, what Always allow covers.
 

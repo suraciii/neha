@@ -733,23 +733,6 @@ impl ComputerDaemon {
         self.output = output;
     }
 
-    /// Stops the daemon's process without ending it.
-    ///
-    /// The channel stays open, so the Space still sees the Computer online,
-    /// but nothing the Space sends is ever answered until it is killed: that
-    /// is how a test holds a channel request open.
-    fn pause(&self) {
-        let Some(child) = &self.child else {
-            return;
-        };
-        let status = Command::new("kill")
-            .arg("-STOP")
-            .arg(child.id().to_string())
-            .status()
-            .expect("kill runs");
-        assert!(status.success(), "the daemon could not be stopped");
-    }
-
     /// Stops the daemon and waits for it to go.
     fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -1412,13 +1395,12 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     assert!(!again.status.success());
     assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
 
-    // The Bot takes the File into its Workspace and delivers one back.
-    script.call("take_file", serde_json::json!({ "file": file }));
-    script.call(
-        "write_file",
-        serde_json::json!({ "path": "answer.txt", "content": "the answer" }),
-    );
-    script.call("put_file", serde_json::json!({ "path": "answer.txt" }));
+    // The Bot uses its CLI instead of File tools: it gets the File into its
+    // Workspace, then sends one back as a Bot Message.
+    let get = format!("{} file get {file}", BIN);
+    script.call("shell", serde_json::json!({"command": get}));
+    let send = format!("{} chat send --file notes.txt", BIN);
+    script.call("shell", serde_json::json!({"command": send}));
     script.say("Done.");
     let answered = run(
         &home,
@@ -1431,10 +1413,15 @@ async fn a_file_travels_between_a_user_and_a_bot() {
         std::fs::read_to_string(workspace.join("notes.txt")).unwrap(),
         "the quick brown fox\n"
     );
+    let read = run(&home, &credential, &["chat", "read", &chat]);
+    assert!(
+        read.lines().any(|line| line.contains("Bot:")),
+        "the File Message is the Bot's: {read}"
+    );
     let listed = run(&home, &credential, &["chat", "files", "--bot", &bot]);
     let delivered = listed
         .lines()
-        .find(|line| line.contains("answer.txt"))
+        .find(|line| line.contains("notes.txt"))
         .and_then(|line| line.split_whitespace().next())
         .expect("the Bot's File is listed");
     let out = downloads.join("fetched.txt");
@@ -1443,7 +1430,10 @@ async fn a_file_travels_between_a_user_and_a_bot() {
         &credential,
         &["file", "get", delivered, "--out", out.to_str().unwrap()],
     );
-    assert_eq!(std::fs::read_to_string(&out).unwrap(), "the answer");
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "the quick brown fox\n"
+    );
 
     // A File the Space cannot hold never leaves this machine.
     let big = directory.path().join("big.bin");
@@ -1466,7 +1456,11 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("at most"));
     let listed = run(&home, &credential, &["chat", "files", "--chat", &chat]);
-    assert_eq!(listed.lines().count(), 2, "{listed}");
+    assert_eq!(
+        listed.lines().count(),
+        1,
+        "the same bytes and name are one File: {listed}"
+    );
 
     // A File the Space does not hold is refused by name.
     let missing = cli(
@@ -2298,107 +2292,6 @@ async fn a_bot_on_a_local_computer_writes_only_its_own_folder() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_file_travels_over_a_local_computers_channel() {
-    if !local_computer_ready() {
-        return;
-    }
-    let (base, script, provider_task) = scripted_provider().await;
-    let content = "the quick brown fox\n";
-    let directory = tempfile::tempdir().unwrap();
-    let computer = local_computer(directory, &base, &script);
-    let folder = computer.workspace.join(&computer.bot);
-    let notes = computer.path().join("notes.txt");
-    std::fs::write(&notes, content).unwrap();
-
-    // A User uploads a File in the Chat.
-    script.say("Got the note.");
-    let sent = run(
-        &computer.home,
-        &computer.credential,
-        &[
-            "chat",
-            "send",
-            "--chat",
-            &computer.chat,
-            "--file",
-            notes.to_str().unwrap(),
-        ],
-    );
-    assert!(sent.contains("Got the note."), "{sent}");
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    let file = listed
-        .lines()
-        .find(|line| line.contains("notes.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the uploaded File is listed")
-        .to_owned();
-
-    // The Bot takes the File into its folder and delivers it back: the bytes
-    // cross the channel twice and must come back unchanged.
-    script.call("take_file", serde_json::json!({"file": &file}));
-    script.call(
-        "put_file",
-        serde_json::json!({"path": "notes.txt", "name": "roundtrip.txt"}),
-    );
-    script.say("Delivered it back.");
-    let answered = run(
-        &computer.home,
-        &computer.credential,
-        &[
-            "chat",
-            "send",
-            "--chat",
-            &computer.chat,
-            "please send it back",
-        ],
-    );
-    assert!(answered.contains("Delivered it back."), "{answered}");
-    let run_id = first_word(&field(&answered, "run "));
-    let shown = run(
-        &computer.home,
-        &computer.credential,
-        &["run", "show", &run_id],
-    );
-    assert!(shown.contains("take_file (succeeded)"), "{shown}");
-    assert!(shown.contains("put_file (succeeded)"), "{shown}");
-    assert_eq!(
-        std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
-        content,
-        "taking the File must write it into the Bot's folder"
-    );
-
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    let delivered = listed
-        .lines()
-        .find(|line| line.contains("roundtrip.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the delivered File is listed")
-        .to_owned();
-    let out = computer.path().join("roundtrip.txt");
-    run(
-        &computer.home,
-        &computer.credential,
-        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
-    );
-    assert_eq!(
-        std::fs::read(&out).unwrap(),
-        content.as_bytes(),
-        "the File's bytes must round-trip through the Bot's Computer"
-    );
-
-    drop(computer);
-    provider_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_message_waits_while_a_local_computer_is_offline() {
     if !local_computer_ready() {
         return;
@@ -2668,127 +2561,6 @@ async fn a_local_computers_messages_run_in_the_order_they_were_sent() {
     assert!(replies[1].ends_with("Bot: First reply."), "{read}");
     assert!(replies[2].ends_with("Bot: Second reply."), "{read}");
     assert!(replies[3].ends_with("Bot: Third reply."), "{read}");
-
-    drop(computer);
-    provider_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_file_take_lost_with_its_computer_fails_the_run() {
-    if !local_computer_ready() {
-        return;
-    }
-    let (base, script, provider_task) = scripted_provider().await;
-    let content = "the quick brown fox\n";
-    let directory = tempfile::tempdir().unwrap();
-    let mut computer = local_computer(directory, &base, &script);
-    let notes = computer.path().join("notes.txt");
-    std::fs::write(&notes, content).unwrap();
-
-    // A first Message uploads the File the Bot will take.
-    script.say("Got the note.");
-    run(
-        &computer.home,
-        &computer.credential,
-        &[
-            "chat",
-            "send",
-            "--chat",
-            &computer.chat,
-            "--file",
-            notes.to_str().unwrap(),
-        ],
-    );
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    let file = listed
-        .lines()
-        .find(|line| line.contains("notes.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the uploaded File is listed")
-        .to_owned();
-
-    // The daemon stops answering the channel before the Bot takes the File:
-    // its process is only stopped, so the Computer still shows online and the
-    // take starts, but the Write frame it sends is never answered.
-    script.call("take_file", serde_json::json!({"file": &file}));
-    script.say("The take finished.");
-    computer.daemon.pause();
-    let (send, stdout, stderr) = spawn_cli(
-        &computer.home,
-        &computer.credential,
-        &[
-            "chat",
-            "send",
-            "--follow",
-            "--chat",
-            &computer.chat,
-            "take the file",
-        ],
-    );
-    let mut error = String::new();
-    read_until_matching(&stderr, &mut error, "the take to start", |line| {
-        line.contains("action take_file (step 1): running")
-    });
-
-    // The machine leaves while the take still owes the Space an answer.
-    computer.daemon.kill();
-    read_until_matching(
-        &stderr,
-        &mut error,
-        "the run to report the lost Computer",
-        |line| line.contains("I lost my Computer before the action returned."),
-    );
-    let output = String::new();
-    let (ok, output) = finish(send, stdout, output);
-    assert!(
-        !ok,
-        "a File take that never returned must fail the run:\nstdout: {output}\nstderr: {error}"
-    );
-    let run_id = first_word(&field(&output, "run "));
-    let shown = run(
-        &computer.home,
-        &computer.credential,
-        &["run", "show", &run_id],
-    );
-    assert!(
-        shown
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .ends_with(": failed"),
-        "a lost File transfer must fail the run:\n{shown}"
-    );
-    assert!(
-        shown.contains("take_file (unknown)"),
-        "a File take whose answer never returned must be unknown:\n{shown}"
-    );
-    assert!(
-        !shown.contains("step 2"),
-        "the Model must not be asked again after losing the Computer:\n{shown}"
-    );
-
-    let read = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "read", &computer.chat],
-    );
-    let last = read.lines().last().expect("the Chat has a last Message");
-    let (_, text) = last
-        .split_once("Bot: ")
-        .expect("the last Message is the Bot's");
-    assert_eq!(
-        text, "I lost my Computer before the action returned.",
-        "{read}"
-    );
-    assert!(
-        !read.contains("The take finished."),
-        "the Model's next reply must never be used:\n{read}"
-    );
-    wait_for_computer_offline(&computer.home, &computer.credential, &computer.computer);
 
     drop(computer);
     provider_task.abort();
@@ -3961,138 +3733,6 @@ async fn an_explicit_allow_rule_wins_over_a_wider_ask_rule() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_file_action_waits_for_approval_once() {
-    if !local_computer_ready() {
-        return;
-    }
-    let (base, script, provider_task) = scripted_provider().await;
-    let content = "the quick brown fox\n";
-    let directory = tempfile::tempdir().unwrap();
-    let computer = bare_local_computer(directory, &base);
-    let folder = computer.workspace.join(&computer.bot);
-    let notes = computer.path().join("notes.txt");
-    std::fs::write(&notes, content).unwrap();
-
-    // Uploading a File runs a normal reply: no Computer action, no approval.
-    script.say("Got the note.");
-    let sent = run(
-        &computer.home,
-        &computer.credential,
-        &[
-            "chat",
-            "send",
-            "--chat",
-            &computer.chat,
-            "--file",
-            notes.to_str().unwrap(),
-        ],
-    );
-    assert!(
-        !sent.contains("is waiting for approval"),
-        "a reply with no action asks nothing:\n{sent}"
-    );
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    let file = listed
-        .lines()
-        .find(|line| line.contains("notes.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the uploaded File is listed")
-        .to_owned();
-
-    // The first File action of the Bot on this Local Computer asks first.
-    script.call("take_file", serde_json::json!({"file": &file}));
-    script.say("Took the note.");
-    let sent = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "send", "--chat", &computer.chat, "take the note"],
-    );
-    let (run_id, approval) = waiting_run(&sent);
-    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
-    assert!(
-        listed.contains("  take_file  first_use_local  "),
-        "the first File action asks like any other Computer action:\n{listed}"
-    );
-    let shown = run(
-        &computer.home,
-        &computer.credential,
-        &["approval", "show", &approval],
-    );
-    assert!(shown.contains("  index 0"), "{shown}");
-    assert!(
-        shown.contains(&format!("  arguments {{\"file\":\"{file}\"}}")),
-        "the show names the File the action takes:\n{shown}"
-    );
-    run(
-        &computer.home,
-        &computer.credential,
-        &["approval", "allow", &approval],
-    );
-    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
-    assert!(shown.contains("take_file (succeeded)"), "{shown}");
-    assert_eq!(
-        std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
-        content,
-        "the allowed take writes the File into the Bot's folder"
-    );
-    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
-    assert!(listed.trim().is_empty(), "{listed}");
-
-    // The next File action, delivering the File back, does not ask again.
-    script.call(
-        "put_file",
-        serde_json::json!({"path": "notes.txt", "name": "delivered.txt"}),
-    );
-    script.say("Delivered the note.");
-    let sent = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "send", "--chat", &computer.chat, "deliver it back"],
-    );
-    assert!(
-        !sent.contains("is waiting for approval"),
-        "the remembered first use covers the next File action:\n{sent}"
-    );
-    assert!(sent.contains("Delivered the note."), "{sent}");
-    let run_id = first_word(&field(&sent, "run "));
-    let shown = run(
-        &computer.home,
-        &computer.credential,
-        &["run", "show", &run_id],
-    );
-    assert!(shown.contains("put_file (succeeded)"), "{shown}");
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    let delivered = listed
-        .lines()
-        .find(|line| line.contains("delivered.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the delivered File is listed")
-        .to_owned();
-    let out = computer.path().join("delivered.bin");
-    run(
-        &computer.home,
-        &computer.credential,
-        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
-    );
-    assert_eq!(
-        std::fs::read(&out).unwrap(),
-        content.as_bytes(),
-        "the delivered File keeps its bytes"
-    );
-
-    drop(computer);
-    provider_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn a_compound_command_asks_only_when_a_shell_rule_exists() {
     if !local_computer_ready() {
         return;
@@ -4592,98 +4232,6 @@ async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
         !read.contains("The action finished."),
         "the Model's next reply must never be used:\n{read}"
     );
-
-    drop(computer);
-    provider_task.abort();
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn a_put_file_rule_asks_by_path_prefix() {
-    if !local_computer_ready() {
-        return;
-    }
-    let (base, script, provider_task) = scripted_provider().await;
-    let content = "the report\n";
-    let directory = tempfile::tempdir().unwrap();
-    let computer = local_computer(directory, &base, &script);
-    let folder = computer.workspace.join(&computer.bot);
-    std::fs::create_dir_all(folder.join("logs")).unwrap();
-    std::fs::write(folder.join("logs").join("report.txt"), content).unwrap();
-
-    // A path-prefix rule on put_file asks before the delivery.
-    let added = run(
-        &computer.home,
-        &computer.credential,
-        &[
-            "rule",
-            "add",
-            "--bot",
-            &computer.bot,
-            "--effect",
-            "ask",
-            "--tool",
-            "put_file",
-            "--path-prefix",
-            "logs",
-        ],
-    );
-    assert!(
-        added.contains(": ask put_file (path-prefix \"logs\")"),
-        "{added}"
-    );
-    let ask = first_word(&field(&added, "Added rule "));
-    script.call(
-        "put_file",
-        serde_json::json!({"path": "logs/report.txt", "name": "report.txt"}),
-    );
-    script.say("Delivered the report.");
-    let sent = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "send", "--chat", &computer.chat, "send the report"],
-    );
-    let (run_id, approval) = waiting_run(&sent);
-    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
-    assert!(
-        listed.contains(&format!(
-            "{approval}  {run_id}  {}  put_file  rule  ",
-            computer.bot
-        )),
-        "a File action is matched by its path rule:\n{listed}"
-    );
-    let shown = run(
-        &computer.home,
-        &computer.credential,
-        &["approval", "show", &approval],
-    );
-    assert!(shown.contains(&format!("  rule {ask}")), "{shown}");
-    assert!(shown.contains("\"path\":\"logs/report.txt\""), "{shown}");
-    assert!(shown.contains("\"name\":\"report.txt\""), "{shown}");
-    run(
-        &computer.home,
-        &computer.credential,
-        &["approval", "allow", &approval],
-    );
-    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
-    assert!(shown.contains("put_file (succeeded)"), "{shown}");
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    let delivered = listed
-        .lines()
-        .find(|line| line.contains("report.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the delivered File is listed")
-        .to_owned();
-    let out = computer.path().join("report.bin");
-    run(
-        &computer.home,
-        &computer.credential,
-        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
-    );
-    assert_eq!(std::fs::read(&out).unwrap(), content.as_bytes());
 
     drop(computer);
     provider_task.abort();

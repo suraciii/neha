@@ -639,6 +639,7 @@ async fn execute_frame(
             action,
             working_dir,
             access,
+            env,
         } => {
             let runtime = match machine(
                 config,
@@ -652,6 +653,7 @@ async fn execute_frame(
                 Ok(runtime) => runtime,
                 Err(message) => return DeviceFrame::Failed { id, message },
             };
+            runtime.set_env(env);
             // The reader cancels whatever sits in this slot when the channel
             // goes away, even while `execute` still runs.
             *current.lock().expect("current action lock") = Some(Arc::clone(&runtime));
@@ -724,6 +726,7 @@ async fn execute_frame(
 }
 
 /// Returns this Bot's runtime, opening its folder on first use.
+#[allow(clippy::too_many_arguments)]
 fn machine(
     config: &Config,
     hidden: &[PathBuf],
@@ -2498,6 +2501,7 @@ mod tests {
                 },
                 working_dir: None,
                 access: Default::default(),
+                env: Vec::new(),
             },
         )
         .await;
@@ -2535,6 +2539,7 @@ mod tests {
             },
             working_dir: None,
             access: Default::default(),
+            env: Vec::new(),
         };
         let second = HostFrame::Action {
             id: 2,
@@ -2544,6 +2549,7 @@ mod tests {
             },
             working_dir: None,
             access: Default::default(),
+            env: Vec::new(),
         };
         for frame in [first, second] {
             socket
@@ -2722,6 +2728,7 @@ mod tests {
                         },
                         working_dir: None,
                         access: Default::default(),
+                        env: Vec::new(),
                     },
                 )
                 .await;
@@ -2734,6 +2741,7 @@ mod tests {
                         },
                         working_dir: None,
                         access: Default::default(),
+                        env: Vec::new(),
                     };
                     if socket
                         .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -2789,6 +2797,7 @@ mod tests {
                         },
                         working_dir: None,
                         access: Default::default(),
+                        env: Vec::new(),
                     },
                 )
                 .await;
@@ -2804,6 +2813,7 @@ mod tests {
                         },
                         working_dir: None,
                         access: Default::default(),
+                        env: Vec::new(),
                     };
                     send_space_frame(&mut socket, frame).await;
                 }

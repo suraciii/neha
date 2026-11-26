@@ -111,7 +111,7 @@ The file tools read with the rights of the machine's user. A file read follows a
 
 The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token. The directory is `~/.config/neha` by default.
 
-The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. Both tools go through the approval gate like other actions. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
+The same split reaches Files: in the shell, `neha file get` writes a File of the Chat into the Workspace, and `neha chat send --file` reads a Workspace file and sends it to the Chat. Both run as shell commands and go through the approval gate like other shell commands. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers them.
 
 A shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace is writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
 

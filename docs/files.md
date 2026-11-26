@@ -79,49 +79,28 @@ When the file is over the limit or the upload fails, the Chat says so and keeps 
 
 ## Let the Bot take and deliver
 
-Ask in the Chat; the Bot chooses its tools, as with the tools in [Let a Bot work on its Computer](tools.md). Two of them move Files:
+The Bot works with Files through the `neha` command in its shell, not through File tools. A run's shell already has `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`, so these commands work without a sign-in:
 
-| Tool | What it does |
-| --- | --- |
-| `take_file` | Puts a File of the Chat into the Workspace, under the File's name. |
-| `put_file` | Delivers a file as a File on a Message from the Bot: a path in the Workspace, or on a Local Computer any file its machine user can read except the Computer's configuration directory. An optional `name` gives the File a name other than the file's. |
+- `neha file get <id>` writes a File of the Chat into the Workspace under the File's name.
+- `neha chat send --file <path>` sends a Workspace file to the Chat as a Bot Message. Text is optional, but the CLI accepts either `--file` or text for one Message, so a Bot sends a file-only Message.
 
-The two tools go through the same approval gate as the other Computer actions. On a Local Computer, a first use or a lasting Ask rule can make `take_file` or `put_file` wait for an answer before it copies or delivers; a `take_file` rule names only the tool, while a `put_file` rule can name a path prefix. [Approvals](approvals.md) covers the card.
-
-`take_file` copies the File. The File stays in the Chat, the Bot can take it again in a later Message, and removing the copy from the Workspace does not remove the File.
+A Message that carries a File includes a `[File id=<uuid> ...]` line; the Bot passes that id to `neha file get`. The Bot never prints or stores its token.
 
 Create a small file and send it with a request:
 
 ```bash
 printf 'a,b\n1,2\n' > rows.csv
-target/debug/neha chat send --file rows.csv "Count the rows in the attached file and send me the result as count.md."
+target/debug/neha chat send --file rows.csv "Count the rows in the attached file and send me the result as count.csv."
 ```
 
-The CLI prints the Bot's reply, then the run and the File you sent:
+The Bot gets `rows.csv` into its Workspace, writes `count.csv`, and sends it back with a Bot Message. The Chat then holds both Files; `neha chat files` lists them and `neha file get <file-id> --out count.csv` downloads the result.
 
-```text
-There are 2 rows.
-  run 0193... (succeeded)
-  file 0193... (rows.csv)
-```
-
-The run lists both actions, `take_file` and `put_file`:
-
-```bash
-target/debug/neha run show <run-id>
-```
-
-The Chat now holds two Files: `rows.csv` and the Bot's `count.md`. `neha chat files` lists both with their ids. Download the result by its id:
-
-```bash
-target/debug/neha chat files
-target/debug/neha file get <file-id> --out count.md
-```
+The shell commands go through the same approval gate as any other shell command, so a first use or an Ask rule for `shell` covers them. There is no separate File action to approve.
 
 ## Limits
 
 An action that breaks a limit returns an error to the Model instead of failing the whole run.
 
-- A File is at most 32 MiB. A larger file is refused before anything is recorded: the CLI stops with an error, the browser reports that the file was not sent, and a Bot's `put_file` fails.
+- A File is at most 32 MiB. A larger file is refused before anything is recorded: the CLI stops with an error, the browser reports that the file was not sent, and a Bot's `chat send --file` fails.
 - A Bot takes only a File of the Chat. A File of another Chat fails the action.
-- On a Hosted Computer, `take_file` and `put_file` follow the path rules in [Let a Bot work on its Computer](tools.md#limits): a path must stay inside the Workspace. On a Local Computer, `take_file` writes only in the Bot's Workspace and `put_file` may read any regular file the machine's user can read, except the Computer's configuration directory; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.
+- `file get` writes only inside the Bot's Workspace; `chat send --file` reads a path the shell can already read, so the shell's approval and sandbox rules apply. On a Hosted Computer a path must stay inside the Workspace; on a Local Computer the shell reads with the machine user's rights except the Computer's configuration directory; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.

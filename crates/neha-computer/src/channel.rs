@@ -58,6 +58,10 @@ pub enum HostFrame {
         /// The owner-granted write access this run carries.
         #[serde(default, skip_serializing_if = "AccessFrame::is_default")]
         access: AccessFrame,
+        /// Environment entries the run adds to shell commands. A Space issues
+        /// its short-lived Bot token here.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<(String, String)>,
     },
     /// Reads a file's bytes from the machine (a File take).
     Read {
@@ -207,6 +211,7 @@ mod tests {
                     },
                     working_dir: None,
                     access: super::AccessFrame::default(),
+                    env: Vec::new(),
                 },
                 json!({
                     "type": "action",
@@ -224,6 +229,7 @@ mod tests {
                     },
                     working_dir: None,
                     access: super::AccessFrame::default(),
+                    env: Vec::new(),
                 },
                 json!({
                     "type": "action",
@@ -242,6 +248,7 @@ mod tests {
                     },
                     working_dir: None,
                     access: super::AccessFrame::default(),
+                    env: Vec::new(),
                 },
                 json!({
                     "type": "action",
@@ -259,6 +266,7 @@ mod tests {
                     },
                     working_dir: None,
                     access: super::AccessFrame::default(),
+                    env: Vec::new(),
                 },
                 json!({
                     "type": "action",

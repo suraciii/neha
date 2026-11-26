@@ -13,6 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -77,6 +78,11 @@ pub struct LocalRuntime {
     /// The directory a run works in. It is where relative paths resolve and
     /// where the shell starts; it is not a writable root by itself.
     cwd: Option<PathBuf>,
+    /// Environment entries a shell command sees, on top of the fixed PATH,
+    /// HOME, and TMPDIR. A Space puts its short-lived Bot token here. The
+    /// daemon reuses one runtime across runs, so its actions update this slot
+    /// before they run instead of holding one token forever.
+    env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
 }
 
 /// Which kind of machine a runtime drives.
@@ -118,6 +124,7 @@ impl LocalRuntime {
             full_access: false,
             grants: Vec::new(),
             cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -262,6 +269,7 @@ impl LocalRuntime {
             full_access: false,
             grants: Vec::new(),
             cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         })
     }
 
@@ -291,6 +299,20 @@ impl LocalRuntime {
     pub fn with_denied(mut self, denied: Vec<PathBuf>) -> Self {
         self.denied = denied;
         self
+    }
+
+    /// Sets the environment every shell command sees.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = Arc::new(std::sync::Mutex::new(env));
+        self
+    }
+
+    /// Replaces the environment for the next action on this runtime.
+    pub fn set_env(&self, env: Vec<(String, String)>) {
+        if let Ok(mut slot) = self.env.lock() {
+            *slot = env;
+        }
     }
 
     /// Applies the owner's access choice to a real-machine runtime.
@@ -988,6 +1010,7 @@ impl LocalRuntime {
             .env("PATH", SHELL_PATH)
             .env("HOME", &self.root)
             .env("TMPDIR", temporary)
+            .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
             .kill_on_drop(true);
         process
     }
@@ -2338,6 +2361,7 @@ mod tests {
             full_access: false,
             grants: Vec::new(),
             cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 

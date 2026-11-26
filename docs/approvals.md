@@ -6,7 +6,7 @@ This guide shows when a Bot asks before an action, how to answer, and how to mak
 
 A Bot runs a Computer action without asking by default. It asks before the first action it runs on a Local Computer, once for each Bot, acting User, and Local Computer, and before an action that a lasting Ask rule names. A Bot moved to another Local Computer asks again on its first action there.
 
-`take_file` and `put_file` are Computer actions too: they can wait for the first use or an Ask rule. A `take_file` rule names only the tool; a `put_file` rule can name a path prefix.
+Files move through the Bot's shell (`neha file get` and `neha chat send --file`), so they wait on the shell action's approval; there is no separate File action.
 
 Only the User the Bot acts for can answer. An Allow runs the action once; an Always allow also covers later actions of that kind.
 
@@ -45,13 +45,13 @@ An Always allow covers the same tool and one of these:
 
 - every shell command whose text starts with the approved command's first word: `printf` covers `printf 'hello'` and `printfx`;
 - every path at or below the approved action's directory;
-- every action of a tool with no command or path, such as `take_file`.
+- every action of a tool with no command or path.
 
-An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, and only an action with neither, such as `take_file`, gives a tool-only rule.
+An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, and only an action with neither gives a tool-only rule.
 
 A rule-triggered approval offers no Always allow, and `--always` is refused, when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path. An ambiguous form that can still make a lasting rule does offer Always allow, and that answer removes no rule.
 
-For a file at the Workspace root, the covered directory is the Workspace root: relative paths are covered and absolute ones are not. When a rule asks, the card names the scope: `shell commands starting with "printf"`, `files under "logs"`, `files in the Workspace root`, or `all take_file actions`. The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
+For a file at the Workspace root, the covered directory is the Workspace root: relative paths are covered and absolute ones are not. When a rule asks, the card names the scope: `shell commands starting with "printf"`, `files under "logs"`, `files in the Workspace root`, or `all <tool> actions`. The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
 
 ## Lasting rules
 
@@ -61,7 +61,7 @@ List, add, and remove lasting rules:
 target/debug/neha rule list
 target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-prefix rm
 target/debug/neha rule add --bot <bot-id> --effect allow --tool read_file --path-prefix /home/ada/docs
-target/debug/neha rule add --bot <bot-id> --effect ask --tool put_file --path-prefix /home/ada/reports
+target/debug/neha rule add --bot <bot-id> --effect ask --tool write_file --path-prefix /home/ada/reports
 target/debug/neha rule remove <rule-id>
 ```
 

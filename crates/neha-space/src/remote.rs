@@ -36,6 +36,8 @@ pub struct RemoteRuntime {
     access: neha_computer::channel::AccessFrame,
     /// A folder allowed for the next action only.
     once_grant: std::sync::Mutex<Option<String>>,
+    /// Environment entries every action of this run adds to its shell.
+    env: Vec<(String, String)>,
 }
 
 impl RemoteRuntime {
@@ -50,6 +52,7 @@ impl RemoteRuntime {
             working_dir: None,
             access: neha_computer::channel::AccessFrame::default(),
             once_grant: std::sync::Mutex::new(None),
+            env: Vec::new(),
         }
     }
 
@@ -64,6 +67,13 @@ impl RemoteRuntime {
     #[must_use]
     pub fn with_access(mut self, access: neha_computer::channel::AccessFrame) -> Self {
         self.access = access;
+        self
+    }
+
+    /// Sets the environment every shell action of this run sees.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = env;
         self
     }
 
@@ -97,8 +107,14 @@ impl ComputerRuntime for RemoteRuntime {
 
             let answer = tokio::time::timeout(
                 self.timeout,
-                self.link
-                    .act(id, self.bot, action, self.working_dir.as_deref(), &access),
+                self.link.act(
+                    id,
+                    self.bot,
+                    action,
+                    self.working_dir.as_deref(),
+                    &access,
+                    &self.env,
+                ),
             )
             .await;
             match answer {

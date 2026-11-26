@@ -236,6 +236,12 @@ impl SpaceServer {
                 post(file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
             )
             .route("/api/files/{id}", get(file_download))
+            .route("/api/bot/messages", post(bot_message))
+            .route(
+                "/api/bot/files",
+                post(bot_file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
+            )
+            .route("/api/bot/files/{id}", get(bot_file_download))
             .route("/api", any(api_not_found))
             .route("/api/", any(api_not_found))
             .route("/api/{*rest}", any(api_not_found));
@@ -373,6 +379,9 @@ async fn start_with(
     // cannot listen must not make a run, reach a Provider, or record a failure.
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
+    if let Ok(mut state) = server.state.lock() {
+        state.url = Some(format!("http://{addr}"));
+    }
     recover_interrupted(&server.store, &server.state).await?;
     reconcile_pairings(&server).await?;
     // The record is the truth about Computers: a token whose Computer the
@@ -1003,6 +1012,144 @@ async fn file_download(
         id.parse()
             .ok()
             .and_then(|id| state.owned_file(id, account.id).cloned())
+    }
+    .ok_or_else(|| ApiError::not_found("no such File"))?;
+    let bytes = server.blobs.get(&file.sha256).await?;
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&file.media_type)
+            .map_err(|_| ApiError::internal("the File has no usable media type"))?,
+    );
+    headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename*=UTF-8''{}",
+            percent_encode(&file.name)
+        ))
+        .map_err(|_| ApiError::internal("the File has no usable name"))?,
+    );
+
+    Ok(response)
+}
+
+/// Returns the binding of the request's Bot run token.
+fn bot_bearer(
+    server: &Arc<SpaceServer>,
+    headers: &HeaderMap,
+) -> Result<crate::state::BotToken, ApiError> {
+    let token = bearer(headers).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::Unauthorized,
+            "a Bot run token is required",
+        )
+    })?;
+    let mut state = server
+        .state
+        .lock()
+        .map_err(|_| ApiError::internal("state lock"))?;
+    state.bot_token(token).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            ErrorCode::Unauthorized,
+            "the Bot run token is not valid",
+        )
+    })
+}
+
+#[derive(Deserialize)]
+struct BotMessageRequest {
+    chat: Option<Id>,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    file: Option<Id>,
+}
+
+/// Posts a Message as the Bot whose run token authorized the request.
+async fn bot_message(
+    State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
+    Json(request): Json<BotMessageRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let token = bot_bearer(&server, &headers)?;
+    let chat = request.chat.unwrap_or(token.chat);
+    let outcome = commands::bot_message(
+        &server.store,
+        &server.state,
+        &token,
+        chat,
+        request.text,
+        request.file,
+    )
+    .await?;
+    broadcast(&server, &outcome.events);
+
+    Ok(Json(outcome.result))
+}
+
+/// Stores the request body as a File of the Chat a Bot's run token names.
+async fn bot_file_upload(
+    State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
+    query: Result<Query<UploadQuery>, QueryRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let token = bot_bearer(&server, &headers)?;
+    let Query(query) = query
+        .map_err(|_| ApiError::invalid_argument("the upload needs a name and a media_type"))?;
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        Err(BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_))) => {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::InvalidArgument,
+                "a File must be at most 32 MiB",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiError::invalid_argument(
+                "the request body could not be read",
+            ));
+        }
+    };
+    let upload_lock = server.upload_lock(token.chat);
+    let _upload = upload_lock.lock().await;
+    let outcome = commands::bot_file_upload(
+        &server.store,
+        &server.state,
+        &server.blobs,
+        &token,
+        token.chat,
+        commands::FileUpload {
+            name: query.name,
+            media_type: query.media_type,
+            bytes: bytes.to_vec(),
+        },
+    )
+    .await?;
+    broadcast(&server, &outcome.events);
+
+    Ok(Json(outcome.result))
+}
+
+/// Sends the bytes of a File in the Chat a Bot's run token names.
+async fn bot_file_download(
+    State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
+    PathParams(id): PathParams<String>,
+) -> Result<Response, ApiError> {
+    let token = bot_bearer(&server, &headers)?;
+    let file = {
+        let state = server
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        id.parse()
+            .ok()
+            .and_then(|id| state.file_of(token.chat, id).cloned())
     }
     .ok_or_else(|| ApiError::not_found("no such File"))?;
     let bytes = server.blobs.get(&file.sha256).await?;
@@ -6612,6 +6759,104 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_run_token_only_reaches_its_own_chat() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (bot, chat, _computer) = create_bot(&mut socket).await;
+        let (_, other_chat, _) = create_bot(&mut socket).await;
+        let acting = {
+            let state = running.server.state.lock().unwrap();
+            state.bots[&bot].owner
+        };
+        let issued = |run, chat, expires| {
+            let mut state = running.server.state.lock().unwrap();
+            state.issue_bot_token(crate::state::BotToken {
+                bot,
+                chat,
+                run,
+                acting,
+                expires,
+            })
+        };
+        let bot_token = issued(
+            Id::new(),
+            chat,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let client = reqwest::Client::new();
+        let uploaded: Value = client
+            .post(format!("{}/api/bot/files", running.url()))
+            .query(&[("name", "bot.txt"), ("media_type", "text/plain")])
+            .bearer_auth(&bot_token)
+            .body("from the bot".to_owned())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+        assert_eq!(uploaded["name"], "bot.txt");
+
+        // The token posts as the Bot, only into its own Chat.
+        let posted: Value = client
+            .post(format!("{}/api/bot/messages", running.url()))
+            .bearer_auth(&bot_token)
+            .json(&serde_json::json!({"chat": chat, "file": file}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let message: Id = serde_json::from_value(posted["message"].clone()).unwrap();
+        {
+            let state = running.server.state.lock().unwrap();
+            let message = state
+                .messages
+                .iter()
+                .find(|view| view.id == message)
+                .unwrap();
+            assert_eq!(message.author, Author::Bot(bot));
+        }
+        let forbidden = client
+            .post(format!("{}/api/bot/messages", running.url()))
+            .bearer_auth(&bot_token)
+            .json(&serde_json::json!({"chat": other_chat, "text": "elsewhere"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // The bytes come back, and a bad or expired token is refused.
+        let response = client
+            .get(format!("{}/api/bot/files/{file}", running.url()))
+            .bearer_auth(&bot_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.bytes().await.unwrap().as_ref(), b"from the bot");
+        let expired = issued(
+            Id::new(),
+            chat,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        for bad in ["not-a-token".to_owned(), expired] {
+            let response = client
+                .post(format!("{}/api/bot/messages", running.url()))
+                .bearer_auth(bad)
+                .json(&serde_json::json!({"chat": chat, "text": "hello"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_file_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let first = start(test_home(dir.path()), 0).await.unwrap();
@@ -6644,267 +6889,6 @@ mod tests {
         assert_eq!(response.bytes().await.unwrap(), b"a,b\n1,2\n".as_slice());
         socket.close(None).await.unwrap();
         second.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_bot_takes_a_file_into_its_workspace_and_delivers_one() {
-        let (_dir, running, invite) = running().await;
-        let (mut socket, token) = admin(&running, &invite).await;
-        let (bot, chat, computer) = create_bot(&mut socket).await;
-        let uploaded: Value = upload(
-            &running,
-            &token,
-            chat,
-            "notes.txt",
-            "text/plain",
-            b"read me".to_vec(),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
-        let taken: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
-        let (base, provider_task) = scripted_provider(vec![
-            tool("take_file", json!({"file": taken})),
-            tool(
-                "write_file",
-                json!({"path": "out/answer.txt", "content": "the answer"}),
-            ),
-            tool(
-                "put_file",
-                json!({"path": "out/answer.txt", "name": "answer.txt"}),
-            ),
-            text("I read your notes and sent the answer back."),
-        ])
-        .await;
-        command(&mut socket, Id::new(), provider_add(base)).await;
-
-        let result = send_file(&mut socket, chat, taken).await;
-        assert_eq!(result["status"], "succeeded");
-
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
-        assert_eq!(
-            std::fs::read(workspace.join("notes.txt")).unwrap(),
-            b"read me"
-        );
-
-        let files = file_list(&mut socket, chat).await;
-        assert_eq!(files.len(), 2);
-        let delivered = &files[1];
-        assert_eq!(delivered["author"], json!({"kind": "bot", "id": bot}));
-        assert_eq!(delivered["acting"], uploaded["author"]["id"]);
-        assert_eq!(delivered["name"], "answer.txt");
-        // A delivered File states the type its name implies.
-        assert_eq!(delivered["media_type"], "text/plain");
-        assert_eq!(delivered["size"], 10);
-        let delivered: Id = serde_json::from_value(delivered["id"].clone()).unwrap();
-
-        // The Bot's Message carries the delivered File and belongs to the run.
-        let messages = command(
-            &mut socket,
-            Id::new(),
-            CommandCall::ChatRead { chat, from: None },
-        )
-        .await;
-        let messages = messages.as_array().unwrap();
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0]["file"], json!(taken));
-        assert_eq!(messages[1]["file"], json!(delivered));
-        assert_eq!(messages[1]["run"], result["run"]);
-        assert_eq!(messages[1]["text"], "");
-        assert_eq!(
-            messages[2]["text"],
-            "I read your notes and sent the answer back."
-        );
-
-        let response = download(&running, &token, delivered).await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "text/plain");
-        assert_eq!(
-            response.headers()["content-disposition"],
-            "attachment; filename*=UTF-8''answer.txt"
-        );
-        assert_eq!(response.bytes().await.unwrap(), b"the answer".as_slice());
-
-        // A restart rebuilds the Chat with both Files and their Messages.
-        let root = running.server_home();
-        socket.close(None).await.unwrap();
-        running.shutdown().await;
-        let restarted = start(test_home(&root), 0).await.unwrap();
-        let mut socket = open_socket(&restarted, &token).await;
-        assert_eq!(file_list(&mut socket, chat).await.len(), 2);
-        let again = download(&restarted, &token, delivered).await;
-        assert_eq!(again.bytes().await.unwrap(), b"the answer".as_slice());
-        socket.close(None).await.unwrap();
-        provider_task.abort();
-        restarted.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_taken_file_stays_downloadable_after_its_workspace_copy_is_gone() {
-        let (_dir, running, invite) = running().await;
-        let (mut socket, token) = admin(&running, &invite).await;
-        let (_bot, chat, computer) = create_bot(&mut socket).await;
-        let uploaded: Value = upload(
-            &running,
-            &token,
-            chat,
-            "notes.txt",
-            "text/plain",
-            b"read me".to_vec(),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
-        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
-
-        let (base, provider_task) = scripted_provider(vec![
-            tool("take_file", json!({"file": file})),
-            text("I read the notes."),
-        ])
-        .await;
-        command(&mut socket, Id::new(), provider_add(base)).await;
-        let result = send(&mut socket, chat, "take the notes").await;
-        assert_eq!(result["status"], "succeeded");
-
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(computer.to_string())
-            .join("workspace");
-        assert_eq!(
-            std::fs::read(workspace.join("notes.txt")).unwrap(),
-            b"read me"
-        );
-        std::fs::remove_file(workspace.join("notes.txt")).unwrap();
-
-        // The Workspace copy belongs to the Bot; the Space still holds the
-        // File, whatever happens to that copy.
-        assert!(!workspace.join("notes.txt").exists());
-        let response = download(&running, &token, file).await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.headers()["content-type"], "text/plain");
-        assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
-        assert_eq!(file_list(&mut socket, chat).await, vec![uploaded]);
-        socket.close(None).await.unwrap();
-        provider_task.abort();
-        running.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_bot_cannot_take_a_file_of_another_chat() {
-        let (_dir, running, invite) = running().await;
-        let (mut socket, token) = admin(&running, &invite).await;
-        let (_bot, chat, _computer) = create_bot(&mut socket).await;
-        let uploaded: Value = upload(
-            &running,
-            &token,
-            chat,
-            "notes.txt",
-            "text/plain",
-            b"read me".to_vec(),
-        )
-        .await
-        .json()
-        .await
-        .unwrap();
-        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
-
-        let (base, provider_task) = scripted_provider(vec![
-            tool("take_file", json!({"file": file})),
-            text("That File is not mine to take."),
-        ])
-        .await;
-        let (_other_bot, other_chat, other_computer) = tool_bot(&mut socket, base).await;
-        let result = send(&mut socket, other_chat, "take my notes").await;
-        assert_eq!(result["status"], "succeeded");
-        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
-        let shown = show_run(&mut socket, run).await;
-        assert_eq!(shown["actions"][0]["tool"], "take_file");
-        assert_eq!(shown["actions"][0]["status"], "failed");
-
-        // The File of the first Chat is untouched: still listed, still
-        // downloadable, and never copied into the other Chat or Workspace.
-        assert_eq!(file_list(&mut socket, chat).await, vec![uploaded]);
-        let response = download(&running, &token, file).await;
-        assert_eq!(response.status(), reqwest::StatusCode::OK);
-        assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
-        assert!(file_list(&mut socket, other_chat).await.is_empty());
-        let workspace = running
-            .server_home()
-            .join("computers")
-            .join(other_computer.to_string())
-            .join("workspace");
-        assert!(
-            !workspace.join("notes.txt").exists(),
-            "a File of another Chat never reaches this Workspace"
-        );
-        socket.close(None).await.unwrap();
-        provider_task.abort();
-        running.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_bot_cannot_take_or_deliver_what_is_not_a_file_of_the_chat() {
-        let (_dir, running, invite) = running().await;
-        let (mut socket, _token) = admin(&running, &invite).await;
-        let (base, provider_task) = scripted_provider(vec![
-            tool(
-                "write_file",
-                json!({"path": "answer.txt", "content": "the answer"}),
-            ),
-            tool("take_file", json!({"file": Id::new()})),
-            tool(
-                "put_file",
-                json!({"path": "answer.txt", "name": "../answer.txt"}),
-            ),
-            text("Nothing moved."),
-        ])
-        .await;
-        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
-
-        let result = send(&mut socket, chat, "take a File that is not there").await;
-
-        assert_eq!(result["status"], "succeeded");
-        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
-        let shown = show_run(&mut socket, run).await;
-        let actions: Vec<(&str, &str)> = shown["actions"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|action| {
-                (
-                    action["tool"].as_str().unwrap(),
-                    action["status"].as_str().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            actions,
-            [
-                ("write_file", "succeeded"),
-                ("take_file", "failed"),
-                ("put_file", "failed"),
-            ]
-        );
-
-        // Nothing the Bot could not move was recorded.
-        assert!(file_list(&mut socket, chat).await.is_empty());
-        let messages = command(
-            &mut socket,
-            Id::new(),
-            CommandCall::ChatRead { chat, from: None },
-        )
-        .await;
-        assert_eq!(messages.as_array().unwrap().len(), 2);
-        socket.close(None).await.unwrap();
-        provider_task.abort();
-        running.shutdown().await;
     }
 
     #[test]
@@ -6966,85 +6950,6 @@ mod tests {
             assert_eq!(response.bytes().await.unwrap().as_ref(), b"read me");
             socket.close(None).await.unwrap();
             restarted.shutdown().await;
-        });
-    }
-
-    #[test]
-    fn a_bot_moves_files_through_s3() {
-        test_s3::block_on(async {
-            let Some(storage) = test_s3::storage() else {
-                return;
-            };
-            let (_dir, running, invite) = running_with_config(&s3_config(&storage)).await;
-            let (mut socket, token) = admin(&running, &invite).await;
-            let (_bot, chat, computer) = create_bot(&mut socket).await;
-
-            let uploaded: Value = upload(
-                &running,
-                &token,
-                chat,
-                "notes.txt",
-                "text/plain",
-                b"read me".to_vec(),
-            )
-            .await
-            .json()
-            .await
-            .unwrap();
-            let taken: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
-            let (base, provider_task) = scripted_provider(vec![
-                tool("take_file", json!({"file": taken})),
-                tool(
-                    "write_file",
-                    json!({"path": "out/answer.txt", "content": "the answer"}),
-                ),
-                tool(
-                    "put_file",
-                    json!({"path": "out/answer.txt", "name": "answer.txt"}),
-                ),
-                text("I read your notes and sent the answer back."),
-            ])
-            .await;
-            command(&mut socket, Id::new(), provider_add(base)).await;
-            let result = send_file(&mut socket, chat, taken).await;
-            assert_eq!(result["status"], "succeeded");
-
-            // The Workspace copy is the Bot's; the File the Chat got back is bytes
-            // in S3, one object per content.
-            let workspace = running
-                .server_home()
-                .join("computers")
-                .join(computer.to_string())
-                .join("workspace");
-            assert_eq!(
-                std::fs::read(workspace.join("notes.txt")).unwrap(),
-                b"read me"
-            );
-            let files = file_list(&mut socket, chat).await;
-            assert_eq!(files.len(), 2);
-            let delivered: Id = serde_json::from_value(files[1]["id"].clone()).unwrap();
-            let response = download(&running, &token, delivered).await;
-            assert_eq!(response.status(), reqwest::StatusCode::OK);
-            assert_eq!(response.bytes().await.unwrap().as_ref(), b"the answer");
-            let mut keys: Vec<String> = test_s3::objects(&storage)
-                .await
-                .into_iter()
-                .map(|(key, _)| key)
-                .collect();
-            let mut expected: Vec<String> = [
-                uploaded["sha256"].as_str().unwrap(),
-                files[1]["sha256"].as_str().unwrap(),
-            ]
-            .iter()
-            .map(|sha| format!("{}/{}", &sha[..2], sha))
-            .collect();
-            keys.sort();
-            expected.sort();
-            assert_eq!(keys, expected, "both Files are one object each in S3");
-
-            socket.close(None).await.unwrap();
-            provider_task.abort();
-            running.shutdown().await;
         });
     }
 
@@ -12370,181 +12275,6 @@ mod tests {
     }
 
     /// Answers the channel frame a File delivery makes: reads the machine.
-    async fn answer_file_read(device: &mut Socket) -> String {
-        use base64::Engine as _;
-        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        use neha_computer::channel::DeviceFrame;
-
-        match next_host_frame(device).await {
-            HostFrame::Read { id, path, .. } => {
-                device
-                    .send(Message::Text(
-                        serde_json::to_string(&DeviceFrame::Bytes {
-                            id,
-                            bytes: URL_SAFE_NO_PAD.encode(b"hello"),
-                        })
-                        .unwrap()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
-
-                path
-            }
-            HostFrame::Write { id, path, .. } => {
-                device
-                    .send(Message::Text(
-                        serde_json::to_string(&DeviceFrame::Bytes {
-                            id,
-                            bytes: String::new(),
-                        })
-                        .unwrap()
-                        .into(),
-                    ))
-                    .await
-                    .unwrap();
-
-                path
-            }
-            HostFrame::Action { id, .. } => {
-                reply_action(device, id, ActionStatus::Succeeded, "o").await;
-                "action".to_owned()
-            }
-            HostFrame::Ping => String::new(),
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_file_delivery_asks_before_it_leaves_the_machine() {
-        let (_dir, running, invite) = running().await;
-        let mut local = local_bot(
-            &running,
-            &invite,
-            vec![
-                tool(
-                    "put_file",
-                    json!({"path": "report.txt", "name": "answer.txt"}),
-                ),
-                text("delivered"),
-                tool(
-                    "put_file",
-                    json!({"path": "report.txt", "name": "answer.txt"}),
-                ),
-                text("again"),
-                tool(
-                    "put_file",
-                    json!({"path": "./logs/report.txt", "name": "logs.txt"}),
-                ),
-                text("third"),
-            ],
-        )
-        .await;
-        let first = run_of(&submit(&mut local.socket, local.chat, "deliver it", None).await);
-        let approval = approval_for_run(&mut local.socket, first).await;
-        assert_eq!(
-            approval["reason"], "first_use_local",
-            "a File delivery runs through the same first-use fence"
-        );
-        assert_eq!(approval["tool"], "put_file");
-        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
-        decide_approval(&mut local.socket, approval_id, true, false).await;
-        assert_eq!(answer_file_read(&mut local.device).await, "report.txt");
-        let finished = wait_run(&mut local.socket, first).await;
-        assert_eq!(finished["status"], "succeeded");
-        assert_eq!(started_actions(&running, first).await.len(), 1);
-        let messages = command(
-            &mut local.socket,
-            Id::new(),
-            CommandCall::ChatRead {
-                chat: local.chat,
-                from: None,
-            },
-        )
-        .await;
-        assert!(
-            messages
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|message| message["file"].is_string()),
-            "the File reached the Chat"
-        );
-
-        // An ask rule on the file path intercepts the next delivery too.
-        command(
-            &mut local.socket,
-            Id::new(),
-            add_rule(
-                local.bot,
-                neha::record::RuleEffect::Ask,
-                "put_file",
-                None,
-                Some("."),
-            ),
-        )
-        .await;
-        let second = run_of(&submit(&mut local.socket, local.chat, "deliver again", None).await);
-        let approval = approval_for_run(&mut local.socket, second).await;
-        assert_eq!(approval["reason"], "rule");
-        assert_eq!(approval["tool"], "put_file");
-        assert_eq!(
-            approval["lasting_scope"], "files in the Workspace root",
-            "the always-allow scope is readable"
-        );
-        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
-        decide_approval(&mut local.socket, approval_id, true, false).await;
-        assert_eq!(answer_file_read(&mut local.device).await, "report.txt");
-        assert_eq!(
-            wait_run(&mut local.socket, second).await["status"],
-            "succeeded"
-        );
-        assert_eq!(
-            started_actions(&running, second).await.len(),
-            1,
-            "a resumed File delivery runs once"
-        );
-
-        // A path rule is compared after the same normalization `./logs/x`.
-        let ask = command(
-            &mut local.socket,
-            Id::new(),
-            add_rule(
-                local.bot,
-                neha::record::RuleEffect::Ask,
-                "put_file",
-                None,
-                Some("logs"),
-            ),
-        )
-        .await;
-        let ask_id: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
-        let third = run_of(&submit(&mut local.socket, local.chat, "deliver logs", None).await);
-        let approval = approval_for_run(&mut local.socket, third).await;
-        assert_eq!(approval["reason"], "rule");
-        assert_eq!(approval["rule"], json!(ask_id));
-        assert_eq!(
-            approval["lasting_scope"], "files under \"logs\"",
-            "the always-allow scope names the normalized directory"
-        );
-        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
-        decide_approval(&mut local.socket, approval_id, true, false).await;
-        assert_eq!(
-            answer_file_read(&mut local.device).await,
-            "./logs/report.txt",
-            "the daemon's own spelling still reaches the machine"
-        );
-        assert_eq!(
-            wait_run(&mut local.socket, third).await["status"],
-            "succeeded"
-        );
-        assert_eq!(started_actions(&running, third).await.len(), 1);
-
-        local.device.close(None).await.unwrap();
-        local.provider_task.abort();
-        local.socket.close(None).await.unwrap();
-        running.shutdown().await;
-    }
-
     #[tokio::test(flavor = "multi_thread")]
     async fn a_path_rule_normalizes_relative_spellings() {
         let (_dir, running, invite) = running().await;
