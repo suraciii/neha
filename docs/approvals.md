@@ -4,13 +4,15 @@ This guide shows when a Bot asks before an action, how to answer, and how to mak
 
 ## When a Bot asks
 
-A Bot runs a Computer action without asking by default. It asks before the first action it runs on a Local Computer, once for each Bot and acting User, and before an action that a lasting Ask rule names.
+A Bot runs a Computer action without asking by default. It asks before the first action it runs on a Local Computer, once for each Bot, acting User, and Local Computer, and before an action that a lasting Ask rule names. A Bot moved to another Local Computer asks again on its first action there.
+
+`take_file` and `put_file` are Computer actions too: they can wait for the first use or an Ask rule. A `take_file` rule names only the tool; a `put_file` rule can name a path prefix.
 
 Only the User the Bot acts for can answer. An Allow runs the action once; an Always allow also covers later actions of that kind.
 
 ## Answer in the Chat
 
-Run `neha chat send` as usual. When the run waits, a terminal shows the approval card: the action's tool, a summary, why the Bot asks, and whether the action can be undone. Answer with:
+Run `neha chat send` as usual. When the run waits, a terminal shows the approval card: the action's tool, a summary, why the Bot asks, whether the action can be undone, and, for a rule, what Always allow covers. A `shell` or `write_file` action says that it cannot be undone; a `read_file`, `list_files`, or other action says that the undoability is unknown. The summary escapes control characters, and one longer than 4096 bytes says how many bytes it left out. Answer with:
 
 ```text
 [a]llow / [A]lways allow / [d]eny / [q]uit
@@ -30,20 +32,22 @@ List the approvals that wait for you, then answer one:
 
 ```bash
 target/debug/neha approval list
+target/debug/neha approval show <approval-id>
 target/debug/neha approval allow <approval-id>
 target/debug/neha approval deny <approval-id>
 ```
 
-`neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. A Deny ends the run, and the Bot says that it stopped.
+`neha approval show <approval-id>` prints where the action sits and its full arguments. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. A Deny ends the run, and the Bot says that it stopped.
 
 ## What an Always allow covers
 
 An Always allow covers the same tool and one of these:
 
-- a shell command that starts with the same first word;
-- a file action in the same directory.
+- every shell command whose text starts with the approved command's first word: `printf` covers `printf 'hello'` and `printfx`;
+- every path at or below the approved action's directory;
+- every action of a tool with no command or path, such as `take_file`.
 
-The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
+For a file at the Workspace root, the covered directory is the Workspace root: relative paths are covered and absolute ones are not. When a rule asks, the card names the scope: `shell commands starting with "printf"`, `files under "logs"`, `files in the Workspace root`, or `all take_file actions`. The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
 
 ## Lasting rules
 
@@ -60,6 +64,8 @@ An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets
 
 When both match, the more specific rule wins: a rule with a command or path prefix beats one with only the tool, and a longer prefix beats a shorter one. If they are equally specific, the Ask rule wins.
 
+Some forms a prefix cannot judge. A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break asks whenever the Bot and User have any shell rule: `echo hi; rm x` is never covered by an `rm` rule. A file path with `..`, or an absolute/relative form unlike the rule's prefix, asks whenever the Bot and User have any rule for that tool: a `logs` rule does not cover `../logs/x` or `/var/logs/x`. With no rule for the tool, the action runs.
+
 ### A wide Ask rule and an Always allow
 
 Create an Ask rule for every shell command:
@@ -68,7 +74,7 @@ Create an Ask rule for every shell command:
 target/debug/neha rule add --bot <bot-id> --effect ask --tool shell
 ```
 
-Before the Bot runs `printf 'hello'`, the approval asks. Choose Always allow: Neha adds an Allow rule for `shell` with the command's first word, `printf`. That Allow rule is narrower than the Ask rule, so the Ask rule stays; other shell commands still ask, and `printf` commands no longer ask.
+Before the Bot runs `printf 'hello'`, the approval asks. Choose Always allow: Neha adds an Allow rule for `shell` with the command's first word, `printf`. The Ask rule has no prefix, so the new Allow rule does not cover it: other shell commands still ask, and `printf` commands no longer ask because the longer prefix wins.
 
 ### A narrow Ask rule and an Always allow
 

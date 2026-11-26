@@ -59,6 +59,27 @@ function asked(name: string): number {
   return space.asked.filter((asked) => asked === name).length;
 }
 
+function lines(view: View, selector: string) {
+  return [...view.container.querySelectorAll(selector)].map((line) => line.textContent);
+}
+
+// A Chat whose newest request waits for an approval.
+function waitingRun() {
+  space.messages.push({
+    id: "m1",
+    chat: "h1",
+    author: { kind: "user", id: "u1" },
+    acting: null,
+    text: "write it",
+    at: "2026-01-01T00:00:00.000Z",
+    seq: "1",
+    run: "r1",
+    file: null,
+  });
+  space.runs["r1"] = { status: "waiting", approval: "a1" };
+  space.approvals.push(firstUse);
+}
+
 useView();
 
 describe("App with approvals", () => {
@@ -70,7 +91,69 @@ describe("App with approvals", () => {
     expect(card(view)).toContain("shell");
     expect(card(view)).toContain("printf hi > a.txt");
     expect(card(view)).toContain("This is the first time Scout uses your Computer.");
+    expect(element(view, ".approval__undo").textContent).toBe("This action cannot be undone.");
     expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
+    // Nothing lasting is offered, so no scope is promised.
+    expect(view.container.querySelector(".approval__scope")).toBeNull();
+  });
+
+  it("takes the Space's word on whether an action can be undone", async () => {
+    space.approvals.push(
+      { ...firstUse, approval: "a1", undoable: "unknown" },
+      { ...firstUse, approval: "a2", tool: "read_file", summary: "notes.txt", undoable: "no" },
+    );
+    const view = await openChat();
+
+    expect(lines(view, ".approval__undo")).toEqual([
+      "It is not known whether this action can be undone.",
+      "This action cannot be undone.",
+    ]);
+  });
+
+  it("shows what an Always allow would cover, in the Space's words or this page's", async () => {
+    space.approvals.push(
+      { ...byRule, approval: "a1", lasting_scope: 'shell commands starting with "git"' },
+      { ...byRule, approval: "a2", tool: "shell", summary: "git status", lasting_scope: null },
+      { ...byRule, approval: "a3", tool: "write_file", summary: "logs/out.txt", lasting_scope: null },
+    );
+    const view = await openChat();
+
+    expect(lines(view, ".approval__scope")).toEqual([
+      'Always allow covers: shell commands starting with "git"',
+      'Always allow covers: shell commands starting with "git"',
+      'Always allow covers: files under "logs"',
+    ]);
+
+    // The scope is a promise about the rule, so it leaves with the buttons.
+    press(view, "Always allow");
+    await waitFor(() => expect(lines(view, ".approval__scope")).toHaveLength(2));
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
+    expect(lines(view, ".approval__scope")[0]).toBe('始终允许的范围：以 "git" 开头的 shell 命令');
+  });
+
+  it("says whether an action can be undone, in the reader's language", async () => {
+    space.approvals.push(
+      { ...firstUse, approval: "a1", action: "act-read", tool: "read_file", summary: "notes.txt" },
+      { ...firstUse, approval: "a2", action: "act-list", tool: "list_files", summary: "." },
+      { ...firstUse, approval: "a3", action: "act-write", tool: "write_file", summary: "out.txt" },
+    );
+    const view = await openChat();
+    const undo = () =>
+      [...view.container.querySelectorAll(".approval__undo")].map((line) => line.textContent);
+
+    // Reading leaves nothing to undo, but the Space has not said so; writing does not come back.
+    expect(undo()).toEqual([
+      "It is not known whether this action can be undone.",
+      "It is not known whether this action can be undone.",
+      "This action cannot be undone.",
+    ]);
+
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
+    expect(undo()).toEqual([
+      "这个操作能否撤销尚不清楚。",
+      "这个操作能否撤销尚不清楚。",
+      "这个操作无法撤销。",
+    ]);
   });
 
   it("offers Always allow when a rule of the User's asks", async () => {
@@ -180,19 +263,7 @@ describe("App with approvals", () => {
   });
 
   it("follows a Run that already waits when the Chat opens", async () => {
-    space.messages.push({
-      id: "m1",
-      chat: "h1",
-      author: { kind: "user", id: "u1" },
-      acting: null,
-      text: "write it",
-      at: "2026-01-01T00:00:00.000Z",
-      seq: "1",
-      run: "r1",
-      file: null,
-    });
-    space.runs["r1"] = { status: "waiting", approval: "a1" };
-    space.approvals.push(firstUse);
+    waitingRun();
     const view = await openChat();
 
     expect(header(view)).toContain("Waiting for approval");
@@ -204,5 +275,47 @@ describe("App with approvals", () => {
     press(view, "Deny");
     await waitFor(() => expect(card(view)).toContain("Denied"));
     expect(header(view)).not.toContain("Waiting for approval");
+  });
+
+  it("keeps waiting when a late answer about the record says the Run works", async () => {
+    waitingRun();
+    const view = await openChat();
+    expect(header(view)).toContain("Waiting for approval");
+
+    // An answer read before the approval still says the Run is running.
+    space.runs["r1"] = { status: "running" };
+    const shows = space.runShows.length;
+    record("neha.message.added", { chat: "h1", message: "m8", text: "tick", file: null, run: "r1" });
+    await waitFor(() => expect(space.runShows.length).toBeGreaterThan(shows));
+    await flush();
+    expect(header(view)).toContain("Waiting for approval");
+    expect(view.container.querySelector(".msg--working")).toBeNull();
+
+    // Only the decision lets the Run work again.
+    press(view, "Allow");
+    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
+    expect(header(view)).not.toContain("Waiting for approval");
+  });
+
+  it("folds a long action and shows all of it on request", async () => {
+    const script = Array.from({ length: 12 }, (_, index) => `echo line ${index + 1}`).join("\n");
+    space.approvals.push({ ...firstUse, summary: script });
+    const view = await openChat();
+    const summary = element(view, ".approval__summary");
+
+    expect(summary.classList.contains("approval__summary--folded")).toBe(true);
+    // The whole action is in the card; only its height is folded.
+    expect(summary.textContent).toBe(script);
+    flush(() => fireEvent.click(element<HTMLButtonElement>(view, ".approval__expand")));
+    expect(summary.classList.contains("approval__summary--folded")).toBe(false);
+    expect(element(view, ".approval__expand").textContent).toBe("Show less");
+  });
+
+  it("shows control characters in an action as escapes", async () => {
+    space.approvals.push({ ...firstUse, summary: "printf \u001b[31mred\u001b[0m\rnext" });
+    const view = await openChat();
+
+    expect(element(view, ".approval__summary").textContent).toBe("printf \\u{1b}[31mred\\u{1b}[0m\\u{d}next");
+    expect(view.container.querySelector(".approval__expand")).toBeNull();
   });
 });

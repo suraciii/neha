@@ -46,12 +46,16 @@ The record holds these kinds for approvals and rules:
 | Kind | What it records |
 | --- | --- |
 | `neha.run.reply` | A step's reply: its content, calls, and usage |
-| `neha.approval.requested` | A Computer action waiting for the acting User's decision |
-| `neha.approval.decided` | The acting User's Allow or Deny for one approval |
+| `neha.approval.requested` | The Computer, the call's index, the action, its arguments, the summary, the reason, the lasting scope, and whether the action can be undone |
+| `neha.approval.decided` | The answer, and the rule a lasting answer added |
 | `neha.rule.added` | A lasting Ask or Allow rule |
 | `neha.rule.removed` | A lasting rule removed |
 
 Each is an Authority event, so a reader that does not know one stops and asks for an upgrade.
+
+## Event visibility
+
+Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.provider.added`) go to every account. An event the account cannot see still advances its cursor.
 
 ## Projections
 

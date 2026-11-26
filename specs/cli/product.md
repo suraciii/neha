@@ -42,11 +42,13 @@ Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves
 
 ## Approvals
 
-`neha approval list` shows the approvals that wait for the User, and `neha approval allow <id>` or `neha approval deny <id>` answers one. `neha approval allow <id> --always` also makes the action's kind a lasting Allow rule.
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. `neha approval show <id>` prints the action's step, call index, action, Chat, asking rule, and full arguments.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool, with how the command starts for a shell or a directory for a file action.
+`neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule.
 
-At a terminal, `neha chat send` shows a waiting approval and offers Allow, Always allow, Deny, or leaving it waiting; without a terminal it prints the run and approval ids and exits, for `neha approval allow` to answer.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path can name a path prefix.
+
+At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, for a rule, what Always allow covers. It offers Allow, Always allow, Deny, or leaving it waiting; without a terminal it prints the run and approval ids and exits, for `neha approval allow` to answer.
 
 ## Gaps
 

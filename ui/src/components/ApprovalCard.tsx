@@ -1,6 +1,7 @@
-import { Show } from "solid-js";
+import { Show, createSignal } from "solid-js";
 
 import { t } from "../i18n";
+import { escapeControls, isLongSummary, localScope, undoableOf } from "../lib/approvals";
 import type { Approval } from "../types";
 import Avatar from "./Avatar";
 import Icon from "./Icon";
@@ -15,12 +16,24 @@ interface ApprovalCardProps {
 
 // One action a Bot waits to run until the User answers.
 export default function ApprovalCard(props: ApprovalCardProps) {
+  const [expanded, setExpanded] = createSignal(false);
   const allowed = () => props.approval.decided === true;
   const denied = () => props.approval.decided === false;
   const reason = () =>
     props.approval.reason === "rule"
       ? t("chat.approval.reason.rule")
       : t("chat.approval.reason.firstUse", { name: props.botName });
+  const undo = () =>
+    t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
+  // What an Always allow would cover: the Space's words, else this page's guess.
+  const scope = () => {
+    if (props.approval.reason !== "rule") return null;
+    const local = localScope(props.approval);
+    const scope = props.approval.lasting_scope ?? (local ? t(local.key, local.params) : null);
+    return scope ? t("chat.approval.lastingScope", { scope }) : null;
+  };
+  const long = () => isLongSummary(props.approval.summary);
+  const folded = () => long() && !expanded();
 
   return (
     <article class="msg msg--bot approval" aria-live="polite">
@@ -30,8 +43,21 @@ export default function ApprovalCard(props: ApprovalCardProps) {
           <b>{props.botName}</b>
           <span>{t("chat.approval.asks", { tool: props.approval.tool })}</span>
         </div>
-        <code class="approval__summary">{props.approval.summary}</code>
+        <code class={`approval__summary ${folded() ? "approval__summary--folded" : ""}`}>
+          {escapeControls(props.approval.summary)}
+        </code>
+        <Show when={long()}>
+          <button
+            class="link-btn approval__expand"
+            type="button"
+            aria-expanded={expanded() ? "true" : "false"}
+            onClick={() => setExpanded(!expanded())}
+          >
+            {expanded() ? t("chat.approval.showLess") : t("chat.approval.showFull")}
+          </button>
+        </Show>
         <p class="approval__reason">{reason()}</p>
+        <p class="approval__undo">{undo()}</p>
         <Show
           when={!allowed() && !denied()}
           fallback={
@@ -44,6 +70,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
             </p>
           }
         >
+          <Show when={scope()}>
+            {(line) => (
+              <p class="approval__scope">{line()}</p>
+            )}
+          </Show>
           <div class="approval__actions">
             <button
               class="btn btn--primary"

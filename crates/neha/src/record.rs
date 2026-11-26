@@ -574,7 +574,12 @@ mod tests {
             "step": 2,
             "content": "Let me look",
             "calls": [
-                {"call": "call-2-0", "tool": "shell", "arguments": {"command": "pwd"}},
+                {
+                    "call": "call-2-0",
+                    "tool": "shell",
+                    "arguments": {"command": "pwd"},
+                    "refused": null,
+                },
             ],
             "usage": {
                 "uncached_input": 11,
@@ -603,20 +608,24 @@ mod tests {
 
     #[test]
     fn an_approval_requested_round_trips() {
-        let ids: Vec<Id> = (0..6).map(|_| Id::new()).collect();
+        let ids: Vec<Id> = (0..7).map(|_| Id::new()).collect();
         let value = serde_json::json!({
             "approval": ids[0],
             "run": ids[1],
             "bot": ids[2],
+            "computer": ids[6],
             "chat": ids[3],
             "acting": ids[4],
             "action": ids[5],
+            "index": 0,
             "step": 1,
             "call": "call-1-0",
             "tool": "shell",
             "arguments": {"command": "pwd"},
             "summary": "Run pwd",
             "reason": "first_use_local",
+            "lasting_scope": null,
+            "undoable": "no",
         });
 
         let EventData::ApprovalRequested(requested) =
@@ -625,8 +634,12 @@ mod tests {
             panic!("an approval request decodes to its data");
         };
         assert_eq!(requested.approval, ids[0]);
+        assert_eq!(requested.computer, ids[6]);
         assert_eq!(requested.action, ids[5]);
+        assert_eq!(requested.index, 0);
         assert_eq!(requested.step, 1);
+        assert_eq!(requested.undoable, super::Undoability::No);
+        assert_eq!(requested.lasting_scope, None);
         assert_eq!(requested.call, "call-1-0");
         assert_eq!(requested.tool, "shell");
         assert_eq!(requested.summary, "Run pwd");
@@ -634,7 +647,7 @@ mod tests {
         assert_eq!(requested.rule, None);
 
         let mut unknown = value;
-        unknown["computer"] = serde_json::json!(Id::new());
+        unknown["group"] = serde_json::json!(Id::new());
         assert!(EventKind::ApprovalRequested.decode(&unknown).is_err());
     }
 
@@ -1292,6 +1305,9 @@ pub struct RecordedCall {
     pub tool: String,
     /// The arguments the tool runs with.
     pub arguments: serde_json::Value,
+    /// Why the loop refused the call before anything ran; `None` when it can run.
+    #[serde(default)]
+    pub refused: Option<String>,
 }
 
 /// The data of `neha.run.reply`.
@@ -1322,6 +1338,16 @@ pub enum ApprovalReason {
     Rule,
 }
 
+/// Whether the User can undo an action after allowing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Undoability {
+    /// The action cannot be undone.
+    No,
+    /// The action may or may not be undoable; this build cannot tell.
+    Unknown,
+}
+
 /// What a lasting rule does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1342,12 +1368,16 @@ pub struct ApprovalRequested {
     pub run: Id,
     /// The Bot.
     pub bot: Id,
+    /// The Computer the run works on; a first use counts per machine.
+    pub computer: Id,
     /// The Chat.
     pub chat: Id,
     /// The User the Bot acts for; they answer.
     pub acting: Id,
     /// The action that waits.
     pub action: Id,
+    /// The call's position among the step's calls, from zero.
+    pub index: u32,
     /// The step.
     pub step: u32,
     /// The tool-call identifier.
@@ -1363,6 +1393,11 @@ pub struct ApprovalRequested {
     /// The rule that asked, when a rule did.
     #[serde(default)]
     pub rule: Option<Id>,
+    /// What an "Always allow" would allow, in words the User reads.
+    #[serde(default)]
+    pub lasting_scope: Option<String>,
+    /// Whether the action can still be undone after it runs.
+    pub undoable: Undoability,
 }
 
 /// The data of `neha.approval.decided`.

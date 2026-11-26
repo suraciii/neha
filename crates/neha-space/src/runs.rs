@@ -212,12 +212,14 @@ async fn work(
             let work = {
                 let state = server.state.lock().ok();
                 state.and_then(|state| {
-                    if let Some(run) = state.resumable_run(bot) {
-                        // An allowed run keeps the place it began with, even
-                        // when its Computer is away: its action must not run
-                        // anywhere else.
-                        return computer_online(&state, &server.links, run)
-                            .then(|| Work::Resume(run.clone()));
+                    // An allowed run that can run now resumes first. One whose
+                    // Computer is away is skipped instead of holding the Bot:
+                    // a later move, a new run, or another run's denial must
+                    // still make progress. It resumes when its Computer
+                    // reconnects, because the run keeps the Computer it began
+                    // with.
+                    if let Some(run) = next_resumable(&state, &server.links, bot) {
+                        return Some(Work::Resume(run));
                     }
                     if let Some(run) = state.denied_run(bot) {
                         return Some(Work::Deny(run.clone()));
@@ -349,6 +351,21 @@ enum Work {
     Deny(RunView),
     /// Start the earliest queued run.
     Queued(RunView),
+}
+
+/// Returns the earliest allowed run of a Bot whose Computer is online.
+fn next_resumable(
+    state: &crate::state::State,
+    links: &crate::computer_link::ComputerLinks,
+    bot: Id,
+) -> Option<RunView> {
+    state
+        .runs
+        .values()
+        .filter(|run| run.bot == bot && state.is_resumable(run))
+        .filter(|run| computer_online(state, links, run))
+        .min_by_key(|run| run.seq)
+        .cloned()
 }
 
 /// Returns whether the Computer a run works on can take the run now.

@@ -8,6 +8,7 @@
 //! A command that is already recorded never writes or creates anything
 //! again: its recorded result is the answer.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{
     ActionStatus as RecordedActionStatus, ApprovalReason, Author, Event, EventDraft, EventKind,
-    FileAdded, RuleEffect,
+    FileAdded, RuleEffect, Undoability,
 };
 use neha::seq::Seq;
 use neha::surface::{BotComputer, BotCreate, CommandCall, FileSummary, MessageSend, ProviderAdd};
@@ -317,6 +318,9 @@ async fn approval_decide(
         ));
     }
 
+    // A lasting answer records the derived rule in the same transaction, and
+    // the decision names it.
+    let lasting_rule = lasting.then(Id::new);
     let mut drafts = vec![
         EventDraft::new(
             EventKind::ApprovalDecided,
@@ -327,6 +331,7 @@ async fn approval_decide(
                 "allow": allow,
                 "lasting": lasting,
                 "user": account.id,
+                "rule": lasting_rule,
             }),
         )
         .acting(account.id),
@@ -336,17 +341,12 @@ async fn approval_decide(
         "run": view.run,
         "status": if allow { "allowed" } else { "denied" },
     });
-    if lasting {
+    if let Some(rule) = lasting_rule {
         let (tool, command_prefix, path_prefix) = derived_rule(&view)?;
-        let rule = Id::new();
         result["rule"] = json!(rule);
-        // A derived allow rule no wider than the ask rule the User just
-        // overrode makes that ask rule obsolete; a narrower one only wins on
-        // the actions it covers, so the wider ask stays for the rest.
-        let derived_specificity = match (&command_prefix, &path_prefix) {
-            (Some(prefix), _) | (_, Some(prefix)) => (true, prefix.chars().count()),
-            (None, None) => (false, 0),
-        };
+        // The ask rule the User just answered is obsolete only when the
+        // derived allow rule covers everything the ask rule covered; a
+        // narrower allow rule lets the wider ask stay for the rest.
         let overridden = if view.reason == ApprovalReason::Rule {
             let state = context
                 .state
@@ -354,7 +354,14 @@ async fn approval_decide(
                 .map_err(|_| ApiError::internal("state lock"))?;
             view.rule
                 .and_then(|rule| state.rules.iter().find(|view| view.rule == rule))
-                .filter(|ask| derived_specificity <= rule_specificity(ask))
+                .filter(|ask| {
+                    rule_covers(
+                        &tool,
+                        command_prefix.as_deref(),
+                        path_prefix.as_deref(),
+                        ask,
+                    )
+                })
                 .map(|ask| ask.rule)
         } else {
             None
@@ -452,6 +459,7 @@ async fn rule_add(
             neha_loop::tools::READ_FILE
                 | neha_loop::tools::WRITE_FILE
                 | neha_loop::tools::LIST_FILES
+                | neha_loop::tools::PUT_FILE
         )
     {
         return Err(ApiError::invalid_argument(
@@ -468,7 +476,8 @@ async fn rule_add(
             .rules
             .iter()
             .find(|rule| {
-                rule.bot == bot
+                rule.user == account.id
+                    && rule.bot == bot
                     && rule.effect == effect
                     && rule.tool == tool
                     && rule.command_prefix == command_prefix
@@ -1597,7 +1606,10 @@ async fn finish_run_with(
         acting: pending.acting,
         run: pending.run,
     };
-    let mut recorder = RunRecorder { log };
+    let mut recorder = RunRecorder {
+        log,
+        calls: HashMap::new(),
+    };
     let files = RunFiles {
         log,
         blobs,
@@ -1613,6 +1625,9 @@ async fn finish_run_with(
         pending.model.max_output,
     );
     if let Some(resume) = resume {
+        // A resumed step's calls come from the record; the loop continues at
+        // the call after the approved one.
+        recorder.calls.insert(resume.step, resume.calls.clone());
         request = request.with_resume(resume);
     }
     let outcome = match neha_loop::run(&runtime, &space_model, &mut recorder, &files, request).await
@@ -1672,11 +1687,14 @@ fn prepare_resume(
         .iter()
         .find(|reply| reply.step == approval.step)
         .ok_or_else(|| ApiError::internal("the waiting step has no recorded reply"))?;
-    let done = reply
-        .calls
-        .iter()
-        .position(|call| call.call == approval.call)
-        .ok_or_else(|| ApiError::internal("the approved call is not in its reply"))?;
+    // The position is the record's own ordinal, never a call identifier the
+    // Model chose: duplicate identifiers must not let a finished call run
+    // again under another call's approval.
+    let done = usize::try_from(approval.index)
+        .map_err(|_| ApiError::internal("the approval index is out of range"))?;
+    if done >= reply.calls.len() {
+        return Err(ApiError::internal("the approval index is out of range"));
+    }
 
     let mut messages = Vec::new();
     for (author, text) in state.history(run.chat) {
@@ -1717,9 +1735,14 @@ fn prepare_resume(
                 })
                 .collect(),
         ));
-        for (call, action) in recorded.calls.iter().zip(actions) {
+        for (index, (call, action)) in recorded.calls.iter().zip(actions).enumerate() {
+            if action.tool != call.tool || action.arguments != call.arguments {
+                return Err(ApiError::internal(
+                    "a step's calls do not match its results",
+                ));
+            }
             messages.push(neha_loop::Message::tool_result(
-                call_id(&call.call, recorded.step, 0),
+                call_id(&call.call, recorded.step, index),
                 action_result_text(action),
             ));
         }
@@ -1730,13 +1753,28 @@ fn prepare_resume(
         .iter()
         .filter(|action| action.step == approval.step)
         .collect();
-    if step_actions.len() < done {
-        return Err(ApiError::internal("the waiting step lost a result"));
+    // Exactly the calls before the approved one have results, each at its own
+    // position and with the same tool and arguments.
+    if step_actions.len() != done {
+        return Err(ApiError::internal(
+            "the waiting step's results do not line up with its calls",
+        ));
     }
-    for (index, call) in reply.calls.iter().take(done).enumerate() {
+    for (index, (call, action)) in reply.calls.iter().take(done).zip(step_actions).enumerate() {
+        if action.tool != call.tool || action.arguments != call.arguments {
+            return Err(ApiError::internal(
+                "the waiting step's results do not line up with its calls",
+            ));
+        }
         messages.push(neha_loop::Message::tool_result(
             call_id(&call.call, approval.step, index),
-            action_result_text(step_actions[index]),
+            action_result_text(action),
+        ));
+    }
+    let approved = &reply.calls[done];
+    if approved.tool != approval.tool || approved.arguments != approval.arguments {
+        return Err(ApiError::internal(
+            "the approval does not name its position's call",
         ));
     }
     let resume = Resume {
@@ -1749,6 +1787,7 @@ fn prepare_resume(
                 call: call.call.clone(),
                 tool: call.tool.clone(),
                 arguments: call.arguments.clone(),
+                refused: call.refused.clone(),
             })
             .collect(),
         done,
@@ -2059,6 +2098,9 @@ impl RunLog<'_> {
 /// Records the steps and actions of one run.
 struct RunRecorder<'a> {
     log: RunLog<'a>,
+    /// The calls of each step the loop asked about, so an approval can name
+    /// the call's position in its step.
+    calls: HashMap<u32, Vec<LoopCall>>,
 }
 
 /// Moves Files between the Space and the Chat of one run.
@@ -2156,6 +2198,7 @@ impl Recorder for RunRecorder<'_> {
         calls: Vec<LoopCall>,
         usage: neha::usage::Usage,
     ) -> Result<(), LoopError> {
+        self.calls.insert(step, calls.clone());
         let calls: Vec<Value> = calls
             .iter()
             .map(|call| {
@@ -2163,6 +2206,7 @@ impl Recorder for RunRecorder<'_> {
                     "call": call.call,
                     "tool": call.tool,
                     "arguments": call.arguments,
+                    "refused": call.refused,
                 })
             })
             .collect();
@@ -2202,20 +2246,28 @@ impl Recorder for RunRecorder<'_> {
                 .get(&run.bot)
                 .ok_or_else(|| LoopError::Record("the Bot is gone".to_owned()))?
                 .clone();
+            // The run keeps the Computer it began on, so the first use counts
+            // on that machine even after a move.
+            let computer = run.computer.unwrap_or(bot.computer);
             let local = state
                 .computers
-                .get(&bot.computer)
-                .is_some_and(|computer| computer.kind == "local");
-            let first_use = local && !state.first_use_allowed.contains(&(bot.id, self.log.acting));
-            let matching: Vec<RuleView> = state
+                .get(&computer)
+                .is_some_and(|view| view.kind == "local");
+            let first_use = local && !state.first_use_allowed(bot.id, self.log.acting, computer);
+            let tool_rules: Vec<RuleView> = state
                 .rules_of(bot.id)
                 .into_iter()
-                .filter(|rule| rule.user == self.log.acting && rule_matches(rule, call))
+                .filter(|rule| rule.user == self.log.acting && rule.tool == call.tool)
                 .cloned()
                 .collect();
-            (local, first_use, matching, run, bot)
+            let matching: Vec<RuleView> = tool_rules
+                .iter()
+                .filter(|rule| rule_matches(rule, call))
+                .cloned()
+                .collect();
+            (local, first_use, computer, matching, tool_rules, run, bot)
         };
-        let (local, first_use, matching, run, bot) = plan;
+        let (local, first_use, computer, matching, tool_rules, run, bot) = plan;
         if !local {
             // A Hosted Computer has no fence yet (M2-B); it never asks.
             return Ok(Decision::Allow);
@@ -2224,6 +2276,10 @@ impl Recorder for RunRecorder<'_> {
             // The first use of a Local Computer always asks, whatever rules
             // exist: a lasting allow cannot cover it.
             (ApprovalReason::FirstUseLocal, None)
+        } else if let Some(rule) = ambiguous_rule(call, &tool_rules) {
+            // A form a prefix rule cannot judge is never allowed by a rule:
+            // with any rule for its tool it goes to the User instead.
+            (ApprovalReason::Rule, Some(rule))
         } else {
             match decisive_rule(&matching) {
                 Some(Decision::Wait) => {
@@ -2237,6 +2293,12 @@ impl Recorder for RunRecorder<'_> {
                 Some(Decision::Allow) | None => return Ok(Decision::Allow),
             }
         };
+        let index = self.call_index(step, call)?;
+        let lasting_scope = if reason == ApprovalReason::Rule {
+            lasting_scope(call)
+        } else {
+            None
+        };
         let approval = Id::new();
         self.log
             .append(vec![self.log.bot_draft(
@@ -2245,9 +2307,11 @@ impl Recorder for RunRecorder<'_> {
                     "approval": approval,
                     "run": self.log.run,
                     "bot": bot.id,
+                    "computer": computer,
                     "chat": run.chat,
                     "acting": self.log.acting,
                     "action": action,
+                    "index": index,
                     "step": step,
                     "call": call.call,
                     "tool": call.tool,
@@ -2255,6 +2319,8 @@ impl Recorder for RunRecorder<'_> {
                     "summary": approval_summary(call),
                     "reason": reason,
                     "rule": rule,
+                    "lasting_scope": lasting_scope,
+                    "undoable": undoability(&call.tool),
                 }),
             )])
             .await?;
@@ -2317,6 +2383,25 @@ impl Recorder for RunRecorder<'_> {
     }
 }
 
+impl RunRecorder<'_> {
+    /// Returns the call's position among the calls of its step.
+    ///
+    /// The loop keeps each step's call identifiers distinct, so the position
+    /// is exact; the record uses it to resume at the same call.
+    fn call_index(&self, step: u32, call: &LoopCall) -> Result<u32, LoopError> {
+        let calls = self
+            .calls
+            .get(&step)
+            .ok_or_else(|| LoopError::Record("the step's calls are not recorded".to_owned()))?;
+
+        calls
+            .iter()
+            .position(|known| known.call == call.call)
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(|| LoopError::Record("the approved call is not in its step".to_owned()))
+    }
+}
+
 /// How specific a rule is: a prefix makes it narrower, and a longer prefix
 /// narrower still.
 fn rule_specificity(rule: &RuleView) -> (bool, usize) {
@@ -2354,7 +2439,113 @@ fn decisive_rule(rules: &[RuleView]) -> Option<Decision> {
     }
 }
 
-/// Returns whether a lasting rule covers one Computer action.
+/// Returns the rule a User must answer for when an action's form defeats
+/// prefix matching.
+///
+/// A shell command with grouping, a pipe, a redirection, a substitution, or a
+/// second command cannot be judged by a prefix: an ask rule must not be
+/// bypassed with `echo hi; rm x`. A file path with a `..` component or one
+/// whose absolute/relative form differs from a rule's prefix is the same.
+fn ambiguous_rule(call: &LoopCall, rules: &[RuleView]) -> Option<Id> {
+    if rules.is_empty() {
+        return None;
+    }
+    let ambiguous = match call.tool.as_str() {
+        neha_loop::tools::SHELL => call
+            .arguments
+            .get("command")
+            .and_then(Value::as_str)
+            .is_some_and(ambiguous_shell),
+        neha_loop::tools::READ_FILE
+        | neha_loop::tools::WRITE_FILE
+        | neha_loop::tools::LIST_FILES
+        | neha_loop::tools::PUT_FILE => call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| ambiguous_path(path, rules)),
+        _ => false,
+    };
+    if !ambiguous {
+        return None;
+    }
+
+    rules
+        .iter()
+        .min_by_key(|rule| rule.seq)
+        .map(|rule| rule.rule)
+}
+
+/// Returns whether a shell command uses a form a prefix cannot judge.
+fn ambiguous_shell(command: &str) -> bool {
+    command.chars().any(|ch| {
+        matches!(
+            ch,
+            ';' | '|' | '&' | '\n' | '\r' | '`' | '$' | '>' | '<' | '(' | ')'
+        )
+    })
+}
+
+/// Returns whether a path is ambiguous for the rules that exist.
+fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
+    if path.split('/').any(|component| component == "..") {
+        return true;
+    }
+    let absolute = path.starts_with('/');
+
+    rules.iter().any(|rule| {
+        rule.path_prefix
+            .as_deref()
+            .is_some_and(|prefix| prefix.starts_with('/') != absolute)
+    })
+}
+
+/// What an "Always allow" would cover, in words a User reads.
+fn lasting_scope(call: &LoopCall) -> Option<String> {
+    match call.tool.as_str() {
+        neha_loop::tools::SHELL => {
+            let command = call
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let word = command.split_whitespace().next()?;
+
+            Some(format!(
+                "shell commands starting with \"{}\"",
+                sanitize_text(word)
+            ))
+        }
+        neha_loop::tools::READ_FILE
+        | neha_loop::tools::WRITE_FILE
+        | neha_loop::tools::LIST_FILES
+        | neha_loop::tools::PUT_FILE => {
+            let path = call.arguments.get("path").and_then(Value::as_str)?;
+
+            Some(file_scope(&sanitize_text(&path_parent(path))))
+        }
+        _ => Some(format!("all {} actions", call.tool)),
+    }
+}
+
+/// Names a path scope for a User.
+fn file_scope(prefix: &str) -> String {
+    if prefix == "." {
+        "files in the Workspace root".to_owned()
+    } else {
+        format!("files under \"{prefix}\"")
+    }
+}
+
+/// Whether the User can undo the action after allowing it.
+fn undoability(tool: &str) -> Undoability {
+    match tool {
+        neha_loop::tools::SHELL | neha_loop::tools::WRITE_FILE => Undoability::No,
+        _ => Undoability::Unknown,
+    }
+}
+
+/// Returns whether a lasting rule covers one action.
 fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
     if rule.tool != call.tool {
         return false;
@@ -2364,7 +2555,9 @@ fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
             return false;
         };
 
-        return command.starts_with(prefix.as_str());
+        // A half-typed command line often starts with whitespace; the rule is
+        // about the first word's prefix either way.
+        return command.trim_start().starts_with(prefix.as_str());
     }
     if let Some(prefix) = &rule.path_prefix {
         let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
@@ -2378,9 +2571,15 @@ fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
 }
 
 /// Compares a path to a lexical prefix on a `/` boundary.
+///
+/// The prefix `.` names the workspace root: it matches every relative path,
+/// including a bare file name like `notes.txt`.
 fn path_matches(path: &str, prefix: &str) -> bool {
     if prefix == "/" {
         return path.starts_with('/');
+    }
+    if prefix == "." {
+        return !path.starts_with('/');
     }
     if path == prefix {
         return true;
@@ -2388,6 +2587,56 @@ fn path_matches(path: &str, prefix: &str) -> bool {
 
     path.strip_prefix(prefix)
         .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Returns whether a path prefix covers another path prefix.
+///
+/// A prefix covers every path under it: `/a` covers `/a/b` and itself, while
+/// `.` covers every relative prefix and no absolute one. A `.` ask is the
+/// relative root itself and is covered only by `.`.
+fn path_covers(derived: &str, ask: &str) -> bool {
+    if derived == "." {
+        return !ask.starts_with('/');
+    }
+    if derived == "/" {
+        return ask.starts_with('/');
+    }
+    if ask == "." || ask.starts_with('/') != derived.starts_with('/') {
+        return false;
+    }
+    if ask == derived {
+        return true;
+    }
+
+    ask.strip_prefix(derived)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Returns whether a derived allow rule covers everything one ask rule covers.
+///
+/// The rule's tool must match, and its prefix must cover the ask's prefix of
+/// the same kind. A tool-only ask rule is covered only by a tool-only allow
+/// rule, and an allow rule with a prefix never covers it.
+fn rule_covers(
+    tool: &str,
+    command_prefix: Option<&str>,
+    path_prefix: Option<&str>,
+    ask: &RuleView,
+) -> bool {
+    if ask.tool != tool {
+        return false;
+    }
+    match (command_prefix, path_prefix) {
+        (Some(derived), _) => ask
+            .command_prefix
+            .as_deref()
+            .is_some_and(|ask| ask.starts_with(derived)),
+        (None, Some(derived)) => ask
+            .path_prefix
+            .as_deref()
+            .is_some_and(|ask| path_covers(derived, ask)),
+        (None, None) => ask.command_prefix.is_none() && ask.path_prefix.is_none(),
+    }
 }
 
 /// Returns the parent directory of a path, as a rule stores it.
@@ -2417,7 +2666,8 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
         }
         neha_loop::tools::READ_FILE
         | neha_loop::tools::WRITE_FILE
-        | neha_loop::tools::LIST_FILES => {
+        | neha_loop::tools::LIST_FILES
+        | neha_loop::tools::PUT_FILE => {
             let path = view
                 .arguments
                 .get("path")
@@ -2433,23 +2683,81 @@ fn derived_rule(view: &ApprovalView) -> Result<(String, Option<String>, Option<S
     }
 }
 
-/// A short text a User reads on the approval card.
+/// The largest summary the record keeps whole.
+const MAX_SUMMARY_BYTES: usize = 4096;
+
+/// A text a User reads on the approval card.
+///
+/// Control characters are escaped and the full command is never silently cut:
+/// a very long summary says how many bytes it left out. The complete
+/// arguments are in the event and in `RunShow`.
 fn approval_summary(call: &LoopCall) -> String {
     let detail = match call.tool.as_str() {
         neha_loop::tools::SHELL => call.arguments.get("command").and_then(Value::as_str),
         neha_loop::tools::READ_FILE
         | neha_loop::tools::WRITE_FILE
-        | neha_loop::tools::LIST_FILES => call.arguments.get("path").and_then(Value::as_str),
+        | neha_loop::tools::LIST_FILES
+        | neha_loop::tools::PUT_FILE => call.arguments.get("path").and_then(Value::as_str),
+        neha_loop::tools::TAKE_FILE => call.arguments.get("file").and_then(Value::as_str),
         _ => None,
     }
     .unwrap_or("")
     .trim();
-    let detail: String = detail.chars().take(200).collect();
-    if detail.is_empty() {
+    let detail = sanitize_text(detail);
+    let text = if detail.is_empty() {
         format!("{} on this Computer", call.tool)
     } else {
         format!("{}: {detail}", call.tool)
+    };
+
+    clip_summary(&text)
+}
+
+/// Escapes control characters so a card cannot hide or rewrite itself.
+fn sanitize_text(text: &str) -> String {
+    let mut clean = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => clean.push_str("\\n"),
+            '\r' => clean.push_str("\\r"),
+            '\t' => clean.push_str("\\t"),
+            ch if ch.is_control() => clean.push_str(&format!("\\u{{{:04x}}}", ch as u32)),
+            ch => clean.push(ch),
+        }
     }
+
+    clean
+}
+
+/// Keeps the head and tail of a very long summary and says what it left out.
+fn clip_summary(text: &str) -> String {
+    if text.len() <= MAX_SUMMARY_BYTES {
+        return text.to_owned();
+    }
+    let mut head_end = 0;
+    for (index, ch) in text.char_indices() {
+        if index >= 3072 {
+            break;
+        }
+        head_end = index + ch.len_utf8();
+    }
+    let mut tail_start = text.len();
+    for (index, _) in text.char_indices().rev() {
+        if text.len() - index > 768 {
+            break;
+        }
+        tail_start = index;
+    }
+    if tail_start <= head_end {
+        return text.to_owned();
+    }
+    let omitted = tail_start - head_end;
+
+    format!(
+        "{}… ({omitted} bytes omitted) …{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
 }
 
 const RUN_ACTION_ARGUMENT_BYTES: usize = 16 * 1024;
@@ -2713,5 +3021,481 @@ fn store_error(error: crate::store::StoreError) -> ApiError {
             ApiError::unsupported_version(format!("this Space must be upgraded to read {kind}"))
         }
         other => ApiError::internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{LoopCall, path_covers, path_matches, prepare_resume, rule_covers, rule_matches};
+    use crate::state::RuleView;
+    use neha::id::Id;
+    use neha::record::RuleEffect;
+    use neha::seq::Seq;
+
+    fn ask(tool: &str, command_prefix: Option<&str>, path_prefix: Option<&str>) -> RuleView {
+        RuleView {
+            rule: Id::new(),
+            bot: Id::new(),
+            user: Id::new(),
+            effect: RuleEffect::Ask,
+            tool: tool.to_owned(),
+            command_prefix: command_prefix.map(ToOwned::to_owned),
+            path_prefix: path_prefix.map(ToOwned::to_owned),
+            seq: Seq::from_i64(1).unwrap(),
+        }
+    }
+
+    fn call(tool: &str, arguments: serde_json::Value) -> LoopCall {
+        LoopCall {
+            call: "call-1".to_owned(),
+            tool: tool.to_owned(),
+            arguments,
+            refused: None,
+        }
+    }
+
+    #[test]
+    fn a_derived_rule_covers_the_asks_it_contains() {
+        // A command prefix covers its longer commands, not the other way.
+        assert!(rule_covers(
+            "shell",
+            Some("git"),
+            None,
+            &ask("shell", Some("git status"), None)
+        ));
+        assert!(rule_covers(
+            "shell",
+            Some("git"),
+            None,
+            &ask("shell", Some("git"), None)
+        ));
+        assert!(!rule_covers(
+            "shell",
+            Some("git status"),
+            None,
+            &ask("shell", Some("git"), None)
+        ));
+        // Command prefixes are raw `starts_with`, so `git` covers `github`.
+        assert!(rule_covers(
+            "shell",
+            Some("git"),
+            None,
+            &ask("shell", Some("github"), None)
+        ));
+
+        // A tool-only ask is covered only by a tool-only allow.
+        assert!(!rule_covers(
+            "shell",
+            Some("git"),
+            None,
+            &ask("shell", None, None)
+        ));
+        assert!(rule_covers("shell", None, None, &ask("shell", None, None)));
+
+        // The tool must be the same.
+        assert!(!rule_covers(
+            "write_file",
+            None,
+            Some("."),
+            &ask("read_file", None, Some("notes.txt"))
+        ));
+
+        // A path covers the paths under it, on a segment boundary.
+        assert!(rule_covers(
+            "write_file",
+            None,
+            Some("/a"),
+            &ask("write_file", None, Some("/a/b"))
+        ));
+        assert!(rule_covers(
+            "write_file",
+            None,
+            Some("/a"),
+            &ask("write_file", None, Some("/a"))
+        ));
+        assert!(!rule_covers(
+            "write_file",
+            None,
+            Some("/a/b"),
+            &ask("write_file", None, Some("/a"))
+        ));
+        assert!(!rule_covers(
+            "write_file",
+            None,
+            Some("/a"),
+            &ask("write_file", None, Some("/ab"))
+        ));
+        assert!(!rule_covers(
+            "write_file",
+            None,
+            Some("/a"),
+            &ask("write_file", None, Some("a/b"))
+        ));
+
+        // The workspace root covers relative asks and no absolute one.
+        assert!(rule_covers(
+            "write_file",
+            None,
+            Some("."),
+            &ask("write_file", None, Some("notes.txt"))
+        ));
+        assert!(rule_covers(
+            "write_file",
+            None,
+            Some("."),
+            &ask("write_file", None, Some("dir/file"))
+        ));
+        assert!(!rule_covers(
+            "write_file",
+            None,
+            Some("."),
+            &ask("write_file", None, Some("/abs"))
+        ));
+        assert!(rule_covers(
+            "write_file",
+            None,
+            Some("/"),
+            &ask("write_file", None, Some("/abs"))
+        ));
+        assert!(!rule_covers(
+            "write_file",
+            None,
+            Some("/"),
+            &ask("write_file", None, Some("rel"))
+        ));
+    }
+
+    #[test]
+    fn a_path_prefix_matches_on_a_segment_boundary() {
+        assert!(path_matches("dir/file", "dir"));
+        assert!(path_matches("dir", "dir"));
+        assert!(!path_matches("dirfile", "dir"));
+        assert!(!path_matches("dir2/file", "dir"));
+        assert!(path_matches("/etc/passwd", "/"));
+        assert!(!path_matches("etc/passwd", "/"));
+    }
+
+    #[test]
+    fn the_workspace_root_prefix_covers_relative_paths() {
+        assert!(path_matches("notes.txt", "."));
+        assert!(path_matches("./notes.txt", "."));
+        assert!(path_matches("dir/notes.txt", "."));
+        assert!(path_matches(".", "."));
+        assert!(!path_matches("/etc/passwd", "."));
+        assert!(path_covers(".", "notes.txt"));
+        assert!(path_covers(".", "dir/file"));
+        assert!(!path_covers(".", "/etc/passwd"));
+    }
+
+    // ---- Resuming from the record by ordinal ----
+
+    use crate::state::State;
+    use crate::store::Projection as _;
+    use neha::record::{Author, Event, EventKind, KIND_VERSION};
+    use neha::time::Timestamp;
+
+    fn event(
+        kind: EventKind,
+        author: Author,
+        acting: Option<Id>,
+        data: serde_json::Value,
+        seq: i64,
+    ) -> Event {
+        Event {
+            seq: Seq::from_i64(seq).unwrap(),
+            kind,
+            version: KIND_VERSION,
+            at: Timestamp::from_microseconds(0).unwrap(),
+            author,
+            acting,
+            command: Some(Id::new()),
+            data,
+        }
+    }
+
+    /// Applies a run whose second call waits for an approval.
+    fn waiting_state(
+        calls: serde_json::Value,
+        index: u32,
+        tool: &str,
+        arguments: serde_json::Value,
+        completed: &[(Id, &str, serde_json::Value)],
+    ) -> (State, crate::state::RunView, Id) {
+        let user = Id::new();
+        let bot = Id::new();
+        let run = Id::new();
+        let chat = Id::new();
+        let approval = Id::new();
+        let approved_action = Id::new();
+        let mut state = State::default();
+        let bot_author = Author::Bot(bot);
+        let computer = Id::new();
+        let mut events = vec![
+            event(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                None,
+                json!({
+                    "computer": computer,
+                    "owner": user,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ),
+            event(
+                EventKind::BotCreated,
+                Author::User(user),
+                None,
+                json!({
+                    "bot": bot,
+                    "owner": user,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ),
+            event(
+                EventKind::ChatCreated,
+                Author::User(user),
+                None,
+                json!({"chat": chat, "owner": user, "bot": bot}),
+                3,
+            ),
+            event(
+                EventKind::RunQueued,
+                bot_author,
+                Some(user),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": Id::new(),
+                    "message": Id::new(),
+                }),
+                4,
+            ),
+            event(
+                EventKind::RunStarted,
+                bot_author,
+                Some(user),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": Id::new(),
+                    "message": Id::new(),
+                }),
+                5,
+            ),
+            event(
+                EventKind::RunReply,
+                bot_author,
+                Some(user),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "content": null,
+                    "calls": calls,
+                    "usage": null,
+                }),
+                6,
+            ),
+        ];
+        let mut seq = 7;
+        for (action, tool, arguments) in completed {
+            events.push(event(
+                EventKind::ActionStarted,
+                bot_author,
+                Some(user),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": tool,
+                    "arguments": arguments,
+                }),
+                seq,
+            ));
+            seq += 1;
+            events.push(event(
+                EventKind::ActionFinished,
+                bot_author,
+                Some(user),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": tool,
+                    "status": "succeeded",
+                    "output": "ok",
+                }),
+                seq,
+            ));
+            seq += 1;
+        }
+        events.push(event(
+            EventKind::ApprovalRequested,
+            bot_author,
+            Some(user),
+            json!({
+                "approval": approval,
+                "run": run,
+                "bot": bot,
+                "computer": computer,
+                "chat": chat,
+                "acting": user,
+                "action": approved_action,
+                "index": index,
+                "step": 1,
+                "call": "call-1",
+                "tool": tool,
+                "arguments": arguments,
+                "summary": "shell: b",
+                "reason": "rule",
+                "rule": null,
+                "lasting_scope": null,
+                "undoable": "no",
+            }),
+            seq,
+        ));
+        seq += 1;
+        events.push(event(
+            EventKind::ApprovalDecided,
+            Author::User(user),
+            Some(user),
+            json!({
+                "approval": approval,
+                "run": run,
+                "allow": true,
+                "lasting": false,
+                "user": user,
+            }),
+            seq,
+        ));
+        for event in &events {
+            state.apply(event).expect("the fabricated record applies");
+        }
+        let run = state.runs.get(&run).expect("the run").clone();
+        let approved_action = state.approvals.last().expect("the approval").action;
+
+        (state, run, approved_action)
+    }
+
+    #[test]
+    fn a_resume_starts_at_the_approved_index() {
+        let (state, run, _approved_action) = waiting_state(
+            json!([
+                {"call": "call-1", "tool": "shell", "arguments": {"command": "a"}, "refused": null},
+                {"call": "call-2", "tool": "shell", "arguments": {"command": "b"}, "refused": null},
+            ]),
+            1,
+            "shell",
+            json!({"command": "b"}),
+            &[(Id::new(), "shell", json!({"command": "a"}))],
+        );
+        let (messages, resume, _usage) =
+            prepare_resume(&std::sync::Mutex::new(state), &run).expect("the record resumes");
+
+        assert_eq!(resume.step, 1);
+        assert_eq!(resume.done, 1);
+        assert_eq!(resume.calls.len(), 2);
+        assert_eq!(resume.calls[1].arguments, json!({"command": "b"}));
+        assert_eq!(
+            messages.len(),
+            1,
+            "the one completed call's result ends the history"
+        );
+    }
+
+    #[test]
+    fn a_resume_uses_the_ordinal_not_a_repeated_call_id() {
+        // Two calls answer under one identifier (a forged or old record). The
+        // ordinal picks the second call; matching by identifier would run the
+        // first call again under the second call's approval.
+        let (state, run, approved_action) = waiting_state(
+            json!([
+                {"call": "same", "tool": "shell", "arguments": {"command": "first"}, "refused": null},
+                {"call": "same", "tool": "shell", "arguments": {"command": "second"}, "refused": null},
+            ]),
+            1,
+            "shell",
+            json!({"command": "second"}),
+            &[(Id::new(), "shell", json!({"command": "first"}))],
+        );
+        let expected = approved_action;
+        let (_, resume, _usage) =
+            prepare_resume(&std::sync::Mutex::new(state), &run).expect("the record resumes");
+
+        assert_eq!(resume.done, 1);
+        assert_eq!(resume.calls[1].arguments, json!({"command": "second"}));
+        assert_eq!(resume.approved_action, expected);
+    }
+
+    #[test]
+    fn a_misaligned_resume_is_refused() {
+        // The approval names a tool and arguments the call at its index does
+        // not have.
+        let (state, run, _approved_action) = waiting_state(
+            json!([
+                {"call": "call-1", "tool": "shell", "arguments": {"command": "a"}, "refused": null},
+            ]),
+            0,
+            "shell",
+            json!({"command": "b"}),
+            &[],
+        );
+        assert!(prepare_resume(&std::sync::Mutex::new(state), &run).is_err());
+
+        // A completed action the approval's index does not expect.
+        let (state, run, _approved_action) = waiting_state(
+            json!([
+                {"call": "call-1", "tool": "shell", "arguments": {"command": "a"}, "refused": null},
+                {"call": "call-2", "tool": "shell", "arguments": {"command": "b"}, "refused": null},
+            ]),
+            0,
+            "shell",
+            json!({"command": "b"}),
+            &[(Id::new(), "shell", json!({"command": "b"}))],
+        );
+        assert!(prepare_resume(&std::sync::Mutex::new(state), &run).is_err());
+    }
+
+    #[test]
+    fn a_rule_matches_its_own_tool_and_prefix() {
+        assert!(rule_matches(
+            &ask("shell", Some("git"), None),
+            &call("shell", json!({"command": "git status"}))
+        ));
+        assert!(
+            rule_matches(
+                &ask("shell", Some("git"), None),
+                &call("shell", json!({"command": "  git status"}))
+            ),
+            "a shell rule ignores leading whitespace"
+        );
+        assert!(!rule_matches(
+            &ask("shell", Some("git"), None),
+            &call("shell", json!({"command": "pwd"}))
+        ));
+        assert!(!rule_matches(
+            &ask("shell", Some("git"), None),
+            &call("read_file", json!({"path": "git"}))
+        ));
+        assert!(rule_matches(
+            &ask("write_file", None, Some(".")),
+            &call("write_file", json!({"path": "notes.txt"}))
+        ));
+        assert!(!rule_matches(
+            &ask("write_file", None, Some(".")),
+            &call("write_file", json!({"path": "/abs/notes.txt"}))
+        ));
+        assert!(rule_matches(
+            &ask("shell", None, None),
+            &call("shell", json!({"command": "anything"}))
+        ));
     }
 }

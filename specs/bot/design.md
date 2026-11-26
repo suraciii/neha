@@ -54,15 +54,27 @@ A failed run does not resume; the Bot says so as a Message. A run never resumes 
 
 ## Approvals
 
-Before a Computer action, the loop asks whether to proceed; a File's taking or delivery is not a Computer action, so it never asks.
+Before a Computer action, the loop asks whether to proceed. A File action asks like any other: `take_file` matches a rule that names only that tool, and `put_file` also matches a path-prefix rule. The first use of a Local Computer is never covered by a lasting rule.
 
-The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User, or when a lasting Ask rule matches. The first use is never covered by a lasting rule.
+The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
 
-A rule names one tool, with how the command starts for a shell or a directory for a file tool. When an Ask rule and an Allow rule both match one action, the more specific rule wins: a prefix beats the tool alone, a longer prefix beats a shorter one, and equally specific rules go to the Ask rule.
+A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix. A path prefix matches a path that equals it or sits below it; `.` is the Workspace root and matches every relative path.
 
-An Always allow on an Ask rule's approval writes an Allow rule from the command's first word for a shell, or from the action's parent directory for a file tool. It removes the Ask rule that asked when the new Allow rule is at least as broad: the same prefix, or a shorter one. Otherwise the Ask rule stays.
+When an Ask rule and an Allow rule both match, the longer prefix wins, and a rule without a prefix is the shortest. A tie goes to the Ask rule.
 
-An Allow resumes the run from the record: the step's reply and finished actions replay, the waiting action keeps its recorded id, and no action runs twice. A Deny fails the run, and the Bot says why.
+A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break is a form a prefix cannot judge. A file path with a `..` component, or an absolute/relative form unlike a rule prefix, is another.
+
+A form a prefix cannot judge asks when the Bot and User have any rule for that tool. With no rule for that tool, the action runs.
+
+An Always allow on an Ask rule's approval writes an Allow rule: the approved command's first word for a shell, or the approved action's parent directory for a file tool with a path.
+
+A relative path at the Workspace root writes `.`. A tool-only Ask rule's answer, such as one for `take_file`, writes a tool-only Allow rule.
+
+The new Allow rule covers the Ask rule when the Ask rule's command prefix starts with the Allow rule's prefix, or when the Ask rule's path equals the Allow rule's path or sits below it. A tool-only Ask rule is not covered by a prefixed Allow rule. Neha removes a covered Ask rule and keeps an uncovered one.
+
+The approval records the Computer and the call's index. An Allow resumes the run from the record: the step's reply and finished actions replay, the waiting action keeps its recorded id, and no action runs twice. The resumed step binds the answer to that call by index.
+
+A Deny fails the run, and the Bot says why.
 
 A run that waits for an approval keeps no place in the Bot's queue, so a later request for the same Bot runs. A Space restart keeps an undecided approval waiting, resumes an allowed one, and fails a denied one.
 

@@ -29,7 +29,11 @@ A Card has a kind. Neha provides four kinds, and a Plugin can add more.
 | Page | A document or report | Opens it |
 | Dashboard | Live figures | Reads them |
 
-An Approval card names one action of one run. It shows the action's tool, a summary, why the Bot asks, and whether the action can be undone. It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
+An Approval card names one action of one run. It shows the action's tool, a summary, why the Bot asks, and whether the action can be undone: `shell` or `write_file` is not undoable, and every other action is unknown.
+
+The summary escapes control characters and says how many bytes it leaves out when it is longer than 4096 bytes.
+
+When a rule asks, the card shows what Always allow covers: the shell prefix, the file directory, the Workspace root, or the whole tool. It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
 
 ## Files
 

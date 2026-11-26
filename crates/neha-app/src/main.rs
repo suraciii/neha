@@ -986,9 +986,9 @@ fn approval_row(approval: &Value) -> Result<String> {
         entity_id(approval, &["approval"])?,
         entity_id(approval, &["run"])?,
         entity_id(approval, &["bot"])?,
-        text_of(approval, "tool")?,
+        escape_text(text_of(approval, "tool")?),
         text_of(approval, "reason")?,
-        approval["summary"].as_str().unwrap_or_default()
+        escape_text(approval["summary"].as_str().unwrap_or_default())
     ))
 }
 
@@ -996,6 +996,9 @@ fn approval_row(approval: &Value) -> Result<String> {
 fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> {
     if let Some(step) = approval["step"].as_u64() {
         writeln!(out, "  step {step}")?;
+    }
+    if let Some(index) = approval["index"].as_u64() {
+        writeln!(out, "  index {index}")?;
     }
     if let Some(action) = approval["action"].as_str() {
         writeln!(out, "  action {action}")?;
@@ -1006,8 +1009,48 @@ fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> 
     if let Some(rule) = approval["rule"].as_str() {
         writeln!(out, "  rule {rule}")?;
     }
+    if let Some(arguments) = approval.get("arguments") {
+        // The whole action, escaped and never clipped, so the User can check
+        // exactly what the approval will run.
+        let arguments =
+            serde_json::to_string(arguments).context("the approval arguments are not JSON")?;
+        writeln!(out, "  arguments {}", escape_text(&arguments))?;
+    }
 
     Ok(())
+}
+
+/// Escapes control characters so a card cannot hide or rewrite itself.
+fn escape_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => escaped.push_str(&format!("\\u{{{:04x}}}", ch as u32)),
+            ch => escaped.push(ch),
+        }
+    }
+
+    escaped
+}
+
+/// Names the files an Always allow would cover from a path.
+fn file_scope(path: &str) -> String {
+    let parent = std::path::Path::new(path)
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    match parent {
+        None => "files in the Workspace root".to_owned(),
+        Some(parent) if parent == std::path::Path::new(".") => {
+            "files in the Workspace root".to_owned()
+        }
+        Some(parent) => format!(
+            "files under \"{}\"",
+            escape_text(&parent.display().to_string())
+        ),
+    }
 }
 
 /// Adds or removes approval rules.
@@ -1190,6 +1233,12 @@ struct ApprovalCard {
     summary: String,
     /// The reason the Space gave.
     reason: String,
+    /// Whether the Space says the action can be undone, when it says.
+    undoable: Option<String>,
+    /// What an Always allow would cover, in the Space's words.
+    lasting_scope: Option<String>,
+    /// The arguments the action runs with.
+    arguments: Value,
 }
 
 impl ApprovalCard {
@@ -1200,12 +1249,68 @@ impl ApprovalCard {
             tool: text_of(approval, "tool")?.to_owned(),
             summary: approval["summary"].as_str().unwrap_or_default().to_owned(),
             reason: text_of(approval, "reason")?.to_owned(),
+            undoable: approval["undoable"].as_str().map(str::to_owned),
+            lasting_scope: approval["lasting_scope"].as_str().map(str::to_owned),
+            arguments: approval.get("arguments").cloned().unwrap_or(Value::Null),
         })
     }
 
     /// Returns whether the Space would accept a lasting answer.
     fn allows_always(&self) -> bool {
         self.reason == "rule"
+    }
+
+    /// Returns the card's line about undoing the action.
+    ///
+    /// The Space names the undoability; when that field is missing this falls
+    /// back to the tool: a shell command or a write can change the machine and
+    /// is not undoable, while a read may leak data and is not called safe.
+    fn undo_text(&self) -> &'static str {
+        match self.undoable.as_deref() {
+            Some("no") => "This action cannot be undone.",
+            Some("unknown") => "It is not known whether this action can be undone.",
+            _ => match self.tool.as_str() {
+                "shell" | "write_file" => "This action cannot be undone.",
+                _ => "It is not known whether this action can be undone.",
+            },
+        }
+    }
+
+    /// Returns what an Always allow would cover, when the prompt offers it.
+    ///
+    /// The Space names the scope; when it does not, this derives the same
+    /// words locally from the tool and its arguments so the User never grants
+    /// a lasting rule without seeing its reach.
+    fn always_scope(&self) -> Option<String> {
+        if !self.allows_always() {
+            return None;
+        }
+
+        Some(match &self.lasting_scope {
+            Some(scope) => escape_text(scope),
+            None => self.derived_scope(),
+        })
+    }
+
+    /// Derives a lasting scope from the tool and its arguments.
+    fn derived_scope(&self) -> String {
+        match self.tool.as_str() {
+            "shell" => self
+                .arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .and_then(|command| command.split_whitespace().next())
+                .map_or_else(
+                    || "all shell actions".to_owned(),
+                    |word| format!("shell commands starting with \"{}\"", escape_text(word)),
+                ),
+            "read_file" | "write_file" | "list_files" | "put_file" => self
+                .arguments
+                .get("path")
+                .and_then(Value::as_str)
+                .map_or_else(|| "files in the Workspace root".to_owned(), file_scope),
+            other => format!("all {} actions", escape_text(other)),
+        }
     }
 
     /// Returns the reason as the card reads it.
@@ -1240,15 +1345,22 @@ impl ApprovalCard {
         let summary = if self.summary.is_empty() {
             String::new()
         } else {
-            format!("\n  {}", self.summary)
+            format!("\n  {}", escape_text(&self.summary))
         };
 
+        let scope = self
+            .always_scope()
+            .map(|scope| format!("\n  Always allow covers: {scope}"))
+            .unwrap_or_default();
+
         format!(
-            "Approval {} for {}{}\n  reason: {}",
+            "Approval {} for {}{}\n  reason: {}{}\n  {}",
             self.approval,
-            self.tool,
+            escape_text(&self.tool),
             summary,
-            self.reason_text()
+            self.reason_text(),
+            scope,
+            self.undo_text()
         )
     }
 }
@@ -1564,7 +1676,7 @@ mod tests {
 
     use super::{
         ApprovalCard, ApprovalCommand, Decision, RuleCommand, RuleEffectChoice, approval_row,
-        decision_from_input, decision_line, read_decision, rule_add_line, rule_rows,
+        decision_from_input, decision_line, escape_text, read_decision, rule_add_line, rule_rows,
         validate_rule_arguments, waiting_advice, write_approval_details,
     };
 
@@ -1573,6 +1685,19 @@ mod tests {
         Cli::try_parse_from(std::iter::once("neha").chain(args.iter().copied()))
             .unwrap()
             .command
+    }
+
+    /// A card for one tool; absent Space fields exercise the local fallbacks.
+    fn approval_card(tool: &str, reason: &str) -> ApprovalCard {
+        ApprovalCard {
+            approval: Id::new(),
+            tool: tool.to_owned(),
+            summary: "printf approved > proof.txt".to_owned(),
+            reason: reason.to_owned(),
+            undoable: None,
+            lasting_scope: None,
+            arguments: json!({"command": "printf approved > proof.txt"}),
+        }
     }
 
     #[test]
@@ -1866,12 +1991,7 @@ mod tests {
 
     #[test]
     fn a_card_hides_always_allow_until_a_rule_asked() {
-        let rule = ApprovalCard {
-            approval: Id::new(),
-            tool: "shell".to_owned(),
-            summary: "printf approved > proof.txt".to_owned(),
-            reason: "rule".to_owned(),
-        };
+        let rule = approval_card("shell", "rule");
         let rendered = rule.render();
         assert!(rendered.contains("Approval "), "{rendered}");
         assert!(rendered.contains("for shell"), "{rendered}");
@@ -1880,21 +2000,227 @@ mod tests {
             "{rendered}"
         );
         assert!(rendered.contains("reason: a rule you set"), "{rendered}");
+        assert!(
+            rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
         assert_eq!(rule.options(), "[a]llow / [A]lways allow / [d]eny / [q]uit");
 
-        let first_use = ApprovalCard {
-            reason: "first_use_local".to_owned(),
-            ..rule
-        };
+        let first_use = approval_card("shell", "first_use_local");
         let rendered = first_use.render();
         assert!(
             rendered.contains("reason: first use of your Local Computer"),
             "{rendered}"
         );
         // The first use of a Local Computer cannot be covered by a lasting
-        // rule, so its prompt does not offer Always allow.
+        // rule, so its card neither offers nor describes Always allow.
         assert_eq!(first_use.options(), "[a]llow / [d]eny / [q]uit");
-        assert!(!first_use.options().contains("Always allow"));
+        assert!(!rendered.contains("Always allow"), "{rendered}");
+    }
+
+    #[test]
+    fn a_card_reads_the_space_view_fields() {
+        let view = json!({
+            "approval": Id::new(),
+            "tool": "shell",
+            "summary": "printf hi",
+            "reason": "rule",
+            "undoable": "no",
+            "lasting_scope": "shell commands starting with \"printf\"",
+            "arguments": {"command": "printf hi"},
+        });
+        let card = ApprovalCard::from_view(&view).unwrap();
+        assert_eq!(card.undoable.as_deref(), Some("no"));
+        assert_eq!(
+            card.lasting_scope.as_deref(),
+            Some("shell commands starting with \"printf\"")
+        );
+        assert_eq!(card.arguments["command"], "printf hi");
+        let rendered = card.render();
+        assert!(
+            rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("Always allow covers: shell commands starting with \"printf\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn a_card_says_whether_the_action_can_be_undone() {
+        // The Space's undoable field wins over what the tool looks like.
+        let mut card = approval_card("read_file", "rule");
+        card.undoable = Some("no".to_owned());
+        let rendered = card.render();
+        assert!(
+            rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("It is not known whether this action can be undone."),
+            "{rendered}"
+        );
+
+        let mut card = approval_card("shell", "rule");
+        card.undoable = Some("unknown".to_owned());
+        let rendered = card.render();
+        assert!(
+            rendered.contains("It is not known whether this action can be undone."),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("This action cannot be undone."),
+            "{rendered}"
+        );
+
+        // A missing field falls back to the tool.
+        for tool in ["shell", "write_file"] {
+            let rendered = approval_card(tool, "rule").render();
+            assert!(
+                rendered.contains("This action cannot be undone."),
+                "{tool}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("It is not known whether this action can be undone."),
+                "{tool}: {rendered}"
+            );
+            // The line comes after the tool, summary, and reason.
+            let reason = rendered.find("reason:").expect("the card names a reason");
+            let undo = rendered
+                .find("This action cannot be undone.")
+                .expect("the card names the undo state");
+            assert!(reason < undo, "{tool}: {rendered}");
+        }
+        for tool in ["read_file", "list_files"] {
+            let rendered = approval_card(tool, "rule").render();
+            assert!(
+                rendered.contains("It is not known whether this action can be undone."),
+                "{tool}: {rendered}"
+            );
+            assert!(
+                !rendered.contains("This action cannot be undone."),
+                "{tool}: {rendered}"
+            );
+        }
+        // A tool this CLI does not know is not called safe either.
+        assert!(
+            approval_card("future_tool", "rule")
+                .render()
+                .contains("It is not known whether this action can be undone.")
+        );
+    }
+
+    #[test]
+    fn a_card_shows_what_always_allow_covers() {
+        // The Space's scope wins.
+        let mut card = approval_card("shell", "rule");
+        card.lasting_scope = Some("shell commands starting with \"git\"".to_owned());
+        let rendered = card.render();
+        assert!(
+            rendered.contains("Always allow covers: shell commands starting with \"git\""),
+            "{rendered}"
+        );
+
+        // Without the field the scope is derived from the command's first word.
+        let card = approval_card("shell", "rule");
+        let rendered = card.render();
+        assert!(
+            rendered.contains("Always allow covers: shell commands starting with \"printf\""),
+            "{rendered}"
+        );
+
+        // File scopes name the parent directory, or the Workspace root.
+        let mut card = approval_card("read_file", "rule");
+        card.arguments = json!({"path": "logs/run.txt"});
+        assert!(
+            card.render()
+                .contains("Always allow covers: files under \"logs\""),
+            "{}",
+            card.render()
+        );
+        card.arguments = json!({"path": "note.txt"});
+        assert!(
+            card.render()
+                .contains("Always allow covers: files in the Workspace root"),
+            "{}",
+            card.render()
+        );
+        card.arguments = json!({"path": "/tmp/report.txt"});
+        assert!(
+            card.render()
+                .contains("Always allow covers: files under \"/tmp\""),
+            "{}",
+            card.render()
+        );
+        // An unknown tool still names its reach.
+        let mut card = approval_card("future_tool", "rule");
+        card.arguments = serde_json::Value::Null;
+        assert!(
+            card.render()
+                .contains("Always allow covers: all future_tool actions"),
+            "{}",
+            card.render()
+        );
+
+        // First use has no Always allow, so it names no lasting scope.
+        let rendered = approval_card("shell", "first_use_local").render();
+        assert!(!rendered.contains("Always allow covers"), "{rendered}");
+    }
+
+    #[test]
+    fn a_card_escapes_control_characters_and_keeps_long_commands() {
+        assert_eq!(
+            escape_text("a\nb\rc\td\u{001b}[31m"),
+            "a\\nb\\rc\\td\\u{001b}[31m"
+        );
+
+        let mut card = approval_card("shell", "rule");
+        card.summary = "printf 'hi'\n\r\t\u{001b}[2J spoof".to_owned();
+        let rendered = card.render();
+        assert!(
+            !rendered.contains('\u{001b}'),
+            "no escape byte: {rendered:?}"
+        );
+        assert!(rendered.contains("\\n"), "{rendered:?}");
+        assert!(rendered.contains("\\r"), "{rendered:?}");
+        assert!(rendered.contains("\\t"), "{rendered:?}");
+        assert!(rendered.contains("\\u{001b}[2J"), "{rendered:?}");
+        assert!(rendered.contains("spoof"), "{rendered:?}");
+
+        // A long command is shown whole; the terminal wraps it.
+        let long = format!("printf '{}' > proof.txt", "x".repeat(400));
+        card.summary = long.clone();
+        let rendered = card.render();
+        assert!(
+            rendered.contains(&escape_text(&long)),
+            "the long command is not clipped: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn approval_show_prints_the_full_arguments() {
+        let command = format!("printf '{}' > proof.txt", "a".repeat(400));
+        let approval = json!({
+            "approval": Id::new(),
+            "run": Id::new(),
+            "bot": Id::new(),
+            "action": Id::new(),
+            "chat": Id::new(),
+            "step": 2,
+            "index": 3,
+            "tool": "shell",
+            "reason": "rule",
+            "summary": "printf long",
+            "arguments": {"command": command, "cwd": "logs"},
+        });
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  index 3"), "{out}");
+        let expected = escape_text(&serde_json::to_string(&approval["arguments"]).unwrap());
+        assert!(out.contains(&format!("  arguments {expected}")), "{out}");
+        assert!(out.contains(&"a".repeat(400)), "the whole command is shown");
     }
 
     #[test]
@@ -1919,12 +2245,7 @@ mod tests {
 
     #[test]
     fn a_card_reprompts_until_the_answer_is_offered() {
-        let card = ApprovalCard {
-            approval: Id::new(),
-            tool: "shell".to_owned(),
-            summary: "ls".to_owned(),
-            reason: "rule".to_owned(),
-        };
+        let card = approval_card("shell", "rule");
         let mut input = std::io::Cursor::new(b"x\nA\n");
         let mut output = Vec::new();
         let decision = read_decision(&card, &mut input, &mut output).unwrap();
@@ -1942,10 +2263,7 @@ mod tests {
         );
 
         // Always allow is not a valid answer for the first use.
-        let first_use = ApprovalCard {
-            reason: "first_use_local".to_owned(),
-            ..card
-        };
+        let first_use = approval_card("shell", "first_use_local");
         let mut input = std::io::Cursor::new(b"A\nq\n");
         let mut output = Vec::new();
         assert_eq!(

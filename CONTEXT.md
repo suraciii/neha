@@ -53,7 +53,7 @@ A request from a Bot's loop to the User it acts for, asking whether one Computer
 _Avoid_: permission, consent, confirmation (as the term)
 
 **Rule**:
-A lasting choice by a User that a kind of action always asks (Ask) or allows (Allow). When an Ask rule and an Allow rule both match, the more specific rule wins, and an Ask rule wins a tie.
+A lasting choice by a User that a kind of action always asks (Ask) or allows (Allow).
 _Avoid_: policy, permission, setting, mode
 
 **Vault**:

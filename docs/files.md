@@ -86,6 +86,8 @@ Ask in the Chat; the Bot chooses its tools, as with the tools in [Let a Bot work
 | `take_file` | Puts a File of the Chat into the Workspace, under the File's name. |
 | `put_file` | Delivers a file as a File on a Message from the Bot: a path in the Workspace, or on a Local Computer any file its machine user can read except the Computer's configuration directory. An optional `name` gives the File a name other than the file's. |
 
+The two tools go through the same approval gate as the other Computer actions. On a Local Computer, a first use or a lasting Ask rule can make `take_file` or `put_file` wait for an answer before it copies or delivers; a `take_file` rule names only the tool, while a `put_file` rule can name a path prefix. [Approvals](approvals.md) covers the card.
+
 `take_file` copies the File. The File stays in the Chat, the Bot can take it again in a later Message, and removing the copy from the Workspace does not remove the File.
 
 Create a small file and send it with a request:

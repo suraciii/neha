@@ -122,6 +122,9 @@ export interface RunView {
 // or a rule the User set to be asked.
 export type ApprovalReason = "first_use_local" | "rule";
 
+// Whether an action can be undone, as far as the Space knows.
+export type Undoable = "no" | "unknown";
+
 // One action a Bot waits to run until the User answers.
 export interface Approval {
   approval: string;
@@ -134,6 +137,9 @@ export interface Approval {
   summary: string;
   reason: ApprovalReason;
   rule?: string | null;
+  undoable?: Undoable | null;
+  // What an Always allow would cover, in the Space's words.
+  lasting_scope?: string | null;
   // The User's answer, once given. The Space lists only approvals still waiting.
   decided?: boolean | null;
 }

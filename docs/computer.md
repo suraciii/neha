@@ -93,7 +93,7 @@ Ask the Bot to work and check where the work ran:
 target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 ```
 
-The first action on this Local Computer asks for approval in the Chat: the Bot waits until you Allow, Always allow, or Deny. [Approvals](approvals.md) covers the card and the commands.
+The first action on this Local Computer asks for approval in the Chat: the Bot waits until you Allow or Deny, and the first use has no Always allow. Each Local Computer asks once for each Bot and User, so a Bot moved to another Local Computer asks again there. [Approvals](approvals.md) covers the card and the commands.
 
 ## The Bot's Workspace and the write fence
 
@@ -111,7 +111,7 @@ The file tools read with the rights of the machine's user. A file read follows a
 
 The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token. The directory is `~/.config/neha` by default.
 
-The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
+The same split reaches Files: `take_file` copies a File of the Chat into the Workspace, and `put_file` may read any file the machine's user can read, outside the configuration directory, and deliver it as a File on a Message. Both tools go through the approval gate like other actions. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers both tools.
 
 A shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace is writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
 

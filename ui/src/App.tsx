@@ -35,6 +35,11 @@ type AuthMode = "join" | "login" | "missing-invite";
 // Where the followed Run is: in the queue, working, or waiting for an approval.
 type RunStep = "queued" | "running" | "waiting";
 
+// How far a Run has come. It only moves up, until a decision lets it work again.
+function rank(step: RunStep): number {
+  return step === "queued" ? 0 : step === "running" ? 1 : 2;
+}
+
 interface State {
   account: Account | null;
   providers: Provider[];
@@ -149,8 +154,9 @@ export default function App() {
     else update({ working: false, waiting: true, queue: null });
   }
 
-  // Moves the followed Run forward. An answer older than the record cannot move
-  // it back to the queue, and a better place for the same wait still shows.
+  // Moves the followed Run forward: queued, then running, then waiting. An
+  // answer older than the record cannot move it back, and a better place for
+  // the same wait still shows.
   function advanceRun(run: string, step: RunStep, position?: number) {
     if (settledRuns.has(run)) return;
     const current = followed;
@@ -158,15 +164,20 @@ export default function App() {
       followRun(run, step, position);
       return;
     }
-    if (current.run !== run) return;
+    if (current.run !== run || rank(current.step) > rank(step)) return;
     if (current.step === step) {
       // The same wait, a better place.
       if (step === "queued") update({ queue: { status: "queued", position } });
       return;
     }
-    // Only an approval sends a Run back to working; the queue never comes again.
-    if (step === "queued") return;
     followRun(run, step, position);
+  }
+
+  // Lets a waiting Run work again once its approval was granted. Only a
+  // decision does this; a late answer about the record cannot.
+  function resumeRun(run: string) {
+    if (settledRuns.has(run) || followed?.run !== run || followed.step !== "waiting") return;
+    followRun(run, "running");
   }
 
   function clearFollowed() {
@@ -334,7 +345,7 @@ export default function App() {
   function applyDecision(approval: string, run: string, allowed: boolean) {
     answerApproval(approval, allowed);
     if (!isFollowing(run)) return;
-    if (allowed) advanceRun(run, "running");
+    if (allowed) resumeRun(run);
     else clearFollowed();
   }
 

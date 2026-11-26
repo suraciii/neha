@@ -4,10 +4,11 @@
 //! every tool call the step requested, record each one before and after it
 //! runs, and feed the results back. A tool call runs on the Computer or, for
 //! the two File tools, moves a File between the Space and the Computer. The
-//! Space approves each Computer action before it starts; a run whose action
-//! must wait ends with [`RunOutcome::Waiting`] and resumes from the record.
+//! Space approves each action before it starts; a run whose action must wait
+//! ends with [`RunOutcome::Waiting`] and resumes from the record.
 //! The loop stops with a final Message, a failure, or a step limit.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::path::Path;
 
@@ -75,11 +76,11 @@ pub struct Resume {
     pub content: Option<String>,
     /// The step's calls as the record keeps them.
     pub calls: Vec<RecordedCall>,
-    /// How many calls already have a recorded result. Their results are the
-    /// last `done` Messages of the history; the next call is the approved
-    /// action.
+    /// How many calls already have a recorded result, refused ones included.
+    /// Their results are the last `done` Messages of the history; the call at
+    /// `done` is the approved action.
     pub done: usize,
-    /// The approved action's identifier, which the action keeps when it runs.
+    /// The approved action's identifier, which the call at `done` keeps when it runs.
     pub approved_action: Id,
     /// The usage of the reply that made the step, which the run's usage starts from.
     pub usage: Usage,
@@ -92,11 +93,14 @@ pub struct RecordedCall {
     pub call: String,
     /// The tool's name.
     pub tool: String,
-    /// The arguments.
+    /// The Model's arguments as JSON; a refused call too large to keep is
+    /// summarized instead.
     pub arguments: Value,
+    /// Why the loop refused the call before anything ran; `None` when the call can run.
+    pub refused: Option<String>,
 }
 
-/// Whether a Computer action may start.
+/// Whether an action may start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     /// The action runs.
@@ -117,7 +121,7 @@ pub enum RunOutcome {
         /// Whether the run reached a final answer.
         succeeded: bool,
     },
-    /// A Computer action waits for the User's approval.
+    /// An action waits for the User's approval.
     Waiting {
         /// The action the run waits for.
         approval: WaitingApproval,
@@ -129,6 +133,8 @@ pub enum RunOutcome {
 pub struct WaitingApproval {
     /// The step that holds the action.
     pub step: u32,
+    /// The call's position among the step's calls, from zero.
+    pub index: u32,
     /// The call's identifier, which its tool result answers under.
     pub call: String,
     /// The tool the Model called.
@@ -158,8 +164,9 @@ pub trait Recorder {
         usage: Usage,
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 
-    /// Asks whether one Computer action may start under `action`. Only a
-    /// Computer action is asked for; a File move never is.
+    /// Asks whether one action may start under `action`. A call the loop
+    /// refused runs nothing and is not asked; every call that can run asks, a
+    /// File move included.
     fn approve(
         &mut self,
         step: u32,
@@ -234,6 +241,7 @@ where
                     usage,
                     ..
                 } = resume;
+                let calls = resumed_calls(calls)?;
                 // The results of the done calls end the history, and the
                 // reply's calls come before them.
                 let at = messages.len() - done.min(messages.len() - 1);
@@ -241,7 +249,7 @@ where
                     at,
                     Message::assistant_with_calls(content, model_calls(&calls)),
                 );
-                (resumed_calls(calls), usage, done, Some(approved_action))
+                (calls, usage, done, Some(approved_action))
             }
             None => {
                 let reply = match model
@@ -263,7 +271,7 @@ where
                     recorder.step(step, reply.usage, 0).await?;
                     return Ok(final_reply(reply.content, usage));
                 }
-                let calls = step_calls(step, &reply.tool_calls);
+                let calls = step_calls(step, &reply.tool_calls)?;
                 recorder
                     .reply(
                         step,
@@ -282,22 +290,27 @@ where
         let tool_calls = calls.len() as u32;
         for (index, call) in calls.into_iter().enumerate().skip(from) {
             // The action the User approved runs under its recorded identifier
-            // and is not asked for again.
-            let action = if index == from { approved } else { None };
+            // and is not asked for again. A refused call cannot have been
+            // approved, so it never takes that identifier.
+            let action = if index == from && call.parsed.is_ok() {
+                approved
+            } else {
+                None
+            };
             let action = match action {
                 Some(action) => action,
                 None => {
-                    // A refused call runs nothing and a File move is the
-                    // Space's own; only a Computer action asks.
                     let action = Id::new();
-                    let computer = matches!(call.parsed, Ok(tools::Call::Computer(_)));
-                    if computer
+                    // A refused call runs nothing and asks nobody; every call
+                    // that can run asks, a File move included.
+                    if call.parsed.is_ok()
                         && recorder.approve(step, &call.recorded, action).await? == Decision::Wait
                     {
                         let recorded = call.recorded;
                         return Ok(RunOutcome::Waiting {
                             approval: WaitingApproval {
                                 step,
+                                index: index as u32,
                                 call: recorded.call,
                                 tool: recorded.tool,
                                 arguments: recorded.arguments,
@@ -363,13 +376,15 @@ where
 
 /// One call of a step: whether it can run, and what the record keeps of it.
 struct StepCall {
+    /// `Err` carries the refusal the Model is told; a resumed step keeps the
+    /// one the record has.
     parsed: Result<tools::Call, String>,
     recorded: RecordedCall,
 }
 
 /// The calls of a Model reply as the step runs them.
-fn step_calls(step: u32, calls: &[ToolCall]) -> Vec<StepCall> {
-    calls
+fn step_calls(step: u32, calls: &[ToolCall]) -> Result<Vec<StepCall>, LoopError> {
+    let calls: Vec<StepCall> = calls
         .iter()
         .enumerate()
         .map(|(index, call)| {
@@ -379,32 +394,55 @@ fn step_calls(step: u32, calls: &[ToolCall]) -> Vec<StepCall> {
                     call: call_id(&call.id, step, index),
                     tool: call.name.clone(),
                     arguments: recorded_arguments(&parsed, &call.arguments),
+                    refused: parsed.as_ref().err().cloned(),
                 },
                 parsed,
             }
         })
-        .collect()
+        .collect();
+    distinct_ids(&calls)?;
+    Ok(calls)
 }
 
 /// The recorded calls of a resumed step as the step runs them.
-fn resumed_calls(calls: Vec<RecordedCall>) -> Vec<StepCall> {
-    calls
+fn resumed_calls(calls: Vec<RecordedCall>) -> Result<Vec<StepCall>, LoopError> {
+    let calls: Vec<StepCall> = calls
         .into_iter()
         .map(|recorded| {
-            let parsed = tools::parse(&recorded.tool, &recorded.arguments.to_string());
+            // A refused call stays refused. The record keeps its arguments as
+            // JSON but not what made the Model's text fail to parse, so
+            // parsing them again could let the call run.
+            let parsed = match &recorded.refused {
+                Some(refusal) => Err(refusal.clone()),
+                None => tools::parse(&recorded.tool, &recorded.arguments.to_string()),
+            };
             StepCall { parsed, recorded }
         })
-        .collect()
+        .collect();
+    distinct_ids(&calls)?;
+    Ok(calls)
 }
 
-/// The recorded calls of a resumed step as the Model wrote them.
-fn model_calls(calls: &[RecordedCall]) -> Vec<ToolCall> {
+/// Two calls of one step must not answer under one identifier, or nobody
+/// could tell which result is whose once the run resumes.
+fn distinct_ids(calls: &[StepCall]) -> Result<(), LoopError> {
+    let mut seen = HashSet::new();
+    for call in calls {
+        if !seen.insert(call.recorded.call.as_str()) {
+            return Err(LoopError::RepeatedCall(call.recorded.call.clone()));
+        }
+    }
+    Ok(())
+}
+
+/// The calls of a resumed step as the Model wrote them.
+fn model_calls(calls: &[StepCall]) -> Vec<ToolCall> {
     calls
         .iter()
-        .map(|recorded| ToolCall {
-            id: recorded.call.clone(),
-            name: recorded.tool.clone(),
-            arguments: recorded.arguments.to_string(),
+        .map(|call| ToolCall {
+            id: call.recorded.call.clone(),
+            name: call.recorded.tool.clone(),
+            arguments: call.recorded.arguments.to_string(),
         })
         .collect()
 }
@@ -552,12 +590,15 @@ fn tool_result_text(result: &ActionResult) -> String {
     }
 }
 
-/// The loop cannot continue because the record failed.
+/// Why a run cannot continue.
 #[derive(Debug, Error)]
 pub enum LoopError {
     /// The record could not hold an event.
     #[error("the record failed: {0}")]
     Record(String),
+    /// Two calls of a step answer under one tool-call identifier.
+    #[error("two calls of the step share the tool-call identifier {0}")]
+    RepeatedCall(String),
 }
 
 #[cfg(test)]
@@ -901,6 +942,7 @@ mod tests {
             call: id.to_owned(),
             tool: tool.to_owned(),
             arguments,
+            refused: None,
         }
     }
 
@@ -1060,6 +1102,7 @@ mod tests {
             approval,
             WaitingApproval {
                 step: 1,
+                index: 0,
                 call: "call-1".to_owned(),
                 tool: "shell".to_owned(),
                 arguments: json!({"command": "rm -rf build"}),
@@ -1297,6 +1340,7 @@ mod tests {
             approval,
             WaitingApproval {
                 step: 2,
+                index: 1,
                 call: "call-2".to_owned(),
                 tool: "shell".to_owned(),
                 arguments: json!({"command": "rm -rf build"}),
@@ -1315,6 +1359,269 @@ mod tests {
         );
         assert!(recorder.steps.is_empty(), "the step did not complete");
         assert!(model.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_file_move_that_waits_is_not_started() {
+        let files = FakeFiles::default();
+        let model = FakeModel::with(vec![call_reply(
+            PUT_FILE,
+            json!({"path": "out/report.txt", "name": "answer.txt"}),
+        )]);
+        let runtime = FakeRuntime::with_file("out/report.txt", b"hello");
+        let mut recorder = TestRecorder::that_waits();
+
+        let approval = waiting(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            approval,
+            WaitingApproval {
+                step: 1,
+                index: 0,
+                call: "call-1".to_owned(),
+                tool: "put_file".to_owned(),
+                arguments: json!({"path": "out/report.txt", "name": "answer.txt"}),
+                action: recorder.approvals[0].2,
+            }
+        );
+        assert_eq!(recorder.order, ["reply", "approve"]);
+        assert!(recorder.started.is_empty());
+        assert!(files.puts.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_file_move_runs_once_under_the_approved_action() {
+        let approved_action = Id::new();
+        let calls = vec![recorded(
+            "call-1",
+            PUT_FILE,
+            json!({"path": "out/report.txt"}),
+        )];
+        let files = FakeFiles::default();
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::with_file("out/report.txt", b"hello");
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100).with_resume(resume(
+                    calls,
+                    0,
+                    approved_action,
+                )),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert_eq!(
+            *files.puts.lock().unwrap(),
+            [("report.txt".to_owned(), b"hello".to_vec())]
+        );
+        assert_eq!(
+            recorder.started,
+            [(2, "put_file".to_owned(), approved_action)]
+        );
+        assert!(recorder.approvals.is_empty());
+        assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_stays_refused_after_a_resume() {
+        // The Model repeated a field. The strict parse refuses the call, but
+        // the JSON the record keeps has lost the duplicate and would parse.
+        let raw = r#"{"path":"b.txt","content":"a","content":"b"}"#;
+        let refusal = crate::tools::parse("write_file", raw).unwrap_err();
+        let model = FakeModel::with(vec![calls_reply(vec![
+            call("call-1", "read_file", json!({"path": "a.txt"})),
+            ToolCall {
+                id: "call-2".to_owned(),
+                name: "write_file".to_owned(),
+                arguments: raw.to_owned(),
+            },
+        ])]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::that_waits();
+
+        let approval = waiting(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(approval.index, 0);
+        let calls = recorder.replies[0].2.clone();
+        assert_eq!(calls[1].refused, Some(refusal.clone()));
+        assert_eq!(calls[1].arguments, json!({"path": "b.txt", "content": "b"}));
+
+        // The User allowed the first call; the run resumes with both to do.
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100).with_resume(resume(
+                    calls,
+                    0,
+                    approval.action,
+                )),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert_eq!(
+            recorder.started[0],
+            (2, "read_file".to_owned(), approval.action)
+        );
+        // The refused call is neither asked nor run, and fails as it did.
+        assert_eq!(recorder.started[1].1, "write_file");
+        assert_ne!(recorder.started[1].2, approval.action);
+        assert!(recorder.approvals.is_empty());
+        assert_eq!(recorder.finished[1].1, ActionStatus::Failed);
+        assert_eq!(
+            *runtime.actions.lock().unwrap(),
+            [Action::ReadFile {
+                path: "a.txt".to_owned(),
+            }]
+        );
+        assert_eq!(
+            tool_messages(&model.requests.lock().unwrap()[0]),
+            [
+                ("call-1".to_owned(), "42".to_owned()),
+                ("call-2".to_owned(), refusal),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_call_never_takes_the_approved_action() {
+        // A refused call cannot have been approved; a resume that says so
+        // still runs nothing and leaves the approved identifier unused.
+        let approved_action = Id::new();
+        let refusal = "the content is larger than 65536 bytes";
+        let calls = vec![RecordedCall {
+            refused: Some(refusal.to_owned()),
+            ..recorded(
+                "call-1",
+                "write_file",
+                json!({"truncated": true, "bytes": 200_000}),
+            )
+        }];
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100).with_resume(resume(
+                    calls,
+                    0,
+                    approved_action,
+                )),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert_eq!(recorder.started.len(), 1);
+        assert_eq!(recorder.started[0].1, "write_file");
+        assert_ne!(recorder.started[0].2, approved_action);
+        assert!(recorder.approvals.is_empty());
+        assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
+        assert!(runtime.actions.lock().unwrap().is_empty());
+        assert_eq!(
+            tool_messages(&model.requests.lock().unwrap()[0]),
+            [("call-1".to_owned(), refusal.to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_repeats_a_call_identifier_fails_the_run() {
+        // Two calls under one identifier, and a Model identifier that equals
+        // the one the loop gives a call the Model left without one.
+        for (ids, repeated) in [
+            (["call-1", "call-1"], "call-1"),
+            (["call-1-1", ""], "call-1-1"),
+        ] {
+            let model = FakeModel::with(vec![calls_reply(vec![
+                call(ids[0], "read_file", json!({"path": "a.txt"})),
+                call(ids[1], "read_file", json!({"path": "b.txt"})),
+            ])]);
+            let runtime = FakeRuntime::default();
+            let files = FakeFiles::default();
+            let mut recorder = TestRecorder::default();
+
+            let error = run(
+                &runtime,
+                &model,
+                &mut recorder,
+                &files,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await;
+
+            assert!(
+                matches!(&error, Err(LoopError::RepeatedCall(id)) if id == repeated),
+                "{ids:?}: {error:?}"
+            );
+            assert!(recorder.order.is_empty(), "nothing is recorded");
+            assert!(runtime.actions.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_resumed_step_with_repeated_identifiers_fails_the_run() {
+        let calls = vec![
+            recorded("call-1", "read_file", json!({"path": "a.txt"})),
+            recorded("call-1", "read_file", json!({"path": "b.txt"})),
+        ];
+        let model = FakeModel::with(Vec::new());
+        let runtime = FakeRuntime::default();
+        let files = FakeFiles::default();
+        let mut recorder = TestRecorder::default();
+
+        let error = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            &files,
+            RunRequest::new("system", Vec::new(), 100).with_resume(resume(calls, 0, Id::new())),
+        )
+        .await;
+
+        assert!(matches!(&error, Err(LoopError::RepeatedCall(id)) if id == "call-1"));
+        assert!(recorder.order.is_empty());
+        assert!(runtime.actions.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -1414,7 +1721,10 @@ mod tests {
         assert!(runtime.actions.lock().unwrap().is_empty());
         assert_eq!(recorder.started[0].1, TAKE_FILE);
         assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
-        assert!(recorder.approvals.is_empty(), "a File move never asks");
+        assert_eq!(
+            recorder.approvals,
+            [(1, TAKE_FILE.to_owned(), recorder.started[0].2)]
+        );
         assert_eq!(
             tool_texts(&model),
             ["took report.txt (5 bytes) as report.txt"]
@@ -1507,7 +1817,10 @@ mod tests {
             );
             assert!(runtime.actions.lock().unwrap().is_empty());
             assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
-            assert!(recorder.approvals.is_empty(), "a File move never asks");
+            assert_eq!(
+                recorder.approvals,
+                [(1, PUT_FILE.to_owned(), recorder.started[0].2)]
+            );
             assert_eq!(
                 tool_texts(&model),
                 [format!("delivered {name} as file {}", files.delivered)]
@@ -1546,15 +1859,18 @@ mod tests {
         );
 
         assert_eq!(text, "done");
+        // Every call that can run asks before it starts, File moves included.
         assert_eq!(
             recorder.order,
             [
                 "reply",
+                "approve",
                 "action_started",
                 "action_finished",
                 "approve",
                 "action_started",
                 "action_finished",
+                "approve",
                 "action_started",
                 "action_finished",
                 "step",
@@ -1577,15 +1893,28 @@ mod tests {
                 .collect::<Vec<_>>(),
             [ActionStatus::Succeeded; 3]
         );
-        // Only write_file is a Computer action: it alone is approved and run.
         assert_eq!(
             recorder
                 .approvals
                 .iter()
                 .map(|(_, tool, _)| tool.as_str())
                 .collect::<Vec<_>>(),
-            ["write_file"]
+            [TAKE_FILE, "write_file", PUT_FILE]
         );
+        // Each action keeps the identifier it was asked under.
+        assert_eq!(
+            recorder
+                .approvals
+                .iter()
+                .map(|(_, _, action)| *action)
+                .collect::<Vec<_>>(),
+            recorder
+                .started
+                .iter()
+                .map(|(_, _, action)| *action)
+                .collect::<Vec<_>>()
+        );
+        // Only write_file runs on the Computer.
         assert_eq!(
             *runtime.actions.lock().unwrap(),
             [Action::WriteFile {
@@ -1797,6 +2126,11 @@ mod tests {
         assert!(
             recorder.approvals.is_empty(),
             "a call that runs nothing asks nobody"
+        );
+        assert_eq!(
+            recorder.replies[0].2[0].refused.as_deref(),
+            Some("there is no tool named no_such_tool"),
+            "the record says why the call was refused"
         );
         let requests = model.requests.lock().unwrap();
         let tool_message = requests[1]
