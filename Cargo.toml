@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["crates/neha", "crates/neha-app", "crates/neha-space"]
+members = [
+    "crates/neha",
+    "crates/neha-app",
+    "crates/neha-computer",
+    "crates/neha-loop",
+    "crates/neha-space",
+]
 
 [workspace.package]
 version = "0.1.0"
