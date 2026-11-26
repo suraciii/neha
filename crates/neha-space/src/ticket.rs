@@ -5,6 +5,10 @@
 //! credential. The ticket is short-lived, works once, and binds one start of
 //! the Space: the configuration directory is hidden from Bots, the file is
 //! written `0600`, and only the ticket's digest is stored.
+//!
+//! Several Spaces on one machine share a configuration directory, so every
+//! start writes under `spaces/<home-key>` named by its Space's home. A start
+//! only ever clears and writes its own Space's file.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
@@ -15,13 +19,17 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
 use rand::RngCore as _;
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 
 use crate::home::Home;
 use crate::identity::{Identity, IdentityError};
 
-/// The file name of the local ticket inside the configuration directory.
+/// The file name of the local ticket inside a Space's configuration folder.
 pub const TICKET_FILE: &str = "local-computer.ticket";
+
+/// The directory under the configuration directory that holds per-Space folders.
+pub const SPACES_DIR: &str = "spaces";
 
 /// How long an issued ticket stays valid.
 pub const TICKET_TTL: Duration = Duration::from_secs(600);
@@ -31,6 +39,9 @@ pub const MAX_PAIR_ATTEMPTS: usize = 10;
 
 /// The most addresses the pairing limit remembers at once.
 pub const MAX_PAIR_PEERS: usize = 1024;
+
+/// The characters of the Space's home digest that name its configuration folder.
+const HOME_KEY_HEX: usize = 16;
 
 /// The window the pairing limit counts.
 const PAIR_WINDOW: Duration = Duration::from_secs(60);
@@ -61,14 +72,19 @@ pub struct StartTicket {
     pub hash: [u8; 32],
 }
 
-/// Returns the file that carries this start's local ticket.
+/// Returns the file that carries this start's local ticket, if there is one.
 ///
-/// The configuration directory is used because the daemon hides it from Bots:
-/// a Local Bot's shell and file tools cannot read the plaintext ticket. The
-/// Space's own `state` directory is only a fallback for a start with neither
-/// `XDG_CONFIG_HOME` nor `HOME`.
+/// The file lives in the User's standard configuration directory, which the
+/// daemon hides from Bots: a Local Bot's shell and file tools cannot read the
+/// plaintext ticket. Both the Space and the CLI use these two places. When
+/// neither `XDG_CONFIG_HOME` nor `HOME` names a directory there is nowhere to
+/// write the file, and a pairing takes a ticket from the signed-in CLI's HTTP
+/// request instead.
+///
+/// The path is per Space: `spaces/<home-key>/local-computer.ticket`, so two
+/// Spaces sharing a configuration directory never clobber each other.
 #[must_use]
-pub fn path(home: &Home) -> PathBuf {
+pub fn path(home: &Home) -> Option<PathBuf> {
     path_from(
         home,
         config_directory(
@@ -79,22 +95,35 @@ pub fn path(home: &Home) -> PathBuf {
 }
 
 /// Returns the ticket path for a known configuration directory.
-fn path_from(home: &Home, config: Option<PathBuf>) -> PathBuf {
-    if let Some(directory) = home.ticket_directory() {
-        return directory.join(TICKET_FILE);
-    }
+fn path_from(home: &Home, config: Option<PathBuf>) -> Option<PathBuf> {
+    let directory = home.ticket_directory().map(Path::to_path_buf).or(config)?;
 
-    config.map_or_else(
-        || home.root().join("state").join(TICKET_FILE),
-        |directory| directory.join(TICKET_FILE),
+    Some(
+        directory
+            .join(SPACES_DIR)
+            .join(space_key(home))
+            .join(TICKET_FILE),
     )
+}
+
+/// Returns the stable name of this Space's folder inside the configuration
+/// directory: the first `HOME_KEY_HEX` hex characters of its home's digest.
+///
+/// The home is canonicalized when it opens, so the same directory always gets
+/// the same key, and two Spaces never share a folder.
+#[must_use]
+pub fn space_key(home: &Home) -> String {
+    let digest = Sha256::digest(home.root().as_os_str().as_encoded_bytes());
+    let hex = format!("{digest:x}");
+
+    hex[..HOME_KEY_HEX].to_owned()
 }
 
 /// Returns the configuration directory from the variables that may name it.
 ///
 /// A relative `XDG_CONFIG_HOME` is ignored, as the XDG base directory
-/// specification requires; without either variable there is no directory and
-/// the ticket falls back to the Space's home.
+/// specification requires. Without either variable there is no directory: the
+/// ticket is never written outside the standard configuration directory.
 fn config_directory(
     xdg_config_home: Option<PathBuf>,
     user_home: Option<PathBuf>,
@@ -270,8 +299,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        MAX_PAIR_ATTEMPTS, MAX_PAIR_PEERS, PairLimiter, TICKET_FILE, config_directory, path,
-        path_from,
+        MAX_PAIR_ATTEMPTS, MAX_PAIR_PEERS, PairLimiter, SPACES_DIR, TICKET_FILE, config_directory,
+        path, path_from, space_key,
     };
     use crate::home::Home;
 
@@ -322,24 +351,37 @@ mod tests {
     }
 
     #[test]
-    fn the_ticket_prefers_the_configuration_directory() {
+    fn the_ticket_lives_in_this_spaces_configuration_folder() {
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
 
         let config = PathBuf::from("/home/ada/.config/neha");
-        assert_eq!(
-            path_from(&home, Some(config.clone())),
-            config.join(TICKET_FILE)
-        );
+        let expected = config
+            .join(SPACES_DIR)
+            .join(space_key(&home))
+            .join(TICKET_FILE);
+        assert_eq!(path_from(&home, Some(config.clone())), Some(expected));
         assert_eq!(
             path_from(&home, None),
-            home.root().join("state").join(TICKET_FILE),
-            "without a configuration directory the Space's own state holds it"
-        );
-        assert_eq!(
-            home.ticket_directory(),
             None,
-            "a plain home has no named ticket directory"
+            "without a configuration directory there is no ticket file"
+        );
+        assert_eq!(home.ticket_directory(), None);
+    }
+
+    #[test]
+    fn different_spaces_get_different_folders() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        let first = Home::open(&first_root).unwrap();
+        let second = Home::open(&second_root).unwrap();
+
+        assert_ne!(space_key(&first), space_key(&second));
+        let config = Some(directory.path().join("config"));
+        assert_ne!(
+            path_from(&first, config.clone()),
+            path_from(&second, config)
         );
     }
 
@@ -362,7 +404,24 @@ mod tests {
         assert_eq!(
             config_directory(None, None),
             None,
-            "without HOME or XDG the Space's state directory is the fallback"
+            "without HOME or XDG there is no configuration directory"
+        );
+    }
+
+    #[test]
+    fn a_named_ticket_directory_wins_over_the_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config");
+        let home = Home::open_with_ticket_directory(directory.path(), &config).unwrap();
+        assert_eq!(
+            path(&home),
+            Some(
+                config
+                    .join(SPACES_DIR)
+                    .join(space_key(&home))
+                    .join(TICKET_FILE)
+            ),
+            "a test names its own configuration directory"
         );
     }
 
@@ -372,11 +431,14 @@ mod tests {
     /// forbids unsafe code, and parallel tests share it), so the fallback and
     /// the variable precedence are checked where the environment is clean.
     #[test]
-    fn the_ticket_path_follows_the_environment_and_falls_back() {
+    fn the_ticket_path_follows_the_environment_and_has_no_fallback() {
         if std::env::var_os("NEHA_TEST_TICKET_CASE").is_some() {
             let root = std::env::var_os("NEHA_TEST_TICKET_HOME").expect("a test home");
             let home = Home::open(root).unwrap();
-            println!("TICKET_PATH={}", path(&home).display());
+            match path(&home) {
+                Some(path) => println!("TICKET_PATH={}", path.display()),
+                None => println!("TICKET_PATH=none"),
+            }
 
             return;
         }
@@ -392,7 +454,7 @@ mod tests {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .arg("--exact")
-                .arg("ticket::tests::the_ticket_path_follows_the_environment_and_falls_back")
+                .arg("ticket::tests::the_ticket_path_follows_the_environment_and_has_no_fallback")
                 .arg("--nocapture")
                 .env_clear()
                 .env("NEHA_TEST_TICKET_CASE", case)
@@ -413,33 +475,25 @@ mod tests {
                 .to_owned()
         };
 
-        assert!(
-            child("fallback", &[]).ends_with("/state/local-computer.ticket"),
-            "without HOME or XDG the Space's state directory holds the ticket"
-        );
-        assert!(
-            child("xdg", &[("XDG_CONFIG_HOME", &xdg), ("HOME", &user_home)])
-                .ends_with(&format!("{}/neha/local-computer.ticket", xdg.display())),
-            "XDG_CONFIG_HOME holds the ticket first"
-        );
-        assert!(
-            child("home", &[("HOME", &user_home)]).ends_with(&format!(
-                "{}/.config/neha/local-computer.ticket",
-                user_home.display()
-            )),
-            "HOME's .config holds the ticket without XDG_CONFIG_HOME"
-        );
-    }
-
-    #[test]
-    fn a_named_ticket_directory_wins_over_the_environment() {
-        let directory = tempfile::tempdir().unwrap();
-        let config = directory.path().join("config");
-        let home = Home::open_with_ticket_directory(directory.path(), &config).unwrap();
         assert_eq!(
-            path(&home),
-            config.join(TICKET_FILE),
-            "a test names its own configuration directory"
+            child("fallback", &[]),
+            "none",
+            "without HOME or XDG no ticket file is written"
+        );
+        let xdg_path = child("xdg", &[("XDG_CONFIG_HOME", &xdg), ("HOME", &user_home)]);
+        assert!(
+            xdg_path.starts_with(&format!("{}/neha/{}", xdg.display(), SPACES_DIR))
+                && xdg_path.ends_with(TICKET_FILE),
+            "XDG_CONFIG_HOME holds the per-Space folder: {xdg_path}"
+        );
+        let home_path = child("home", &[("HOME", &user_home)]);
+        assert!(
+            home_path.starts_with(&format!(
+                "{}/.config/neha/{}",
+                user_home.display(),
+                SPACES_DIR
+            )) && home_path.ends_with(TICKET_FILE),
+            "HOME's .config holds the per-Space folder: {home_path}"
         );
     }
 }

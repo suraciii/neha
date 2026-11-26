@@ -141,38 +141,66 @@ pub async fn pair(
     // see the pairing target before any request leaves this machine, and a
     // ticket or session that names a different Space is refused without one.
     let credential = Credential::load().ok();
-    let ticket_file = ticket_file.or_else(find_ticket_file);
-    let ticket = match &ticket_file {
-        Some(path) => Some(read_ticket(path)?),
-        None => None,
-    };
-    let saved_url = credential.as_ref().map(saved_session_url);
-    let (space_url, ticket, needs_ticket) = match ticket {
-        Some(ticket) => {
-            if let (Some(ticket_url), Some(explicit)) = (ticket.url.as_deref(), space.as_deref()) {
-                check_ticket_space(ticket_url, explicit)?;
-            }
-            let space_url = target_url(
-                space.as_deref(),
-                ticket.url.as_deref(),
-                saved_url.as_deref(),
-            )?;
-            (space_url, ticket.ticket, false)
+    let (ticket, used_ticket_file) = match ticket_file {
+        Some(path) => {
+            let ticket = read_ticket(&path)?;
+            (ticket, Some(path))
         }
         None => {
-            let saved = saved_url.as_deref().context(
+            let standard_config = standard_config_from_env();
+            let found = standard_config
+                .as_deref()
+                .map(found_tickets)
+                .unwrap_or_default();
+            // With several tickets waiting and no --space, the saved session
+            // names the Space to match. With one ticket no match is needed.
+            let target = match space.as_deref() {
+                Some(space) => Some(normalized_space_url(space)?),
+                None if found.len() <= 1 => None,
+                None => Some(saved_session_url(credential.as_ref())?.context(
+                    "several Space tickets are waiting; pass --space or --ticket-file to choose one",
+                )?),
+            };
+            match choose_ticket(found, target.as_deref())? {
+                Some(found) => (found.ticket, Some(found.file)),
+                None => (
+                    Ticket {
+                        ticket: String::new(),
+                        url: None,
+                    },
+                    None,
+                ),
+            }
+        }
+    };
+    let (space_url, ticket, needs_ticket) = if used_ticket_file.is_some() {
+        if let (Some(ticket_url), Some(explicit)) = (ticket.url.as_deref(), space.as_deref()) {
+            check_ticket_space(ticket_url, explicit)?;
+        }
+        let space_url = match (space.as_deref(), ticket.url.as_deref()) {
+            (Some(space), _) => normalized_space_url(space)?,
+            (None, Some(ticket_url)) => normalized_space_url(ticket_url)?,
+            (None, None) => saved_session_url(credential.as_ref())?
+                .context("pass --space, or pair with a ticket that names its Space")?,
+        };
+        (space_url, ticket.ticket, false)
+    } else {
+        let saved = saved_session_url(credential.as_ref())?;
+        let space_url = match space.as_deref() {
+            Some(space) => normalized_space_url(space)?,
+            None => saved.clone().context(
                 "there is no local pairing ticket; run `neha serve` on this machine, or sign \
                  in with `neha login`",
-            )?;
-            let space_url = match space.as_deref() {
-                Some(space) => normalized_space_url(space)?,
-                None => saved.to_owned(),
-            };
-            // The fallback asks the Space this session belongs to for a
-            // ticket; sending the session's token anywhere else is refused.
-            check_saved_origin(&space_url, saved)?;
-            (space_url, String::new(), true)
-        }
+            )?,
+        };
+        let saved = saved.context(
+            "there is no local pairing ticket; run `neha serve` on this machine, or sign in \
+             with `neha login`",
+        )?;
+        // The fallback asks the Space this session belongs to for a ticket;
+        // sending the session's token anywhere else is refused.
+        check_saved_origin(&space_url, &saved)?;
+        (space_url, String::new(), true)
     };
 
     if !confirm_pairing(&space_url, yes)? {
@@ -219,7 +247,7 @@ pub async fn pair(
     // A used ticket is dead; remove the file so a rerun cannot try it again.
     // The Space removes it too when it claims the ticket, so a missing file is
     // success rather than a warning.
-    if let Some(path) = &ticket_file {
+    if let Some(path) = &used_ticket_file {
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -264,6 +292,7 @@ async fn serve(config: Config) -> Result<()> {
     // The configuration directory holds this Computer's channel credential.
     // Every Bot runtime hides it from the file tools and the sandbox.
     let hidden = hidden_roots()?;
+    let denied = denied_paths();
     // A machine that cannot fence a command never serves as a Computer. This
     // only probes bubblewrap: Bot folders are opened lazily, each through the
     // workspace root's descriptor.
@@ -272,7 +301,7 @@ async fn serve(config: Config) -> Result<()> {
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => return Ok(()),
-            served = connect_and_serve(&config, &hidden, Arc::clone(&runtimes)) => {
+            served = connect_and_serve(&config, &hidden, &denied, Arc::clone(&runtimes)) => {
                 if let Err(error) = served {
                     eprintln!("{error:#}");
                 }
@@ -293,7 +322,12 @@ fn fence() -> Result<()> {
 }
 
 /// Holds the channel to the Space until it closes, then returns the failure.
-async fn connect_and_serve(config: &Config, hidden: &[PathBuf], runtimes: Runtimes) -> Result<()> {
+async fn connect_and_serve(
+    config: &Config,
+    hidden: &[PathBuf],
+    denied: &[PathBuf],
+    runtimes: Runtimes,
+) -> Result<()> {
     let mut request = socket_url(&config.space_url)?
         .into_client_request()
         .context("the Space URL is not usable")?;
@@ -325,7 +359,7 @@ async fn connect_and_serve(config: &Config, hidden: &[PathBuf], runtimes: Runtim
     .await?;
     println!("Connected to {}.", config.space_url);
 
-    serve_channel(config, hidden, socket, runtimes).await
+    serve_channel(config, hidden, denied, socket, runtimes).await
 }
 
 /// Serves one open channel: reads frames, runs them one at a time, and kills
@@ -339,6 +373,7 @@ async fn connect_and_serve(config: &Config, hidden: &[PathBuf], runtimes: Runtim
 async fn serve_channel(
     config: &Config,
     hidden: &[PathBuf],
+    denied: &[PathBuf],
     socket: Socket,
     runtimes: Runtimes,
 ) -> Result<()> {
@@ -460,6 +495,7 @@ async fn serve_channel(
     let mut worker = tokio::spawn({
         let config = config.clone();
         let hidden = hidden.to_vec();
+        let denied = denied.to_vec();
         let runtimes = Arc::clone(&runtimes);
         let current = Arc::clone(&current);
         let answers = answers.clone();
@@ -480,7 +516,7 @@ async fn serve_channel(
                         let answer = tokio::select! {
                             biased;
                             _ = stopped.changed() => None,
-                            answer = execute_frame(&config, &hidden, &runtimes, &current, frame) => {
+                            answer = execute_frame(&config, &hidden, &denied, &runtimes, &current, frame) => {
                                 Some(answer)
                             }
                         };
@@ -569,6 +605,7 @@ fn release_bytes(counted: &AtomicUsize, size: usize) {
 async fn execute_frame(
     config: &Config,
     hidden: &[PathBuf],
+    denied: &[PathBuf],
     runtimes: &Runtimes,
     current: &Mutex<Option<Arc<LocalRuntime>>>,
     frame: HostFrame,
@@ -576,7 +613,7 @@ async fn execute_frame(
     match frame {
         HostFrame::Ping => DeviceFrame::Pong,
         HostFrame::Action { id, bot, action } => {
-            let runtime = match machine(config, hidden, runtimes, &bot) {
+            let runtime = match machine(config, hidden, denied, runtimes, &bot) {
                 Ok(runtime) => runtime,
                 Err(message) => return DeviceFrame::Failed { id, message },
             };
@@ -591,25 +628,27 @@ async fn execute_frame(
                 output: result.output,
             }
         }
-        HostFrame::Read { id, bot, path } => match machine(config, hidden, runtimes, &bot) {
-            Ok(runtime) => match runtime.read_bytes(&path).await {
-                Ok(bytes) => DeviceFrame::Bytes {
-                    id,
-                    bytes: encode_bytes(&bytes),
+        HostFrame::Read { id, bot, path } => {
+            match machine(config, hidden, denied, runtimes, &bot) {
+                Ok(runtime) => match runtime.read_bytes(&path).await {
+                    Ok(bytes) => DeviceFrame::Bytes {
+                        id,
+                        bytes: encode_bytes(&bytes),
+                    },
+                    Err(error) => DeviceFrame::Failed {
+                        id,
+                        message: error.to_string(),
+                    },
                 },
-                Err(error) => DeviceFrame::Failed {
-                    id,
-                    message: error.to_string(),
-                },
-            },
-            Err(message) => DeviceFrame::Failed { id, message },
-        },
+                Err(message) => DeviceFrame::Failed { id, message },
+            }
+        }
         HostFrame::Write {
             id,
             bot,
             path,
             bytes,
-        } => match machine(config, hidden, runtimes, &bot) {
+        } => match machine(config, hidden, denied, runtimes, &bot) {
             Ok(runtime) => match decode_bytes(&bytes) {
                 Ok(bytes) => {
                     let length = bytes.len();
@@ -632,6 +671,7 @@ async fn execute_frame(
 fn machine(
     config: &Config,
     hidden: &[PathBuf],
+    denied: &[PathBuf],
     runtimes: &Runtimes,
     bot: &str,
 ) -> Result<Arc<LocalRuntime>, String> {
@@ -651,7 +691,8 @@ fn machine(
                 .map_err(|error| error.to_string())?;
             let runtime = Arc::new(
                 LocalRuntime::machine_at(&root, bot, hidden.to_vec())
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|error| error.to_string())?
+                    .with_denied(denied.to_vec()),
             );
             Ok(Arc::clone(entry.insert(runtime)))
         }
@@ -745,6 +786,7 @@ fn normalized_space_url(url: &str) -> Result<String> {
 const TICKET_NAME: &str = "local-computer.ticket";
 
 /// The ticket a Space wrote for this machine's first pairing.
+#[derive(Debug)]
 struct Ticket {
     /// The one-use pairing secret.
     ticket: String,
@@ -829,31 +871,81 @@ fn refuse_older_pairing_from(user_home: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-/// Returns the ticket file to read, in the pinned order.
-///
-/// An explicit `--ticket-file` wins. The Space writes its ticket where the CLI
-/// keeps its own state first, and under its home second; the first file that
-/// exists is used.
-fn find_ticket_file() -> Option<PathBuf> {
-    let directory = config_directory().ok()?;
-    let neha_home = std::env::var_os("NEHA_HOME").map(PathBuf::from);
-
-    first_existing(ticket_candidates_from(&directory, neha_home))
+/// A Space ticket found on disk, with the file it came from.
+#[derive(Debug)]
+struct FoundTicket {
+    /// The file the ticket was read from.
+    file: PathBuf,
+    /// The ticket itself.
+    ticket: Ticket,
 }
 
-/// Returns the ticket files to try, in the pinned order.
-fn ticket_candidates_from(config_directory: &Path, neha_home: Option<PathBuf>) -> Vec<PathBuf> {
-    let mut candidates = vec![config_directory.join(TICKET_NAME)];
-    if let Some(home) = neha_home {
-        candidates.push(home.join("state").join(TICKET_NAME));
+/// Returns the standard per-user configuration directory from the environment.
+fn standard_config_from_env() -> Option<PathBuf> {
+    standard_config_directory(
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Returns every Space ticket under `<config>/spaces/<home-key>/`.
+///
+/// Each Space writes its own ticket; only a ticket that names its Space can be
+/// matched, so a file without a URL is skipped. Unreadable or corrupt files
+/// are skipped too: another Space's in-progress file must not break pairing.
+fn found_tickets(standard_config: &Path) -> Vec<FoundTicket> {
+    let Ok(entries) = std::fs::read_dir(standard_config.join("spaces")) else {
+        return Vec::new();
+    };
+    let mut tickets = Vec::new();
+    for entry in entries.flatten() {
+        let file = entry.path().join(TICKET_NAME);
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let Ok(ticket) = parse_ticket(&text) else {
+            continue;
+        };
+        if ticket.url.is_none() {
+            continue;
+        }
+        tickets.push(FoundTicket { file, ticket });
+    }
+    tickets.sort_by(|left, right| left.file.cmp(&right.file));
+
+    tickets
+}
+
+/// Chooses the one ticket for `target`, or `None` to ask the Space instead.
+///
+/// With no known target, exactly one waiting ticket is unambiguous. Anything
+/// ambiguous is an error: pairing this machine with the wrong Space because a
+/// directory happened to hold two tickets is not a choice to guess.
+fn choose_ticket(found: Vec<FoundTicket>, target: Option<&str>) -> Result<Option<FoundTicket>> {
+    let Some(target) = target else {
+        return match found.len() {
+            0 => Ok(None),
+            1 => Ok(found.into_iter().next()),
+            _ => bail!(
+                "several Space tickets are waiting; pass --space or --ticket-file to choose one"
+            ),
+        };
+    };
+    let target = normalized_space_url(target)?;
+    let mut matching = found.into_iter().filter(|found| {
+        found
+            .ticket
+            .url
+            .as_deref()
+            .and_then(|url| normalized_space_url(url).ok())
+            .is_some_and(|url| url == target)
+    });
+    let ticket = matching.next();
+    if matching.next().is_some() {
+        bail!("several Space tickets match {target}; pass --ticket-file with the one to use");
     }
 
-    candidates
-}
-
-/// Returns the first candidate that exists.
-fn first_existing(candidates: Vec<PathBuf>) -> Option<PathBuf> {
-    candidates.into_iter().find(|path| path.exists())
+    Ok(ticket)
 }
 
 /// Reads one ticket file.
@@ -896,27 +988,15 @@ fn parse_ticket(text: &str) -> Result<Ticket> {
     })
 }
 
-/// Returns the Space this pairing targets.
+/// Returns the normalized URL of the saved CLI session, when there is one.
 ///
-/// An explicit `--space` wins over the URL a ticket file names, which wins over
-/// the Space a signed-in CLI already knows. A ticket from a Space with no URL
-/// in it is enough only when one of the other two is known.
-fn target_url(
-    space: Option<&str>,
-    ticket: Option<&str>,
-    credential: Option<&str>,
-) -> Result<String> {
-    let url = space.or(ticket).or(credential).context(
-        "pass --space, sign in with `neha login`, or run `neha serve` on this machine to \
-         write a ticket",
-    )?;
-    normalized_space_url(url)
-}
-
-/// The URL the saved CLI session belongs to, normalized for messages.
-fn saved_session_url(credential: &Credential) -> String {
-    normalized_space_url(&credential.url)
-        .unwrap_or_else(|_| credential.url.trim_end_matches('/').to_owned())
+/// A saved URL this milestone cannot pair with is an error, never a fallback:
+/// the HTTP ticket route would otherwise send the session's bearer token to
+/// whatever host the stale or edited file names.
+fn saved_session_url(credential: Option<&Credential>) -> Result<Option<String>> {
+    credential
+        .map(|credential| normalized_space_url(&credential.url))
+        .transpose()
 }
 
 /// Refuses a ticket that names a different Space than `--space` does.
@@ -1019,48 +1099,80 @@ fn default_workspace_from(user_home: Option<PathBuf>) -> Result<PathBuf> {
 /// credential in `computer.json`, so neither a Bot's file tools nor its sandbox
 /// may reach it.
 fn hidden_roots() -> Result<Vec<PathBuf>> {
-    Ok(hidden_roots_from(
+    hidden_roots_from(
         config_directory()?,
-        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        std::env::var_os("HOME").map(PathBuf::from),
+        standard_config_from_env(),
         std::env::var_os("NEHA_CREDENTIAL").map(PathBuf::from),
-        std::env::var_os("NEHA_HOME")
-            .map(|home| PathBuf::from(home).join("state").join(TICKET_NAME)),
-    ))
+    )
 }
 
-/// Returns the paths a Bot must not reach, resolved and de-duplicated.
+/// Returns the directories a Bot must not reach, resolved and de-duplicated.
 ///
-/// The daemon's configuration directory holds the channel credential, and the
-/// CLI keeps its session credential in the per-user configuration directory;
-/// `NEHA_CREDENTIAL` may move that file anywhere. A path that does not exist
-/// is dropped: there is nothing there to hide yet.
+/// The daemon's configuration directory holds the channel credential, the
+/// per-user configuration directory holds the CLI's session credential and the
+/// Space tickets, and `NEHA_CREDENTIAL` may move that session file into a
+/// directory of its own. The roots are directories even when the files inside
+/// them do not exist yet: the directories are created here, so a file created
+/// later inside one is still covered by the sandbox's mount and by the file
+/// tools' prefix check.
 fn hidden_roots_from(
     config_directory: PathBuf,
-    xdg_config_home: Option<PathBuf>,
-    user_home: Option<PathBuf>,
+    standard_config: Option<PathBuf>,
     credential: Option<PathBuf>,
-    ticket: Option<PathBuf>,
-) -> Vec<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     let mut candidates = vec![config_directory];
-    if let Some(directory) = standard_config_directory(xdg_config_home, user_home) {
+    if let Some(directory) = standard_config {
         candidates.push(directory);
     }
-    candidates.extend(credential);
-    candidates.extend(ticket);
-
+    if let Some(credential) = credential {
+        let parent = credential
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .with_context(|| {
+                format!(
+                    "NEHA_CREDENTIAL {} has no directory to hide",
+                    credential.display()
+                )
+            })?;
+        candidates.push(parent);
+    }
+    // The roots must exist before the daemon starts; creating a hidden root
+    // later would leave the files already there unprotected.
+    for candidate in &candidates {
+        std::fs::create_dir_all(candidate)
+            .with_context(|| format!("cannot create {}", candidate.display()))?;
+    }
     let mut seen = std::collections::HashSet::new();
     let mut roots = Vec::new();
     for candidate in candidates {
-        let Ok(root) = std::fs::canonicalize(&candidate) else {
-            continue;
-        };
+        let root = std::fs::canonicalize(&candidate)
+            .with_context(|| format!("cannot resolve {}", candidate.display()))?;
         if seen.insert(root.clone()) {
             roots.push(root);
         }
     }
 
-    roots
+    Ok(roots)
+}
+
+/// Returns the files the file tools must refuse even when they appear later.
+///
+/// These are the daemon configuration, the CLI session credential, and the
+/// per-Space ticket directory. The sandbox hides their directories; the file
+/// tools run with the machine user's rights, so they get the paths themselves,
+/// existing or not.
+fn denied_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(path) = config_path() {
+        paths.push(resolved_path(&path));
+    }
+    paths.push(resolved_path(&client::credential_path()));
+    if let Some(directory) = standard_config_from_env() {
+        paths.push(resolved_path(&directory.join("spaces")));
+    }
+
+    paths
 }
 
 /// Refuses a Workspace and the configuration directory that contains each
@@ -1138,12 +1250,14 @@ mod tests {
     };
     use tokio_tungstenite::tungstenite::Message;
 
+    use crate::client::{Credential, SignedIn};
+
     use super::{
         Config, Runtimes, Socket, answer_is_yes, check_saved_origin, check_ticket_space,
-        config_directory_from, confirmation_needed, decode_bytes, default_workspace_from,
-        encode_bytes, execute_frame, first_existing, folder_for, hidden_roots_from,
-        normalized_space_url, parse_ticket, refuse_older_pairing_from, refuse_workspace,
-        same_origin, serve_channel, socket_url, target_url, ticket_candidates_from, write_receipt,
+        choose_ticket, config_directory_from, confirmation_needed, decode_bytes,
+        default_workspace_from, encode_bytes, execute_frame, folder_for, found_tickets,
+        hidden_roots_from, normalized_space_url, parse_ticket, refuse_older_pairing_from,
+        refuse_workspace, same_origin, saved_session_url, serve_channel, socket_url, write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -1332,41 +1446,35 @@ mod tests {
         );
     }
 
+    /// A saved CLI session that names one Space URL.
+    fn session_at(url: &str) -> Credential {
+        Credential {
+            url: url.to_owned(),
+            token: "session-token".to_owned(),
+            account: SignedIn {
+                id: Id::new(),
+                display_name: "Ada".to_owned(),
+                is_admin: false,
+            },
+        }
+    }
+
     #[test]
-    fn a_pairing_prefers_the_space_then_the_ticket_then_the_credential() {
-        let error = target_url(None, None, None).unwrap_err().to_string();
-        assert!(error.contains("--space"), "{error}");
+    fn a_saved_session_url_must_be_a_space_this_machine_can_pair_with() {
+        assert_eq!(saved_session_url(None).unwrap(), None);
         assert_eq!(
-            target_url(None, Some("http://127.0.0.1:7337/"), None).unwrap(),
-            "http://127.0.0.1:7337"
+            saved_session_url(Some(&session_at("http://127.0.0.1:7337/"))).unwrap(),
+            Some("http://127.0.0.1:7337".to_owned())
         );
-        assert_eq!(
-            target_url(None, None, Some("http://127.0.0.1:7337")).unwrap(),
-            "http://127.0.0.1:7337"
-        );
-        assert_eq!(
-            target_url(
-                Some("https://localhost:7337"),
-                Some("http://127.0.0.1:7337"),
-                Some("http://127.0.0.1:7338")
-            )
-            .unwrap(),
-            "https://localhost:7337"
-        );
-        // A ticket URL wins over the saved credential's Space.
-        assert_eq!(
-            target_url(
-                None,
-                Some("http://127.0.0.1:7337"),
-                Some("http://127.0.0.1:7338")
-            )
-            .unwrap(),
-            "http://127.0.0.1:7337"
-        );
-        let error = target_url(Some("space.example"), None, None)
+        // A stale or edited file that names another host is an error, never a
+        // URL to send the session's bearer token to.
+        let error = saved_session_url(Some(&session_at("http://192.0.2.1:7337")))
             .unwrap_err()
             .to_string();
-        assert!(error.contains("URL"), "{error}");
+        assert!(
+            error.contains("127.0.0.1") || error.contains("this machine"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1401,33 +1509,120 @@ mod tests {
         );
     }
 
+    /// Writes one Space's ticket under `<config>/spaces/<space>/`.
+    fn ticket_file(config: &Path, space: &str, url: &str) -> PathBuf {
+        let file = config
+            .join("spaces")
+            .join(space)
+            .join("local-computer.ticket");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &file,
+            format!(r#"{{"ticket":"{space}-ticket","url":"{url}"}}"#),
+        )
+        .unwrap();
+        file
+    }
+
     #[test]
-    fn ticket_files_are_tried_in_the_pinned_order() {
+    fn one_waiting_ticket_is_used_without_asking_which_space() {
         let directory = tempfile::tempdir().unwrap();
-        let configuration = directory.path().join(".config/neha");
-        let neha_home = directory.path().join("space");
-        std::fs::create_dir_all(&configuration).unwrap();
-        std::fs::create_dir_all(neha_home.join("state")).unwrap();
-        let candidates = ticket_candidates_from(&configuration, Some(neha_home.clone()));
-        assert_eq!(
-            candidates,
-            vec![
-                configuration.join("local-computer.ticket"),
-                neha_home.join("state/local-computer.ticket"),
-            ]
+        let config = directory.path().join(".config/neha");
+        std::fs::create_dir_all(&config).unwrap();
+        assert!(found_tickets(&config).is_empty());
+
+        let only = ticket_file(&config, "one", "http://127.0.0.1:7337");
+        let found = found_tickets(&config);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, only);
+        let chosen = choose_ticket(found, None).unwrap().unwrap();
+        assert_eq!(chosen.file, only);
+        assert_eq!(chosen.ticket.ticket, "one-ticket");
+    }
+
+    #[test]
+    fn a_ticket_is_matched_to_the_space_url() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/neha");
+        let first = ticket_file(&config, "a", "http://127.0.0.1:7337");
+        let second = ticket_file(&config, "b", "http://127.0.0.1:7338");
+        let found = found_tickets(&config);
+        assert_eq!(found.len(), 2);
+
+        // The target is normalized before matching, so a trailing slash does
+        // not pick the wrong ticket.
+        let chosen = choose_ticket(found, Some("http://127.0.0.1:7338/"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(chosen.file, second);
+        assert_ne!(chosen.file, first);
+    }
+
+    #[test]
+    fn a_ticket_without_its_space_asks_the_space_instead() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/neha");
+        ticket_file(&config, "a", "http://127.0.0.1:7337");
+        assert!(
+            choose_ticket(found_tickets(&config), Some("http://127.0.0.1:7338"))
+                .unwrap()
+                .is_none(),
+            "a ticket for another Space leaves the saved session to ask the Space"
         );
 
-        // The first existing file wins; the Space home file is the fallback.
-        assert_eq!(first_existing(candidates.clone()), None);
-        std::fs::write(&candidates[1], "ticket-b").unwrap();
-        assert_eq!(
-            first_existing(candidates.clone()),
-            Some(candidates[1].clone())
+        // A corrupt file, or one without a URL, cannot be matched and is
+        // skipped: another Space's in-progress file must not break pairing.
+        let junk = config.join("spaces/junk/local-computer.ticket");
+        std::fs::create_dir_all(junk.parent().unwrap()).unwrap();
+        std::fs::write(&junk, "not a ticket").unwrap();
+        let url_less = config.join("spaces/url-less/local-computer.ticket");
+        std::fs::create_dir_all(url_less.parent().unwrap()).unwrap();
+        std::fs::write(&url_less, r#"{"ticket":"no-url"}"#).unwrap();
+        assert_eq!(found_tickets(&config).len(), 1);
+    }
+
+    #[test]
+    fn a_ticket_outside_a_space_folder_is_not_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/neha");
+        std::fs::create_dir_all(&config).unwrap();
+        // The old flat location is not a Space ticket any more.
+        std::fs::write(
+            config.join("local-computer.ticket"),
+            r#"{"ticket":"flat","url":"http://127.0.0.1:7337"}"#,
+        )
+        .unwrap();
+        assert!(found_tickets(&config).is_empty());
+
+        let in_space = ticket_file(&config, "space", "http://127.0.0.1:7337");
+        let found = found_tickets(&config);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file, in_space);
+    }
+
+    #[test]
+    fn ambiguous_tickets_are_refused_with_a_way_to_choose() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join(".config/neha");
+        ticket_file(&config, "first", "http://127.0.0.1:7337");
+        ticket_file(&config, "second", "http://127.0.0.1:7337");
+        let error = choose_ticket(found_tickets(&config), Some("http://127.0.0.1:7337"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("several Space tickets match") && error.contains("--ticket-file"),
+            "{error}"
         );
-        std::fs::write(&candidates[0], "ticket-a").unwrap();
-        assert_eq!(
-            first_existing(candidates),
-            Some(configuration.join("local-computer.ticket"))
+
+        // Without --space the saved session picks; if there is no session to
+        // pick, the error names both ways to choose.
+        ticket_file(&config, "third", "http://127.0.0.1:7338");
+        let error = choose_ticket(found_tickets(&config), None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("--space") && error.contains("--ticket-file"),
+            "{error}"
         );
     }
 
@@ -1436,43 +1631,42 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let configuration = directory.path().join("computer-home");
         let standard = directory.path().join(".config/neha");
-        let credential = directory.path().join("credential.json");
-        for path in [&configuration, &standard] {
-            std::fs::create_dir_all(path).unwrap();
-        }
-        std::fs::write(&credential, "{}").unwrap();
+        let credential_directory = directory.path().join("elsewhere");
+        let credential = credential_directory.join("credential.json");
 
+        // The roots are directories, created up front: a credential or ticket
+        // file created after the daemon started is still inside a hidden root.
         let roots = hidden_roots_from(
             configuration.clone(),
-            Some(directory.path().join(".config")),
-            None,
+            Some(standard.clone()),
             Some(credential.clone()),
-            None,
-        );
+        )
+        .unwrap();
         let canonical = |path: &Path| std::fs::canonicalize(path).unwrap();
-        assert!(roots.contains(&canonical(&configuration)));
-        assert!(roots.contains(&canonical(&standard)));
-        assert!(roots.contains(&canonical(&credential)));
+        assert_eq!(
+            roots,
+            vec![
+                canonical(&configuration),
+                canonical(&standard),
+                canonical(&credential_directory),
+            ]
+        );
+        assert!(configuration.is_dir() && standard.is_dir() && credential_directory.is_dir());
 
-        // A path that does not exist has nothing to hide and is dropped; the
-        // configuration directory is not duplicated when it is also the
-        // platform configuration directory.
-        let missing = directory.path().join("missing.json");
-        let roots = hidden_roots_from(
+        // NEHA_CREDENTIAL without a directory is an error, not a silently
+        // uncovered file.
+        let error = hidden_roots_from(
             configuration.clone(),
-            Some(directory.path().join(".config")),
-            None,
-            Some(missing),
-            None,
-        );
-        assert_eq!(roots.len(), 2);
-        let roots = hidden_roots_from(
-            standard.clone(),
-            Some(directory.path().join(".config")),
-            None,
-            None,
-            None,
-        );
+            Some(standard.clone()),
+            Some(PathBuf::new()),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("NEHA_CREDENTIAL"), "{error}");
+
+        // The configuration directory is not duplicated when it is also the
+        // standard configuration directory.
+        let roots = hidden_roots_from(standard.clone(), None, None).unwrap();
         assert_eq!(roots, vec![canonical(&standard)]);
     }
 
@@ -1594,7 +1788,7 @@ mod tests {
         let current = Mutex::new(None);
 
         assert_eq!(
-            execute_frame(&config, &[], &runtimes, &current, HostFrame::Ping).await,
+            execute_frame(&config, &[], &[], &runtimes, &current, HostFrame::Ping).await,
             DeviceFrame::Pong
         );
         assert!(runtimes.lock().unwrap().is_empty());
@@ -1609,6 +1803,7 @@ mod tests {
 
         let answer = execute_frame(
             &config,
+            &[],
             &[],
             &runtimes,
             &current,
@@ -1711,7 +1906,7 @@ mod tests {
             .await
             .unwrap();
 
-        let error = serve_channel(&config, &[], socket, runtimes)
+        let error = serve_channel(&config, &[], &[], socket, runtimes)
             .await
             .expect_err("a closed channel ends the session");
         assert!(error.to_string().contains("closed"), "{error}");
@@ -1851,7 +2046,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(10),
-            serve_channel(&config, &[], daemon, runtimes),
+            serve_channel(&config, &[], &[], daemon, runtimes),
         )
         .await
         .expect("a flooding Space must not hang the daemon")
@@ -1911,7 +2106,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(10),
-            serve_channel(&config, &[], daemon, runtimes),
+            serve_channel(&config, &[], &[], daemon, runtimes),
         )
         .await
         .expect("a Space stuffing huge frames must not hang the daemon")
@@ -1956,7 +2151,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(10),
-            serve_channel(&config, &[], daemon, runtimes),
+            serve_channel(&config, &[], &[], daemon, runtimes),
         )
         .await
         .expect("a Space that stops reading must not hang the daemon")
@@ -1980,7 +2175,7 @@ mod tests {
 
         let error = tokio::time::timeout(
             Duration::from_secs(5),
-            serve_channel(&config, &[], daemon, empty_runtimes()),
+            serve_channel(&config, &[], &[], daemon, empty_runtimes()),
         )
         .await
         .expect("a quiet Space must not hang the daemon")

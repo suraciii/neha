@@ -623,9 +623,9 @@ impl MachineEnv {
             .env("NEHA_HOME", &self.space_home)
             .env("HOME", &self.user_home)
             .env("NEHA_COMPUTER_HOME", &self.computer_home)
-            // Keep every default path inside the fixture, not in the runner's
-            // home directory.
-            .env("XDG_CONFIG_HOME", self.computer_home.with_file_name("xdg"));
+            // The Space and this machine are the same machine, so they share
+            // one configuration tree; pairing finds the Space's ticket there.
+            .env("XDG_CONFIG_HOME", self.space_home.join("xdg"));
     }
 }
 
@@ -638,15 +638,33 @@ fn computer_command(machine: &MachineEnv, credential: &Path, arguments: &[&str])
     command.output().expect("neha computer runs")
 }
 
-/// Returns the path a Space writes its one-use pairing ticket to.
+/// Returns every pairing ticket a Space wrote under its configuration tree.
 ///
 /// The fixture gives `neha serve` an `XDG_CONFIG_HOME` under the Space's home,
-/// so the ticket is `$XDG_CONFIG_HOME/neha/local-computer.ticket`.
+/// and the Space writes `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`.
+fn space_tickets(space_home: &Path) -> Vec<PathBuf> {
+    let spaces = space_home.join("xdg").join("neha").join("spaces");
+    let Ok(entries) = std::fs::read_dir(spaces) else {
+        return Vec::new();
+    };
+    let mut tickets: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path().join("local-computer.ticket"))
+        .filter(|path| path.is_file())
+        .collect();
+    tickets.sort();
+    tickets
+}
+
+/// Returns the one pairing ticket waiting for this Space.
 fn ticket_path(space_home: &Path) -> PathBuf {
-    space_home
-        .join("xdg")
-        .join("neha")
-        .join("local-computer.ticket")
+    let tickets = space_tickets(space_home);
+    assert_eq!(
+        tickets.len(),
+        1,
+        "the Space must write exactly one pairing ticket: {tickets:?}"
+    );
+    tickets.into_iter().next().expect("the ticket was counted")
 }
 
 /// A machine-side `neha computer pair` or `neha computer run`, killed on drop.
@@ -724,7 +742,7 @@ impl Drop for ComputerDaemon {
 /// what lets the saved CLI credential keep working.
 fn space_with_admin(directory: &Path, provider: Option<&str>) -> (SpaceProcess, String) {
     let home = directory.join("home");
-    let credential = directory.join("credential.json");
+    let credential = directory.join("session").join("credential.json");
     let (server, url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
     run(&home, &credential, &["join", &invite, "--name", "Ada"]);
@@ -750,22 +768,15 @@ fn space_with_admin(directory: &Path, provider: Option<&str>) -> (SpaceProcess, 
         restarted_url, url,
         "the Space restarts on the address its Computers save"
     );
-    assert!(
-        ticket_path(&home).is_file(),
-        "a Space with an Admin writes the zero-code pairing ticket"
+    let tickets = space_tickets(&home);
+    assert_eq!(
+        tickets.len(),
+        1,
+        "a Space with an Admin writes one zero-code pairing ticket: {tickets:?}"
     );
     server.expect_line("Pair this PC: neha computer pair");
 
     (server, url)
-}
-
-/// Returns the ticket file waiting for the next pairing, when the Space wrote
-/// one that no machine has spent yet.
-fn ticket_for_pairing(space_home: &Path) -> Option<String> {
-    let ticket = ticket_path(space_home);
-    ticket
-        .is_file()
-        .then(|| ticket.to_string_lossy().into_owned())
 }
 
 /// One Local Computer paired into a Space, with its daemon running.
@@ -801,14 +812,10 @@ fn pair_computer_to(
     workspace: Option<&Path>,
 ) -> PairedComputer {
     let machine = MachineEnv::under(home, machine);
-    // The first machine spends the ticket the Space wrote; a later machine has
-    // no ticket file and asks the Space for one through the signed-in CLI.
+    // The CLI scans the configuration tree for the ticket the Space wrote, so
+    // the first machine spends it; a later machine finds none and asks the
+    // Space for one through its signed-in CLI.
     let mut arguments = vec!["computer", "pair", "--yes", "--space", url];
-    let ticket = ticket_for_pairing(home);
-    if let Some(ticket) = &ticket {
-        arguments.push("--ticket-file");
-        arguments.push(ticket);
-    }
     if let Some(workspace) = workspace {
         arguments.push("--workspace");
         arguments.push(workspace.to_str().unwrap());
@@ -882,7 +889,7 @@ impl LocalComputer {
 /// a fence assertion.
 fn local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer {
     let home = directory.path().join("home");
-    let credential = directory.path().join("credential.json");
+    let credential = directory.path().join("session").join("credential.json");
     let (server, url) = space_with_admin(directory.path(), Some(provider));
     let paired = pair_computer(&home, &credential, &url, &directory.path().join("machine"));
     let created = run(&home, &credential, &["bot", "create", "Scout"]);
@@ -924,7 +931,7 @@ fn local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer
 async fn a_bot_works_on_its_computer_with_tools() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential: PathBuf = directory.path().join("credential.json");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
     let (base, script, provider_task) = scripted_provider().await;
     script.call(
         "write_file",
@@ -999,7 +1006,7 @@ async fn a_bot_works_on_its_computer_with_tools() {
 async fn a_user_runs_a_space_and_chats_with_a_bot() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential: PathBuf = directory.path().join("credential.json");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
     let (provider, provider_task) = fake_provider().await;
 
     let (server, url, invite) = serve(&home);
@@ -1086,7 +1093,7 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
 async fn a_file_travels_between_a_user_and_a_bot() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential: PathBuf = directory.path().join("credential.json");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
     let downloads = directory.path().join("downloads");
     std::fs::create_dir(&downloads).unwrap();
     let notes = directory.path().join("notes.txt");
@@ -1247,7 +1254,8 @@ async fn a_file_travels_between_a_user_and_a_bot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_download_needs_a_space_name_only_when_the_destination_is_implicit() {
     let directory = tempfile::tempdir().unwrap();
-    let credential = directory.path().join("credential.json");
+    let credential = directory.path().join("session").join("credential.json");
+    std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
     let (space, space_task) = unnamed_file_server(b"the unnamed bytes").await;
     std::fs::write(
         &credential,
@@ -1304,7 +1312,7 @@ async fn a_download_needs_a_space_name_only_when_the_destination_is_implicit() {
 async fn a_second_message_waits_while_the_first_run_holds_the_bot() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential: PathBuf = directory.path().join("credential.json");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
     let (base, script, provider_task) = scripted_provider().await;
     // The test holds the first two runs open, so each Message sees the place
     // the Space recorded for it instead of racing a timer.
@@ -1375,7 +1383,7 @@ async fn a_second_message_waits_while_the_first_run_holds_the_bot() {
 async fn a_failed_run_reports_its_error_and_fails_the_command() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential: PathBuf = directory.path().join("credential.json");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
     let (base, script, provider_task) = scripted_provider().await;
     script.fail();
 
@@ -1412,7 +1420,7 @@ fn an_invitation_without_a_secret_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let output = cli(
         directory.path(),
-        &directory.path().join("credential.json"),
+        &directory.path().join("session").join("credential.json"),
         &["join", "http://127.0.0.1:1/invite", "--name", "Ada"],
     );
 
@@ -1640,7 +1648,7 @@ async fn a_local_computer_pairs_without_a_code_and_takes_the_default_bot() {
         );
     }
     assert!(
-        !ticket_path(&computer.home).is_file(),
+        space_tickets(&computer.home).is_empty(),
         "pairing spends the Space's one-use ticket"
     );
 
@@ -1726,7 +1734,7 @@ fn a_workspace_inside_a_computers_configuration_directory_is_refused() {
     let inside = machine.computer_home.join("workspace");
     let output = computer_command(
         &machine,
-        &directory.path().join("credential.json"),
+        &directory.path().join("session").join("credential.json"),
         &[
             "computer",
             "pair",
@@ -1772,7 +1780,7 @@ fn a_saved_workspace_inside_the_configuration_directory_is_refused_at_start() {
     .unwrap();
     let output = computer_command(
         &machine,
-        &directory.path().join("credential.json"),
+        &directory.path().join("session").join("credential.json"),
         &["computer", "run"],
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2367,7 +2375,7 @@ async fn a_bot_moves_to_another_local_computer() {
     let (base, script, provider_task) = scripted_provider().await;
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential = directory.path().join("credential.json");
+    let credential = directory.path().join("session").join("credential.json");
     let (server, url) = space_with_admin(directory.path(), Some(&base));
 
     // Two machines pair into the same Space. Each has its own user home,
@@ -2562,7 +2570,7 @@ async fn a_bot_moves_to_another_local_computer() {
 fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential = directory.path().join("credential.json");
+    let credential = directory.path().join("session").join("credential.json");
     let (server, _url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
     run(&home, &credential, &["join", &invite, "--name", "Ada"]);
@@ -2614,7 +2622,7 @@ fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
 fn a_bot_created_with_computer_hosted_works_in_the_space() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
-    let credential = directory.path().join("credential.json");
+    let credential = directory.path().join("session").join("credential.json");
     let (server, _url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
     run(&home, &credential, &["join", &invite, "--name", "Ada"]);
@@ -2695,7 +2703,7 @@ fn an_older_pairing_is_refused_until_the_machine_pairs_again() {
         .to_string(),
     )
     .unwrap();
-    let credential = directory.path().join("credential.json");
+    let credential = directory.path().join("session").join("credential.json");
 
     for arguments in [
         vec!["computer", "run"],
@@ -2720,4 +2728,82 @@ fn an_older_pairing_is_refused_until_the_machine_pairs_again() {
             arguments.join(" ")
         );
     }
+}
+
+#[test]
+fn a_local_pairing_uses_the_space_ticket() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, url) = space_with_admin(directory.path(), None);
+
+    // The first machine names the ticket file the Space wrote, and pairing
+    // spends it.
+    let explicit = MachineEnv::under(&home, &directory.path().join("explicit"));
+    let ticket = ticket_path(&home);
+    let output = computer_command(
+        &explicit,
+        &credential,
+        &[
+            "computer",
+            "pair",
+            "--yes",
+            "--space",
+            &url,
+            "--ticket-file",
+            ticket.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "pairing with an explicit ticket failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Paired Computer "),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!ticket.is_file(), "pairing spends the ticket file");
+    assert!(space_tickets(&home).is_empty(), "no ticket is left waiting");
+
+    // A fresh Space start writes a fresh per-Space ticket, which the CLI finds
+    // on its own: zero-code pairing needs no path at all.
+    let port = space_port(&url);
+    drop(server);
+    let (server, restarted, _) = serve_on(&home, port);
+    assert_eq!(
+        restarted, url,
+        "the Space restarts on the address its Computers save"
+    );
+    let tickets = space_tickets(&home);
+    assert_eq!(
+        tickets.len(),
+        1,
+        "a restart writes one ticket under spaces/<space-key>: {tickets:?}"
+    );
+    let automatic = MachineEnv::under(&home, &directory.path().join("automatic"));
+    let output = computer_command(
+        &automatic,
+        &credential,
+        &["computer", "pair", "--yes", "--space", &url],
+    );
+    assert!(
+        output.status.success(),
+        "pairing by discovery failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("Paired Computer "),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        space_tickets(&home).is_empty(),
+        "the ticket the CLI found is gone after pairing"
+    );
+
+    drop(server);
 }

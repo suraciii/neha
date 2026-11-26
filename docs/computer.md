@@ -9,7 +9,7 @@ This milestone pairs the machine that runs the Space, because the Space listens 
 - A Linux machine with the Neha CLI. [Building and verification](building.md) covers the build; the examples use `target/debug/neha`.
 - `bubblewrap` on that machine. The daemon runs each shell command in a sandbox it starts; the file tools check their own paths.
 - A Space running on the same machine, at an address the Local Computer can reach; in this milestone that is the host that runs the Space.
-- A CLI signed in to the Space. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
+- A CLI signed in to the Space for commands such as `computer list` and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
 
 ## Pair the machine
 
@@ -25,7 +25,7 @@ Run it in another terminal:
 target/debug/neha computer pair
 ```
 
-No pairing code is entered. The command reads the ticket the Space wrote in this machine's configuration directory, or, when there is none, asks the Space for one with the signed-in CLI. It then asks for confirmation:
+No pairing code is entered. The command reads the startup ticket the Space wrote under this machine's Neha configuration directory, or, when there is none, asks the Space for one with the signed-in CLI. It then asks for confirmation:
 
 ```text
 Pair this Computer with the Space at http://127.0.0.1:7337? [y/N]
@@ -45,17 +45,19 @@ target/debug/neha computer run
 
 Keep that terminal open. The Space shows the Computer as online while the daemon runs, and the run prints the Workspace root it serves.
 
-The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes a startup ticket, `local-computer.ticket`, in the machine's configuration directory with mode 0600, where Bots cannot read it; a Space that started without one writes none, and the signed-in CLI asks the Space for a ticket.
+The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, where Bots cannot read it.
 
-Only that fallback needs a signed-in CLI. The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one.
+Each Space's ticket sits at `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`, or `~/.config/neha/spaces/<space-key>/local-computer.ticket` when `XDG_CONFIG_HOME` is not set. `computer pair` scans `spaces/` and pairs the Space whose URL its ticket names; `--ticket-file` names another file. When no ticket file exists, a signed-in CLI asks the Space that saved its session for one, so only that fallback needs a signed-in CLI.
 
-Run `neha computer pair` again if the ticket expired or was used, and restart the Space first if it wrote the old one. Pass `--yes` to skip the confirmation, `--space <url>` to name the Space address, and `--ticket-file <path>` to name another ticket file.
+The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one.
+
+Run `neha computer pair` again if the ticket expired or was used, and restart the Space first if it wrote the old one. Pass `--yes` to skip the confirmation, `--space <url>` to name the Space address, and `--ticket-file <path>` to name another ticket file. `--space` accepts only a loopback address in this milestone, and the fallback calls only the Space that saved the CLI session.
 
 The machine keeps its configuration in `~/.config/neha/computer.json` with mode 0600. `$XDG_CONFIG_HOME/neha` replaces that directory when `XDG_CONFIG_HOME` is set, and `NEHA_COMPUTER_HOME` replaces both. The Bots' Workspaces go in `~/.neha/workspaces` by default; pass `--workspace <directory>` to `computer pair` to put them under another root, and a root inside the configuration directory is refused.
 
-An older Neha kept its pairing in `~/.neha/computer.json` and its Workspaces in `~/Neha`. While that file exists, `computer pair` and `computer run` refuse; the old file and the old Workspaces are not read or moved. Remove or rename the old file, then pair again; the old Workspaces stay where they are.
+An older Neha kept its pairing in `~/.neha/computer.json` and its Workspaces in `~/Neha`. While that file exists, `computer pair` and `computer run` refuse; the old file and the old Workspaces are not read or moved. Delete the old file, or move it into storage that the machine's Bots cannot read, then pair again; the old Workspaces stay where they are. Storage outside the machine is the safe place for a copy.
 
-The old file may still hold a valid credential, so keep it private until you delete it.
+The old file may still hold a valid credential. Renaming it in place does not hide it from the machine's Bots, so keep any copy private.
 
 Re-pairing adds a new Computer; the Bots on the old one stay bound to it, and their Workspaces and queued work stay there. Move a Bot to the new Computer with `neha bot move`; [Moving a Bot](#moving-a-bot) covers the details.
 
@@ -149,7 +151,7 @@ The machine ends the command it was running when the channel drops, so no action
 | --- | --- |
 | `pair` asks for a Space URL | Pass `--space <url>`, or sign in from the CLI so it can ask the Space for a ticket. |
 | `pair` stops before printing a Computer | Read the error it prints. A ticket that expired or was used, a workspace directory it cannot create, and a Space it cannot reach are the common causes. |
-| `pair` or `computer run` reports an older pairing | The old `~/.neha/computer.json` blocks both commands while it exists. Remove or rename it, then run `neha computer pair`; the new pairing goes in `~/.config/neha/computer.json`. The old file may still hold a valid credential, so keep it private. |
+| `pair` or `computer run` reports an older pairing | The old `~/.neha/computer.json` blocks both commands while it exists. Delete it, or move it into storage the machine's Bots cannot read, then run `neha computer pair`; the new pairing goes in `~/.config/neha/computer.json`. Any copy may still hold a valid credential, so keep it private. |
 | A `computer list` workspace is empty | A Local Computer's workspace is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none. `neha computer run` prints the real root. |
 | An older record uses `real` or `managed` | An old `real` Computer reads as Local and an old `managed` one as Hosted. No action is needed. |
 | `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.config/neha` by default, and a Workspace inside it is refused. Pair again with `--workspace` outside that directory. |

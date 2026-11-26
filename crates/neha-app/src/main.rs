@@ -163,7 +163,8 @@ enum ComputerCommand {
         /// The Space URL; defaults to the ticket file's or the saved Space's.
         #[arg(long)]
         space: Option<String>,
-        /// The ticket file; defaults to NEHA_HOME/state/local-computer.ticket.
+        /// The ticket file; defaults to a Space ticket under the Neha
+        /// configuration directory.
         #[arg(long)]
         ticket_file: Option<std::path::PathBuf>,
         /// The Workspace root that holds one folder per Bot.
@@ -1028,7 +1029,7 @@ mod tests {
     fn the_pairing_hint_waits_for_a_ticket() {
         assert_eq!(
             pairing_hint(Some(std::path::Path::new(
-                "/home/ada/.neha/state/local-computer.ticket"
+                "/home/ada/.config/neha/local-computer.ticket"
             ))),
             Some("Pair this PC: neha computer pair")
         );
@@ -1051,7 +1052,7 @@ mod tests {
             "--space",
             "http://127.0.0.1:7337",
             "--ticket-file",
-            "/tmp/local-computer.ticket",
+            "/home/ada/.config/neha/local-computer.ticket",
             "--workspace",
             "/home/ada/.neha/workspaces",
             "--yes",
@@ -1070,7 +1071,9 @@ mod tests {
                 assert_eq!(space.as_deref(), Some("http://127.0.0.1:7337"));
                 assert_eq!(
                     ticket_file.as_deref(),
-                    Some(std::path::Path::new("/tmp/local-computer.ticket"))
+                    Some(std::path::Path::new(
+                        "/home/ada/.config/neha/local-computer.ticket"
+                    ))
                 );
                 assert_eq!(
                     workspace.as_deref(),

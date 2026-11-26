@@ -98,7 +98,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn credential_path() -> PathBuf {
+pub(crate) fn credential_path() -> PathBuf {
     if let Some(path) = std::env::var_os("NEHA_CREDENTIAL") {
         return PathBuf::from(path);
     }

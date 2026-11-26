@@ -40,7 +40,7 @@ The CLI signing in shows a code.
 
 A signed-in User enters the code in an app or a browser. The CLI joins the Space on that User's behalf and acts as the User.
 
-A Local Computer on the Space's own machine needs no code. The User who pairs it starts the pairing there and confirms it; the Computer belongs to that User.
+A Local Computer on the Space's own machine needs no code. A User starts the pairing there and confirms it. The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one; [design](design.md#codes) covers the ticket.
 
 A Bot has no account. The Space gives a Bot its own credential when the Bot is created, and the Bot's loop uses it to act as the Bot.
 

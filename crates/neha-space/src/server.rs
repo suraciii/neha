@@ -392,21 +392,23 @@ async fn start_with(
     // A local ticket binds one start of the Space: the previous start's
     // tickets are void before this one issues its own for the Admin.
     ticket::clear(&server.identity).await?;
-    for path in [
-        ticket::path(&server.home),
-        server.home.root().join("state").join(ticket::TICKET_FILE),
-    ] {
-        ticket::remove_file(&path).await?;
+    // The standard configuration directory is the only place the file lives.
+    // A Space clears and writes only its own `spaces/<home-key>` folder, so
+    // starting one Space never removes another Space's waiting ticket. When
+    // neither XDG_CONFIG_HOME nor HOME names a directory no file ticket is
+    // issued; a pairing takes its ticket from the signed-in CLI instead.
+    let ticket_path = ticket::path(&server.home);
+    if let Some(path) = &ticket_path {
+        ticket::remove_file(path).await?;
     }
-    let start_ticket = match server.identity.admin_account().await? {
-        Some(admin) => {
-            let path = ticket::path(&server.home);
+    let start_ticket = match (server.identity.admin_account().await?, ticket_path) {
+        (Some(admin), Some(path)) => {
             let url = format!("http://{addr}");
             let start = ticket::issue_for_start(&server.identity, &path, admin.id, &url).await?;
             *server.start_ticket.lock().expect("start ticket lock") = Some(start.clone());
             Some(start)
         }
-        None => None,
+        (Some(_), None) | (None, _) => None,
     };
     server.runs.wake_all(&server);
     let invite = server
@@ -7077,7 +7079,12 @@ mod tests {
 
     /// Opens a home whose local ticket stays inside this test's directory.
     fn test_home(root: &std::path::Path) -> Home {
-        Home::open_with_ticket_directory(root, root.join("config")).unwrap()
+        test_home_in(root, &root.join("config"))
+    }
+
+    /// Opens a test home that shares `config` with other test Spaces.
+    fn test_home_in(root: &std::path::Path, config: &std::path::Path) -> Home {
+        Home::open_with_ticket_directory(root, config).unwrap()
     }
 
     fn add_bot(name: &str, computer: Option<Id>) -> CommandCall {
@@ -9014,7 +9021,7 @@ mod tests {
         running.shutdown().await;
     }
     fn local_ticket_file(dir: &std::path::Path) -> std::path::PathBuf {
-        dir.join("config").join("local-computer.ticket")
+        crate::ticket::path(&test_home(dir)).expect("a test configuration directory")
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -9277,6 +9284,158 @@ mod tests {
         device.close(None).await.unwrap();
         socket.close(None).await.unwrap();
         restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_clears_only_its_own_spaces_ticket_file() {
+        let config = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+
+        // The first Space joins an Admin, then restarts so its start issues a
+        // ticket file in the shared configuration directory.
+        let space = start(test_home_in(first.path(), config.path()), 0)
+            .await
+            .unwrap();
+        let invite = space.invite.clone().expect("a fresh Space invites");
+        join(&space, &invite, "Ada", "correct horse battery").await;
+        space.shutdown().await;
+        let first_space = start(test_home_in(first.path(), config.path()), 0)
+            .await
+            .unwrap();
+        let first_file = first_space
+            .local_ticket
+            .clone()
+            .expect("the first Space issued a ticket");
+        assert!(first_file.starts_with(config.path()));
+        let first_body: Value =
+            serde_json::from_str(&std::fs::read_to_string(&first_file).unwrap()).unwrap();
+        let first_ticket = first_body["ticket"].as_str().unwrap().to_owned();
+
+        // The second Space uses the same configuration directory: its start
+        // must not clear the first Space's waiting ticket.
+        let second_space = start(test_home_in(second.path(), config.path()), 0)
+            .await
+            .unwrap();
+        assert!(
+            first_file.exists(),
+            "another Space's start leaves the first ticket file alone"
+        );
+        let second_invite = second_space.invite.clone().expect("a fresh Space invites");
+        join(
+            &second_space,
+            &second_invite,
+            "Ada",
+            "correct horse battery",
+        )
+        .await;
+        second_space.shutdown().await;
+        let second_space = start(test_home_in(second.path(), config.path()), 0)
+            .await
+            .unwrap();
+        let second_file = second_space
+            .local_ticket
+            .clone()
+            .expect("the second Space issued a ticket");
+        assert_ne!(first_file, second_file, "each Space has its own folder");
+        assert!(first_file.exists(), "the first Space's ticket still waits");
+        assert!(second_file.exists());
+        let second_body: Value =
+            serde_json::from_str(&std::fs::read_to_string(&second_file).unwrap()).unwrap();
+        let second_ticket = second_body["ticket"].as_str().unwrap().to_owned();
+
+        // The first Space's ticket pairs once, against its own Space.
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", first_space.url()))
+            .json(&json!({"ticket": first_ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), reqwest::StatusCode::OK);
+        assert!(!first_file.exists(), "its own ticket file is removed");
+        assert!(second_file.exists(), "the other Space's file is untouched");
+        let again = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", first_space.url()))
+            .json(&json!({"ticket": first_ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(again.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // The second Space's ticket pairs its own Space.
+        let paired = reqwest::Client::new()
+            .post(format!("{}/api/computer/pair", second_space.url()))
+            .json(&json!({"ticket": second_ticket}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(paired.status(), reqwest::StatusCode::OK);
+        assert!(!second_file.exists());
+
+        first_space.shutdown().await;
+        second_space.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_serve_without_a_configuration_directory_writes_no_ticket_file() {
+        if std::env::var_os("NEHA_TEST_NO_CONFIG_CHILD").is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let running = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+            assert!(
+                running.local_ticket.is_none(),
+                "without a configuration directory no file ticket is written"
+            );
+            assert!(
+                !running
+                    .server_home()
+                    .join("state")
+                    .join(crate::ticket::TICKET_FILE)
+                    .exists(),
+                "the Space's state directory is not a ticket fallback"
+            );
+
+            // The signed-in CLI's HTTP fallback still works.
+            let invite = running.invite.clone().expect("a fresh Space invites");
+            let session = join(&running, &invite, "Ada", "correct horse battery").await;
+            let token = session["token"].as_str().unwrap();
+            let issued = reqwest::Client::new()
+                .post(format!("{}/api/computer/ticket", running.url()))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(issued.status(), reqwest::StatusCode::OK);
+            let issued: Value = issued.json().await.unwrap();
+            let paired = reqwest::Client::new()
+                .post(format!("{}/api/computer/pair", running.url()))
+                .json(&json!({"ticket": issued["ticket"]}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(paired.status(), reqwest::StatusCode::OK);
+            let paired: Value = paired.json().await.unwrap();
+            assert!(paired["computer"].is_string());
+            running.shutdown().await;
+            println!("NO_CONFIG_CHILD_OK");
+
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("server::tests::a_serve_without_a_configuration_directory_writes_no_ticket_file")
+            .arg("--nocapture")
+            .env_clear()
+            .env("NEHA_TEST_NO_CONFIG_CHILD", "1")
+            .output()
+            .expect("the child test process starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child Space failed: {stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("NO_CONFIG_CHILD_OK"), "{stdout}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
