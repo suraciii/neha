@@ -2046,11 +2046,15 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
     };
     for run in interrupted {
         match commands::prepare_recovery(state, &run) {
-            Ok(_) => {
+            Ok(plan) => {
                 let mut state = state
                     .lock()
                     .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
-                state.mark_recovered(run.id);
+                if matches!(plan, commands::RecoveryPlan::Final { .. }) {
+                    state.mark_final_recovered(run.id);
+                } else {
+                    state.mark_recovered(run.id);
+                }
             }
             Err(reason) => {
                 fail_interrupted(store, state, &run, &reason).await?;
@@ -2071,11 +2075,7 @@ async fn fail_interrupted(
     let message = Id::new();
     let text = format!("I could not continue after the interruption: {reason}.");
     let error = format!("the Space stopped before the run finished: {reason}");
-    let usage = run
-        .steps
-        .iter()
-        .filter_map(|step| step.usage)
-        .fold(neha::usage::Usage::default(), |total, usage| total + usage);
+    let usage = commands::known_usage(state, run.id);
     let drafts = vec![
         EventDraft::new(
             EventKind::MessageAdded,

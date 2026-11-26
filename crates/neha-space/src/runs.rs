@@ -376,6 +376,10 @@ fn computer_online(
     links: &crate::computer_link::ComputerLinks,
     run: &RunView,
 ) -> bool {
+    // A recorded final answer needs no machine: it finishes from the record.
+    if state.is_final_recovered(run.id) {
+        return true;
+    }
     let Some(computer) = run.computer else {
         return true;
     };

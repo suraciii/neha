@@ -115,8 +115,13 @@ pub enum RecoveryPlan {
         text: String,
         /// Whether the answer was a final answer.
         succeeded: bool,
-        /// The usage the completed steps reported.
+        /// The usage the completed steps reported, including the final reply.
         usage: neha::usage::Usage,
+        /// The step to record before finishing, when the final reply was
+        /// recorded but its step was not.
+        record_step: Option<u32>,
+        /// The usage the final reply reported.
+        reply_usage: neha::usage::Usage,
     },
     /// The run continues from the first step it did not finish.
     Continue(Box<ContinuePlan>),
@@ -1813,6 +1818,86 @@ pub async fn finish_run(
     .await
 }
 
+/// Finishes a recovered run whose final answer is already in the record.
+///
+/// It needs no Computer and no Provider: the Message and the run's end are
+/// pure record writes, so an offline machine or a missing key cannot lose an
+/// answer the Model already gave.
+#[allow(clippy::too_many_arguments)]
+async fn finish_recovered_final(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    run: &crate::state::RunView,
+    text: String,
+    succeeded: bool,
+    usage: neha::usage::Usage,
+    record_step: Option<u32>,
+    reply_usage: neha::usage::Usage,
+) -> Result<Finished, ApiError> {
+    if let Some(step) = record_step {
+        record_recovered_step(
+            store,
+            state,
+            events,
+            run.bot,
+            run.acting,
+            run.id,
+            step,
+            reply_usage,
+        )
+        .await?;
+    }
+    let message = Id::new();
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::MessageAdded,
+            Author::Bot(run.bot),
+            json!({"message": message, "chat": run.chat, "text": text, "run": run.id}),
+        )
+        .acting(run.acting),
+        EventDraft::new(
+            EventKind::RunFinished,
+            Author::Bot(run.bot),
+            json!({
+                "run": run.id,
+                "status": if succeeded {
+                    crate::state::RunStatus::Succeeded
+                } else {
+                    crate::state::RunStatus::Failed
+                },
+                "reply": message,
+                "usage": usage,
+                "error": if succeeded { serde_json::Value::Null } else {
+                    serde_json::json!("the Model returned an empty reply")
+                },
+            }),
+        )
+        .acting(run.acting),
+    ];
+    let confirmation = serde_json::json!({
+        "run": run.id,
+        "status": if succeeded { "succeeded" } else { "failed" },
+        "reply": message,
+        "text": text,
+        "usage": usage,
+    });
+    let appended = store
+        .append(
+            AppendRequest::new(Id::new(), format!("recover-final:{}", run.id), drafts)
+                .with_confirmation(run.command, confirmation),
+        )
+        .await
+        .map_err(store_error)?;
+    if !appended.existing {
+        apply(state, &appended.events)?;
+    }
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+    Ok(Finished::Completed(Vec::new()))
+}
+
 /// Continues a run whose waited-for action the acting User allowed.
 ///
 /// The reply, the call identifiers, and the completed actions come from the
@@ -1832,22 +1917,6 @@ pub async fn resume_run(
     links: &ComputerLinks,
     run: &crate::state::RunView,
 ) -> Result<Finished, ApiError> {
-    let pending = match resume_pending(state, secrets, run).await {
-        Ok(pending) => pending,
-        Err(error) => {
-            let events = fail_run(
-                store,
-                state,
-                events,
-                run,
-                &format!("I could not continue my run: {error}"),
-                &error.to_string(),
-            )
-            .await?;
-            return Ok(Finished::Completed(events));
-        }
-    };
-
     let (resumable, recovering) = {
         let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
         (state.is_resumable(run), state.is_recovering(run))
@@ -1858,6 +1927,21 @@ pub async fn resume_run(
             Err(error) => {
                 eprintln!("neha: cannot resume run {}: {error}", run.id);
                 let events = fail_resume(store, state, events, run).await?;
+                return Ok(Finished::Completed(events));
+            }
+        };
+        let pending = match resume_pending(state, secrets, run).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let events = fail_run(
+                    store,
+                    state,
+                    events,
+                    run,
+                    &format!("I could not continue my run: {error}"),
+                    &error.to_string(),
+                )
+                .await?;
                 return Ok(Finished::Completed(events));
             }
         };
@@ -1904,16 +1988,19 @@ pub async fn resume_run(
             text,
             succeeded,
             usage,
+            record_step,
+            reply_usage,
         } => {
-            finish_completion(
+            finish_recovered_final(
                 store,
                 state,
-                pending,
-                RunOutcome::Reply {
-                    text,
-                    usage,
-                    succeeded,
-                },
+                events,
+                run,
+                text,
+                succeeded,
+                usage,
+                record_step,
+                reply_usage,
             )
             .await
         }
@@ -1925,6 +2012,21 @@ pub async fn resume_run(
                 base_usage,
                 unknown,
             } = *plan;
+            let pending = match resume_pending(state, secrets, run).await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let events = fail_run(
+                        store,
+                        state,
+                        events,
+                        run,
+                        &format!("I could not continue my run: {error}"),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Ok(Finished::Completed(events));
+                }
+            };
             finish_run_with(
                 store,
                 state,
@@ -2048,7 +2150,22 @@ async fn finish_run_with(
                             text,
                             succeeded,
                             usage,
+                            record_step,
+                            reply_usage,
                         }) => {
+                            if let Some(step) = record_step {
+                                record_recovered_step(
+                                    store,
+                                    state,
+                                    events,
+                                    pending.bot.id,
+                                    pending.acting,
+                                    pending.run,
+                                    step,
+                                    reply_usage,
+                                )
+                                .await?;
+                            }
                             return finish_completion(
                                 store,
                                 state,
@@ -2176,6 +2293,58 @@ async fn finish_run_with(
         },
     };
     finish_completion(store, state, pending, outcome).await
+}
+
+/// Records the step a recovered final reply belongs to, when the Space
+/// stopped between the reply and its step.
+#[allow(clippy::too_many_arguments)]
+async fn record_recovered_step(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    bot: Id,
+    acting: Id,
+    run: Id,
+    step: u32,
+    usage: neha::usage::Usage,
+) -> Result<(), ApiError> {
+    let already = state
+        .lock()
+        .map_err(|_| ApiError::internal("state lock"))?
+        .runs
+        .get(&run)
+        .is_some_and(|view| view.steps.iter().any(|step_view| step_view.index == step));
+    if already {
+        return Ok(());
+    }
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::RunStep,
+            Author::Bot(bot),
+            json!({
+                "run": run,
+                "step": step,
+                "usage": usage,
+                "tool_calls": 0,
+            }),
+        )
+        .acting(acting),
+    ];
+    let appended = store
+        .append(AppendRequest::new(
+            Id::new(),
+            format!("recover-step:{run}:{step}"),
+            drafts,
+        ))
+        .await
+        .map_err(store_error)?;
+    if !appended.existing {
+        apply(state, &appended.events)?;
+    }
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+    Ok(())
 }
 
 /// Verifies one action that started before the Space stopped.
@@ -2456,6 +2625,36 @@ pub(crate) fn prepare_recovery(
         base_usage += reply.usage.unwrap_or_default();
     }
 
+    // A recorded final step is the answer: the Space stopped before recording
+    // the run's end, not before the Model called again.
+    if let Some(last) = run.steps.last()
+        && last.tool_calls == 0
+    {
+        let reply = replies
+            .iter()
+            .find(|reply| reply.step == last.index)
+            .ok_or_else(|| format!("step {} has no recorded reply", last.index))?;
+        if reply.calls.is_empty() && !run.actions.iter().any(|action| action.step == last.index) {
+            let content = reply.content.clone().unwrap_or_default();
+            return Ok(if content.trim().is_empty() {
+                RecoveryPlan::Final {
+                    text: "The Model returned an empty reply.".to_owned(),
+                    succeeded: false,
+                    usage: base_usage,
+                    record_step: None,
+                    reply_usage: neha::usage::Usage::default(),
+                }
+            } else {
+                RecoveryPlan::Final {
+                    text: content,
+                    succeeded: true,
+                    usage: base_usage,
+                    record_step: None,
+                    reply_usage: neha::usage::Usage::default(),
+                }
+            });
+        }
+    }
     let Some(reply) = replies.iter().find(|reply| reply.step == next_step) else {
         if run.actions.iter().any(|action| action.step == next_step) {
             return Err(format!(
@@ -2493,12 +2692,16 @@ pub(crate) fn prepare_recovery(
                 text: "The Model returned an empty reply.".to_owned(),
                 succeeded: false,
                 usage,
+                record_step: Some(next_step),
+                reply_usage: reply.usage.unwrap_or_default(),
             }
         } else {
             RecoveryPlan::Final {
                 text: content,
                 succeeded: true,
                 usage,
+                record_step: Some(next_step),
+                reply_usage: reply.usage.unwrap_or_default(),
             }
         });
     }
@@ -2511,6 +2714,18 @@ pub(crate) fn prepare_recovery(
     if actions.len() > reply.calls.len() {
         return Err(format!("step {next_step} has more actions than calls"));
     }
+    for (call, action) in reply.calls.iter().zip(&actions) {
+        if action.tool != call.tool || action.arguments != call.arguments {
+            return Err(format!(
+                "step {next_step}'s actions do not line up with its calls"
+            ));
+        }
+        if call.refused.is_some() {
+            return Err(format!(
+                "step {next_step}'s recorded call was refused but has an action"
+            ));
+        }
+    }
     if let Some(position) = actions
         .iter()
         .position(|action| action.status == RecordedActionStatus::Unknown)
@@ -2520,6 +2735,15 @@ pub(crate) fn prepare_recovery(
         if position + 1 != actions.len() {
             return Err(format!(
                 "step {next_step} has actions after one that never returned"
+            ));
+        }
+        if actions[position].finished {
+            // The Computer answered and its result was unknown (for example a
+            // lost channel). That is a terminal answer, not something to
+            // verify from the machine now.
+            return Err(format!(
+                "step {next_step}'s {} action returned an unknown result",
+                actions[position].tool
             ));
         }
         if actions[position].tool != neha_loop::tools::WRITE_FILE {
@@ -2544,7 +2768,10 @@ pub(crate) fn prepare_recovery(
         }
     }
     let done = actions.len();
-    append_replay(&mut history, next_step, reply, &actions)?;
+    // The loop inserts the assistant Message itself when it rebuilds a
+    // resumed step; the history ends with the results of the calls already
+    // recorded.
+    append_results(&mut history, next_step, reply, &actions)?;
     let calls: Vec<LoopCall> = reply
         .calls
         .iter()
@@ -2573,7 +2800,7 @@ pub(crate) fn prepare_recovery(
     })))
 }
 
-/// Appends one step's assistant Message and tool results to a replay.
+/// Appends one completed step's assistant Message and tool results to a replay.
 fn append_replay(
     history: &mut Vec<neha_loop::Message>,
     step: u32,
@@ -2595,6 +2822,19 @@ fn append_replay(
             })
             .collect(),
     ));
+    append_results(history, step, reply, actions)
+}
+
+/// Appends the results of a step's already recorded calls, in call order.
+fn append_results(
+    history: &mut Vec<neha_loop::Message>,
+    step: u32,
+    reply: &neha::record::RunReply,
+    actions: &[&crate::state::ActionView],
+) -> Result<(), String> {
+    if actions.len() > reply.calls.len() {
+        return Err(format!("step {step} has more results than calls"));
+    }
     for (index, (call, action)) in reply.calls.iter().zip(actions).enumerate() {
         if action.tool != call.tool || action.arguments != call.arguments {
             return Err(format!("step {step}'s calls do not match its results"));
@@ -2807,7 +3047,7 @@ impl ComputerRuntime for RunRuntime {
     }
 }
 
-fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {
+pub(crate) fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {
     let Ok(state) = state.lock() else {
         return neha::usage::Usage::default();
     };
@@ -4766,7 +5006,11 @@ mod tests {
             panic!("expected a continuation");
         };
         assert_eq!(plan.next_step, 2);
-        assert_eq!(plan.history.len(), 5);
+        assert_eq!(
+            plan.history.len(),
+            4,
+            "the resumed history ends after the recorded results"
+        );
         let resume = plan.resume.expect("the recorded reply resumes the step");
         assert_eq!(resume.step, 2);
         assert_eq!(resume.done, 1);
@@ -4786,6 +5030,7 @@ mod tests {
             step: 1,
             tool: "write_file".to_owned(),
             arguments: json!({"path": "note.txt", "content": "asked"}),
+            finished: false,
             status: neha::record::ActionStatus::Unknown,
             output: String::new(),
             truncated: false,
@@ -4815,6 +5060,49 @@ mod tests {
     }
 
     #[test]
+    fn a_recovery_finishes_from_a_recorded_final_step() {
+        let (state, run) = recovering_state(json!([]), &[], None);
+        let RecoveryPlan::Final {
+            text,
+            succeeded,
+            usage,
+            record_step,
+            ..
+        } = prepare_recovery(&std::sync::Mutex::new(state), &run)
+            .expect("a final step finishes from the record")
+        else {
+            panic!("expected a final answer");
+        };
+        assert_eq!(text, "first");
+        assert!(succeeded);
+        assert_eq!(record_step, None);
+        assert_eq!(usage.budgeted(), 0);
+    }
+
+    #[test]
+    fn a_recovery_records_a_final_reply_whose_step_was_not_recorded() {
+        let action = Id::new();
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(action, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((json!([]), Vec::new())),
+        );
+        let RecoveryPlan::Final {
+            text,
+            record_step,
+            succeeded,
+            ..
+        } = prepare_recovery(&std::sync::Mutex::new(state), &run)
+            .expect("a final reply finishes from the record")
+        else {
+            panic!("expected a final answer");
+        };
+        assert_eq!(text, "second");
+        assert!(succeeded);
+        assert_eq!(record_step, Some(2));
+    }
+
+    #[test]
     fn a_recovery_does_not_rerun_a_write_that_may_have_happened() {
         let (first, unknown) = (Id::new(), Id::new());
         let (state, run) = recovering_state(
@@ -4838,6 +5126,38 @@ mod tests {
         let action = plan.unknown.expect("the write waits to be verified");
         assert_eq!(action.id, unknown);
         assert_eq!(action.tool, "write_file");
+    }
+
+    #[test]
+    fn a_recovery_does_not_turn_a_recorded_unknown_result_into_success() {
+        let (first, unknown) = (Id::new(), Id::new());
+        let (state, mut run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(first, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((
+                json!([{"call": "call-2", "tool": "write_file", "arguments": {"path": "b", "content": "b"}, "refused": null}]),
+                vec![(
+                    unknown,
+                    "write_file",
+                    json!({"path": "b", "content": "b"}),
+                    false,
+                )],
+            )),
+        );
+        // The Computer answered Unknown before the Space stopped: that result
+        // is terminal and must not be re-verified as a success.
+        let action = run
+            .actions
+            .iter_mut()
+            .find(|action| action.id == unknown)
+            .unwrap();
+        action.finished = true;
+        action.status = neha::record::ActionStatus::Unknown;
+        let error = match prepare_recovery(&std::sync::Mutex::new(state), &run) {
+            Err(error) => error,
+            Ok(_) => panic!("a recorded unknown result must not be recovered"),
+        };
+        assert!(error.contains("returned an unknown result"), "{error}");
     }
 
     #[test]
