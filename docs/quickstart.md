@@ -151,13 +151,39 @@ target/debug/neha run show <run-id>
 
 `neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
 
+## Put a Bot on a real Computer
+
+A real Computer is a Neha process that runs outside the Space and connects out to it. It runs a Bot's actions in that Bot's Workspace on the machine. This milestone pairs a machine on the same host as the Space, because the Space listens only on loopback.
+
+Open a second terminal and start the machine:
+
+```bash
+target/debug/neha computer pair --space http://127.0.0.1:7337
+```
+
+It prints a pairing code that lasts up to 10 minutes, then waits. In a third terminal, enter the code from the signed-in CLI and create a Bot on the new Computer. `computer list` also shows managed Computers; use the id on the `real` line:
+
+```bash
+target/debug/neha computer add <code>
+target/debug/neha computer list
+target/debug/neha bot create Runner --computer <computer-id>
+```
+
+Ask the new Bot to work:
+
+```bash
+target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
+```
+
+The Bot works in its own Workspace on the machine, `~/Neha/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a real Computer](computer.md) covers the fence, pairing, and offline behavior.
+
 ## Send a file
 
-A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it:
+A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it. This Space now has two Chats, so name the Bot:
 
 ```bash
 printf 'remember the milk\n' > notes.txt
-target/debug/neha chat send --file notes.txt "Read the attached file and tell me what it says."
+target/debug/neha chat send --file notes.txt --bot <bot-id> "Read the attached file and tell me what it says."
 ```
 
 [Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.

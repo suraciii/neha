@@ -7,6 +7,7 @@
 - Python 3 for the documentation and hygiene checks in `scripts/`.
 - Node 24 and pnpm 11 for the browser client under `ui/`.
 - Docker, for the local S3 test store.
+- `bubblewrap` on Linux, for the sandbox a real Computer runs its shell commands in.
 
 The Rust workspace has no native dependencies. The browser client's dependencies are installed from its committed lockfile.
 
@@ -37,6 +38,18 @@ just ui-check     # type-check, test, and build the browser client
 ## S3 test store
 
 The `neha-space` tests include S3 tests that need a local SeaweedFS container; [Storage](storage.md#run-the-s3-tests-locally) gives the container, the bucket, the variables, and the command.
+
+## A real Computer sandbox
+
+The machine-side process of a real Computer runs shell commands in a `bubblewrap` sandbox on Linux. Its file tools check write paths themselves and never start a command. Install the package with the system's package manager:
+
+```bash
+sudo apt install bubblewrap      # Debian, Ubuntu
+sudo dnf install bubblewrap      # Fedora
+sudo pacman -S bubblewrap        # Arch Linux
+```
+
+The fence tests skip when they cannot start a sandbox. Set `NEHA_TEST_BWRAP=1` to make a missing sandbox fail them; CI sets it after installing the package.
 
 ## Evidence
 

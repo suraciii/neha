@@ -13,6 +13,12 @@ use thiserror::Error;
 /// The schema version this build writes.
 pub use crate::schema::SCHEMA_VERSION;
 
+/// The file name of the Space's database inside `db`.
+const DATABASE_FILE: &str = "neha.sqlite3";
+
+/// The database file an older build wrote, renamed when the home opens.
+const LEGACY_DATABASE_FILE: &str = "neha-1.sqlite3";
+
 const DIRECTORIES: [&str; 8] = [
     "db",
     "secrets",
@@ -52,6 +58,7 @@ impl Home {
         for name in DIRECTORIES {
             fs::create_dir_all(self.root.join(name))?;
         }
+        rename_legacy_database(&self.root)?;
         for path in [
             &self.root,
             &self.root.join("db"),
@@ -73,9 +80,7 @@ impl Home {
     /// Returns the record's database file.
     #[must_use]
     pub fn db_path(&self) -> PathBuf {
-        self.root
-            .join("db")
-            .join(format!("neha-{}.sqlite3", crate::schema::SCHEMA_VERSION))
+        self.root.join("db").join(DATABASE_FILE)
     }
 
     /// Returns the directory that holds the bytes of Files.
@@ -92,6 +97,28 @@ impl Home {
             .join(computer.to_string())
             .join("workspace")
     }
+}
+
+fn rename_legacy_database(root: &Path) -> Result<(), HomeError> {
+    let db = root.join("db");
+    let current = db.join(DATABASE_FILE);
+    let legacy = db.join(LEGACY_DATABASE_FILE);
+    if current.exists() || !legacy.exists() {
+        return Ok(());
+    }
+
+    // SQLite finds a write-ahead log and its shared memory by the database
+    // file's name. Move them first so a crash between the renames leaves both
+    // halves under the new name.
+    for suffix in ["-wal", "-shm"] {
+        let from = db.join(format!("{LEGACY_DATABASE_FILE}{suffix}"));
+        if from.exists() {
+            fs::rename(&from, db.join(format!("{DATABASE_FILE}{suffix}")))?;
+        }
+    }
+    fs::rename(&legacy, &current)?;
+
+    Ok(())
 }
 
 fn restrict(path: &Path) -> Result<(), HomeError> {
@@ -151,7 +178,46 @@ mod tests {
         assert!(home.root().join("computers").is_dir());
         assert!(home.blobs_dir().is_dir());
         assert!(!home.root().join("tmp").join("leftover").exists());
-        assert!(home.db_path().starts_with(home.root().join("db")));
+        assert_eq!(home.db_path(), home.root().join("db").join("neha.sqlite3"));
+    }
+
+    #[test]
+    fn renames_the_version_one_database_and_its_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("neha-1.sqlite3"), b"record").unwrap();
+        std::fs::write(db.join("neha-1.sqlite3-wal"), b"log").unwrap();
+        std::fs::write(db.join("neha-1.sqlite3-shm"), b"shared").unwrap();
+
+        let home = Home::open(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(home.db_path()).unwrap(),
+            b"record",
+            "the record moved under the fixed name"
+        );
+        assert_eq!(
+            std::fs::read(home.root().join("db").join("neha.sqlite3-wal")).unwrap(),
+            b"log"
+        );
+        assert!(home.root().join("db").join("neha.sqlite3-shm").exists());
+        assert!(!db.join("neha-1.sqlite3").exists());
+        assert!(!db.join("neha-1.sqlite3-wal").exists());
+    }
+
+    #[test]
+    fn keeps_both_files_when_the_fixed_name_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("db");
+        std::fs::create_dir_all(&db).unwrap();
+        std::fs::write(db.join("neha.sqlite3"), b"current").unwrap();
+        std::fs::write(db.join("neha-1.sqlite3"), b"legacy").unwrap();
+
+        let home = Home::open(dir.path()).unwrap();
+
+        assert_eq!(std::fs::read(home.db_path()).unwrap(), b"current");
+        assert_eq!(std::fs::read(db.join("neha-1.sqlite3")).unwrap(), b"legacy");
     }
 
     #[test]

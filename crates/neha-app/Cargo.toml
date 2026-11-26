@@ -13,10 +13,13 @@ doc = false
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 futures-util.workspace = true
 neha = { path = "../neha" }
+neha-computer = { path = "../neha-computer" }
 neha-space = { path = "../neha-space" }
+rand = "0.9"
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls"] }
 rpassword = "7"
 serde = { workspace = true, features = ["derive"] }

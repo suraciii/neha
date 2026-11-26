@@ -25,7 +25,13 @@ A managed Computer depends on [Space](../space/product.md) for the workspace it 
 
 A real Computer runs Neha as a persistent process. The process holds one outgoing connection to the Space for control and data, and one more per screen; it listens on no network port.
 
-The channel carries commands, file reads and writes, process streams, and the screen. A managed Computer uses the same channel on the Space's own machine.
+A machine joins a Space by pairing; [Identity](../identity/design.md) covers the code and the token the machine keeps.
+
+The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange, and a managed Computer uses the same channel on the Space's own machine.
+
+The Space sends each action with an id, and the Computer answers that id with the action's result. Each action has a time limit, including one that moves a File's bytes, and an action that runs past its limit ends as timed out.
+
+A connection that ends makes every action in flight unknown. The process reconnects while it runs, and the Space shows the Computer offline until it does.
 
 ## The machine
 
@@ -39,11 +45,19 @@ The record names a Computer's kind and a provider's machine. That machine refere
 
 A managed Computer keeps its durable files in a workspace the Space holds. A real Computer keeps its files on the machine, and the Space keeps no copy.
 
+A real Computer keeps its Bots' Workspaces in one directory on the machine. Each Bot has its own Workspace in that directory, and the actions of a run start in it.
+
 ## Isolation
 
 A Computer is the unit of isolation.
 
 Bots assigned to one Computer share its files, processes, and logins. The Space does not isolate them from each other.
+
+On a real Computer, a Bot's default write range is its own Workspace, and it reads with the machine user's rights. The file tools check every write path, and the shell runs in an operating-system sandbox that mounts the machine read-only except that Workspace. A machine that cannot start its sandbox does not serve as a Computer.
+
+A real Computer's configuration directory is hidden from its Bots. The file tools and the shell cannot reach it, so a Bot cannot read the saved pairing or the token the machine keeps.
+
+On a real Computer, a Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted.
 
 A real Computer's owner grants what a Bot on it can reach. [product.md](product.md) covers the grants.
 

@@ -119,7 +119,9 @@ An empty `prefix` gives the Space the whole bucket. Use it only when the bucket 
 
 ## Backup
 
-A complete backup has two parts: the Space home and the objects in the File store. The Space home holds the record, the encrypted Vault and Provider keys, and each managed Computer's Workspace; with local storage it also holds `blobs`.
+A complete backup of a Space has two parts: the Space home and the objects in the File store. The Space home holds the record, the encrypted Vault and Provider keys, and each managed Computer's Workspace; with local storage it also holds `blobs`.
+
+A real Computer is not part of a Space backup. By default, its pairing in `~/.neha/computer.json` and its Bots' Workspaces in `~/Neha` sit on the machine, so back them up there.
 
 | Store | What to copy |
 | --- | --- |

@@ -33,4 +33,6 @@ A device that receives a link from a signed-in User trusts the certificate the l
 
 ## Codes
 
-An invitation and a pairing code each admit one caller to one Space. A used code admits no one again.
+An invitation and a pairing code each admit one caller to one Space, work once, and expire. A pairing code is typed, so a User gets only a limited number of tries at it. The Space keeps a pairing code only as a hash, and a paired machine keeps the token that admits it.
+
+Any process that can reach a loopback Space MAY start pairing. Under contention, a waiting machine MAY need a new code. Approving a Computer requires a signed-in User.

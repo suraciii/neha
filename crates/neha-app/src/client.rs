@@ -59,40 +59,43 @@ impl Credential {
     }
 
     /// Saves the credential for later commands.
-    ///
-    /// The file is created 0600 and replaces the old one atomically, so a
-    /// reader never sees a partly written or world-readable credential.
     pub fn save(&self) -> Result<()> {
-        let path = credential_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("cannot create {}", parent.display()))?;
-            restrict(parent, 0o700)?;
-        }
-        let bytes = serde_json::to_vec(self)?;
-        let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .with_context(|| format!("cannot write {}", temporary.display()))?;
-        {
-            use std::io::Write as _;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-        }
-        drop(file);
-        fs::rename(&temporary, &path)
-            .with_context(|| format!("cannot move the credential to {}", path.display()))?;
-        restrict(&path, 0o600)?;
-
-        Ok(())
+        write_private(&credential_path(), &serde_json::to_vec(self)?)
     }
+}
+
+/// Writes a secret file only this machine user can read, atomically.
+///
+/// The directory is made 0700 and the file 0600, and the file moves into place
+/// whole, so a reader never sees a partly written or world-readable secret.
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+        restrict(parent, 0o700)?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .with_context(|| format!("cannot write {}", temporary.display()))?;
+    {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    drop(file);
+    fs::rename(&temporary, path)
+        .with_context(|| format!("cannot move the file to {}", path.display()))?;
+    restrict(path, 0o600)?;
+
+    Ok(())
 }
 
 fn credential_path() -> PathBuf {
@@ -111,7 +114,7 @@ fn credential_path() -> PathBuf {
 }
 
 #[cfg(unix)]
-fn restrict(path: &Path, mode: u32) -> Result<()> {
+pub(crate) fn restrict(path: &Path, mode: u32) -> Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
 
     fs::set_permissions(path, fs::Permissions::from_mode(mode))
@@ -119,7 +122,7 @@ fn restrict(path: &Path, mode: u32) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn restrict(_path: &Path, _mode: u32) -> Result<()> {
+pub(crate) fn restrict(_path: &Path, _mode: u32) -> Result<()> {
     Ok(())
 }
 
@@ -217,6 +220,143 @@ async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
         .or(status.canonical_reason())
         .unwrap_or("no message");
     bail!("the Space refused ({code}): {message}");
+}
+
+/// What a Space tells a machine when pairing starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairingStart {
+    /// The device identifier the machine polls its pairing with.
+    pub device: String,
+    /// The one-time code a signed-in User enters.
+    pub code: String,
+}
+
+/// What a machine learns when it polls its pairing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PairingState {
+    /// No User has entered the code yet.
+    Pending,
+    /// A User entered the code; the Space created this Computer.
+    Approved {
+        /// The identifier of the Computer the Space created.
+        computer: String,
+    },
+}
+
+/// Returns an HTTP client for the pairing routes.
+///
+/// Pairing exchanges carry the machine's own secrets, and a redirect would
+/// hand them to whatever origin the answer names. The routes never redirect,
+/// so the client keeps any redirect answer as the refusal it is.
+fn pairing_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        // This milestone pairs with a loopback Space only, and the body carries
+        // the machine's own secrets: a system proxy must not see or forward it.
+        .no_proxy()
+        .build()
+        .context("cannot build the pairing HTTP client")
+}
+
+/// Asks a Space to start pairing this machine.
+pub async fn pair_start(
+    space_url: &str,
+    machine: &str,
+    workspace: &str,
+    token: &str,
+    poll_secret: &str,
+) -> Result<PairingStart> {
+    let body: Value = accepted(
+        pairing_client()?
+            .post(pair_start_url(space_url))
+            .json(&pair_request_body(machine, workspace, token, poll_secret))
+            .send()
+            .await
+            .context("the Space could not be reached")?,
+    )
+    .await?
+    .json()
+    .await
+    .context("the Space did not answer with JSON")?;
+
+    Ok(PairingStart {
+        device: text_field(&body, "device")?,
+        code: text_field(&body, "code")?,
+    })
+}
+
+/// Asks a Space how the pairing this machine started is doing.
+///
+/// The polling secret travels in the body, not the URL: a request line ends up
+/// in proxy logs and shell history, a body does not.
+pub async fn pair_poll(space_url: &str, device: &str, poll_secret: &str) -> Result<PairingState> {
+    let response = pairing_client()?
+        .post(pair_poll_url(space_url, device))
+        .json(&pair_poll_body(poll_secret))
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        bail!("the pairing expired before it was approved; run `neha computer pair` again");
+    }
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+
+    pairing_state(&body)
+}
+
+/// The URL a machine starts its pairing at.
+fn pair_start_url(space_url: &str) -> String {
+    format!("{}/api/computers/pair", space_url.trim_end_matches('/'))
+}
+
+/// The URL a machine polls its pairing at.
+///
+/// The device is URL-safe base64, so it needs no escaping; the secret travels
+/// in the request body.
+fn pair_poll_url(space_url: &str, device: &str) -> String {
+    format!(
+        "{}/api/computers/pair/{device}",
+        space_url.trim_end_matches('/')
+    )
+}
+
+/// The body a machine sends to poll its pairing.
+fn pair_poll_body(poll_secret: &str) -> Value {
+    serde_json::json!({"secret": poll_secret})
+}
+
+/// The body a machine sends to start pairing.
+fn pair_request_body(machine: &str, workspace: &str, token: &str, poll_secret: &str) -> Value {
+    serde_json::json!({
+        "machine": machine,
+        "workspace": workspace,
+        "token": token,
+        "poll_secret": poll_secret,
+    })
+}
+
+/// Reads the pairing state a poll answered with.
+fn pairing_state(answer: &Value) -> Result<PairingState> {
+    match answer.get("state").and_then(Value::as_str) {
+        Some("pending") => Ok(PairingState::Pending),
+        Some("approved") => Ok(PairingState::Approved {
+            computer: text_field(answer, "computer")?,
+        }),
+        _ => bail!("the Space's answer does not describe a pairing"),
+    }
+}
+
+/// Reads a string field out of a Space's answer.
+fn text_field(value: &Value, field: &str) -> Result<String> {
+    Ok(value
+        .get(field)
+        .and_then(Value::as_str)
+        .with_context(|| format!("the Space's answer has no {field}"))?
+        .to_owned())
 }
 
 /// Uploads one File to a Chat and returns what the Space recorded.
@@ -484,7 +624,11 @@ mod tests {
     use neha::surface::PROTOCOL_VERSION;
     use tokio_tungstenite::tungstenite::Message;
 
-    use super::{Credential, SignedIn, disposition_name, read_for_upload, wait_for_run_within};
+    use super::{
+        Credential, PairingState, SignedIn, disposition_name, pair_poll, pair_poll_body,
+        pair_poll_url, pair_request_body, pair_start, pair_start_url, pairing_state,
+        read_for_upload, wait_for_run_within,
+    };
 
     /// The CLI's credential for a Space at this address.
     fn credential_at(address: std::net::SocketAddr) -> Credential {
@@ -553,6 +697,62 @@ mod tests {
     }
 
     #[test]
+    fn the_pairing_request_is_the_pinned_body() {
+        assert_eq!(
+            pair_request_body(
+                "laptop",
+                "/home/ada/.neha/workspace",
+                "machine-token",
+                "poll-secret"
+            ),
+            serde_json::json!({
+                "machine": "laptop",
+                "workspace": "/home/ada/.neha/workspace",
+                "token": "machine-token",
+                "poll_secret": "poll-secret",
+            })
+        );
+    }
+
+    #[test]
+    fn the_pairing_urls_are_the_pinned_paths() {
+        assert_eq!(
+            pair_start_url("http://127.0.0.1:7337/"),
+            "http://127.0.0.1:7337/api/computers/pair"
+        );
+        assert_eq!(
+            pair_poll_url("http://127.0.0.1:7337/", "device-a"),
+            "http://127.0.0.1:7337/api/computers/pair/device-a"
+        );
+        assert_eq!(
+            pair_poll_body("secret-a"),
+            serde_json::json!({"secret": "secret-a"}),
+            "the polling secret travels in the body, not the URL"
+        );
+        assert!(!pair_poll_url("http://127.0.0.1:7337/", "device-a").contains("secret"));
+    }
+
+    #[test]
+    fn a_poll_answer_says_whether_the_pairing_is_approved() {
+        assert_eq!(
+            pairing_state(&serde_json::json!({"state": "pending"})).unwrap(),
+            PairingState::Pending
+        );
+        assert_eq!(
+            pairing_state(
+                &serde_json::json!({"state": "approved", "computer": "01890a5d-ac96-774b-bcce-b302099a8057"})
+            )
+            .unwrap(),
+            PairingState::Approved {
+                computer: "01890a5d-ac96-774b-bcce-b302099a8057".to_owned(),
+            }
+        );
+        assert!(pairing_state(&serde_json::json!({"state": "approved"})).is_err());
+        assert!(pairing_state(&serde_json::json!({"state": "later"})).is_err());
+        assert!(pairing_state(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
     fn a_disposition_names_the_file() {
         assert_eq!(
             disposition_name("attachment; filename*=UTF-8''report.pdf").as_deref(),
@@ -607,5 +807,172 @@ mod tests {
             started.elapsed()
         );
         space.abort();
+    }
+
+    /// Serves a 302 to `location` for every request.
+    async fn redirecting_space(
+        location: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::http::header::LOCATION;
+        use axum::response::IntoResponse;
+        use axum::routing::any;
+
+        let app = Router::new().fallback(any(move || {
+            let location = location.clone();
+            async move { (StatusCode::FOUND, [(LOCATION, location)]).into_response() }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn pairing_requests_do_not_follow_redirects() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A redirect target that counts every connection it receives.
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let target_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = target.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let (address, space) = redirecting_space(format!("http://{target_address}")).await;
+        let space_url = format!("http://{address}");
+
+        let started = pair_start(&space_url, "laptop", "/ws", "token", "poll").await;
+        assert!(
+            started.is_err(),
+            "a redirecting pairing start must not be accepted"
+        );
+        let polled = pair_poll(&space_url, "device", "secret").await;
+        assert!(
+            polled.is_err(),
+            "a redirecting pairing poll must not be accepted"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "pairing requests must not follow a redirect"
+        );
+
+        space.abort();
+        target_task.abort();
+    }
+
+    /// Runs only as the child half of `pairing_requests_bypass_a_system_proxy`.
+    ///
+    /// The parent starts a fake Space and points the proxy variables at a
+    /// listener it counts; this child then pairs through the real client. It
+    /// returns at once when the normal suite runs it.
+    #[tokio::test]
+    async fn a_pairing_client_child_pairs_around_the_proxy() {
+        let Ok(space) = std::env::var("NEHA_PAIRING_CHILD_SPACE") else {
+            return;
+        };
+
+        let started = pair_start(&space, "laptop", "/ws", "token", "poll")
+            .await
+            .expect("the direct pairing start must succeed");
+        assert_eq!(started.code, "CODE1234");
+        assert_eq!(
+            pair_poll(&space, &started.device, "poll").await.unwrap(),
+            PairingState::Pending
+        );
+    }
+
+    #[test]
+    fn pairing_requests_bypass_a_system_proxy() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::Json;
+        use axum::Router;
+        use axum::routing::post;
+        use serde_json::json;
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            // A proxy that counts every connection it receives.
+            let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let proxy_address = proxy_listener.local_addr().unwrap();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&hits);
+            let proxy = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = proxy_listener.accept().await else {
+                        break;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+
+            // A fake Space on loopback that answers both pairing routes.
+            let app = Router::new()
+                .route(
+                    "/api/computers/pair",
+                    post(|| async {
+                        Json(json!({"device": "device-from-space", "code": "CODE1234"}))
+                    }),
+                )
+                .route(
+                    "/api/computers/pair/{device}",
+                    post(|| async { Json(json!({"state": "pending"})) }),
+                );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let space_address = listener.local_addr().unwrap();
+            let space = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let proxy_url = format!("http://{proxy_address}");
+            let space_url = format!("http://{space_address}");
+            let child = tokio::task::spawn_blocking(move || {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--exact")
+                    .arg("client::tests::a_pairing_client_child_pairs_around_the_proxy")
+                    .arg("--nocapture")
+                    .env("HTTP_PROXY", &proxy_url)
+                    .env("HTTPS_PROXY", &proxy_url)
+                    .env("ALL_PROXY", &proxy_url)
+                    .env("NEHA_PAIRING_CHILD_SPACE", &space_url)
+                    .output()
+                    .expect("the child test process starts")
+            })
+            .await
+            .unwrap();
+
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            let stderr = String::from_utf8_lossy(&child.stderr);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "the child pairing failed: {stdout}\n{stderr}"
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "the pairing client must not touch the system proxy"
+            );
+            space.abort();
+            proxy.abort();
+        });
     }
 }

@@ -1,6 +1,7 @@
 //! `neha` runs a Space and talks to its Bots from a terminal.
 
 mod client;
+mod computer;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -70,6 +71,11 @@ enum Top {
         #[command(subcommand)]
         command: BotCommand,
     },
+    /// Pair this machine as a Computer or run its daemon.
+    Computer {
+        #[command(subcommand)]
+        command: ComputerCommand,
+    },
     /// List Chats and exchange Messages.
     Chat {
         #[command(subcommand)]
@@ -126,6 +132,9 @@ enum BotCommand {
     Create {
         /// The Bot's name.
         name: String,
+        /// The real Computer the Bot works on; a managed one when absent.
+        #[arg(long)]
+        computer: Option<Id>,
     },
     /// Show your Bot, its Chat, and its Computer.
     Show {
@@ -133,6 +142,31 @@ enum BotCommand {
         bot: Id,
     },
     /// List your Bots.
+    List,
+}
+
+#[derive(Subcommand)]
+enum ComputerCommand {
+    /// Pair this machine to a Space and start its daemon.
+    Pair {
+        /// The Space URL; defaults to NEHA_SPACE_URL.
+        #[arg(long)]
+        space: Option<String>,
+        /// The directory that holds one folder per Bot.
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        /// The machine name the Space shows.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Start this machine's daemon with its saved pairing.
+    Run,
+    /// Add the machine that printed a pairing code to this Space.
+    Add {
+        /// The pairing code the machine printed.
+        code: String,
+    },
+    /// List the Computers you own.
     List,
 }
 
@@ -208,6 +242,7 @@ async fn main() -> Result<()> {
         Top::Provider { command } => provider(command).await,
         Top::Model { command } => model(command).await,
         Top::Bot { command } => bot(command).await,
+        Top::Computer { command } => computer_command(command).await,
         Top::Chat { command } => chat(command).await,
         Top::File { command } => file(command).await,
         Top::Run { command } => run(command).await,
@@ -421,10 +456,13 @@ async fn model(command: ModelCommand) -> Result<()> {
 async fn bot(command: BotCommand) -> Result<()> {
     let credential = Credential::load()?;
     match command {
-        BotCommand::Create { name } => {
+        BotCommand::Create { name, computer } => {
             let result = client::command(
                 &credential,
-                CommandCall::BotCreate(BotCreate { name: name.clone() }),
+                CommandCall::BotCreate(BotCreate {
+                    name: name.clone(),
+                    computer,
+                }),
             )
             .await?;
             println!("Created Bot {} ({name}).", id_of(&result["bot"], "id")?);
@@ -462,6 +500,44 @@ async fn bot(command: BotCommand) -> Result<()> {
                     id_of(bot, "id")?,
                     text_of(bot, "name")?,
                     id_of(bot, "chat")?
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn computer_command(command: ComputerCommand) -> Result<()> {
+    match command {
+        ComputerCommand::Pair {
+            space,
+            workspace,
+            name,
+        } => computer::pair(space, workspace, name).await?,
+        ComputerCommand::Run => computer::run().await?,
+        ComputerCommand::Add { code } => {
+            let credential = Credential::load()?;
+            let computer = client::command(&credential, CommandCall::ComputerAdd { code }).await?;
+            let id = id_of(&computer, "id")?;
+            println!("Added Computer {id} ({}).", text_of(&computer, "kind")?);
+            println!("  Workspace: {}", text_of(&computer, "workspace")?);
+            println!("Create a Bot on it with: neha bot create <name> --computer {id}");
+        }
+        ComputerCommand::List => {
+            let credential = Credential::load()?;
+            let result = client::command(&credential, CommandCall::ComputerList).await?;
+            for computer in result.as_array().context("no Computers in the answer")? {
+                let online = if computer["online"].as_bool().unwrap_or(false) {
+                    "online"
+                } else {
+                    "offline"
+                };
+                println!(
+                    "{}  {}  {online}  {}",
+                    id_of(computer, "id")?,
+                    text_of(computer, "kind")?,
+                    text_of(computer, "workspace")?
                 );
             }
         }

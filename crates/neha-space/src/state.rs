@@ -202,6 +202,8 @@ pub struct State {
     pub bots: HashMap<Id, BotView>,
     /// The Computers, by identifier.
     pub computers: HashMap<Id, ComputerView>,
+    /// The Computers in the order the record created them.
+    pub computer_order: Vec<Id>,
     /// The Chats, by identifier.
     pub chats: HashMap<Id, ChatView>,
     /// The Messages, in cursor order.
@@ -387,6 +389,7 @@ impl Projection for State {
                         workspace: data.workspace,
                     },
                 );
+                self.computer_order.push(data.computer);
             }
             EventData::ChatCreated(data) => {
                 self.chats.insert(

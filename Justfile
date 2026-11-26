@@ -24,6 +24,10 @@ test:
 test-s3:
     cargo test --locked -p neha-space
 
+# Run the machine-side tests with the fence switched on; needs bubblewrap (docs/building.md).
+test-bwrap:
+    cargo test --locked -p neha-computer
+
 # Install the browser client's locked dependencies.
 ui-deps:
     pnpm --dir ui install --frozen-lockfile

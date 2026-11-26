@@ -22,6 +22,9 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
+      # Run the fence tests against the bubblewrap installed below; without
+      # NEHA_TEST_BWRAP they would skip.
+      NEHA_TEST_BWRAP: '1'
       # Run the S3 tests against the SeaweedFS service started below;
       # without NEHA_TEST_S3 they would skip.
       NEHA_TEST_S3: '1'
@@ -60,6 +63,19 @@ jobs:
           node-version: 24
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces by default, and
+      # bubblewrap here is not setuid. The gate runs the fence tests, so it
+      # lifts the restriction for this runner only.
+      - name: Allow the fence sandbox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
 
       - name: Start SeaweedFS
         run: docker run -d --name neha-s3 -p 8333:8333 chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 server -s3 -dir=/data
