@@ -10,6 +10,7 @@ pub mod config;
 pub mod home;
 pub mod identity;
 pub mod model;
+pub mod runs;
 pub mod schema;
 pub mod secrets;
 pub mod server;

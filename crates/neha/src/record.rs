@@ -49,6 +49,9 @@ pub enum EventKind {
     /// A File was added to a Chat or Group.
     #[serde(rename = "neha.file.added")]
     FileAdded,
+    /// A run entered its Bot's queue.
+    #[serde(rename = "neha.run.queued")]
+    RunQueued,
     /// A run started.
     #[serde(rename = "neha.run.started")]
     RunStarted,
@@ -78,6 +81,7 @@ impl EventKind {
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
             Self::FileAdded => "neha.file.added",
+            Self::RunQueued => "neha.run.queued",
             Self::RunStarted => "neha.run.started",
             Self::RunFinished => "neha.run.finished",
             Self::RunStep => "neha.run.step",
@@ -90,9 +94,11 @@ impl EventKind {
     #[must_use]
     pub const fn class(self) -> EventClass {
         match self {
-            Self::MessageAdded | Self::FileAdded | Self::RunStarted | Self::RunFinished => {
-                EventClass::Presentation
-            }
+            Self::MessageAdded
+            | Self::FileAdded
+            | Self::RunQueued
+            | Self::RunStarted
+            | Self::RunFinished => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunStep | Self::ActionStarted | Self::ActionFinished => EventClass::Authority,
@@ -117,6 +123,7 @@ impl FromStr for EventKind {
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
             "neha.file.added" => Ok(Self::FileAdded),
+            "neha.run.queued" => Ok(Self::RunQueued),
             "neha.run.started" => Ok(Self::RunStarted),
             "neha.run.finished" => Ok(Self::RunFinished),
             "neha.run.step" => Ok(Self::RunStep),
@@ -193,7 +200,7 @@ pub struct Event {
 
 #[cfg(test)]
 mod tests {
-    use super::{Author, EventData, EventDraft, EventKind, FileAdded, FileError};
+    use super::{Author, EventData, EventDraft, EventKind, FileAdded, FileError, RunQueued};
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
     use crate::id::Id;
@@ -208,6 +215,7 @@ mod tests {
             EventKind::ChatCreated,
             EventKind::MessageAdded,
             EventKind::FileAdded,
+            EventKind::RunQueued,
             EventKind::RunStarted,
             EventKind::RunFinished,
             EventKind::RunStep,
@@ -225,11 +233,67 @@ mod tests {
     fn message_and_run_events_are_presentation() {
         assert_eq!(EventKind::MessageAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::FileAdded.class(), EventClass::Presentation);
+        assert_eq!(EventKind::RunQueued.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStarted.class(), EventClass::Presentation);
+        assert_eq!(EventKind::RunFinished.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStep.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionFinished.class(), EventClass::Authority);
         assert_eq!(EventKind::BotCreated.class(), EventClass::Authority);
+    }
+
+    #[test]
+    fn a_run_queued_round_trips() {
+        let data = RunQueued {
+            run: Id::new(),
+            chat: Id::new(),
+            bot: Id::new(),
+            command: Id::new(),
+            message: Id::new(),
+        };
+        let value = serde_json::json!({
+            "run": data.run,
+            "chat": data.chat,
+            "bot": data.bot,
+            "command": data.command,
+            "message": data.message,
+        });
+
+        assert_eq!(
+            EventKind::RunQueued.decode(&value).unwrap(),
+            EventData::RunQueued(data)
+        );
+
+        let mut unknown = value.clone();
+        unknown["position"] = serde_json::json!(1);
+        assert!(EventKind::RunQueued.decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn a_queued_run_takes_the_authors_a_started_run_takes() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        for kind in [EventKind::RunQueued, EventKind::RunStarted] {
+            assert!(kind.validate_author(bot, Some(Id::new())).is_ok());
+            assert!(kind.validate_author(user, None).is_err());
+            assert!(kind.validate_author(user, Some(Id::new())).is_err());
+            assert!(kind.validate_author(bot, None).is_err());
+        }
+    }
+
+    #[test]
+    fn a_finished_run_is_not_queued() {
+        let run = Id::new();
+        let queued = serde_json::json!({"run": run, "status": "queued"});
+        assert!(EventKind::RunFinished.decode(&queued).is_err());
+
+        for status in ["running", "succeeded", "failed"] {
+            let data = serde_json::json!({"run": run, "status": status});
+            assert!(
+                EventKind::RunFinished.decode(&data).is_ok(),
+                "{status} is a status a finished run may carry"
+            );
+        }
     }
 
     #[test]
@@ -358,10 +422,12 @@ mod tests {
     }
 }
 
-/// How a finished run ended.
+/// Where a run is: waiting, working, or how it ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
+    /// The run waits for its Bot to finish the work before it.
+    Queued,
     /// The run is still working.
     Running,
     /// The run produced a reply.
@@ -387,6 +453,8 @@ pub enum EventData {
     MessageAdded(MessageAdded),
     /// A File was added.
     FileAdded(FileAdded),
+    /// A run entered its Bot's queue.
+    RunQueued(RunQueued),
     /// A run started.
     RunStarted(RunStarted),
     /// A run finished.
@@ -424,8 +492,19 @@ impl EventKind {
 
                 EventData::FileAdded(data)
             }
+            Self::RunQueued => EventData::RunQueued(decode(data)?),
             Self::RunStarted => EventData::RunStarted(decode(data)?),
-            Self::RunFinished => EventData::RunFinished(decode(data)?),
+            Self::RunFinished => {
+                let data: RunFinished = decode(data)?;
+                // Waiting is where a run is before it starts, not how it ends.
+                if data.status == RunStatus::Queued {
+                    return Err(EventDataError::Data(
+                        "a finished run cannot be queued".to_owned(),
+                    ));
+                }
+
+                EventData::RunFinished(data)
+            }
             Self::RunStep => EventData::RunStep(decode(data)?),
             Self::ActionStarted => EventData::ActionStarted(decode(data)?),
             Self::ActionFinished => EventData::ActionFinished(decode(data)?),
@@ -450,7 +529,8 @@ impl EventKind {
                 (Author::User(_), None) | (Author::Bot(_), Some(_)) => {}
                 _ => return Err(EventDataError::Author),
             },
-            Self::RunStarted
+            Self::RunQueued
+            | Self::RunStarted
             | Self::RunFinished
             | Self::RunStep
             | Self::ActionStarted
@@ -687,6 +767,22 @@ impl FileAdded {
 
         Ok(())
     }
+}
+
+/// The data of `neha.run.queued`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunQueued {
+    /// The run.
+    pub run: Id,
+    /// The Chat it works in.
+    pub chat: Id,
+    /// The Bot that works it.
+    pub bot: Id,
+    /// The command that queued it.
+    pub command: Id,
+    /// The Message that started it.
+    pub message: Id,
 }
 
 /// The data of `neha.run.started`.

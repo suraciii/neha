@@ -13,6 +13,7 @@ Owned by cli. Every topic's behavior is reachable through the command surface, s
 3. A caller and a Space agree on a version before the first command.
 4. A command, its events, and the work it starts are stored together or not at all.
 5. A command names a File by its id, and a File's bytes travel over HTTP beside the command surface.
+6. A command that starts a run confirms when the Space queues the run, and its first result names the run and the place it holds.
 
 ## The command surface
 
@@ -20,9 +21,9 @@ The command surface is the set of commands a Space accepts and the events it sen
 
 ## Commands and events
 
-A command carries an identifier from its caller, the scope it acts in, and its parameters. A caller that sends a command again receives the result of the first one, or a conflict.
+A command carries an identifier from its caller, the scope it acts in, and its parameters. A caller that sends a command again receives the result of the first one, or a conflict. The result of a run-starting command settles when its run ends; a caller that sends the command again before then waits for the settled result.
 
-A command is accepted when the Space holds it, committed when the record holds it, and confirmed when its effect outside the Space is done. Each is a separate event to the caller.
+A command is accepted when the Space holds it, committed when the record holds it, and confirmed when its effect outside the Space is done. That effect is the run's place in the queue when the command starts a run. Each is a separate event to the caller.
 
 ## Versions
 

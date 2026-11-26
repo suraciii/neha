@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use futures_util::{SinkExt as _, StreamExt as _};
@@ -16,6 +17,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// How often the CLI asks a Space how a run is doing.
+const RUN_POLL: Duration = Duration::from_millis(200);
+/// How long the CLI waits for a run to end.
+const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// The account the CLI acts as.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -321,147 +327,64 @@ fn percent_decode(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
-/// Runs one command and returns its result, reporting its own run's events.
-pub async fn command_following(
+/// Polls one run until it ends, reports each view, and returns the last one.
+///
+/// The Space confirms the command that starts a run when it queues the run,
+/// so the run's result comes from the record, not from that command.
+pub async fn wait_for_run(
     credential: &Credential,
-    command: CommandCall,
-    mut on_event: impl FnMut(&neha::record::Event),
+    run: Id,
+    on_view: impl FnMut(&Value),
 ) -> Result<Value> {
-    let command_id = Id::new();
-    let mut socket = connect(credential).await?;
-    socket
-        .send(Message::Text(
-            serde_json::to_string(&ClientFrame::Subscribe {
-                id: Id::new(),
-                cursor: None,
-                limit: None,
-            })?
-            .into(),
-        ))
-        .await
-        .context("cannot subscribe to the record")?;
-    socket
-        .send(Message::Text(
-            serde_json::to_string(&ClientFrame::Command {
-                id: command_id,
-                command,
-            })?
-            .into(),
-        ))
-        .await
-        .context("cannot send the command")?;
+    wait_for_run_within(credential, run, RUN_TIMEOUT, on_view).await
+}
 
-    let mut filter = FollowFilter::new(command_id);
+/// Polls one run for at most `timeout`, and reports each view on the way.
+///
+/// The whole wait has one deadline: the connection, every frame, and every
+/// pause between polls share the time that is left.
+async fn wait_for_run_within(
+    credential: &Credential,
+    run: Id,
+    timeout: Duration,
+    mut on_view: impl FnMut(&Value),
+) -> Result<Value> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut socket = tokio::time::timeout(left(deadline, timeout)?, connect(credential))
+        .await
+        .map_err(|_| run_timeout(timeout))??;
     loop {
-        let Some(message) = socket.next().await else {
-            bail!("the Space closed the connection");
-        };
-        let message = message.context("the Space's stream failed")?;
-        let Message::Text(text) = message else {
-            continue;
-        };
-        match serde_json::from_str::<ServerFrame>(text.as_str()) {
-            Ok(ServerFrame::Confirmed { result, .. }) => return Ok(result),
-            Ok(ServerFrame::Error { code, message, .. }) => {
-                bail!("the Space refused ({code}): {message}");
-            }
-            Ok(ServerFrame::ProtocolError { message }) => {
-                bail!("the Space ended the subscription: {message}");
-            }
-            Ok(ServerFrame::Event { event }) => {
-                for event in filter.push_event(event) {
-                    on_event(&event);
-                }
-            }
-            Ok(ServerFrame::Snapshot { events, .. }) => {
-                for event in filter.push_snapshot(events) {
-                    on_event(&event);
-                }
-            }
-            Ok(
-                ServerFrame::Accepted { .. }
-                | ServerFrame::Committed { .. }
-                | ServerFrame::Hello { .. }
-                | ServerFrame::Heartbeat { .. },
-            ) => {}
-            Err(_) => bail!("the Space sent a frame this CLI does not understand"),
+        let view = tokio::time::timeout(
+            left(deadline, timeout)?,
+            command_on(&mut socket, CommandCall::RunShow { run }),
+        )
+        .await
+        .map_err(|_| run_timeout(timeout))??;
+        on_view(&view);
+        if matches!(view["status"].as_str(), Some("succeeded" | "failed")) {
+            return Ok(view);
         }
+        tokio::time::sleep(RUN_POLL.min(left(deadline, timeout)?)).await;
     }
 }
 
-/// Keeps only the events of the run a submitted command started.
-#[derive(Debug)]
-struct FollowFilter {
-    command: Id,
-    target: Option<Id>,
-    pending: Vec<neha::record::Event>,
+/// Returns the time left before the deadline, or the error when it passed.
+fn left(deadline: tokio::time::Instant, timeout: Duration) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if left.is_zero() {
+        return Err(run_timeout(timeout));
+    }
+
+    Ok(left)
 }
 
-impl FollowFilter {
-    fn new(command: Id) -> Self {
-        Self {
-            command,
-            target: None,
-            pending: Vec::new(),
-        }
-    }
-
-    fn push_event(&mut self, event: neha::record::Event) -> Vec<neha::record::Event> {
-        if self.target.is_none() {
-            self.target = self.started_run(&event);
-            self.pending.push(event);
-            if self.target.is_some() {
-                return std::mem::take(&mut self.pending)
-                    .into_iter()
-                    .filter(|event| self.belongs(event))
-                    .collect();
-            }
-            return Vec::new();
-        }
-        if self.belongs(&event) {
-            vec![event]
-        } else {
-            Vec::new()
-        }
-    }
-
-    fn push_snapshot(&mut self, events: Vec<neha::record::Event>) -> Vec<neha::record::Event> {
-        if self.target.is_none() {
-            self.target = events.iter().find_map(|event| self.started_run(event));
-        }
-
-        events
-            .into_iter()
-            .filter(|event| self.belongs(event))
-            .collect()
-    }
-
-    fn started_run(&self, event: &neha::record::Event) -> Option<Id> {
-        if event.kind != neha::record::EventKind::RunStarted {
-            return None;
-        }
-        let started_for = event.data.get("command")?.as_str()?;
-        if started_for != self.command.to_string() {
-            return None;
-        }
-        serde_json::from_value(event.data.get("run")?.clone()).ok()
-    }
-
-    fn belongs(&self, event: &neha::record::Event) -> bool {
-        let Some(run) = self.target else {
-            return false;
-        };
-        event
-            .data
-            .get("run")
-            .and_then(|value| serde_json::from_value::<Id>(value.clone()).ok())
-            == Some(run)
-    }
+/// The error a run that outlasts the wait produces.
+fn run_timeout(timeout: Duration) -> anyhow::Error {
+    anyhow::anyhow!("the run did not end within {timeout:?}")
 }
 
-/// Runs one command and returns its result.
-pub async fn command(credential: &Credential, command: CommandCall) -> Result<Value> {
-    let mut socket = connect(credential).await?;
+/// Runs one command on an open connection and returns its result.
+async fn command_on(socket: &mut Socket, command: CommandCall) -> Result<Value> {
     socket
         .send(Message::Text(
             serde_json::to_string(&ClientFrame::Command {
@@ -500,6 +423,12 @@ pub async fn command(credential: &Credential, command: CommandCall) -> Result<Va
             Err(_) => bail!("the Space sent a frame this CLI does not understand"),
         }
     }
+}
+
+/// Runs one command and returns its result.
+pub async fn command(credential: &Credential, command: CommandCall) -> Result<Value> {
+    let mut socket = connect(credential).await?;
+    command_on(&mut socket, command).await
 }
 
 async fn connect(credential: &Credential) -> Result<Socket> {
@@ -547,13 +476,62 @@ async fn connect(credential: &Credential) -> Result<Socket> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt as _, StreamExt as _};
     use neha::file::MAX_FILE_BYTES;
     use neha::id::Id;
-    use neha::record::{Author, Event, EventKind, KIND_VERSION};
-    use neha::seq::Seq;
-    use neha::time::Timestamp;
+    use neha::surface::PROTOCOL_VERSION;
+    use tokio_tungstenite::tungstenite::Message;
 
-    use super::{FollowFilter, disposition_name, read_for_upload};
+    use super::{Credential, SignedIn, disposition_name, read_for_upload, wait_for_run_within};
+
+    /// The CLI's credential for a Space at this address.
+    fn credential_at(address: std::net::SocketAddr) -> Credential {
+        Credential {
+            url: format!("http://{address}"),
+            token: "token".to_owned(),
+            account: SignedIn {
+                id: Id::new(),
+                display_name: "Ada".to_owned(),
+                is_admin: false,
+            },
+        }
+    }
+
+    /// Waits for one run against a Space that never answers, and returns the
+    /// error the wait produced.
+    async fn timed_out_run_wait(credential: &Credential) -> anyhow::Error {
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_run_within(credential, Id::new(), Duration::from_millis(300), |_| {}),
+        )
+        .await
+        .expect("the wait must end")
+        .expect_err("a Space that never answers must end the wait")
+    }
+
+    /// Serves a Space that greets the CLI and then never answers a command.
+    async fn silent_space(listener: tokio::net::TcpListener) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        loop {
+            let Some(Ok(message)) = socket.next().await else {
+                break;
+            };
+            let Message::Text(text) = message else {
+                continue;
+            };
+            let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if frame["type"] == "hello" {
+                let greeting = serde_json::json!({"type": "hello", "version": PROTOCOL_VERSION});
+                socket
+                    .send(Message::Text(greeting.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn a_file_larger_than_the_limit_is_refused_before_upload() {
@@ -591,88 +569,43 @@ mod tests {
         );
     }
 
-    fn event(kind: EventKind, data: serde_json::Value, seq: i64) -> Event {
-        Event {
-            seq: Seq::from_i64(seq).unwrap(),
-            kind,
-            version: KIND_VERSION,
-            at: Timestamp::from_microseconds(0).unwrap(),
-            author: Author::Bot(Id::new()),
-            acting: Some(Id::new()),
-            command: None,
-            data,
-        }
-    }
+    #[tokio::test]
+    async fn a_space_that_never_answers_ends_the_run_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = tokio::spawn(silent_space(listener));
 
-    fn started(run: Id, command: Id, seq: i64) -> Event {
-        event(
-            EventKind::RunStarted,
-            serde_json::json!({
-                "run": run,
-                "chat": Id::new(),
-                "bot": Id::new(),
-                "command": command,
-                "message": Id::new(),
-            }),
-            seq,
-        )
-    }
+        let started = std::time::Instant::now();
+        let error = timed_out_run_wait(&credential_at(address)).await;
 
-    fn action(run: Id, seq: i64) -> Event {
-        event(
-            EventKind::RunStep,
-            serde_json::json!({"run": run, "step": 1, "tool_calls": 1}),
-            seq,
-        )
-    }
-
-    #[test]
-    fn a_snapshot_keeps_the_submitted_runs_early_progress() {
-        let command = Id::new();
-        let run = Id::new();
-        let mut filter = FollowFilter::new(command);
-        let snapshot = vec![
-            event(
-                EventKind::MessageAdded,
-                serde_json::json!({"run": run, "chat": Id::new(), "text": "hi"}),
-                1,
-            ),
-            started(run, command, 2),
-            action(run, 3),
-        ];
-
-        let kept = filter.push_snapshot(snapshot);
-
-        assert_eq!(kept.len(), 3);
-    }
-
-    #[test]
-    fn another_runs_events_are_ignored() {
-        let command = Id::new();
-        let other = Id::new();
-        let mut filter = FollowFilter::new(command);
-
-        let kept = filter.push_event(started(other, Id::new(), 1));
-
-        assert!(kept.is_empty());
-    }
-
-    #[test]
-    fn events_before_the_run_start_are_replayed_once() {
-        let command = Id::new();
-        let run = Id::new();
-        let mut filter = FollowFilter::new(command);
-        let user_message = event(
-            EventKind::MessageAdded,
-            serde_json::json!({"run": run, "chat": Id::new(), "text": "hi"}),
-            1,
+        assert!(error.to_string().contains("did not end"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait took {:?}",
+            started.elapsed()
         );
+        space.abort();
+    }
 
-        assert!(filter.push_event(user_message).is_empty());
-        let kept = filter.push_event(started(run, command, 2));
-        assert_eq!(kept.len(), 2);
-        assert_eq!(kept[0].kind, EventKind::MessageAdded);
-        assert_eq!(kept[1].kind, EventKind::RunStarted);
-        assert_eq!(filter.push_event(action(run, 3)).len(), 1);
+    #[tokio::test]
+    async fn a_space_that_never_opens_ends_the_run_wait() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = tokio::spawn(async move {
+            // Accept the connection and never answer the opening handshake.
+            let (_stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let started = std::time::Instant::now();
+        let error = timed_out_run_wait(&credential_at(address)).await;
+
+        assert!(error.to_string().contains("did not end"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the wait took {:?}",
+            started.elapsed()
+        );
+        space.abort();
     }
 }

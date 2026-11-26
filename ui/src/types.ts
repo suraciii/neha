@@ -84,14 +84,14 @@ export interface BotResult {
   chat: Chat;
 }
 
+// How a run is doing, from queued to finished.
+export type RunStatus = "queued" | "running" | "succeeded" | "failed";
+
+// The command result that starts a run: the Space accepts it into the queue.
 export interface SendResult {
   run: string;
-  message: string;
-  status: "succeeded" | "failed";
-  reply: string;
-  text: string;
-  error?: string;
-  usage?: unknown;
+  status: "queued";
+  position: number;
 }
 
 export interface ApiErrorBody {
@@ -106,10 +106,19 @@ export interface RunView {
   acting: string;
   command: string;
   message: string;
-  status: "running" | "succeeded" | "failed";
+  status: RunStatus;
+  seq: string;
+  // The run's place in its Bot's queue; only a queued run has one.
+  position?: number;
   reply: string | null;
   error: string | null;
   usage: unknown;
+}
+
+// What the Chat shows while its run has not finished.
+export interface RunProgress {
+  status: "queued" | "running";
+  position?: number;
 }
 
 export type Preview = { text: string; file: boolean } | { error: true } | null;

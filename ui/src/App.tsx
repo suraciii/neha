@@ -23,6 +23,7 @@ import type {
   BotResult,
   Preview,
   RecordEvent,
+  RunProgress,
   RunView,
   SendResult,
 } from "./types";
@@ -41,7 +42,12 @@ interface State {
   files: Record<string, FileSummary>;
   activeBot: Bot | null;
   activeComputer: Computer | null;
+  // A command (upload or send) is in flight; the composer waits for it.
+  submitting: boolean;
+  // The followed Run is running; the Chat shows the Bot working.
   working: boolean;
+  // The followed Run waits; the Chat shows the place it holds.
+  queue: RunProgress | null;
   busy: boolean;
   error: unknown | null;
 }
@@ -58,7 +64,9 @@ const emptyState: State = {
   files: {},
   activeBot: null,
   activeComputer: null,
+  submitting: false,
   working: false,
+  queue: null,
   busy: false,
   error: null,
 };
@@ -90,10 +98,79 @@ export default function App() {
   const commands = new Commands();
   let runGeneration = 0;
   let following = false;
-  let activeRun: string | null = null;
   let refreshTimer: number | null = null;
   let refreshAgain = false;
   let previewLoad = 0;
+
+  // The Run this page follows: the newest one it submitted, or the one its Chat
+  // was already running when it opened. It only moves forward, queued → running.
+  let followed: { run: string; step: "queued" | "running" } | null = null;
+  // Runs the record already reported finished: a late command result or answer
+  // must not revive them.
+  const settledRuns = new Set<string>();
+
+  // Whether the Chat on screen still belongs to this piece of work.
+  function isCurrentChat(chat: Chat, generation: number): boolean {
+    return generation === runGeneration && state.activeChat?.id === chat.id;
+  }
+
+  // The newest User request in a Chat. A Bot reply names its Run too, so only a
+  // User Message may start following a Run.
+  function newestRequestRun(messages: Message[]): string | null {
+    return [...messages].reverse().find((message) => message.author.kind === "user" && message.run)?.run ?? null;
+  }
+
+  function isFollowing(run: string): boolean {
+    return followed?.run === run;
+  }
+
+  // Follows one Run and shows the furthest state the page knows for it.
+  function followRun(run: string, step: "queued" | "running", position?: number) {
+    if (settledRuns.has(run)) return;
+    followed = { run, step };
+    if (step === "queued") update({ working: false, queue: { status: "queued", position } });
+    else update({ working: true, queue: null });
+  }
+
+  // Moves the followed Run forward. An answer older than the record cannot move
+  // it back, and a better place for the same wait still shows.
+  function advanceRun(run: string, step: "queued" | "running", position?: number) {
+    if (settledRuns.has(run)) return;
+    const current = followed;
+    if (!current) {
+      followRun(run, step, position);
+      return;
+    }
+    if (current.run !== run) return;
+    const rank = (value: "queued" | "running") => (value === "queued" ? 0 : 1);
+    if (rank(current.step) > rank(step)) return;
+    if (current.step === step) {
+      // The same wait, a better place.
+      if (step === "queued") update({ queue: { status: "queued", position } });
+      return;
+    }
+    followRun(run, step, position);
+  }
+
+  function clearFollowed() {
+    followed = null;
+    update({ working: false, queue: null });
+  }
+
+  // The record says this Run ended. Only the Run still followed may settle the
+  // Chat: a late answer about an earlier Run must not drop a newer one.
+  function finishFollowing(run: string) {
+    settledRuns.add(run);
+    if (isFollowing(run)) clearFollowed();
+  }
+
+  // Applies one record answer about the followed Run. The caller always asks
+  // about that Run, so a finished answer settles the Chat.
+  function applyRunView(view: RunView) {
+    if (view.status === "queued") advanceRun(view.id, "queued", view.position);
+    else if (view.status === "running") advanceRun(view.id, "running");
+    else finishFollowing(view.id);
+  }
 
   onSettled(() => {
     const query = window.matchMedia("(max-width: 900px)");
@@ -161,34 +238,59 @@ export default function App() {
       const file = typeof data.file === "string";
       setPreview(chat, { text, file });
     }
+    const run = typeof data.run === "string" ? data.run : null;
     if (event.kind === "neha.run.finished") {
-      const run = typeof data.run === "string" ? data.run : null;
-      const known = activeRun ?? latestRunForActiveChat();
-      // RunFinished carries no Chat. Only the active Chat's Run may unlock it.
-      if (!run || run !== known) return;
-      activeRun = null;
-      update({ working: false });
-      queueRefresh();
+      // RunFinished carries no Chat. Only the followed Run may settle the Chat.
+      if (!run) return;
+      if (isFollowing(run)) {
+        finishFollowing(run);
+        queueRefresh();
+        return;
+      }
+      settledRuns.add(run);
+      // A Run of this Bot ahead of ours may have ended and left a better place.
+      if (followed?.step === "queued") void refreshRunPlace(followed.run);
+      else if (run === newestRequestRun(state.messages)) queueRefresh();
+      return;
+    }
+    if (event.kind === "neha.run.queued") {
+      // The command result may hold an older place than the record does.
+      if (run && chat && state.activeChat?.id === chat && isFollowing(run)) void refreshRunPlace(run);
+      return;
+    }
+    if (event.kind === "neha.run.started") {
+      if (!run || !chat || state.activeChat?.id !== chat) return;
+      if (isFollowing(run)) {
+        advanceRun(run, "running");
+      } else if (followed) {
+        // Another Run of this Bot left the queue; read the place we hold now.
+        if (followed.step === "queued") void refreshRunPlace(followed.run);
+      } else {
+        // Another client started this Run; follow it from the record.
+        followRun(run, "running");
+      }
       return;
     }
     if (chat && state.activeChat?.id === chat) {
-      if (event.kind === "neha.run.started") {
-        const run = typeof data.run === "string" ? data.run : null;
-        if (run) activeRun = run;
-        update({ working: true });
-      }
       queueRefresh();
-      return;
     }
-    if (event.kind.startsWith("neha.run.") && state.working) queueRefresh();
   }
 
-  function latestRunForActiveChat(): string | null {
-    const chat = state.activeChat;
-    if (!chat) return null;
-    return [...state.messages].reverse().find((message) => message.chat === chat.id && message.run)?.run ?? null;
+  // Reads the place of the Run this page follows, once, from the record.
+  async function refreshRunPlace(run: string) {
+    if (!isFollowing(run) || settledRuns.has(run)) return;
+    const generation = runGeneration;
+    try {
+      const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      if (generation !== runGeneration || !isFollowing(run)) return;
+      applyRunView(view);
+      if (view.status !== "queued" && view.status !== "running") queueRefresh();
+    } catch {
+      // A Run that is gone leaves the finish event to settle the Chat.
+    }
   }
 
+  // Coalesces the record reads a burst of events asks for.
   function queueRefresh() {
     if (refreshTimer !== null) {
       refreshAgain = true;
@@ -196,7 +298,9 @@ export default function App() {
     }
     refreshTimer = window.setTimeout(() => {
       refreshTimer = null;
-      void refreshActive().finally(() => {
+      const chat = state.activeChat;
+      const refresh = chat ? refreshActive(chat, runGeneration) : Promise.resolve();
+      void refresh.finally(() => {
         if (refreshAgain) {
           refreshAgain = false;
           queueRefresh();
@@ -282,8 +386,8 @@ export default function App() {
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
-    activeRun = null;
-    update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
+    followed = null;
+    update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, submitting: false, working: false, queue: null, error: null });
     try {
       const [messages, files, bot] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
@@ -297,57 +401,61 @@ export default function App() {
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
-      await restoreRun(messages, generation);
+      await restoreRun(chat, messages, generation);
     } catch (reason) {
-      update({ error: reason });
+      if (isCurrentChat(chat, generation)) update({ error: reason });
     }
   }
 
-  async function restoreRun(messages: Message[], generation: number) {
-    const run = [...messages].reverse().find((message) => message.run)?.run;
-    if (!run || generation !== runGeneration) return;
+  async function restoreRun(chat: Chat, messages: Message[], generation: number) {
+    const run = newestRequestRun(messages);
+    if (!run || !isCurrentChat(chat, generation)) return;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
-      if (generation !== runGeneration) return;
-      if (view.status === "running") {
-        activeRun = run;
-        update({ working: true });
+      if (!isCurrentChat(chat, generation)) return;
+      if (view.status === "queued" || view.status === "running") {
+        // A waiting Run is unfinished too: show its place and follow it.
+        advanceRun(run, view.status, view.position);
       } else {
-        activeRun = null;
-        await refreshActive();
+        finishFollowing(run);
+        await refreshActive(chat, generation);
       }
     } catch {
       // A Run that is already gone leaves the recorded Messages in place.
     }
   }
 
-  async function reconcileRun(messages: Message[]) {
-    const run = [...messages].reverse().find((message) => message.run)?.run;
-    if (!run) return;
+  async function reconcileRun(chat: Chat, messages: Message[], generation: number) {
+    if (!isCurrentChat(chat, generation)) return;
+    // The followed Run owns the Chat; only a Chat that follows none discovers
+    // the newest request in the record.
+    const run = followed?.run ?? newestRequestRun(messages);
+    if (!run || settledRuns.has(run)) return;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
-      activeRun = view.status === "running" ? run : null;
-      update({ working: view.status === "running" });
+      if (!isCurrentChat(chat, generation)) return;
+      applyRunView(view);
     } catch {
-      activeRun = null;
-      update({ working: false });
+      // A late answer for a Chat the reader left must not touch the new one.
+      if (!isCurrentChat(chat, generation)) return;
+      if (isFollowing(run)) clearFollowed();
     }
   }
 
-  async function refreshActive() {
-    const chat = state.activeChat;
-    if (!chat) return;
+  async function refreshActive(chat: Chat, generation: number) {
+    if (!isCurrentChat(chat, generation)) return;
     try {
       const [messages, files] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
         commands.command<FileSummary[]>("file_list", { chat: chat.id }),
       ]);
+      if (!isCurrentChat(chat, generation)) return;
       update({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
-      await reconcileRun(messages);
+      await reconcileRun(chat, messages, generation);
     } catch (reason) {
-      update({ error: reason });
+      if (isCurrentChat(chat, generation)) update({ error: reason });
     }
   }
 
@@ -355,15 +463,18 @@ export default function App() {
   async function sendMessage(text: string, file: File | null): Promise<boolean> {
     const chat = state.activeChat;
     const bot = state.activeBot;
-    if (!chat || !bot || state.working) return false;
+    if (!chat || !bot || state.submitting) return false;
     if (!text && !file) return false;
+    const generation = runGeneration;
 
-    update({ working: true, error: null });
+    update({ submitting: true, error: null });
     let uploaded: FileSummary | null = null;
     if (file) {
-      uploaded = await upload(chat.id, file);
+      uploaded = await upload(chat, file, generation);
+      // The reader moved on; the accepted File belongs to the old Chat.
+      if (!isCurrentChat(chat, generation)) return true;
       if (!uploaded) {
-        update({ working: false });
+        update({ submitting: false });
         return false;
       }
       const saved = uploaded;
@@ -389,24 +500,33 @@ export default function App() {
       const result = await commands.command<SendResult>(
         "message_send",
         uploaded ? { chat: chat.id, text, file: uploaded.id } : { chat: chat.id, text },
-        180_000,
       );
-      await refreshActive();
-      if (result.status === "failed") {
-        update({ error: result.error ? result.error : { key: "error.botAnswer" } });
+      // The Space accepted the Message into its Bot's queue. The Chat stays
+      // available: the reader may put another request behind this Run.
+      if (!isCurrentChat(chat, generation)) return true;
+      if (settledRuns.has(result.run)) {
+        // The record already reported this Run finished before the answer came.
+        queueRefresh();
+      } else if (isFollowing(result.run)) {
+        // An event already moved this Run; the result can only add its place.
+        advanceRun(result.run, "queued", result.position);
+      } else {
+        followRun(result.run, "queued", result.position);
       }
+      queueRefresh();
     } catch (reason) {
+      if (!isCurrentChat(chat, generation)) return true;
       update({ error: reason });
-      await refreshActive();
+      await refreshActive(chat, generation);
     } finally {
-      update({ working: false });
+      if (isCurrentChat(chat, generation)) update({ submitting: false });
     }
 
     return true;
   }
 
   // Uploads one File, or shows why that failed and resolves null.
-  async function upload(chat: string, file: File): Promise<FileSummary | null> {
+  async function upload(chat: Chat, file: File, generation: number): Promise<FileSummary | null> {
     const tooLarge = () => ({
       key: "error.fileTooLarge",
       params: { name: file.name, limit: MAX_FILE_LABEL },
@@ -416,8 +536,9 @@ export default function App() {
       return null;
     }
     try {
-      return await api.uploadFile(chat, file, file.name, mediaTypeFor(file));
+      return await api.uploadFile(chat.id, file, file.name, mediaTypeFor(file));
     } catch (reason) {
+      if (!isCurrentChat(chat, generation)) return null;
       update({ error: reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason) });
       return null;
     }
@@ -483,8 +604,8 @@ export default function App() {
 
   function backToList() {
     runGeneration += 1;
-    activeRun = null;
-    update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
+    followed = null;
+    update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, submitting: false, working: false, queue: null, error: null });
   }
 
   const errorText = () => (state.error ? messageFor(state.error) : null);
@@ -543,7 +664,9 @@ export default function App() {
                   computer={state.activeComputer}
                   messages={state.messages}
                   files={state.files}
+                  submitting={state.submitting}
                   working={state.working}
+                  queue={state.queue}
                   error={errorText()}
                   onSend={sendMessage}
                   onBack={backToList}

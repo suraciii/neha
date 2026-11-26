@@ -102,6 +102,61 @@ fn run(home: &Path, credential: &Path, arguments: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+/// Starts the CLI in the background and returns a reader of its stdout.
+fn spawn_cli(
+    home: &Path,
+    credential: &Path,
+    arguments: &[&str],
+) -> (Child, mpsc::Receiver<String>) {
+    let mut child = Command::new(BIN)
+        .args(arguments)
+        .env("NEHA_HOME", home)
+        .env("NEHA_CREDENTIAL", credential)
+        .env("NEHA_PROVIDER_KEY", "sk-test")
+        .env("NEHA_PASSWORD", PASSWORD)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("neha runs");
+    let stdout = child.stdout.take().unwrap();
+    let (lines, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if lines.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    (child, received)
+}
+
+/// Reads a background CLI's stdout until it prints this line, appending to
+/// `output`.
+fn read_until(lines: &mpsc::Receiver<String>, output: &mut String, expected: &str) {
+    loop {
+        let line = lines
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("the CLI did not print `{expected}`:\n{output}"));
+        output.push_str(&line);
+        output.push('\n');
+        if line == expected {
+            return;
+        }
+    }
+}
+
+/// Waits for a background CLI and returns whether it succeeded and all stdout.
+fn finish(mut child: Child, lines: mpsc::Receiver<String>, output: String) -> (bool, String) {
+    let status = child.wait().expect("neha exits");
+    let mut output = output;
+    while let Ok(line) = lines.recv_timeout(Duration::from_secs(10)) {
+        output.push_str(&line);
+        output.push('\n');
+    }
+
+    (status.success(), output)
+}
+
 fn field(output: &str, prefix: &str) -> String {
     output
         .lines()
@@ -150,16 +205,50 @@ async fn unnamed_file_server(bytes: &'static [u8]) -> (String, tokio::task::Join
 #[derive(Clone, Debug)]
 enum ScriptedReply {
     Text(String),
+    /// Answers once the test releases it, so a run can be held open.
+    Hold(String),
     Tool {
         name: String,
         arguments: serde_json::Value,
     },
+    Fail,
+}
+
+/// The SSE body that answers a request with one text.
+fn text_body(text: &str) -> String {
+    format!(
+        "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
+        serde_json::to_string(text).unwrap()
+    )
+}
+
+/// Lets each held reply finish when the test releases it.
+#[derive(Clone)]
+struct Gate(Arc<tokio::sync::Semaphore>);
+
+impl Gate {
+    fn new() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(0)))
+    }
+
+    /// Lets one held reply finish.
+    fn release(&self) {
+        self.0.add_permits(1);
+    }
+
+    async fn wait(&self) {
+        // Spend the permit: one release lets one held reply finish.
+        if let Ok(permit) = self.0.acquire().await {
+            permit.forget();
+        }
+    }
 }
 
 /// The replies a fake Provider gives, one per request in the order queued.
 #[derive(Clone)]
 struct Script {
     replies: tokio::sync::mpsc::UnboundedSender<ScriptedReply>,
+    gate: Gate,
 }
 
 impl Script {
@@ -181,6 +270,21 @@ impl Script {
             arguments,
         });
     }
+
+    /// Refuses the next request, so its run fails.
+    fn fail(&self) {
+        self.push(ScriptedReply::Fail);
+    }
+
+    /// Answers the next request with this text, once the test releases it.
+    fn hold(&self, text: &str) {
+        self.push(ScriptedReply::Hold(text.to_owned()));
+    }
+
+    /// Lets the oldest held reply finish.
+    fn release(&self) {
+        self.gate.release();
+    }
 }
 
 async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
@@ -189,23 +293,33 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
     let (replies, queued) = tokio::sync::mpsc::unbounded_channel::<ScriptedReply>();
     let queued = Arc::new(tokio::sync::Mutex::new(queued));
     let requests = Arc::new(AtomicUsize::new(0));
+    let gate = Gate::new();
+    let script_gate = gate.clone();
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move || {
             let queued = Arc::clone(&queued);
             let requests = Arc::clone(&requests);
+            let gate = gate.clone();
             async move {
                 let index = requests.fetch_add(1, Ordering::SeqCst);
-                let reply = tokio::time::timeout(Duration::from_secs(10), queued.lock().await.recv())
-                    .await
-                    .expect("the fake Provider got more requests than the script answers")
-                    .expect("the script is closed");
+                let reply =
+                    tokio::time::timeout(Duration::from_secs(10), queued.lock().await.recv())
+                        .await
+                        .expect("the fake Provider got more requests than the script answers")
+                        .expect("the script is closed");
                 let body = match reply {
-                    ScriptedReply::Text(text) => {
-                        format!(
-                            "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\ndata: [DONE]\n\n",
-                            serde_json::to_string(&text).unwrap()
-                        )
+                    ScriptedReply::Text(text) => text_body(&text),
+                    ScriptedReply::Hold(text) => {
+                        gate.wait().await;
+                        text_body(&text)
+                    }
+                    ScriptedReply::Fail => {
+                        // A rejected request is not retried, so the run fails once.
+                        return Response::builder()
+                            .status(400)
+                            .body(axum::body::Body::from("the fake Provider refused"))
+                            .unwrap();
                     }
                     ScriptedReply::Tool { name, arguments } => {
                         let chunk = serde_json::json!({"choices":[{"delta":{"tool_calls":[{
@@ -233,7 +347,14 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
         let _ = axum::serve(listener, app).await;
     });
 
-    (format!("http://{addr}/v1"), Script { replies }, task)
+    (
+        format!("http://{addr}/v1"),
+        Script {
+            replies,
+            gate: script_gate,
+        },
+        task,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -614,6 +735,113 @@ async fn a_download_needs_a_space_name_only_when_the_destination_is_implicit() {
     assert!(stderr.contains("--out"), "{stderr}");
 
     space_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_message_waits_while_the_first_run_holds_the_bot() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential: PathBuf = directory.path().join("credential.json");
+    let (base, script, provider_task) = scripted_provider().await;
+    // The test holds the first two runs open, so each Message sees the place
+    // the Space recorded for it instead of racing a timer.
+    script.hold("First reply.");
+    script.hold("Second reply.");
+    script.say("Third reply.");
+
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    run(&home, &credential, &["bot", "create", "Scout"]);
+
+    let (first, first_lines) = spawn_cli(&home, &credential, &["chat", "send", "first"]);
+    let mut first_output = String::new();
+    read_until(&first_lines, &mut first_output, "running");
+    let (second, second_lines) = spawn_cli(&home, &credential, &["chat", "send", "second"]);
+    let mut second_output = String::new();
+    read_until(&second_lines, &mut second_output, "queued (position 2)");
+    let (third, third_lines) = spawn_cli(&home, &credential, &["chat", "send", "third"]);
+    let mut third_output = String::new();
+    read_until(&third_lines, &mut third_output, "queued (position 3)");
+
+    // The first run answers, the second run takes the Bot and waits, and the
+    // third Message moves up one place.
+    script.release();
+    read_until(&third_lines, &mut third_output, "waiting (position 2)");
+    // The second run answers, so the third run starts.
+    script.release();
+
+    let (first_ok, first_output) = finish(first, first_lines, first_output);
+    let (second_ok, second_output) = finish(second, second_lines, second_output);
+    let (third_ok, third_output) = finish(third, third_lines, third_output);
+
+    assert!(first_ok, "the first send failed:\n{first_output}");
+    assert!(
+        first_output.contains("queued (position 1)"),
+        "{first_output}"
+    );
+    assert!(first_output.contains("First reply."), "{first_output}");
+    assert!(second_ok, "the second send failed:\n{second_output}");
+    assert!(second_output.contains("Second reply."), "{second_output}");
+    assert!(third_ok, "the third send failed:\n{third_output}");
+    // The running run holds place 1, so the third Message joins at place 3 and
+    // moves up when the first run ends.
+    assert!(
+        third_output.contains("waiting (position 2)"),
+        "{third_output}"
+    );
+    assert!(third_output.contains("Third reply."), "{third_output}");
+
+    drop(server);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_run_reports_its_error_and_fails_the_command() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential: PathBuf = directory.path().join("credential.json");
+    let (base, script, provider_task) = scripted_provider().await;
+    script.fail();
+
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    run(&home, &credential, &["bot", "create", "Scout"]);
+
+    let failed = cli(&home, &credential, &["chat", "send", "please fail"]);
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(!failed.status.success(), "stdout: {stdout}");
+    assert!(stdout.contains("(failed)"), "stdout: {stdout}");
+    assert!(stderr.contains("could not answer"), "stderr: {stderr}");
+
+    drop(server);
+    provider_task.abort();
 }
 
 #[test]

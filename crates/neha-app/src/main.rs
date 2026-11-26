@@ -2,6 +2,9 @@
 
 mod client;
 
+use std::collections::HashMap;
+use std::io::Write;
+
 use anyhow::{Context as _, Result, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
@@ -493,22 +496,22 @@ async fn chat(command: ChatCommand) -> Result<()> {
                 text: text.unwrap_or_default(),
                 file: uploaded.as_ref().map(|file| file.id),
             });
-            let result = if follow {
-                client::command_following(&credential, command, |event| {
-                    print_progress(event);
-                })
-                .await?
-            } else {
-                client::command(&credential, command).await?
-            };
-            println!("{}", text_of(&result, "text")?);
-            println!(
-                "  run {} ({})",
-                id_of(&result, "run")?,
-                text_of(&result, "status")?
-            );
+            let result = client::command(&credential, command).await?;
+            let run = id_of(&result, "run")?;
+            let mut progress = Progress::new(follow);
+            progress.accepted(&result);
+            let view =
+                client::wait_for_run(&credential, run, |view| progress.observed(view)).await?;
+            let status = text_of(&view, "status")?;
+            if status == "succeeded" {
+                println!("{}", reply_text(&credential, chat, &view).await?);
+            }
+            println!("  run {run} ({status})");
             if let Some(file) = uploaded {
                 println!("  file {} ({})", file.id, file.name);
+            }
+            if status != "succeeded" {
+                bail!("{}", text_of(&view, "error").unwrap_or("the run failed"));
             }
         }
         ChatCommand::Files { chat, bot } => {
@@ -633,42 +636,56 @@ async fn run(command: RunCommand) -> Result<()> {
     match command {
         RunCommand::Show { run } => {
             let result = client::command(&credential, CommandCall::RunShow { run }).await?;
-            println!(
-                "Run {}: {}",
-                id_of(&result, "id")?,
-                text_of(&result, "status")?
-            );
-            if let Some(reply) = result["reply"].as_str() {
-                println!("  reply {}", reply);
-            }
-            if let Some(error) = result["error"].as_str() {
-                println!("  error {error}");
-            }
-            if !result["usage"].is_null() {
-                println!("  usage {}", result["usage"]);
-            }
-            if let Some(steps) = result["steps"].as_array() {
-                for step in steps {
-                    println!(
-                        "  step {}: {} tool call(s)",
-                        step["index"], step["tool_calls"]
-                    );
-                }
-            }
-            if let Some(actions) = result["actions"].as_array() {
-                for (index, action) in actions.iter().enumerate() {
-                    println!(
-                        "  action {} (step {}): {} ({})",
-                        index + 1,
-                        action["step"].as_u64().unwrap_or_default(),
-                        action["tool"].as_str().unwrap_or("?"),
-                        action["status"].as_str().unwrap_or("?")
-                    );
-                    if let Some(output) = action["output"].as_str() {
-                        for line in output.lines().take(8) {
-                            println!("    {line}");
-                        }
-                    }
+            let stdout = std::io::stdout();
+            write_run(&mut stdout.lock(), &result)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Prints one run the way `run show` reports it.
+fn write_run(out: &mut impl Write, result: &Value) -> Result<()> {
+    writeln!(
+        out,
+        "Run {}: {}",
+        id_of(result, "id")?,
+        text_of(result, "status")?
+    )?;
+    if let Some(position) = result["position"].as_u64() {
+        writeln!(out, "  position {position}")?;
+    }
+    if let Some(reply) = result["reply"].as_str() {
+        writeln!(out, "  reply {reply}")?;
+    }
+    if let Some(error) = result["error"].as_str() {
+        writeln!(out, "  error {error}")?;
+    }
+    if !result["usage"].is_null() {
+        writeln!(out, "  usage {}", result["usage"])?;
+    }
+    if let Some(steps) = result["steps"].as_array() {
+        for step in steps {
+            writeln!(
+                out,
+                "  step {}: {} tool call(s)",
+                step["index"], step["tool_calls"]
+            )?;
+        }
+    }
+    if let Some(actions) = result["actions"].as_array() {
+        for (index, action) in actions.iter().enumerate() {
+            writeln!(
+                out,
+                "  action {} (step {}): {} ({})",
+                index + 1,
+                action["step"].as_u64().unwrap_or_default(),
+                action["tool"].as_str().unwrap_or("?"),
+                action["status"].as_str().unwrap_or("?")
+            )?;
+            if let Some(output) = action["output"].as_str() {
+                for line in output.lines().take(8) {
+                    writeln!(out, "    {line}")?;
                 }
             }
         }
@@ -677,29 +694,118 @@ async fn run(command: RunCommand) -> Result<()> {
     Ok(())
 }
 
-fn print_progress(event: &neha::record::Event) {
-    match event.kind.as_str() {
-        "neha.run.step" => {
-            let step = &event.data["step"];
-            let calls = &event.data["tool_calls"];
-            eprintln!("  step {step}: {calls} tool call(s)");
+/// Reads the text of the Message a finished run replied with.
+async fn reply_text(credential: &Credential, chat: Id, run: &Value) -> Result<String> {
+    let reply = run["reply"]
+        .as_str()
+        .context("the run has no reply Message")?;
+    let messages = client::command(credential, CommandCall::ChatRead { chat, from: None }).await?;
+    let message = messages
+        .as_array()
+        .context("no Messages in the answer")?
+        .iter()
+        .find(|message| message["id"].as_str() == Some(reply))
+        .with_context(|| format!("the reply Message {reply} is not in the Chat"))?;
+
+    Ok(text_of(message, "text")?.to_owned())
+}
+
+/// Prints a run's progress while the CLI waits for it to end.
+struct Progress {
+    /// Whether to print the run's steps and actions as they appear.
+    follow: bool,
+    /// The queue place printed last, if the run was queued.
+    queued: Option<u64>,
+    /// Whether the start of the run was printed.
+    running: bool,
+    /// How many steps were printed.
+    steps: usize,
+    /// The status printed last for each action.
+    actions: HashMap<String, String>,
+}
+
+impl Progress {
+    fn new(follow: bool) -> Self {
+        Self {
+            follow,
+            queued: None,
+            running: false,
+            steps: 0,
+            actions: HashMap::new(),
         }
-        "neha.action.started" => {
-            eprintln!(
-                "  action {} (step {}): running",
-                event.data["tool"].as_str().unwrap_or("?"),
-                event.data["step"]
-            );
+    }
+
+    /// Prints what the command's own result says about the run.
+    fn accepted(&mut self, result: &Value) {
+        match result["status"].as_str() {
+            Some("queued") => {
+                let position = result["position"].as_u64().unwrap_or(1);
+                println!("queued (position {position})");
+                self.queued = Some(position);
+            }
+            Some("running") => {
+                println!("running");
+                self.running = true;
+            }
+            _ => {}
         }
-        "neha.action.finished" => {
-            eprintln!(
-                "  action {} (step {}): {}",
-                event.data["tool"].as_str().unwrap_or("?"),
-                event.data["step"],
-                event.data["status"].as_str().unwrap_or("?")
-            );
+    }
+
+    /// Prints what a poll of the run shows that the CLI has not shown yet.
+    fn observed(&mut self, view: &Value) {
+        match view["status"].as_str() {
+            Some("queued") => {
+                let position = view["position"]
+                    .as_u64()
+                    .unwrap_or_else(|| self.queued.unwrap_or(1));
+                if self.queued != Some(position) {
+                    println!("waiting (position {position})");
+                    self.queued = Some(position);
+                }
+            }
+            Some("running") if !self.running => {
+                println!("running");
+                self.running = true;
+            }
+            _ => {}
         }
-        _ => {}
+        if self.follow {
+            self.show_progress(view);
+        }
+    }
+
+    /// Prints the steps and actions the run recorded since the last poll.
+    fn show_progress(&mut self, view: &Value) {
+        if let Some(steps) = view["steps"].as_array() {
+            for step in steps.iter().skip(self.steps) {
+                eprintln!(
+                    "  step {}: {} tool call(s)",
+                    step["index"], step["tool_calls"]
+                );
+            }
+            self.steps = steps.len();
+        }
+        if let Some(actions) = view["actions"].as_array() {
+            for action in actions {
+                let id = action["id"].as_str().unwrap_or_default().to_owned();
+                let status = action["status"].as_str().unwrap_or("unknown");
+                if self.actions.get(&id).is_some_and(|shown| shown == status) {
+                    continue;
+                }
+                // An action is still running until its final status is known.
+                let shown = if status == "unknown" {
+                    "running"
+                } else {
+                    status
+                };
+                eprintln!(
+                    "  action {} (step {}): {shown}",
+                    action["tool"].as_str().unwrap_or("?"),
+                    action["step"]
+                );
+                self.actions.insert(id, status.to_owned());
+            }
+        }
     }
 }
 
@@ -741,7 +847,48 @@ fn text_of<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
-    use super::space_file_name;
+    use neha::id::Id;
+    use serde_json::json;
+
+    use super::{space_file_name, write_run};
+
+    /// One run as `run show` reports it.
+    fn run_view(status: &str, position: Option<u32>) -> serde_json::Value {
+        let mut view = json!({
+            "id": Id::new(),
+            "chat": Id::new(),
+            "bot": Id::new(),
+            "acting": Id::new(),
+            "command": Id::new(),
+            "message": Id::new(),
+            "status": status,
+            "reply": null,
+            "error": null,
+            "usage": null,
+            "steps": [],
+            "actions": [],
+        });
+        if let Some(position) = position {
+            view["position"] = position.into();
+        }
+        view
+    }
+
+    #[test]
+    fn a_queued_run_shows_its_place_and_a_running_one_does_not() {
+        let queued = run_view("queued", Some(2));
+        let mut shown = Vec::new();
+        write_run(&mut shown, &queued).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains("queued"), "{shown}");
+        assert!(shown.contains("  position 2"), "{shown}");
+
+        let running = run_view("running", None);
+        let mut shown = Vec::new();
+        write_run(&mut shown, &running).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(!shown.contains("position"), "{shown}");
+    }
 
     #[test]
     fn a_space_name_is_a_file_name_only_when_it_is_one_path_component() {

@@ -76,6 +76,8 @@ A User who is not allowed sees the Bot's name and picture in shared Groups and n
 
 A Bot's work is in progress, waiting, or done. While it is in progress, a User redirects it by sending a Message, and stops it by saying so.
 
+A Bot works on one request at a time. A later request waits in a queue, and the Chat shows how many requests are ahead of it.
+
 When work fails, the Bot says so as a Message, and the work is done.
 
 A Bot asks for information, a decision, or an approval in the Chat or Group where the request was made.

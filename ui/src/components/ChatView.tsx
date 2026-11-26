@@ -3,7 +3,7 @@ import { For, Show, createEffect, createSignal } from "solid-js";
 import { locale, t } from "../i18n";
 import { dayLabel, timeOfDay } from "../lib/format";
 import { formatBytes } from "../lib/files";
-import type { Account, Bot, Computer, FileSummary, Message } from "../types";
+import type { Account, Bot, Computer, FileSummary, Message, RunProgress } from "../types";
 import Avatar from "./Avatar";
 import FileCard from "./FileCard";
 import Icon from "./Icon";
@@ -15,7 +15,12 @@ interface ChatViewProps {
   computer: Computer | null;
   messages: Message[];
   files: Record<string, FileSummary>;
+  // A command is in flight; the composer waits for its answer.
+  submitting: boolean;
+  // The followed Run is running; the Bot is working.
   working: boolean;
+  // The followed Run waits; the Chat shows the place it holds.
+  queue: RunProgress | null;
   error: string | null;
   // Resolves false when nothing left the composer, which keeps its Message.
   onSend: (text: string, file: File | null) => Promise<boolean>;
@@ -41,7 +46,18 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const canSend = () =>
-    !props.working && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+    !props.submitting && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+
+  // How many requests a waiting Run has ahead. A running Run shows the Bot
+  // working instead, so the two never show together.
+  const queueLabel = (): string | null => {
+    const queue = props.queue;
+    if (!queue || queue.status !== "queued") return null;
+    // The running run holds place 1, so place N has N - 1 requests ahead.
+    const ahead = Math.max((queue.position ?? 1) - 1, 0);
+    if (ahead === 0) return t("chat.queue.queued");
+    return t(ahead === 1 ? "chat.queue.waiting.one" : "chat.queue.waiting.many", { count: ahead });
+  };
 
   async function send(event?: SubmitEvent) {
     event?.preventDefault();
@@ -209,6 +225,13 @@ export default function ChatView(props: ChatViewProps) {
             </div>
           )}
         </Show>
+        <Show when={queueLabel()}>
+          {(label) => (
+            <p class="composer__queue" role="status">
+              {label()}
+            </p>
+          )}
+        </Show>
         <textarea
           ref={composer}
           class="composer__input"
@@ -229,7 +252,7 @@ export default function ChatView(props: ChatViewProps) {
               type="button"
               aria-label={t("chat.attach")}
               title={t("chat.attach")}
-              disabled={!props.bot || props.working}
+              disabled={!props.bot || props.submitting}
               onClick={() => picker?.click()}
             >
               <Icon name="paperclip" size="sm" />
@@ -251,7 +274,7 @@ export default function ChatView(props: ChatViewProps) {
           type="file"
           aria-hidden="true"
           tabindex={-1}
-          disabled={!props.bot || props.working}
+          disabled={!props.bot || props.submitting}
           onChange={pick}
         />
       </form>
