@@ -148,16 +148,22 @@ where
         messages.push(Message::assistant_with_calls(reply.content, calls.clone()));
         for (index, call) in calls.iter().enumerate() {
             let action = Id::new();
-            let arguments = if call.arguments.len() > MAX_RECORDED_ARGUMENTS {
-                serde_json::json!({"truncated": true, "bytes": call.arguments.len()})
-            } else {
-                serde_json::from_str(&call.arguments)
-                    .unwrap_or_else(|_| Value::String(call.arguments.clone()))
+            // A call that will run keeps its real arguments in the record.
+            // Only a call that is refused may be summarized.
+            let validated = tools::action(&call.name, &call.arguments);
+            let arguments = match (&validated, call.arguments.len() > MAX_RECORDED_ARGUMENTS) {
+                (Ok(_), _) => serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+                (Err(_), true) => {
+                    serde_json::json!({"truncated": true, "bytes": call.arguments.len()})
+                }
+                (Err(_), false) => serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| Value::String(call.arguments.clone())),
             };
             recorder
                 .action_started(step, action, call.name.clone(), arguments)
                 .await?;
-            let result = match tools::action(&call.name, &call.arguments) {
+            let result = match validated {
                 Ok(computer_action) => runtime.execute(computer_action).await,
                 Err(error) => neha_computer::ActionResult::failed(error),
             };

@@ -66,10 +66,10 @@ The final reply still prints on standard output; progress prints on standard err
 
 The local runtime enforces these limits, and an action that breaks one returns an error to the Model instead of failing the whole run:
 
-- A path must stay inside the workspace. Absolute paths outside it, `..` climbs, and symlinks that lead outside are refused.
+- A path must stay inside the workspace. Absolute paths outside it, `..` climbs, and any symlink in the path are refused, including a dangling symlink a write could follow.
 - A shell command has 30 seconds. When it runs past the limit, the Space kills the whole process group.
 - The shell starts with an empty environment and only `PATH`, `HOME` (the workspace), and `TMPDIR` (the workspace's `.tmp`) set. Provider keys and other Space secrets are not in that environment. The runtime is not isolated, so a shell command still has the Space user's file access; run only prompts you trust.
-- A tool result keeps its first 8 KiB and last 24 KiB and names the omitted byte count, including output beyond the capture limit. A write is limited to 64 KiB; a read returns at most 8 MiB, keeping its head and true tail.
+- A tool result keeps its first 8 KiB and last 24 KiB and names the omitted byte count, including output beyond the capture limit. A write is limited to 64 KiB. A file read reads at most 8 MiB, then shows its first 8 KiB and last 24 KiB with the omitted count.
 - A run stops after 8 steps. If the Model keeps asking for tools, the Bot answers with a failure Message and the Space stays available.
 
 ## What the milestone does not do

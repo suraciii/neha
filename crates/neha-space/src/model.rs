@@ -297,8 +297,13 @@ impl ModelClient {
             }
             let chunk: Chunk = serde_json::from_str(data).map_err(|_| ModelError::Protocol)?;
             if let Some(choice) = chunk.choices.first() {
-                if choice.finish_reason.is_some() {
-                    finished = true;
+                if let Some(reason) = choice.finish_reason.as_deref() {
+                    match reason {
+                        "stop" | "tool_calls" | "function_call" => finished = true,
+                        "length" => return Err(ModelError::Truncated),
+                        "content_filter" => return Err(ModelError::Filtered),
+                        _ => return Err(ModelError::Protocol),
+                    }
                 }
                 if let Some(delta) = &choice.delta.content {
                     text.push_str(delta);
@@ -640,6 +645,12 @@ pub enum ModelError {
     /// The provider stream ended before it said the reply was complete.
     #[error("the Provider closed the stream before the reply was complete")]
     StreamEnded,
+    /// The provider cut the reply at its output limit.
+    #[error("the Provider cut the reply at its output limit")]
+    Truncated,
+    /// The provider filtered the reply.
+    #[error("the Provider filtered the reply")]
+    Filtered,
     /// The Provider's stream did not fit the protocol.
     #[error("the Provider's reply did not fit the protocol")]
     Protocol,
@@ -684,6 +695,8 @@ impl ModelError {
             Self::ContextTooLarge
             | Self::Empty
             | Self::Protocol
+            | Self::Truncated
+            | Self::Filtered
             | Self::Provider(_)
             | Self::Request(_) => ErrorCode::InvalidArgument,
         }
@@ -883,6 +896,42 @@ mod tests {
 
         assert!(matches!(error, Err(ModelError::StreamEnded)));
         assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_length_finish_releases_no_tool_call() {
+        let chunk = serde_json::json!({"choices":[{
+            "delta": {"tool_calls":[{
+                "index": 0,
+                "id": "call-1",
+                "type": "function",
+                "function": {
+                    "name": "write_file",
+                    "arguments": "{\"path\":\"a.txt\",\"content\":\"a\"}",
+                },
+            }]},
+            "finish_reason": "length",
+        }]});
+        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let sse = sse.clone();
+                async move {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(sse))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await;
+
+        assert!(matches!(error, Err(ModelError::Truncated)), "{error:?}");
         task.abort();
     }
 

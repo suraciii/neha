@@ -732,7 +732,9 @@ async fn catch_up(
         .await
         .map_err(|_| StreamError::Closed)?;
         sent = true;
-        if complete < page_size {
+        let trimmed = next < page.next;
+        // A full page or a trimmed page leaves more to read.
+        if complete < page_size && !trimmed {
             return Ok(next);
         }
         cursor = next;
@@ -1232,6 +1234,8 @@ mod tests {
     enum ScriptedReply {
         Text(String),
         Tool { name: String, arguments: Value },
+        RawTool { name: String, arguments: String },
+        TruncatedTool { name: String, arguments: Value },
     }
 
     async fn scripted_provider(
@@ -1277,6 +1281,30 @@ mod tests {
                             }]}}]});
                             format!("data: {chunk}\n\ndata: [DONE]\n\n")
                         }
+                        ScriptedReply::RawTool { name, arguments } => {
+                            let chunk = json!({"choices":[{"delta":{"tool_calls":[{
+                                "index": 0,
+                                "id": format!("call-{index}"),
+                                "type": "function",
+                                "function": {"name": name, "arguments": arguments},
+                            }]}}]});
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
+                        ScriptedReply::TruncatedTool { name, arguments } => {
+                            let chunk = json!({"choices":[{
+                                "delta": {"tool_calls":[{
+                                    "index": 0,
+                                    "id": format!("call-{index}"),
+                                    "type": "function",
+                                    "function": {
+                                        "name": name,
+                                        "arguments": serde_json::to_string(&arguments).unwrap(),
+                                    },
+                                }]},
+                                "finish_reason": "length",
+                            }]});
+                            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                        }
                     };
                     Response::builder()
                         .header(CONTENT_TYPE, "text/event-stream")
@@ -1303,6 +1331,20 @@ mod tests {
 
     fn text(text: &str) -> ScriptedReply {
         ScriptedReply::Text(text.to_owned())
+    }
+
+    fn raw_tool(name: &str, arguments: String) -> ScriptedReply {
+        ScriptedReply::RawTool {
+            name: name.to_owned(),
+            arguments,
+        }
+    }
+
+    fn truncated_tool(name: &str, arguments: Value) -> ScriptedReply {
+        ScriptedReply::TruncatedTool {
+            name: name.to_owned(),
+            arguments,
+        }
     }
 
     async fn open_socket(running: &Running, token: &str) -> Socket {
@@ -2617,13 +2659,9 @@ mod tests {
         let reader = store.reader();
         let (out, mut frames) = tokio::sync::mpsc::channel(8);
 
-        let first = catch_up(&reader, &out, neha::seq::Seq::ZERO, None)
-            .await
-            .unwrap();
-        let second = catch_up(&reader, &out, first, None).await;
+        let result = catch_up(&reader, &out, neha::seq::Seq::ZERO, None).await;
 
-        assert_eq!(first, neha::seq::Seq::from_i64(1).unwrap());
-        assert!(matches!(second, Err(StreamError::Oversized(_))));
+        assert!(matches!(result, Err(StreamError::Oversized(_))));
         assert!(matches!(
             frames.try_recv(),
             Ok(ServerFrame::Snapshot { .. })
@@ -3080,6 +3118,227 @@ mod tests {
         );
         socket.close(None).await.unwrap();
         provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_truncated_tool_call_does_not_run() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            truncated_tool(
+                "write_file",
+                json!({"path": "truncated.txt", "content": "never written"}),
+            ),
+            text("unused"),
+        ])
+        .await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "write a file").await;
+
+        assert_eq!(result["status"], "failed");
+        assert!(
+            result["text"].as_str().unwrap().contains("output limit"),
+            "{}",
+            result["text"]
+        );
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "failed");
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert!(!workspace.join("truncated.txt").exists());
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unicode_write_arguments_are_recorded_in_full() {
+        use neha::record::EventKind;
+
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let content = "漢".repeat(21_800);
+        let raw = format!(
+            "{{\"path\":\"unicode.txt\",\"content\":\"{}\"}}",
+            "\\u6f22".repeat(21_800)
+        );
+        let (base, provider_task) = scripted_provider(vec![
+            raw_tool("write_file", raw),
+            text("I wrote the unicode file."),
+        ])
+        .await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "write unicode text").await;
+
+        assert_eq!(result["status"], "succeeded");
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert_eq!(
+            std::fs::read(workspace.join("unicode.txt")).unwrap().len(),
+            65_400
+        );
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+        let home = Home::open(&root).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let page = store.events_from(Seq::ZERO, 1000).await.unwrap();
+        let started = page
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::ActionStarted)
+            .expect("an action event");
+        assert_eq!(
+            started.data["arguments"]["content"].as_str(),
+            Some(content.as_str()),
+            "a running action must keep its real arguments"
+        );
+        store.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_long_record_of_large_events_catches_up_across_frames() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let user = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let run = Id::new();
+        let command = Id::new();
+        let message = Id::new();
+        let mut drafts = vec![
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": command,
+                    "message": message,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunStep,
+                Author::Bot(bot),
+                json!({"run": run, "step": 1, "tool_calls": 18}),
+            )
+            .acting(user),
+        ];
+        for index in 0..18 {
+            let action = Id::new();
+            drafts.push(
+                EventDraft::new(
+                    EventKind::ActionStarted,
+                    Author::Bot(bot),
+                    json!({
+                        "run": run,
+                        "step": 1,
+                        "action": action,
+                        "tool": "write_file",
+                        "arguments": {
+                            "path": format!("big-{index}.txt"),
+                            "content": "x".repeat(60 * 1024),
+                        },
+                    }),
+                )
+                .acting(user),
+            );
+            drafts.push(
+                EventDraft::new(
+                    EventKind::ActionFinished,
+                    Author::Bot(bot),
+                    json!({
+                        "run": run,
+                        "step": 1,
+                        "action": action,
+                        "tool": "write_file",
+                        "status": "succeeded",
+                        "output": "ok",
+                    }),
+                )
+                .acting(user),
+            );
+        }
+        drafts.push(
+            EventDraft::new(
+                EventKind::RunFinished,
+                Author::Bot(bot),
+                json!({"run": run, "status": "succeeded", "reply": null, "usage": null}),
+            )
+            .acting(user),
+        );
+        store
+            .append(AppendRequest::new(command, "seed", drafts))
+            .await
+            .unwrap();
+        let last = store.last_seq().await.unwrap();
+        store.close().await.unwrap();
+
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().unwrap();
+        let (mut socket, _token) = admin(&running, &invite).await;
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut snapshots = 0;
+        while !seen.contains(&last.as_i64()) {
+            let frame =
+                tokio::time::timeout(std::time::Duration::from_secs(10), next_frame(&mut socket))
+                    .await
+                    .expect("the stream keeps sending");
+            match frame {
+                ServerFrame::Snapshot { cursor, events } => {
+                    snapshots += 1;
+                    assert!(cursor >= events.last().map(|event| event.seq).unwrap_or(cursor));
+                    for event in events {
+                        seen.insert(event.seq.as_i64());
+                    }
+                }
+                ServerFrame::Event { event } => {
+                    seen.insert(event.seq.as_i64());
+                }
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Accepted { .. }
+                | ServerFrame::Committed { .. }
+                | ServerFrame::Confirmed { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+
+        assert!(snapshots >= 2, "the record must be split across frames");
+        let recorded: Vec<i64> = seen
+            .iter()
+            .copied()
+            .filter(|seq| *seq <= last.as_i64())
+            .collect();
+        assert_eq!(recorded, (1..=last.as_i64()).collect::<Vec<_>>());
+        socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 }

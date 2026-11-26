@@ -19,10 +19,12 @@ use crate::output::{HEAD_BYTES, TAIL_BYTES, truncate};
 /// The time a shell command may run before its process group is killed.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-const MAX_WRITE_BYTES: usize = 64 * 1024;
+/// The largest file a write tool accepts.
+pub const MAX_WRITE_BYTES: usize = 64 * 1024;
 const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 1000;
-const MAX_COMMAND_BYTES: usize = 64 * 1024;
+/// The largest shell command a tool accepts.
+pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// A Computer runtime backed by one workspace directory.
@@ -296,10 +298,14 @@ impl LocalRuntime {
         if timed_out {
             text = format!("the command ran past its time limit and was killed\n{text}");
         }
+        let truncated = stdout_truncated || stderr_truncated;
+        let captured = truncate(text);
         let output = ToolOutput {
-            text,
-            truncated: stdout_truncated || stderr_truncated,
-            omitted_bytes: stdout_omitted.saturating_add(stderr_omitted),
+            text: captured.text,
+            truncated: truncated || captured.truncated,
+            omitted_bytes: stdout_omitted
+                .saturating_add(stderr_omitted)
+                .saturating_add(captured.omitted_bytes),
         };
         if timed_out {
             return ActionResult {
@@ -400,9 +406,14 @@ async fn drain(
     let Some(task) = task else {
         return (Bounded::default(), false);
     };
+    let abort = task.abort_handle();
     match tokio::time::timeout(grace, task).await {
         Ok(Ok(Ok(bounded))) => (bounded, false),
-        _ => (Bounded::default(), true),
+        Ok(_) => (Bounded::default(), true),
+        Err(_) => {
+            abort.abort();
+            (Bounded::default(), true)
+        }
     }
 }
 
@@ -615,6 +626,27 @@ mod tests {
 
         assert_eq!(result.status, ActionStatus::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn stdout_and_stderr_share_one_output_budget() {
+        let (_dir, runtime) = runtime();
+        let result = runtime
+            .execute(Action::Shell {
+                command: "head -c 30000 /dev/zero | tr '\\0' 'a'; \
+                          head -c 30000 /dev/zero | tr '\\0' 'b' >&2"
+                    .to_owned(),
+            })
+            .await;
+
+        assert!(result.output.truncated);
+        assert!(result.output.omitted_bytes > 0);
+        assert!(
+            result.output.text.len() < 40_000,
+            "the combined result is {} bytes",
+            result.output.text.len()
+        );
+        assert!(result.output.text.contains("bytes omitted"));
     }
 
     #[cfg(unix)]

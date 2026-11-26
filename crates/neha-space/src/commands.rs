@@ -462,7 +462,7 @@ pub async fn finish_run(
         Err(error) => {
             let outcome = RunOutcome {
                 text: format!("I could not finish the run: {error}"),
-                usage: neha::usage::Usage::default(),
+                usage: known_usage(state, pending.run),
                 succeeded: false,
             };
             return finish_completion(store, state, pending, outcome).await;
@@ -490,6 +490,20 @@ async fn finish_completion(
     .await?;
 
     Ok((result, completion.events))
+}
+
+fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {
+    let Ok(state) = state.lock() else {
+        return neha::usage::Usage::default();
+    };
+    let Some(run) = state.runs.get(&run) else {
+        return neha::usage::Usage::default();
+    };
+
+    run.steps
+        .iter()
+        .filter_map(|step| step.usage)
+        .fold(neha::usage::Usage::default(), |total, usage| total + usage)
 }
 
 fn completion_drafts(pending: &PendingRun, outcome: RunOutcome) -> (Vec<EventDraft>, Value) {

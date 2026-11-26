@@ -1,6 +1,7 @@
 //! The built-in tools and their schemas.
 
 use neha_computer::Action;
+use neha_computer::local::{MAX_COMMAND_BYTES, MAX_WRITE_BYTES};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -82,6 +83,11 @@ pub fn action(name: &str, arguments: &str) -> Result<Action, String> {
             if arguments.command.trim().is_empty() {
                 return Err("the shell tool needs a command".to_owned());
             }
+            if arguments.command.len() > MAX_COMMAND_BYTES {
+                return Err(format!(
+                    "the command is larger than {MAX_COMMAND_BYTES} bytes"
+                ));
+            }
             Ok(Action::Shell {
                 command: arguments.command,
             })
@@ -96,6 +102,11 @@ pub fn action(name: &str, arguments: &str) -> Result<Action, String> {
         WRITE_FILE => {
             let arguments: WriteArguments =
                 serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            if arguments.content.len() > MAX_WRITE_BYTES {
+                return Err(format!(
+                    "the content is larger than {MAX_WRITE_BYTES} bytes"
+                ));
+            }
             Ok(Action::WriteFile {
                 path: arguments.path,
                 content: arguments.content,
