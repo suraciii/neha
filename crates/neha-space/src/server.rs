@@ -13080,8 +13080,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_resumed_run_rebuilds_the_history_it_first_saw() {
         let (_dir, running, invite) = running().await;
-        let (base, provider_task, _gates, recorded) = gated_provider(vec![
-            text("A done"),
+        let (base, provider_task, gates, recorded) = gated_provider(vec![
+            hold("A done"),
             tool("read_file", json!({"path": "a.txt"})),
             text("C done"),
             text("B done"),
@@ -13096,12 +13096,43 @@ mod tests {
         let mut device = connect_computer(&running, &machine, computer).await;
         wait_online(&mut socket, computer).await;
 
-        // A starts; B queues behind it before A's answer exists.
-        let _a = submit(&mut socket, chat, "A task", None).await;
+        // A starts and holds its answer; B queues behind it before that answer
+        // exists.
+        let a = run_of(&submit(&mut socket, chat, "A task", None).await);
         let b = run_of(&submit(&mut socket, chat, "B task", None).await);
+        gates[0].open();
         let approval: Id =
             serde_json::from_value(approval_for_run(&mut socket, b).await["approval"].clone())
                 .unwrap();
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let seq_of = |kind: EventKind, run: Id| {
+            events
+                .iter()
+                .find(|event| event.kind == kind && event.data["run"] == json!(run))
+                .unwrap_or_else(|| panic!("no {kind:?} for {run}"))
+                .seq
+        };
+        let queued = seq_of(EventKind::RunQueued, b);
+        let answered = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::MessageAdded
+                    && event.data["run"] == json!(a)
+                    && matches!(event.author, Author::Bot(_))
+            })
+            .expect("A's answer")
+            .seq;
+        let started = seq_of(EventKind::RunStarted, b);
+        assert!(
+            queued < answered && answered < started,
+            "B queued before A answered, and started after: {queued} < {answered} < {started}"
+        );
         // C runs while B waits; B must resume on the history it first saw.
         let c = run_of(&submit(&mut socket, chat, "C task", None).await);
         assert_eq!(wait_run(&mut socket, c).await["status"], "succeeded");
