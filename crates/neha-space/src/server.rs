@@ -791,6 +791,11 @@ async fn recover_interrupted(store: &Store, state: &mut SpaceState) -> Result<()
     for run in interrupted {
         let message = Id::new();
         let text = "I was interrupted before I could answer.";
+        let usage = run
+            .steps
+            .iter()
+            .filter_map(|step| step.usage)
+            .fold(neha::usage::Usage::default(), |total, usage| total + usage);
         let drafts = vec![
             EventDraft::new(
                 EventKind::MessageAdded,
@@ -805,6 +810,7 @@ async fn recover_interrupted(store: &Store, state: &mut SpaceState) -> Result<()
                     "run": run.id,
                     "status": crate::state::RunStatus::Failed,
                     "reply": message,
+                    "usage": usage,
                     "error": "the Space stopped before the run finished",
                 }),
             )
@@ -1768,6 +1774,17 @@ mod tests {
                 }),
             )
             .acting(user),
+            EventDraft::new(
+                EventKind::RunStep,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "usage": {"uncached_input": 5, "cache_read": 0, "cache_write": 0, "output": 2, "reasoning": 0},
+                    "tool_calls": 0,
+                }),
+            )
+            .acting(user),
         ];
         store
             .append(AppendRequest::new(command, "seed", drafts))
@@ -1781,6 +1798,7 @@ mod tests {
             let recovered = &state.runs[&run];
 
             assert_eq!(recovered.status, crate::state::RunStatus::Failed);
+            assert_eq!(recovered.usage.unwrap().budgeted(), 7);
             assert_eq!(recovered.reply, Some(state.messages.last().unwrap().id));
             assert_eq!(
                 state.messages.last().unwrap().text,
@@ -2982,6 +3000,85 @@ mod tests {
         assert_ne!(messages[1]["text"], messages[3]["text"]);
         first.close(None).await.unwrap();
         second.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_large_write_is_still_inspectable() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let content = "x".repeat(60 * 1024);
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "write_file",
+                json!({"path": "large.txt", "content": content}),
+            ),
+            text("I wrote the large file."),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "write a large file").await;
+
+        assert_eq!(result["status"], "succeeded");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        let action = &shown["actions"][0];
+        assert_eq!(action["tool"], "write_file");
+        assert_eq!(action["arguments"]["truncated"], true);
+        assert!(
+            action["arguments"]["bytes"].as_u64().unwrap() >= 60 * 1024,
+            "{}",
+            action["arguments"]
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_computer_that_cannot_start_fails_the_run() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        std::fs::write(workspace.join(".tmp"), "not a directory").unwrap();
+
+        let result = send(&mut socket, chat, "hello").await;
+
+        assert_eq!(result["status"], "failed");
+        assert!(
+            result["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not start my Computer"),
+            "{}",
+            result["text"]
+        );
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "failed");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let last = messages.as_array().unwrap().last().unwrap();
+        assert_eq!(last["author"]["kind"], "bot");
+        assert!(
+            last["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not start my Computer")
+        );
+        socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
     }

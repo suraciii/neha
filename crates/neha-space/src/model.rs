@@ -230,12 +230,11 @@ impl ModelClient {
                 .map(|message| WireMessage {
                     role: message.role,
                     content: message.content.as_deref(),
-                    tool_calls: message
-                        .tool_calls
-                        .iter()
-                        .map(WireToolCall::from)
-                        .collect::<Vec<_>>()
-                        .into(),
+                    tool_calls: if message.tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(message.tool_calls.iter().map(WireToolCall::from).collect())
+                    },
                     tool_call_id: message.tool_call_id.as_deref(),
                 })
                 .collect(),
@@ -282,6 +281,7 @@ impl ModelClient {
         let mut calls: std::collections::BTreeMap<u32, ChatToolCall> =
             std::collections::BTreeMap::new();
         let mut usage = Usage::default();
+        let mut finished = false;
         while let Some(event) = events.next().await {
             let event = event.map_err(|_| ModelError::Transport)?;
             if event.event == "error" {
@@ -292,10 +292,14 @@ impl ModelClient {
                 continue;
             }
             if data == "[DONE]" {
+                finished = true;
                 break;
             }
             let chunk: Chunk = serde_json::from_str(data).map_err(|_| ModelError::Protocol)?;
             if let Some(choice) = chunk.choices.first() {
+                if choice.finish_reason.is_some() {
+                    finished = true;
+                }
                 if let Some(delta) = &choice.delta.content {
                     text.push_str(delta);
                 }
@@ -319,6 +323,9 @@ impl ModelClient {
             if let Some(reported) = chunk.usage {
                 usage = reported.normalize();
             }
+        }
+        if !finished {
+            return Err(ModelError::StreamEnded);
         }
         let tool_calls: Vec<ChatToolCall> = calls.into_values().collect();
         if text.is_empty() && tool_calls.is_empty() {
@@ -536,6 +543,8 @@ struct Chunk {
 struct Choice {
     #[serde(default)]
     delta: Delta,
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -628,6 +637,9 @@ pub enum ModelError {
     /// The reply was empty.
     #[error("the Model returned an empty reply")]
     Empty,
+    /// The provider stream ended before it said the reply was complete.
+    #[error("the Provider closed the stream before the reply was complete")]
+    StreamEnded,
     /// The Provider's stream did not fit the protocol.
     #[error("the Provider's reply did not fit the protocol")]
     Protocol,
@@ -645,7 +657,11 @@ impl ModelError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            Self::RateLimited { .. } | Self::Server { .. } | Self::Transport | Self::Empty
+            Self::RateLimited { .. }
+                | Self::Server { .. }
+                | Self::Transport
+                | Self::Empty
+                | Self::StreamEnded
         )
     }
 
@@ -664,7 +680,7 @@ impl ModelError {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
             Self::RateLimited { .. } => ErrorCode::RateLimited,
-            Self::Server { .. } | Self::Transport => ErrorCode::Unavailable,
+            Self::Server { .. } | Self::Transport | Self::StreamEnded => ErrorCode::Unavailable,
             Self::ContextTooLarge
             | Self::Empty
             | Self::Protocol
@@ -777,6 +793,11 @@ mod tests {
                     body["messages"][0]["role"], "system",
                     "the adapter sends roles"
                 );
+                assert!(
+                    body["messages"][0].get("tool_calls").is_none(),
+                    "a plain message must not carry an empty tool_calls field"
+                );
+                assert!(body["messages"][1].get("tool_calls").is_none());
                 Response::builder()
                     .header(CONTENT_TYPE, "text/event-stream")
                     .body(Body::from(sse))
@@ -799,6 +820,69 @@ mod tests {
         assert_eq!(reply.tool_calls[0].name, "read_file");
         assert_eq!(reply.tool_calls[0].arguments, "{\"path\":\"a.txt\"}");
         assert!(reply.text.is_empty());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn parses_two_tool_calls_from_one_chunk() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"tool_calls\":[\
+            {\"index\":0,\"id\":\"a\",\"type\":\"function\",\"function\":\
+            {\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}},\
+            {\"index\":1,\"id\":\"b\",\"type\":\"function\",\"function\":\
+            {\"name\":\"list_files\",\"arguments\":\"{\\\"path\\\":\\\".\\\"}\"}}]}}]}\n\n\
+            data: [DONE]\n\n";
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || async move {
+                Response::builder()
+                    .header(CONTENT_TYPE, "text/event-stream")
+                    .body(Body::from(sse))
+                    .unwrap()
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let reply = client.chat(request(&base, "sk-test")).await.unwrap();
+
+        assert_eq!(reply.tool_calls.len(), 2);
+        assert_eq!(reply.tool_calls[0].id, "a");
+        assert_eq!(reply.tool_calls[0].name, "read_file");
+        assert_eq!(reply.tool_calls[1].id, "b");
+        assert_eq!(reply.tool_calls[1].name, "list_files");
+        assert_eq!(reply.tool_calls[1].arguments, "{\"path\":\".\"}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stream_that_ends_early_is_retried_and_never_released() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await;
+
+        assert!(matches!(error, Err(ModelError::StreamEnded)));
+        assert_eq!(attempts.load(Ordering::SeqCst), 5);
         task.abort();
     }
 

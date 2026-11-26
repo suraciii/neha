@@ -529,14 +529,14 @@ fn print_progress(event: &neha::record::Event) {
         }
         "neha.action.started" => {
             eprintln!(
-                "  action {} ({}) requested",
+                "  action {} (step {}): running",
                 event.data["tool"].as_str().unwrap_or("?"),
                 event.data["step"]
             );
         }
         "neha.action.finished" => {
             eprintln!(
-                "  action {} ({}) {}",
+                "  action {} (step {}): {}",
                 event.data["tool"].as_str().unwrap_or("?"),
                 event.data["step"],
                 event.data["status"].as_str().unwrap_or("?")

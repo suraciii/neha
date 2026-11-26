@@ -16,6 +16,9 @@ use thiserror::Error;
 use crate::model::{Message, Model, ModelFailure, ModelRequest, ToolCall};
 use crate::tools;
 
+/// The largest raw tool-call arguments string a step event keeps whole.
+const MAX_RECORDED_ARGUMENTS: usize = 128 * 1024;
+
 /// What one run needs to start.
 pub struct RunRequest {
     /// The system instruction.
@@ -145,8 +148,12 @@ where
         messages.push(Message::assistant_with_calls(reply.content, calls.clone()));
         for (index, call) in calls.iter().enumerate() {
             let action = Id::new();
-            let arguments = serde_json::from_str(&call.arguments)
-                .unwrap_or_else(|_| Value::String(call.arguments.clone()));
+            let arguments = if call.arguments.len() > MAX_RECORDED_ARGUMENTS {
+                serde_json::json!({"truncated": true, "bytes": call.arguments.len()})
+            } else {
+                serde_json::from_str(&call.arguments)
+                    .unwrap_or_else(|_| Value::String(call.arguments.clone()))
+            };
             recorder
                 .action_started(step, action, call.name.clone(), arguments)
                 .await?;
@@ -455,6 +462,80 @@ mod tests {
         assert_eq!(
             requests[1].messages.last().unwrap().tool_call_id.as_deref(),
             Some("call-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_tool_is_recorded_and_returned_to_the_model() {
+        let model = FakeModel::with(vec![
+            call_reply("no_such_tool", json!({"x": 1})),
+            reply("the tool did not exist"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.succeeded);
+        assert_eq!(recorder.started[0].1, "no_such_tool");
+        assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
+        let requests = model.requests.lock().unwrap();
+        let tool_message = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == crate::model::Role::Tool)
+            .unwrap();
+        assert!(
+            tool_message
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("no tool named"),
+            "{tool_message:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_arguments_are_returned_to_the_model() {
+        let mut reply_with_bad_arguments = call_reply("write_file", json!({}));
+        if let Ok(reply) = &mut reply_with_bad_arguments {
+            reply.tool_calls[0].arguments = "not json".to_owned();
+        }
+        let model = FakeModel::with(vec![reply_with_bad_arguments, reply("bad call")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let outcome = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            RunRequest::new("system", Vec::new(), 100),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.succeeded);
+        assert_eq!(recorder.finished[0].1, ActionStatus::Failed);
+        let requests = model.requests.lock().unwrap();
+        let tool_message = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == crate::model::Role::Tool)
+            .unwrap();
+        assert!(
+            tool_message
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("expected"),
+            "{tool_message:?}"
         );
     }
 

@@ -202,12 +202,35 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
     Ok((token, account))
 }
 
-/// Runs one command and returns its result, reporting live events.
+/// Runs one command and returns its result, reporting its own run's events.
 pub async fn command_following(
     credential: &Credential,
     command: CommandCall,
     mut on_event: impl FnMut(&neha::record::Event),
 ) -> Result<Value> {
+    fn started_run(event: &neha::record::Event, command: &Id) -> Option<Id> {
+        if event.kind != neha::record::EventKind::RunStarted {
+            return None;
+        }
+        let started_for = event.data.get("command")?.as_str()?;
+        if started_for != command.to_string() {
+            return None;
+        }
+        serde_json::from_value(event.data.get("run")?.clone()).ok()
+    }
+
+    fn belongs_to(event: &neha::record::Event, run: Option<Id>) -> bool {
+        let Some(run) = run else {
+            return false;
+        };
+        event
+            .data
+            .get("run")
+            .and_then(|value| serde_json::from_value::<Id>(value.clone()).ok())
+            == Some(run)
+    }
+
+    let command_id = Id::new();
     let mut socket = connect(credential).await?;
     socket
         .send(Message::Text(
@@ -223,7 +246,7 @@ pub async fn command_following(
     socket
         .send(Message::Text(
             serde_json::to_string(&ClientFrame::Command {
-                id: Id::new(),
+                id: command_id,
                 command,
             })?
             .into(),
@@ -231,6 +254,8 @@ pub async fn command_following(
         .await
         .context("cannot send the command")?;
 
+    let mut target = None;
+    let mut pending = Vec::new();
     loop {
         let Some(message) = socket.next().await else {
             bail!("the Space closed the connection");
@@ -245,13 +270,38 @@ pub async fn command_following(
                 bail!("the Space refused ({code}): {message}");
             }
             Ok(ServerFrame::ProtocolError { message }) => {
-                bail!("the Space could not read the command: {message}");
+                bail!("the Space ended the subscription: {message}");
             }
-            Ok(ServerFrame::Event { event }) => on_event(&event),
+            Ok(ServerFrame::Event { event }) => {
+                if target.is_none() {
+                    target = started_run(&event, &command_id);
+                    pending.push(event);
+                    if target.is_some() {
+                        for event in pending.drain(..) {
+                            if belongs_to(&event, target) {
+                                on_event(&event);
+                            }
+                        }
+                    }
+                } else if belongs_to(&event, target) {
+                    on_event(&event);
+                }
+            }
+            Ok(ServerFrame::Snapshot { events, .. }) => {
+                if target.is_none() {
+                    target = events
+                        .iter()
+                        .find_map(|event| started_run(event, &command_id));
+                }
+                for event in events {
+                    if belongs_to(&event, target) {
+                        on_event(&event);
+                    }
+                }
+            }
             Ok(
                 ServerFrame::Accepted { .. }
                 | ServerFrame::Committed { .. }
-                | ServerFrame::Snapshot { .. }
                 | ServerFrame::Hello { .. }
                 | ServerFrame::Heartbeat { .. },
             ) => {}

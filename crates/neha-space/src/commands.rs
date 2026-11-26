@@ -166,7 +166,7 @@ pub async fn execute(
                 .get(&run)
                 .filter(|run| run.acting == account.id)
                 .ok_or_else(|| ApiError::not_found("no such run"))?;
-            serde_json::to_value(run).map_err(json_error)
+            bounded_run(run)
         }),
     }
 }
@@ -423,9 +423,17 @@ pub async fn finish_run(
     pending: PendingRun,
 ) -> Result<(Value, Vec<Event>), ApiError> {
     let history = build_history(state, &pending)?;
-    let runtime = LocalRuntime::new(home.workspace_dir(pending.bot.computer))
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .with_timeout(tool_timeout);
+    let runtime = match LocalRuntime::new(home.workspace_dir(pending.bot.computer)) {
+        Ok(runtime) => runtime.with_timeout(tool_timeout),
+        Err(error) => {
+            let outcome = RunOutcome {
+                text: format!("I could not start my Computer: {error}"),
+                usage: neha::usage::Usage::default(),
+                succeeded: false,
+            };
+            return finish_completion(store, state, pending, outcome).await;
+        }
+    };
     let space_model = SpaceModel::new(
         model,
         &pending.provider.base_url,
@@ -449,10 +457,26 @@ pub async fn finish_run(
         history,
         pending.model.max_output,
     );
-    let outcome = neha_loop::run(&runtime, &space_model, &mut recorder, request)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let outcome = match neha_loop::run(&runtime, &space_model, &mut recorder, request).await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let outcome = RunOutcome {
+                text: format!("I could not finish the run: {error}"),
+                usage: neha::usage::Usage::default(),
+                succeeded: false,
+            };
+            return finish_completion(store, state, pending, outcome).await;
+        }
+    };
+    finish_completion(store, state, pending, outcome).await
+}
 
+async fn finish_completion(
+    store: &Store,
+    state: &Mutex<State>,
+    pending: PendingRun,
+    outcome: RunOutcome,
+) -> Result<(Value, Vec<Event>), ApiError> {
     let (drafts, result) = completion_drafts(&pending, outcome);
     let completion = append(
         store,
@@ -614,6 +638,68 @@ impl Recorder for RunRecorder<'_> {
         ))
         .await
     }
+}
+
+const RUN_ACTION_ARGUMENT_BYTES: usize = 16 * 1024;
+const RUN_SHOW_BYTES: usize = 700 * 1024;
+
+fn bounded_run(run: &crate::state::RunView) -> Result<Value, ApiError> {
+    let mut value = serde_json::to_value(run).map_err(json_error)?;
+    if let Some(actions) = value.get_mut("actions").and_then(Value::as_array_mut) {
+        for action in actions.iter_mut() {
+            let Some(arguments) = action.get("arguments").cloned() else {
+                continue;
+            };
+            let encoded = serde_json::to_string(&arguments).map_err(json_error)?;
+            if encoded.len() > RUN_ACTION_ARGUMENT_BYTES {
+                action["arguments"] = json!({"truncated": true, "bytes": encoded.len()});
+            }
+        }
+    }
+    if serde_json::to_vec(&value).map_err(json_error)?.len() <= RUN_SHOW_BYTES {
+        return Ok(value);
+    }
+
+    // A very large run still shows its steps and a summary of its actions.
+    let actions = value["actions"].as_array().cloned().unwrap_or_default();
+    let compact: Vec<Value> = actions
+        .iter()
+        .map(|action| {
+            json!({
+                "id": action["id"],
+                "step": action["step"],
+                "tool": action["tool"],
+                "status": action["status"],
+                "error": action["error"],
+                "truncated": true,
+                "output": action["output"].as_str().map(|text| {
+                    text.chars().take(512).collect::<String>()
+                }),
+            })
+        })
+        .collect();
+    value["actions"] = Value::Array(compact);
+    value["truncated"] = json!(true);
+    if serde_json::to_vec(&value).map_err(json_error)?.len() <= RUN_SHOW_BYTES {
+        return Ok(value);
+    }
+
+    let steps = value["steps"].clone();
+    Ok(json!({
+        "id": run.id,
+        "chat": run.chat,
+        "bot": run.bot,
+        "acting": run.acting,
+        "command": run.command,
+        "message": run.message,
+        "status": run.status,
+        "reply": run.reply,
+        "usage": run.usage,
+        "error": run.error,
+        "steps": steps,
+        "actions": [],
+        "truncated": true,
+    }))
 }
 
 fn preflight(
