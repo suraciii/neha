@@ -4,6 +4,7 @@
 //! every change enters it as an event whose sequence number is the cursor a
 //! reader resumes from.
 
+pub mod blobs;
 pub mod commands;
 pub mod home;
 pub mod identity;
@@ -14,13 +15,14 @@ pub mod server;
 pub mod state;
 pub mod store;
 
+pub use blobs::{Blobs, BlobsError};
 pub use home::{Home, HomeError, SCHEMA_VERSION};
 pub use identity::{Account, Identity, IdentityError};
 pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage};
 pub use secrets::{Secrets, SecretsError};
 pub use server::{Running, ServerError, SpaceServer, start, start_with_ui};
 pub use state::{
-    BotView, ChatView, ComputerView, MessageView, ModelView, ProviderView, RunStatus, RunView,
-    State, UserView,
+    BotView, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView, RunStatus,
+    RunView, State, UserView,
 };
 pub use store::{AppendRequest, AppendResult, EventPage, Projection, Store, StoreError};

@@ -876,6 +876,59 @@ code,
   line-height: 1.6;
 }
 
+.file-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 100%;
+  margin-top: 6px;
+  padding: 8px 12px 8px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--raised);
+  color: var(--ink);
+  text-decoration: none;
+  transition: border-color 140ms var(--ease-soft), background 140ms var(--ease-soft);
+}
+.file-card:hover {
+  border-color: var(--line-strong);
+}
+.msg__text + .file-card {
+  margin-top: 8px;
+}
+.msg--user .file-card {
+  background: var(--sunken);
+}
+.file-card__icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--r-sm);
+  background: var(--accent-wash);
+  color: var(--accent);
+}
+.file-card__text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.file-card__name {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-card__size {
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+.file-card__action {
+  color: var(--ink-4);
+}
+
 .work-bars {
   display: flex;
   gap: 3px;
@@ -910,6 +963,7 @@ code,
 }
 
 .composer {
+  position: relative;
   width: min(100% - 40px, 880px);
   margin: 0 auto 20px;
   padding: 12px 12px 10px;
@@ -952,6 +1006,74 @@ code,
 .composer__hint {
   color: var(--ink-4);
   font-size: var(--text-2xs);
+}
+
+.composer__tools {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.composer__attach {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  color: var(--ink-3);
+  transition: background 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+.composer__attach:hover:not(:disabled) {
+  background: var(--sunken);
+  color: var(--ink);
+}
+
+/* The picker stays in the form and clickable, but out of sight. */
+.composer__picker {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 4px 6px 4px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-wash);
+  color: var(--ink-2);
+  font-size: var(--text-sm);
+}
+.attachment__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.attachment__size {
+  flex: none;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+.attachment__remove {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  color: var(--ink-3);
+}
+.attachment__remove:hover {
+  background: var(--accent-line);
+  color: var(--ink);
 }
 
 /* -------------------------------------------------------------- setup --- */

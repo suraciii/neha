@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::ErrorCode;
 use crate::id::Id;
 use crate::record::{Author, Event};
-use crate::time::Timestamp;
 use crate::seq::Seq;
+use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -261,13 +261,26 @@ mod tests {
 
     #[test]
     fn a_message_send_round_trips() {
-        let command = CommandCall::MessageSend(MessageSend {
-            chat: Id::new(),
+        let chat = Id::new();
+        let plain = CommandCall::MessageSend(MessageSend {
+            chat,
             text: "hello".to_owned(),
+            file: None,
         });
-        let text = serde_json::to_string(&command).unwrap();
+        let text = serde_json::to_string(&plain).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), plain);
+        assert!(
+            !text.contains("\"file\""),
+            "a Message without a File omits it"
+        );
 
-        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+        let file = CommandCall::MessageSend(MessageSend {
+            chat,
+            text: String::new(),
+            file: Some(Id::new()),
+        });
+        let text = serde_json::to_string(&file).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), file);
     }
 
     #[test]

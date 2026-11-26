@@ -3,6 +3,7 @@
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -69,14 +70,23 @@ fn serve(home: &Path) -> (SpaceProcess, String, Option<String>) {
 }
 
 fn cli(home: &Path, credential: &Path, arguments: &[&str]) -> Output {
-    Command::new(BIN)
+    cli_in(None, home, credential, arguments)
+}
+
+/// Runs the CLI, optionally from another directory than this test's.
+fn cli_in(directory: Option<&Path>, home: &Path, credential: &Path, arguments: &[&str]) -> Output {
+    let mut command = Command::new(BIN);
+    command
         .args(arguments)
         .env("NEHA_HOME", home)
         .env("NEHA_CREDENTIAL", credential)
         .env("NEHA_PROVIDER_KEY", "sk-test")
-        .env("NEHA_PASSWORD", PASSWORD)
-        .output()
-        .expect("neha runs")
+        .env("NEHA_PASSWORD", PASSWORD);
+    if let Some(directory) = directory {
+        command.current_dir(directory);
+    }
+
+    command.output().expect("neha runs")
 }
 
 fn run(home: &Path, credential: &Path, arguments: &[&str]) -> String {
@@ -125,7 +135,7 @@ async fn fake_provider() -> (String, tokio::task::JoinHandle<()>) {
     (format!("http://{addr}/v1"), task)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum ScriptedReply {
     Text(String),
     Tool {
@@ -134,20 +144,50 @@ enum ScriptedReply {
     },
 }
 
-async fn scripted_provider(script: Vec<ScriptedReply>) -> (String, tokio::task::JoinHandle<()>) {
-    use std::sync::Arc;
+/// The replies a fake Provider gives, one per request in the order queued.
+#[derive(Clone)]
+struct Script {
+    replies: tokio::sync::mpsc::UnboundedSender<ScriptedReply>,
+}
+
+impl Script {
+    fn push(&self, reply: ScriptedReply) {
+        self.replies
+            .send(reply)
+            .expect("the fake Provider is still running");
+    }
+
+    /// Answers the next request with this text.
+    fn say(&self, text: &str) {
+        self.push(ScriptedReply::Text(text.to_owned()));
+    }
+
+    /// Answers the next request with one tool call.
+    fn call(&self, name: &str, arguments: serde_json::Value) {
+        self.push(ScriptedReply::Tool {
+            name: name.to_owned(),
+            arguments,
+        });
+    }
+}
+
+async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    let script = Arc::new(script);
+    let (replies, queued) = tokio::sync::mpsc::unbounded_channel::<ScriptedReply>();
+    let queued = Arc::new(tokio::sync::Mutex::new(queued));
     let requests = Arc::new(AtomicUsize::new(0));
     let app = Router::new().route(
         "/v1/chat/completions",
         post(move || {
-            let script = Arc::clone(&script);
+            let queued = Arc::clone(&queued);
             let requests = Arc::clone(&requests);
             async move {
                 let index = requests.fetch_add(1, Ordering::SeqCst);
-                let reply = script.get(index).cloned().unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(10), queued.lock().await.recv())
+                    .await
+                    .expect("the fake Provider got more requests than the script answers")
+                    .expect("the script is closed");
                 let body = match reply {
                     ScriptedReply::Text(text) => {
                         format!(
@@ -181,7 +221,7 @@ async fn scripted_provider(script: Vec<ScriptedReply>) -> (String, tokio::task::
         let _ = axum::serve(listener, app).await;
     });
 
-    (format!("http://{addr}/v1"), task)
+    (format!("http://{addr}/v1"), Script { replies }, task)
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -189,23 +229,15 @@ async fn a_bot_works_on_its_computer_with_tools() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let credential: PathBuf = directory.path().join("credential.json");
-    let (base, provider_task) = scripted_provider(vec![
-        ScriptedReply::Tool {
-            name: "write_file".to_owned(),
-            arguments: serde_json::json!({"path": "hello.txt", "content": "hello neha"}),
-        },
-        ScriptedReply::Tool {
-            name: "read_file".to_owned(),
-            arguments: serde_json::json!({"path": "hello.txt"}),
-        },
-        ScriptedReply::Text("The file says hello neha.".to_owned()),
-        ScriptedReply::Tool {
-            name: "shell".to_owned(),
-            arguments: serde_json::json!({"command": "printf 42"}),
-        },
-        ScriptedReply::Text("The command printed 42.".to_owned()),
-    ])
-    .await;
+    let (base, script, provider_task) = scripted_provider().await;
+    script.call(
+        "write_file",
+        serde_json::json!({"path": "hello.txt", "content": "hello neha"}),
+    );
+    script.call("read_file", serde_json::json!({"path": "hello.txt"}));
+    script.say("The file says hello neha.");
+    script.call("shell", serde_json::json!({"command": "printf 42"}));
+    script.say("The command printed 42.");
 
     let (server, _url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
@@ -352,6 +384,168 @@ async fn a_user_runs_a_space_and_chats_with_a_bot() {
 
     provider_task.abort();
     assert!(!url.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_travels_between_a_user_and_a_bot() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential: PathBuf = directory.path().join("credential.json");
+    let downloads = directory.path().join("downloads");
+    std::fs::create_dir(&downloads).unwrap();
+    let notes = directory.path().join("notes.txt");
+    std::fs::write(&notes, "the quick brown fox\n").unwrap();
+    let notes = notes.to_str().unwrap();
+    let (base, script, provider_task) = scripted_provider().await;
+
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = field(&created, "Created Bot ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let computer = field(&created, "Computer:");
+    let chat = field(&created, "Chat:");
+
+    // A Message needs text, a File, or both.
+    let nothing = cli(&home, &credential, &["chat", "send"]);
+    assert!(!nothing.status.success());
+    assert!(
+        String::from_utf8_lossy(&nothing.stderr).contains("--file"),
+        "stderr: {}",
+        String::from_utf8_lossy(&nothing.stderr)
+    );
+
+    // A File alone is a Message.
+    script.say("Got the file.");
+    let sent = run(&home, &credential, &["chat", "send", "--file", notes]);
+    assert!(sent.contains("Got the file."), "{sent}");
+    let file = field(&sent, "file ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let read = run(&home, &credential, &["chat", "read", &chat]);
+    assert!(read.contains(&format!("User:\n  file {file}")), "{read}");
+    let listed = run(&home, &credential, &["chat", "files"]);
+    assert!(
+        listed.contains(&format!("{file}  notes.txt  20 bytes  text/plain")),
+        "{listed}"
+    );
+
+    // The default destination is the current directory, under the File's name.
+    let got = cli_in(
+        Some(&downloads),
+        &home,
+        &credential,
+        &["file", "get", &file],
+    );
+    assert!(
+        got.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&got.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&got.stdout).contains("notes.txt"),
+        "stdout: {}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(downloads.join("notes.txt")).unwrap(),
+        "the quick brown fox\n"
+    );
+    // It never replaces a file the User already has.
+    let again = cli_in(
+        Some(&downloads),
+        &home,
+        &credential,
+        &["file", "get", &file],
+    );
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+
+    // The Bot takes the File into its Workspace and delivers one back.
+    script.call("take_file", serde_json::json!({ "file": file }));
+    script.call(
+        "write_file",
+        serde_json::json!({ "path": "answer.txt", "content": "the answer" }),
+    );
+    script.call("put_file", serde_json::json!({ "path": "answer.txt" }));
+    script.say("Done.");
+    let answered = run(
+        &home,
+        &credential,
+        &["chat", "send", "--chat", &chat, "please answer"],
+    );
+    assert!(answered.contains("Done."), "{answered}");
+    let workspace = home.join("computers").join(&computer).join("workspace");
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("notes.txt")).unwrap(),
+        "the quick brown fox\n"
+    );
+    let listed = run(&home, &credential, &["chat", "files", "--bot", &bot]);
+    let delivered = listed
+        .lines()
+        .find(|line| line.contains("answer.txt"))
+        .and_then(|line| line.split_whitespace().next())
+        .expect("the Bot's File is listed");
+    let out = downloads.join("fetched.txt");
+    run(
+        &home,
+        &credential,
+        &["file", "get", delivered, "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "the answer");
+
+    // A File the Space cannot hold never leaves this machine.
+    let big = directory.path().join("big.bin");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(neha::file::MAX_FILE_BYTES + 1)
+        .unwrap();
+    let refused = cli(
+        &home,
+        &credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &chat,
+            "--file",
+            big.to_str().unwrap(),
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("at most"));
+    let listed = run(&home, &credential, &["chat", "files", "--chat", &chat]);
+    assert_eq!(listed.lines().count(), 2, "{listed}");
+
+    // A File the Space does not hold is refused by name.
+    let missing = cli(
+        &home,
+        &credential,
+        &["file", "get", &neha::id::Id::new().to_string()],
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("not_found"));
+
+    drop(server);
+    provider_task.abort();
 }
 
 #[test]

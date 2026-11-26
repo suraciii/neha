@@ -4,7 +4,7 @@ This guide shows a Bot using the built-in tools to work in its Computer's worksp
 
 ## What the Bot has
 
-Every Bot has four tools:
+A Bot has six tools. Four of them work in the workspace:
 
 | Tool | What it does |
 | --- | --- |
@@ -12,6 +12,8 @@ Every Bot has four tools:
 | `read_file` | Reads a file in the workspace. |
 | `write_file` | Writes a file in the workspace. |
 | `list_files` | Lists a directory in the workspace. |
+
+The other two, `take_file` and `put_file`, move Files in and out of the workspace. [Send and receive Files](files.md) shows them.
 
 The loop offers these tools to the Model. When the Model asks for a tool, the Space records the action, runs it on the Bot's Computer, records the result, and gives the result back to the Model. The Bot can take several steps this way before it answers in the Chat.
 

@@ -2,7 +2,7 @@
 
 ## Authority
 
-Owned by messaging. A Message depends on [Space](../../space/product.md) to hold its Files and on [User](../../../CONTEXT.md) and [Bot](../../bot/product.md) as its authors.
+Owned by messaging. A Message depends on [Space](../../space/product.md) to hold its Files, on [Computer](../../computer/product.md) for the Workspace a Bot moves Files in and out of, and on [User](../../../CONTEXT.md) and [Bot](../../bot/product.md) as its authors.
 
 ## Laws
 
@@ -31,11 +31,23 @@ A Card has a kind. Neha provides four kinds, and a Plugin can add more.
 
 ## Files
 
-A Message names a File by its id, and the record keeps the File's name, type, and size.
+A Message carries at most one File. A Message names the File by its id, and the record keeps the File's name, type, and size.
 
-A File lives in the Space. A Message with a File reads the same from every client.
+A File belongs to the Chat or Group it was sent in. The Files of a Chat or Group form one list, in the order they were sent. [Search](../search/product.md) covers finding a File by its name.
+
+A File lives in the Space. A Message with a File reads the same from every client, and any client that reads the Message downloads the same File.
 
 A File is readable wherever a Message carrying it is readable.
+
+A File moves in three ways:
+
+| Who | Move | What happens |
+| --- | --- | --- |
+| A User | Sends | A Message carries one File, with or without text |
+| A Bot | Delivers | A Message from the Bot carries a file of its Workspace as a File |
+| A Bot | Takes | A copy of a File of the conversation is written into its Workspace under the File's name. The File stays in the conversation. |
+
+A File is at most 32 MiB. The Space refuses a larger file, tells the sender, and records no File and no Message.
 
 ## Threads
 

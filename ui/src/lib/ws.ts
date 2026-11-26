@@ -33,6 +33,7 @@ type CommandName =
   | "bot_show"
   | "chat_list"
   | "chat_read"
+  | "file_list"
   | "message_send"
   | "run_show";
 

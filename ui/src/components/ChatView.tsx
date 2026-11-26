@@ -2,8 +2,10 @@ import { For, Show, createEffect, createSignal } from "solid-js";
 
 import { locale, t } from "../i18n";
 import { dayLabel, timeOfDay } from "../lib/format";
-import type { Account, Bot, Computer, Message } from "../types";
+import { formatBytes } from "../lib/files";
+import type { Account, Bot, Computer, FileSummary, Message } from "../types";
 import Avatar from "./Avatar";
+import FileCard from "./FileCard";
 import Icon from "./Icon";
 import LocaleSwitch from "./LocaleSwitch";
 
@@ -12,9 +14,11 @@ interface ChatViewProps {
   bot: Bot | null;
   computer: Computer | null;
   messages: Message[];
+  files: Record<string, FileSummary>;
   working: boolean;
   error: string | null;
-  onSend: (text: string) => void;
+  // Resolves false when nothing left the composer, which keeps its Message.
+  onSend: (text: string, file: File | null) => Promise<boolean>;
   onBack: () => void;
 }
 
@@ -22,8 +26,10 @@ const suggestions = ["chat.suggestion.hello", "chat.suggestion.work", "chat.sugg
 
 export default function ChatView(props: ChatViewProps) {
   const [draft, setDraft] = createSignal("");
+  const [attachment, setAttachment] = createSignal<File | null>(null);
   let stream: HTMLDivElement | undefined;
   let composer: HTMLTextAreaElement | undefined;
+  let picker: HTMLInputElement | undefined;
 
   createEffect(() => {
     props.messages.length;
@@ -33,12 +39,20 @@ export default function ChatView(props: ChatViewProps) {
     });
   });
 
-  function send(event?: SubmitEvent) {
+  const canSend = () =>
+    !props.working && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+
+  async function send(event?: SubmitEvent) {
     event?.preventDefault();
     const text = draft().trim();
-    if (!text || props.working) return;
+    const file = attachment();
+    if (!canSend()) return;
     setDraft("");
-    props.onSend(text);
+    setAttachment(null);
+    if (!(await props.onSend(text, file))) {
+      setDraft(text);
+      setAttachment(file);
+    }
     if (composer) composer.focus();
   }
 
@@ -46,8 +60,15 @@ export default function ChatView(props: ChatViewProps) {
     if (event.isComposing || event.keyCode === 229) return;
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
-      send();
+      void send();
     }
+  }
+
+  function pick(event: Event) {
+    const input = event.currentTarget as HTMLInputElement;
+    setAttachment(input.files?.[0] ?? null);
+    // Clearing lets the same file be picked again after it is removed.
+    input.value = "";
   }
 
   const title = () => props.bot?.name ?? t("chat.title");
@@ -137,7 +158,12 @@ export default function ChatView(props: ChatViewProps) {
                           <span>{t("chat.acting")}</span>
                         </Show>
                       </div>
-                      <p class="msg__text">{message.text}</p>
+                      <Show when={message.text}>
+                        <p class="msg__text">{message.text}</p>
+                      </Show>
+                      <Show when={message.file}>
+                        {(id) => <FileCard id={id()} file={props.files[id()] ?? null} />}
+                      </Show>
                     </div>
                   </article>
                 </>
@@ -164,7 +190,24 @@ export default function ChatView(props: ChatViewProps) {
         </Show>
       </div>
 
-      <form class="composer" onSubmit={(event) => send(event)}>
+      <form class="composer" onSubmit={(event) => void send(event)}>
+        <Show when={attachment()} keyed>
+          {(file) => (
+            <div class="attachment">
+              <Icon name="file" size="sm" />
+              <span class="attachment__name">{file.name}</span>
+              <span class="attachment__size">{formatBytes(file.size)}</span>
+              <button
+                class="attachment__remove"
+                type="button"
+                aria-label={t("chat.attachment.remove", { name: file.name })}
+                onClick={() => setAttachment(null)}
+              >
+                <Icon name="x" size="sm" />
+              </button>
+            </div>
+          )}
+        </Show>
         <textarea
           ref={composer}
           class="composer__input"
@@ -179,16 +222,37 @@ export default function ChatView(props: ChatViewProps) {
           onKeyDown={onKeyDown}
         />
         <div class="composer__foot">
-          <span class="composer__hint">{t("chat.hint")}</span>
+          <div class="composer__tools">
+            <button
+              class="composer__attach"
+              type="button"
+              aria-label={t("chat.attach")}
+              title={t("chat.attach")}
+              disabled={!props.bot || props.working}
+              onClick={() => picker?.click()}
+            >
+              <Icon name="paperclip" size="sm" />
+            </button>
+            <span class="composer__hint">{t("chat.hint")}</span>
+          </div>
           <button
             class="btn btn--primary btn--icon-only"
             type="submit"
             aria-label={t("chat.send")}
-            disabled={props.working || draft().trim() === "" || !props.bot}
+            disabled={!canSend()}
           >
             <Icon name="arrow-up" size="sm" />
           </button>
         </div>
+        <input
+          ref={picker}
+          class="composer__picker"
+          type="file"
+          aria-hidden="true"
+          tabIndex={-1}
+          disabled={!props.bot || props.working}
+          onChange={pick}
+        />
       </form>
     </section>
   );

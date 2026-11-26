@@ -644,6 +644,18 @@ mod tests {
                     "run": null,
                 }),
             ),
+            EventKind::FileAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "file": Id::new(),
+                    "chat": Id::new(),
+                    "name": "report.csv",
+                    "media_type": "text/csv",
+                    "size": 7,
+                    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                }),
+            ),
             EventKind::RunStarted => EventDraft::new(
                 kind,
                 Author::Bot(Id::new()),

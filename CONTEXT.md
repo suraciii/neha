@@ -77,7 +77,7 @@ A single-level reply chain under a Message. Under a Task, it is the work log.
 _Avoid_: nested thread, thread (as a Chat or Group)
 
 **File**:
-An image, document, or other artifact attached to a Message. A File lives in the Space, whatever Computer produced it.
+An image, document, or other artifact attached to a Message. A File lives in the Space, whatever Computer produced it. A File belongs to the Chat or Group it was sent in.
 _Avoid_: attachment, artifact, upload, block
 
 **Card**:

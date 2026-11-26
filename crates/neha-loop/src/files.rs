@@ -29,7 +29,8 @@ pub struct DeliveredFile {
 /// What a run needs from the Space to move Files in and out of the Computer.
 pub trait FileHost {
     /// Reads one File of the run's conversation.
-    fn take(&self, file: Id) -> impl std::future::Future<Output = Result<TakenFile, String>> + Send;
+    fn take(&self, file: Id)
+    -> impl std::future::Future<Output = Result<TakenFile, String>> + Send;
 
     /// Delivers bytes as a File of the run's conversation.
     fn put(

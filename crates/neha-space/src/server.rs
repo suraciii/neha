@@ -1,8 +1,8 @@
 //! The Space's HTTP and WebSocket server.
 //!
 //! A client joins with the Space's invitation and password, then reaches
-//! every capability through one WebSocket. The server listens on loopback
-//! until a remote Space is configured.
+//! every capability through one WebSocket and sends and receives Files over
+//! HTTP. The server listens on loopback until a remote Space is configured.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -12,9 +12,14 @@ use std::time::{Duration, Instant};
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::rand_core::RngCore as _;
+use axum::body::Bytes;
+use axum::extract::Path as PathParams;
+use axum::extract::rejection::{BytesRejection, FailedToBufferBody, QueryRejection};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Request, State};
-use axum::http::header::{AUTHORIZATION, COOKIE, HOST, ORIGIN, SET_COOKIE};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Query, Request, State};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
+};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
@@ -25,6 +30,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt, StreamExt};
 use neha::error::ErrorCode;
+use neha::file::MAX_FILE_BYTES;
 use neha::id::Id;
 use neha::record::{Author, EventDraft, EventKind};
 use neha::surface::{ClientFrame, CommandCall, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
@@ -37,6 +43,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
+use crate::blobs::{Blobs, BlobsError};
 use crate::commands;
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError};
@@ -56,6 +63,7 @@ pub struct SpaceServer {
     home: Home,
     store: Store,
     identity: Identity,
+    blobs: Blobs,
     invite: Mutex<Option<Invite>>,
     login: Mutex<LoginLimiter>,
     state: Mutex<SpaceState>,
@@ -89,6 +97,7 @@ impl SpaceServer {
         let browser_host = browser_host(home.root());
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
+        let blobs = Blobs::open(&home.blobs_dir())?;
         let invite = if identity.has_accounts().await? {
             None
         } else {
@@ -105,6 +114,7 @@ impl SpaceServer {
             home,
             store,
             identity,
+            blobs,
             invite: Mutex::new(invite),
             login: Mutex::new(LoginLimiter::default()),
             state: Mutex::new(state),
@@ -143,6 +153,11 @@ impl SpaceServer {
             .route("/api/login", post(login))
             .route("/api/me", get(me))
             .route("/api/socket", get(socket))
+            .route(
+                "/api/chats/{chat}/files",
+                post(file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
+            )
+            .route("/api/files/{id}", get(file_download))
             .route("/api", any(api_not_found))
             .route("/api/", any(api_not_found))
             .route("/api/{*rest}", any(api_not_found));
@@ -700,6 +715,109 @@ async fn me(Authed { account }: Authed) -> Json<AccountBody> {
     Json(account.into())
 }
 
+#[derive(Deserialize)]
+struct UploadQuery {
+    name: String,
+    media_type: String,
+}
+
+/// Stores the request body as a File of a Chat the account owns.
+async fn file_upload(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account }: Authed,
+    PathParams(chat): PathParams<String>,
+    query: Result<Query<UploadQuery>, QueryRejection>,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Response, ApiError> {
+    let chat = chat
+        .parse()
+        .map_err(|_| ApiError::not_found("no such Chat"))?;
+    let Query(query) = query
+        .map_err(|_| ApiError::invalid_argument("the upload needs a name and a media_type"))?;
+    let bytes = match body {
+        Ok(bytes) => bytes,
+        Err(BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_))) => {
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                ErrorCode::InvalidArgument,
+                "a File must be at most 32 MiB",
+            ));
+        }
+        Err(_) => {
+            return Err(ApiError::invalid_argument(
+                "the request body could not be read",
+            ));
+        }
+    };
+    let outcome = commands::file_upload(
+        &server.store,
+        &server.state,
+        &server.blobs,
+        &account,
+        chat,
+        commands::FileUpload {
+            name: query.name,
+            media_type: query.media_type,
+            bytes: bytes.to_vec(),
+        },
+    )
+    .await?;
+    broadcast(&server, &outcome.events);
+
+    Ok(Json(outcome.result).into_response())
+}
+
+/// Sends the bytes of a File in a Chat the account owns.
+async fn file_download(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account }: Authed,
+    PathParams(id): PathParams<String>,
+) -> Result<Response, ApiError> {
+    let file = {
+        let state = server
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        id.parse()
+            .ok()
+            .and_then(|id| state.owned_file(id, account.id).cloned())
+    }
+    .ok_or_else(|| ApiError::not_found("no such File"))?;
+    let bytes = server.blobs.get(&file.sha256).await?;
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_str(&file.media_type)
+            .map_err(|_| ApiError::internal("the File has no usable media type"))?,
+    );
+    headers.insert(
+        CONTENT_DISPOSITION,
+        HeaderValue::from_str(&format!(
+            "attachment; filename*=UTF-8''{}",
+            percent_encode(&file.name)
+        ))
+        .map_err(|_| ApiError::internal("the File has no usable name"))?,
+    );
+
+    Ok(response)
+}
+
+/// Returns the value of an RFC 8187 `filename*`: every byte that is not an
+/// `attr-char` as the uppercase hex of its UTF-8.
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+
+    encoded
+}
+
 async fn socket(
     Authed { account }: Authed,
     ws: WebSocketUpgrade,
@@ -821,7 +939,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                 }
                                 match outcome.pending {
                                     Some(pending) => {
-                                        match commands::finish_run(&server.store, &server.state, &server.home, &server.model, &server.events, server.tool_timeout, pending).await {
+                                        match commands::finish_run(&server.store, &server.state, &server.home, &server.blobs, &server.model, &server.events, server.tool_timeout, pending).await {
                                             Ok((result, events)) => {
                                                 broadcast(&server, &events);
                                                 result
@@ -1242,6 +1360,12 @@ impl IntoResponse for ApiError {
     }
 }
 
+impl From<BlobsError> for ApiError {
+    fn from(error: BlobsError) -> Self {
+        ApiError::internal(error.to_string())
+    }
+}
+
 fn identity_error(error: IdentityError) -> ApiError {
     match error {
         IdentityError::InvalidName | IdentityError::WeakPassword => ApiError::new(
@@ -1345,6 +1469,9 @@ pub enum ServerError {
     /// The secrets cannot be loaded.
     #[error("secrets error: {0}")]
     Secrets(#[from] SecretsError),
+    /// The File bytes cannot be stored.
+    #[error("blobs error: {0}")]
+    Blobs(#[from] BlobsError),
     /// The model client cannot be built.
     #[error("model error: {0}")]
     Model(#[from] ModelError),
@@ -1514,7 +1641,9 @@ mod tests {
     }
 
     use neha::error::ErrorCode;
+    use neha::file::MAX_FILE_BYTES;
     use neha::id::Id;
+    use neha::record::EventKind;
     use neha::seq::Seq;
     use neha::surface::{
         BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
@@ -1873,6 +2002,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "hello".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -1918,6 +2048,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "hello".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -2439,6 +2570,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "hello".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -2448,6 +2580,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "again".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -2531,6 +2664,7 @@ mod tests {
         let message = CommandCall::MessageSend(MessageSend {
             chat,
             text: "hello".to_owned(),
+            file: None,
         });
 
         let first = command(&mut socket, send, message.clone()).await;
@@ -2576,6 +2710,7 @@ mod tests {
                     command: CommandCall::MessageSend(MessageSend {
                         chat,
                         text: "hello".to_owned(),
+                        file: None,
                     }),
                 })
                 .unwrap()
@@ -2595,6 +2730,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "hello".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -2644,6 +2780,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "hello".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -2699,6 +2836,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "hello".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -2842,6 +2980,7 @@ mod tests {
                     command: CommandCall::MessageSend(MessageSend {
                         chat,
                         text: "hello".to_owned(),
+                        file: None,
                     }),
                 })
                 .unwrap()
@@ -2896,6 +3035,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: "again".to_owned(),
+                file: None,
             }),
         )
         .await;
@@ -3137,6 +3277,7 @@ mod tests {
                     command: CommandCall::MessageSend(MessageSend {
                         chat,
                         text: "answer with a huge reply".to_owned(),
+                        file: None,
                     }),
                 })
                 .unwrap()
@@ -3191,6 +3332,7 @@ mod tests {
             CommandCall::MessageSend(MessageSend {
                 chat,
                 text: text.to_owned(),
+                file: None,
             }),
         )
         .await
@@ -3875,6 +4017,581 @@ mod tests {
             .join(computer.to_string())
             .join("workspace");
         assert!(!workspace.join("never.txt").exists());
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    // The SHA-256 of `abc`, from FIPS 180-2.
+    const ABC: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    async fn create_bot(socket: &mut Socket) -> (Id, Id, Id) {
+        let bot = command(
+            socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+            }),
+        )
+        .await;
+
+        (
+            serde_json::from_value(bot["bot"]["id"].clone()).unwrap(),
+            serde_json::from_value(bot["chat"]["id"].clone()).unwrap(),
+            serde_json::from_value(bot["computer"]["id"].clone()).unwrap(),
+        )
+    }
+
+    async fn upload(
+        running: &Running,
+        token: &str,
+        chat: Id,
+        name: &str,
+        media_type: &str,
+        bytes: Vec<u8>,
+    ) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{}/api/chats/{chat}/files", running.url()))
+            .query(&[("name", name), ("media_type", media_type)])
+            .bearer_auth(token)
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn download(running: &Running, token: &str, file: Id) -> reqwest::Response {
+        reqwest::Client::new()
+            .get(format!("{}/api/files/{file}", running.url()))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn file_list(socket: &mut Socket, chat: Id) -> Vec<Value> {
+        command(socket, Id::new(), CommandCall::FileList { chat })
+            .await
+            .as_array()
+            .cloned()
+            .unwrap()
+    }
+
+    async fn sign_in(running: &Running, name: &str) -> String {
+        let session: Value = reqwest::Client::new()
+            .post(format!("{}/api/login", running.url()))
+            .json(&json!({"display_name": name, "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        session["token"].as_str().unwrap().to_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_is_sent_with_a_message_and_downloaded() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+        // A subscriber receives the record so far, then every new File live.
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Subscribe {
+                    id: Id::new(),
+                    cursor: None,
+                    limit: Some(100),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let ServerFrame::Snapshot { events, .. } = next_frame(&mut socket).await else {
+            panic!("expected a snapshot");
+        };
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded)
+        );
+
+        let response = upload(
+            &running,
+            &token,
+            chat,
+            "hello world.txt",
+            "text/plain",
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let first: Value = response.json().await.unwrap();
+        let file: Id = serde_json::from_value(first["id"].clone()).unwrap();
+        assert_eq!(first["chat"], json!(chat));
+        assert_eq!(first["name"], "hello world.txt");
+        assert_eq!(first["media_type"], "text/plain");
+        assert_eq!(first["size"], 3);
+        assert_eq!(first["sha256"], ABC);
+        assert_eq!(first["author"]["kind"], "user");
+        assert!(first.get("acting").is_none());
+
+        // The same bytes are stored once, however many Files carry them.
+        let again: Value = upload(
+            &running,
+            &token,
+            chat,
+            "copy.txt",
+            "text/plain",
+            b"abc".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        assert_ne!(again["id"], first["id"]);
+        assert_eq!(again["sha256"], ABC);
+        let objects: Vec<_> =
+            std::fs::read_dir(running.server_home().join("blobs").join(&ABC[..2]))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+        assert_eq!(objects, [std::ffi::OsStr::new(ABC)]);
+
+        // Each upload wrote one event, which the subscriber received live.
+        let mut added = Vec::new();
+        for summary in [&first, &again] {
+            match next_frame(&mut socket).await {
+                ServerFrame::Event { event } => {
+                    assert_eq!(json!(event.seq), summary["seq"]);
+                    added.push(event);
+                }
+                other => panic!("expected the File's event, got {other:?}"),
+            }
+        }
+        assert!(
+            added
+                .iter()
+                .all(|event| event.kind == EventKind::FileAdded && event.data["sha256"] == ABC)
+        );
+        assert_eq!(added[0].data["file"], json!(file));
+        // The Chat lists the Files in the order they were sent.
+        assert_eq!(file_list(&mut socket, chat).await, vec![first, again]);
+
+        // A Message carries the File with no text.
+        let (base, provider_task) = scripted_provider(vec![text("Hello from fake")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let sent = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: String::new(),
+                file: Some(file),
+            }),
+        )
+        .await;
+        assert_eq!(sent["status"], "succeeded");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages[0]["file"], json!(file));
+        assert_eq!(messages[0]["text"], "");
+        assert!(messages[1]["file"].is_null());
+
+        let response = download(&running, &token, file).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename*=UTF-8''hello%20world.txt"
+        );
+        assert_eq!(response.bytes().await.unwrap(), b"abc".as_slice());
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_stays_with_the_account_of_its_chat() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+        let mine: Value = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"abc".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let file: Id = serde_json::from_value(mine["id"].clone()).unwrap();
+
+        // Without a session neither route answers.
+        let anonymous = reqwest::Client::new();
+        let route = format!("{}/api/chats/{chat}/files", running.url());
+        let upload_anon = anonymous
+            .post(&route)
+            .query(&[("name", "a.txt"), ("media_type", "text/plain")])
+            .body("abc")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(upload_anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let download_anon = anonymous
+            .get(format!("{}/api/files/{file}", running.url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(download_anon.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        // An unknown Chat is not found.
+        let unknown = upload(
+            &running,
+            &token,
+            Id::new(),
+            "a.txt",
+            "text/plain",
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+        // Another account may neither write to the Chat nor read its Files.
+        let identity = crate::identity::Identity::open(&Home::open(running.server_home()).unwrap())
+            .await
+            .unwrap();
+        identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace = sign_in(&running, "Grace").await;
+        let foreign = upload(
+            &running,
+            &grace,
+            chat,
+            "a.txt",
+            "text/plain",
+            b"abc".to_vec(),
+        )
+        .await;
+        assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+        let foreign = download(&running, &grace, file).await;
+        assert_eq!(foreign.status(), reqwest::StatusCode::NOT_FOUND);
+        let mut grace_socket = open_socket(&running, &grace).await;
+        assert!(matches!(
+            try_command(&mut grace_socket, Id::new(), CommandCall::FileList { chat }).await,
+            Err((ErrorCode::NotFound, _))
+        ));
+
+        // A Message may only carry a File of its own Chat.
+        let helper = command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Helper".to_owned(),
+            }),
+        )
+        .await;
+        let helper_chat: Id = serde_json::from_value(helper["chat"]["id"].clone()).unwrap();
+        assert!(matches!(
+            try_command(
+                &mut grace_socket,
+                Id::new(),
+                CommandCall::MessageSend(MessageSend {
+                    chat: helper_chat,
+                    text: String::new(),
+                    file: Some(file),
+                }),
+            )
+            .await,
+            Err((ErrorCode::InvalidArgument, _))
+        ));
+
+        // Nothing of Grace's attempts reached either Chat.
+        assert!(file_list(&mut grace_socket, helper_chat).await.is_empty());
+        assert_eq!(file_list(&mut socket, chat).await.len(), 1);
+        socket.close(None).await.unwrap();
+        grace_socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_the_space_cannot_hold_is_refused() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+
+        // Larger than the server's default body limit, and still a File.
+        let large = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            vec![b'x'; 100 * 1024],
+        )
+        .await;
+        assert_eq!(large.status(), reqwest::StatusCode::OK);
+
+        let over = upload(
+            &running,
+            &token,
+            chat,
+            "huge.bin",
+            "application/octet-stream",
+            vec![0; MAX_FILE_BYTES as usize + 1],
+        )
+        .await;
+        assert_eq!(over.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        let body: Value = over.json().await.unwrap();
+        assert_eq!(body["code"], "invalid_argument");
+
+        for (name, media_type) in [
+            ("", "text/plain"),
+            (".", "text/plain"),
+            ("a/b.txt", "text/plain"),
+            ("notes.txt", ""),
+            ("notes.txt", "text/plain\n"),
+        ] {
+            let refused = upload(&running, &token, chat, name, media_type, b"abc".to_vec()).await;
+            assert_eq!(
+                refused.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{name:?} with {media_type:?}"
+            );
+            let body: Value = refused.json().await.unwrap();
+            assert_eq!(body["code"], "invalid_argument");
+        }
+        let missing_type = reqwest::Client::new()
+            .post(format!("{}/api/chats/{chat}/files", running.url()))
+            .query(&[("name", "notes.txt")])
+            .bearer_auth(&token)
+            .body("abc")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing_type.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // Only the valid File was recorded or stored.
+        assert_eq!(file_list(&mut socket, chat).await.len(), 1);
+        let stored = std::fs::read_dir(running.server_home().join("blobs"))
+            .unwrap()
+            .count();
+        assert_eq!(
+            stored, 2,
+            "one digest directory beside the scratch directory"
+        );
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_file_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let (mut socket, token) = admin(&first, &invite).await;
+        let (_bot, chat, _computer) = create_bot(&mut socket).await;
+        let uploaded: Value = upload(
+            &first,
+            &token,
+            chat,
+            "report.csv",
+            "text/csv",
+            b"a,b\n1,2\n".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+        socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        let second = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        assert_eq!(file_list(&mut socket, chat).await, vec![uploaded]);
+        let response = download(&second, &token, file).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/csv");
+        assert_eq!(response.bytes().await.unwrap(), b"a,b\n1,2\n".as_slice());
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_takes_a_file_into_its_workspace_and_delivers_one() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let (bot, chat, computer) = create_bot(&mut socket).await;
+        let uploaded: Value = upload(
+            &running,
+            &token,
+            chat,
+            "notes.txt",
+            "text/plain",
+            b"read me".to_vec(),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+        let taken: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+        let (base, provider_task) = scripted_provider(vec![
+            tool("take_file", json!({"file": taken})),
+            tool(
+                "write_file",
+                json!({"path": "out/answer.txt", "content": "the answer"}),
+            ),
+            tool(
+                "put_file",
+                json!({"path": "out/answer.txt", "name": "answer.txt"}),
+            ),
+            text("I read your notes and sent the answer back."),
+        ])
+        .await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+
+        let result = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: String::new(),
+                file: Some(taken),
+            }),
+        )
+        .await;
+        assert_eq!(result["status"], "succeeded");
+
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert_eq!(
+            std::fs::read(workspace.join("notes.txt")).unwrap(),
+            b"read me"
+        );
+
+        let files = file_list(&mut socket, chat).await;
+        assert_eq!(files.len(), 2);
+        let delivered = &files[1];
+        assert_eq!(delivered["author"], json!({"kind": "bot", "id": bot}));
+        assert_eq!(delivered["acting"], uploaded["author"]["id"]);
+        assert_eq!(delivered["name"], "answer.txt");
+        // A delivered File states the type its name implies.
+        assert_eq!(delivered["media_type"], "text/plain");
+        assert_eq!(delivered["size"], 10);
+        let delivered: Id = serde_json::from_value(delivered["id"].clone()).unwrap();
+
+        // The Bot's Message carries the delivered File and belongs to the run.
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let messages = messages.as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["file"], json!(taken));
+        assert_eq!(messages[1]["file"], json!(delivered));
+        assert_eq!(messages[1]["run"], result["run"]);
+        assert_eq!(messages[1]["text"], "");
+        assert_eq!(
+            messages[2]["text"],
+            "I read your notes and sent the answer back."
+        );
+
+        let response = download(&running, &token, delivered).await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/plain");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename*=UTF-8''answer.txt"
+        );
+        assert_eq!(response.bytes().await.unwrap(), b"the answer".as_slice());
+
+        // A restart rebuilds the Chat with both Files and their Messages.
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(Home::open(&root).unwrap(), 0).await.unwrap();
+        let mut socket = open_socket(&restarted, &token).await;
+        assert_eq!(file_list(&mut socket, chat).await.len(), 2);
+        let again = download(&restarted, &token, delivered).await;
+        assert_eq!(again.bytes().await.unwrap(), b"the answer".as_slice());
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_cannot_take_or_deliver_what_is_not_a_file_of_the_chat() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "write_file",
+                json!({"path": "answer.txt", "content": "the answer"}),
+            ),
+            tool("take_file", json!({"file": Id::new()})),
+            tool(
+                "put_file",
+                json!({"path": "answer.txt", "name": "../answer.txt"}),
+            ),
+            text("Nothing moved."),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "take a File that is not there").await;
+
+        assert_eq!(result["status"], "succeeded");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        let actions: Vec<(&str, &str)> = shown["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|action| {
+                (
+                    action["tool"].as_str().unwrap(),
+                    action["status"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            actions,
+            [
+                ("write_file", "succeeded"),
+                ("take_file", "failed"),
+                ("put_file", "failed"),
+            ]
+        );
+
+        // Nothing the Bot could not move was recorded.
+        assert!(file_list(&mut socket, chat).await.is_empty());
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages.as_array().unwrap().len(), 2);
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;

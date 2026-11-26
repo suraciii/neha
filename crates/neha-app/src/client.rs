@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use futures_util::{SinkExt as _, StreamExt as _};
+use neha::file::MAX_FILE_BYTES;
 use neha::id::Id;
-use neha::surface::{ClientFrame, CommandCall, PROTOCOL_VERSION, ServerFrame};
+use neha::surface::{ClientFrame, CommandCall, FileSummary, PROTOCOL_VERSION, ServerFrame};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpStream;
@@ -182,16 +183,11 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
         .send()
         .await
         .context("the Space could not be reached")?;
-    let status = response.status();
-    let body: Value = response
+    let body: Value = accepted(response)
+        .await?
         .json()
         .await
         .context("the Space did not answer with JSON")?;
-    if !status.is_success() {
-        let code = body["code"].as_str().unwrap_or("error");
-        let message = body["message"].as_str().unwrap_or("no message");
-        bail!("the Space refused ({code}): {message}");
-    }
     let token = body["token"]
         .as_str()
         .context("the Space's answer has no token")?
@@ -200,6 +196,138 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
         .context("the Space's account does not fit")?;
 
     Ok((token, account))
+}
+
+/// Returns the answer when the Space accepted the request, or names why it refused.
+async fn accepted(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    let code = body["code"].as_str().unwrap_or("error");
+    let message = body["message"]
+        .as_str()
+        .or(status.canonical_reason())
+        .unwrap_or("no message");
+    bail!("the Space refused ({code}): {message}");
+}
+
+/// Uploads one File to a Chat and returns what the Space recorded.
+///
+/// The size is checked before anything leaves this machine, so a File the
+/// Space cannot hold never starts an upload.
+pub async fn upload_file(credential: &Credential, chat: Id, path: &Path) -> Result<FileSummary> {
+    let bytes = read_for_upload(path)?;
+    let name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .with_context(|| format!("{} has no usable file name", path.display()))?;
+    let response = reqwest::Client::new()
+        .post(format!("{}/api/chats/{chat}/files", credential.url))
+        .query(&[
+            ("name", name),
+            (
+                "media_type",
+                neha::file::media_type_for(&path.to_string_lossy()),
+            ),
+        ])
+        .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+        .bearer_auth(&credential.token)
+        .body(bytes)
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space's answer does not describe a File")
+}
+
+/// Downloads one File and returns its name and bytes.
+///
+/// The name becomes a path on this machine, so it has to be one path
+/// component; anything else from the Space is refused.
+pub async fn download_file(credential: &Credential, file: Id) -> Result<(String, Vec<u8>)> {
+    let response = accepted(
+        reqwest::Client::new()
+            .get(format!("{}/api/files/{file}", credential.url))
+            .bearer_auth(&credential.token)
+            .send()
+            .await
+            .context("the Space could not be reached")?,
+    )
+    .await?;
+    let name = response
+        .headers()
+        .get(reqwest::header::CONTENT_DISPOSITION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(disposition_name)
+        .context("the Space did not name the File; pass --out")?;
+    if !is_one_component(&name) {
+        bail!("the Space named the File {name:?}, which is not a file name; pass --out");
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .context("the Space's answer was cut short")?;
+
+    Ok((name, bytes.to_vec()))
+}
+
+/// Whether a name can be one path component, wherever this CLI runs.
+fn is_one_component(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
+/// Reads a File for upload, refusing one larger than the Space holds.
+fn read_for_upload(path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a file", path.display());
+    }
+    if metadata.len() > MAX_FILE_BYTES {
+        bail!(
+            "{} is {} bytes; a File can be at most {MAX_FILE_BYTES} bytes",
+            path.display(),
+            metadata.len()
+        );
+    }
+    fs::read(path).with_context(|| format!("cannot read {}", path.display()))
+}
+
+/// Reads the File name out of a `filename*=UTF-8''…` disposition parameter.
+fn disposition_name(disposition: &str) -> Option<String> {
+    let parameter = disposition.split(';').find(|part| {
+        part.trim_start()
+            .get(..9)
+            .is_some_and(|name| name.eq_ignore_ascii_case("filename*"))
+    })?;
+    let encoded = parameter.split_once('=')?.1.trim();
+    let (_charset, encoded) = encoded.split_once('\'')?;
+    let (_language, encoded) = encoded.split_once('\'')?;
+    percent_decode(encoded)
+}
+
+/// Decodes RFC 3986 percent-escapes into UTF-8 text.
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        if byte == b'%' {
+            let digits = bytes.get(index + 1..index + 3)?;
+            let high = (digits[0] as char).to_digit(16)?;
+            let low = (digits[1] as char).to_digit(16)?;
+            decoded.push(u8::try_from(high * 16 + low).ok()?);
+            index += 3;
+        } else {
+            decoded.push(byte);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
 }
 
 /// Runs one command and returns its result, reporting its own run's events.
@@ -428,12 +556,70 @@ async fn connect(credential: &Credential) -> Result<Socket> {
 
 #[cfg(test)]
 mod tests {
+    use neha::file::MAX_FILE_BYTES;
     use neha::id::Id;
     use neha::record::{Author, Event, EventKind, KIND_VERSION};
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::FollowFilter;
+    use super::{FollowFilter, disposition_name, is_one_component, read_for_upload};
+
+    #[test]
+    fn a_file_name_decides_its_media_type() {
+        let media_type = |name: &str| neha::file::media_type_for(name);
+
+        assert_eq!(media_type("notes.txt"), "text/plain");
+        assert_eq!(media_type("main.rs"), "text/plain");
+        assert_eq!(media_type("data.json"), "application/json");
+        assert_eq!(media_type("photo.JPG"), "image/jpeg");
+        assert_eq!(media_type("paper.pdf"), "application/pdf");
+        assert_eq!(media_type("archive.bin"), "application/octet-stream");
+        assert_eq!(media_type("Makefile"), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_file_larger_than_the_limit_is_refused_before_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let big = directory.path().join("big.bin");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_FILE_BYTES + 1)
+            .unwrap();
+        std::fs::write(directory.path().join("small.txt"), "hi").unwrap();
+
+        let error = read_for_upload(&big).unwrap_err().to_string();
+        assert!(error.contains("at most"), "{error}");
+        assert_eq!(
+            read_for_upload(&directory.path().join("small.txt")).unwrap(),
+            b"hi"
+        );
+        assert!(read_for_upload(directory.path()).is_err());
+    }
+
+    #[test]
+    fn a_disposition_names_the_file() {
+        assert_eq!(
+            disposition_name("attachment; filename*=UTF-8''report.pdf").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            disposition_name("attachment; filename*=UTF-8''%E6%8A%A5%E5%91%8A%20v2.txt").as_deref(),
+            Some("报告 v2.txt")
+        );
+        assert_eq!(disposition_name("attachment").as_deref(), None);
+        assert_eq!(
+            disposition_name("attachment; filename*=UTF-8''%zz").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_single_path_component_is_a_file_name() {
+        assert!(is_one_component("报告 v2.txt"));
+        for name in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(!is_one_component(name), "{name:?}");
+        }
+    }
 
     fn event(kind: EventKind, data: serde_json::Value, seq: i64) -> Event {
         Event {

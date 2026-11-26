@@ -13,12 +13,15 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
-use neha::record::{ActionStatus as RecordedActionStatus, Author, Event, EventDraft, EventKind};
+use neha::record::{
+    ActionStatus as RecordedActionStatus, Author, Event, EventDraft, EventKind, FileAdded,
+};
 use neha::seq::Seq;
-use neha::surface::{CommandCall, MessageSend, ProviderAdd};
+use neha::surface::{CommandCall, FileSummary, MessageSend, ProviderAdd};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::blobs::Blobs;
 use crate::home::Home;
 use crate::model::{ModelClient, SpaceModel};
 use crate::secrets::Secrets;
@@ -27,11 +30,10 @@ use crate::state::{BotView, ChatView, ModelView, ProviderView, RunStatus, State}
 use crate::store::{AppendRequest, AppendResult, CommandRecord, Projection, Store};
 
 use neha_computer::{ActionStatus, LocalRuntime, ToolOutput};
-use neha_loop::{LoopError, Recorder, RunOutcome, RunRequest};
+use neha_loop::{DeliveredFile, FileHost, LoopError, Recorder, RunOutcome, RunRequest, TakenFile};
 
 const RESULT_RUNNING: &str = "running";
 const RUN_POLL: Duration = Duration::from_millis(100);
-
 /// What a command wrote and whether work follows.
 pub struct Outcome {
     /// The cursor of the command's last event.
@@ -42,6 +44,16 @@ pub struct Outcome {
     pub pending: Option<PendingRun>,
     /// The events this command just wrote.
     pub events: Vec<Event>,
+}
+
+/// A File a client sends to a Chat.
+pub struct FileUpload {
+    /// Its name.
+    pub name: String,
+    /// Its media type.
+    pub media_type: String,
+    /// Its bytes.
+    pub bytes: Vec<u8>,
 }
 
 /// A one-shot run waiting for its Model reply.
@@ -141,6 +153,12 @@ pub async fn execute(
                 .filter(|chat| chat.owner == account.id)
                 .collect();
             serde_json::to_value(chats).map_err(json_error)
+        }),
+        CommandCall::FileList { chat } => read(state, |state| {
+            state
+                .owned_chat(chat, account.id)
+                .ok_or_else(|| ApiError::not_found("no such Chat"))?;
+            serde_json::to_value(state.files_of(chat, None)).map_err(json_error)
         }),
         CommandCall::ChatRead { chat, from } => read(state, |state| {
             state
@@ -351,19 +369,25 @@ async fn message_send(
         return existing_outcome(store, command_id, record).await;
     }
 
-    let (bot, model, provider, api_key) = preflight(state, arguments.chat, account.id, secrets)?;
-    if arguments.text.trim().is_empty() {
-        return Err(ApiError::invalid_argument("a Message needs text"));
+    let (bot, model, provider, api_key) =
+        preflight(state, arguments.chat, account.id, secrets, arguments.file)?;
+    if arguments.file.is_none() && arguments.text.trim().is_empty() {
+        return Err(ApiError::invalid_argument("a Message needs text or a File"));
     }
 
     let message = Id::new();
     let run = Id::new();
+    let mut added = json!({
+        "message": message,
+        "chat": arguments.chat,
+        "text": arguments.text,
+        "run": run,
+    });
+    if let Some(file) = arguments.file {
+        added["file"] = json!(file);
+    }
     let drafts = vec![
-        EventDraft::new(
-            EventKind::MessageAdded,
-            Author::User(account.id),
-            json!({"message": message, "chat": arguments.chat, "text": arguments.text, "run": run}),
-        ),
+        EventDraft::new(EventKind::MessageAdded, Author::User(account.id), added),
         EventDraft::new(
             EventKind::RunStarted,
             Author::Bot(bot.id),
@@ -408,15 +432,89 @@ async fn message_send(
     })
 }
 
+/// Stores a File's bytes and records the File in a Chat the account owns.
+pub async fn file_upload(
+    store: &Store,
+    state: &Mutex<State>,
+    blobs: &Blobs,
+    account: &crate::identity::Account,
+    chat: Id,
+    upload: FileUpload,
+) -> Result<Outcome, ApiError> {
+    let FileUpload {
+        name,
+        media_type,
+        bytes,
+    } = upload;
+    {
+        let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .owned_chat(chat, account.id)
+            .ok_or_else(|| ApiError::not_found("no such Chat"))?;
+    }
+    // The name and type are refused before the bytes take any room.
+    FileAdded::check_name(&name)
+        .and_then(|()| FileAdded::check_media_type(&media_type))
+        .map_err(|error| ApiError::invalid_argument(error.to_string()))?;
+    let file = Id::new();
+    let data = FileAdded {
+        file,
+        chat,
+        name,
+        media_type,
+        size: bytes.len() as u64,
+        sha256: blobs.put(&bytes).await?,
+    };
+    let draft = EventDraft::new(
+        EventKind::FileAdded,
+        Author::User(account.id),
+        serde_json::to_value(&data).map_err(json_error)?,
+    );
+    let appended = append(
+        store,
+        state,
+        Id::new(),
+        format!("file.add:{}", data.sha256),
+        vec![draft],
+        None,
+        None,
+    )
+    .await?;
+    let Some(event) = appended.events.first() else {
+        return Err(ApiError::internal("the File was not recorded"));
+    };
+    let summary = FileSummary {
+        id: data.file,
+        chat: data.chat,
+        name: data.name,
+        media_type: data.media_type,
+        size: data.size,
+        sha256: data.sha256,
+        author: event.author,
+        acting: event.acting,
+        at: event.at,
+        seq: event.seq,
+    };
+
+    Ok(Outcome {
+        committed: Some(event.seq),
+        result: serde_json::to_value(summary).map_err(json_error)?,
+        pending: None,
+        events: appended.events,
+    })
+}
+
 /// Runs the Bot loop and records the reply or the failure.
 ///
 /// Steps and actions are recorded as they happen; the final Message, the
 /// finished run, and the starting command's result are written in one
 /// transaction, so a retry never sees a finished run without a result.
+#[allow(clippy::too_many_arguments)]
 pub async fn finish_run(
     store: &Store,
     state: &Mutex<State>,
     home: &Home,
+    blobs: &Blobs,
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
@@ -440,13 +538,19 @@ pub async fn finish_run(
         &pending.api_key,
         &pending.model.name,
     );
-    let mut recorder = RunRecorder {
+    let log = RunLog {
         store,
         state,
         events,
         bot: pending.bot.id,
         acting: pending.acting,
         run: pending.run,
+    };
+    let mut recorder = RunRecorder { log };
+    let files = RunFiles {
+        log,
+        blobs,
+        chat: pending.chat.id,
     };
     let request = RunRequest::new(
         format!(
@@ -457,7 +561,8 @@ pub async fn finish_run(
         history,
         pending.model.max_output,
     );
-    let outcome = match neha_loop::run(&runtime, &space_model, &mut recorder, request).await {
+    let outcome = match neha_loop::run(&runtime, &space_model, &mut recorder, &files, request).await
+    {
         Ok(outcome) => outcome,
         Err(error) => {
             let outcome = RunOutcome {
@@ -546,7 +651,9 @@ fn completion_drafts(pending: &PendingRun, outcome: RunOutcome) -> (Vec<EventDra
     (drafts, result)
 }
 
-struct RunRecorder<'a> {
+/// Where one run records what it does.
+#[derive(Clone, Copy)]
+struct RunLog<'a> {
     store: &'a Store,
     state: &'a Mutex<State>,
     events: &'a tokio::sync::broadcast::Sender<Event>,
@@ -555,16 +662,16 @@ struct RunRecorder<'a> {
     run: Id,
 }
 
-impl RunRecorder<'_> {
-    async fn record(&self, draft: EventDraft) -> Result<(), LoopError> {
+impl RunLog<'_> {
+    /// Appends the events of the run and streams them to subscribers.
+    async fn append(&self, drafts: Vec<EventDraft>) -> Result<(), LoopError> {
         let command = Id::new();
-        let fingerprint = format!("run.record:{command}");
         let appended = append(
             self.store,
             self.state,
             command,
-            fingerprint,
-            vec![draft],
+            format!("run.record:{command}"),
+            drafts,
             None,
             None,
         )
@@ -577,8 +684,82 @@ impl RunRecorder<'_> {
         Ok(())
     }
 
+    /// Returns an event the Bot writes for the User it acts for.
     fn bot_draft(&self, kind: EventKind, data: Value) -> EventDraft {
         EventDraft::new(kind, Author::Bot(self.bot), data).acting(self.acting)
+    }
+}
+
+/// Records the steps and actions of one run.
+struct RunRecorder<'a> {
+    log: RunLog<'a>,
+}
+
+/// Moves Files between the Space and the Chat of one run.
+struct RunFiles<'a> {
+    log: RunLog<'a>,
+    blobs: &'a Blobs,
+    chat: Id,
+}
+
+impl FileHost for RunFiles<'_> {
+    async fn take(&self, file: Id) -> Result<TakenFile, String> {
+        let view = {
+            let state = self
+                .log
+                .state
+                .lock()
+                .map_err(|_| "the Space state is locked".to_owned())?;
+            state
+                .file_of(self.chat, file)
+                .cloned()
+                .ok_or_else(|| format!("no File {file} belongs to this Chat"))?
+        };
+        let bytes = self
+            .blobs
+            .get(&view.sha256)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(TakenFile {
+            name: view.name,
+            media_type: view.media_type,
+            bytes,
+        })
+    }
+
+    async fn put(&self, name: String, bytes: Vec<u8>) -> Result<DeliveredFile, String> {
+        FileAdded::check_name(&name).map_err(|error| error.to_string())?;
+        let media_type = neha::file::media_type_for(&name).to_owned();
+        let message = Id::new();
+        let data = FileAdded {
+            file: Id::new(),
+            chat: self.chat,
+            name,
+            media_type,
+            size: bytes.len() as u64,
+            sha256: self
+                .blobs
+                .put(&bytes)
+                .await
+                .map_err(|error| error.to_string())?,
+        };
+        let added = serde_json::to_value(&data).map_err(|error| error.to_string())?;
+        self.log
+            .append(vec![
+                self.log.bot_draft(EventKind::FileAdded, added),
+                self.log.bot_draft(
+                    EventKind::MessageAdded,
+                    json!({"message": message, "chat": self.chat, "text": "", "run": self.log.run, "file": data.file}),
+                ),
+            ])
+            .await
+            .map_err(|error| error.to_string())?;
+
+        Ok(DeliveredFile {
+            id: data.file,
+            name: data.name,
+        })
     }
 }
 
@@ -589,16 +770,17 @@ impl Recorder for RunRecorder<'_> {
         usage: neha::usage::Usage,
         tool_calls: u32,
     ) -> Result<(), LoopError> {
-        self.record(self.bot_draft(
-            EventKind::RunStep,
-            json!({
-                "run": self.run,
-                "step": step,
-                "usage": usage,
-                "tool_calls": tool_calls,
-            }),
-        ))
-        .await
+        self.log
+            .append(vec![self.log.bot_draft(
+                EventKind::RunStep,
+                json!({
+                    "run": self.log.run,
+                    "step": step,
+                    "usage": usage,
+                    "tool_calls": tool_calls,
+                }),
+            )])
+            .await
     }
 
     async fn action_started(
@@ -608,17 +790,18 @@ impl Recorder for RunRecorder<'_> {
         tool: String,
         arguments: Value,
     ) -> Result<(), LoopError> {
-        self.record(self.bot_draft(
-            EventKind::ActionStarted,
-            json!({
-                "run": self.run,
-                "step": step,
-                "action": action,
-                "tool": tool,
-                "arguments": arguments,
-            }),
-        ))
-        .await
+        self.log
+            .append(vec![self.log.bot_draft(
+                EventKind::ActionStarted,
+                json!({
+                    "run": self.log.run,
+                    "step": step,
+                    "action": action,
+                    "tool": tool,
+                    "arguments": arguments,
+                }),
+            )])
+            .await
     }
 
     async fn action_finished(
@@ -636,21 +819,22 @@ impl Recorder for RunRecorder<'_> {
             ActionStatus::TimedOut => RecordedActionStatus::TimedOut,
             ActionStatus::Unknown => RecordedActionStatus::Unknown,
         };
-        self.record(self.bot_draft(
-            EventKind::ActionFinished,
-            json!({
-                "run": self.run,
-                "step": step,
-                "action": action,
-                "tool": tool,
-                "status": status,
-                "output": output.text,
-                "truncated": output.truncated,
-                "omitted_bytes": output.omitted_bytes,
-                "error": error,
-            }),
-        ))
-        .await
+        self.log
+            .append(vec![self.log.bot_draft(
+                EventKind::ActionFinished,
+                json!({
+                    "run": self.log.run,
+                    "step": step,
+                    "action": action,
+                    "tool": tool,
+                    "status": status,
+                    "output": output.text,
+                    "truncated": output.truncated,
+                    "omitted_bytes": output.omitted_bytes,
+                    "error": error,
+                }),
+            )])
+            .await
     }
 }
 
@@ -721,12 +905,20 @@ fn preflight(
     chat: Id,
     owner: Id,
     secrets: &Secrets,
+    file: Option<Id>,
 ) -> Result<(BotView, ModelView, ProviderView, String), ApiError> {
     let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
     state
         .owned_chat(chat, owner)
         .ok_or_else(|| ApiError::not_found("no such Chat"))?;
     let chat_view = state.chats.get(&chat).expect("checked above");
+    if let Some(file) = file
+        && state.file_of(chat, file).is_none()
+    {
+        return Err(ApiError::invalid_argument(
+            "the Message's File must belong to the Chat",
+        ));
+    }
     let bot = state
         .bots
         .get(&chat_view.bot)

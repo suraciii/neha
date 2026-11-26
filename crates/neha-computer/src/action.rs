@@ -106,7 +106,10 @@ pub trait ComputerRuntime {
     fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send;
 
     /// Reads a file's bytes from the workspace.
-    fn read_bytes(&self, path: &str) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
+    fn read_bytes(
+        &self,
+        path: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send;
 
     /// Writes bytes to a file in the workspace, creating its parent directories.
     fn write_bytes(

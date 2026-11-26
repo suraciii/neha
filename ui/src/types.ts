@@ -56,6 +56,21 @@ export interface Message {
   at: string;
   seq: string;
   run: string | null;
+  file: string | null;
+}
+
+// One File as the client reads it.
+export interface FileSummary {
+  id: string;
+  chat: string;
+  name: string;
+  media_type: string;
+  size: number;
+  sha256: string;
+  author: Author;
+  acting?: string;
+  at: string;
+  seq: string;
 }
 
 export interface ProviderResult {

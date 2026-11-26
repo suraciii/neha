@@ -43,6 +43,8 @@ const en = {
   "error.botAnswer": "The Bot could not answer.",
   "error.password": "The password must be at least eight bytes.",
   "error.invalid": "There is a problem with that value.",
+  "error.upload": "The file could not be uploaded. Try again.",
+  "error.fileTooLarge": "{name} is larger than {limit}.",
 
   "sidebar.chats": "Chats",
   "sidebar.conversation.one": "1 conversation",
@@ -121,6 +123,9 @@ const en = {
   "chat.placeholder.empty": "Message the Bot…",
   "chat.hint": "Enter to send · Shift+Enter for a new line",
   "chat.send": "Send Message",
+  "chat.attach": "Attach a file",
+  "chat.attachment.remove": "Remove {name}",
+  "chat.file.download": "Download {name}",
 
   "select.eyebrow": "Chats",
   "select.title": "Select a Chat to open it.",
@@ -174,6 +179,8 @@ const zh: Record<MessageKey, string> = {
   "error.botAnswer": "Bot 无法回答。",
   "error.password": "密码至少需要八个字节。",
   "error.invalid": "这个值不符合要求。",
+  "error.upload": "文件上传失败，请重试。",
+  "error.fileTooLarge": "{name} 超过 {limit}。",
 
   "sidebar.chats": "Chats",
   "sidebar.conversation.one": "1 个对话",
@@ -249,6 +256,9 @@ const zh: Record<MessageKey, string> = {
   "chat.placeholder.empty": "给 Bot 发消息…",
   "chat.hint": "Enter 发送 · Shift+Enter 换行",
   "chat.send": "发送消息",
+  "chat.attach": "添加附件",
+  "chat.attachment.remove": "移除{name}",
+  "chat.file.download": "下载{name}",
 
   "select.eyebrow": "Chats",
   "select.title": "选择一个 Chat 打开。",
