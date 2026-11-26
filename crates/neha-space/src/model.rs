@@ -282,6 +282,7 @@ impl ModelClient {
             std::collections::BTreeMap::new();
         let mut usage = Usage::default();
         let mut finished = false;
+        let mut finish_failure: Option<ModelError> = None;
         while let Some(event) = events.next().await {
             let event = event.map_err(|_| ModelError::Transport)?;
             if event.event == "error" {
@@ -300,27 +301,35 @@ impl ModelClient {
                 if let Some(reason) = choice.finish_reason.as_deref() {
                     match reason {
                         "stop" | "tool_calls" | "function_call" => finished = true,
-                        "length" => return Err(ModelError::Truncated),
-                        "content_filter" => return Err(ModelError::Filtered),
+                        "length" => {
+                            finished = true;
+                            finish_failure = Some(ModelError::Truncated { usage });
+                        }
+                        "content_filter" => {
+                            finished = true;
+                            finish_failure = Some(ModelError::Filtered { usage });
+                        }
                         _ => return Err(ModelError::Protocol),
                     }
                 }
-                if let Some(delta) = &choice.delta.content {
-                    text.push_str(delta);
-                }
-                for delta in &choice.delta.tool_calls {
-                    let call = calls.entry(delta.index).or_default();
-                    if let Some(id) = &delta.id
-                        && !id.is_empty()
-                    {
-                        call.id.clone_from(id);
+                if finish_failure.is_none() {
+                    if let Some(delta) = &choice.delta.content {
+                        text.push_str(delta);
                     }
-                    if let Some(function) = &delta.function {
-                        if let Some(name) = &function.name {
-                            call.name.push_str(name);
+                    for delta in &choice.delta.tool_calls {
+                        let call = calls.entry(delta.index).or_default();
+                        if let Some(id) = &delta.id
+                            && !id.is_empty()
+                        {
+                            call.id.clone_from(id);
                         }
-                        if let Some(arguments) = &function.arguments {
-                            call.arguments.push_str(arguments);
+                        if let Some(function) = &delta.function {
+                            if let Some(name) = &function.name {
+                                call.name.push_str(name);
+                            }
+                            if let Some(arguments) = &function.arguments {
+                                call.arguments.push_str(arguments);
+                            }
                         }
                     }
                 }
@@ -329,8 +338,16 @@ impl ModelClient {
                 usage = reported.normalize();
             }
         }
+        if let Some(mut failure) = finish_failure {
+            match &mut failure {
+                ModelError::Truncated { usage: reported }
+                | ModelError::Filtered { usage: reported } => *reported = usage,
+                _ => {}
+            }
+            return Err(failure);
+        }
         if !finished {
-            return Err(ModelError::StreamEnded);
+            return Err(ModelError::StreamEnded { usage });
         }
         let tool_calls: Vec<ChatToolCall> = calls.into_values().collect();
         if text.is_empty() && tool_calls.is_empty() {
@@ -430,6 +447,7 @@ impl neha_loop::Model for SpaceModel<'_> {
                 .map_err(|error| neha_loop::ModelFailure {
                     code: error.code(),
                     detail: error.to_string(),
+                    usage: error.usage().unwrap_or_default(),
                 })?;
 
             Ok(neha_loop::ModelReply {
@@ -644,13 +662,22 @@ pub enum ModelError {
     Empty,
     /// The provider stream ended before it said the reply was complete.
     #[error("the Provider closed the stream before the reply was complete")]
-    StreamEnded,
+    StreamEnded {
+        /// The usage it reported before it ended.
+        usage: Usage,
+    },
     /// The provider cut the reply at its output limit.
     #[error("the Provider cut the reply at its output limit")]
-    Truncated,
+    Truncated {
+        /// The usage it reported.
+        usage: Usage,
+    },
     /// The provider filtered the reply.
     #[error("the Provider filtered the reply")]
-    Filtered,
+    Filtered {
+        /// The usage it reported.
+        usage: Usage,
+    },
     /// The Provider's stream did not fit the protocol.
     #[error("the Provider's reply did not fit the protocol")]
     Protocol,
@@ -672,7 +699,7 @@ impl ModelError {
                 | Self::Server { .. }
                 | Self::Transport
                 | Self::Empty
-                | Self::StreamEnded
+                | Self::StreamEnded { .. }
         )
     }
 
@@ -685,18 +712,31 @@ impl ModelError {
         }
     }
 
+    /// Returns the usage the Provider reported for a failed call.
+    #[must_use]
+    pub fn usage(&self) -> Option<Usage> {
+        match self {
+            Self::StreamEnded { usage } | Self::Truncated { usage } | Self::Filtered { usage } => {
+                Some(*usage)
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the command-surface code for this failure.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
             Self::RateLimited { .. } => ErrorCode::RateLimited,
-            Self::Server { .. } | Self::Transport | Self::StreamEnded => ErrorCode::Unavailable,
+            Self::Server { .. } | Self::Transport | Self::StreamEnded { .. } => {
+                ErrorCode::Unavailable
+            }
             Self::ContextTooLarge
             | Self::Empty
             | Self::Protocol
-            | Self::Truncated
-            | Self::Filtered
+            | Self::Truncated { .. }
+            | Self::Filtered { .. }
             | Self::Provider(_)
             | Self::Request(_) => ErrorCode::InvalidArgument,
         }
@@ -894,7 +934,7 @@ mod tests {
 
         let error = client.chat(request(&base, "sk-test")).await;
 
-        assert!(matches!(error, Err(ModelError::StreamEnded)));
+        assert!(matches!(error, Err(ModelError::StreamEnded { .. })));
         assert_eq!(attempts.load(Ordering::SeqCst), 5);
         task.abort();
     }
@@ -913,7 +953,11 @@ mod tests {
             }]},
             "finish_reason": "length",
         }]});
-        let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+        let usage = serde_json::json!({"choices":[],"usage":{
+            "prompt_tokens": 40,
+            "completion_tokens": 12,
+        }});
+        let sse = format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n");
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move || {
@@ -931,7 +975,12 @@ mod tests {
 
         let error = client.chat(request(&base, "sk-test")).await;
 
-        assert!(matches!(error, Err(ModelError::Truncated)), "{error:?}");
+        match error {
+            Err(ModelError::Truncated { usage }) => {
+                assert_eq!(usage.budgeted(), 52);
+            }
+            other => panic!("expected a truncated stream, got {other:?}"),
+        }
         task.abort();
     }
 

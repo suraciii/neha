@@ -7,6 +7,9 @@ use serde_json::json;
 
 use crate::model::ToolSpec;
 
+/// The largest path a file tool accepts.
+const MAX_PATH_BYTES: usize = 4 * 1024;
+
 /// The shell tool.
 pub const SHELL: &str = "shell";
 /// The read file tool.
@@ -95,6 +98,7 @@ pub fn action(name: &str, arguments: &str) -> Result<Action, String> {
         READ_FILE => {
             let arguments: PathArguments =
                 serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            check_path(&arguments.path)?;
             Ok(Action::ReadFile {
                 path: arguments.path,
             })
@@ -102,6 +106,7 @@ pub fn action(name: &str, arguments: &str) -> Result<Action, String> {
         WRITE_FILE => {
             let arguments: WriteArguments =
                 serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            check_path(&arguments.path)?;
             if arguments.content.len() > MAX_WRITE_BYTES {
                 return Err(format!(
                     "the content is larger than {MAX_WRITE_BYTES} bytes"
@@ -115,12 +120,20 @@ pub fn action(name: &str, arguments: &str) -> Result<Action, String> {
         LIST_FILES => {
             let arguments: PathArguments =
                 serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            check_path(&arguments.path)?;
             Ok(Action::ListFiles {
                 path: arguments.path,
             })
         }
         _ => Err(format!("there is no tool named {name}")),
     }
+}
+
+fn check_path(path: &str) -> Result<(), String> {
+    if path.len() > MAX_PATH_BYTES {
+        return Err(format!("the path is larger than {MAX_PATH_BYTES} bytes"));
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -170,5 +183,7 @@ mod tests {
         assert!(action("shell", r#"{"command":"x","surprise":true}"#).is_err());
         assert!(action("shell", "not json").is_err());
         assert!(action("unknown", "{}").is_err());
+        let long = serde_json::json!({"path": "x".repeat(5000)});
+        assert!(action("read_file", &long.to_string()).is_err());
     }
 }

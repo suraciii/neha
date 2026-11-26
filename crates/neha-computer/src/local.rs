@@ -282,31 +282,17 @@ impl LocalRuntime {
         };
         let (stdout, stdout_lost) = drain(stdout_task, grace).await;
         let (stderr, stderr_lost) = drain(stderr_task, grace).await;
-        let (mut stdout_text, stdout_truncated, stdout_omitted) = stdout.render();
-        let (stderr_text, stderr_truncated, stderr_omitted) = stderr.render();
-        if stdout_lost || stderr_lost {
-            stdout_text.push_str("\n[the shell's output could not be drained]");
-        }
         let code = status
             .as_ref()
             .and_then(std::process::ExitStatus::code)
             .map_or_else(|| "none".to_owned(), |code| code.to_string());
-        let mut text = format!("exit code: {code}\nstdout:\n{stdout_text}");
-        if !stderr_text.is_empty() {
-            text.push_str(&format!("\nstderr:\n{stderr_text}"));
-        }
-        if timed_out {
-            text = format!("the command ran past its time limit and was killed\n{text}");
-        }
-        let truncated = stdout_truncated || stderr_truncated;
-        let captured = truncate(text);
-        let output = ToolOutput {
-            text: captured.text,
-            truncated: truncated || captured.truncated,
-            omitted_bytes: stdout_omitted
-                .saturating_add(stderr_omitted)
-                .saturating_add(captured.omitted_bytes),
-        };
+        let output = render_shell_output(
+            &stdout,
+            &stderr,
+            &code,
+            timed_out,
+            stdout_lost || stderr_lost,
+        );
         if timed_out {
             return ActionResult {
                 status: ActionStatus::TimedOut,
@@ -352,23 +338,108 @@ struct Bounded {
 }
 
 impl Bounded {
-    fn render(&self) -> (String, bool, u64) {
-        if self.total <= (HEAD_BYTES + TAIL_BYTES) as u64 {
-            let mut text = String::from_utf8_lossy(&self.head).into_owned();
-            let tail: Vec<u8> = self.tail.iter().copied().collect();
-            text.push_str(&String::from_utf8_lossy(&tail));
-            return (text, false, 0);
-        }
-        let omitted = self
-            .total
-            .saturating_sub(self.head.len() as u64)
-            .saturating_sub(self.tail.len() as u64);
-        let mut text = String::from_utf8_lossy(&self.head).into_owned();
-        text.push_str(&format!("\n[... {omitted} bytes omitted ...]\n"));
-        let tail: Vec<u8> = self.tail.iter().copied().collect();
-        text.push_str(&String::from_utf8_lossy(&tail));
+    fn full(&self) -> Vec<u8> {
+        let mut bytes = self.head.clone();
+        bytes.extend(self.tail.iter().copied());
+        bytes
+    }
 
-        (text, true, omitted)
+    fn prefix(&self, length: usize) -> Vec<u8> {
+        let length = length.min(self.total as usize).min(self.head.len());
+        self.head[..length].to_vec()
+    }
+
+    fn suffix(&self, length: usize) -> Vec<u8> {
+        let length = length.min(self.total as usize);
+        if length == 0 {
+            return Vec::new();
+        }
+        if length <= self.tail.len() {
+            return self
+                .tail
+                .iter()
+                .skip(self.tail.len() - length)
+                .copied()
+                .collect();
+        }
+        let from_head = length - self.tail.len();
+        let mut bytes = self.head[self.head.len() - from_head..].to_vec();
+        bytes.extend(self.tail.iter().copied());
+        bytes
+    }
+}
+
+fn render_shell_output(
+    stdout: &Bounded,
+    stderr: &Bounded,
+    code: &str,
+    timed_out: bool,
+    drain_lost: bool,
+) -> ToolOutput {
+    let total = stdout.total.saturating_add(stderr.total);
+    let mut text = String::new();
+    if timed_out {
+        text.push_str("the command ran past its time limit and was killed\n");
+    }
+    text.push_str(&format!("exit code: {code}\n"));
+    if drain_lost {
+        text.push_str("[the shell's output could not be drained]\n");
+    }
+
+    if total <= (HEAD_BYTES + TAIL_BYTES) as u64 {
+        if stdout.total > 0 {
+            text.push_str("stdout:\n");
+            text.push_str(&String::from_utf8_lossy(&stdout.full()));
+            text.push('\n');
+        }
+        if stderr.total > 0 {
+            text.push_str("stderr:\n");
+            text.push_str(&String::from_utf8_lossy(&stderr.full()));
+            text.push('\n');
+        }
+        return ToolOutput {
+            text,
+            truncated: false,
+            omitted_bytes: 0,
+        };
+    }
+
+    // One shared budget: the first HEAD_BYTES of the output and then its
+    // last TAIL_BYTES. The omitted count is the real number of bytes
+    // between what is shown.
+    let head_stdout = HEAD_BYTES.min(stdout.total as usize);
+    let head_stderr = (HEAD_BYTES - head_stdout).min(stderr.total as usize);
+    let tail_stderr = TAIL_BYTES.min(stderr.total as usize);
+    let tail_stdout = (TAIL_BYTES - tail_stderr).min(stdout.total as usize);
+    if head_stdout > 0 {
+        text.push_str("stdout:\n");
+        text.push_str(&String::from_utf8_lossy(&stdout.prefix(head_stdout)));
+        text.push('\n');
+    }
+    if head_stderr > 0 {
+        text.push_str("stderr:\n");
+        text.push_str(&String::from_utf8_lossy(&stderr.prefix(head_stderr)));
+        text.push('\n');
+    }
+    let omitted = total
+        .saturating_sub(head_stdout as u64 + head_stderr as u64)
+        .saturating_sub(tail_stdout as u64 + tail_stderr as u64);
+    text.push_str(&format!("[... {omitted} bytes omitted ...]\n"));
+    if tail_stdout > 0 {
+        text.push_str("stdout tail:\n");
+        text.push_str(&String::from_utf8_lossy(&stdout.suffix(tail_stdout)));
+        text.push('\n');
+    }
+    if tail_stderr > 0 {
+        text.push_str("stderr tail:\n");
+        text.push_str(&String::from_utf8_lossy(&stderr.suffix(tail_stderr)));
+        text.push('\n');
+    }
+
+    ToolOutput {
+        text,
+        truncated: true,
+        omitted_bytes: omitted,
     }
 }
 
@@ -476,6 +547,12 @@ mod tests {
 
     use super::LocalRuntime;
     use crate::action::{Action, ActionStatus, ComputerRuntime};
+
+    fn omitted_in_text(text: &str) -> u64 {
+        let start = text.find("[... ").expect("an omission marker") + 5;
+        let end = text[start..].find(" bytes omitted").unwrap() + start;
+        text[start..end].parse().unwrap()
+    }
 
     fn runtime() -> (tempfile::TempDir, LocalRuntime) {
         let directory = tempfile::tempdir().unwrap();
@@ -640,13 +717,36 @@ mod tests {
             .await;
 
         assert!(result.output.truncated);
-        assert!(result.output.omitted_bytes > 0);
+        assert_eq!(result.output.omitted_bytes, 60_000 - 32_768);
+        assert_eq!(
+            omitted_in_text(&result.output.text),
+            result.output.omitted_bytes
+        );
         assert!(
             result.output.text.len() < 40_000,
             "the combined result is {} bytes",
             result.output.text.len()
         );
-        assert!(result.output.text.contains("bytes omitted"));
+    }
+
+    #[tokio::test]
+    async fn a_result_slightly_over_the_budget_names_the_true_omitted_count() {
+        let (_dir, runtime) = runtime();
+        for (bytes, omitted) in [(33_000_u64, 232_u64), (40_000, 7_232)] {
+            let result = runtime
+                .execute(Action::Shell {
+                    command: format!("head -c {bytes} /dev/zero | tr '\\0' 'a'"),
+                })
+                .await;
+
+            assert!(result.output.truncated);
+            assert_eq!(result.output.omitted_bytes, omitted, "{bytes} bytes");
+            assert_eq!(
+                omitted_in_text(&result.output.text),
+                omitted,
+                "the marker must name the true omitted count"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -660,9 +760,12 @@ mod tests {
             .await;
 
         assert!(result.output.truncated);
-        assert!(result.output.omitted_bytes > 8_000_000);
-        assert!(result.output.text.contains("bytes omitted"));
-        assert!(result.output.text.ends_with("END") || result.output.text.contains("END"));
+        assert_eq!(result.output.omitted_bytes, 9_000_003 - 32_768);
+        assert_eq!(
+            omitted_in_text(&result.output.text),
+            result.output.omitted_bytes
+        );
+        assert!(result.output.text.contains("END"));
     }
 
     #[tokio::test]

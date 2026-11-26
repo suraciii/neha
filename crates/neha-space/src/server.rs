@@ -1303,7 +1303,11 @@ mod tests {
                                 }]},
                                 "finish_reason": "length",
                             }]});
-                            format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                            let usage = json!({"choices":[],"usage":{
+                                "prompt_tokens": 40,
+                                "completion_tokens": 12,
+                            }});
+                            format!("data: {chunk}\n\ndata: {usage}\n\ndata: [DONE]\n\n")
                         }
                     };
                     Response::builder()
@@ -3146,6 +3150,8 @@ mod tests {
         let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
         let shown = show_run(&mut socket, run).await;
         assert_eq!(shown["status"], "failed");
+        assert_eq!(shown["usage"]["uncached_input"], 40);
+        assert_eq!(shown["usage"]["output"], 12);
         let workspace = running
             .server_home()
             .join("computers")
@@ -3164,9 +3170,15 @@ mod tests {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
         let content = "漢".repeat(21_800);
+        let padding = " ".repeat(500);
         let raw = format!(
-            "{{\"path\":\"unicode.txt\",\"content\":\"{}\"}}",
+            "{{{padding}\"path\":\"unicode.txt\",\"content\":\"{}\"}}",
             "\\u6f22".repeat(21_800)
+        );
+        assert!(
+            raw.len() > 131_072,
+            "the test must exceed the old summary threshold: {}",
+            raw.len()
         );
         let (base, provider_task) = scripted_provider(vec![
             raw_tool("write_file", raw),
@@ -3340,5 +3352,51 @@ mod tests {
         assert_eq!(recorded, (1..=last.as_i64()).collect::<Vec<_>>());
         socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_huge_path_is_recorded_bounded() {
+        use neha::record::EventKind;
+
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let raw = format!("{{\"path\":\"{}\"}}", "x".repeat(1_100_000));
+        let (base, provider_task) = scripted_provider(vec![
+            raw_tool("read_file", raw),
+            text("The read was blocked."),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        let result = send(&mut socket, chat, "read a huge path").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["text"], "The read was blocked.");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        let action = &shown["actions"][0];
+        assert_eq!(action["tool"], "read_file");
+        assert_eq!(action["status"], "failed");
+        assert_eq!(action["arguments"]["truncated"], true);
+
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+        let home = Home::open(&root).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let page = store.events_from(Seq::ZERO, 1000).await.unwrap();
+        let started = page
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::ActionStarted)
+            .expect("an action event");
+        let arguments = serde_json::to_string(&started.data["arguments"]).unwrap();
+        assert!(
+            arguments.len() < 4096,
+            "the refused call must be summarized, got {} bytes",
+            arguments.len()
+        );
+        store.close().await.unwrap();
     }
 }

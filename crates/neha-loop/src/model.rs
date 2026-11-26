@@ -140,6 +140,8 @@ pub struct ModelFailure {
     pub code: ErrorCode,
     /// A message for the Bot to repeat.
     pub detail: String,
+    /// The usage the Provider reported for the failed call.
+    pub usage: Usage,
 }
 
 /// The Model seam the loop calls.

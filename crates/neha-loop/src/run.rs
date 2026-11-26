@@ -196,7 +196,7 @@ where
 fn failure_outcome(failure: &ModelFailure, usage: Usage) -> RunOutcome {
     RunOutcome {
         text: format!("I could not answer: {}", failure.detail),
-        usage,
+        usage: usage + failure.usage,
         succeeded: false,
     }
 }
@@ -550,6 +550,11 @@ mod tests {
         let model = FakeModel::with(vec![Err(ModelFailure {
             code: neha::error::ErrorCode::Unavailable,
             detail: "down".to_owned(),
+            usage: Usage {
+                uncached_input: 40,
+                output: 12,
+                ..Usage::default()
+            },
         })]);
         let runtime = FakeRuntime::default();
         let mut recorder = TestRecorder::default();
@@ -565,6 +570,7 @@ mod tests {
 
         assert!(!outcome.succeeded);
         assert!(outcome.text.contains("down"));
+        assert_eq!(outcome.usage.budgeted(), 52);
         assert!(recorder.steps.is_empty());
     }
 
