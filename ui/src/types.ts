@@ -113,3 +113,15 @@ export interface RunView {
 }
 
 export type Preview = { text: string; file: boolean } | { error: true } | null;
+
+// One recorded event as the subscription carries it.
+export interface RecordEvent {
+  seq: string;
+  kind: string;
+  version: number;
+  at: string;
+  author: Author;
+  acting?: string;
+  command?: string;
+  data: Record<string, unknown>;
+}

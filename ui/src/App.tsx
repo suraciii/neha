@@ -1,4 +1,4 @@
-import { Show, createSignal, createStore, onSettled } from "solid-js";
+import { Show, createSignal, createStore, onCleanup, onSettled } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
@@ -22,6 +22,7 @@ import type {
   ProviderResult,
   BotResult,
   Preview,
+  RecordEvent,
   RunView,
   SendResult,
 } from "./types";
@@ -75,8 +76,7 @@ export default function App() {
       if (current === next) return;
       if (current && next && "text" in current && "text" in next) {
         if (current.text === next.text && current.file === next.file) return;
-        current.text = next.text;
-        current.file = next.file;
+        draft.previews[chatId] = { text: next.text, file: next.file };
         return;
       }
       if (current && next && "error" in current && "error" in next) return;
@@ -89,6 +89,11 @@ export default function App() {
   const [isMobile, setIsMobile] = createSignal(false);
   const commands = new Commands();
   let runGeneration = 0;
+  let following = false;
+  let activeRun: string | null = null;
+  let refreshTimer: number | null = null;
+  let refreshAgain = false;
+  let previewLoad = 0;
 
   onSettled(() => {
     const query = window.matchMedia("(max-width: 900px)");
@@ -106,6 +111,100 @@ export default function App() {
     void boot();
   });
 
+  onCleanup(() => {
+    if (refreshTimer !== null) {
+      window.clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    void commands.close();
+  });
+
+  async function startFollowing() {
+    if (following) return;
+    following = true;
+    try {
+      await commands.subscribe(
+        {
+          onSnapshot: (_events, cursor, resumed) => {
+            saveCursor(cursor);
+            if (resumed) queueRefresh();
+          },
+          onEvent: (event) => {
+            saveCursor(event.seq);
+            handleRecordEvent(event);
+          },
+          onCursor: saveCursor,
+          onError: (reason) => update({ error: reason }),
+        },
+        { cursor: readCursor() },
+      );
+    } catch (reason) {
+      following = false;
+      update({ error: reason });
+    }
+  }
+
+  function handleRecordEvent(event: RecordEvent) {
+    const data = event.data ?? {};
+    const chat = typeof data.chat === "string" ? data.chat : null;
+    if (
+      event.kind === "neha.bot.created" ||
+      event.kind === "neha.chat.created" ||
+      event.kind === "neha.computer.created" ||
+      event.kind === "neha.provider.added"
+    ) {
+      void loadWorkspace();
+      return;
+    }
+    if (event.kind === "neha.message.added" && chat) {
+      const text = typeof data.text === "string" ? data.text : "";
+      const file = typeof data.file === "string";
+      setPreview(chat, { text, file });
+    }
+    if (event.kind === "neha.run.finished") {
+      const run = typeof data.run === "string" ? data.run : null;
+      const known = activeRun ?? latestRunForActiveChat();
+      // RunFinished carries no Chat. Only the active Chat's Run may unlock it.
+      if (!run || run !== known) return;
+      activeRun = null;
+      update({ working: false });
+      queueRefresh();
+      return;
+    }
+    if (chat && state.activeChat?.id === chat) {
+      if (event.kind === "neha.run.started") {
+        const run = typeof data.run === "string" ? data.run : null;
+        if (run) activeRun = run;
+        update({ working: true });
+      }
+      queueRefresh();
+      return;
+    }
+    if (event.kind.startsWith("neha.run.") && state.working) queueRefresh();
+  }
+
+  function latestRunForActiveChat(): string | null {
+    const chat = state.activeChat;
+    if (!chat) return null;
+    return [...state.messages].reverse().find((message) => message.chat === chat.id && message.run)?.run ?? null;
+  }
+
+  function queueRefresh() {
+    if (refreshTimer !== null) {
+      refreshAgain = true;
+      return;
+    }
+    refreshTimer = window.setTimeout(() => {
+      refreshTimer = null;
+      void refreshActive().finally(() => {
+        if (refreshAgain) {
+          refreshAgain = false;
+          queueRefresh();
+        }
+      });
+    }, 50);
+  }
+
   async function boot() {
     try {
       const account = await api.me();
@@ -121,6 +220,7 @@ export default function App() {
   async function enter(account: Account) {
     update({ account });
     setReady(true);
+    void startFollowing();
     await loadWorkspace();
   }
 
@@ -152,10 +252,12 @@ export default function App() {
   }
 
   async function loadPreviews(chats: Chat[]) {
+    const generation = ++previewLoad;
     if (chats.length === 0) {
-      update({ previews: {} });
+      if (generation === previewLoad) update({ previews: {} });
       return;
     }
+    const before = new Map(chats.map((chat) => [chat.id, state.previews[chat.id]]));
     const previews: Record<string, Preview> = {};
     for (const chat of chats) {
       try {
@@ -166,11 +268,21 @@ export default function App() {
         previews[chat.id] = { error: true };
       }
     }
-    update({ previews });
+    if (generation !== previewLoad) return;
+    setState((draft) => {
+      for (const chat of chats) {
+        // A live event may have written a newer preview while this read ran.
+        const next = previews[chat.id];
+        if (next !== undefined && draft.previews[chat.id] === before.get(chat.id)) {
+          draft.previews[chat.id] = next;
+        }
+      }
+    });
   }
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
+    activeRun = null;
     update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
     try {
       const [messages, files, bot] = await Promise.all([
@@ -185,22 +297,23 @@ export default function App() {
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
-      await restoreRun(chat, messages, generation);
+      await restoreRun(messages, generation);
     } catch (reason) {
       update({ error: reason });
     }
   }
 
-  async function restoreRun(chat: Chat, messages: Message[], generation: number) {
+  async function restoreRun(messages: Message[], generation: number) {
     const run = [...messages].reverse().find((message) => message.run)?.run;
     if (!run || generation !== runGeneration) return;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (generation !== runGeneration) return;
       if (view.status === "running") {
+        activeRun = run;
         update({ working: true });
-        void pollRun(chat, run, generation);
       } else {
+        activeRun = null;
         await refreshActive();
       }
     } catch {
@@ -208,22 +321,16 @@ export default function App() {
     }
   }
 
-  async function pollRun(chat: Chat, run: string, generation: number) {
-    while (generation === runGeneration) {
-      await new Promise((resolve) => setTimeout(resolve, 1_500));
-      if (generation !== runGeneration) return;
-      try {
-        const view = await commands.command<RunView>("run_show", { run }, 10_000);
-        if (generation !== runGeneration) return;
-        if (view.status !== "running") {
-          update({ working: false });
-          if (state.activeChat?.id === chat.id) await refreshActive();
-          return;
-        }
-      } catch {
-        update({ working: false });
-        return;
-      }
+  async function reconcileRun(messages: Message[]) {
+    const run = [...messages].reverse().find((message) => message.run)?.run;
+    if (!run) return;
+    try {
+      const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      activeRun = view.status === "running" ? run : null;
+      update({ working: view.status === "running" });
+    } catch {
+      activeRun = null;
+      update({ working: false });
     }
   }
 
@@ -238,6 +345,7 @@ export default function App() {
       update({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
+      await reconcileRun(messages);
     } catch (reason) {
       update({ error: reason });
     }
@@ -375,6 +483,7 @@ export default function App() {
 
   function backToList() {
     runGeneration += 1;
+    activeRun = null;
     update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
   }
 
@@ -511,4 +620,30 @@ function messageFor(reason: unknown): string {
   if (reason instanceof TypeError) return t("error.unreachable");
   if (typeof reason === "string") return reason;
   return t("error.generic");
+}
+
+const CURSOR_KEY = "neha.record.cursor";
+const MAX_CURSOR = "9223372036854775807";
+
+function isCursor(value: string | null): value is string {
+  if (!value || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  return value.length < MAX_CURSOR.length || (value.length === MAX_CURSOR.length && value <= MAX_CURSOR);
+}
+
+function readCursor(): string | null {
+  try {
+    const value = localStorage.getItem(CURSOR_KEY);
+    return isCursor(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCursor(cursor: string) {
+  if (!isCursor(cursor)) return;
+  try {
+    localStorage.setItem(CURSOR_KEY, cursor);
+  } catch {
+    // A browser that blocks storage still follows events for this page.
+  }
 }
