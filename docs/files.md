@@ -102,5 +102,5 @@ The shell commands go through the same approval gate as any other shell command,
 An action that breaks a limit returns an error to the Model instead of failing the whole run.
 
 - A File is at most 32 MiB. A larger file is refused before anything is recorded: the CLI stops with an error, the browser reports that the file was not sent, and a Bot's `chat send --file` fails.
-- A Bot takes only a File of the Chat. A File of another Chat fails the action.
-- `file get` without `--out` writes inside the Bot's Workspace; `--out` and `chat send --file` use paths the shell can already reach, so the shell's approval and sandbox rules apply. On a Hosted Computer a path must stay inside the Workspace; on a Local Computer the shell reads with the machine user's rights except the Computer's configuration directory; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.
+- A Bot reaches only the Files of its own Chat. A File of another Chat is not found.
+- `file get` without `--out` writes inside the Bot's Workspace, whatever the shell's current directory; `--out` and `chat send --file` use paths the shell can already reach, so the shell's own approval and sandbox rules apply. A Hosted shell runs with the Space user's rights and no Workspace fence. A Local shell reads with the machine user's rights except the Computer's configuration directory and writes only where its Workspace, grants, or full access allow; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.

@@ -321,6 +321,20 @@ fn first_word(field: &str) -> String {
         .to_owned()
 }
 
+/// Returns the File id under the Bot Message whose text is `text`.
+fn bot_file_id(read: &str, text: &str) -> String {
+    let lines: Vec<&str> = read.lines().collect();
+    let position = lines
+        .iter()
+        .position(|line| line.contains("Bot:") && line.contains(text))
+        .unwrap_or_else(|| panic!("no Bot Message says {text:?}:\n{read}"));
+    lines[position + 1]
+        .trim()
+        .strip_prefix("file ")
+        .unwrap_or_else(|| panic!("the Message after {text:?} names no File:\n{read}"))
+        .to_owned()
+}
+
 /// Waits for a background CLI and returns whether it succeeded and all stdout.
 fn finish(mut child: Child, lines: mpsc::Receiver<String>, output: String) -> (bool, String) {
     let status = child.wait().expect("neha exits");
@@ -1330,11 +1344,6 @@ async fn a_file_travels_between_a_user_and_a_bot() {
         ],
     );
     let created = run(&home, &credential, &["bot", "create", "Scout"]);
-    let bot = field(&created, "Created Bot ")
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
     let computer = field(&created, "Computer:");
     let chat = field(&created, "Chat:");
 
@@ -1401,8 +1410,14 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     // the Bot's Workspace (its HOME), not the shell's current directory.
     let get = format!("cd /tmp && neha file get {file}");
     script.call("shell", serde_json::json!({"command": get}));
-    let send = "neha chat send --file notes.txt".to_owned();
-    script.call("shell", serde_json::json!({"command": send}));
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf 'hosted result' > result.txt"}),
+    );
+    script.call(
+        "shell",
+        serde_json::json!({"command": "neha chat send --file result.txt 'Here is the result.'"}),
+    );
     script.say("Done.");
     let answered = run(
         &home,
@@ -1412,30 +1427,19 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     assert!(answered.contains("Done."), "{answered}");
     let workspace = home.join("computers").join(&computer).join("workspace");
     assert_eq!(
-        std::fs::read_to_string(workspace.join("notes.txt")).unwrap(),
-        "the quick brown fox\n"
+        std::fs::read_to_string(workspace.join("result.txt")).unwrap(),
+        "hosted result"
     );
     let read = run(&home, &credential, &["chat", "read", &chat]);
-    assert!(
-        read.lines().any(|line| line.contains("Bot:")),
-        "the File Message is the Bot's: {read}"
-    );
-    let listed = run(&home, &credential, &["chat", "files", "--bot", &bot]);
-    let delivered = listed
-        .lines()
-        .find(|line| line.contains("notes.txt"))
-        .and_then(|line| line.split_whitespace().next())
-        .expect("the Bot's File is listed");
+    let delivered = bot_file_id(&read, "Here is the result.");
+    assert_ne!(delivered, file, "the Bot delivered a new File");
     let out = downloads.join("fetched.txt");
     run(
         &home,
         &credential,
-        &["file", "get", delivered, "--out", out.to_str().unwrap()],
+        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
     );
-    assert_eq!(
-        std::fs::read_to_string(&out).unwrap(),
-        "the quick brown fox\n"
-    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "hosted result");
 
     // A File the Space cannot hold never leaves this machine.
     let big = directory.path().join("big.bin");
@@ -1460,8 +1464,8 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     let listed = run(&home, &credential, &["chat", "files", "--chat", &chat]);
     assert_eq!(
         listed.lines().count(),
-        1,
-        "the same bytes and name are one File: {listed}"
+        2,
+        "the user's File and the Bot's result: {listed}"
     );
 
     // A File the Space does not hold is refused by name.
@@ -1524,7 +1528,11 @@ async fn a_file_travels_through_a_local_computers_cli() {
     );
     script.call(
         "shell",
-        serde_json::json!({"command": "neha chat send --file notes.txt"}),
+        serde_json::json!({"command": "printf 'local result' > result.txt"}),
+    );
+    script.call(
+        "shell",
+        serde_json::json!({"command": "neha chat send --file result.txt 'Local result.'"}),
     );
     script.say("Sent it back.");
     let answered = run(
@@ -1543,16 +1551,23 @@ async fn a_file_travels_through_a_local_computers_cli() {
         shown.contains("[redacted]"),
         "the token is redacted in the record: {shown}"
     );
+    let read = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "read", &computer.chat],
+    );
+    let delivered = bot_file_id(&read, "Local result.");
+    let out = computer.path().join("downloaded.txt");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["file", "get", &delivered, "--out", out.to_str().unwrap()],
+    );
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), "local result");
     assert_eq!(
         std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
         "over the channel\n"
     );
-    let listed = run(
-        &computer.home,
-        &computer.credential,
-        &["chat", "files", "--bot", &computer.bot],
-    );
-    assert!(listed.contains("notes.txt"), "{listed}");
 
     drop(computer);
     provider_task.abort();
