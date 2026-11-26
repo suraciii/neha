@@ -939,9 +939,13 @@ fn migrate_legacy_credential_for(
 }
 
 /// Moves `legacy` to `target` unless they are the same directory entry.
+///
+/// The copy reads through the old name (a symbolic link's target is read), but
+/// the cleanup removes the name itself: for a symbolic link that is the link,
+/// never the file it points at.
 fn migrate_legacy_credential_between(target: &Path, legacy: &Path) -> Result<()> {
     if same_directory_entry(target, legacy) {
-        // cwd == HOME and XDG_CONFIG_HOME == ".config" resolve to one file;
+        // cwd == HOME and XDG_CONFIG_HOME == ".config" resolve to one entry;
         // it already sits in the hidden configuration directory, so it stays
         // exactly where it is.
         return Ok(());
@@ -962,28 +966,34 @@ fn migrate_legacy_credential_between(target: &Path, legacy: &Path) -> Result<()>
 }
 
 /// Returns whether two paths name the same directory entry.
+///
+/// Only the parent directory is resolved; the final name is kept as written.
+/// Resolving the last component would make a hard link under another name look
+/// like the same entry (it is not — the old name still exists and must go) and
+/// would turn a symbolic link into its target (whose name must never be
+/// removed).
 fn same_directory_entry(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
+    match (
+        resolved_directory_entry(left),
+        resolved_directory_entry(right),
+    ) {
+        (Some(left), Some(right)) => left == right,
+        _ => left == right,
     }
-    let (Ok(left), Ok(right)) = (std::fs::canonicalize(left), std::fs::canonicalize(right)) else {
-        return false;
-    };
-    if left == right {
-        return true;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if let (Ok(left), Ok(right)) = (std::fs::metadata(&left), std::fs::metadata(&right)) {
-            return left.dev() == right.dev() && left.ino() == right.ino();
-        }
-    }
+}
 
-    false
+/// Returns the resolved parent directory plus the path's final name.
+fn resolved_directory_entry(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+
+    Some(resolved_path(parent).join(name))
 }
 
 /// Returns the cwd-relative credential path the old resolver used, if any.
+///
+/// The final name is preserved even when it is a symbolic link: migration must
+/// remove the link, not the file it points at.
 fn legacy_relative_credential_path(
     cwd: &Path,
     neha_credential: Option<&Path>,
@@ -999,9 +1009,7 @@ fn legacy_relative_credential_path(
         return None;
     }
 
-    Some(resolved_path(
-        &cwd.join(xdg).join("neha").join("credential.json"),
-    ))
+    resolved_directory_entry(&cwd.join(xdg).join("neha").join("credential.json"))
 }
 
 /// Returns the path of the saved pairing.
@@ -1440,10 +1448,10 @@ mod tests {
         Config, Runtimes, Socket, answer_is_yes, check_saved_origin, check_ticket_space,
         choose_ticket, config_directory_from, confirmation_needed, credential_path_from,
         decode_bytes, default_workspace_from, denied_paths_from, encode_bytes, execute_frame,
-        folder_for, found_tickets, hidden_roots_for, migrate_legacy_credential_for,
-        normalized_space_url, parse_ticket, refuse_older_pairing_from, refuse_workspace,
-        same_origin, saved_session_url, serve_channel, socket_url, standard_config_directory,
-        write_receipt,
+        folder_for, found_tickets, hidden_roots_for, legacy_relative_credential_path,
+        migrate_legacy_credential_for, normalized_space_url, parse_ticket,
+        refuse_older_pairing_from, refuse_workspace, same_origin, saved_session_url, serve_channel,
+        socket_url, standard_config_directory, write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -2038,6 +2046,105 @@ mod tests {
             credential.is_file(),
             "a symlinked alias of the session must not be deleted"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_legacy_credential_is_migrated_by_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let session = session_at("http://127.0.0.1:7337");
+        let target = home.join(".config/neha/credential.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, serde_json::to_vec(&session).unwrap()).unwrap();
+        // Same inode, different name: the old name must be removed even though
+        // the bytes are already in the resolved file.
+        let legacy = cwd.join("relative-xdg/neha/credential.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::hard_link(&target, &legacy).unwrap();
+
+        migrate_legacy_credential_for(
+            &cwd,
+            None,
+            Some(PathBuf::from("relative-xdg")),
+            Some(home.clone()),
+        )
+        .unwrap();
+
+        assert!(!legacy.exists(), "the old hard-link name is removed");
+        assert!(target.is_file(), "the resolved session is kept");
+        let loaded = Credential::load_from(&target).unwrap();
+        assert_eq!(loaded.token, "session-token");
+        assert_eq!(
+            credential_path_from(None, Some(PathBuf::from("relative-xdg")), Some(home), &cwd)
+                .unwrap(),
+            target
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_legacy_credential_removes_only_the_link() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().join("cwd");
+        std::fs::create_dir(&cwd).unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let session = session_at("http://127.0.0.1:7337");
+        let marker = directory.path().join("marker.json");
+        std::fs::write(&marker, serde_json::to_vec(&session).unwrap()).unwrap();
+        let legacy = cwd.join("relative-xdg/neha/credential.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&marker, &legacy).unwrap();
+
+        // The legacy path keeps its final name; it is not the marker's path.
+        let known =
+            legacy_relative_credential_path(&cwd, None, Some(Path::new("relative-xdg"))).unwrap();
+        assert_eq!(
+            known.file_name(),
+            Some(std::ffi::OsStr::new("credential.json"))
+        );
+        assert_eq!(
+            known,
+            std::fs::canonicalize(&cwd)
+                .unwrap()
+                .join("relative-xdg/neha/credential.json")
+        );
+        assert_ne!(known, marker);
+
+        migrate_legacy_credential_for(
+            &cwd,
+            None,
+            Some(PathBuf::from("relative-xdg")),
+            Some(home.clone()),
+        )
+        .unwrap();
+
+        // Only the link name is gone; the file it pointed at is untouched.
+        assert!(
+            std::fs::symlink_metadata(&legacy).is_err(),
+            "the old symbolic link is removed"
+        );
+        assert_eq!(
+            std::fs::read(&marker).unwrap(),
+            serde_json::to_vec(&session).unwrap(),
+            "the link target is never deleted or rewritten"
+        );
+        let target =
+            credential_path_from(None, Some(PathBuf::from("relative-xdg")), Some(home), &cwd)
+                .unwrap();
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            serde_json::to_vec(&session).unwrap()
+        );
+        // Two loads keep the same session.
+        for _ in 0..2 {
+            let loaded = Credential::load_from(&target).unwrap();
+            assert_eq!(loaded.token, "session-token");
+        }
     }
 
     #[cfg(unix)]

@@ -598,6 +598,17 @@ async fn validate_client_directory(server: &SpaceServer) -> Result<(), ServerErr
             return Err(ServerError::UiOverlapsConfiguration(dir.clone()));
         }
     }
+    // The daemon's machine configuration directory holds `computer.json`,
+    // which carries a Computer's credential; a static root that reaches it
+    // would serve that bearer to a caller that has not signed in.
+    if let Some(computer_home) = std::env::var_os("NEHA_COMPUTER_HOME").map(PathBuf::from) {
+        let directory = resolve_path(&computer_home)
+            .await
+            .map_err(|_| ServerError::Ui(dir.clone()))?;
+        if root.starts_with(&directory) || directory.starts_with(&root) {
+            return Err(ServerError::UiOverlapsConfiguration(dir.clone()));
+        }
+    }
 
     Ok(())
 }
@@ -2326,7 +2337,8 @@ pub enum ServerError {
     /// The browser client directory overlaps the machine's configuration and
     /// credential directory, where the local pairing ticket is written.
     #[error(
-        "the browser client at {} overlaps the Neha configuration and credential directory",
+        "the browser client at {} overlaps the Neha configuration and credential directories, \
+         including the machine configuration directory",
         .0.display()
     )]
     UiOverlapsConfiguration(PathBuf),
@@ -9815,6 +9827,103 @@ mod tests {
         spawn("independent", &ui, &home, Some(&credential));
 
         // Without NEHA_CREDENTIAL nothing changes.
+        let absent = tempfile::tempdir().unwrap();
+        let ui = write_ui(absent.path());
+        let home = absent.path().join("home");
+        spawn("absent", &ui, &home, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_computer_home_named_in_the_environment_is_hidden_from_the_ui() {
+        if std::env::var_os("NEHA_TEST_COMPUTER_HOME_CHILD").is_some() {
+            let case = std::env::var("NEHA_TEST_COMPUTER_HOME_CASE").unwrap();
+            let root = std::env::var_os("NEHA_TEST_HOME").expect("a test home");
+            let ui = std::env::var_os("NEHA_TEST_UI_ROOT").expect("a test UI root");
+            let home = Home::open(root).unwrap();
+            let result = start_with_ui(home, 0, Some(std::path::PathBuf::from(ui))).await;
+            if case == "absent" || case == "independent" {
+                let running = result.expect("an independent UI root starts");
+                assert!(
+                    running.local_ticket.is_none(),
+                    "without HOME or XDG no ticket file is written"
+                );
+                running.shutdown().await;
+            } else {
+                let Err(error) = result else {
+                    panic!("the computer-home case {case} must be refused");
+                };
+                assert!(
+                    matches!(&error, ServerError::UiOverlapsConfiguration(_)),
+                    "the wrong refusal for {case}: {error:?}"
+                );
+                assert!(
+                    error.to_string().contains("machine configuration"),
+                    "the refusal names the machine configuration directory: {error}"
+                );
+            }
+            println!("COMPUTER_HOME_CHILD_OK");
+
+            return;
+        }
+
+        let spawn = |case: &str,
+                     ui: &std::path::Path,
+                     home: &std::path::Path,
+                     computer_home: Option<&std::path::Path>| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .arg("--exact")
+                .arg(
+                    "server::tests::a_computer_home_named_in_the_environment_is_hidden_from_the_ui",
+                )
+                .arg("--nocapture")
+                .env_clear()
+                .env("NEHA_TEST_COMPUTER_HOME_CHILD", "1")
+                .env("NEHA_TEST_COMPUTER_HOME_CASE", case)
+                .env("NEHA_TEST_UI_ROOT", ui)
+                .env("NEHA_TEST_HOME", home);
+            if let Some(computer_home) = computer_home {
+                command.env("NEHA_COMPUTER_HOME", computer_home);
+            }
+            let output = command.output().expect("the child test process starts");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "the child Space failed for {case}: {stdout}\n{stderr}"
+            );
+            assert!(stdout.contains("COMPUTER_HOME_CHILD_OK"), "{stdout}");
+        };
+        let write_ui = |root: &std::path::Path| {
+            let ui = root.join("ui");
+            std::fs::create_dir_all(&ui).unwrap();
+            std::fs::write(ui.join("index.html"), "<!doctype html><title>Neha</title>").unwrap();
+            ui
+        };
+
+        // The machine configuration directory sits inside the UI root.
+        let inside = tempfile::tempdir().unwrap();
+        let ui = write_ui(inside.path());
+        let home = inside.path().join("home");
+        let machine = ui.join("machine");
+        spawn("inside", &ui, &home, Some(&machine));
+
+        // The UI root sits inside the machine configuration directory.
+        let enclosing = tempfile::tempdir().unwrap();
+        let ui = write_ui(enclosing.path());
+        let home = enclosing.path().join("home");
+        let machine = enclosing.path().to_path_buf();
+        spawn("enclosing", &ui, &home, Some(&machine));
+
+        // Independent places start normally.
+        let independent = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let ui = write_ui(independent.path());
+        let home = independent.path().join("home");
+        let machine = elsewhere.path().join("machine");
+        spawn("independent", &ui, &home, Some(&machine));
+
+        // Without NEHA_COMPUTER_HOME nothing changes.
         let absent = tempfile::tempdir().unwrap();
         let ui = write_ui(absent.path());
         let home = absent.path().join("home");
