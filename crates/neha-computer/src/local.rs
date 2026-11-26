@@ -48,6 +48,13 @@ pub struct MachineAccess {
     pub folder: PathBuf,
 }
 
+/// Returns the directory holding this build's `neha` binary, when known.
+fn default_cli_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
 /// A Computer runtime backed by one directory.
 pub struct LocalRuntime {
     /// The only root writes may reach: the managed workspace, or the Bot's
@@ -83,6 +90,10 @@ pub struct LocalRuntime {
     /// daemon reuses one runtime across runs, so its actions update this slot
     /// before they run instead of holding one token forever.
     env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// The directory holding this build's `neha` binary. A Bot's shell finds
+    /// the CLI by name, so the skill's commands run where a `neha` install
+    /// is not on the fixed system PATH.
+    cli_dir: Option<PathBuf>,
 }
 
 /// Which kind of machine a runtime drives.
@@ -125,6 +136,7 @@ impl LocalRuntime {
             grants: Vec::new(),
             cwd: None,
             env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: default_cli_dir(),
         })
     }
 
@@ -270,6 +282,7 @@ impl LocalRuntime {
             grants: Vec::new(),
             cwd: None,
             env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: default_cli_dir(),
         })
     }
 
@@ -1002,12 +1015,16 @@ impl LocalRuntime {
             Mode::Managed => self.root.join(".tmp"),
             Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
         };
+        let path = match &self.cli_dir {
+            Some(directory) => format!("{}:{SHELL_PATH}", directory.display()),
+            None => SHELL_PATH.to_owned(),
+        };
         process
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
-            .env("PATH", SHELL_PATH)
+            .env("PATH", path)
             .env("HOME", &self.root)
             .env("TMPDIR", temporary)
             .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
@@ -2362,6 +2379,7 @@ mod tests {
             grants: Vec::new(),
             cwd: None,
             env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: None,
         }
     }
 

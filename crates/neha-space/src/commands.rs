@@ -1840,20 +1840,19 @@ pub async fn bot_message(
             "a Bot's run token is bound to its own Chat",
         ));
     }
-    if text.trim().is_empty() && file.is_none() {
-        return Err(ApiError::invalid_argument("a Message needs text or a File"));
-    }
-    if let Some(file) = file {
+    let Some(file) = file else {
+        return Err(ApiError::invalid_argument(
+            "a Bot's run token may send only a File Message",
+        ));
+    };
+    {
         let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
         state
             .file_of(chat, file)
             .ok_or_else(|| ApiError::not_found("no such File"))?;
     }
     let message = Id::new();
-    let mut data = json!({"message": message, "chat": chat, "text": text});
-    if let Some(file) = file {
-        data["file"] = json!(file);
-    }
+    let data = json!({"message": message, "chat": chat, "text": text, "file": file});
     let appended = append(
         store,
         state,
@@ -1870,10 +1869,7 @@ pub async fn bot_message(
     let Some(event) = appended.events.first() else {
         return Err(ApiError::internal("the Message was not recorded"));
     };
-    let mut result = json!({"message": message, "chat": chat, "seq": event.seq});
-    if let Some(file) = file {
-        result["file"] = json!(file);
-    }
+    let result = json!({"message": message, "chat": chat, "seq": event.seq, "file": file});
 
     Ok(Outcome {
         committed: Some(event.seq),
@@ -2203,6 +2199,10 @@ async fn finish_run_with(
     let mut start_step = None;
     let computer = pending.computer;
     let bot_env = bot_environment(state, &pending)?;
+    let secret = bot_env
+        .iter()
+        .find(|(key, _)| key == "NEHA_BOT_TOKEN")
+        .map(|(_, value)| value.clone());
     // The Computer's kind picks the runtime: a hosted Computer runs inside
     // the Space, a local one across its channel. The queue never starts a run
     // whose local Computer is offline; starting one here anyway fails it the
@@ -2238,7 +2238,7 @@ async fn finish_run_with(
                 if let Some(folder) = &pending.once_grant {
                     runtime = runtime.with_once_grant(folder);
                 }
-                runtime.with_env(bot_env)
+                runtime.with_env(bot_env.clone())
             })
         }
         _ => match LocalRuntime::new(home.workspace_dir(computer)) {
@@ -2254,6 +2254,10 @@ async fn finish_run_with(
                 return finish_completion(store, state, pending, outcome).await;
             }
         },
+    };
+    let runtime = RedactingRuntime {
+        inner: runtime,
+        secret,
     };
     if let Some((next_step, unknown)) = recovery {
         start_step = Some(next_step);
@@ -2489,8 +2493,8 @@ async fn record_recovered_step(
 /// hold exactly the content the action was asked to write. A missing or
 /// different file is unknown, not a failure, because the action may have
 /// written and something else changed it later.
-async fn verify_recovered_action(
-    runtime: &RunRuntime,
+async fn verify_recovered_action<R: neha_computer::ComputerRuntime>(
+    runtime: &R,
     action: &crate::state::ActionView,
 ) -> Result<(String, Option<String>), String> {
     let arguments = action.arguments.to_string();
@@ -3133,6 +3137,59 @@ async fn finish_completion(
     .await?;
 
     Ok(Finished::Completed(completion.events))
+}
+
+/// Wraps a run's runtime so the run token never reaches the Model or the
+/// record, even when a shell command prints its environment.
+struct RedactingRuntime {
+    inner: RunRuntime,
+    secret: Option<String>,
+}
+
+impl RedactingRuntime {
+    fn redact(&self, mut result: neha_computer::ActionResult) -> neha_computer::ActionResult {
+        if let Some(secret) = &self.secret {
+            result.output.text = result.output.text.replace(secret, "[redacted]");
+            if let Some(error) = &mut result.error {
+                *error = error.replace(secret, "[redacted]");
+            }
+        }
+
+        result
+    }
+}
+
+impl neha_computer::ComputerRuntime for RedactingRuntime {
+    #[allow(clippy::manual_async_fn)]
+    fn execute(
+        &self,
+        action: neha_computer::Action,
+    ) -> impl std::future::Future<Output = neha_computer::ActionResult> + Send {
+        async move {
+            let result = self.inner.execute(action).await;
+
+            self.redact(result)
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn read_bytes(
+        &self,
+        path: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, neha_computer::ByteError>> + Send {
+        let path = path.to_owned();
+        async move { self.inner.read_bytes(&path).await }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn write_bytes(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), neha_computer::ByteError>> + Send {
+        let path = path.to_owned();
+        async move { self.inner.write_bytes(&path, bytes).await }
+    }
 }
 
 /// The runtime a run works on.
@@ -4470,8 +4527,10 @@ fn store_error(error: crate::store::StoreError) -> ApiError {
 mod tests {
     use serde_json::json;
 
+    use neha_computer::ComputerRuntime as _;
+
     use super::{
-        LoopCall, RecoveryPlan, RunRuntime, ambiguous_path, ambiguous_path_at,
+        LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
         lasting_rule_path_at, path_covers, path_matches, path_matches_at, path_parent,
         prepare_recovery, prepare_resume, resolve_action_path, rule_covers, rule_matches,
         verify_recovered_action,
@@ -5080,6 +5139,35 @@ mod tests {
         assert!(resume.recovered, "every call already has its result");
         assert!(resume.approved_action.is_none());
         assert!(plan.unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_run_token_never_enters_an_action_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let inner = RunRuntime::Managed(
+            neha_computer::LocalRuntime::new(directory.path())
+                .unwrap()
+                .with_env(vec![(
+                    "NEHA_BOT_TOKEN".to_owned(),
+                    "run-token-123".to_owned(),
+                )]),
+        );
+        let runtime = RedactingRuntime {
+            inner,
+            secret: Some("run-token-123".to_owned()),
+        };
+        let result = runtime
+            .execute(neha_computer::Action::Shell {
+                command: "printf %s \"$NEHA_BOT_TOKEN\"".to_owned(),
+            })
+            .await;
+        assert!(
+            result.output.text.contains("[redacted]"),
+            "{}",
+            result.output.text
+        );
+        assert!(!result.output.text.contains("run-token-123"));
+        assert!(result.error.is_none());
     }
 
     #[tokio::test]

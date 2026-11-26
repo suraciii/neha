@@ -81,8 +81,8 @@ When the file is over the limit or the upload fails, the Chat says so and keeps 
 
 The Bot works with Files through the `neha` command in its shell, not through File tools. A run's shell already has `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`, so these commands work without a sign-in:
 
-- `neha file get <id>` writes a File of the Chat into the Workspace under the File's name.
-- `neha chat send --file <path>` sends a Workspace file to the Chat as a Bot Message. Text is optional, but the CLI accepts either `--file` or text for one Message, so a Bot sends a file-only Message.
+- `neha file get <id>` writes a File of the Chat into the Workspace under the File's name; it writes there even when the shell runs in another directory. With `--out`, the shell runs the CLI with its usual write rights.
+- `neha chat send --file <path>` sends a Workspace file to the Chat as a Bot Message, alone or with text.
 
 A Message that carries a File includes a `[File id=<uuid> ...]` line; the Bot passes that id to `neha file get`. The Bot never prints or stores its token.
 
@@ -103,4 +103,4 @@ An action that breaks a limit returns an error to the Model instead of failing t
 
 - A File is at most 32 MiB. A larger file is refused before anything is recorded: the CLI stops with an error, the browser reports that the file was not sent, and a Bot's `chat send --file` fails.
 - A Bot takes only a File of the Chat. A File of another Chat fails the action.
-- `file get` writes only inside the Bot's Workspace; `chat send --file` reads a path the shell can already read, so the shell's approval and sandbox rules apply. On a Hosted Computer a path must stay inside the Workspace; on a Local Computer the shell reads with the machine user's rights except the Computer's configuration directory; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.
+- `file get` without `--out` writes inside the Bot's Workspace; `--out` and `chat send --file` use paths the shell can already reach, so the shell's approval and sandbox rules apply. On a Hosted Computer a path must stay inside the Workspace; on a Local Computer the shell reads with the machine user's rights except the Computer's configuration directory; [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers that range.

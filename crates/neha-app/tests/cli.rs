@@ -1397,9 +1397,11 @@ async fn a_file_travels_between_a_user_and_a_bot() {
 
     // The Bot uses its CLI instead of File tools: it gets the File into its
     // Workspace, then sends one back as a Bot Message.
-    let get = format!("{} file get {file}", BIN);
+    // Run from another directory: without --out, the CLI still writes into
+    // the Bot's Workspace (its HOME), not the shell's current directory.
+    let get = format!("cd /tmp && neha file get {file}");
     script.call("shell", serde_json::json!({"command": get}));
-    let send = format!("{} chat send --file notes.txt", BIN);
+    let send = "neha chat send --file notes.txt".to_owned();
     script.call("shell", serde_json::json!({"command": send}));
     script.say("Done.");
     let answered = run(
@@ -1472,6 +1474,87 @@ async fn a_file_travels_between_a_user_and_a_bot() {
     assert!(String::from_utf8_lossy(&missing.stderr).contains("not_found"));
 
     drop(server);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_file_travels_through_a_local_computers_cli() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-file-")
+        .tempdir_in("/var/tmp")
+        .expect("the File test needs a writable /var/tmp");
+    let computer = local_computer(directory, &base, &script);
+    let folder = computer.workspace.join(&computer.bot);
+    let notes = computer.path().join("notes.txt");
+    std::fs::write(&notes, "over the channel\n").unwrap();
+
+    script.say("Got the note.");
+    run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--file",
+            notes.to_str().unwrap(),
+        ],
+    );
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    let file = first_word(listed.lines().next().expect("the uploaded File is listed"));
+
+    // The skill's commands run by name in the bwrap sandbox and use the run
+    // token from the shell environment, not the User's saved credential.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf %s \"$NEHA_BOT_TOKEN\""}),
+    );
+    script.call(
+        "shell",
+        serde_json::json!({"command": format!("neha file get {file}")}),
+    );
+    script.call(
+        "shell",
+        serde_json::json!({"command": "neha chat send --file notes.txt"}),
+    );
+    script.say("Sent it back.");
+    let answered = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "send it back"],
+    );
+    assert!(answered.contains("Sent it back."), "{answered}");
+    let run_id = first_word(&field(&answered, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.contains("[redacted]"),
+        "the token is redacted in the record: {shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(folder.join("notes.txt")).unwrap(),
+        "over the channel\n"
+    );
+    let listed = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "files", "--bot", &computer.bot],
+    );
+    assert!(listed.contains("notes.txt"), "{listed}");
+
+    drop(computer);
     provider_task.abort();
 }
 

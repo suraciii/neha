@@ -6822,11 +6822,30 @@ mod tests {
         let forbidden = client
             .post(format!("{}/api/bot/messages", running.url()))
             .bearer_auth(&bot_token)
-            .json(&serde_json::json!({"chat": other_chat, "text": "elsewhere"}))
+            .json(&serde_json::json!({"chat": other_chat, "file": file}))
             .send()
             .await
             .unwrap();
         assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+        // The token sends File Messages only; a text-only Message is refused
+        // and records nothing.
+        let before = {
+            let state = running.server.state.lock().unwrap();
+            state.messages.len()
+        };
+        let text_only = client
+            .post(format!("{}/api/bot/messages", running.url()))
+            .bearer_auth(&bot_token)
+            .json(&serde_json::json!({"chat": chat, "text": "just words"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(text_only.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert_eq!(
+            running.server.state.lock().unwrap().messages.len(),
+            before,
+            "a refused Bot Message records nothing"
+        );
 
         // The bytes come back, and a bad or expired token is refused.
         let response = client

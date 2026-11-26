@@ -44,7 +44,7 @@ describe("approvals", () => {
       scopeShell("git"),
     );
     expect(localScope(file("cache/tmp.txt"))).toEqual(scopeFiles("cache"));
-    expect(localScope({ ...shell, tool: "put_file", arguments: { path: "out/report.pdf" } })).toEqual(
+    expect(localScope({ ...shell, tool: "write_file", arguments: { path: "out/report.pdf" } })).toEqual(
       scopeFiles("out"),
     );
     // A summary names the action after its tool; other prose names nothing.
@@ -67,7 +67,7 @@ describe("approvals", () => {
       expect(localScope(file(path))).toBeNull();
     }
     expect(localScope(file(42, "write_file:  "))).toBeNull();
-    expect(localScope({ ...shell, tool: "take_file" })).toBeNull();
+    expect(localScope({ ...shell, tool: "unknown_tool" })).toBeNull();
     expect(localScope({ ...shell, arguments: { command: "   " }, summary: "shell: " })).toBeNull();
   });
 
