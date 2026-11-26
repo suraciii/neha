@@ -492,6 +492,7 @@ mod tests {
                     "run": run,
                     "step": 1,
                     "action": action,
+                    "tool": "shell",
                     "status": "succeeded",
                     "output": "ok",
                 }),

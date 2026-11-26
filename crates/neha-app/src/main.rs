@@ -499,9 +499,10 @@ async fn run(command: RunCommand) -> Result<()> {
                 }
             }
             if let Some(actions) = result["actions"].as_array() {
-                for action in actions {
+                for (index, action) in actions.iter().enumerate() {
                     println!(
-                        "  action {}: {} ({})",
+                        "  action {} (step {}): {} ({})",
+                        index + 1,
                         action["step"].as_u64().unwrap_or_default(),
                         action["tool"].as_str().unwrap_or("?"),
                         action["status"].as_str().unwrap_or("?")

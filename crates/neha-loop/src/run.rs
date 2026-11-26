@@ -83,6 +83,7 @@ pub trait Recorder {
         &mut self,
         step: u32,
         action: Id,
+        tool: String,
         status: ActionStatus,
         output: ToolOutput,
         error: Option<String>,
@@ -123,8 +124,9 @@ where
         };
         usage += reply.usage;
         let calls = reply.tool_calls;
-        recorder.step(step, reply.usage, calls.len() as u32).await?;
         if calls.is_empty() {
+            // A step with no actions completes when the Model answers.
+            recorder.step(step, reply.usage, 0).await?;
             let text = reply.content.unwrap_or_default();
             if text.trim().is_empty() {
                 return Ok(RunOutcome {
@@ -156,6 +158,7 @@ where
                 .action_finished(
                     step,
                     action,
+                    call.name.clone(),
                     result.status,
                     result.output.clone(),
                     result.error.clone(),
@@ -166,6 +169,8 @@ where
                 tool_result_text(&result),
             ));
         }
+        // A step completes only after all of its actions were recorded.
+        recorder.step(step, reply.usage, calls.len() as u32).await?;
     }
 
     Ok(RunOutcome {
@@ -271,6 +276,7 @@ mod tests {
         started: Vec<(u32, String)>,
         finished: Vec<(u32, ActionStatus)>,
         fail: bool,
+        order: Vec<&'static str>,
     }
 
     impl Recorder for TestRecorder {
@@ -278,6 +284,7 @@ mod tests {
             if self.fail {
                 return Err(LoopError::Record("no".to_owned()));
             }
+            self.order.push("step");
             self.steps.push((step, usage, calls));
             Ok(())
         }
@@ -289,6 +296,7 @@ mod tests {
             tool: String,
             _arguments: Value,
         ) -> Result<(), LoopError> {
+            self.order.push("action_started");
             self.started.push((step, tool));
             Ok(())
         }
@@ -297,10 +305,12 @@ mod tests {
             &mut self,
             step: u32,
             _action: Id,
+            _tool: String,
             status: ActionStatus,
             _output: ToolOutput,
             _error: Option<String>,
         ) -> Result<(), LoopError> {
+            self.order.push("action_finished");
             self.finished.push((step, status));
             Ok(())
         }
@@ -380,6 +390,10 @@ mod tests {
         assert_eq!(recorder.started.len(), 1);
         assert_eq!(recorder.started[0].1, "write_file");
         assert_eq!(recorder.finished[0].1, ActionStatus::Succeeded);
+        assert_eq!(
+            recorder.order,
+            ["action_started", "action_finished", "step", "step"]
+        );
         let actions = runtime.actions.lock().unwrap();
         assert_eq!(
             actions[0],

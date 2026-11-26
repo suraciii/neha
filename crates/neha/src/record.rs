@@ -85,12 +85,10 @@ impl EventKind {
     #[must_use]
     pub const fn class(self) -> EventClass {
         match self {
-            Self::MessageAdded
-            | Self::RunStarted
-            | Self::RunFinished
-            | Self::RunStep
-            | Self::ActionStarted
-            | Self::ActionFinished => EventClass::Presentation,
+            Self::MessageAdded | Self::RunStarted | Self::RunFinished => EventClass::Presentation,
+            // Steps and actions decide which work may run again and what a
+            // budget counted: a reader that does not know them must stop.
+            Self::RunStep | Self::ActionStarted | Self::ActionFinished => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::BotCreated
@@ -216,6 +214,9 @@ mod tests {
     fn message_and_run_events_are_presentation() {
         assert_eq!(EventKind::MessageAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStarted.class(), EventClass::Presentation);
+        assert_eq!(EventKind::RunStep.class(), EventClass::Authority);
+        assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
+        assert_eq!(EventKind::ActionFinished.class(), EventClass::Authority);
         assert_eq!(EventKind::BotCreated.class(), EventClass::Authority);
     }
 
@@ -540,6 +541,8 @@ pub struct ActionFinished {
     pub step: u32,
     /// The action.
     pub action: Id,
+    /// The tool's name.
+    pub tool: String,
     /// How it ended.
     pub status: ActionStatus,
     /// The text the Model reads.

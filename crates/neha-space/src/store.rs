@@ -697,6 +697,7 @@ mod tests {
                     "run": Id::new(),
                     "step": 1,
                     "action": Id::new(),
+                    "tool": "shell",
                     "status": "succeeded",
                     "output": "ok",
                 }),
