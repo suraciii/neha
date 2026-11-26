@@ -823,6 +823,7 @@ function mergeApprovals(listed: Approval[], shown: Approval[]): Approval[] {
 }
 
 // The approval a `neha.approval.requested` event carries, when it is whole.
+// The event's optional fields keep their three states: a string, null, or absent.
 function approvalRequested(event: RecordEvent): Approval | null {
   const data = event.data;
   const text = (key: string): string | null => {
@@ -839,7 +840,7 @@ function approvalRequested(event: RecordEvent): Approval | null {
   const reason = data.reason;
   if (!approval || !run || !bot || !chat || !action || !tool || !summary) return null;
   if (reason !== "first_use_local" && reason !== "rule") return null;
-  return {
+  const card: Approval = {
     approval,
     run,
     bot,
@@ -849,8 +850,25 @@ function approvalRequested(event: RecordEvent): Approval | null {
     tool,
     summary,
     reason,
-    rule: typeof data.rule === "string" ? data.rule : null,
+    ambiguous: data.ambiguous === true,
+    rule: text("rule"),
   };
+  const arguments_ = data.arguments;
+  if (arguments_ !== null && typeof arguments_ === "object" && !Array.isArray(arguments_)) {
+    card.arguments = arguments_ as Record<string, unknown>;
+  }
+  const undoable = data.undoable;
+  if (undoable === "no" || undoable === "unknown") card.undoable = undoable;
+  // A null here is the Space saying that no lasting rule can come from the
+  // action. It must not read as silence, or the page would offer what the
+  // Space refuses.
+  if ("lasting_scope" in data) card.lasting_scope = text("lasting_scope");
+  card.computer = text("computer");
+  card.acting = text("acting");
+  card.call = text("call");
+  card.index = typeof data.index === "number" ? data.index : null;
+
+  return card;
 }
 
 // Names an upload failure the Space or the network reported.

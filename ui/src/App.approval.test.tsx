@@ -80,6 +80,17 @@ function waitingRun() {
   space.approvals.push(firstUse);
 }
 
+// The record event the Space writes when a Bot asks before an action.
+function requested(approval: Approval) {
+  record("neha.approval.requested", {
+    computer: "p1",
+    acting: "u1",
+    index: 0,
+    call: "c1",
+    ...approval,
+  });
+}
+
 useView();
 
 describe("App with approvals", () => {
@@ -354,6 +365,43 @@ describe("App with approvals", () => {
     press(view, "Allow");
     await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
     expect(header(view)).not.toContain("Waiting for approval");
+  });
+
+  it("keeps what a live request says about a lasting rule", async () => {
+    const view = await openChat();
+    // The page could guess "files under logs", but the Space said no rule can last.
+    const noLasting: Approval = {
+      ...byRule,
+      approval: "a1",
+      tool: "write_file",
+      summary: "write_file: logs/x",
+      lasting_scope: null,
+    };
+    space.approvals.push(noLasting);
+    requested(noLasting);
+    await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(1));
+    expect(view.container.querySelector(".approval__scope")).toBeNull();
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
+
+    // A request that carries the Space's words shows them, and the lasting button.
+    const said: Approval = {
+      ...byRule,
+      approval: "a2",
+      tool: "shell",
+      summary: "shell: git status",
+      lasting_scope: 'shell commands starting with "git"',
+    };
+    space.approvals.push(said);
+    requested(said);
+    await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(2));
+    expect(lines(view, ".approval__scope")).toEqual(['Always allow covers: shell commands starting with "git"']);
+    expect(buttons(view).map((button) => button.textContent)).toEqual([
+      "Allow",
+      "Deny",
+      "Allow",
+      "Always allow",
+      "Deny",
+    ]);
   });
 
   it("folds a long action and shows all of it on request", async () => {

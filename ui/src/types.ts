@@ -141,10 +141,17 @@ export interface Approval {
   // No rule could judge this action's form, so the Space asked instead.
   ambiguous?: boolean | null;
   rule?: string | null;
+  // Whether the action can be undone, as far as the Space knows.
   undoable?: Undoable | null;
   // What an Always allow would cover, in the Space's words: null when the Space
   // says no lasting rule can come from this action, absent when it says nothing.
   lasting_scope?: string | null;
+  // The machine the action would run on, and the User who answers.
+  computer?: string | null;
+  acting?: string | null;
+  // The call's position among its step's calls, and the call's identifier.
+  index?: number | null;
+  call?: string | null;
   // The User's answer, once given. The Space lists only approvals still waiting.
   decided?: boolean | null;
 }
