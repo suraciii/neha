@@ -207,7 +207,8 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        Author, BotMoved, EventData, EventDraft, EventKind, FileAdded, FileError, RunQueued,
+        Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
+        FileAdded, FileError, RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -473,6 +474,51 @@ mod tests {
         };
         assert_eq!(data.file, None);
     }
+    fn computer_created_data(kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "computer": Id::new(),
+            "owner": Id::new(),
+            "kind": kind,
+            "workspace": "/tmp/workspace",
+        })
+    }
+
+    #[test]
+    fn a_computer_kind_reads_its_old_names_and_writes_the_new_ones() {
+        for (recorded, expected) in [
+            ("local", ComputerKind::Local),
+            ("real", ComputerKind::Local),
+            ("hosted", ComputerKind::Hosted),
+            ("managed", ComputerKind::Hosted),
+        ] {
+            let decoded = EventKind::ComputerCreated
+                .decode(&computer_created_data(recorded))
+                .unwrap();
+            let EventData::ComputerCreated(created) = decoded else {
+                panic!("a ComputerCreated event decodes to its data")
+            };
+            assert_eq!(created.kind, expected, "{recorded} reads as {expected:?}");
+        }
+
+        assert_eq!(
+            serde_json::to_value(ComputerKind::Local).unwrap(),
+            serde_json::json!("local"),
+            "new events write canonical names"
+        );
+        assert_eq!(
+            serde_json::to_value(ComputerKind::Hosted).unwrap(),
+            serde_json::json!("hosted")
+        );
+    }
+
+    #[test]
+    fn an_unknown_computer_kind_is_refused() {
+        let error = EventKind::ComputerCreated
+            .decode(&computer_created_data("mainframe"))
+            .unwrap_err();
+
+        assert!(matches!(error, EventDataError::Data(_)), "{error}");
+    }
 }
 
 /// Where a run is: waiting, working, or how it ended.
@@ -704,6 +750,55 @@ pub struct BotMoved {
     pub to: Id,
 }
 
+/// What a Computer is: the machine Neha runs on, or the Space itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComputerKind {
+    /// The machine the User runs Neha on.
+    Local,
+    /// A Computer the Space runs itself.
+    Hosted,
+}
+
+impl ComputerKind {
+    /// Returns the canonical recorded name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Hosted => "hosted",
+        }
+    }
+
+    /// Reads a recorded name.
+    ///
+    /// Records written before the names settled say `real` and `managed`; a
+    /// reading build maps them to the current names instead of failing, so an
+    /// old record still replays. Anything else is an error: a reader must not
+    /// guess what an unknown kind means.
+    #[must_use]
+    pub fn parse(kind: &str) -> Option<Self> {
+        match kind {
+            "local" | "real" => Some(Self::Local),
+            "hosted" | "managed" => Some(Self::Hosted),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for ComputerKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ComputerKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = String::deserialize(deserializer)?;
+        Self::parse(&kind)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown Computer kind `{kind}`")))
+    }
+}
+
 /// The data of `neha.computer.created`.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -712,8 +807,8 @@ pub struct ComputerCreated {
     pub computer: Id,
     /// The User who owns it.
     pub owner: Id,
-    /// `managed` or `real`.
-    pub kind: String,
+    /// The kind of Computer.
+    pub kind: ComputerKind,
     /// The Computer's workspace directory.
     pub workspace: String,
 }

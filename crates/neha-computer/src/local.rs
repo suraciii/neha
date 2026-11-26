@@ -57,6 +57,10 @@ pub struct LocalRuntime {
     /// configuration directory, which holds its channel credential. Resolved,
     /// so an opened file's real path can be compared against them.
     hidden: Vec<PathBuf>,
+    /// Paths the file tools must refuse even when they do not exist yet: a
+    /// credential or ticket file the daemon created after the runtime started.
+    /// An entry matches itself and anything below it.
+    denied: Vec<PathBuf>,
     timeout: Duration,
     /// The process group id of the shell that is running, or 0.
     ///
@@ -100,6 +104,7 @@ impl LocalRuntime {
             root: workspace,
             mode: Mode::Managed,
             hidden: Vec::new(),
+            denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
         })
@@ -212,6 +217,13 @@ impl LocalRuntime {
             .map(|root| std::fs::canonicalize(&root).map_err(RuntimeError::Io))
             .collect::<Result<Vec<_>, _>>()?;
         for root in &hidden {
+            let metadata = std::fs::metadata(root).map_err(RuntimeError::Io)?;
+            if !metadata.is_file() && !metadata.is_dir() {
+                return Err(RuntimeError::NoSandbox(format!(
+                    "the hidden path {} is not a regular file or a directory",
+                    root.display()
+                )));
+            }
             if root.starts_with(&folder_path) {
                 return Err(unsafe_folder(
                     &folder_path,
@@ -233,6 +245,7 @@ impl LocalRuntime {
             root: folder_path,
             mode: Mode::Machine { bwrap, folder },
             hidden,
+            denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
         })
@@ -252,6 +265,18 @@ impl LocalRuntime {
         Err(RuntimeError::NoSandbox(
             "a real Computer runs only on Unix".to_owned(),
         ))
+    }
+
+    /// Marks paths the file tools must refuse even when they do not exist yet.
+    ///
+    /// The daemon passes its configuration, session credential, and ticket
+    /// locations here: they are hidden from the sandbox by directory mounts,
+    /// and the file tools read with the machine user's rights, so they must
+    /// refuse the paths themselves even when a file appears later.
+    #[must_use]
+    pub fn with_denied(mut self, denied: Vec<PathBuf>) -> Self {
+        self.denied = denied;
+        self
     }
 
     /// Kills the process group of the shell that is running, if one is.
@@ -392,7 +417,8 @@ impl LocalRuntime {
                 // only reachable when that folder itself sits under one; that
                 // is a misconfiguration the daemon refuses, and a write is
                 // refused here before any descriptor is opened.
-                if self.is_hidden(&normalize_path(&self.root.join(input.trim()))) {
+                let target = normalize_path(&self.root.join(input.trim()));
+                if self.is_hidden(&target) || self.is_denied(&target) {
                     return Err(ByteError::Failed(hidden_error(input.trim())));
                 }
                 write_machine_file(folder, input, bytes)?;
@@ -411,6 +437,13 @@ impl LocalRuntime {
     /// Returns whether a path lies under one of this runtime's hidden roots.
     fn is_hidden(&self, path: &Path) -> bool {
         self.hidden.iter().any(|root| path.starts_with(root))
+    }
+
+    /// Returns whether a path is denied for the file tools.
+    fn is_denied(&self, path: &Path) -> bool {
+        self.denied
+            .iter()
+            .any(|denied| path == denied || path.starts_with(denied))
     }
 
     /// Opens a file whose bytes this runtime may read.
@@ -469,15 +502,20 @@ impl LocalRuntime {
         Ok((file, metadata))
     }
 
-    /// Refuses an opened file or directory that resolves under a hidden root.
+    /// Refuses an opened file or directory that is hidden or denied.
+    ///
+    /// The opened descriptor's real path is what counts, not the path the
+    /// caller typed: a symlink inside the Bot's folder cannot aim at a hidden
+    /// file and have the check miss.
     fn refuse_hidden(&self, opened: &std::fs::File, path: &Path) -> Result<(), String> {
-        if self.hidden.is_empty() {
+        if self.hidden.is_empty() && self.denied.is_empty() {
             return Ok(());
         }
         let shown = path.display();
         let real = opened_path(opened)
             .map_err(|error| format!("cannot verify what {shown} names: {error}"))?;
-        if self.is_hidden(&without_deleted_suffix(real)) {
+        let real = without_deleted_suffix(real);
+        if self.is_hidden(&real) || self.is_denied(&real) {
             return Err(hidden_error(shown));
         }
 
@@ -905,6 +943,11 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
     ))
 }
 
+/// Returns whether one hidden root is a file rather than a directory.
+fn hidden_is_file(root: &Path) -> bool {
+    std::fs::metadata(root).is_ok_and(|metadata| metadata.is_file())
+}
+
 /// The bubblewrap arguments that fence one real shell.
 ///
 /// The machine is read-only, `/dev` is a minimal device set of the sandbox's
@@ -924,11 +967,20 @@ fn sandbox_args(source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Vec<OsStri
         .into_iter()
         .map(OsString::from)
         .collect();
-    // The tmpfs mounts come before /tmp's: a hidden root inside /tmp must be
-    // mounted while the host's /tmp is still what the sandbox sees.
+    // Hidden roots are mounted before /tmp's: a root inside /tmp must be
+    // mounted while the host's /tmp is still what the sandbox sees. A
+    // directory root is replaced by an empty tmpfs; a single hidden file (a
+    // credential file) is replaced by `/dev/null`, so reading it yields
+    // nothing and writing it still reaches nothing on the machine.
     for root in hidden {
-        arguments.push(OsString::from("--tmpfs"));
-        arguments.push(root.as_os_str().to_owned());
+        if hidden_is_file(root) {
+            arguments.push(OsString::from("--ro-bind"));
+            arguments.push(OsString::from("/dev/null"));
+            arguments.push(root.as_os_str().to_owned());
+        } else {
+            arguments.push(OsString::from("--tmpfs"));
+            arguments.push(root.as_os_str().to_owned());
+        }
     }
     arguments.extend(
         [
@@ -1888,6 +1940,7 @@ mod tests {
 
     use super::{
         DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, Mode, RuntimeError, open_directory_path,
+        sandbox_args,
     };
     use crate::action::{Action, ActionStatus, ByteError, ComputerRuntime};
 
@@ -1963,6 +2016,24 @@ mod tests {
         Some((directory, runtime, hidden))
     }
 
+    /// Returns a real-machine runtime that hides one file outside `/tmp`,
+    /// or `None` when the bwrap tests are off.
+    fn machine_runtime_with_hidden_file()
+    -> Option<(tempfile::TempDir, LocalRuntime, std::path::PathBuf)> {
+        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+            return None;
+        }
+        let directory = outside_tempdir();
+        let secret = directory.path().join("credential.json");
+        std::fs::write(&secret, "session-secret-must-not-leak").unwrap();
+        let runtime =
+            LocalRuntime::machine_with_hidden(directory.path().join("bot"), vec![secret.clone()])
+                .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
+
+        Some((directory, runtime, secret))
+    }
+
     /// Builds a real-machine runtime for the file tools alone.
     ///
     /// The file tools never start a sandbox, so a test of their hidden-root
@@ -1976,6 +2047,7 @@ mod tests {
                 folder: open_directory_path(&std::fs::canonicalize(root).unwrap()).unwrap(),
             },
             hidden: vec![std::fs::canonicalize(hidden).unwrap()],
+            denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
         }
@@ -3547,5 +3619,235 @@ mod tests {
         stop.store(true, Ordering::Relaxed);
         writer.join().unwrap();
         assert!(refused, "a file that grew past the limit is refused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hidden_file_is_mounted_as_dev_null() {
+        let directory = tempfile::tempdir().unwrap();
+        let hidden_file = directory.path().join("credential.json");
+        std::fs::write(&hidden_file, "session-secret").unwrap();
+        let hidden_directory = directory.path().join("computer");
+        std::fs::create_dir(&hidden_directory).unwrap();
+        let folder = directory.path().join("bot");
+        std::fs::create_dir(&folder).unwrap();
+
+        let arguments = sandbox_args(
+            folder.as_os_str(),
+            &folder,
+            &[hidden_file.clone(), hidden_directory.clone()],
+        );
+        let shown: Vec<String> = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let file = hidden_file.to_string_lossy().into_owned();
+        let file_at = shown
+            .iter()
+            .position(|argument| argument == &file)
+            .expect("the hidden file is mounted");
+        assert_eq!(
+            &shown[file_at - 2..file_at],
+            ["--ro-bind", "/dev/null"],
+            "a hidden file is replaced by /dev/null: {shown:?}"
+        );
+        let directory = hidden_directory.to_string_lossy().into_owned();
+        let directory_at = shown
+            .iter()
+            .position(|argument| argument == &directory)
+            .expect("the hidden directory is mounted");
+        assert_eq!(shown[directory_at - 1], "--tmpfs", "{shown:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_machine_file_tool_refuses_a_single_hidden_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret = directory.path().join("credential.json");
+        std::fs::write(&secret, "session-secret-must-not-leak").unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let visible = directory.path().join("visible.txt");
+        std::fs::write(&visible, "readable").unwrap();
+        let runtime = file_runtime(&root, &secret);
+
+        // A hidden file is refused by both read paths, and its bytes never
+        // come back in the refusal.
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: secret.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Failed, "{read:?}");
+        assert!(
+            read.output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            read.output.text
+        );
+        assert!(!read.output.text.contains("session-secret-must-not-leak"));
+
+        let error = runtime
+            .read_bytes(&secret.to_string_lossy())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the path is hidden from this Computer"),
+            "{error}"
+        );
+        assert!(!error.contains("session-secret-must-not-leak"));
+
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: visible.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "readable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_real_shell_cannot_read_a_hidden_file() {
+        let Some((_directory, runtime, secret)) = machine_runtime_with_hidden_file() else {
+            return;
+        };
+        let command = format!("cat '{}'", secret.display());
+        let result = runtime
+            .execute(Action::Shell {
+                command: command.clone(),
+            })
+            .await;
+        // The sandbox mounts /dev/null over the file, so the command reads
+        // nothing (an empty read, or a refusal) — but the secret never
+        // crosses into the output.
+        assert!(
+            !result.output.text.contains("session-secret-must-not-leak"),
+            "the hidden file's bytes must never reach the shell: {}",
+            result.output.text
+        );
+        // The host file is untouched: only the sandbox's view changed.
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            "session-secret-must-not-leak"
+        );
+    }
+
+    /// A denied path that does not exist yet is refused once it appears.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_denied_file_is_refused_even_when_it_appears_later() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let hidden = directory.path().join("computer");
+        std::fs::create_dir(&hidden).unwrap();
+        let visible = directory.path().join("visible.txt");
+        std::fs::write(&visible, "readable").unwrap();
+        let late = directory.path().join("credential.json");
+
+        // The runtime is built while the credential file does not exist; the
+        // daemon's file tools must refuse it when it appears later.
+        let runtime = file_runtime(&root, &hidden).with_denied(vec![late.clone()]);
+        std::fs::write(&late, "session-secret-must-not-leak").unwrap();
+
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: late.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Failed, "{read:?}");
+        assert!(
+            read.output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            read.output.text
+        );
+        assert!(!read.output.text.contains("session-secret-must-not-leak"));
+        let error = runtime
+            .read_bytes(&late.to_string_lossy())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the path is hidden from this Computer"),
+            "{error}"
+        );
+        assert!(!error.contains("session-secret-must-not-leak"));
+
+        // A write to a denied path inside the Bot's folder is refused too,
+        // even before the file exists.
+        let inside = root.join("credential.json");
+        let runtime = file_runtime(&root, &hidden).with_denied(vec![inside.clone()]);
+        let write = runtime
+            .execute(Action::WriteFile {
+                path: "credential.json".to_owned(),
+                content: "new".to_owned(),
+            })
+            .await;
+        assert_eq!(write.status, ActionStatus::Failed, "{write:?}");
+        assert!(
+            write
+                .output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            write.output.text
+        );
+        assert!(
+            !inside.exists(),
+            "the denied write must not create the file"
+        );
+
+        // A normal file stays readable and writable.
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: visible.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "readable");
+    }
+
+    /// A file created inside a hidden directory after the runtime is built is
+    /// still out of the shell's reach, and the Workspace stays writable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_file_created_later_inside_a_hidden_directory_stays_hidden() {
+        let Some((_directory, runtime, hidden)) = machine_runtime_with_hidden() else {
+            return;
+        };
+        let late = hidden.join("token.json");
+        std::fs::write(&late, "channel-secret-must-not-leak").unwrap();
+
+        let command = format!("ls {} && cat {}", hidden.display(), late.display());
+        let result = runtime
+            .execute(Action::Shell {
+                command: command.clone(),
+            })
+            .await;
+        assert!(
+            !result.output.text.contains("channel-secret-must-not-leak"),
+            "the hidden directory's late file must stay hidden: {}",
+            result.output.text
+        );
+        // The Bot's Workspace is still writable.
+        let write = runtime
+            .execute(Action::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "written".to_owned(),
+            })
+            .await;
+        assert_eq!(write.status, ActionStatus::Succeeded, "{write:?}");
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: "note.txt".to_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "written");
     }
 }

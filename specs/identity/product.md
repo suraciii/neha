@@ -8,7 +8,7 @@ Owned by identity. [Space](../space/product.md) holds the accounts; [CLI](../cli
 
 1. Every User of a Space has an account on it.
 2. The built-in Space signs its first User in without a prompt.
-3. A device joins a Space only through a code that a signed-in User enters.
+3. A device joins a Space through a code that a signed-in User enters, except a Local Computer started on the Space's own machine.
 
 ## Accounts
 
@@ -36,9 +36,11 @@ The invited User opens the link in an app or a browser, sets a display name and 
 
 ## Devices
 
-The CLI signing in and a real Computer pairing both show a code.
+The CLI signing in shows a code.
 
-A signed-in User enters the code in an app or a browser. The device joins the Space on that User's behalf: the CLI acts as the User, and the Computer belongs to the User.
+A signed-in User enters the code in an app or a browser. The CLI joins the Space on that User's behalf and acts as the User.
+
+A Local Computer on the Space's own machine needs no code. A User starts the pairing there and confirms it. The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one; [design](design.md#codes) covers the ticket.
 
 A Bot has no account. The Space gives a Bot its own credential when the Bot is created, and the Bot's loop uses it to act as the Bot.
 

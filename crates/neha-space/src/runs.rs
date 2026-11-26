@@ -280,7 +280,7 @@ fn next_queued(server: &SpaceServer, bot: Id) -> Option<RunView> {
     let real = state
         .computers
         .get(&computer)
-        .is_some_and(|view| view.kind == "real");
+        .is_some_and(|view| view.kind == "local");
     if real && !server.links.online(computer) {
         return None;
     }

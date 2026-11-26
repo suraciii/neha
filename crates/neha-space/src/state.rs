@@ -82,7 +82,7 @@ pub struct ComputerView {
     pub id: Id,
     /// The User who owns it.
     pub owner: Id,
-    /// `managed` or `real`.
+    /// `local` or `hosted`.
     pub kind: String,
     /// Whether its channel is up.
     pub online: bool,
@@ -396,7 +396,7 @@ impl Projection for State {
                     ComputerView {
                         id: data.computer,
                         owner: data.owner,
-                        kind: data.kind,
+                        kind: data.kind.as_str().to_owned(),
                         online: true,
                         workspace: data.workspace,
                     },
@@ -1070,5 +1070,27 @@ mod tests {
 
         assert_eq!(error, "a move goes to an existing Computer");
         assert_eq!(state.bots[&bot].computer, computer);
+    }
+    #[test]
+    fn an_old_computer_kind_replays_as_the_current_name() {
+        let owner = Id::new();
+        let mut state = State::default();
+        for (seq, recorded, expected) in [(1, "real", "local"), (2, "managed", "hosted")] {
+            let computer = Id::new();
+            state
+                .apply(&event(
+                    EventKind::ComputerCreated,
+                    Author::User(owner),
+                    serde_json::json!({
+                        "computer": computer,
+                        "owner": owner,
+                        "kind": recorded,
+                        "workspace": "/tmp/workspace",
+                    }),
+                    seq,
+                ))
+                .unwrap();
+            assert_eq!(state.computers[&computer].kind, expected, "{recorded}");
+        }
     }
 }

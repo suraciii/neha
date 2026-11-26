@@ -16,7 +16,7 @@ A remote Space signs a User in with a passkey, with a password, or with an exter
 
 The Admin invites a User with a link. The invited User sets a name and a way to sign in, and joins.
 
-A device, the CLI or a real Computer, joins by showing a code that a signed-in User enters in an app.
+A device joins by showing a code that a signed-in User enters in an app, except a Local Computer on the Space's own machine, which joins without one.
 
 ## Why this way
 
@@ -26,7 +26,7 @@ A passkey is offered when the Space has a domain and HTTPS, and a password is al
 
 Invitations are links because email is the one thing a self-hoster does not want to configure.
 
-A device shows a code because a terminal or a headless machine cannot receive a sign-in, and a user already signed in can vouch for it.
+A device shows a code because a terminal or a headless machine cannot receive a sign-in, and a user already signed in can vouch for it. A Local Computer on the Space's own machine needs no code because the User who pairs it starts the pairing there.
 
 Sign-in methods are Plugins because a Space that already has an identity provider can use it, and one that does not sees nothing about it.
 
@@ -36,7 +36,7 @@ Sign-in methods are Plugins because a Space that already has an identity provide
 - **No sign-in step when alone.** The built-in Space signs its first user in without a prompt, and that user is its Admin.
 - **Passkey when the Space can, password always.** A Space with a domain and HTTPS offers a passkey; every remote Space offers a password.
 - **Invite by link.** The Admin makes an invitation link; the invited User sets up their own account.
-- **Devices join by code.** A CLI or a real Computer shows a code, and a signed-in User enters it.
+- **Devices join by code, except the Local Computer.** A CLI shows a code, and a signed-in User enters it; a Local Computer on the Space's own machine joins without one.
 - **Sign-in methods are Plugins.** An external provider is added to a Space as a Plugin and shows up on its sign-in page.
 
 ## What this enables

@@ -13,7 +13,7 @@ import type { Account, Chat, FileSummary, Message, RunView } from "./types";
 const { space, FakeCommands } = vi.hoisted(() => {
   const account = { id: "u1", display_name: "Ada", is_admin: true };
   const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
-  const computer = { id: "p1", owner: "u1", kind: "managed", online: true, workspace: "/w" };
+  const computer = { id: "p1", owner: "u1", kind: "local", online: true, workspace: "/w" };
   const chat = { id: "h1", owner: "u1", bot: "b1" };
   const otherChat = { id: "h2", owner: "u1", bot: "b1" };
   // A send can be held open, so a test can act while the Space has not
@@ -301,6 +301,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   space.releaseSends();
+  space.computer.kind = "local";
   space.asked = [];
   space.sent = [];
   space.files = [];
@@ -819,5 +820,24 @@ describe("App with Files", () => {
     );
     flush(() => fireEvent.click(element(view, ".locale-switch--foot")));
     expect(element<HTMLElement>(view, ".conv__preview").textContent).toBe("已发送文件");
+  });
+});
+
+describe("App with Computers", () => {
+  it("names a Local Computer in the Chat header, in the reader's language", async () => {
+    const view = await openChat();
+
+    expect(element(view, ".chat__sub").textContent).toContain("Local Computer");
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
+    expect(element(view, ".chat__sub").textContent).toContain("自己的 Computer");
+  });
+
+  it("calls a Hosted Computer just a Computer", async () => {
+    space.computer.kind = "hosted";
+    const view = await openChat();
+
+    const header = element(view, ".chat__sub").textContent ?? "";
+    expect(header).toContain("Computer");
+    expect(header).not.toContain("Local Computer");
   });
 });

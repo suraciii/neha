@@ -102,7 +102,7 @@ export default function ChatView(props: ChatViewProps) {
           <p class="chat__sub">
             {props.bot ? t("chat.bot") : t("chat.loading")}
             <span class="chat__dot" />
-            {props.computer?.kind === "managed" ? t("chat.managedComputer") : t("chat.computer")}
+            {props.computer?.kind === "local" ? t("chat.localComputer") : t("chat.computer")}
             <span class="chat__dot" />
             <span class={props.computer?.online ? "state-text state-text--online" : "state-text"}>
               {props.computer?.online ? t("chat.online") : t("chat.offline")}

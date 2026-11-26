@@ -8,10 +8,10 @@ Owned by identity. [CLI](../cli/product.md) and [Computer](../computer/product.m
 
 ## Laws
 
-1. A Space admits a connection only from a caller it has signed in, or from a device that is pairing.
+1. A Space admits a connection only from a caller it has signed in, a device that is pairing, or a Local Computer presenting a valid local ticket.
 2. A connection to a Space is encrypted, except one from the Space's own machine or from a proxy the Space trusts.
 3. A code works once, expires, and belongs to one caller and one Space. A code that a User types can be tried only a limited number of times.
-4. A device checks the Space's key against one it received from a signed-in User before it connects.
+4. A device on another machine checks the Space's key against one it received from a signed-in User before it connects.
 5. The Space stores only a hash of a token, never its plaintext.
 6. A client that loads the Space's own pages keeps its token only in an HttpOnly cookie. Any other client sends its token in the Authorization header.
 
@@ -35,4 +35,10 @@ A device that receives a link from a signed-in User trusts the certificate the l
 
 An invitation and a pairing code each admit one caller to one Space, work once, and expire. A pairing code is typed, so a User gets only a limited number of tries at it. The Space keeps a pairing code only as a hash, and a paired machine keeps the token that admits it.
 
-Any process that can reach a loopback Space MAY start pairing. Under contention, a waiting machine MAY need a new code. Approving a Computer requires a signed-in User.
+A Local Computer started on the Space's own machine uses no code. The User who pairs the machine confirms the pairing there.
+
+The Space issues a short-lived, one-use ticket that binds one User, one Space, and one Space start. Its database keeps only the ticket's digest, and a used or expired ticket admits no one.
+
+A Space that starts with an Admin issues a ticket for that Admin, even with no signed-in client, as one file per Space under the machine's Neha configuration directory, with mode 0600, where the machine's Bots cannot read it. A signed-in User MAY request a ticket from the Space, and it stays in the answer.
+
+The ticket's User owns the Computer it pairs. A process that can read the startup ticket MAY pair the machine as its Admin, and a signed-in caller MAY pair as itself.

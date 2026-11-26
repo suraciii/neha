@@ -23,7 +23,7 @@ Teammates work together. They take work in parallel, hand it off, and share what
 
 - **Several users, one product.** Neha serves one user or many with the same model; using it alone simplifies what is shown, and the model is the same either way.
 - **You own it.** The complete product runs on infrastructure the user running it controls, and every provider is that user's choice.
-- **It lives where you choose.** A teammate runs on a computer its owner picks, managed or real; on a real machine, its state is the machine's own. The machine's owner gives permission.
+- **It lives where you choose.** A teammate runs on a Hosted Computer or on the Local Computer where Neha runs; on the Local one, its state is the machine's own. The machine's owner gives permission.
 - **It can be rebuilt.** Every part of Neha is a Plugin — model, tools, Bot loop, Group — and any Plugin can replace any part or add to it. The Kernel that Plugins attach to is fixed.
 - **The CLI does everything the GUI does.** Neha is agent-native: whatever a user can do in the GUI, a user or an agent can do from the CLI.
 - **Anyone can use it.** The default experience stands on its own; plugins, configuration, and protocols stay out of sight until wanted.

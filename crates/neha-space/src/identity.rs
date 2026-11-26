@@ -47,6 +47,12 @@ pub const MAX_CODE_TRIES: i64 = 5;
 /// an unauthenticated caller can churn rows, but cannot lock a User out.
 pub const MAX_PENDING_PAIRINGS: i64 = 16;
 
+/// The most unused local tickets one owner may hold at once.
+///
+/// Issuing past the cap drops the oldest, so a caller that keeps asking for
+/// tickets cannot make the table grow without bound.
+pub const MAX_LOCAL_TICKETS_PER_OWNER: i64 = 8;
+
 /// The bytes of random device identifier a pairing starts with.
 const DEVICE_BYTES: usize = 16;
 
@@ -389,6 +395,192 @@ impl Identity {
         }
 
         Ok(claims)
+    }
+
+    /// Returns the Space's Admin, once the first User has joined.
+    pub async fn admin_account(&self) -> Result<Option<Account>, IdentityError> {
+        let row = sqlx::query(
+            "SELECT id, display_name, is_admin FROM accounts WHERE is_admin = 1 LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.as_ref().map(account_from_row).transpose()
+    }
+
+    /// Forgets every local ticket.
+    ///
+    /// A local ticket is bound to one start of the Space, so a new start
+    /// forgets whatever a previous one left before it issues its own.
+    pub async fn clear_local_tickets(&self) -> Result<(), IdentityError> {
+        sqlx::query("DELETE FROM computer_tickets")
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Stores the digest of a local ticket for `ttl`, owned by `owner`.
+    ///
+    /// Returns the digest, which lets the caller delete the exact file it
+    /// wrote. Every issue also drops tickets that have expired and keeps at
+    /// most [`MAX_LOCAL_TICKETS_PER_OWNER`] unused ones per owner, so a caller
+    /// that keeps asking cannot make stale rows accumulate.
+    pub async fn remember_local_ticket(
+        &self,
+        ticket: &str,
+        owner: Id,
+        ttl: Duration,
+    ) -> Result<[u8; 32], IdentityError> {
+        let ticket_hash = digest(ticket);
+        let owner_text = owner.to_string();
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            let now = now();
+            let expires_at = now.saturating_add(i64::try_from(ttl.as_micros()).unwrap_or(i64::MAX));
+            sqlx::query("DELETE FROM computer_tickets WHERE expires_at <= ?")
+                .bind(now)
+                .execute(&mut *connection)
+                .await?;
+            let held: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM computer_tickets WHERE owner = ?")
+                    .bind(&owner_text)
+                    .fetch_one(&mut *connection)
+                    .await?;
+            if held >= MAX_LOCAL_TICKETS_PER_OWNER {
+                let excess = held - (MAX_LOCAL_TICKETS_PER_OWNER - 1);
+                sqlx::query(
+                    "DELETE FROM computer_tickets WHERE ticket_hash IN (\
+                     SELECT ticket_hash FROM computer_tickets WHERE owner = ? \
+                     ORDER BY created_at ASC, rowid ASC LIMIT ?)",
+                )
+                .bind(&owner_text)
+                .bind(excess)
+                .execute(&mut *connection)
+                .await?;
+            }
+            sqlx::query(
+                "INSERT INTO computer_tickets (ticket_hash, owner, created_at, expires_at) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(ticket_hash.as_slice())
+            .bind(&owner_text)
+            .bind(now)
+            .bind(expires_at)
+            .execute(&mut *connection)
+            .await?;
+
+            Ok(ticket_hash)
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
+    }
+
+    /// Claims a local ticket, returning its owner and digest once.
+    ///
+    /// An unknown, expired, or already claimed ticket gives `None`. Expired
+    /// rows are dropped in the same immediate transaction, so the delete and
+    /// the expiry check cannot race another pairing.
+    pub async fn claim_local_ticket(
+        &self,
+        ticket: &str,
+    ) -> Result<Option<(Id, [u8; 32])>, IdentityError> {
+        let ticket_hash = digest(ticket);
+        let now = now();
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            sqlx::query("DELETE FROM computer_tickets WHERE expires_at <= ?")
+                .bind(now)
+                .execute(&mut *connection)
+                .await?;
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT owner FROM computer_tickets WHERE ticket_hash = ?")
+                    .bind(ticket_hash.as_slice())
+                    .fetch_optional(&mut *connection)
+                    .await?;
+            let Some(owner) = owner else {
+                return Ok(None);
+            };
+            let deleted = sqlx::query("DELETE FROM computer_tickets WHERE ticket_hash = ?")
+                .bind(ticket_hash.as_slice())
+                .execute(&mut *connection)
+                .await?;
+            if deleted.rows_affected() != 1 {
+                return Ok(None);
+            }
+            let owner = owner.parse::<Id>().map_err(|_| IdentityError::Corrupt)?;
+
+            Ok(Some((owner, ticket_hash)))
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
+    }
+
+    /// Deletes tokens whose Computer the record does not hold.
+    ///
+    /// A pairing writes its token before the `ComputerCreated` event and rolls
+    /// it back when the append fails, but a crash between the two can leave a
+    /// final token with no Computer. The record is the truth: anything the
+    /// replay no longer names is forgotten here, before the Space serves.
+    /// Returns how many rows were removed.
+    pub async fn forget_unrecorded_computer_tokens(
+        &self,
+        recorded: &[Id],
+    ) -> Result<usize, IdentityError> {
+        let computers: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT computer_id FROM computer_tokens")
+                .fetch_all(&self.pool)
+                .await?;
+        let recorded: std::collections::HashSet<String> =
+            recorded.iter().map(ToString::to_string).collect();
+        let mut removed = 0;
+        for computer in computers {
+            if !recorded.contains(&computer) {
+                removed += sqlx::query("DELETE FROM computer_tokens WHERE computer_id = ?")
+                    .bind(&computer)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected() as usize;
+            }
+        }
+
+        Ok(removed)
+    }
+
+    /// Records the final token of a Computer created by a local pairing.
+    ///
+    /// Local pairing has no device code to wait on, so the token is final at
+    /// once; the record's `ComputerCreated` is what makes it meaningful.
+    pub async fn record_computer_token(
+        &self,
+        computer: Id,
+        credential: &str,
+    ) -> Result<(), IdentityError> {
+        sqlx::query(
+            "INSERT INTO computer_tokens (token_hash, computer_id, created_at, finalized) \
+             VALUES (?, ?, ?, 1)",
+        )
+        .bind(digest(credential).as_slice())
+        .bind(computer.to_string())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Forgets a Computer token whose Computer could not be recorded.
+    pub async fn forget_computer_token(&self, credential: &str) -> Result<(), IdentityError> {
+        sqlx::query("DELETE FROM computer_tokens WHERE token_hash = ?")
+            .bind(digest(credential).as_slice())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
     }
 
     /// Returns the Computer a machine token belongs to.
@@ -912,8 +1104,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Account, CODE_ALPHABET, Identity, IdentityError, MAX_CODE_TRIES, MAX_PENDING_PAIRINGS,
-        PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState, digest,
+        Account, CODE_ALPHABET, Identity, IdentityError, MAX_CODE_TRIES,
+        MAX_LOCAL_TICKETS_PER_OWNER, MAX_PENDING_PAIRINGS, PAIRING_TTL_SECS, PairingClaim,
+        PairingRequest, PairingState, digest,
     };
     use crate::home::Home;
     use base64::Engine as _;
@@ -2067,6 +2260,160 @@ mod tests {
         assert!(
             identity.pairing_claims().await.unwrap().is_empty(),
             "released claims leave nothing behind"
+        );
+    }
+    #[tokio::test]
+    async fn a_local_ticket_is_stored_as_a_digest_and_works_once() {
+        let (_dir, _home, identity) = identity().await;
+        let owner = Id::new();
+        identity
+            .remember_local_ticket("ticket-one", owner, Duration::from_secs(600))
+            .await
+            .unwrap();
+
+        let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT ticket_hash FROM computer_tickets")
+            .fetch_all(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].len(), 32, "the database keeps a digest");
+        assert!(
+            !hashes[0]
+                .windows(b"ticket-one".len())
+                .any(|window| window == b"ticket-one"),
+            "the plaintext never reaches the database"
+        );
+
+        assert_eq!(
+            identity
+                .claim_local_ticket("ticket-one")
+                .await
+                .unwrap()
+                .map(|(owner, _hash)| owner),
+            Some(owner)
+        );
+        assert_eq!(
+            identity.claim_local_ticket("ticket-one").await.unwrap(),
+            None,
+            "a ticket works once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_expired_local_ticket_is_not_claimable() {
+        let (_dir, _home, identity) = identity().await;
+        identity
+            .remember_local_ticket("stale", Id::new(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        assert_eq!(identity.claim_local_ticket("stale").await.unwrap(), None);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_tickets")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "an expired ticket is deleted when it is tried");
+    }
+
+    #[tokio::test]
+    async fn clearing_tickets_forgets_them_and_a_recorded_token_authenticates() {
+        let (_dir, _home, identity) = identity().await;
+        let computer = Id::new();
+        identity
+            .remember_local_ticket("ticket", Id::new(), Duration::from_secs(600))
+            .await
+            .unwrap();
+        identity.clear_local_tickets().await.unwrap();
+        assert_eq!(identity.claim_local_ticket("ticket").await.unwrap(), None);
+
+        identity
+            .record_computer_token(computer, "credential")
+            .await
+            .unwrap();
+        assert_eq!(
+            identity.authenticate_computer("credential").await.unwrap(),
+            Some(computer)
+        );
+        identity.forget_computer_token("credential").await.unwrap();
+        assert_eq!(
+            identity.authenticate_computer("credential").await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_admin_is_known_once_it_joins() {
+        let (_dir, _home, identity) = identity().await;
+        assert_eq!(identity.admin_account().await.unwrap(), None);
+
+        let (account, _token) = identity
+            .create_admin("Ada", "correct horse battery")
+            .await
+            .unwrap();
+
+        assert_eq!(identity.admin_account().await.unwrap(), Some(account));
+    }
+    #[tokio::test]
+    async fn issuing_keeps_at_most_eight_unused_tickets_per_owner() {
+        let (_dir, _home, identity) = identity().await;
+        let owner = Id::new();
+        let mut tickets = Vec::new();
+        for number in 0..(MAX_LOCAL_TICKETS_PER_OWNER + 2) {
+            let ticket = format!("ticket-{number}");
+            identity
+                .remember_local_ticket(&ticket, owner, Duration::from_secs(600))
+                .await
+                .unwrap();
+            tickets.push(ticket);
+        }
+
+        let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_tickets WHERE owner = ?")
+            .bind(owner.to_string())
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(held, MAX_LOCAL_TICKETS_PER_OWNER);
+        assert_eq!(
+            identity.claim_local_ticket(&tickets[0]).await.unwrap(),
+            None,
+            "the oldest unused ticket is dropped"
+        );
+        assert!(
+            identity
+                .claim_local_ticket(tickets.last().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "the newest ticket works"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuing_and_claiming_drop_expired_tickets() {
+        let (_dir, _home, identity) = identity().await;
+        let owner = Id::new();
+        sqlx::query(
+            "INSERT INTO computer_tickets (ticket_hash, owner, created_at, expires_at) \
+             VALUES (?, ?, 0, 0)",
+        )
+        .bind(digest("stale-ticket").as_slice())
+        .bind(owner.to_string())
+        .execute(&identity.pool)
+        .await
+        .unwrap();
+
+        identity
+            .remember_local_ticket("fresh-ticket", owner, Duration::from_secs(600))
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_tickets")
+            .fetch_one(&identity.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1, "an issue drops what already expired");
+        assert_eq!(
+            identity.claim_local_ticket("stale-ticket").await.unwrap(),
+            None
         );
     }
 }
