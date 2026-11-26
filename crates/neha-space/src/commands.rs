@@ -2634,9 +2634,18 @@ impl Recorder for RunRecorder<'_> {
         let index = self.call_index(step, call)?;
         let lasting_scope = match reason {
             ApprovalReason::Rule => lasting_scope_at(call, self.log.cwd.as_deref()),
-            ApprovalReason::Grant => grant
-                .as_ref()
-                .map(|(folder, scope)| format!("{scope} under {folder}")),
+            ApprovalReason::Grant => {
+                if first_use {
+                    // The first use of a Local Computer always asks; the owner
+                    // can allow this one action, but no lasting answer is
+                    // offered on the first card.
+                    None
+                } else {
+                    grant
+                        .as_ref()
+                        .map(|(folder, scope)| format!("{scope} under {folder}"))
+                }
+            }
             ApprovalReason::FirstUseLocal => None,
         };
         let approval = Id::new();
@@ -2827,21 +2836,6 @@ fn ambiguous_path(path: &str, rules: &[RuleView]) -> bool {
 }
 
 fn ambiguous_path_at(path: &str, rules: &[RuleView], cwd: Option<&str>) -> bool {
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/neha-debug-ambig")
-        .and_then(|mut f| {
-            use std::io::Write as _;
-            writeln!(
-                f,
-                "ambig input={path:?} cwd={cwd:?} rules={:?}",
-                rules
-                    .iter()
-                    .map(|r| (&r.tool, &r.path_prefix))
-                    .collect::<Vec<_>>()
-            )
-        });
     let Some(path) = resolve_action_path(path, cwd) else {
         return true;
     };
@@ -2852,20 +2846,11 @@ fn ambiguous_path_at(path: &str, rules: &[RuleView], cwd: Option<&str>) -> bool 
     }
     let absolute = path.starts_with('/');
 
-    let result = rules.iter().any(|rule| {
+    rules.iter().any(|rule| {
         rule.path_prefix
             .as_deref()
             .is_some_and(|prefix| lexical_path(prefix).starts_with('/') != absolute)
-    });
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/neha-debug-ambig")
-        .and_then(|mut f| {
-            use std::io::Write as _;
-            writeln!(f, "  resolved={path:?} absolute={absolute} result={result}")
-        });
-    result
+    })
 }
 
 /// What an "Always allow" would cover, in words a User reads.
@@ -3202,7 +3187,9 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
         return None;
     }
     let (folder, scope) = match call.tool.as_str() {
-        neha_loop::tools::WRITE_FILE | neha_loop::tools::PUT_FILE => {
+        // `put_file` reads from the machine and delivers to the Space; it does
+        // not write the machine. Only `write_file` asks for a folder.
+        neha_loop::tools::WRITE_FILE => {
             let path = call.arguments.get("path").and_then(Value::as_str)?;
             let target = if Path::new(path).is_absolute() {
                 action_path(path)?
@@ -3217,7 +3204,13 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
         }
         neha_loop::tools::SHELL => {
             // A shell can write anywhere; its working directory is the only
-            // target the Space can name before it runs.
+            // target the Space can name before it runs. A command that reads
+            // only is not turned into a grant card, and a command that writes
+            // without an obvious target still meets the daemon's fence.
+            let command = call.arguments.get("command").and_then(Value::as_str)?;
+            if !shell_may_write(command) {
+                return None;
+            }
             let cwd = action_path(cwd?)?;
             if under_grants(&cwd, &bot.grants) {
                 return None;
@@ -3227,6 +3220,46 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
         _ => return None,
     };
     Some((folder, scope.to_owned()))
+}
+
+/// Returns whether a shell command is likely to write.
+///
+/// A shell can write through almost anything, so this is only the pre-run
+/// judgement: a command that names a write (a redirect or a common writing
+/// tool) asks the owner for its working directory, while a plainly read-only
+/// command does not. The daemon's fence still refuses anything this missed.
+fn shell_may_write(command: &str) -> bool {
+    if command.contains('>') {
+        return true;
+    }
+    let mut words = command.split_whitespace();
+    words.any(|word| {
+        let word = word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
+        matches!(
+            word,
+            "tee"
+                | "touch"
+                | "mkdir"
+                | "rmdir"
+                | "rm"
+                | "mv"
+                | "cp"
+                | "ln"
+                | "dd"
+                | "truncate"
+                | "chmod"
+                | "chown"
+                | "install"
+                | "patch"
+                | "sed"
+                | "perl"
+                | "python"
+                | "python3"
+                | "sh"
+                | "bash"
+                | "node"
+        ) || word.ends_with("-i")
+    })
 }
 
 /// Returns whether a normalized path lies in one of the granted folders.

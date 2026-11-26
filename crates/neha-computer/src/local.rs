@@ -310,36 +310,48 @@ impl LocalRuntime {
         }
         let mut roots = Vec::new();
         for grant in grants {
-            let dbg = std::fs::canonicalize(grant.trim());
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/neha-debug-grants")
-                .and_then(|mut f| {
-                    use std::io::Write as _;
-                    writeln!(f, "grant input={grant:?} canonical={dbg:?}")
-                });
-            let Ok(root) = std::fs::canonicalize(grant.trim()) else {
+            // Open first, then judge the descriptor. A path replaced between a
+            // check and the open could otherwise point the grant somewhere
+            // else; every later write and shell bind uses this descriptor.
+            let Ok(file) = std::fs::File::open(grant.trim()) else {
                 // The Space may hold a grant from another machine or a folder
                 // that has since gone. It must not take the whole runtime down:
                 // that grant simply grants nothing here.
                 continue;
             };
-            let Ok(metadata) = std::fs::metadata(&root) else {
+            #[cfg(unix)]
+            let mut file = file;
+            // The shell moves the Bot's folder descriptor to a fixed one-digit
+            // number. A grant that landed there is moved to another descriptor
+            // so the two mounts can never name each other.
+            #[cfg(unix)]
+            while {
+                use std::os::fd::AsRawFd as _;
+                file.as_raw_fd() == MOUNT_FD
+            } {
+                match file.try_clone() {
+                    Ok(next) => file = next,
+                    Err(_) => break,
+                }
+            }
+            #[cfg(not(unix))]
+            let file = file;
+            let Ok(metadata) = file.metadata() else {
                 continue;
             };
             if !metadata.is_dir() {
                 continue;
             }
+            #[cfg(unix)]
+            let root = {
+                use std::os::fd::AsRawFd as _;
+                std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+                    .or_else(|_| std::fs::canonicalize(grant.trim()))
+                    .map_err(RuntimeError::Io)?
+            };
+            #[cfg(not(unix))]
+            let root = std::fs::canonicalize(grant.trim()).map_err(RuntimeError::Io)?;
             if self.is_hidden(&root) || self.is_denied(&root) {
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/neha-debug-grants")
-                    .and_then(|mut f| {
-                        use std::io::Write as _;
-                        writeln!(f, "  skipped hidden root={}", root.display())
-                    });
                 return Err(RuntimeError::Access(format!(
                     "the granted folder is hidden from this Computer: {}",
                     root.display()
@@ -348,14 +360,6 @@ impl LocalRuntime {
             // A grant that contains a hidden root would re-expose it after the
             // hidden tmpfs is mounted.
             if self.hidden.iter().any(|hidden| hidden.starts_with(&root)) {
-                let _ = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open("/tmp/neha-debug-grants")
-                    .and_then(|mut f| {
-                        use std::io::Write as _;
-                        writeln!(f, "  skipped ancestor root={}", root.display())
-                    });
                 return Err(RuntimeError::Access(format!(
                     "the granted folder contains a hidden path: {}",
                     root.display()
@@ -364,10 +368,6 @@ impl LocalRuntime {
             if root == self.root || self.grants.iter().any(|(seen, _)| seen == &root) {
                 continue;
             }
-            let file = match std::fs::File::open(&root) {
-                Ok(file) => file,
-                Err(_) => continue,
-            };
             roots.push((root, file));
         }
         self.grants = roots;
@@ -4150,6 +4150,47 @@ mod tests {
             std::fs::read_to_string(granted.join("shell.txt")).unwrap(),
             "shell\n"
         );
+    }
+
+    #[tokio::test]
+    async fn a_shell_mounts_every_grant_separately() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(
+                false,
+                &[
+                    first.to_string_lossy().into_owned(),
+                    second.to_string_lossy().into_owned(),
+                ],
+            )
+            .unwrap();
+        let command = format!(
+            "printf first > {}/one; printf second > {}/two; printf own > {}/own.txt",
+            first.display(),
+            second.display(),
+            directory.path().join("bot").display()
+        );
+        let result = runtime.execute(Action::Shell { command }).await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert_eq!(std::fs::read_to_string(first.join("one")).unwrap(), "first");
+        assert_eq!(
+            std::fs::read_to_string(second.join("two")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("bot").join("own.txt")).unwrap(),
+            "own"
+        );
+        assert!(!first.join("two").exists());
+        assert!(!second.join("one").exists());
     }
 
     #[tokio::test]

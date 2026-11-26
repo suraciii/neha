@@ -94,14 +94,7 @@ impl ComputerRuntime for RemoteRuntime {
             {
                 access.write_roots.push(folder);
             }
-            let _ = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("/tmp/neha-debug")
-                .and_then(|mut f| {
-                    use std::io::Write as _;
-                    writeln!(f, "remote access={:?}", access)
-                });
+
             let answer = tokio::time::timeout(
                 self.timeout,
                 self.link
@@ -139,8 +132,12 @@ impl ComputerRuntime for RemoteRuntime {
         let path = path.to_owned();
         async move {
             let id = self.next_id();
-            let answer =
-                tokio::time::timeout(self.timeout, self.link.read(id, self.bot, &path)).await;
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.link
+                    .read(id, self.bot, &path, self.working_dir.as_deref()),
+            )
+            .await;
             match answer {
                 Ok(Answer::Bytes(bytes)) => Ok(bytes),
                 Ok(Answer::ActionResult(_)) => Err(ByteError::Failed(

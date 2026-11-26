@@ -663,7 +663,12 @@ async fn execute_frame(
                 output: result.output,
             }
         }
-        HostFrame::Read { id, bot, path } => {
+        HostFrame::Read {
+            id,
+            bot,
+            path,
+            working_dir,
+        } => {
             match machine(
                 config,
                 hidden,
@@ -671,7 +676,7 @@ async fn execute_frame(
                 runtimes,
                 &bot,
                 &AccessFrame::default(),
-                None,
+                working_dir.as_deref(),
             ) {
                 Ok(runtime) => match runtime.read_bytes(&path).await {
                     Ok(bytes) => DeviceFrame::Bytes {
@@ -731,14 +736,7 @@ fn machine(
     // The Bot must be one identifier component; reject anything else before
     // touching the filesystem.
     folder_for(&config.workspace, bot)?;
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/neha-debug-daemon")
-        .and_then(|mut f| {
-            use std::io::Write as _;
-            writeln!(f, "machine bot={bot} access={access:?}")
-        });
+
     let key = RuntimeKey {
         bot: bot.to_owned(),
         full_access: access.full_access,
@@ -2830,6 +2828,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_file_read_uses_the_runs_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        std::fs::write(folder.join("report.txt"), "from the workspace").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("report.txt"), "from the run").unwrap();
+        let config = channel_config(workspace.path());
+
+        let answer = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Read {
+                id: 1,
+                bot: bot.to_string(),
+                path: "report.txt".to_owned(),
+                working_dir: Some(directory.path().to_string_lossy().into_owned()),
+            },
+        )
+        .await;
+        let DeviceFrame::Bytes { bytes, .. } = answer else {
+            panic!("expected bytes, got {answer:?}");
+        };
+        assert_eq!(decode_bytes(&bytes).unwrap(), b"from the run");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_space_that_stops_reading_is_disconnected() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2848,6 +2876,7 @@ mod tests {
                             id,
                             bot: bot.to_string(),
                             path: "big.bin".to_owned(),
+                            working_dir: None,
                         },
                     )
                     .await;

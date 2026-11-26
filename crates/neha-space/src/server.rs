@@ -13238,6 +13238,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_grant_cannot_become_lasting() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/first-grant.txt", "content": "x"}),
+                ),
+                text("done"),
+            ],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
+        let approval = approval_for_run(&mut local.socket, run).await;
+        assert_eq!(approval["reason"], "grant");
+        assert!(approval["grant_folder"].is_string());
+        assert!(
+            approval["lasting_scope"].is_null(),
+            "the first use cannot offer a lasting grant"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let refused = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(refused.is_err(), "a first grant cannot become lasting");
+
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, run).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!([]));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_write_outside_the_grants_asks_the_owner() {
         let (_dir, running, invite) = running().await;
         let mut local = local_bot(

@@ -118,13 +118,14 @@ impl ComputerLink {
     }
 
     /// Reads a File's bytes from the Computer and waits for them.
-    pub async fn read(&self, id: u64, bot: Id, path: &str) -> Answer {
+    pub async fn read(&self, id: u64, bot: Id, path: &str, working_dir: Option<&str>) -> Answer {
         self.request(
             id,
             HostFrame::Read {
                 id,
                 bot: bot.to_string(),
                 path: path.to_owned(),
+                working_dir: working_dir.map(ToOwned::to_owned),
             },
         )
         .await
@@ -465,7 +466,7 @@ mod tests {
         let bot = Id::new();
         let reader = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.read(2, bot, "notes.txt").await }
+            async move { link.read(2, bot, "notes.txt", None).await }
         });
         assert_eq!(
             outgoing.recv().await.unwrap(),
@@ -473,6 +474,7 @@ mod tests {
                 id: 2,
                 bot: bot.to_string(),
                 path: "notes.txt".to_owned(),
+                working_dir: None,
             }
         );
         link.deliver(2, Answer::Bytes(b"hello".to_vec()));
@@ -500,7 +502,7 @@ mod tests {
         let (links, computer, link, _outgoing) = connected();
         let waiting = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.read(4, Id::new(), "/etc/hostname").await }
+            async move { link.read(4, Id::new(), "/etc/hostname", None).await }
         });
         tokio::task::yield_now().await;
 
@@ -530,7 +532,7 @@ mod tests {
         let signal = old.closed_signal();
         let waiting = tokio::spawn({
             let old = Arc::clone(&old);
-            async move { old.read(4, Id::new(), "/etc/hostname").await }
+            async move { old.read(4, Id::new(), "/etc/hostname", None).await }
         });
         tokio::task::yield_now().await;
 

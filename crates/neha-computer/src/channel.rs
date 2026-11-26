@@ -67,6 +67,9 @@ pub enum HostFrame {
         bot: String,
         /// The path to read.
         path: String,
+        /// The directory this run works in; absent means the Bot's folder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_dir: Option<String>,
     },
     /// Writes a file's bytes on the machine (a File delivery).
     Write {
@@ -269,6 +272,7 @@ mod tests {
                     id: 11,
                     bot: "bot-1".to_owned(),
                     path: "/home/me/report.pdf".to_owned(),
+                    working_dir: None,
                 },
                 json!({
                     "type": "read",
