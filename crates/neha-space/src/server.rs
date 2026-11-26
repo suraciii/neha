@@ -566,7 +566,57 @@ async fn validate_client_directory(server: &SpaceServer) -> Result<(), ServerErr
     if root.starts_with(&home) || home.starts_with(&root) {
         return Err(ServerError::UiOverlapsHome(dir.clone()));
     }
+    // The standard configuration directory holds the plaintext local ticket
+    // (and the saved Computer credential). A static root that can reach it
+    // would serve the secret as a File, and the file's 0600 mode would not
+    // stop the Space itself from reading it. The check is by path, so it also
+    // covers a ticket folder the current start has not created yet.
+    if let Some(config) = crate::ticket::configuration_directory(&server.home) {
+        let config = resolve_path(&config)
+            .await
+            .map_err(|_| ServerError::Ui(dir.clone()))?;
+        if root.starts_with(&config) || config.starts_with(&root) {
+            return Err(ServerError::UiOverlapsConfiguration(dir.clone()));
+        }
+    }
+
     Ok(())
+}
+
+/// Resolves `path` to an absolute path even when it does not exist yet.
+///
+/// The deepest existing ancestor is canonicalized and the missing names are
+/// appended, so the result follows symlinks of the part that exists while the
+/// rest is compared by name.
+async fn resolve_path(path: &Path) -> Result<PathBuf, std::io::Error> {
+    let mut path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        match tokio::fs::canonicalize(&path).await {
+            Ok(mut resolved) => {
+                for name in missing.iter().rev() {
+                    resolved.push(name);
+                }
+
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let Some(name) = path.file_name().map(|name| name.to_os_string()) else {
+                    return Err(error);
+                };
+                path.pop();
+                missing.push(name);
+                if path.as_os_str().is_empty() {
+                    return Err(error);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 async fn health() -> &'static str {
@@ -2254,6 +2304,13 @@ pub enum ServerError {
     /// The browser client directory overlaps the Space home.
     #[error("the browser client at {} overlaps the Space home", .0.display())]
     UiOverlapsHome(PathBuf),
+    /// The browser client directory overlaps the machine's configuration and
+    /// credential directory, where the local pairing ticket is written.
+    #[error(
+        "the browser client at {} overlaps the Neha configuration and credential directory",
+        .0.display()
+    )]
+    UiOverlapsConfiguration(PathBuf),
     /// The local pairing ticket cannot be issued or cleared.
     #[error("local ticket error: {0}")]
     Ticket(#[from] TicketError),
@@ -2266,7 +2323,7 @@ mod tests {
     use serde_json::json;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use super::{Running, ServerError, SpaceServer, StreamError, catch_up, start};
+    use super::{Running, ServerError, SpaceServer, StreamError, catch_up, start, start_with_ui};
     use crate::blobs::test_s3;
     use crate::config::S3Storage;
     use crate::home::Home;
@@ -9591,5 +9648,112 @@ mod tests {
         assert_eq!(named["computer"]["kind"], "local");
         socket.close(None).await.unwrap();
         restarted.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ui_root_that_contains_the_configuration_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        // The Space's own home is elsewhere, so this refusal is the
+        // configuration directory's, not the home's. The configuration
+        // directory, and so the ticket folder, does not exist yet: the check
+        // must not depend on it.
+        let space = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let home = test_home_in(space.path(), &config);
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<!doctype html><title>Neha</title>",
+        )
+        .unwrap();
+
+        let result = start_with_ui(home, 0, Some(dir.path().to_path_buf())).await;
+
+        let Err(error) = result else {
+            panic!("a UI root holding the configuration directory is refused");
+        };
+        let ServerError::UiOverlapsConfiguration(path) = error else {
+            panic!("the wrong refusal: {error:?}");
+        };
+        assert_eq!(path, dir.path());
+        let message = ServerError::UiOverlapsConfiguration(path).to_string();
+        assert!(
+            message.contains("configuration and credential"),
+            "the refusal names the directory: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ui_root_inside_the_configuration_directory_is_refused() {
+        for (case, equals) in [("inside", false), ("equal", true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config");
+            let ui = if equals {
+                config.clone()
+            } else {
+                config.join("ui")
+            };
+            std::fs::create_dir_all(&ui).unwrap();
+            std::fs::write(ui.join("index.html"), "<!doctype html><title>Neha</title>").unwrap();
+            let home = test_home_in(&dir.path().join("space"), &config);
+
+            let result = start_with_ui(home, 0, Some(ui.clone())).await;
+
+            let Err(error) = result else {
+                panic!("a UI root {case} the configuration directory is refused");
+            };
+            let ServerError::UiOverlapsConfiguration(path) = error else {
+                panic!("the wrong refusal for {case}: {error:?}");
+            };
+            assert_eq!(path, ui);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_independent_ui_root_does_not_overlap_the_configuration_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let ui = dir.path().join("ui");
+        std::fs::create_dir_all(&ui).unwrap();
+        std::fs::write(ui.join("index.html"), "<!doctype html><title>Neha</title>").unwrap();
+        let home = test_home_in(&dir.path().join("space"), &config);
+
+        let running = start_with_ui(home, 0, Some(ui)).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_without_a_configuration_directory_has_nothing_to_overlap() {
+        if std::env::var_os("NEHA_TEST_NO_CONFIG_UI_CHILD").is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let ui = dir.path().join("ui");
+            std::fs::create_dir_all(&ui).unwrap();
+            std::fs::write(ui.join("index.html"), "<!doctype html><title>Neha</title>").unwrap();
+            let home = Home::open(dir.path().join("space")).unwrap();
+
+            let running = start_with_ui(home, 0, Some(ui)).await.unwrap();
+            assert!(
+                running.local_ticket.is_none(),
+                "without HOME or XDG no ticket file is written"
+            );
+            running.shutdown().await;
+            println!("NO_CONFIG_UI_CHILD_OK");
+
+            return;
+        }
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("server::tests::a_start_without_a_configuration_directory_has_nothing_to_overlap")
+            .arg("--nocapture")
+            .env_clear()
+            .env("NEHA_TEST_NO_CONFIG_UI_CHILD", "1")
+            .output()
+            .expect("the child test process starts");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child Space failed: {stdout}\n{stderr}"
+        );
+        assert!(stdout.contains("NO_CONFIG_UI_CHILD_OK"), "{stdout}");
     }
 }

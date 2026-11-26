@@ -1,7 +1,7 @@
 //! The CLI's connection to one Space.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -48,7 +48,11 @@ pub struct Credential {
 impl Credential {
     /// Loads the saved credential.
     pub fn load() -> Result<Self> {
-        let path = credential_path();
+        // One resolver for the CLI and the daemon's hidden roots: a relative
+        // `XDG_CONFIG_HOME` must not put the session under the working
+        // directory, where a Bot can read it.
+        let path = crate::computer::credential_path();
+        crate::computer::migrate_legacy_credential(&path)?;
         let bytes = fs::read(&path).with_context(|| {
             format!(
                 "not signed in: {} is missing; run `neha join <invite link>`",
@@ -60,7 +64,10 @@ impl Credential {
 
     /// Saves the credential for later commands.
     pub fn save(&self) -> Result<()> {
-        write_private(&credential_path(), &serde_json::to_vec(self)?)
+        write_private(
+            &crate::computer::credential_path(),
+            &serde_json::to_vec(self)?,
+        )
     }
 }
 
@@ -96,21 +103,6 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     restrict(path, 0o600)?;
 
     Ok(())
-}
-
-pub(crate) fn credential_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("NEHA_CREDENTIAL") {
-        return PathBuf::from(path);
-    }
-    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(config).join("neha").join("credential.json");
-    }
-    let home = std::env::var_os("HOME").unwrap_or_default();
-
-    PathBuf::from(home)
-        .join(".config")
-        .join("neha")
-        .join("credential.json")
 }
 
 #[cfg(unix)]

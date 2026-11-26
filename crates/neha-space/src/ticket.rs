@@ -94,6 +94,21 @@ pub fn path(home: &Home) -> Option<PathBuf> {
     )
 }
 
+/// Returns the standard configuration directory this machine's Neha files are
+/// written to, if one is known.
+///
+/// Production resolves it from `XDG_CONFIG_HOME`/`HOME`; a test home names it
+/// directly. The directory may not exist yet: a Space that has not written a
+/// ticket or a credential still must not serve the directory as a static root.
+pub(crate) fn configuration_directory(home: &Home) -> Option<PathBuf> {
+    home.ticket_directory().map(Path::to_path_buf).or_else(|| {
+        config_directory(
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    })
+}
+
 /// Returns the ticket path for a known configuration directory.
 fn path_from(home: &Home, config: Option<PathBuf>) -> Option<PathBuf> {
     let directory = home.ticket_directory().map(Path::to_path_buf).or(config)?;

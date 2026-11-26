@@ -839,6 +839,88 @@ fn standard_config_directory(
         .map(|base| base.join("neha"))
 }
 
+/// Returns the path of the CLI session credential.
+///
+/// The resolver is the same one the daemon uses for its hidden roots: a
+/// relative `XDG_CONFIG_HOME` is ignored (per the XDG base directory
+/// specification), `NEHA_CREDENTIAL` wins, and otherwise the file lives under
+/// `$HOME/.config/neha`. One resolver is what makes the directory the daemon
+/// hides and the file the CLI writes the same place.
+pub(crate) fn credential_path() -> PathBuf {
+    credential_path_from(
+        std::env::var_os("NEHA_CREDENTIAL").map(PathBuf::from),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
+/// Returns the credential path for known environment values.
+fn credential_path_from(
+    neha_credential: Option<PathBuf>,
+    xdg_config_home: Option<PathBuf>,
+    user_home: Option<PathBuf>,
+) -> PathBuf {
+    if let Some(path) = neha_credential {
+        return path;
+    }
+    let directory = standard_config_directory(xdg_config_home, user_home)
+        .unwrap_or_else(|| PathBuf::from(".config").join("neha"));
+
+    resolved_path(&directory.join("credential.json"))
+}
+
+/// Moves a credential written by the old cwd-relative resolver into place.
+///
+/// Before this resolver existed, a relative `XDG_CONFIG_HOME` made the CLI
+/// save the session under that relative path — inside whatever directory the
+/// User ran the command in, which is exactly where a Bot's shell may read it.
+/// The resolved file wins; when it is missing and the old relative file still
+/// exists, the old file is moved so no leaked copy stays in the working
+/// directory.
+pub(crate) fn migrate_legacy_credential(path: &Path) -> Result<()> {
+    migrate_legacy_credential_from(path, legacy_relative_credential_path().as_deref())
+}
+
+/// Moves one known legacy credential into `path`.
+fn migrate_legacy_credential_from(path: &Path, legacy: Option<&Path>) -> Result<()> {
+    let Some(legacy) = legacy else {
+        return Ok(());
+    };
+    if legacy == path || !legacy.exists() {
+        return Ok(());
+    }
+    if !path.exists() {
+        let bytes = std::fs::read(legacy)
+            .with_context(|| format!("cannot read the older credential at {}", legacy.display()))?;
+        client::write_private(path, &bytes)?;
+    }
+    // The resolved credential is authoritative. The cwd-relative copy is a
+    // leaked secret wherever the resolved file came from, so it is removed
+    // either way.
+    match std::fs::remove_file(legacy) {
+        Ok(()) => {}
+        Err(error) => eprintln!(
+            "warning: cannot remove the older credential {}: {error}",
+            legacy.display()
+        ),
+    }
+
+    Ok(())
+}
+
+/// Returns the cwd-relative credential path the old resolver used, if any.
+fn legacy_relative_credential_path() -> Option<PathBuf> {
+    if std::env::var_os("NEHA_CREDENTIAL").is_some() {
+        return None;
+    }
+    let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)?;
+    if xdg.is_absolute() {
+        return None;
+    }
+
+    Some(xdg.join("neha").join("credential.json"))
+}
+
 /// Returns the path of the saved pairing.
 fn config_path() -> Result<PathBuf> {
     Ok(config_directory()?.join("computer.json"))
@@ -1163,12 +1245,29 @@ fn hidden_roots_from(
 /// tools run with the machine user's rights, so they get the paths themselves,
 /// existing or not.
 fn denied_paths() -> Vec<PathBuf> {
+    denied_paths_from(
+        config_path().ok(),
+        credential_path(),
+        standard_config_from_env(),
+    )
+}
+
+/// Returns the deny list for known paths.
+///
+/// The credential path comes from [`credential_path_from`], the same resolver
+/// the daemon uses to choose hidden directories: a relative `XDG_CONFIG_HOME`
+/// cannot put the credential outside the hidden configuration directory.
+fn denied_paths_from(
+    config_path: Option<PathBuf>,
+    credential_path: PathBuf,
+    standard_config: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(path) = config_path() {
+    if let Some(path) = config_path {
         paths.push(resolved_path(&path));
     }
-    paths.push(resolved_path(&client::credential_path()));
-    if let Some(directory) = standard_config_from_env() {
+    paths.push(resolved_path(&credential_path));
+    if let Some(directory) = standard_config {
         paths.push(resolved_path(&directory.join("spaces")));
     }
 
@@ -1246,7 +1345,8 @@ mod tests {
     use futures_util::{SinkExt as _, StreamExt as _};
     use neha::id::Id;
     use neha_computer::{
-        ActionStatus, CHANNEL_VERSION, DeviceFrame, HostFrame, LocalRuntime, ToolOutput, WireAction,
+        Action, ActionStatus, CHANNEL_VERSION, ComputerRuntime as _, DeviceFrame, HostFrame,
+        LocalRuntime, ToolOutput, WireAction,
     };
     use tokio_tungstenite::tungstenite::Message;
 
@@ -1254,10 +1354,12 @@ mod tests {
 
     use super::{
         Config, Runtimes, Socket, answer_is_yes, check_saved_origin, check_ticket_space,
-        choose_ticket, config_directory_from, confirmation_needed, decode_bytes,
-        default_workspace_from, encode_bytes, execute_frame, folder_for, found_tickets,
-        hidden_roots_from, normalized_space_url, parse_ticket, refuse_older_pairing_from,
-        refuse_workspace, same_origin, saved_session_url, serve_channel, socket_url, write_receipt,
+        choose_ticket, config_directory_from, confirmation_needed, credential_path_from,
+        decode_bytes, default_workspace_from, denied_paths_from, encode_bytes, execute_frame,
+        folder_for, found_tickets, hidden_roots_from, migrate_legacy_credential_from,
+        normalized_space_url, parse_ticket, refuse_older_pairing_from, refuse_workspace,
+        same_origin, saved_session_url, serve_channel, socket_url, standard_config_directory,
+        write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -1668,6 +1770,184 @@ mod tests {
         // standard configuration directory.
         let roots = hidden_roots_from(standard.clone(), None, None).unwrap();
         assert_eq!(roots, vec![canonical(&standard)]);
+    }
+
+    /// A temporary directory outside `/tmp`, which bubblewrap replaces.
+    #[cfg(unix)]
+    fn outside_tempdir() -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix("neha-credential-")
+            .tempdir_in("/var/tmp")
+            .expect("a temporary directory outside /tmp")
+    }
+
+    #[test]
+    fn the_credential_path_ignores_a_relative_xdg_config_home() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let canonical_home = std::fs::canonicalize(&home).unwrap();
+
+        // The daemon ignores a relative XDG_CONFIG_HOME, so the CLI must too:
+        // the credential may not land in whatever directory the User ran in.
+        assert_eq!(
+            credential_path_from(
+                None,
+                Some(PathBuf::from("relative-xdg")),
+                Some(home.clone())
+            ),
+            canonical_home.join(".config/neha/credential.json")
+        );
+
+        // An absolute XDG_CONFIG_HOME is still honoured.
+        let absolute = directory.path().join("xdg");
+        std::fs::create_dir(&absolute).unwrap();
+        assert_eq!(
+            credential_path_from(None, Some(absolute.clone()), Some(home.clone())),
+            std::fs::canonicalize(&absolute)
+                .unwrap()
+                .join("neha/credential.json")
+        );
+
+        // NEHA_CREDENTIAL still wins, as before.
+        let explicit = directory.path().join("custom.json");
+        assert_eq!(
+            credential_path_from(Some(explicit.clone()), Some(absolute), Some(home)),
+            explicit
+        );
+    }
+
+    #[test]
+    fn an_older_relative_credential_moves_to_the_resolved_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let legacy = directory.path().join("relative/neha/credential.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "old-session").unwrap();
+        let path = directory.path().join("home/.config/neha/credential.json");
+
+        migrate_legacy_credential_from(&path, Some(&legacy)).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-session");
+        assert!(
+            !legacy.exists(),
+            "the stale cwd-relative credential must not stay behind"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the credential stays private");
+        }
+
+        // Even when the resolved credential already exists, the old leaked
+        // copy is removed rather than left in the working directory.
+        std::fs::write(&legacy, "older-session").unwrap();
+        migrate_legacy_credential_from(&path, Some(&legacy)).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-session");
+    }
+
+    #[test]
+    fn the_relative_xdg_credential_sits_inside_the_hidden_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let relative_xdg = PathBuf::from("relative-xdg");
+        let credential = credential_path_from(None, Some(relative_xdg.clone()), Some(home.clone()));
+        let standard = standard_config_directory(Some(relative_xdg), Some(home)).unwrap();
+        let config_directory = directory.path().join("computer-config");
+        std::fs::create_dir(&config_directory).unwrap();
+
+        // The daemon's hidden roots cover the directory the CLI actually
+        // writes, even though XDG_CONFIG_HOME was relative.
+        let hidden = hidden_roots_from(
+            config_directory,
+            Some(standard.clone()),
+            Some(credential.clone()),
+        )
+        .unwrap();
+        assert!(
+            hidden.iter().any(|root| credential.starts_with(root)),
+            "the credential {credential:?} must sit under a hidden root: {hidden:?}"
+        );
+        let denied = denied_paths_from(None, credential.clone(), Some(standard));
+        assert!(
+            denied
+                .iter()
+                .any(|path| credential == *path || credential.starts_with(path)),
+            "the credential must be denied to the file tools: {denied:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_bot_cannot_read_the_credential_the_cli_saved() {
+        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+            return;
+        }
+        let directory = outside_tempdir();
+        let home = directory.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        // What the CLI saves when XDG_CONFIG_HOME is relative.
+        let relative_xdg = PathBuf::from("relative-xdg");
+        let credential = credential_path_from(None, Some(relative_xdg.clone()), Some(home.clone()));
+        crate::client::write_private(&credential, b"session-secret-must-not-leak").unwrap();
+        let standard = standard_config_directory(Some(relative_xdg), Some(home)).unwrap();
+        let config_directory = directory.path().join("computer-config");
+        std::fs::create_dir(&config_directory).unwrap();
+        let hidden = hidden_roots_from(
+            config_directory,
+            Some(standard.clone()),
+            Some(credential.clone()),
+        )
+        .unwrap();
+        let denied = denied_paths_from(None, credential.clone(), Some(standard));
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let runtime = LocalRuntime::machine_with_hidden(workspace, hidden)
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_denied(denied);
+
+        // The Bot's shell cannot read the credential the CLI actually uses.
+        let shell = runtime
+            .execute(Action::Shell {
+                command: format!("cat '{}'", credential.display()),
+            })
+            .await;
+        assert!(
+            !shell.output.text.contains("session-secret-must-not-leak"),
+            "the shell must not read the CLI credential: {}",
+            shell.output.text
+        );
+
+        // Neither can the file tools.
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: credential.to_string_lossy().into_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Failed, "{read:?}");
+        assert!(
+            read.output
+                .text
+                .contains("the path is hidden from this Computer"),
+            "{}",
+            read.output.text
+        );
+        assert!(!read.output.text.contains("session-secret-must-not-leak"));
+        let error = runtime
+            .read_bytes(&credential.to_string_lossy())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("the path is hidden from this Computer"),
+            "{error}"
+        );
+        assert!(!error.contains("session-secret-must-not-leak"));
+
+        // The credential is still there on the host, private to the user.
+        assert!(credential.is_file());
     }
 
     #[test]
