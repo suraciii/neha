@@ -69,6 +69,8 @@ pub enum CommandCall {
     ComputerList,
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
+    /// Changes a Bot's file access.
+    BotUpdate(BotUpdate),
     /// Moves a Bot to another real Computer.
     BotMove {
         /// The Bot.
@@ -198,6 +200,19 @@ pub struct BotCreate {
     pub computer: Option<BotComputer>,
 }
 
+/// The parameters of `bot_update`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct BotUpdate {
+    /// The Bot to change.
+    pub bot: Id,
+    /// Whether it may write outside its Workspace fence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_access: Option<bool>,
+    /// The complete list of extra folders it may write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grants: Option<Vec<String>>,
+}
+
 /// The Computer a `bot_create` asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BotComputer {
@@ -243,6 +258,9 @@ pub struct MessageSend {
     /// The File the Message carries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<Id>,
+    /// The directory this run works in; absent means the Bot's Workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// A frame the Space sends.
@@ -443,6 +461,7 @@ mod tests {
             chat,
             text: "hello".to_owned(),
             file: None,
+            cwd: None,
         });
         let text = serde_json::to_string(&plain).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), plain);
@@ -455,6 +474,7 @@ mod tests {
             chat,
             text: String::new(),
             file: Some(Id::new()),
+            cwd: None,
         });
         let text = serde_json::to_string(&file).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), file);

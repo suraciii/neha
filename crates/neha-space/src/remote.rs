@@ -30,6 +30,12 @@ pub struct RemoteRuntime {
     ids: Arc<AtomicU64>,
     /// How long one request may wait for its answer.
     timeout: Duration,
+    /// The directory the run works in.
+    working_dir: Option<String>,
+    /// The owner-granted write access the run carries.
+    access: neha_computer::channel::AccessFrame,
+    /// A folder allowed for the next action only.
+    once_grant: std::sync::Mutex<Option<String>>,
 }
 
 impl RemoteRuntime {
@@ -41,7 +47,33 @@ impl RemoteRuntime {
             bot,
             ids,
             timeout,
+            working_dir: None,
+            access: neha_computer::channel::AccessFrame::default(),
+            once_grant: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Sets the directory this run's actions work in.
+    #[must_use]
+    pub fn with_working_dir(mut self, working_dir: impl Into<String>) -> Self {
+        self.working_dir = Some(working_dir.into());
+        self
+    }
+
+    /// Sets the owner-granted write access this run carries.
+    #[must_use]
+    pub fn with_access(mut self, access: neha_computer::channel::AccessFrame) -> Self {
+        self.access = access;
+        self
+    }
+
+    /// Allows one extra folder for the next action only.
+    #[must_use]
+    pub fn with_once_grant(self, folder: impl Into<String>) -> Self {
+        if let Ok(mut once) = self.once_grant.lock() {
+            *once = Some(folder.into());
+        }
+        self
     }
 
     /// Returns the id for the next request.
@@ -56,8 +88,19 @@ impl ComputerRuntime for RemoteRuntime {
     fn execute(&self, action: Action) -> impl std::future::Future<Output = ActionResult> + Send {
         async move {
             let id = self.next_id();
-            let answer =
-                tokio::time::timeout(self.timeout, self.link.act(id, self.bot, action)).await;
+            let mut access = self.access.clone();
+            if let Ok(mut once) = self.once_grant.lock()
+                && let Some(folder) = once.take()
+            {
+                access.write_roots.push(folder);
+            }
+
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.link
+                    .act(id, self.bot, action, self.working_dir.as_deref(), &access),
+            )
+            .await;
             match answer {
                 Ok(Answer::ActionResult(result)) => result,
                 Ok(Answer::Bytes(_)) => {
@@ -89,8 +132,12 @@ impl ComputerRuntime for RemoteRuntime {
         let path = path.to_owned();
         async move {
             let id = self.next_id();
-            let answer =
-                tokio::time::timeout(self.timeout, self.link.read(id, self.bot, &path)).await;
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.link
+                    .read(id, self.bot, &path, self.working_dir.as_deref()),
+            )
+            .await;
             match answer {
                 Ok(Answer::Bytes(bytes)) => Ok(bytes),
                 Ok(Answer::ActionResult(_)) => Err(ByteError::Failed(

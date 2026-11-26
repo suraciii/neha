@@ -24,6 +24,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use futures_util::{SinkExt as _, StreamExt as _};
 use neha::id::Id;
+use neha_computer::channel::AccessFrame;
 use neha_computer::{
     ActionStatus, CHANNEL_VERSION, ComputerRuntime as _, DeviceFrame, HostFrame, LocalRuntime,
     MAX_CHANNEL_FRAME_BYTES, ToolOutput,
@@ -41,7 +42,16 @@ use crate::client::{self, Credential};
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The runtimes this machine opened, one per Bot, kept across reconnects.
-type Runtimes = Arc<Mutex<HashMap<String, Arc<LocalRuntime>>>>;
+/// What makes one cached runtime different from another.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RuntimeKey {
+    bot: String,
+    full_access: bool,
+    grants: Vec<String>,
+    cwd: Option<String>,
+}
+
+type Runtimes = Arc<Mutex<HashMap<RuntimeKey, Arc<LocalRuntime>>>>;
 
 /// How long the daemon waits before it reconnects to its Space.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -334,6 +344,11 @@ async fn connect_and_serve(
     denied: &[PathBuf],
     runtimes: Runtimes,
 ) -> Result<()> {
+    // A reconnect starts with fresh runtimes: descriptors opened for an older
+    // channel must not outlive it or serve a different access choice.
+    if let Ok(mut runtimes) = runtimes.lock() {
+        runtimes.clear();
+    }
     let mut request = socket_url(&config.space_url)?
         .into_client_request()
         .context("the Space URL is not usable")?;
@@ -618,8 +633,22 @@ async fn execute_frame(
 ) -> DeviceFrame {
     match frame {
         HostFrame::Ping => DeviceFrame::Pong,
-        HostFrame::Action { id, bot, action } => {
-            let runtime = match machine(config, hidden, denied, runtimes, &bot) {
+        HostFrame::Action {
+            id,
+            bot,
+            action,
+            working_dir,
+            access,
+        } => {
+            let runtime = match machine(
+                config,
+                hidden,
+                denied,
+                runtimes,
+                &bot,
+                &access,
+                working_dir.as_deref(),
+            ) {
                 Ok(runtime) => runtime,
                 Err(message) => return DeviceFrame::Failed { id, message },
             };
@@ -634,8 +663,21 @@ async fn execute_frame(
                 output: result.output,
             }
         }
-        HostFrame::Read { id, bot, path } => {
-            match machine(config, hidden, denied, runtimes, &bot) {
+        HostFrame::Read {
+            id,
+            bot,
+            path,
+            working_dir,
+        } => {
+            match machine(
+                config,
+                hidden,
+                denied,
+                runtimes,
+                &bot,
+                &AccessFrame::default(),
+                working_dir.as_deref(),
+            ) {
                 Ok(runtime) => match runtime.read_bytes(&path).await {
                     Ok(bytes) => DeviceFrame::Bytes {
                         id,
@@ -654,7 +696,15 @@ async fn execute_frame(
             bot,
             path,
             bytes,
-        } => match machine(config, hidden, denied, runtimes, &bot) {
+        } => match machine(
+            config,
+            hidden,
+            denied,
+            runtimes,
+            &bot,
+            &AccessFrame::default(),
+            None,
+        ) {
             Ok(runtime) => match decode_bytes(&bytes) {
                 Ok(bytes) => {
                     let length = bytes.len();
@@ -680,14 +730,23 @@ fn machine(
     denied: &[PathBuf],
     runtimes: &Runtimes,
     bot: &str,
+    access: &AccessFrame,
+    working_dir: Option<&str>,
 ) -> Result<Arc<LocalRuntime>, String> {
     // The Bot must be one identifier component; reject anything else before
     // touching the filesystem.
     folder_for(&config.workspace, bot)?;
+
+    let key = RuntimeKey {
+        bot: bot.to_owned(),
+        full_access: access.full_access,
+        grants: access.write_roots.clone(),
+        cwd: working_dir.map(ToOwned::to_owned),
+    };
     let mut runtimes = runtimes
         .lock()
         .map_err(|_| "the runtime table is locked".to_owned())?;
-    match runtimes.entry(bot.to_owned()) {
+    match runtimes.entry(key) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
             // Open the workspace root without following a symlink, then walk
@@ -695,12 +754,17 @@ fn machine(
             // can never redirect the runtime outside its folder.
             let root = LocalRuntime::open_workspace(&config.workspace)
                 .map_err(|error| error.to_string())?;
-            let runtime = Arc::new(
-                LocalRuntime::machine_at(&root, bot, hidden.to_vec())
-                    .map_err(|error| error.to_string())?
-                    .with_denied(denied.to_vec()),
-            );
-            Ok(Arc::clone(entry.insert(runtime)))
+            let mut runtime = LocalRuntime::machine_at(&root, bot, hidden.to_vec())
+                .map_err(|error| error.to_string())?
+                .with_denied(denied.to_vec())
+                .with_machine_access(access.full_access, &access.write_roots)
+                .map_err(|error| error.to_string())?;
+            if let Some(working_dir) = working_dir {
+                runtime = runtime
+                    .with_working_dir(working_dir)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(Arc::clone(entry.insert(Arc::new(runtime))))
         }
     }
 }
@@ -1445,13 +1509,13 @@ mod tests {
     use crate::client::{Credential, SignedIn};
 
     use super::{
-        Config, Runtimes, Socket, answer_is_yes, check_saved_origin, check_ticket_space,
-        choose_ticket, config_directory_from, confirmation_needed, credential_path_from,
-        decode_bytes, default_workspace_from, denied_paths_from, encode_bytes, execute_frame,
-        folder_for, found_tickets, hidden_roots_for, legacy_relative_credential_path,
-        migrate_legacy_credential_for, normalized_space_url, parse_ticket,
-        refuse_older_pairing_from, refuse_workspace, same_origin, saved_session_url, serve_channel,
-        socket_url, standard_config_directory, write_receipt,
+        Config, RuntimeKey, Runtimes, Socket, answer_is_yes, check_saved_origin,
+        check_ticket_space, choose_ticket, config_directory_from, confirmation_needed,
+        credential_path_from, decode_bytes, default_workspace_from, denied_paths_from,
+        encode_bytes, execute_frame, folder_for, found_tickets, hidden_roots_for,
+        legacy_relative_credential_path, migrate_legacy_credential_for, normalized_space_url,
+        parse_ticket, refuse_older_pairing_from, refuse_workspace, same_origin, saved_session_url,
+        serve_channel, socket_url, standard_config_directory, write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -2432,6 +2496,8 @@ mod tests {
                 action: WireAction::Shell {
                     command: "true".to_owned(),
                 },
+                working_dir: None,
+                access: Default::default(),
             },
         )
         .await;
@@ -2467,6 +2533,8 @@ mod tests {
                     folder.join("done").display()
                 ),
             },
+            working_dir: None,
+            access: Default::default(),
         };
         let second = HostFrame::Action {
             id: 2,
@@ -2474,6 +2542,8 @@ mod tests {
             action: WireAction::Shell {
                 command: format!("echo second > {}", folder.join("second").display()),
             },
+            working_dir: None,
+            access: Default::default(),
         };
         for frame in [first, second] {
             socket
@@ -2498,7 +2568,12 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let runtime = LocalRuntime::new(&folder).unwrap();
         let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::from([(
-            bot.to_string(),
+            RuntimeKey {
+                bot: bot.to_string(),
+                full_access: false,
+                grants: Vec::new(),
+                cwd: None,
+            },
             Arc::new(runtime),
         )])));
         let config = Config {
@@ -2602,7 +2677,12 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let runtime = LocalRuntime::new(&folder).unwrap();
         let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::from([(
-            bot.to_string(),
+            RuntimeKey {
+                bot: bot.to_string(),
+                full_access: false,
+                grants: Vec::new(),
+                cwd: None,
+            },
             Arc::new(runtime),
         )])));
 
@@ -2640,6 +2720,8 @@ mod tests {
                                 folder.join("done").display()
                             ),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     },
                 )
                 .await;
@@ -2650,6 +2732,8 @@ mod tests {
                         action: WireAction::Shell {
                             command: "true".to_owned(),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     };
                     if socket
                         .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -2703,6 +2787,8 @@ mod tests {
                                 folder.join("done").display()
                             ),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     },
                 )
                 .await;
@@ -2716,6 +2802,8 @@ mod tests {
                         action: WireAction::Shell {
                             command: huge.clone(),
                         },
+                        working_dir: None,
+                        access: Default::default(),
                     };
                     send_space_frame(&mut socket, frame).await;
                 }
@@ -2740,6 +2828,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_file_read_uses_the_runs_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        std::fs::write(folder.join("report.txt"), "from the workspace").unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("report.txt"), "from the run").unwrap();
+        let config = channel_config(workspace.path());
+
+        let answer = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Read {
+                id: 1,
+                bot: bot.to_string(),
+                path: "report.txt".to_owned(),
+                working_dir: Some(directory.path().to_string_lossy().into_owned()),
+            },
+        )
+        .await;
+        let DeviceFrame::Bytes { bytes, .. } = answer else {
+            panic!("expected bytes, got {answer:?}");
+        };
+        assert_eq!(decode_bytes(&bytes).unwrap(), b"from the run");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_space_that_stops_reading_is_disconnected() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2758,6 +2876,7 @@ mod tests {
                             id,
                             bot: bot.to_string(),
                             path: "big.bin".to_owned(),
+                            working_dir: None,
                         },
                     )
                     .await;

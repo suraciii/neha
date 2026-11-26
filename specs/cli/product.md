@@ -40,9 +40,23 @@ It finds the startup ticket the Space wrote under the machine's Neha configurati
 
 Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
 
+`neha bot update <bot>` changes a Bot's file access. Only the Bot's owner can change it, and the next run uses the new access.
+
+`--full-access on` gives it the daemon's own file rights and removes the shell fence. `--full-access off` restores the Bot's Workspace fence.
+
+`--grant <path>` grants write access to an extra folder; repeat it for more folders. The folder MUST exist on the Local Computer.
+
+`--clear-grants` removes them all and cannot be combined with `--grant`. `neha bot show` prints what is in effect.
+
+`neha chat send --cwd <path>` starts that run's actions in the named directory. Without it they start in the Bot's Workspace. The directory is recorded with the run and shown on an approval card.
+
+A path that is not absolute is refused.
+
 ## Approvals
 
-`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. `neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, a lasting rule, or a folder the owner has not granted.
+
+`neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 

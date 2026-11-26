@@ -120,7 +120,7 @@ export interface RunView {
 
 // Why a Bot asked before an action: the first use of the User's own Computer,
 // or a rule the User set to be asked.
-export type ApprovalReason = "first_use_local" | "rule";
+export type ApprovalReason = "first_use_local" | "rule" | "grant";
 
 // Whether an action can be undone, as far as the Space knows.
 export type Undoable = "no" | "unknown";

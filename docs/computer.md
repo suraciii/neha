@@ -163,7 +163,7 @@ The machine ends the command it was running when the channel drops, so no action
 | A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. |
-| A write is refused | The path is outside the Bot's Workspace. Write inside the Workspace, or use a relative path. |
+| A write is refused | The path is outside the Bot's Workspace and the folders its owner granted. Write inside those, grant the folder, or answer the approval card that asks for it. |
 
 [Building and verification](building.md#a-local-computer-sandbox) shows how to install `bubblewrap`.
 
@@ -171,8 +171,6 @@ The machine ends the command it was running when the channel drops, so no action
 
 - The Space listens on loopback only, so this milestone pairs the machine that runs the Space. A Computer on another machine is not available; `neha computer add` stays for that future flow.
 - There is no command yet to revoke or replace a Computer's credential.
-- Granted folders and the `full-access` switch are not available. A Bot's write range stays its own Workspace, and its owner cannot widen that range.
-- A request cannot choose a working directory. Every run starts in the Bot's Workspace.
 - Moving a Bot to or from a Hosted Computer is not available, and carrying its Workspace is not specified.
 - A Hosted Computer runs inside the Space's process; a provider-backed Hosted machine is not available.
 - A Hosted Computer does not ask before an action yet; [Approvals](approvals.md) covers the gate for a Local Computer.
@@ -180,3 +178,25 @@ The machine ends the command it was running when the channel drops, so no action
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.
 - Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.
+
+## File access and a run's directory
+
+A Local Bot starts in its own Workspace and may write only there. The owner can widen that with `neha bot update`:
+
+```sh
+neha bot update <bot-id> --grant /data/shared
+neha bot update <bot-id> --full-access on
+neha bot update <bot-id> --clear-grants
+```
+
+`--grant` adds one extra folder the Bot may write; repeat it for more. The folder must already exist on this machine. `--full-access on` gives the Bot the daemon process's own write rights and removes the write fence, so its shell sees the machine's own `/tmp`, `/dev`, and process view; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
+
+When a Bot's action would write outside its Workspace and the granted folders, the run waits for the owner's approval instead of running the action. This covers a file path the Space can see and a shell that names a working directory. A shell that writes from the default Workspace is refused by the fence rather than turned into a request, because the Space does not know the Local Workspace's absolute path; grant the folder, or name it with `--cwd`, to let the Bot ask. A shell mounted into a grant is not writable when the grant contains a hard link, symlink, or special file, so it cannot change a file outside the grant. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. The Computer's configuration directory stays hidden even with full access.
+
+A run can start its actions in another directory with `neha chat send --cwd`:
+
+```sh
+neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
+```
+
+Without `--cwd` the run starts in the Bot's Workspace. The directory is recorded with the run and appears on an approval card. It must be absolute. Choosing a directory does not make it writable: writes still need the Workspace, a grant, or full access. Reading still follows the machine user's rights, except the Computer's own configuration directory, which stays hidden.

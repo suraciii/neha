@@ -96,26 +96,36 @@ impl ComputerLink {
     }
 
     /// Runs one action on the Computer and waits for its result.
-    pub async fn act(&self, id: u64, bot: Id, action: Action) -> Answer {
+    pub async fn act(
+        &self,
+        id: u64,
+        bot: Id,
+        action: Action,
+        working_dir: Option<&str>,
+        access: &neha_computer::channel::AccessFrame,
+    ) -> Answer {
         self.request(
             id,
             HostFrame::Action {
                 id,
                 bot: bot.to_string(),
                 action: action.into(),
+                working_dir: working_dir.map(ToOwned::to_owned),
+                access: access.clone(),
             },
         )
         .await
     }
 
     /// Reads a File's bytes from the Computer and waits for them.
-    pub async fn read(&self, id: u64, bot: Id, path: &str) -> Answer {
+    pub async fn read(&self, id: u64, bot: Id, path: &str, working_dir: Option<&str>) -> Answer {
         self.request(
             id,
             HostFrame::Read {
                 id,
                 bot: bot.to_string(),
                 path: path.to_owned(),
+                working_dir: working_dir.map(ToOwned::to_owned),
             },
         )
         .await
@@ -418,6 +428,8 @@ mod tests {
                     Action::Shell {
                         command: "pwd".to_owned(),
                     },
+                    None,
+                    &neha_computer::channel::AccessFrame::default(),
                 )
                 .await
             }
@@ -431,6 +443,8 @@ mod tests {
                 action: neha_computer::channel::WireAction::Shell {
                     command: "pwd".to_owned(),
                 },
+                working_dir: None,
+                access: Default::default(),
             }
         );
 
@@ -452,7 +466,7 @@ mod tests {
         let bot = Id::new();
         let reader = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.read(2, bot, "notes.txt").await }
+            async move { link.read(2, bot, "notes.txt", None).await }
         });
         assert_eq!(
             outgoing.recv().await.unwrap(),
@@ -460,6 +474,7 @@ mod tests {
                 id: 2,
                 bot: bot.to_string(),
                 path: "notes.txt".to_owned(),
+                working_dir: None,
             }
         );
         link.deliver(2, Answer::Bytes(b"hello".to_vec()));
@@ -487,7 +502,7 @@ mod tests {
         let (links, computer, link, _outgoing) = connected();
         let waiting = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.read(4, Id::new(), "/etc/hostname").await }
+            async move { link.read(4, Id::new(), "/etc/hostname", None).await }
         });
         tokio::task::yield_now().await;
 
@@ -496,7 +511,15 @@ mod tests {
         assert!(matches!(waiting.await.unwrap(), Answer::Gone(message) if message == OFFLINE));
         assert!(
             matches!(
-                link.act(5, Id::new(), Action::Shell { command: "true".to_owned() }).await,
+                link
+                    .act(
+                        5,
+                        Id::new(),
+                        Action::Shell { command: "true".to_owned() },
+                        None,
+                        &neha_computer::channel::AccessFrame::default(),
+                    )
+                    .await,
                 Answer::Gone(message) if message == OFFLINE
             ),
             "a closed channel refuses new requests"
@@ -509,7 +532,7 @@ mod tests {
         let signal = old.closed_signal();
         let waiting = tokio::spawn({
             let old = Arc::clone(&old);
-            async move { old.read(4, Id::new(), "/etc/hostname").await }
+            async move { old.read(4, Id::new(), "/etc/hostname", None).await }
         });
         tokio::task::yield_now().await;
 
@@ -551,6 +574,8 @@ mod tests {
                         Action::Shell {
                             command: format!("sleep {id}"),
                         },
+                        None,
+                        &neha_computer::channel::AccessFrame::default(),
                     )
                     .await
                 }

@@ -3079,6 +3079,8 @@ mod tests {
                 chat,
                 text: "hello".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -3692,6 +3694,8 @@ mod tests {
             chat,
             text: "hello".to_owned(),
             file: None,
+
+            cwd: None,
         });
 
         let first = command(&mut socket, send, message.clone()).await;
@@ -3744,6 +3748,8 @@ mod tests {
                 chat,
                 text: "hello".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -3761,6 +3767,8 @@ mod tests {
                         chat,
                         text: "hello".to_owned(),
                         file: None,
+
+                        cwd: None,
                     }),
                 })
                 .unwrap()
@@ -3881,6 +3889,8 @@ mod tests {
                 chat,
                 text: "hello".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -3996,6 +4006,8 @@ mod tests {
                         chat,
                         text: "hello".to_owned(),
                         file: None,
+
+                        cwd: None,
                     }),
                 })
                 .unwrap()
@@ -4051,6 +4063,8 @@ mod tests {
                 chat,
                 text: "again".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -4322,6 +4336,8 @@ mod tests {
                         chat,
                         text: "answer with a huge reply".to_owned(),
                         file: None,
+
+                        cwd: None,
                     }),
                 })
                 .unwrap()
@@ -4379,6 +4395,8 @@ mod tests {
                 chat,
                 text: text.to_owned(),
                 file,
+
+                cwd: None,
             }),
         )
         .await
@@ -5081,6 +5099,8 @@ mod tests {
                         chat,
                         text: "burst".to_owned(),
                         file: None,
+
+                        cwd: None,
                     }),
                 )
                 .await
@@ -5171,6 +5191,8 @@ mod tests {
                 chat,
                 text: "first".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -5187,6 +5209,8 @@ mod tests {
                         chat,
                         text: "first".to_owned(),
                         file: None,
+
+                        cwd: None,
                     }),
                 })
                 .unwrap()
@@ -5235,6 +5259,8 @@ mod tests {
                     chat,
                     text: "next".to_owned(),
                     file: None,
+
+                    cwd: None,
                 }),
             ),
         )
@@ -5280,6 +5306,8 @@ mod tests {
                 chat,
                 text: "second".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -5314,6 +5342,8 @@ mod tests {
                 chat,
                 text: "second".to_owned(),
                 file: None,
+
+                cwd: None,
             }),
         )
         .await;
@@ -5358,6 +5388,8 @@ mod tests {
                         chat,
                         text: "late".to_owned(),
                         file: None,
+
+                        cwd: None,
                     }),
                 })
                 .unwrap()
@@ -6429,6 +6461,8 @@ mod tests {
                     chat: helper_chat,
                     text: String::new(),
                     file: Some(file),
+
+                    cwd: None,
                 }),
             )
             .await,
@@ -8428,7 +8462,9 @@ mod tests {
         let run = run_of(&queued);
         allow_first_use(&mut socket, chat).await;
         let (id, named, action) = match next_host_frame(&mut device).await {
-            HostFrame::Action { id, bot, action } => (id, bot, action),
+            HostFrame::Action {
+                id, bot, action, ..
+            } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
         };
         assert_eq!(named, bot.to_string());
@@ -8555,7 +8591,9 @@ mod tests {
         wait_online(&mut socket, computer).await;
         allow_first_use(&mut socket, chat).await;
         let (id, named, _action) = match next_host_frame(&mut device).await {
-            HostFrame::Action { id, bot, action } => (id, bot, action),
+            HostFrame::Action {
+                id, bot, action, ..
+            } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
         };
         assert_eq!(named, bot.to_string());
@@ -8885,7 +8923,9 @@ mod tests {
         assert_eq!(moved["bot"]["computer"], json!(new));
         allow_first_use(&mut socket, chat).await;
         let (id, named, action) = match next_host_frame(&mut device).await {
-            HostFrame::Action { id, bot, action } => (id, bot, action),
+            HostFrame::Action {
+                id, bot, action, ..
+            } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
         };
         assert_eq!(named, bot.to_string());
@@ -9064,7 +9104,9 @@ mod tests {
                 .await
                 .expect("the run must reach one of the Computers");
             let (id, named, action) = match frame {
-                HostFrame::Action { id, bot, action } => (id, bot, action),
+                HostFrame::Action {
+                    id, bot, action, ..
+                } => (id, bot, action),
                 other => panic!("expected an action frame, got {other:?}"),
             };
             assert_eq!(named, bot.to_string());
@@ -9202,7 +9244,9 @@ mod tests {
             "a run paused after its snapshot keeps the old Computer"
         );
         let (id, named, action) = match frame {
-            HostFrame::Action { id, bot, action } => (id, bot, action),
+            HostFrame::Action {
+                id, bot, action, ..
+            } => (id, bot, action),
             other => panic!("expected an action frame, got {other:?}"),
         };
         assert_eq!(named, bot.to_string());
@@ -10233,7 +10277,9 @@ mod tests {
     /// Answers the next action a fake Computer receives.
     async fn answer_next_action(device: &mut Socket, output: &str) -> WireAction {
         let (id, _bot, action) = match next_host_frame(device).await {
-            HostFrame::Action { id, bot, action } => (id, bot, action),
+            HostFrame::Action {
+                id, bot, action, ..
+            } => (id, bot, action),
             other => panic!("expected an action, got {other:?}"),
         };
         reply_action(device, id, ActionStatus::Succeeded, output).await;
@@ -11173,6 +11219,16 @@ mod tests {
             ],
         )
         .await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotUpdate(neha::surface::BotUpdate {
+                bot: local.bot,
+                full_access: None,
+                grants: Some(vec!["/tmp".to_owned(), "/etc".to_owned()]),
+            }),
+        )
+        .await;
         let first = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
         let approval: Id = serde_json::from_value(
             approval_for_run(&mut local.socket, first).await["approval"].clone(),
@@ -11737,6 +11793,16 @@ mod tests {
                     json!({"path": "/tmp/abs.txt", "content": "four"}),
                 ),
             ],
+        )
+        .await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotUpdate(neha::surface::BotUpdate {
+                bot: local.bot,
+                full_access: None,
+                grants: Some(vec!["/tmp".to_owned()]),
+            }),
         )
         .await;
         let first = run_of(&submit(&mut local.socket, local.chat, "write one", None).await);
@@ -13167,6 +13233,201 @@ mod tests {
 
         device.close(None).await.unwrap();
         provider_task.abort();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_first_grant_cannot_become_lasting() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/first-grant.txt", "content": "x"}),
+                ),
+                text("done"),
+            ],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
+        let approval = approval_for_run(&mut local.socket, run).await;
+        assert_eq!(approval["reason"], "grant");
+        assert!(approval["grant_folder"].is_string());
+        assert!(
+            approval["lasting_scope"].is_null(),
+            "the first use cannot offer a lasting grant"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let refused = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(refused.is_err(), "a first grant cannot become lasting");
+
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, run).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!([]));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_outside_the_grants_asks_the_owner() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "inside.txt", "content": "one"}),
+                ),
+                text("first"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "two"}),
+                ),
+                text("second"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "three"}),
+                ),
+                text("third"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "four"}),
+                ),
+                text("fourth"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "inside", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A write outside the Workspace and its grants asks the owner.
+        let second = run_of(&submit(&mut local.socket, local.chat, "outside", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "grant");
+        assert_eq!(approval["lasting_scope"], "writes under /tmp");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // One allow does not last: the next write asks again, and a lasting
+        // answer adds the folder to the Bot.
+        let third = run_of(&submit(&mut local.socket, local.chat, "outside again", None).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "grant");
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert_eq!(decided["grant"], "/tmp");
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!(["/tmp"]));
+
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "granted", None).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "the lasting grant covers the next write"
+        );
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_update_sets_full_access_and_grants_for_its_owner() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let command_id = Id::new();
+        let update = CommandCall::BotUpdate(neha::surface::BotUpdate {
+            bot,
+            full_access: Some(true),
+            grants: Some(vec!["/data/shared".to_owned(), "/data/team".to_owned()]),
+        });
+        let first = command(&mut socket, command_id, update.clone()).await;
+        assert_eq!(first["full_access"], json!(true));
+        assert_eq!(first["grants"], json!(["/data/shared", "/data/team"]));
+        assert!(
+            first["user"].is_string(),
+            "the result names the User it belongs to"
+        );
+        let retried = command(&mut socket, command_id, update).await;
+        assert_eq!(
+            first["id"], retried["id"],
+            "a retry replays the confirmation"
+        );
+
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotUpdate(neha::surface::BotUpdate {
+                bot,
+                full_access: None,
+                grants: Some(vec!["relative/folder".to_owned()]),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+            "a relative grant is refused: {refused:?}"
+        );
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["full_access"], json!(true));
+
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }

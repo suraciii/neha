@@ -75,6 +75,12 @@ pub struct BotView {
     pub computer: Id,
     /// Its Chat with the owner.
     pub chat: Id,
+    /// Whether it may write outside its Workspace fence.
+    #[serde(default)]
+    pub full_access: bool,
+    /// Extra folders outside its Workspace it may write.
+    #[serde(default)]
+    pub grants: Vec<String>,
 }
 
 /// A Computer.
@@ -190,6 +196,10 @@ pub struct RunView {
     pub error: Option<String>,
     /// The approval the run waits on, while it is undecided.
     pub approval: Option<Id>,
+    /// The directory the run works in, when it named one.
+    pub cwd: Option<String>,
+    /// A write folder allowed for the next action after a one-time grant.
+    pub once_grant: Option<String>,
     /// The Computer the run started on, from the projection's replay.
     ///
     /// A move after the start does not change it: the run keeps the Computer
@@ -239,6 +249,8 @@ pub struct ApprovalView {
     pub rule: Option<Id>,
     /// What an "Always allow" would allow, in words the User reads.
     pub lasting_scope: Option<String>,
+    /// The folder a grant answer covers, when the reason is a grant.
+    pub grant_folder: Option<String>,
     /// Whether the action can still be undone after it runs.
     pub undoable: Undoability,
     /// The answer, once the acting User gave one.
@@ -560,6 +572,8 @@ impl Projection for State {
                         name: data.name,
                         computer: data.computer,
                         chat: data.chat,
+                        full_access: false,
+                        grants: Vec::new(),
                     },
                 );
             }
@@ -574,6 +588,18 @@ impl Projection for State {
                     return Err("a move goes to an existing Computer".to_owned());
                 }
                 bot.computer = data.to;
+            }
+            EventData::BotUpdated(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("an updated Bot must exist")?;
+                if let Some(full_access) = data.full_access {
+                    bot.full_access = full_access;
+                }
+                if let Some(grants) = data.grants {
+                    bot.grants = grants;
+                }
             }
             EventData::ComputerCreated(data) => {
                 self.computers.insert(
@@ -658,6 +684,8 @@ impl Projection for State {
                         usage: None,
                         error: None,
                         approval: None,
+                        cwd: None,
+                        once_grant: None,
                         computer: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
@@ -690,12 +718,24 @@ impl Projection for State {
                             usage: None,
                             error: None,
                             approval: None,
+                            cwd: None,
+                            once_grant: None,
                             computer,
                             steps: Vec::new(),
                             actions: Vec::new(),
                         });
                     }
                 }
+            }
+            EventData::RunContext(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a run context must belong to a queued run")?;
+                if run.status != RunStatus::Queued {
+                    return Err("a run context is recorded before the run starts".to_owned());
+                }
+                run.cwd = Some(data.working_dir);
             }
             EventData::RunFinished(data) => {
                 let run = self
@@ -724,6 +764,7 @@ impl Projection for State {
                     .runs
                     .get_mut(&data.run)
                     .ok_or("an action must belong to a started run")?;
+                run.once_grant = None;
                 run.actions.push(ActionView {
                     id: data.action,
                     step: data.step,
@@ -808,6 +849,7 @@ impl Projection for State {
                     ambiguous: data.ambiguous,
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
+                    grant_folder: data.grant_folder,
                     undoable: data.undoable,
                     decided: None,
                     seq: event.seq,
@@ -831,7 +873,7 @@ impl Projection for State {
                 {
                     return Err("an approval is answered by its acting User".to_owned());
                 }
-                let (allow, reason, bot, acting, computer) = {
+                let (allow, reason, bot, acting, computer, scope) = {
                     let approval = &mut self.approvals[position];
                     approval.decided = Some(data.allow);
 
@@ -841,6 +883,7 @@ impl Projection for State {
                         approval.bot,
                         approval.acting,
                         approval.computer,
+                        approval.grant_folder.clone(),
                     )
                 };
                 let run = self
@@ -854,6 +897,15 @@ impl Projection for State {
                     run.status = RunStatus::Running;
                     if reason == ApprovalReason::FirstUseLocal {
                         self.first_use_allowed.insert((bot, acting, computer));
+                    }
+                    if reason == ApprovalReason::Grant {
+                        // The owner answered a grant card, which names the
+                        // Bot, the folder, and the machine: that also answers
+                        // the first use of this machine.
+                        self.first_use_allowed.insert((bot, acting, computer));
+                        if !data.lasting {
+                            run.once_grant = scope;
+                        }
                     }
                 }
             }
@@ -1702,6 +1754,43 @@ mod tests {
         assert_eq!(error, "a move goes to an existing Computer");
         assert_eq!(state.bots[&bot].computer, computer);
     }
+    #[test]
+    fn a_bot_update_changes_only_what_it_names() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": bot,
+                    "full_access": true,
+                    "grants": ["/data/shared"],
+                }),
+                4,
+            ))
+            .unwrap();
+        assert!(state.bots[&bot].full_access);
+        assert_eq!(state.bots[&bot].grants, vec!["/data/shared".to_owned()]);
+
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                Author::User(owner),
+                serde_json::json!({"bot": bot, "grants": []}),
+                5,
+            ))
+            .unwrap();
+        assert!(
+            state.bots[&bot].full_access,
+            "an update leaves other fields"
+        );
+        assert!(state.bots[&bot].grants.is_empty());
+    }
+
     #[test]
     fn an_old_computer_kind_replays_as_the_current_name() {
         let owner = Id::new();

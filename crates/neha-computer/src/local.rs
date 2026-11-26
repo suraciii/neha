@@ -69,6 +69,14 @@ pub struct LocalRuntime {
     ///
     /// [`cancel_in_flight`]: LocalRuntime::cancel_in_flight
     in_flight: AtomicU32,
+    /// Whether the owner gave this Bot the daemon's own rights.
+    full_access: bool,
+    /// Extra folders the owner granted for writing, each opened as a
+    /// directory descriptor so a later path swap cannot redirect a write.
+    grants: Vec<(PathBuf, std::fs::File)>,
+    /// The directory a run works in. It is where relative paths resolve and
+    /// where the shell starts; it is not a writable root by itself.
+    cwd: Option<PathBuf>,
 }
 
 /// Which kind of machine a runtime drives.
@@ -107,6 +115,9 @@ impl LocalRuntime {
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
+            full_access: false,
+            grants: Vec::new(),
+            cwd: None,
         })
     }
 
@@ -248,6 +259,9 @@ impl LocalRuntime {
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
+            full_access: false,
+            grants: Vec::new(),
+            cwd: None,
         })
     }
 
@@ -277,6 +291,136 @@ impl LocalRuntime {
     pub fn with_denied(mut self, denied: Vec<PathBuf>) -> Self {
         self.denied = denied;
         self
+    }
+
+    /// Applies the owner's access choice to a real-machine runtime.
+    ///
+    /// Grant roots are canonicalized and opened now, so a later rename cannot
+    /// point a write somewhere else. A missing root is an error: the owner
+    /// grants a folder that exists. Full access needs no roots.
+    pub fn with_machine_access(
+        mut self,
+        full_access: bool,
+        grants: &[String],
+    ) -> Result<Self, RuntimeError> {
+        if full_access {
+            self.full_access = true;
+            self.grants.clear();
+            return Ok(self);
+        }
+        let mut roots = Vec::new();
+        for grant in grants {
+            // Open first, then judge the descriptor. A path replaced between a
+            // check and the open could otherwise point the grant somewhere
+            // else; every later write and shell bind uses this descriptor.
+            // Open without blocking and require a directory. A path swapped or
+            // turned into a FIFO after the Space's check must not stall the
+            // daemon here.
+            #[cfg(unix)]
+            let file = {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                match std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK | libc::O_DIRECTORY)
+                    .open(grant.trim())
+                {
+                    Ok(file) => file,
+                    Err(_) => continue,
+                }
+            };
+            #[cfg(not(unix))]
+            let file = match std::fs::File::open(grant.trim()) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
+            let Ok(metadata) = file.metadata() else {
+                continue;
+            };
+            if !metadata.is_dir() {
+                continue;
+            }
+            #[cfg(unix)]
+            let mut file = file;
+            // The shell moves the Bot's folder descriptor to a fixed one-digit
+            // number. A grant that landed there is moved to another descriptor
+            // so the two mounts can never name each other.
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd as _;
+                let mut moved = true;
+                while file.as_raw_fd() == MOUNT_FD {
+                    match file.try_clone() {
+                        Ok(next) => file = next,
+                        Err(_) => {
+                            moved = false;
+                            break;
+                        }
+                    }
+                }
+                if !moved {
+                    // Without a safe descriptor this grant cannot be mounted.
+                    continue;
+                }
+            }
+            #[cfg(unix)]
+            let Some(root) = ({
+                use std::os::fd::AsRawFd as _;
+                std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+            }) else {
+                // The opened directory has no readable identity; do not fall
+                // back to a path that may name something else.
+                continue;
+            };
+            #[cfg(not(unix))]
+            let root = match std::fs::canonicalize(grant.trim()) {
+                Ok(root) => root,
+                Err(_) => continue,
+            };
+            if self.is_hidden(&root) || self.is_denied(&root) {
+                return Err(RuntimeError::Access(format!(
+                    "the granted folder is hidden from this Computer: {}",
+                    root.display()
+                )));
+            }
+            // A grant that contains a hidden root would re-expose it after the
+            // hidden tmpfs is mounted.
+            if self.hidden.iter().any(|hidden| hidden.starts_with(&root)) {
+                return Err(RuntimeError::Access(format!(
+                    "the granted folder contains a hidden path: {}",
+                    root.display()
+                )));
+            }
+            if root == self.root || self.grants.iter().any(|(seen, _)| seen == &root) {
+                continue;
+            }
+            roots.push((root, file));
+        }
+        self.grants = roots;
+        Ok(self)
+    }
+
+    /// Sets the directory a run works in.
+    ///
+    /// The directory must exist; it is never created and never becomes a
+    /// writable root. Relative file paths resolve against it and the shell
+    /// starts there.
+    pub fn with_working_dir(mut self, directory: &str) -> Result<Self, RuntimeError> {
+        let path = std::fs::canonicalize(directory.trim()).map_err(RuntimeError::Io)?;
+        let metadata = std::fs::metadata(&path).map_err(RuntimeError::Io)?;
+        if !metadata.is_dir() {
+            return Err(RuntimeError::Access(format!(
+                "the working directory is not a folder: {}",
+                path.display()
+            )));
+        }
+        if self.is_hidden(&path) || self.is_denied(&path) {
+            return Err(RuntimeError::Access(format!(
+                "the working directory is hidden from this Computer: {}",
+                path.display()
+            )));
+        }
+        self.cwd = Some(path);
+        Ok(self)
     }
 
     /// Kills the process group of the shell that is running, if one is.
@@ -311,6 +455,11 @@ impl LocalRuntime {
     }
 
     /// The path a model asked for, before any mode's rules apply.
+    /// The directory relative paths resolve against.
+    fn base(&self) -> &Path {
+        self.cwd.as_deref().unwrap_or(&self.root)
+    }
+
     fn requested(&self, input: &str) -> Result<PathBuf, String> {
         let input = input.trim();
         if input.is_empty() {
@@ -320,7 +469,7 @@ impl LocalRuntime {
         Ok(if requested.is_absolute() {
             requested.to_path_buf()
         } else {
-            self.root.join(requested)
+            self.base().join(requested)
         })
     }
 
@@ -413,16 +562,64 @@ impl LocalRuntime {
                 Ok(self.relative(&path))
             }
             Mode::Machine { folder, .. } => {
-                // A write cannot leave the Bot's folder, so a hidden root is
-                // only reachable when that folder itself sits under one; that
-                // is a misconfiguration the daemon refuses, and a write is
-                // refused here before any descriptor is opened.
-                let target = normalize_path(&self.root.join(input.trim()));
-                if self.is_hidden(&target) || self.is_denied(&target) {
-                    return Err(ByteError::Failed(hidden_error(input.trim())));
+                let shown = input.trim();
+                let path = Path::new(shown);
+                if !path.is_absolute()
+                    && path
+                        .components()
+                        .any(|part| matches!(part, std::path::Component::ParentDir))
+                {
+                    return Err(ByteError::Failed(format!(
+                        "the path uses `..`, which a real Computer does not write through: {shown}"
+                    )));
                 }
-                write_machine_file(folder, input, bytes)?;
-                Ok(input.trim().to_owned())
+                let target = if path.is_absolute() {
+                    normalize_path(path)
+                } else {
+                    normalize_path(&self.base().join(path))
+                };
+                if self.is_hidden(&target) || self.is_denied(&target) {
+                    return Err(ByteError::Failed(hidden_error(shown)));
+                }
+                if self.full_access {
+                    // Full access writes what the machine user can, but still
+                    // goes through an opened root and no-follow components, so
+                    // a symlink cannot redirect the write around the hidden
+                    // roots the sandbox overlays.
+                    let relative = target
+                        .strip_prefix("/")
+                        .map_err(|_| ByteError::Failed("the path is not absolute".to_owned()))?;
+                    let root = std::fs::File::open("/").map_err(|error| {
+                        ByteError::Failed(format!("cannot open the machine root: {error}"))
+                    })?;
+                    write_machine_file(&root, &relative.to_string_lossy(), bytes)?;
+                    return Ok(shown.to_owned());
+                }
+                let written = if let Ok(relative) = target.strip_prefix(&self.root) {
+                    let relative = relative.to_string_lossy();
+                    write_machine_file(folder, &relative, bytes)?;
+                    shown.to_owned()
+                } else if let Some((root, granted)) = self
+                    .grants
+                    .iter()
+                    .find(|(root, _)| target.starts_with(root))
+                {
+                    let relative = target
+                        .strip_prefix(root)
+                        .map_err(|_| ByteError::Failed("the path left its grant".to_owned()))?
+                        .to_string_lossy();
+                    write_machine_file(granted, &relative, bytes)?;
+                    shown.to_owned()
+                } else if path.is_absolute() {
+                    return Err(ByteError::Failed(format!(
+                        "the path is absolute and outside the Bot's workspace and grants: {shown}"
+                    )));
+                } else {
+                    return Err(ByteError::Failed(format!(
+                        "the path is outside the Bot's workspace and its grants: {shown}"
+                    )));
+                };
+                Ok(written)
             }
         }
     }
@@ -692,7 +889,43 @@ impl LocalRuntime {
                 let source = folder_mount_source();
                 #[cfg(not(unix))]
                 let source = self.root.as_os_str().to_owned();
-                let mut process = sandbox_command(bwrap, &source, &self.root, &self.hidden);
+                #[cfg(unix)]
+                let (write_roots, grant_fds): (
+                    Vec<(OsString, PathBuf)>,
+                    Vec<libc::c_int>,
+                ) = self
+                    .grants
+                    .iter()
+                    // A grant the Bot's folder scan would refuse is not mounted
+                    // writable for the shell: a hard link or symlink in it
+                    // could otherwise change a file outside the grant. The
+                    // file tools keep their own per-write checks.
+                    .filter(|(root, file)| scan_bot_folder(file, root).is_ok())
+                    .map(|(root, file)| {
+                        use std::os::fd::AsRawFd as _;
+                        (
+                            (
+                                OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+                                root.clone(),
+                            ),
+                            file.as_raw_fd(),
+                        )
+                    })
+                    .unzip();
+                #[cfg(not(unix))]
+                let (write_roots, grant_fds): (
+                    Vec<(OsString, PathBuf)>,
+                    Vec<libc::c_int>,
+                ) = (Vec::new(), Vec::new());
+                let mut process = sandbox_command(
+                    bwrap,
+                    &source,
+                    &self.root,
+                    self.base(),
+                    &self.hidden,
+                    &write_roots,
+                    self.full_access,
+                );
                 // The parent keeps this descriptor close-on-exec, so other
                 // runtimes' folders are never inherited. In the child, after
                 // fork and before exec, move this runtime's folder descriptor
@@ -718,6 +951,11 @@ impl LocalRuntime {
                             if libc::fcntl(MOUNT_FD, libc::F_SETFD, 0) < 0 {
                                 return Err(std::io::Error::last_os_error());
                             }
+                            for fd in &grant_fds {
+                                if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                            }
                             Ok(())
                         });
                     }
@@ -734,7 +972,7 @@ impl LocalRuntime {
                 }
                 #[cfg(not(unix))]
                 process.arg("/bin/sh").arg("-c").arg(command);
-                process.current_dir(&self.root);
+                process.current_dir(self.base());
                 process
             }
         };
@@ -926,7 +1164,14 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
         return Err("bwrap --version failed; install a working bubblewrap".to_owned());
     }
     let output = std::process::Command::new(bwrap)
-        .args(sandbox_args(folder.as_os_str(), folder, hidden))
+        .args(sandbox_args(
+            folder.as_os_str(),
+            folder,
+            folder,
+            hidden,
+            &[],
+            false,
+        ))
         .arg("/bin/sh")
         .arg("-c")
         .arg("true")
@@ -961,12 +1206,23 @@ fn hidden_is_file(root: &Path) -> bool {
 /// The writable mount's source is `source` — the runtime's opened folder by
 /// descriptor — while its target, and the working directory, stay the
 /// folder's path.
-fn sandbox_args(source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Vec<OsString> {
+fn sandbox_args(
+    source: &OsStr,
+    folder: &Path,
+    cwd: &Path,
+    hidden: &[PathBuf],
+    write_roots: &[(OsString, PathBuf)],
+    full_access: bool,
+) -> Vec<OsString> {
     let folder = folder.as_os_str();
-    let mut arguments: Vec<OsString> = ["--ro-bind", "/", "/"]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
+    let mut arguments: Vec<OsString> = if full_access {
+        ["--bind", "/", "/"]
+    } else {
+        ["--ro-bind", "/", "/"]
+    }
+    .into_iter()
+    .map(OsString::from)
+    .collect();
     // Hidden roots are mounted before /tmp's: a root inside /tmp must be
     // mounted while the host's /tmp is still what the sandbox sees. A
     // directory root is replaced by an empty tmpfs; a single hidden file (a
@@ -982,27 +1238,39 @@ fn sandbox_args(source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Vec<OsStri
             arguments.push(root.as_os_str().to_owned());
         }
     }
-    arguments.extend(
-        [
-            "--dev",
-            "/dev",
-            "--proc",
-            "/proc",
-            "--tmpfs",
-            "/tmp",
-            "--tmpfs",
-            "/dev/shm",
-            "--unshare-pid",
-            "--die-with-parent",
-        ]
-        .into_iter()
-        .map(OsString::from),
-    );
-    arguments.push(OsString::from("--bind"));
-    arguments.push(source.to_owned());
-    arguments.push(folder.to_owned());
+    if full_access {
+        // Full access keeps the machine's own /dev, /proc and /tmp: it is the
+        // daemon process's file view, not a fresh sandbox. The hidden roots
+        // above still mask the Computer's configuration and credential.
+        arguments.push(OsString::from("--die-with-parent"));
+    } else {
+        arguments.extend(
+            [
+                "--dev",
+                "/dev",
+                "--proc",
+                "/proc",
+                "--tmpfs",
+                "/tmp",
+                "--tmpfs",
+                "/dev/shm",
+                "--unshare-pid",
+                "--die-with-parent",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        arguments.push(OsString::from("--bind"));
+        arguments.push(source.to_owned());
+        arguments.push(folder.to_owned());
+        for (source, target) in write_roots {
+            arguments.push(OsString::from("--bind"));
+            arguments.push(source.clone());
+            arguments.push(target.as_os_str().to_owned());
+        }
+    }
     arguments.push(OsString::from("--chdir"));
-    arguments.push(folder.to_owned());
+    arguments.push(cwd.as_os_str().to_owned());
     arguments.push(OsString::from("--"));
 
     arguments
@@ -1023,9 +1291,24 @@ fn folder_mount_source() -> OsString {
 }
 
 /// Builds the fenced shell process without starting it.
-fn sandbox_command(bwrap: &Path, source: &OsStr, folder: &Path, hidden: &[PathBuf]) -> Command {
+fn sandbox_command(
+    bwrap: &Path,
+    source: &OsStr,
+    folder: &Path,
+    cwd: &Path,
+    hidden: &[PathBuf],
+    write_roots: &[(OsString, PathBuf)],
+    full_access: bool,
+) -> Command {
     let mut process = Command::new(bwrap);
-    process.args(sandbox_args(source, folder, hidden));
+    process.args(sandbox_args(
+        source,
+        folder,
+        cwd,
+        hidden,
+        write_roots,
+        full_access,
+    ));
     process
 }
 
@@ -1232,8 +1515,6 @@ fn scan_directory(
     depth: usize,
     budget: &mut usize,
 ) -> Result<(), RuntimeError> {
-    use std::os::fd::AsRawFd as _;
-
     if depth > MAX_SCAN_DEPTH {
         return Err(unsafe_folder(
             folder_path,
@@ -1243,16 +1524,17 @@ fn scan_directory(
             ),
         ));
     }
-    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
-    if duplicate < 0 {
-        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
-    }
-    let stream = unsafe { libc::fdopendir(duplicate) };
+    // Open `.` afresh instead of `dup`: a duplicate shares the directory
+    // offset, so a second scan of a cached descriptor would start at EOF and
+    // silently see no entries at all.
+    use std::os::fd::IntoRawFd as _;
+    let opened = match open_directory_at(directory, std::ffi::OsStr::new(".")) {
+        Ok(opened) => opened,
+        Err(error) => return Err(RuntimeError::Io(error)),
+    };
+    let stream = unsafe { libc::fdopendir(opened.into_raw_fd()) };
     if stream.is_null() {
-        let error = std::io::Error::last_os_error();
-        // SAFETY: `duplicate` is still ours when `fdopendir` fails.
-        unsafe { libc::close(duplicate) };
-        return Err(RuntimeError::Io(error));
+        return Err(RuntimeError::Io(std::io::Error::last_os_error()));
     }
     let result = scan_entries(directory, folder_path, relative, depth, budget, stream);
     // SAFETY: `stream` is the open directory stream created above.
@@ -1929,6 +2211,9 @@ pub enum RuntimeError {
     /// sits; the message names the folder and what to clean.
     #[error("{0}")]
     UnsafeFolder(String),
+    /// An owner-granted folder cannot be used.
+    #[error("access error: {0}")]
+    Access(String),
 }
 
 #[cfg(test)]
@@ -2050,6 +2335,9 @@ mod tests {
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             in_flight: AtomicU32::new(0),
+            full_access: false,
+            grants: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -2532,7 +2820,8 @@ mod tests {
             "top"
         );
 
-        // An absolute path reads the machine; a real Computer never writes one.
+        // An absolute path reads the machine; writing one is allowed when it
+        // names the Bot's own folder.
         let absolute = folder.join("notes/hello.txt");
         let read = runtime
             .execute(Action::ReadFile {
@@ -2547,11 +2836,10 @@ mod tests {
                 content: "absolute".to_owned(),
             })
             .await;
-        assert_eq!(written.status, ActionStatus::Failed, "{written:?}");
-        assert!(
-            written.output.text.contains("absolute"),
-            "{}",
-            written.output.text
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join("notes/hello.txt")).unwrap(),
+            "absolute"
         );
 
         let listed = runtime
@@ -3635,7 +3923,10 @@ mod tests {
         let arguments = sandbox_args(
             folder.as_os_str(),
             &folder,
+            &folder,
             &[hidden_file.clone(), hidden_directory.clone()],
+            &[],
+            false,
         );
         let shown: Vec<String> = arguments
             .iter()
@@ -3849,5 +4140,199 @@ mod tests {
             .await;
         assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
         assert_eq!(read.output.text, "written");
+    }
+    #[tokio::test]
+    async fn a_granted_folder_is_writable_outside_the_workspace() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let granted = directory.path().join("shared");
+        std::fs::create_dir(&granted).unwrap();
+        let runtime = runtime
+            .with_machine_access(false, &[granted.to_string_lossy().into_owned()])
+            .unwrap();
+        let file = granted.join("written.txt");
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: file.to_string_lossy().into_owned(),
+                content: "shared".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "shared");
+
+        // A file outside both the workspace and the grant is refused.
+        let outside = directory.path().join("outside.txt");
+        let refused = runtime
+            .execute(Action::WriteFile {
+                path: outside.to_string_lossy().into_owned(),
+                content: "no".to_owned(),
+            })
+            .await;
+        assert_eq!(refused.status, ActionStatus::Failed, "{refused:?}");
+
+        // The shell sees the same grant through the fence.
+        let command = format!("echo shell > {}", granted.join("shell.txt").display());
+        let shell = runtime.execute(Action::Shell { command }).await;
+        assert_eq!(shell.status, ActionStatus::Succeeded, "{shell:?}");
+        assert_eq!(
+            std::fs::read_to_string(granted.join("shell.txt")).unwrap(),
+            "shell\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hard_link_in_a_grant_is_not_writable_by_the_shell() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let granted = directory.path().join("granted");
+        std::fs::create_dir(&granted).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "safe").unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(false, &[granted.to_string_lossy().into_owned()])
+            .unwrap();
+        // The first scan leaves the cached grant descriptor at EOF; a second
+        // scan must open a fresh directory stream, not read from that offset.
+        let first = runtime
+            .execute(Action::Shell {
+                command: format!("printf ok > {}/ok.txt", granted.display()),
+            })
+            .await;
+        assert_eq!(first.status, ActionStatus::Succeeded, "{first:?}");
+
+        std::fs::hard_link(&outside, granted.join("late.txt")).unwrap();
+        let second = runtime
+            .execute(Action::Shell {
+                command: format!("printf changed > {}/late.txt", granted.display()),
+            })
+            .await;
+        assert_eq!(second.status, ActionStatus::Failed, "{second:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "safe");
+    }
+
+    #[tokio::test]
+    async fn a_shell_mounts_every_grant_separately() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(
+                false,
+                &[
+                    first.to_string_lossy().into_owned(),
+                    second.to_string_lossy().into_owned(),
+                ],
+            )
+            .unwrap();
+        let command = format!(
+            "printf first > {}/one; printf second > {}/two; printf own > {}/own.txt",
+            first.display(),
+            second.display(),
+            directory.path().join("bot").display()
+        );
+        let result = runtime.execute(Action::Shell { command }).await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert_eq!(std::fs::read_to_string(first.join("one")).unwrap(), "first");
+        assert_eq!(
+            std::fs::read_to_string(second.join("two")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join("bot").join("own.txt")).unwrap(),
+            "own"
+        );
+        assert!(!first.join("two").exists());
+        assert!(!second.join("one").exists());
+    }
+
+    #[tokio::test]
+    async fn full_access_keeps_the_machines_own_tmp() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(true, &[])
+            .unwrap();
+        let marker = format!("neha-full-{}", std::process::id());
+        let result = runtime
+            .execute(Action::Shell {
+                command: format!("printf full > /tmp/{marker}"),
+            })
+            .await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        let written = std::fs::read_to_string(format!("/tmp/{marker}")).unwrap();
+        assert_eq!(written, "full");
+        std::fs::remove_file(format!("/tmp/{marker}")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_access_writes_outside_the_workspace_without_a_grant() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let runtime = runtime.with_machine_access(true, &[]).unwrap();
+        let outside = directory.path().join("anywhere.txt");
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: outside.to_string_lossy().into_owned(),
+                content: "full".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "full");
+    }
+    #[tokio::test]
+    async fn a_working_directory_does_not_become_writable() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
+        let work = directory.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let runtime = runtime.with_working_dir(work.to_str().unwrap()).unwrap();
+        let pwd = runtime
+            .execute(Action::Shell {
+                command: "pwd".to_owned(),
+            })
+            .await;
+        assert_eq!(pwd.status, ActionStatus::Succeeded, "{pwd:?}");
+        assert!(
+            pwd.output.text.contains(work.to_str().unwrap()),
+            "{}",
+            pwd.output.text
+        );
+
+        // Starting there does not grant a write there.
+        let refused = runtime
+            .execute(Action::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "no".to_owned(),
+            })
+            .await;
+        assert_eq!(refused.status, ActionStatus::Failed, "{refused:?}");
+        assert!(!work.join("note.txt").exists());
+        // The own Workspace stays writable through an absolute path.
+        let own = runtime.workspace().join("own.txt");
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: own.to_string_lossy().into_owned(),
+                content: "yes".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
     }
 }
