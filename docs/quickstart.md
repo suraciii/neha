@@ -184,7 +184,7 @@ target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 
 The first action on this Local Computer asks for approval. At the card, type `a` to allow it once; [Approvals](approvals.md) covers the other answers.
 
-The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a Local Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
+The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. Files move through the Bot's shell with `neha file get` and `neha chat send --file`. [Add a Local Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
 
 ## Send a file
 

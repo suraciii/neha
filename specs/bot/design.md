@@ -20,6 +20,8 @@ The built-in loop runs with the Space. It reaches the Space as the Bot does, thr
 
 The built-in loop sends a Bot's actions to the Computer: commands, file reads and writes, and screen actions. The Model, the Bot's memory, and its conversation live in the Space.
 
+A Bot moves Files with its CLI, not with a tool: its shell can run `neha file get` and `neha chat send --file` with the run token in its environment. The system prompt carries this built-in skill and tells the Bot never to print the token.
+
 An outside harness is a loop that runs on the Bot's Computer. Its work lands in the record as any Bot's work does.
 
 The Bot's Computer can change, and a move changes only where its actions run.
@@ -54,7 +56,7 @@ A failed run does not resume; the Bot says so as a Message. A run never resumes 
 
 ## Approvals
 
-Before a Computer action, the loop asks whether to proceed. A File action asks like any other: `take_file` matches a rule that names only that tool, and `put_file` also matches a path-prefix rule. The first use of a Local Computer is never covered by a lasting rule.
+Before a Computer action, the loop asks whether to proceed. A File action asks like any other. The first use of a Local Computer is never covered by a lasting rule.
 
 The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
 
@@ -74,7 +76,7 @@ A form a prefix cannot judge asks when the Bot and User have any rule for that t
 
 An Always allow writes an Allow rule from the action itself: the command's first word when the action has a command, or the path's parent directory when it has a path. A relative path at the Workspace root writes `.`.
 
-Only an action with neither a command nor a path, such as `take_file`, writes a tool-only Allow rule.
+Only an action with neither a command nor a path writes a tool-only Allow rule.
 
 When an action cannot make a lasting rule, its approval offers no Always allow: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path.
 

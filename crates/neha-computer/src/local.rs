@@ -13,6 +13,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -47,6 +48,13 @@ pub struct MachineAccess {
     pub folder: PathBuf,
 }
 
+/// Returns the directory holding this build's `neha` binary, when known.
+fn default_cli_dir() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+}
+
 /// A Computer runtime backed by one directory.
 pub struct LocalRuntime {
     /// The only root writes may reach: the managed workspace, or the Bot's
@@ -77,6 +85,15 @@ pub struct LocalRuntime {
     /// The directory a run works in. It is where relative paths resolve and
     /// where the shell starts; it is not a writable root by itself.
     cwd: Option<PathBuf>,
+    /// Environment entries a shell command sees, on top of the fixed PATH,
+    /// HOME, and TMPDIR. A Space puts its short-lived Bot token here. The
+    /// daemon reuses one runtime across runs, so its actions update this slot
+    /// before they run instead of holding one token forever.
+    env: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+    /// The directory holding this build's `neha` binary. A Bot's shell finds
+    /// the CLI by name, so the skill's commands run where a `neha` install
+    /// is not on the fixed system PATH.
+    cli_dir: Option<PathBuf>,
 }
 
 /// Which kind of machine a runtime drives.
@@ -118,6 +135,8 @@ impl LocalRuntime {
             full_access: false,
             grants: Vec::new(),
             cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: default_cli_dir(),
         })
     }
 
@@ -262,6 +281,8 @@ impl LocalRuntime {
             full_access: false,
             grants: Vec::new(),
             cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: default_cli_dir(),
         })
     }
 
@@ -291,6 +312,20 @@ impl LocalRuntime {
     pub fn with_denied(mut self, denied: Vec<PathBuf>) -> Self {
         self.denied = denied;
         self
+    }
+
+    /// Sets the environment every shell command sees.
+    #[must_use]
+    pub fn with_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.env = Arc::new(std::sync::Mutex::new(env));
+        self
+    }
+
+    /// Replaces the environment for the next action on this runtime.
+    pub fn set_env(&self, env: Vec<(String, String)>) {
+        if let Ok(mut slot) = self.env.lock() {
+            *slot = env;
+        }
     }
 
     /// Applies the owner's access choice to a real-machine runtime.
@@ -980,14 +1015,19 @@ impl LocalRuntime {
             Mode::Managed => self.root.join(".tmp"),
             Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
         };
+        let path = match &self.cli_dir {
+            Some(directory) => format!("{}:{SHELL_PATH}", directory.display()),
+            None => SHELL_PATH.to_owned(),
+        };
         process
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env_clear()
-            .env("PATH", SHELL_PATH)
+            .env("PATH", path)
             .env("HOME", &self.root)
             .env("TMPDIR", temporary)
+            .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
             .kill_on_drop(true);
         process
     }
@@ -2338,6 +2378,8 @@ mod tests {
             full_access: false,
             grants: Vec::new(),
             cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: None,
         }
     }
 

@@ -19,6 +19,12 @@ Owned by cli. Every topic's behavior is reachable through the command surface, s
 
 The command surface is the set of commands a Space accepts and the events it sends. One definition of it produces the Space's types and the clients' types.
 
+## A Bot's shell
+
+A run's shell gets `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`. The token is bound to that run's Bot and Chat. It lives only in the Space's memory and expires; a restart drops it and a later run issues a new one.
+
+With the token, `neha file get <id>` and `neha chat send --file <path>` move a File's bytes. No other command is open to it.
+
 ## The computer daemon
 
 A Local Computer is reached through the CLI: the binary that runs `neha computer pair` is the daemon that `neha computer run` starts.

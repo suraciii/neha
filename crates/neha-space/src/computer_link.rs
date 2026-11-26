@@ -103,6 +103,7 @@ impl ComputerLink {
         action: Action,
         working_dir: Option<&str>,
         access: &neha_computer::channel::AccessFrame,
+        env: &[(String, String)],
     ) -> Answer {
         self.request(
             id,
@@ -112,6 +113,7 @@ impl ComputerLink {
                 action: action.into(),
                 working_dir: working_dir.map(ToOwned::to_owned),
                 access: access.clone(),
+                env: env.to_vec(),
             },
         )
         .await
@@ -430,6 +432,7 @@ mod tests {
                     },
                     None,
                     &neha_computer::channel::AccessFrame::default(),
+                    &[],
                 )
                 .await
             }
@@ -445,6 +448,7 @@ mod tests {
                 },
                 working_dir: None,
                 access: Default::default(),
+                env: Vec::new(),
             }
         );
 
@@ -518,6 +522,7 @@ mod tests {
                         Action::Shell { command: "true".to_owned() },
                         None,
                         &neha_computer::channel::AccessFrame::default(),
+                        &[],
                     )
                     .await,
                 Answer::Gone(message) if message == OFFLINE
@@ -576,6 +581,7 @@ mod tests {
                         },
                         None,
                         &neha_computer::channel::AccessFrame::default(),
+                        &[],
                     )
                     .await
                 }

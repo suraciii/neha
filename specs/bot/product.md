@@ -94,7 +94,7 @@ It also asks before the first action it runs on a Local Computer, once for each 
 
 Only the User the Bot acts for answers the approval. An Allow runs the action once, and an Always allow also covers later actions of that kind.
 
-An Always allow covers the same tool and either a shell command that starts with the approved command's first word or a file path from the approved action's directory, including files below it. For a tool with no command or path, such as `take_file`, it covers every action of that tool.
+An Always allow covers the same tool and either a shell command that starts with the approved command's first word or a file path from the approved action's directory, including files below it. For a tool with no command or path, it covers every action of that tool.
 
 A file at the Workspace root makes the covered directory the Workspace root, so relative paths in the Workspace are covered and absolute ones are not. The first use of a Local Computer offers no Always allow, and no lasting rule covers it.
 

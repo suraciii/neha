@@ -220,7 +220,12 @@ enum ChatCommand {
     /// List your Chats.
     List,
     /// Send a Message, with an optional File, and wait for the Bot's reply.
-    #[command(group(ArgGroup::new("payload").required(true).args(["text", "file"])))]
+    #[command(group(
+        ArgGroup::new("payload")
+            .required(true)
+            .multiple(true)
+            .args(["text", "file"])
+    ))]
     Send {
         /// The Chat identifier.
         #[arg(long)]
@@ -780,6 +785,42 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
 }
 
 async fn chat(command: ChatCommand) -> Result<()> {
+    if let Some(bot) = client::BotSession::from_env()? {
+        let ChatCommand::Send {
+            chat,
+            bot: named,
+            text,
+            file,
+            cwd,
+            follow,
+        } = command
+        else {
+            bail!("a Bot's shell can send a Message or a File with `neha chat send`");
+        };
+        if named.is_some() {
+            bail!("a Bot's shell names no Bot");
+        }
+        if cwd.is_some() {
+            bail!("a Bot's shell cannot choose a working directory");
+        }
+        if follow {
+            bail!("a Bot's shell has no run to follow");
+        }
+        let Some(file) = &file else {
+            bail!("a Bot's shell sends a File with `neha chat send --file`");
+        };
+        let chat = bot.chat(chat)?;
+        let uploaded = Some(bot.upload(file).await?);
+        let post = bot
+            .send(chat, text.unwrap_or_default(), uploaded.as_ref())
+            .await?;
+        println!("Sent {} in Chat {chat}.", post.message);
+        if let Some(file) = post.file {
+            println!("  file {} ({})", file.id, file.name);
+        }
+
+        return Ok(());
+    }
     let credential = Credential::load()?;
     match command {
         ChatCommand::List => {
@@ -891,35 +932,60 @@ async fn resolve_chat(credential: &Credential, chat: Option<Id>, bot: Option<Id>
     }
 }
 
+/// Writes one downloaded File to the destination a `file get` named.
+fn write_downloaded(
+    name: Option<String>,
+    bytes: Vec<u8>,
+    out: Option<std::path::PathBuf>,
+    implicit_dir: Option<std::path::PathBuf>,
+) -> Result<()> {
+    let path = match &out {
+        Some(path) if !path.is_dir() => path.clone(),
+        Some(directory) => directory.join(space_file_name(name.as_deref())?),
+        None => {
+            let name = space_file_name(name.as_deref())?;
+            match implicit_dir {
+                Some(directory) => directory.join(name),
+                None => std::path::PathBuf::from(name),
+            }
+        }
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    if out.is_none() && path.exists() {
+        bail!(
+            "{} already exists; pass --out with the path you want",
+            path.display()
+        );
+    }
+    std::fs::write(&path, &bytes).with_context(|| format!("cannot write {}", path.display()))?;
+    let shown = std::fs::canonicalize(&path).unwrap_or(path);
+    println!("Wrote {} ({} bytes).", shown.display(), bytes.len());
+
+    Ok(())
+}
+
 async fn file(command: FileCommand) -> Result<()> {
+    if let Some(bot) = client::BotSession::from_env()? {
+        let FileCommand::Get { file, out } = command;
+        let (name, bytes) = bot.download(file).await?;
+        let workspace = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_dir())
+            .context("a Bot's shell has no HOME folder")?;
+        write_downloaded(name, bytes, out, Some(workspace))?;
+
+        return Ok(());
+    }
     let credential = Credential::load()?;
     match command {
         FileCommand::Get { file, out } => {
             let (name, bytes) = client::download_file(&credential, file).await?;
-            // An explicit file path is the destination; only an implicit one
-            // needs the name the Space gave the File.
-            let path = match &out {
-                Some(path) if !path.is_dir() => path.clone(),
-                Some(directory) => directory.join(space_file_name(name.as_deref())?),
-                None => std::path::PathBuf::from(space_file_name(name.as_deref())?),
-            };
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("cannot create {}", parent.display()))?;
-            }
-            // An implicit destination never replaces a file the User already has.
-            if out.is_none() && path.exists() {
-                bail!(
-                    "{} already exists; pass --out with the path you want",
-                    path.display()
-                );
-            }
-            std::fs::write(&path, &bytes)
-                .with_context(|| format!("cannot write {}", path.display()))?;
-            let shown = std::fs::canonicalize(&path).unwrap_or(path);
-            println!("Wrote {} ({} bytes).", shown.display(), bytes.len());
+            write_downloaded(name, bytes, out, None)?;
         }
     }
 
@@ -1319,9 +1385,9 @@ fn validate_rule_arguments(
         if tool == "shell" {
             bail!("--path-prefix matches file actions; shell uses --command-prefix");
         }
-        if !matches!(tool, "read_file" | "write_file" | "list_files" | "put_file") {
+        if !matches!(tool, "read_file" | "write_file" | "list_files") {
             bail!(
-                "--path-prefix matches file actions (read_file, write_file, list_files, put_file); \
+                "--path-prefix matches file actions (read_file, write_file, list_files); \
                  {tool} is not one"
             );
         }
@@ -1459,7 +1525,7 @@ impl ApprovalCard {
                 .and_then(Value::as_str)
                 .and_then(|command| command.split_whitespace().next())
                 .map(|word| format!("shell commands starting with \"{}\"", escape_text(word))),
-            "read_file" | "write_file" | "list_files" | "put_file" => self
+            "read_file" | "write_file" | "list_files" => self
                 .arguments
                 .get("path")
                 .and_then(Value::as_str)
@@ -2139,13 +2205,12 @@ mod tests {
         validate_rule_arguments("shell", Some("git"), None).unwrap();
         validate_rule_arguments("read_file", None, Some("/home/ada")).unwrap();
         validate_rule_arguments("write_file", None, Some(".")).unwrap();
-        validate_rule_arguments("put_file", None, Some("logs")).unwrap();
 
         for (tool, command_prefix, path_prefix, expected) in [
             ("shell", Some("git"), Some("/tmp"), "at most one"),
             ("read_file", Some("git"), None, "--command-prefix"),
             ("shell", None, Some("/tmp"), "--path-prefix"),
-            ("take_file", None, Some("/tmp"), "--path-prefix"),
+            ("shell", None, Some("/tmp"), "--path-prefix"),
             ("shell", Some("  "), None, "must not be empty"),
             ("read_file", None, Some(" "), "must not be empty"),
             ("   ", None, None, "--tool"),
@@ -2689,8 +2754,8 @@ mod tests {
             "path_prefix": "logs",
         });
         assert_eq!(
-            rule_add_report(&result, bot, "ask", "put_file", None, Some("./logs/")).unwrap(),
-            format!("Added rule {rule} for Bot {bot}: ask put_file (path-prefix \"logs\")")
+            rule_add_report(&result, bot, "ask", "write_file", None, Some("./logs/")).unwrap(),
+            format!("Added rule {rule} for Bot {bot}: ask write_file (path-prefix \"logs\")")
         );
 
         // The same for shell commands: print what the Space kept.

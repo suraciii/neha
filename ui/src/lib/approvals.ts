@@ -5,7 +5,7 @@ import type { Approval, Undoable } from "../types";
 const IRREVERSIBLE = new Set(["shell", "write_file"]);
 
 // The tools whose Always allow covers a directory.
-const FILE_TOOLS = new Set(["read_file", "write_file", "list_files", "put_file"]);
+const FILE_TOOLS = new Set(["read_file", "write_file", "list_files"]);
 
 // A summary longer than this, or with more lines, starts folded.
 const LONG_SUMMARY = 240;

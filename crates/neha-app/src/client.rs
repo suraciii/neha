@@ -22,6 +22,12 @@ type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 const RUN_POLL: Duration = Duration::from_millis(200);
 /// How long the CLI waits for a run to end.
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
+/// The token a run's shell uses to reach its Space.
+const BOT_TOKEN_ENV: &str = "NEHA_BOT_TOKEN";
+/// The Space address a run's shell uses.
+const BOT_SPACE_ENV: &str = "NEHA_SPACE_URL";
+/// The Chat a run works in.
+const BOT_CHAT_ENV: &str = "NEHA_CHAT";
 
 /// The account the CLI acts as.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -312,6 +318,151 @@ fn text_field(value: &Value, field: &str) -> Result<String> {
         .and_then(Value::as_str)
         .with_context(|| format!("the Space's answer has no {field}"))?
         .to_owned())
+}
+
+/// The short-lived session a Bot's shell has instead of a User credential.
+#[derive(Clone, Debug)]
+pub struct BotSession {
+    url: String,
+    token: String,
+    chat: Option<Id>,
+}
+
+/// What a Bot's shell posted to its Chat.
+pub struct BotPost {
+    /// The Message the Space recorded.
+    pub message: Id,
+    /// The File the Message carries, when it carries one.
+    pub file: Option<FileSummary>,
+}
+
+impl BotSession {
+    /// Reads the environment a Bot's run injects, when this is such a shell.
+    pub fn from_env() -> Result<Option<Self>> {
+        let Some(token) = std::env::var_os(BOT_TOKEN_ENV).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let token = token
+            .to_str()
+            .context("NEHA_BOT_TOKEN is not valid UTF-8")?
+            .to_owned();
+        let url = std::env::var(BOT_SPACE_ENV)
+            .context("NEHA_SPACE_URL is not set; a Bot's shell needs its Space address")?
+            .trim_end_matches('/')
+            .to_owned();
+        let chat = match std::env::var(BOT_CHAT_ENV) {
+            Ok(text) if !text.trim().is_empty() => Some(
+                text.trim()
+                    .parse()
+                    .map_err(|error| anyhow::anyhow!("NEHA_CHAT is not a Chat id: {error}"))?,
+            ),
+            _ => None,
+        };
+
+        Ok(Some(Self { url, token, chat }))
+    }
+
+    /// Returns the Chat to act in, which must be the token's Chat.
+    pub fn chat(&self, chat: Option<Id>) -> Result<Id> {
+        match (chat, self.chat) {
+            (Some(chat), Some(bound)) if chat != bound => {
+                bail!("this Bot's token is bound to Chat {bound}; it cannot act in another Chat")
+            }
+            (Some(chat), _) => Ok(chat),
+            (None, Some(chat)) => Ok(chat),
+            (None, None) => bail!("pass --chat; a Bot's shell does not name its Chat"),
+        }
+    }
+
+    /// Uploads one File into the token's Chat.
+    pub async fn upload(&self, path: &Path) -> Result<FileSummary> {
+        let bytes = read_for_upload(path)?;
+        let name = path
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .with_context(|| format!("{} has no usable file name", path.display()))?;
+        let response = reqwest::Client::new()
+            .post(format!("{}/api/bot/files", self.url))
+            .query(&[
+                ("name", name),
+                (
+                    "media_type",
+                    neha::file::media_type_for(&path.to_string_lossy()),
+                ),
+            ])
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .bearer_auth(&self.token)
+            .body(bytes)
+            .send()
+            .await
+            .context("the Space could not be reached")?;
+
+        accepted(response)
+            .await?
+            .json()
+            .await
+            .context("the Space's answer does not describe a File")
+    }
+
+    /// Sends a Message, with an optional File, as the Bot.
+    pub async fn send(
+        &self,
+        chat: Id,
+        text: String,
+        file: Option<&FileSummary>,
+    ) -> Result<BotPost> {
+        let mut body = serde_json::json!({"chat": chat, "text": text});
+        if let Some(file) = file {
+            body["file"] = serde_json::json!(file.id);
+        }
+        let response = accepted(
+            reqwest::Client::new()
+                .post(format!("{}/api/bot/messages", self.url))
+                .bearer_auth(&self.token)
+                .json(&body)
+                .send()
+                .await
+                .context("the Space could not be reached")?,
+        )
+        .await?;
+        let value = response
+            .json::<Value>()
+            .await
+            .context("the Space's answer does not describe a Message")?;
+        let message = value["message"]
+            .as_str()
+            .and_then(|text| text.parse().ok())
+            .context("the Space's answer has no Message id")?;
+
+        Ok(BotPost {
+            message,
+            file: file.cloned(),
+        })
+    }
+
+    /// Downloads one File of the token's Chat.
+    pub async fn download(&self, file: Id) -> Result<(Option<String>, Vec<u8>)> {
+        let response = accepted(
+            reqwest::Client::new()
+                .get(format!("{}/api/bot/files/{file}", self.url))
+                .bearer_auth(&self.token)
+                .send()
+                .await
+                .context("the Space could not be reached")?,
+        )
+        .await?;
+        let name = response
+            .headers()
+            .get(reqwest::header::CONTENT_DISPOSITION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(disposition_name);
+        let bytes = response
+            .bytes()
+            .await
+            .context("the Space's answer was cut short")?;
+
+        Ok((name, bytes.to_vec()))
+    }
 }
 
 /// Uploads one File to a Chat and returns what the Space recorded.

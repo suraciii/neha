@@ -5,6 +5,11 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use rand::Rng as _;
 
 use neha::id::Id;
 use neha::record::{
@@ -283,6 +288,45 @@ pub struct RuleView {
     pub seq: Seq,
 }
 
+/// What a Bot's shell may do with its short-lived token.
+#[derive(Clone, Debug)]
+pub struct BotToken {
+    /// The Bot the run works for.
+    pub bot: Id,
+    /// The Chat the run works in.
+    pub chat: Id,
+    /// The run.
+    pub run: Id,
+    /// The User the Bot acts for.
+    pub acting: Id,
+    /// When the token stops being accepted.
+    pub expires: Instant,
+}
+
+impl State {
+    /// Issues a token bound to one run and its Chat.
+    pub fn issue_bot_token(&mut self, binding: BotToken) -> String {
+        let mut bytes = [0_u8; 32];
+        rand::rng().fill(&mut bytes);
+        let token = URL_SAFE_NO_PAD.encode(bytes);
+        self.bot_tokens
+            .insert(token.clone(), BotToken { ..binding });
+
+        token
+    }
+
+    /// Returns the binding of a token that is still valid.
+    pub fn bot_token(&mut self, token: &str) -> Option<BotToken> {
+        let entry = self.bot_tokens.get(token)?.clone();
+        if entry.expires <= Instant::now() {
+            self.bot_tokens.remove(token);
+            return None;
+        }
+
+        Some(entry)
+    }
+}
+
 /// The Space's record, projected into memory.
 #[derive(Debug, Default)]
 pub struct State {
@@ -321,6 +365,12 @@ pub struct State {
     /// Recovered runs whose final answer is already in the record, so they
     /// need no Computer to finish.
     pub final_recovered_runs: HashSet<Id>,
+    /// The address this Space answers at, once it is bound.
+    pub url: Option<String>,
+    /// Short-lived credentials a Bot's shell uses to reach this Space. They
+    /// live in memory only: a restart drops them and a later run issues new
+    /// ones.
+    pub bot_tokens: HashMap<String, BotToken>,
 }
 
 impl State {
@@ -772,6 +822,8 @@ impl Projection for State {
             EventData::RunFinished(data) => {
                 self.recovered_runs.remove(&data.run);
                 self.final_recovered_runs.remove(&data.run);
+                // A token lives only while its run does.
+                self.bot_tokens.retain(|_, token| token.run != data.run);
                 let run = self
                     .runs
                     .get_mut(&data.run)
