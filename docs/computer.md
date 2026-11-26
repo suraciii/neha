@@ -25,7 +25,7 @@ The command prints a pairing code and waits:
 Pairing code: <code>
 ```
 
-The code is valid for 10 minutes. It admits one Computer. The Bot Workspaces go in `~/Neha` by default; pass `--workspace <directory>` to move them, and a directory inside the configuration directory is refused. Set `NEHA_SPACE_URL` to leave out `--space`.
+The code is valid for up to 10 minutes. It admits one Computer. The Bot Workspaces go in `~/Neha` by default; pass `--workspace <directory>` to move them, and a directory inside the configuration directory is refused. Set `NEHA_SPACE_URL` to leave out `--space`.
 
 In a second terminal, enter the code from the signed-in CLI:
 
@@ -112,7 +112,7 @@ The machine ends the command it was running when the channel drops, so no action
 | `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.neha` by default, and a Workspace inside it is refused. Run `computer pair` again, and pass `--workspace` outside that directory if you want a different place. |
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory. A Bot cannot read that directory. |
 | A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/Neha/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
-| `add` reports the code is not valid or has expired | The code lasts 10 minutes and admits one Computer. Run `pair` again for a new code. |
+| `add` reports the code is not valid or has expired | The code lasts up to 10 minutes and admits one Computer. Run `pair` again for a new code. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. |
 | A write is refused | The path is outside the Bot's Workspace. Write inside the Workspace, or use a relative path. |

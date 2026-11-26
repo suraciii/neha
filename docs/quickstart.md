@@ -161,7 +161,7 @@ Open a second terminal and start the machine:
 target/debug/neha computer pair --space http://127.0.0.1:7337
 ```
 
-It prints a pairing code that lasts 10 minutes, then waits. In a third terminal, enter the code from the signed-in CLI and create a Bot on the new Computer. `computer list` also shows managed Computers; use the id on the `real` line:
+It prints a pairing code that lasts up to 10 minutes, then waits. In a third terminal, enter the code from the signed-in CLI and create a Bot on the new Computer. `computer list` also shows managed Computers; use the id on the `real` line:
 
 ```bash
 target/debug/neha computer add <code>

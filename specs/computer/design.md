@@ -57,7 +57,7 @@ On a real Computer, a Bot's default write range is its own Workspace, and it rea
 
 A real Computer's configuration directory is hidden from its Bots. The file tools and the shell cannot reach it, so a Bot cannot read the saved pairing or the token the machine keeps.
 
-A Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted.
+On a real Computer, a Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted.
 
 A real Computer's owner grants what a Bot on it can reach. [product.md](product.md) covers the grants.
 
