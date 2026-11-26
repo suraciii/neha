@@ -37,8 +37,12 @@ const { space, FakeCommands } = vi.hoisted(() => {
     // What the record says about each Run. A Run this map omits has succeeded.
     runs: {} as Record<string, { status: RunView["status"]; position?: number }>,
     runShows: [] as string[],
+    // A run_show answer can be held open, so a test can act while it is in flight.
+    runHolds: {} as Record<string, { gate: Promise<void>; fail: () => void } | undefined>,
     // Sends that settled in the fake Space.
     sendsDone: 0,
+    // Runs the Space accepted, in order.
+    sends: 0,
     // The seq of the last event the client read.
     seq: 100,
     holdSends() {
@@ -50,6 +54,13 @@ const { space, FakeCommands } = vi.hoisted(() => {
       openSend?.();
       openSend = null;
       sendGate = null;
+    },
+    holdRunShow(run: string) {
+      let fail!: () => void;
+      const gate = new Promise<void>((_resolve, reject) => {
+        fail = () => reject(new Error("the run_show answer was lost"));
+      });
+      space.runHolds[run] = { gate, fail };
     },
   };
   class FakeCommands {
@@ -86,8 +97,13 @@ const { space, FakeCommands } = vi.hoisted(() => {
           try {
             const sent = args as { chat: string; text: string; file?: string };
             space.sent.push(sent);
-            // The Space records the Message with the Run it starts and confirms
-            // the place the Run holds at once.
+            space.sends += 1;
+            const run = `r${space.sends}`;
+            // The place sits behind every Run its Bot has not finished.
+            const active = Object.values(space.runs).filter(
+              (known) => known.status === "queued" || known.status === "running",
+            ).length;
+            const position = active + 1;
             space.messages.push({
               id: `m${space.messages.length + 1}`,
               chat: sent.chat,
@@ -96,11 +112,11 @@ const { space, FakeCommands } = vi.hoisted(() => {
               text: sent.text,
               at: "2026-01-01T00:00:00.000Z",
               seq: "3",
-              run: "r1",
+              run,
               file: sent.file ?? null,
             });
-            space.runs["r1"] = { status: "queued", position: 2 };
-            return { run: "r1", status: "queued", position: 2 } as T;
+            space.runs[run] = { status: "queued", position };
+            return { run, status: "queued", position } as T;
           } finally {
             space.sendsDone += 1;
           }
@@ -108,6 +124,8 @@ const { space, FakeCommands } = vi.hoisted(() => {
         case "run_show": {
           const requested = (args as { run: string }).run;
           space.runShows.push(requested);
+          const hold = space.runHolds[requested];
+          if (hold) await hold.gate;
           const known = space.runs[requested] ?? { status: "succeeded" };
           return {
             id: requested,
@@ -206,7 +224,13 @@ function record(kind: string, data: Record<string, unknown>) {
   });
 }
 
-// Ends a Run in the record, with the reply Message when it has one.
+// The record starts a queued Run.
+function startRun(run: string) {
+  space.runs[run] = { status: "running" };
+  record("neha.run.started", { chat: space.chat.id, run, bot: space.bot.id, command: "c1", message: "m1" });
+}
+
+// The record ends a Run, with the reply Message when it has one.
 function finishRun(run: string, reply: Message | null = null) {
   space.runs[run] = { status: "succeeded" };
   if (reply) {
@@ -216,26 +240,49 @@ function finishRun(run: string, reply: Message | null = null) {
   record("neha.run.finished", { run, status: "succeeded", reply: reply?.id ?? null, usage: null, error: null });
 }
 
+function request(id: string, chat: string, run: string, text = "earlier"): Message {
+  return {
+    id,
+    chat,
+    author: { kind: "user", id: "u1" },
+    acting: null,
+    text,
+    at: "2026-01-01T00:00:00.000Z",
+    seq: "1",
+    run,
+    file: null,
+  };
+}
+
+function reply(id: string, chat: string, run: string, text: string): Message {
+  return {
+    id,
+    chat,
+    author: { kind: "bot", id: "b1" },
+    acting: "u1",
+    text,
+    at: "2026-01-01T00:00:01.000Z",
+    seq: "2",
+    run,
+    file: null,
+  };
+}
+
 // A second Chat on the sidebar whose last Run waits at place 3.
 function waitingChat() {
   space.chats = [space.chat, space.otherChat];
-  space.otherMessages.push({
-    id: "m9",
-    chat: "h2",
-    author: { kind: "user", id: "u1" },
-    acting: null,
-    text: "earlier",
-    at: "2026-01-01T00:00:00.000Z",
-    seq: "2",
-    run: "r2",
-    file: null,
-  });
+  space.otherMessages.push(request("m9", "h2", "r2"));
   space.runs["r2"] = { status: "queued", position: 3 };
 }
 
 async function openWaitingChat(view: ReturnType<typeof render>) {
   fireEvent.click(element<HTMLButtonElement>(view, ".conv:nth-of-type(2)"));
   await waitFor(() => expect(queueText(view)).toBe("Waiting behind 2 requests"));
+}
+
+// Lets the microtask chains a settled answer starts run before a test reads the view.
+async function drain() {
+  for (let turn = 0; turn < 4; turn += 1) await Promise.resolve();
 }
 
 beforeAll(() => {
@@ -262,7 +309,9 @@ beforeEach(() => {
   space.handlers = null;
   space.runs = {};
   space.runShows = [];
+  space.runHolds = {};
   space.sendsDone = 0;
+  space.sends = 0;
   space.seq = 100;
 });
 
@@ -316,10 +365,11 @@ describe("App with Files", () => {
 
     submit(view);
     await waitFor(() => expect(view.container.querySelector(".file-card")).toBeTruthy());
-    // The Message is accepted at once, and its Run holds the Chat until it ends.
-    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    // The Message is accepted at once: its Run waits, and the composer is free.
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
     finishRun("r1");
-    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
+    await waitFor(() => expect(queueText(view)).toBeUndefined());
 
     expect(upload).toHaveBeenCalledWith("h1", file, "notes.txt", "text/plain");
     expect(space.sent).toEqual([{ chat: "h1", text: "", file: "f1" }]);
@@ -459,17 +509,8 @@ describe("App with Files", () => {
   });
 
   it("does not unlock the active Chat when another Run finishes", async () => {
-    space.messages.push({
-      id: "m1",
-      chat: "h1",
-      author: { kind: "user", id: "u1" },
-      acting: null,
-      text: "please work",
-      at: "2026-01-01T00:00:00.000Z",
-      seq: "3",
-      run: null,
-      file: null,
-    });
+    // The Chat shows the working state only beside recorded Messages.
+    space.messages.push({ ...request("m1", "h1", "r1", "please work"), run: null });
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
     await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
@@ -515,8 +556,7 @@ describe("App with Files", () => {
     submit(view);
 
     // The command result names the place the Message holds in its Bot's queue.
-    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
-    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(true);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
 
     // The record holds a newer place than the command result did.
     space.runs["r1"] = { status: "queued", position: 4 };
@@ -530,56 +570,47 @@ describe("App with Files", () => {
   });
 
   it("restores a waiting Run when its Chat opens", async () => {
-    space.messages.push({
-      id: "m1",
-      chat: "h1",
-      author: { kind: "user", id: "u1" },
-      acting: null,
-      text: "earlier",
-      at: "2026-01-01T00:00:00.000Z",
-      seq: "1",
-      run: "r9",
-      file: null,
-    });
+    space.messages.push(request("m1", "h1", "r9"));
     space.runs["r9"] = { status: "queued", position: 3 };
     const view = await openChat();
 
-    // A waiting Run is unfinished: its place shows and the composer stays shut.
+    // A waiting Run is unfinished: its place shows and the composer stays usable.
     await waitFor(() => expect(queueText(view)).toBe("Waiting behind 2 requests"));
-    expect(element(view, ".msg--working")).toBeTruthy();
-    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(true);
+    expect(view.container.querySelector(".msg--working")).toBeNull();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
 
     finishRun("r9");
     await waitFor(() => expect(queueText(view)).toBeUndefined());
-    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
     expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
+  });
+
+  it("restores the newest request, not a later Bot reply", async () => {
+    space.messages.push(request("m1", "h1", "r1"), request("m2", "h1", "r2"), reply("m3", "h1", "r1", "first done"));
+    space.runs["r1"] = { status: "succeeded" };
+    space.runs["r2"] = { status: "queued", position: 2 };
+    const view = await openChat();
+
+    // The reply names r1, but the Chat waits on the newest User request: r2.
+    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    expect(space.runShows).toContain("r2");
+    expect(space.runShows).not.toContain("r1");
   });
 
   it("shows the Bot working once the waiting Run starts", async () => {
     const view = await openChat();
-    const reply: Message = {
-      id: "m2",
-      chat: "h1",
-      author: { kind: "bot", id: "b1" },
-      acting: "u1",
-      text: "Here is the answer.",
-      at: "2026-01-01T00:00:01.000Z",
-      seq: "5",
-      run: "r1",
-      file: null,
-    };
     type(view, "hello");
     submit(view);
-    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    expect(view.container.querySelector(".msg--working")).toBeNull();
 
-    record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
-    await waitFor(() => expect(queueText(view)).toBe("Working"));
-    expect(element(view, ".msg--working")).toBeTruthy();
+    startRun("r1");
+    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
+    expect(queueText(view)).toBeUndefined();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
 
-    finishRun("r1", reply);
-    await waitFor(() => expect(queueText(view)).toBeUndefined());
+    finishRun("r1", reply("m2", "h1", "r1", "Here is the answer."));
     await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
-    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
     await waitFor(() => expect(view.container.textContent).toContain("Here is the answer."));
   });
 
@@ -610,6 +641,136 @@ describe("App with Files", () => {
     record("neha.run.finished", { run: "r0", status: "succeeded" });
     await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
     expect(space.runShows.filter((run) => run === "r2").length).toBeGreaterThan(readsBefore);
+    expect(alertText(view)).toBeUndefined();
+  });
+
+  it("keeps following the latest Run when an earlier Run's reply lands", async () => {
+    const view = await openChat();
+    type(view, "first");
+    submit(view);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    startRun("r1");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+
+    // A second request waits behind the first, and becomes the followed Run.
+    type(view, "second");
+    submit(view);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+
+    // The first Run ends; its reply is a Message that names the first Run.
+    const showsBefore = space.runShows.length;
+    space.runs["r1"] = { status: "succeeded" };
+    const firstReply = reply("m3", "h1", "r1", "first done");
+    space.messages.push(firstReply);
+    record("neha.message.added", { chat: "h1", message: firstReply.id, text: firstReply.text, file: null, run: "r1" });
+    await waitFor(() => expect(view.container.textContent).toContain("first done"));
+    // The reply's read asks the record about the followed Run, not the reply's.
+    await waitFor(() => expect(space.runShows.length).toBeGreaterThan(showsBefore));
+    await drain();
+    expect(space.runShows.slice(showsBefore)).not.toContain("r1");
+    expect(queueText(view)).toBe("Waiting behind 1 request");
+
+    // The first Run's finish moves the second Run's place, not its tracking.
+    space.runs["r2"] = { status: "queued", position: 1 };
+    record("neha.run.finished", { run: "r1", status: "succeeded", reply: "m3", usage: null, error: null });
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    expect(view.container.querySelector(".msg--working")).toBeNull();
+
+    startRun("r2");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    finishRun("r2", reply("m4", "h1", "r2", "second done"));
+    await waitFor(() => expect(queueText(view)).toBeUndefined());
+    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
+    await waitFor(() => expect(view.container.textContent).toContain("second done"));
+  });
+
+  it("accepts a later request while a Run is still unfinished", async () => {
+    const view = await openChat();
+    type(view, "first");
+    submit(view);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    startRun("r1");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+
+    // The composer stays open: the reader puts a second request in the queue.
+    type(view, "second");
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
+    submit(view);
+    await waitFor(() => expect(space.asked.filter((name) => name === "message_send")).toHaveLength(2));
+    expect(space.sent).toHaveLength(2);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+
+    // The first Run's end moves the second Run's place; the second is still followed.
+    space.runs["r1"] = { status: "succeeded" };
+    space.runs["r2"] = { status: "queued", position: 1 };
+    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+
+    startRun("r2");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    finishRun("r2");
+    await waitFor(() => expect(queueText(view)).toBeUndefined());
+    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
+  });
+
+  it("does not move back to queued when the Run started before the answer", async () => {
+    const view = await openChat();
+    space.holdSends();
+    type(view, "hello");
+    submit(view);
+    await waitFor(() => expect(space.asked).toContain("message_send"));
+
+    // The record starts the Run before the command's answer reaches the page.
+    startRun("r1");
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+
+    space.releaseSends();
+    await waitFor(() => expect(space.sendsDone).toBe(1));
+    await drain();
+    expect(element(view, ".msg--working")).toBeTruthy();
+    expect(queueText(view)).toBeUndefined();
+  });
+
+  it("does not revive a Run that finished before its answer", async () => {
+    const view = await openChat();
+    space.holdSends();
+    type(view, "hello");
+    submit(view);
+    await waitFor(() => expect(space.asked).toContain("message_send"));
+
+    startRun("r1");
+    finishRun("r1", reply("m2", "h1", "r1", "done already"));
+    await drain();
+    space.releaseSends();
+    await waitFor(() => expect(space.sendsDone).toBe(1));
+    await drain();
+
+    expect(queueText(view)).toBeUndefined();
+    expect(view.container.querySelector(".msg--working")).toBeNull();
+    await waitFor(() => expect(view.container.textContent).toContain("done already"));
+  });
+
+  it("does not let an old Chat's lost run_show answer clear the new Chat", async () => {
+    waitingChat();
+    space.messages.push(request("m1", "h1", "r9"));
+    space.runs["r9"] = { status: "queued", position: 2 };
+    const view = await openChat();
+    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+
+    // A refresh of the old Chat asks the record about its Run and the answer hangs.
+    space.holdRunShow("r9");
+    const showsBefore = space.runShows.filter((run) => run === "r9").length;
+    record("neha.message.added", { chat: "h1", message: "m2", text: "hello", file: null, run: null });
+    await waitFor(() => expect(space.runShows.filter((run) => run === "r9").length).toBeGreaterThan(showsBefore));
+
+    // The reader moves to the waiting Chat before the old answer is lost.
+    await openWaitingChat(view);
+    space.runHolds["r9"]?.fail();
+    await drain();
+
+    // The lost answer belongs to the old Chat; the new Chat keeps its place.
+    expect(queueText(view)).toBe("Waiting behind 2 requests");
     expect(alertText(view)).toBeUndefined();
   });
 

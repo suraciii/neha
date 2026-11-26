@@ -15,7 +15,11 @@ interface ChatViewProps {
   computer: Computer | null;
   messages: Message[];
   files: Record<string, FileSummary>;
+  // A command is in flight; the composer waits for its answer.
+  submitting: boolean;
+  // The followed Run is running; the Bot is working.
   working: boolean;
+  // The followed Run waits; the Chat shows the place it holds.
   queue: RunProgress | null;
   error: string | null;
   // Resolves false when nothing left the composer, which keeps its Message.
@@ -42,13 +46,13 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const canSend = () =>
-    !props.working && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+    !props.submitting && !!props.bot && (draft().trim() !== "" || attachment() !== null);
 
-  // What the Chat says about the run it waits for, if it waits for one.
+  // How many requests a waiting Run has ahead. A running Run shows the Bot
+  // working instead, so the two never show together.
   const queueLabel = (): string | null => {
     const queue = props.queue;
-    if (!queue) return null;
-    if (queue.status === "running") return t("chat.queue.running");
+    if (!queue || queue.status !== "queued") return null;
     // The running run holds place 1, so place N has N - 1 requests ahead.
     const ahead = Math.max((queue.position ?? 1) - 1, 0);
     if (ahead === 0) return t("chat.queue.queued");
@@ -248,7 +252,7 @@ export default function ChatView(props: ChatViewProps) {
               type="button"
               aria-label={t("chat.attach")}
               title={t("chat.attach")}
-              disabled={!props.bot || props.working}
+              disabled={!props.bot || props.submitting}
               onClick={() => picker?.click()}
             >
               <Icon name="paperclip" size="sm" />
@@ -270,7 +274,7 @@ export default function ChatView(props: ChatViewProps) {
           type="file"
           aria-hidden="true"
           tabindex={-1}
-          disabled={!props.bot || props.working}
+          disabled={!props.bot || props.submitting}
           onChange={pick}
         />
       </form>
