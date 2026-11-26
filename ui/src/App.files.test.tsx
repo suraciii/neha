@@ -4,6 +4,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 
 import App from "./App";
 import { api, ApiError } from "./lib/api";
+import type { SubscriptionHandlers } from "./lib/ws";
 import { MAX_FILE_BYTES } from "./lib/files";
 import { setLocale } from "./i18n";
 import type { Account, Bot, Chat, Computer, FileSummary, Message } from "./types";
@@ -23,8 +24,13 @@ const { space, FakeCommands } = vi.hoisted(() => {
     sent: [] as unknown[],
     files: [] as FileSummary[],
     messages: [] as Message[],
+    handlers: null as SubscriptionHandlers | null,
   };
   class FakeCommands {
+    async subscribe(handlers: SubscriptionHandlers): Promise<void> {
+      space.handlers = handlers;
+    }
+
     async command<T>(name: string, args?: unknown): Promise<T> {
       space.asked.push(name);
       switch (name) {
@@ -123,6 +129,7 @@ beforeEach(() => {
   space.sent = [];
   space.files = [];
   space.messages = [];
+  space.handlers = null;
 });
 
 afterEach(() => {
@@ -231,6 +238,32 @@ describe("App with Files", () => {
 
     flush(() => fireEvent.click(element(view, ".locale-switch")));
     expect(alertText(view)).toBe("文件上传失败，请重试。");
+  });
+
+  it("refreshes the Chat from a live record event", async () => {
+    const view = await openChat();
+    expect(space.handlers).not.toBeNull();
+    space.messages.push({
+      id: "m-live",
+      chat: "h1",
+      author: { kind: "bot", id: "b1" },
+      acting: "u1",
+      text: "Live reply",
+      at: "2026-01-01T00:00:01.000Z",
+      seq: "8",
+      run: null,
+      file: null,
+    });
+    space.handlers?.onEvent?.({
+      seq: "8",
+      kind: "neha.message.added",
+      version: 1,
+      at: "2026-01-01T00:00:01.000Z",
+      author: { kind: "bot", id: "b1" },
+      data: { chat: "h1", message: "m-live", text: "Live reply", file: null, run: null },
+    });
+
+    await waitFor(() => expect(view.container.textContent).toContain("Live reply"));
   });
 
   it("previews a Message that carries only a File, in the reader's language", async () => {

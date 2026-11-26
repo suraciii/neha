@@ -1,3 +1,4 @@
+import type { RecordEvent } from "../types";
 import { uuidv7 } from "./uuid";
 
 export class ProtocolError extends Error {
@@ -22,6 +23,29 @@ interface Frame {
   result?: unknown;
   code?: string;
   message?: string;
+  event?: RecordEvent;
+  events?: RecordEvent[];
+  cursor?: string;
+}
+
+/** What the caller wants to know about the record. */
+export interface SubscriptionHandlers {
+  /** A page of history. `resumed` is true when the caller asked to continue. */
+  onSnapshot?: (events: RecordEvent[], cursor: string, resumed: boolean) => void;
+  /** One live event. */
+  onEvent?: (event: RecordEvent) => void;
+  /** The cursor advanced. Persist it to resume after a reload. */
+  onCursor?: (cursor: string) => void;
+  /** The subscription could not continue. */
+  onError?: (error: ProtocolError) => void;
+}
+
+/** Where a subscription starts. */
+export interface SubscribeOptions {
+  /** The cursor to resume from; omit to read the record from the start. */
+  cursor?: string | null;
+  /** The page size to ask the Space for. */
+  limit?: number;
 }
 
 type CommandName =
@@ -37,16 +61,54 @@ type CommandName =
   | "message_send"
   | "run_show";
 
+interface Following {
+  handlers: SubscriptionHandlers;
+  cursor: string | null;
+  startedWithCursor: boolean;
+  frameSent: boolean;
+  limit: number;
+}
+
 export class Commands {
   private socket: WebSocket | null = null;
   private connecting: Promise<void> | null = null;
   private hello: Promise<void> | null = null;
   private pending = new Map<string, Pending>();
+  private following: Following | null = null;
+  private reconnectTimer: number | null = null;
+  private closed = false;
 
   async close(): Promise<void> {
+    this.closed = true;
+    this.following = null;
+    if (this.reconnectTimer !== null) {
+      window.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.socket?.close();
     this.socket = null;
     this.rejectAll(new ProtocolError("closed", "The Space connection is closed."));
+  }
+
+  /**
+   * Follows the record from a cursor. The Space sends a snapshot and then live
+   * events; reconnecting resumes from the last cursor.
+   */
+  async subscribe(
+    handlers: SubscriptionHandlers,
+    options: SubscribeOptions = {},
+  ): Promise<void> {
+    this.closed = false;
+    this.following = {
+      handlers,
+      cursor: options.cursor ?? null,
+      startedWithCursor: Boolean(options.cursor),
+      frameSent: false,
+      limit: options.limit ?? 200,
+    };
+    await this.ensureConnected();
+    await this.hello;
+    this.sendSubscribe();
   }
 
   async command<T>(name: CommandName, args?: unknown, timeoutMs = 20_000): Promise<T> {
@@ -69,6 +131,27 @@ export class Commands {
       });
       socket.send(JSON.stringify(commandFrame(id, name, args)));
     });
+  }
+
+  private sendSubscribe(): void {
+    const following = this.following;
+    const socket = this.socket;
+    if (
+      !following ||
+      following.frameSent ||
+      !socket ||
+      socket.readyState !== WebSocket.OPEN
+    ) {
+      return;
+    }
+    following.frameSent = true;
+    const frame: Record<string, unknown> = {
+      type: "subscribe",
+      id: uuidv7(),
+      limit: following.limit,
+    };
+    if (following.cursor !== null) frame.cursor = following.cursor;
+    socket.send(JSON.stringify(frame));
   }
 
   private async ensureConnected(): Promise<void> {
@@ -99,6 +182,7 @@ export class Commands {
         }
       };
       socket.addEventListener("open", () => {
+        if (this.following) this.following.frameSent = false;
         socket.send(JSON.stringify({ type: "hello", version: 1 }));
         this.hello = new Promise<void>((helloResolve, helloReject) => {
           const onHello = (event: MessageEvent) => {
@@ -113,14 +197,45 @@ export class Commands {
           };
           socket.addEventListener("message", onHello);
         });
-        this.hello.then(succeed, fail);
+        this.hello.then(() => {
+          this.sendSubscribe();
+          succeed();
+        }, fail);
       });
       socket.addEventListener("message", (event) => {
         const frame = parse(event);
         if (!frame) return;
         if (frame.type === "hello") return;
         if (frame.type === "accepted" || frame.type === "committed") return;
+        if (frame.type === "heartbeat") return;
+        if (frame.type === "snapshot") {
+          const following = this.following;
+          if (!following) return;
+          const cursor = frame.cursor ?? following.cursor ?? "";
+          if (cursor) following.cursor = cursor;
+          const resumed = following.startedWithCursor;
+          following.handlers.onSnapshot?.(frame.events ?? [], cursor, resumed);
+          if (cursor) following.handlers.onCursor?.(cursor);
+          following.startedWithCursor = true;
+          return;
+        }
+        if (frame.type === "event") {
+          const following = this.following;
+          if (!following || !frame.event) return;
+          following.cursor = frame.event.seq;
+          following.startedWithCursor = true;
+          following.handlers.onEvent?.(frame.event);
+          following.handlers.onCursor?.(frame.event.seq);
+          return;
+        }
         if (frame.type === "confirmed" || frame.type === "error") {
+          if (frame.type === "error" && !frame.id) {
+            this.following?.handlers.onError?.(
+              new ProtocolError(frame.code ?? "error", frame.message ?? "The subscription failed."),
+            );
+            socket.close();
+            return;
+          }
           const id = frame.id;
           if (!id) return;
           const pending = this.pending.get(id);
@@ -132,7 +247,10 @@ export class Commands {
           return;
         }
         if (frame.type === "protocol_error") {
-          this.rejectAll(new ProtocolError("protocol", frame.message ?? "The Space rejected a frame."));
+          const error = new ProtocolError("protocol", frame.message ?? "The Space rejected a frame.");
+          this.following?.handlers.onError?.(error);
+          this.following = null;
+          this.rejectAll(error);
           socket.close();
         }
       });
@@ -140,12 +258,14 @@ export class Commands {
         this.socket = null;
         this.connecting = null;
         this.hello = null;
+        if (this.following) this.following.frameSent = false;
         this.rejectAll(new ProtocolError("closed", "The Space connection closed."));
         if (!settled) {
           settled = true;
           window.clearTimeout(timer);
           reject(new ProtocolError("closed", "The Space connection closed before the session opened."));
         }
+        this.scheduleReconnect();
       });
       socket.addEventListener("error", () => {
         fail(new ProtocolError("network", "The browser cannot reach the Space."));
@@ -154,6 +274,15 @@ export class Commands {
       this.connecting = null;
     });
     return this.connecting;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.closed || !this.following || this.reconnectTimer !== null) return;
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closed || !this.following) return;
+      void this.ensureConnected().catch(() => this.scheduleReconnect());
+    }, 1_000);
   }
 
   private rejectAll(error: Error): void {

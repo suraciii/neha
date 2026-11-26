@@ -22,6 +22,7 @@ import type {
   ProviderResult,
   BotResult,
   Preview,
+  RecordEvent,
   RunView,
   SendResult,
 } from "./types";
@@ -89,6 +90,9 @@ export default function App() {
   const [isMobile, setIsMobile] = createSignal(false);
   const commands = new Commands();
   let runGeneration = 0;
+  let following = false;
+  let refreshTimer: number | null = null;
+  let refreshAgain = false;
 
   onSettled(() => {
     const query = window.matchMedia("(max-width: 900px)");
@@ -106,6 +110,74 @@ export default function App() {
     void boot();
   });
 
+  async function startFollowing() {
+    if (following) return;
+    following = true;
+    try {
+      await commands.subscribe(
+        {
+          onSnapshot: (_events, cursor, resumed) => {
+            saveCursor(cursor);
+            if (resumed) queueRefresh();
+          },
+          onEvent: (event) => {
+            saveCursor(event.seq);
+            handleRecordEvent(event);
+          },
+          onCursor: saveCursor,
+          onError: (reason) => update({ error: reason }),
+        },
+        { cursor: readCursor() },
+      );
+    } catch (reason) {
+      following = false;
+      update({ error: reason });
+    }
+  }
+
+  function handleRecordEvent(event: RecordEvent) {
+    const data = event.data ?? {};
+    const chat = typeof data.chat === "string" ? data.chat : null;
+    if (
+      event.kind === "neha.bot.created" ||
+      event.kind === "neha.chat.created" ||
+      event.kind === "neha.computer.created" ||
+      event.kind === "neha.provider.added"
+    ) {
+      void loadWorkspace();
+      return;
+    }
+    if (event.kind === "neha.message.added" && chat) {
+      const text = typeof data.text === "string" ? data.text : "";
+      const file = typeof data.file === "string";
+      setPreview(chat, { text, file });
+    }
+    if (chat && state.activeChat?.id === chat) {
+      if (event.kind === "neha.run.started") update({ working: true });
+      if (event.kind === "neha.run.finished") update({ working: false });
+      queueRefresh();
+      return;
+    }
+    if (event.kind === "neha.run.finished") update({ working: false });
+    if (event.kind.startsWith("neha.run.") && state.working) queueRefresh();
+  }
+
+  function queueRefresh() {
+    if (refreshTimer !== null) {
+      refreshAgain = true;
+      return;
+    }
+    refreshTimer = window.setTimeout(() => {
+      refreshTimer = null;
+      void refreshActive().finally(() => {
+        if (refreshAgain) {
+          refreshAgain = false;
+          queueRefresh();
+        }
+      });
+    }, 50);
+  }
+
   async function boot() {
     try {
       const account = await api.me();
@@ -121,6 +193,7 @@ export default function App() {
   async function enter(account: Account) {
     update({ account });
     setReady(true);
+    void startFollowing();
     await loadWorkspace();
   }
 
@@ -185,13 +258,13 @@ export default function App() {
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
-      await restoreRun(chat, messages, generation);
+      await restoreRun(messages, generation);
     } catch (reason) {
       update({ error: reason });
     }
   }
 
-  async function restoreRun(chat: Chat, messages: Message[], generation: number) {
+  async function restoreRun(messages: Message[], generation: number) {
     const run = [...messages].reverse().find((message) => message.run)?.run;
     if (!run || generation !== runGeneration) return;
     try {
@@ -199,7 +272,6 @@ export default function App() {
       if (generation !== runGeneration) return;
       if (view.status === "running") {
         update({ working: true });
-        void pollRun(chat, run, generation);
       } else {
         await refreshActive();
       }
@@ -208,22 +280,14 @@ export default function App() {
     }
   }
 
-  async function pollRun(chat: Chat, run: string, generation: number) {
-    while (generation === runGeneration) {
-      await new Promise((resolve) => setTimeout(resolve, 1_500));
-      if (generation !== runGeneration) return;
-      try {
-        const view = await commands.command<RunView>("run_show", { run }, 10_000);
-        if (generation !== runGeneration) return;
-        if (view.status !== "running") {
-          update({ working: false });
-          if (state.activeChat?.id === chat.id) await refreshActive();
-          return;
-        }
-      } catch {
-        update({ working: false });
-        return;
-      }
+  async function reconcileRun(messages: Message[]) {
+    const run = [...messages].reverse().find((message) => message.run)?.run;
+    if (!run) return;
+    try {
+      const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      update({ working: view.status === "running" });
+    } catch {
+      update({ working: false });
     }
   }
 
@@ -238,6 +302,7 @@ export default function App() {
       update({ messages, files: indexFiles(files) });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
+      await reconcileRun(messages);
     } catch (reason) {
       update({ error: reason });
     }
@@ -511,4 +576,24 @@ function messageFor(reason: unknown): string {
   if (reason instanceof TypeError) return t("error.unreachable");
   if (typeof reason === "string") return reason;
   return t("error.generic");
+}
+
+const CURSOR_KEY = "neha.record.cursor";
+
+function readCursor(): string | null {
+  try {
+    const value = localStorage.getItem(CURSOR_KEY);
+    return value && /^(0|[1-9][0-9]*)$/.test(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function saveCursor(cursor: string) {
+  if (!/^(0|[1-9][0-9]*)$/.test(cursor)) return;
+  try {
+    localStorage.setItem(CURSOR_KEY, cursor);
+  } catch {
+    // A browser that blocks storage still follows events for this page.
+  }
 }

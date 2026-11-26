@@ -32,6 +32,6 @@ The `Authorization` header remains for the CLI and other native clients. The bro
 
 ## Limits
 
-The client has one command connection. It reads the Chat again after a Message command completes.
+The client has one command connection. It loads its view, then follows the record from a cursor. A reconnect resumes from the last cursor; a cursor the Space can no longer serve gives the client a fresh snapshot.
 
-The model reply is not streamed. The client shows the working state for the duration of the Run.
+The model reply is not streamed. The client shows the working state for the duration of the Run, driven by record events as well as the command result.
