@@ -116,6 +116,6 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 ## What this milestone does not do
 
-- The managed Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations on the Space's machine. Do not run a Space exposed to other machines.
+- The managed Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
 - A Bot has no approval gate yet. It runs an action as soon as the Model asks for it.
 - One human joins a Space. Group Chats, Files, Boards, approvals, notifications, and search arrive in later milestones.

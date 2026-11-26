@@ -68,12 +68,12 @@ The local runtime enforces these limits, and an action that breaks one returns a
 
 - A path must stay inside the workspace. Absolute paths outside it, `..` climbs, and symlinks that lead outside are refused.
 - A shell command has 30 seconds. When it runs past the limit, the Space kills the whole process group.
-- The shell starts with an empty environment and only `PATH`, `HOME` (the workspace), and `TMPDIR` (the workspace's `.tmp`) set. Provider keys and other Space state never reach it.
+- The shell starts with an empty environment and only `PATH`, `HOME` (the workspace), and `TMPDIR` (the workspace's `.tmp`) set. Provider keys and other Space secrets are not in that environment. The runtime is not isolated, so a shell command still has the Space user's file access; run only prompts you trust.
 - A tool result keeps its first 8 KiB and last 24 KiB and names the omitted byte count. A write is limited to 1 MiB; a read returns at most 8 MiB.
 - A run stops after 8 steps. If the Model keeps asking for tools, the Bot answers with a failure Message and the Space stays available.
 
 ## What the milestone does not do
 
-- The Computer is not isolated. The runtime executes real commands in a workspace directory; it is a development and local-use implementation. Do not run a Space exposed to other machines.
+- The Computer is not isolated. The runtime executes real commands in a workspace directory with the Space user's permissions; it is a development and local-use implementation. Do not run a Space exposed to other machines or with prompts you do not trust.
 - There is no approval gate yet. A Bot runs an action as soon as the Model asks for it. The approval rules in [Bot](../specs/bot/product.md) arrive with their own milestone.
 - The workspace is local to the Space's machine. A real Computer, its outbound channel, and its access settings arrive in a later milestone.
