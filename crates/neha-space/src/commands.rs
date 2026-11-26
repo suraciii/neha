@@ -102,6 +102,44 @@ pub struct PendingRun {
     pub provider: ProviderView,
     /// The Provider's API key.
     pub api_key: String,
+    /// How a run this Space start recovered from the record continues.
+    pub recovery: Option<RecoveryPlan>,
+}
+
+/// How one interrupted run continues from the record.
+pub enum RecoveryPlan {
+    /// The record already holds the run's final answer; finish it without a
+    /// Model call.
+    Final {
+        /// The text the Bot answered.
+        text: String,
+        /// Whether the answer was a final answer.
+        succeeded: bool,
+        /// The usage the completed steps reported, including the final reply.
+        usage: neha::usage::Usage,
+        /// The step to record before finishing, when the final reply was
+        /// recorded but its step was not.
+        record_step: Option<u32>,
+        /// The usage the final reply reported.
+        reply_usage: neha::usage::Usage,
+    },
+    /// The run continues from the first step it did not finish.
+    Continue(Box<ContinuePlan>),
+}
+
+/// The record a continuation replays.
+pub struct ContinuePlan {
+    /// The step the run continues with.
+    pub next_step: u32,
+    /// The Messages the completed steps replay.
+    pub history: Vec<neha_loop::Message>,
+    /// The reply of the step in flight, when the record kept one.
+    pub resume: Option<Resume>,
+    /// The usage of the completed steps.
+    pub base_usage: neha::usage::Usage,
+    /// An action that started and never returned, when its effect can be
+    /// verified before the run continues.
+    pub unknown: Option<crate::state::ActionView>,
 }
 
 /// The Space connections one command handler reads and writes through.
@@ -1576,6 +1614,7 @@ pub async fn resume_pending(
         model,
         provider,
         api_key,
+        recovery: None,
     })
 }
 
@@ -1774,8 +1813,90 @@ pub async fn finish_run(
         history,
         None,
         neha::usage::Usage::default(),
+        None,
     )
     .await
+}
+
+/// Finishes a recovered run whose final answer is already in the record.
+///
+/// It needs no Computer and no Provider: the Message and the run's end are
+/// pure record writes, so an offline machine or a missing key cannot lose an
+/// answer the Model already gave.
+#[allow(clippy::too_many_arguments)]
+async fn finish_recovered_final(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    run: &crate::state::RunView,
+    text: String,
+    succeeded: bool,
+    usage: neha::usage::Usage,
+    record_step: Option<u32>,
+    reply_usage: neha::usage::Usage,
+) -> Result<Finished, ApiError> {
+    if let Some(step) = record_step {
+        record_recovered_step(
+            store,
+            state,
+            events,
+            run.bot,
+            run.acting,
+            run.id,
+            step,
+            reply_usage,
+        )
+        .await?;
+    }
+    let message = Id::new();
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::MessageAdded,
+            Author::Bot(run.bot),
+            json!({"message": message, "chat": run.chat, "text": text, "run": run.id}),
+        )
+        .acting(run.acting),
+        EventDraft::new(
+            EventKind::RunFinished,
+            Author::Bot(run.bot),
+            json!({
+                "run": run.id,
+                "status": if succeeded {
+                    crate::state::RunStatus::Succeeded
+                } else {
+                    crate::state::RunStatus::Failed
+                },
+                "reply": message,
+                "usage": usage,
+                "error": if succeeded { serde_json::Value::Null } else {
+                    serde_json::json!("the Model returned an empty reply")
+                },
+            }),
+        )
+        .acting(run.acting),
+    ];
+    let confirmation = serde_json::json!({
+        "run": run.id,
+        "message": run.message,
+        "status": if succeeded { "succeeded" } else { "failed" },
+        "reply": message,
+        "text": text,
+        "usage": usage,
+    });
+    let appended = store
+        .append(
+            AppendRequest::new(Id::new(), format!("recover-final:{}", run.id), drafts)
+                .with_confirmation(run.command, confirmation),
+        )
+        .await
+        .map_err(store_error)?;
+    if !appended.existing {
+        apply(state, &appended.events)?;
+    }
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+    Ok(Finished::Completed(Vec::new()))
 }
 
 /// Continues a run whose waited-for action the acting User allowed.
@@ -1797,45 +1918,134 @@ pub async fn resume_run(
     links: &ComputerLinks,
     run: &crate::state::RunView,
 ) -> Result<Finished, ApiError> {
-    let pending = match resume_pending(state, secrets, run).await {
-        Ok(pending) => pending,
+    let (resumable, recovering) = {
+        let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+        (state.is_resumable(run), state.is_recovering(run))
+    };
+    if resumable {
+        let (history, resume, base_usage) = match prepare_resume(state, run) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("neha: cannot resume run {}: {error}", run.id);
+                let events = fail_resume(store, state, events, run).await?;
+                return Ok(Finished::Completed(events));
+            }
+        };
+        let pending = match resume_pending(state, secrets, run).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                let events = fail_run(
+                    store,
+                    state,
+                    events,
+                    run,
+                    &format!("I could not continue my run: {error}"),
+                    &error.to_string(),
+                )
+                .await?;
+                return Ok(Finished::Completed(events));
+            }
+        };
+        return finish_run_with(
+            store,
+            state,
+            home,
+            blobs,
+            model,
+            events,
+            tool_timeout,
+            links,
+            pending,
+            history,
+            Some(resume),
+            base_usage,
+            None,
+        )
+        .await;
+    }
+    if !recovering {
+        eprintln!("neha: run {} is not resumable", run.id);
+        let events = fail_resume(store, state, events, run).await?;
+        return Ok(Finished::Completed(events));
+    }
+    let recovery = match prepare_recovery(state, run) {
+        Ok(plan) => plan,
         Err(error) => {
+            eprintln!("neha: cannot recover run {}: {error}", run.id);
             let events = fail_run(
                 store,
                 state,
                 events,
                 run,
-                &format!("I could not continue my run: {error}"),
-                &error.to_string(),
+                &format!("I could not continue after the interruption: {error}"),
+                &error,
             )
             .await?;
             return Ok(Finished::Completed(events));
         }
     };
-    let (history, resume, base_usage) = match prepare_resume(state, run) {
-        Ok(plan) => plan,
-        Err(error) => {
-            eprintln!("neha: cannot resume run {}: {error}", run.id);
-            let events = fail_resume(store, state, events, run).await?;
-            return Ok(Finished::Completed(events));
+    match recovery {
+        RecoveryPlan::Final {
+            text,
+            succeeded,
+            usage,
+            record_step,
+            reply_usage,
+        } => {
+            finish_recovered_final(
+                store,
+                state,
+                events,
+                run,
+                text,
+                succeeded,
+                usage,
+                record_step,
+                reply_usage,
+            )
+            .await
         }
-    };
-
-    finish_run_with(
-        store,
-        state,
-        home,
-        blobs,
-        model,
-        events,
-        tool_timeout,
-        links,
-        pending,
-        history,
-        Some(resume),
-        base_usage,
-    )
-    .await
+        RecoveryPlan::Continue(plan) => {
+            let ContinuePlan {
+                next_step,
+                history,
+                resume,
+                base_usage,
+                unknown,
+            } = *plan;
+            let pending = match resume_pending(state, secrets, run).await {
+                Ok(pending) => pending,
+                Err(error) => {
+                    let events = fail_run(
+                        store,
+                        state,
+                        events,
+                        run,
+                        &format!("I could not continue my run: {error}"),
+                        &error.to_string(),
+                    )
+                    .await?;
+                    return Ok(Finished::Completed(events));
+                }
+            };
+            finish_run_with(
+                store,
+                state,
+                home,
+                blobs,
+                model,
+                events,
+                tool_timeout,
+                links,
+                pending,
+                history,
+                resume,
+                base_usage,
+                Some((next_step, unknown)),
+            )
+            .await
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1852,7 +2062,12 @@ async fn finish_run_with(
     history: Vec<neha_loop::Message>,
     resume: Option<Resume>,
     base_usage: neha::usage::Usage,
+    recovery: Option<(u32, Option<crate::state::ActionView>)>,
 ) -> Result<Finished, ApiError> {
+    let mut history = history;
+    let mut resume = resume;
+    let mut base_usage = base_usage;
+    let mut start_step = None;
     let computer = pending.computer;
     // The Computer's kind picks the runtime: a hosted Computer runs inside
     // the Space, a local one across its channel. The queue never starts a run
@@ -1904,6 +2119,117 @@ async fn finish_run_with(
             }
         },
     };
+    if let Some((next_step, unknown)) = recovery {
+        start_step = Some(next_step);
+        if let Some(action) = unknown {
+            match verify_recovered_action(&runtime, &action).await {
+                Ok((output, error)) => {
+                    record_recovered_action(store, state, events, &pending, &action, output, error)
+                        .await?;
+                    let current = state
+                        .lock()
+                        .map_err(|_| ApiError::internal("state lock"))?
+                        .runs
+                        .get(&pending.run)
+                        .cloned()
+                        .ok_or_else(|| ApiError::internal("the run is gone"))?;
+                    match prepare_recovery(state, &current) {
+                        Ok(RecoveryPlan::Continue(plan)) if plan.unknown.is_none() => {
+                            let ContinuePlan {
+                                next_step,
+                                history: replay,
+                                resume: replay_resume,
+                                base_usage: replay_usage,
+                                ..
+                            } = *plan;
+                            start_step = Some(next_step);
+                            history = replay;
+                            resume = replay_resume;
+                            base_usage = replay_usage;
+                        }
+                        Ok(RecoveryPlan::Final {
+                            text,
+                            succeeded,
+                            usage,
+                            record_step,
+                            reply_usage,
+                        }) => {
+                            if let Some(step) = record_step {
+                                record_recovered_step(
+                                    store,
+                                    state,
+                                    events,
+                                    pending.bot.id,
+                                    pending.acting,
+                                    pending.run,
+                                    step,
+                                    reply_usage,
+                                )
+                                .await?;
+                            }
+                            return finish_completion(
+                                store,
+                                state,
+                                pending,
+                                RunOutcome::Reply {
+                                    text,
+                                    usage,
+                                    succeeded,
+                                },
+                            )
+                            .await;
+                        }
+                        Ok(RecoveryPlan::Continue(_)) => {
+                            let usage = known_usage(state, pending.run);
+                            return finish_completion(
+                                store,
+                                state,
+                                pending,
+                                RunOutcome::Reply {
+                                    text: "I could not continue after the interruption: another action's result is unknown.".to_owned(),
+                                    usage,
+                                    succeeded: false,
+                                },
+                            )
+                            .await;
+                        }
+                        Err(error) => {
+                            let usage = known_usage(state, pending.run);
+                            return finish_completion(
+                                store,
+                                state,
+                                pending,
+                                RunOutcome::Reply {
+                                    text: format!(
+                                        "I could not continue after the interruption: {error}"
+                                    ),
+                                    usage,
+                                    succeeded: false,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Err(detail) => {
+                    let usage = known_usage(state, pending.run);
+                    return finish_completion(
+                        store,
+                        state,
+                        pending,
+                        RunOutcome::Reply {
+                            text: format!(
+                                "I stopped while an action was running. Its result is unknown: {detail}. I did not run it again."
+                            ),
+                            usage,
+                            succeeded: false,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+    }
     let space_model = SpaceModel::new(
         model,
         &pending.provider.base_url,
@@ -1942,6 +2268,8 @@ async fn finish_run_with(
         // the call after the approved one.
         recorder.calls.insert(resume.step, resume.calls.clone());
         request = request.with_resume(resume);
+    } else if let Some(step) = start_step {
+        request = request.with_start_step(step);
     }
     let outcome = match neha_loop::run(&runtime, &space_model, &mut recorder, &files, request).await
     {
@@ -1966,6 +2294,131 @@ async fn finish_run_with(
         },
     };
     finish_completion(store, state, pending, outcome).await
+}
+
+/// Records the step a recovered final reply belongs to, when the Space
+/// stopped between the reply and its step.
+#[allow(clippy::too_many_arguments)]
+async fn record_recovered_step(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    bot: Id,
+    acting: Id,
+    run: Id,
+    step: u32,
+    usage: neha::usage::Usage,
+) -> Result<(), ApiError> {
+    let already = state
+        .lock()
+        .map_err(|_| ApiError::internal("state lock"))?
+        .runs
+        .get(&run)
+        .is_some_and(|view| view.steps.iter().any(|step_view| step_view.index == step));
+    if already {
+        return Ok(());
+    }
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::RunStep,
+            Author::Bot(bot),
+            json!({
+                "run": run,
+                "step": step,
+                "usage": usage,
+                "tool_calls": 0,
+            }),
+        )
+        .acting(acting),
+    ];
+    let appended = store
+        .append(AppendRequest::new(
+            Id::new(),
+            format!("recover-step:{run}:{step}"),
+            drafts,
+        ))
+        .await
+        .map_err(store_error)?;
+    if !appended.existing {
+        apply(state, &appended.events)?;
+    }
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+    Ok(())
+}
+
+/// Verifies one action that started before the Space stopped.
+///
+/// Only a write has an effect the Space can check from outside: the file must
+/// hold exactly the content the action was asked to write. A missing or
+/// different file is unknown, not a failure, because the action may have
+/// written and something else changed it later.
+async fn verify_recovered_action(
+    runtime: &RunRuntime,
+    action: &crate::state::ActionView,
+) -> Result<(String, Option<String>), String> {
+    let arguments = action.arguments.to_string();
+    let parsed = neha_loop::tools::action(&action.tool, &arguments)
+        .map_err(|error| format!("its recorded arguments cannot be read: {error}"))?;
+    let Action::WriteFile { path, content } = parsed else {
+        return Err(format!("a {} action has no verifiable effect", action.tool));
+    };
+    match runtime.read_bytes(&path).await {
+        Ok(bytes) if bytes == content.as_bytes() => Ok((
+            format!("the file {path} holds the content the action was asked to write"),
+            None,
+        )),
+        Ok(_) => Err(format!(
+            "the file {path} does not hold the content the action was asked to write"
+        )),
+        Err(error) => Err(format!("the file {path} cannot be read: {error}")),
+    }
+}
+
+/// Records the verified result of one action that started before a stop.
+async fn record_recovered_action(
+    store: &Store,
+    state: &Mutex<State>,
+    events: &tokio::sync::broadcast::Sender<Event>,
+    pending: &PendingRun,
+    action: &crate::state::ActionView,
+    output: String,
+    error: Option<String>,
+) -> Result<(), ApiError> {
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::ActionFinished,
+            Author::Bot(pending.bot.id),
+            json!({
+                "run": pending.run,
+                "step": action.step,
+                "action": action.id,
+                "tool": action.tool,
+                "status": RecordedActionStatus::Succeeded,
+                "output": output,
+                "truncated": false,
+                "omitted_bytes": 0,
+                "error": error,
+            }),
+        )
+        .acting(pending.acting),
+    ];
+    let appended = store
+        .append(AppendRequest::new(
+            Id::new(),
+            format!("recover-action:{}", action.id),
+            drafts,
+        ))
+        .await
+        .map_err(store_error)?;
+    if !appended.existing {
+        apply(state, &appended.events)?;
+    }
+    for event in appended.events {
+        let _ = events.send(event);
+    }
+    Ok(())
 }
 
 /// Rebuilds the Messages and the [`Resume`] one waiting run continues from.
@@ -2105,11 +2558,299 @@ fn prepare_resume(
             })
             .collect(),
         done,
-        approved_action: approval.action,
+        approved_action: Some(approval.action),
         usage: reply.usage.unwrap_or_default(),
+        recovered: false,
     };
 
     Ok((messages, resume, base_usage))
+}
+
+/// Plans how one run this Space start found interrupted continues.
+///
+/// The record is replayed rather than guessed: a completed step becomes the
+/// assistant Message with its calls and one tool result per action; the step in
+/// flight becomes a `Resume` whose finished calls already have their results.
+/// An action that started and never returned is *not* run again: a write can
+/// be verified from its file, and anything else is refused as unresumable.
+pub(crate) fn prepare_recovery(
+    state: &Mutex<State>,
+    run: &crate::state::RunView,
+) -> Result<RecoveryPlan, String> {
+    let state = state.lock().map_err(|_| "the state is locked".to_owned())?;
+    // A step is recorded only when it completed, one at a time from one.
+    for (position, step) in run.steps.iter().enumerate() {
+        if step.index != position as u32 + 1 {
+            return Err("its step numbers are not in order".to_owned());
+        }
+    }
+    let next_step = run.steps.last().map_or(1, |step| step.index + 1);
+    if run
+        .actions
+        .iter()
+        .any(|action| action.step == 0 || action.step > next_step)
+    {
+        return Err("its actions name a step the record does not hold".to_owned());
+    }
+
+    let mut history = Vec::new();
+    let cutoff = run.started.unwrap_or(run.seq);
+    for (author, text) in state.history_until(run.chat, cutoff) {
+        history.push(match author {
+            Author::User(_) => neha_loop::Message::user(text),
+            Author::Bot(_) => neha_loop::Message::assistant(text),
+        });
+    }
+    let replies = state.run_replies(run.id);
+    let mut base_usage = neha::usage::Usage::default();
+    for step in run.steps.iter().filter(|step| step.index < next_step) {
+        let reply = replies
+            .iter()
+            .find(|reply| reply.step == step.index)
+            .ok_or_else(|| format!("step {} has no recorded reply", step.index))?;
+        if reply.calls.len() as u32 != step.tool_calls {
+            return Err(format!(
+                "step {} does not hold every call it requested",
+                step.index
+            ));
+        }
+        let actions: Vec<&crate::state::ActionView> = run
+            .actions
+            .iter()
+            .filter(|action| action.step == step.index)
+            .collect();
+        if actions.len() != reply.calls.len() {
+            return Err(format!("step {} lost the actions it requested", step.index));
+        }
+        append_replay(&mut history, step.index, reply, &actions)?;
+        base_usage += reply.usage.unwrap_or_default();
+    }
+
+    // A recorded final step is the answer: the Space stopped before recording
+    // the run's end, not before the Model called again.
+    if let Some(last) = run.steps.last()
+        && last.tool_calls == 0
+    {
+        let reply = replies
+            .iter()
+            .find(|reply| reply.step == last.index)
+            .ok_or_else(|| format!("step {} has no recorded reply", last.index))?;
+        if reply.calls.is_empty() && !run.actions.iter().any(|action| action.step == last.index) {
+            let content = reply.content.clone().unwrap_or_default();
+            return Ok(if content.trim().is_empty() {
+                RecoveryPlan::Final {
+                    text: "The Model returned an empty reply.".to_owned(),
+                    succeeded: false,
+                    usage: base_usage,
+                    record_step: None,
+                    reply_usage: neha::usage::Usage::default(),
+                }
+            } else {
+                RecoveryPlan::Final {
+                    text: content,
+                    succeeded: true,
+                    usage: base_usage,
+                    record_step: None,
+                    reply_usage: neha::usage::Usage::default(),
+                }
+            });
+        }
+    }
+    let Some(reply) = replies.iter().find(|reply| reply.step == next_step) else {
+        if run.actions.iter().any(|action| action.step == next_step) {
+            return Err(format!(
+                "step {} has actions but no recorded reply",
+                next_step
+            ));
+        }
+        return Ok(RecoveryPlan::Continue(Box::new(ContinuePlan {
+            next_step,
+            history,
+            resume: None,
+            base_usage,
+            unknown: None,
+        })));
+    };
+
+    if reply.calls.is_empty() {
+        // The Model's final answer was recorded; the Space stopped before the
+        // run's own end.
+        let actions: Vec<&crate::state::ActionView> = run
+            .actions
+            .iter()
+            .filter(|action| action.step == next_step)
+            .collect();
+        if !actions.is_empty() {
+            return Err(format!(
+                "step {} has a final answer but also actions",
+                next_step
+            ));
+        }
+        let usage = base_usage + reply.usage.unwrap_or_default();
+        let content = reply.content.clone().unwrap_or_default();
+        return Ok(if content.trim().is_empty() {
+            RecoveryPlan::Final {
+                text: "The Model returned an empty reply.".to_owned(),
+                succeeded: false,
+                usage,
+                record_step: Some(next_step),
+                reply_usage: reply.usage.unwrap_or_default(),
+            }
+        } else {
+            RecoveryPlan::Final {
+                text: content,
+                succeeded: true,
+                usage,
+                record_step: Some(next_step),
+                reply_usage: reply.usage.unwrap_or_default(),
+            }
+        });
+    }
+
+    let actions: Vec<&crate::state::ActionView> = run
+        .actions
+        .iter()
+        .filter(|action| action.step == next_step)
+        .collect();
+    if actions.len() > reply.calls.len() {
+        return Err(format!("step {next_step} has more actions than calls"));
+    }
+    for (call, action) in reply.calls.iter().zip(&actions) {
+        if action.tool != call.tool || action.arguments != call.arguments {
+            return Err(format!(
+                "step {next_step}'s actions do not line up with its calls"
+            ));
+        }
+        if call.refused.is_some()
+            && !(action.finished && action.status == RecordedActionStatus::Failed)
+        {
+            // A refused call never runs, but the loop records its refusal as a
+            // failed result so the Model can read it; a replay keeps that
+            // result. A bare started refused action is not a safe replay.
+            return Err(format!(
+                "step {next_step}'s refused call has no recorded failure"
+            ));
+        }
+    }
+    if let Some(position) = actions
+        .iter()
+        .position(|action| action.status == RecordedActionStatus::Unknown)
+    {
+        // Actions run in order, so nothing after an unfinished action may have
+        // started. Only a write can be checked from its effect.
+        if position + 1 != actions.len() {
+            return Err(format!(
+                "step {next_step} has actions after one that never returned"
+            ));
+        }
+        if actions[position].finished {
+            // The Computer answered and its result was unknown (for example a
+            // lost channel). That is a terminal answer, not something to
+            // verify from the machine now.
+            return Err(format!(
+                "step {next_step}'s {} action returned an unknown result",
+                actions[position].tool
+            ));
+        }
+        if actions[position].tool != neha_loop::tools::WRITE_FILE {
+            return Err(format!(
+                "step {next_step}'s {} action never returned and cannot be verified",
+                actions[position].tool
+            ));
+        }
+        return Ok(RecoveryPlan::Continue(Box::new(ContinuePlan {
+            next_step,
+            history,
+            resume: None,
+            base_usage,
+            unknown: Some(actions[position].clone()),
+        })));
+    }
+    for (call, action) in reply.calls.iter().zip(&actions) {
+        if action.tool != call.tool || action.arguments != call.arguments {
+            return Err(format!(
+                "step {next_step}'s actions do not line up with its calls"
+            ));
+        }
+    }
+    let done = actions.len();
+    // The loop inserts the assistant Message itself when it rebuilds a
+    // resumed step; the history ends with the results of the calls already
+    // recorded.
+    append_results(&mut history, next_step, reply, &actions)?;
+    let calls: Vec<LoopCall> = reply
+        .calls
+        .iter()
+        .map(|call| LoopCall {
+            call: call.call.clone(),
+            tool: call.tool.clone(),
+            arguments: call.arguments.clone(),
+            refused: call.refused.clone(),
+        })
+        .collect();
+    let resume = Resume {
+        step: next_step,
+        content: reply.content.clone(),
+        calls,
+        done,
+        approved_action: None,
+        usage: reply.usage.unwrap_or_default(),
+        recovered: done == reply.calls.len(),
+    };
+    Ok(RecoveryPlan::Continue(Box::new(ContinuePlan {
+        next_step,
+        history,
+        resume: Some(resume),
+        base_usage,
+        unknown: None,
+    })))
+}
+
+/// Appends one completed step's assistant Message and tool results to a replay.
+fn append_replay(
+    history: &mut Vec<neha_loop::Message>,
+    step: u32,
+    reply: &neha::record::RunReply,
+    actions: &[&crate::state::ActionView],
+) -> Result<(), String> {
+    if actions.len() != reply.calls.len() {
+        return Err(format!("step {step}'s calls do not match its results"));
+    }
+    history.push(neha_loop::Message::assistant_with_calls(
+        reply.content.clone(),
+        reply
+            .calls
+            .iter()
+            .map(|call| neha_loop::ToolCall {
+                id: call.call.clone(),
+                name: call.tool.clone(),
+                arguments: call.arguments.to_string(),
+            })
+            .collect(),
+    ));
+    append_results(history, step, reply, actions)
+}
+
+/// Appends the results of a step's already recorded calls, in call order.
+fn append_results(
+    history: &mut Vec<neha_loop::Message>,
+    step: u32,
+    reply: &neha::record::RunReply,
+    actions: &[&crate::state::ActionView],
+) -> Result<(), String> {
+    if actions.len() > reply.calls.len() {
+        return Err(format!("step {step} has more results than calls"));
+    }
+    for (index, (call, action)) in reply.calls.iter().zip(actions).enumerate() {
+        if action.tool != call.tool || action.arguments != call.arguments {
+            return Err(format!("step {step}'s calls do not match its results"));
+        }
+        history.push(neha_loop::Message::tool_result(
+            call_id(&call.call, step, index),
+            action_result_text(action),
+        ));
+    }
+    Ok(())
 }
 
 /// The text the Model reads for one finished action.
@@ -2312,7 +3053,7 @@ impl ComputerRuntime for RunRuntime {
     }
 }
 
-fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {
+pub(crate) fn known_usage(state: &Mutex<State>, run: Id) -> neha::usage::Usage {
     let Ok(state) = state.lock() else {
         return neha::usage::Usage::default();
     };
@@ -3673,9 +4414,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        LoopCall, ambiguous_path, ambiguous_path_at, lasting_rule_path_at, path_covers,
-        path_matches, path_matches_at, path_parent, prepare_resume, resolve_action_path,
-        rule_covers, rule_matches,
+        LoopCall, RecoveryPlan, RunRuntime, ambiguous_path, ambiguous_path_at,
+        lasting_rule_path_at, path_covers, path_matches, path_matches_at, path_parent,
+        prepare_recovery, prepare_resume, resolve_action_path, rule_covers, rule_matches,
+        verify_recovered_action,
     };
     use crate::state::RuleView;
     use neha::id::Id;
@@ -4033,6 +4775,145 @@ mod tests {
         (state, run, approved_action)
     }
 
+    /// Applies a run whose first step completed and whose second step may
+    /// have been recorded before the Space stopped.
+    #[allow(clippy::type_complexity)]
+    fn recovering_state(
+        first_calls: serde_json::Value,
+        first_actions: &[(Id, &str, serde_json::Value)],
+        second: Option<(serde_json::Value, Vec<(Id, &str, serde_json::Value, bool)>)>,
+    ) -> (State, crate::state::RunView) {
+        let user = Id::new();
+        let bot = Id::new();
+        let computer = Id::new();
+        let chat = Id::new();
+        let message = Id::new();
+        let run = Id::new();
+        let command = Id::new();
+        let bot_author = Author::Bot(bot);
+        let mut events = vec![
+            event(
+                EventKind::UserJoined,
+                Author::User(user),
+                None,
+                json!({"display_name": "Ada", "is_admin": true}),
+                1,
+            ),
+            event(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                None,
+                json!({"computer": computer, "owner": user, "kind": "hosted", "workspace": "/tmp/workspace"}),
+                2,
+            ),
+            event(
+                EventKind::BotCreated,
+                Author::User(user),
+                None,
+                json!({"bot": bot, "owner": user, "name": "Scout", "computer": computer, "chat": chat}),
+                3,
+            ),
+            event(
+                EventKind::ChatCreated,
+                Author::User(user),
+                None,
+                json!({"chat": chat, "owner": user, "bot": bot}),
+                4,
+            ),
+            event(
+                EventKind::MessageAdded,
+                Author::User(user),
+                Some(user),
+                json!({"message": message, "chat": chat, "text": "go", "run": run}),
+                5,
+            ),
+            event(
+                EventKind::RunQueued,
+                bot_author,
+                Some(user),
+                json!({"run": run, "chat": chat, "bot": bot, "command": command, "message": message}),
+                6,
+            ),
+            event(
+                EventKind::RunStarted,
+                bot_author,
+                Some(user),
+                json!({"run": run, "chat": chat, "bot": bot, "command": command, "message": message}),
+                7,
+            ),
+            event(
+                EventKind::RunReply,
+                bot_author,
+                Some(user),
+                json!({"run": run, "step": 1, "content": "first", "calls": first_calls, "usage": null}),
+                8,
+            ),
+        ];
+        let mut seq = 9;
+        for (action, tool, arguments) in first_actions {
+            events.push(event(
+                EventKind::ActionStarted,
+                bot_author,
+                Some(user),
+                json!({"run": run, "step": 1, "action": action, "tool": tool, "arguments": arguments}),
+                seq,
+            ));
+            seq += 1;
+            events.push(event(
+                EventKind::ActionFinished,
+                bot_author,
+                Some(user),
+                json!({"run": run, "step": 1, "action": action, "tool": tool, "status": "succeeded", "output": "ok"}),
+                seq,
+            ));
+            seq += 1;
+        }
+        events.push(event(
+            EventKind::RunStep,
+            bot_author,
+            Some(user),
+            json!({"run": run, "step": 1, "tool_calls": first_actions.len()}),
+            seq,
+        ));
+        seq += 1;
+        if let Some((second_calls, second_actions)) = second {
+            events.push(event(
+                EventKind::RunReply,
+                bot_author,
+                Some(user),
+                json!({"run": run, "step": 2, "content": "second", "calls": second_calls, "usage": null}),
+                seq,
+            ));
+            seq += 1;
+            for (action, tool, arguments, finished) in second_actions {
+                events.push(event(
+                    EventKind::ActionStarted,
+                    bot_author,
+                    Some(user),
+                    json!({"run": run, "step": 2, "action": action, "tool": tool, "arguments": arguments}),
+                    seq,
+                ));
+                seq += 1;
+                if finished {
+                    events.push(event(
+                        EventKind::ActionFinished,
+                        bot_author,
+                        Some(user),
+                        json!({"run": run, "step": 2, "action": action, "tool": tool, "status": "succeeded", "output": "ok"}),
+                        seq,
+                    ));
+                    seq += 1;
+                }
+            }
+        }
+        let mut state = State::default();
+        for event in &events {
+            state.apply(event).expect("the fabricated record applies");
+        }
+        let run = state.runs.get(&run).expect("the run").clone();
+        (state, run)
+    }
+
     #[test]
     fn a_resume_starts_at_the_approved_index() {
         let (state, run, _approved_action) = waiting_state(
@@ -4080,7 +4961,227 @@ mod tests {
 
         assert_eq!(resume.done, 1);
         assert_eq!(resume.calls[1].arguments, json!({"command": "second"}));
-        assert_eq!(resume.approved_action, expected);
+        assert_eq!(resume.approved_action, Some(expected));
+    }
+
+    #[test]
+    fn a_recovery_continues_at_the_step_after_the_completed_one() {
+        let action = Id::new();
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(action, "write_file", json!({"path": "a", "content": "a"}))],
+            None,
+        );
+        let RecoveryPlan::Continue(plan) =
+            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
+        else {
+            panic!("expected a continuation");
+        };
+        assert_eq!(plan.next_step, 2);
+        assert_eq!(
+            plan.history.len(),
+            3,
+            "the user message and the completed step replay"
+        );
+        assert!(
+            plan.resume.is_none(),
+            "the next Model call starts a fresh step"
+        );
+        assert!(plan.unknown.is_none());
+    }
+
+    #[test]
+    fn a_recovery_replays_a_step_whose_actions_all_finished() {
+        let (first, second) = (Id::new(), Id::new());
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(first, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((
+                json!([{"call": "call-2", "tool": "write_file", "arguments": {"path": "b", "content": "b"}, "refused": null}]),
+                vec![(
+                    second,
+                    "write_file",
+                    json!({"path": "b", "content": "b"}),
+                    true,
+                )],
+            )),
+        );
+        let RecoveryPlan::Continue(plan) =
+            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
+        else {
+            panic!("expected a continuation");
+        };
+        assert_eq!(plan.next_step, 2);
+        assert_eq!(
+            plan.history.len(),
+            4,
+            "the resumed history ends after the recorded results"
+        );
+        let resume = plan.resume.expect("the recorded reply resumes the step");
+        assert_eq!(resume.step, 2);
+        assert_eq!(resume.done, 1);
+        assert!(resume.recovered, "every call already has its result");
+        assert!(resume.approved_action.is_none());
+        assert!(plan.unknown.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_recovered_write_is_checked_from_its_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("note.txt"), "asked").unwrap();
+        let runtime =
+            RunRuntime::Managed(neha_computer::LocalRuntime::new(directory.path()).unwrap());
+        let action = crate::state::ActionView {
+            id: Id::new(),
+            step: 1,
+            tool: "write_file".to_owned(),
+            arguments: json!({"path": "note.txt", "content": "asked"}),
+            finished: false,
+            status: neha::record::ActionStatus::Unknown,
+            output: String::new(),
+            truncated: false,
+            omitted_bytes: 0,
+            error: None,
+        };
+        assert!(
+            verify_recovered_action(&runtime, &action).await.is_ok(),
+            "the file holds the asked content"
+        );
+
+        std::fs::write(directory.path().join("note.txt"), "different").unwrap();
+        let error = verify_recovered_action(&runtime, &action)
+            .await
+            .expect_err("different content is unknown, not success");
+        assert!(error.contains("does not hold"), "{error}");
+
+        let shell = crate::state::ActionView {
+            tool: "shell".to_owned(),
+            arguments: json!({"command": "true"}),
+            ..action
+        };
+        let error = verify_recovered_action(&runtime, &shell)
+            .await
+            .expect_err("a shell has no verifiable effect");
+        assert!(error.contains("no verifiable effect"), "{error}");
+    }
+
+    #[test]
+    fn a_recovery_finishes_from_a_recorded_final_step() {
+        let (state, run) = recovering_state(json!([]), &[], None);
+        let RecoveryPlan::Final {
+            text,
+            succeeded,
+            usage,
+            record_step,
+            ..
+        } = prepare_recovery(&std::sync::Mutex::new(state), &run)
+            .expect("a final step finishes from the record")
+        else {
+            panic!("expected a final answer");
+        };
+        assert_eq!(text, "first");
+        assert!(succeeded);
+        assert_eq!(record_step, None);
+        assert_eq!(usage.budgeted(), 0);
+    }
+
+    #[test]
+    fn a_recovery_records_a_final_reply_whose_step_was_not_recorded() {
+        let action = Id::new();
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(action, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((json!([]), Vec::new())),
+        );
+        let RecoveryPlan::Final {
+            text,
+            record_step,
+            succeeded,
+            ..
+        } = prepare_recovery(&std::sync::Mutex::new(state), &run)
+            .expect("a final reply finishes from the record")
+        else {
+            panic!("expected a final answer");
+        };
+        assert_eq!(text, "second");
+        assert!(succeeded);
+        assert_eq!(record_step, Some(2));
+    }
+
+    #[test]
+    fn a_recovery_does_not_rerun_a_write_that_may_have_happened() {
+        let (first, unknown) = (Id::new(), Id::new());
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(first, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((
+                json!([{"call": "call-2", "tool": "write_file", "arguments": {"path": "b", "content": "b"}, "refused": null}]),
+                vec![(
+                    unknown,
+                    "write_file",
+                    json!({"path": "b", "content": "b"}),
+                    false,
+                )],
+            )),
+        );
+        let RecoveryPlan::Continue(plan) =
+            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("a write can be verified")
+        else {
+            panic!("expected an action to verify");
+        };
+        let action = plan.unknown.expect("the write waits to be verified");
+        assert_eq!(action.id, unknown);
+        assert_eq!(action.tool, "write_file");
+    }
+
+    #[test]
+    fn a_recovery_does_not_turn_a_recorded_unknown_result_into_success() {
+        let (first, unknown) = (Id::new(), Id::new());
+        let (state, mut run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(first, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((
+                json!([{"call": "call-2", "tool": "write_file", "arguments": {"path": "b", "content": "b"}, "refused": null}]),
+                vec![(
+                    unknown,
+                    "write_file",
+                    json!({"path": "b", "content": "b"}),
+                    false,
+                )],
+            )),
+        );
+        // The Computer answered Unknown before the Space stopped: that result
+        // is terminal and must not be re-verified as a success.
+        let action = run
+            .actions
+            .iter_mut()
+            .find(|action| action.id == unknown)
+            .unwrap();
+        action.finished = true;
+        action.status = neha::record::ActionStatus::Unknown;
+        let error = match prepare_recovery(&std::sync::Mutex::new(state), &run) {
+            Err(error) => error,
+            Ok(_) => panic!("a recorded unknown result must not be recovered"),
+        };
+        assert!(error.contains("returned an unknown result"), "{error}");
+    }
+
+    #[test]
+    fn a_recovery_refuses_an_unverifiable_action() {
+        let (first, unknown) = (Id::new(), Id::new());
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(first, "write_file", json!({"path": "a", "content": "a"}))],
+            Some((
+                json!([{"call": "call-2", "tool": "shell", "arguments": {"command": "true"}, "refused": null}]),
+                vec![(unknown, "shell", json!({"command": "true"}), false)],
+            )),
+        );
+        let error = match prepare_recovery(&std::sync::Mutex::new(state), &run) {
+            Err(error) => error,
+            Ok(_) => panic!("a shell has no verifiable effect"),
+        };
+        assert!(error.contains("cannot be verified"), "{error}");
     }
 
     #[test]

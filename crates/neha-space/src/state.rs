@@ -154,6 +154,9 @@ pub struct ActionView {
     pub tool: String,
     /// The tool's arguments.
     pub arguments: serde_json::Value,
+    /// Whether an `ActionFinished` event recorded this action.
+    #[serde(skip)]
+    pub finished: bool,
     /// How the action ended; unknown until it finishes.
     pub status: ActionStatus,
     /// The text the Model reads.
@@ -312,6 +315,12 @@ pub struct State {
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
     /// The Model's replies per run, in the order the record holds them.
     pub replies: HashMap<Id, Vec<RunReply>>,
+    /// Runs a Space start found interrupted and may recover. It is not part of
+    /// the record: a later start rebuilds it from the same events.
+    pub recovered_runs: HashSet<Id>,
+    /// Recovered runs whose final answer is already in the record, so they
+    /// need no Computer to finish.
+    pub final_recovered_runs: HashSet<Id>,
 }
 
 impl State {
@@ -369,6 +378,29 @@ impl State {
             .iter()
             .filter(|view| view.run == run)
             .max_by_key(|view| view.seq)
+    }
+
+    /// Marks a run the current Space start recovered from an interruption.
+    pub fn mark_recovered(&mut self, run: Id) {
+        self.recovered_runs.insert(run);
+    }
+
+    /// Marks a recovered run that ends from its recorded final answer.
+    pub fn mark_final_recovered(&mut self, run: Id) {
+        self.recovered_runs.insert(run);
+        self.final_recovered_runs.insert(run);
+    }
+
+    /// Returns whether a recovered run needs no Computer to finish.
+    #[must_use]
+    pub fn is_final_recovered(&self, run: Id) -> bool {
+        self.final_recovered_runs.contains(&run)
+    }
+
+    /// Returns whether this Space start recovered the run.
+    #[must_use]
+    pub fn is_recovering(&self, run: &RunView) -> bool {
+        run.status == RunStatus::Running && self.recovered_runs.contains(&run.id)
     }
 
     /// Returns whether a run may resume: its approval was allowed and the
@@ -738,6 +770,8 @@ impl Projection for State {
                 run.cwd = Some(data.working_dir);
             }
             EventData::RunFinished(data) => {
+                self.recovered_runs.remove(&data.run);
+                self.final_recovered_runs.remove(&data.run);
                 let run = self
                     .runs
                     .get_mut(&data.run)
@@ -770,6 +804,7 @@ impl Projection for State {
                     step: data.step,
                     tool: data.tool,
                     arguments: data.arguments,
+                    finished: false,
                     status: ActionStatus::Unknown,
                     output: String::new(),
                     truncated: false,
@@ -787,6 +822,7 @@ impl Projection for State {
                     .iter_mut()
                     .find(|action| action.id == data.action)
                     .ok_or("a finished action must have started")?;
+                action.finished = true;
                 action.status = data.status;
                 action.output = data.output;
                 action.truncated = data.truncated;

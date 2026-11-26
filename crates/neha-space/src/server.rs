@@ -2027,11 +2027,12 @@ async fn reconcile_pairings(server: &Arc<SpaceServer>) -> Result<(), ServerError
 /// port and before it serves, so a start that cannot listen writes nothing.
 async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result<(), StoreError> {
     // A run whose action waited keeps waiting when its approval is undecided;
-    // an allowed one is left for the pump to resume, and a denied one is left
-    // for the pump to fail with its own message. Anything else that was still
-    // running when the Space stopped cannot continue without redoing work, so
-    // it ends here.
-    let interrupted: Vec<_> = {
+    // an allowed one is left for the pump to resume. Anything else that was
+    // still running when the Space stopped is recovered from its record: the
+    // pump replays the completed steps and verifies or refuses an action that
+    // started and never returned. A record that cannot be replayed fails the
+    // run here, with its own message, instead of being dropped or rerun.
+    let interrupted: Vec<crate::state::RunView> = {
         let state = state
             .lock()
             .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
@@ -2040,76 +2041,81 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
             .values()
             .filter(|run| run.status == crate::state::RunStatus::Running)
             .filter(|run| !state.is_resumable(run))
-            .map(|run| {
-                let after_approval = state
-                    .latest_approval(run.id)
-                    .is_some_and(|approval| approval.decided == Some(true));
-
-                (run.clone(), after_approval)
-            })
+            .cloned()
             .collect()
     };
-    for (run, after_approval) in interrupted {
-        let message = Id::new();
-        let (text, error) = if after_approval {
-            // The User allowed the action, but the run ended before the
-            // action could start or finish: resuming would run work twice.
-            (
-                "I could not continue after the approval.",
-                "the approval could not be resumed",
-            )
-        } else {
-            (
-                "I was interrupted before I could answer.",
-                "the Space stopped before the run finished",
-            )
-        };
-        let usage = run
-            .steps
-            .iter()
-            .filter_map(|step| step.usage)
-            .fold(neha::usage::Usage::default(), |total, usage| total + usage);
-        let drafts = vec![
-            EventDraft::new(
-                EventKind::MessageAdded,
-                Author::Bot(run.bot),
-                serde_json::json!({"message": message, "chat": run.chat, "text": text, "run": run.id}),
-            )
-            .acting(run.acting),
-            EventDraft::new(
-                EventKind::RunFinished,
-                Author::Bot(run.bot),
+    for run in interrupted {
+        match commands::prepare_recovery(state, &run) {
+            Ok(plan) => {
+                let mut state = state
+                    .lock()
+                    .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
+                if matches!(plan, commands::RecoveryPlan::Final { .. }) {
+                    state.mark_final_recovered(run.id);
+                } else {
+                    state.mark_recovered(run.id);
+                }
+            }
+            Err(reason) => {
+                fail_interrupted(store, state, &run, &reason).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Records an interrupted run the record cannot replay as failed.
+async fn fail_interrupted(
+    store: &Store,
+    state: &Mutex<SpaceState>,
+    run: &crate::state::RunView,
+    reason: &str,
+) -> Result<(), StoreError> {
+    let message = Id::new();
+    let text = format!("I could not continue after the interruption: {reason}.");
+    let error = format!("the Space stopped before the run finished: {reason}");
+    let usage = commands::known_usage(state, run.id);
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::MessageAdded,
+            Author::Bot(run.bot),
+            serde_json::json!({"message": message, "chat": run.chat, "text": text, "run": run.id}),
+        )
+        .acting(run.acting),
+        EventDraft::new(
+            EventKind::RunFinished,
+            Author::Bot(run.bot),
+            serde_json::json!({
+                "run": run.id,
+                "status": crate::state::RunStatus::Failed,
+                "reply": message,
+                "usage": usage,
+                "error": error,
+            }),
+        )
+        .acting(run.acting),
+    ];
+    let appended = store
+        .append(
+            AppendRequest::new(Id::new(), format!("recover:{}", run.id), drafts).with_confirmation(
+                run.command,
                 serde_json::json!({
                     "run": run.id,
-                    "status": crate::state::RunStatus::Failed,
+                    "message": run.message,
+                    "status": "failed",
                     "reply": message,
-                    "usage": usage,
+                    "text": text,
                     "error": error,
                 }),
-            )
-            .acting(run.acting),
-        ];
-        let appended = store
-            .append(
-                AppendRequest::new(Id::new(), format!("recover:{}", run.id), drafts)
-                    .with_confirmation(
-                        run.command,
-                        serde_json::json!({
-                            "run": run.id,
-                            "status": "failed",
-                            "reply": message,
-                            "text": text,
-                            "error": error,
-                        }),
-                    ),
-            )
-            .await?;
-        let mut state = state
-            .lock()
-            .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
-        for event in &appended.events {
-            state.apply(event).map_err(StoreError::Corrupt)?;
-        }
+            ),
+        )
+        .await?;
+    let mut state = state
+        .lock()
+        .map_err(|_| StoreError::Corrupt("the Space state is locked".to_owned()))?;
+    for event in &appended.events {
+        state.apply(event).map_err(StoreError::Corrupt)?;
     }
 
     Ok(())
@@ -3407,7 +3413,7 @@ mod tests {
             assert_eq!(recovered.reply, Some(state.messages.last().unwrap().id));
             assert_eq!(
                 state.messages.last().unwrap().text,
-                "I was interrupted before I could answer."
+                "I could not continue after the interruption: step 1 has no recorded reply."
             );
         }
         let recorded = running
@@ -4854,8 +4860,12 @@ mod tests {
         let running = start(home, 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
         let (mut socket, token) = admin(&running, &invite).await;
-        let (base, provider_task, _gates, _recorded) =
-            gated_provider(vec![hold("first answer"), text("second answer")]).await;
+        let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+            hold("first answer"),
+            text("recovered first"),
+            text("second answer"),
+        ])
+        .await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
         let first = submit(&mut socket, chat, "first", None).await;
@@ -4873,8 +4883,11 @@ mod tests {
 
         let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
-        // The working run died with the old process; the waiting one runs now.
-        assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
+        // The working run recovers from its record; the waiting one runs after it.
+        assert_eq!(
+            wait_run(&mut socket, first_run).await["status"],
+            "succeeded"
+        );
         let shown = wait_run(&mut socket, second_run).await;
         assert_eq!(shown["status"], "succeeded");
         assert!(
@@ -4893,8 +4906,13 @@ mod tests {
         let running = start(home, 0).await.unwrap();
         let invite = running.invite.clone().expect("a fresh Space invites");
         let (mut socket, token) = admin(&running, &invite).await;
-        let (base, provider_task, _gates, _recorded) =
-            gated_provider(vec![hold("one"), text("two"), text("three")]).await;
+        let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+            hold("one"),
+            text("recovered one"),
+            text("two"),
+            text("three"),
+        ])
+        .await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
         let first = submit(&mut socket, chat, "first", None).await;
@@ -4912,7 +4930,10 @@ mod tests {
         running.shutdown().await;
         let restarted = start(test_home(&root), 0).await.unwrap();
         let mut socket = open_socket(&restarted, &token).await;
-        assert_eq!(wait_run(&mut socket, first_run).await["status"], "failed");
+        assert_eq!(
+            wait_run(&mut socket, first_run).await["status"],
+            "succeeded"
+        );
         assert_eq!(
             wait_run(&mut socket, second_run).await["status"],
             "succeeded"
@@ -5443,7 +5464,6 @@ mod tests {
         let user = Id::new();
         let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
         let (message, run) = (Id::new(), Id::new());
-        let (interrupted_message, interrupted_run) = (Id::new(), Id::new());
         let command_id = Id::new();
         crate::secrets::Secrets::load(&home)
             .unwrap()
@@ -5501,29 +5521,6 @@ mod tests {
                 }),
             )
             .acting(user),
-            // A run the previous process left working: a start recovers it.
-            EventDraft::new(
-                EventKind::MessageAdded,
-                Author::User(user),
-                json!({
-                    "message": interrupted_message,
-                    "chat": chat,
-                    "text": "older",
-                    "run": interrupted_run,
-                }),
-            ),
-            EventDraft::new(
-                EventKind::RunStarted,
-                Author::Bot(bot),
-                json!({
-                    "run": interrupted_run,
-                    "chat": chat,
-                    "bot": bot,
-                    "message": interrupted_message,
-                    "command": command_id,
-                }),
-            )
-            .acting(user),
         ];
         let seeded = store
             .append(AppendRequest::new(command_id, "seed", drafts))
@@ -5555,22 +5552,6 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         store.close().await.unwrap();
-
-        // A start that listens recovers the run the previous process left working.
-        let running = start(test_home(directory.path()), 0).await.unwrap();
-        {
-            let state = running.server.state.lock().unwrap();
-            let recovered = &state.runs[&interrupted_run];
-            assert_eq!(recovered.status, crate::state::RunStatus::Failed);
-            let reply = recovered.reply.expect("an interrupted run answers");
-            let answer = state
-                .messages
-                .iter()
-                .find(|message| message.id == reply)
-                .expect("the interruption Message");
-            assert_eq!(answer.text, "I was interrupted before I could answer.");
-        }
-        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
