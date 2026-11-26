@@ -328,6 +328,51 @@ impl ComputerRuntime for LocalRuntime {
             }
         }
     }
+
+    #[allow(clippy::manual_async_fn)]
+    fn read_bytes(&self, path: &str) -> impl std::future::Future<Output = Result<Vec<u8>, String>> + Send {
+        let resolved = self.resolve(path);
+        async move {
+            let path = resolved?;
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+            if !metadata.is_file() {
+                return Err(format!("{} is not a file", path.display()));
+            }
+            if metadata.len() > neha::file::MAX_FILE_BYTES {
+                return Err(format!(
+                    "the file is larger than {} bytes",
+                    neha::file::MAX_FILE_BYTES
+                ));
+            }
+            std::fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    fn write_bytes(
+        &self,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), String>> + Send {
+        let resolved = self.resolve(path);
+        async move {
+            if bytes.len() as u64 > neha::file::MAX_FILE_BYTES {
+                return Err(format!(
+                    "the content is larger than {} bytes",
+                    neha::file::MAX_FILE_BYTES
+                ));
+            }
+            let path = resolved?;
+            if let Some(parent) = path.parent()
+                && let Err(error) = std::fs::create_dir_all(parent)
+            {
+                return Err(format!("cannot create {}: {error}", parent.display()));
+            }
+            std::fs::write(&path, bytes)
+                .map_err(|error| format!("cannot write {}: {error}", path.display()))
+        }
+    }
 }
 
 #[derive(Default)]

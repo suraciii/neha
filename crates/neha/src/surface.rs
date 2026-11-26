@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorCode;
 use crate::id::Id;
-use crate::record::Event;
+use crate::record::{Author, Event};
+use crate::time::Timestamp;
 use crate::seq::Seq;
 
 /// The protocol version this build speaks.
@@ -70,6 +71,11 @@ pub enum CommandCall {
     },
     /// Lists the caller's Chats.
     ChatList,
+    /// Lists a Chat's Files.
+    FileList {
+        /// The Chat.
+        chat: Id,
+    },
     /// Reads a Chat's Messages.
     ChatRead {
         /// The Chat.
@@ -136,8 +142,11 @@ pub struct BotCreate {
 pub struct MessageSend {
     /// The Chat to post in.
     pub chat: Id,
-    /// The Message text.
+    /// The Message text, empty only when the Message carries a File.
     pub text: String,
+    /// The File the Message carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Id>,
 }
 
 /// A frame the Space sends.
@@ -302,4 +311,30 @@ mod tests {
         assert!(text.contains("\"type\":\"event\""));
         assert!(text.contains("\"kind\":\"neha.message.added\""));
     }
+}
+
+/// One File as a client reads it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FileSummary {
+    /// The File.
+    pub id: Id,
+    /// The Chat it belongs to.
+    pub chat: Id,
+    /// Its name.
+    pub name: String,
+    /// Its media type.
+    pub media_type: String,
+    /// Its size in bytes.
+    pub size: u64,
+    /// Its lowercase hex SHA-256.
+    pub sha256: String,
+    /// Who sent it.
+    pub author: Author,
+    /// The User a Bot acted for, when a Bot sent it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acting: Option<Id>,
+    /// When the record holds it.
+    pub at: Timestamp,
+    /// The cursor of the event that recorded it.
+    pub seq: Seq,
 }

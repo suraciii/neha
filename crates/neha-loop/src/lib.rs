@@ -5,9 +5,11 @@
 //! its steps and actions through a [`run::Recorder`]. The Space supplies the
 //! Model adapter and the record implementation.
 
+pub mod files;
 pub mod model;
 pub mod run;
 pub mod tools;
 
+pub use files::{DeliveredFile, FileHost, TakenFile};
 pub use model::{Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall, ToolSpec};
 pub use run::{LoopError, Recorder, RunOutcome, RunRequest, run};

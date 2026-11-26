@@ -16,6 +16,7 @@ futures-util.workspace = true
 neha = { path = "../neha" }
 neha-computer = { path = "../neha-computer" }
 neha-loop = { path = "../neha-loop" }
+opendal.workspace = true
 rand = "0.9"
 reqwest = { workspace = true, default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
