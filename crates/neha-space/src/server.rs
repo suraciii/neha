@@ -103,7 +103,7 @@ pub struct SpaceServer {
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
     /// Set once the Space stops: no command may then start new work.
     closed: AtomicBool,
-    runs: Arc<RunQueue>,
+    pub(crate) runs: Arc<RunQueue>,
     uploads: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
     ui: Option<PathBuf>,
     session_cookie: String,
@@ -1318,7 +1318,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         // A recorded command answers from the record; it must not
                         // hold the Bot's place while it waits for the run's result.
                         let replayed = match &command {
-                            CommandCall::MessageSend(_) => {
+                            CommandCall::MessageSend(_) | CommandCall::BotMove { .. } => {
                                 matches!(server.store.command(id).await, Ok(Some(_)))
                             }
                             _ => false,
@@ -1329,6 +1329,14 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         // submissions of one id may both miss the record and take
                         // the lock; the second then finds the record and waits for
                         // its result. That tiny race settles on the same answer.
+                        //
+                        // A move takes the same lock for its whole command: its
+                        // check of the Bot's Computer and the event it appends must
+                        // not interleave with another move, or the record would
+                        // hold an event the projection refuses. The Computer the
+                        // command saw before waiting is compared under the lock: a
+                        // move that waited behind another move is refused instead
+                        // of silently becoming a second, different move.
                         let admit = match &command {
                             CommandCall::MessageSend(message) if !replayed => {
                                 let bot = server.state.lock().ok().and_then(|state| {
@@ -1338,6 +1346,32 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                                     Some(bot) => Some(server.runs.admit(bot).await),
                                     None => None,
                                 }
+                            }
+                            CommandCall::BotMove { bot, .. } if !replayed => {
+                                let observed = server.state.lock().ok().and_then(|state| {
+                                    state.bots.get(bot).map(|bot| bot.computer)
+                                });
+                                let guard = server.runs.admit(*bot).await;
+                                let current = server.state.lock().ok().and_then(|state| {
+                                    state.bots.get(bot).map(|bot| bot.computer)
+                                });
+                                if current != observed {
+                                    drop(guard);
+                                    let moved = ApiError::invalid_argument(
+                                        "the Bot moved while the command was waiting; show it and try again",
+                                    );
+                                    let _ = send(
+                                        &out,
+                                        ServerFrame::Error {
+                                            id: Some(id),
+                                            code: moved.code(),
+                                            message: moved.to_string(),
+                                        },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                Some(guard)
                             }
                             _ => None,
                         };
@@ -6805,11 +6839,94 @@ mod tests {
         }
     }
 
+    /// Sends one command without waiting for its answer.
+    async fn send_command(socket: &mut Socket, id: Id, command: CommandCall) {
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ClientFrame::Command { id, command })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// Waits until the server accepts a command it was sent.
+    async fn expect_accepted(socket: &mut Socket, id: Id) {
+        loop {
+            match next_frame(socket).await {
+                ServerFrame::Accepted { id: answered } => {
+                    assert_eq!(answered, id);
+                    return;
+                }
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. } => {}
+                other => panic!("expected Accepted for {id}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Waits for a sent command's answer.
+    async fn expect_answer(socket: &mut Socket, id: Id) -> Result<Value, (ErrorCode, String)> {
+        loop {
+            match next_frame(socket).await {
+                ServerFrame::Committed { .. } => {}
+                ServerFrame::Confirmed {
+                    id: answered,
+                    result,
+                } => {
+                    assert_eq!(answered, id);
+                    return Ok(result);
+                }
+                ServerFrame::Error {
+                    id: Some(answered),
+                    code,
+                    message,
+                } => {
+                    assert_eq!(answered, id);
+                    return Err((code, message));
+                }
+                ServerFrame::Error { id: None, .. }
+                | ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. } => {}
+                other => panic!("expected an answer for {id}, got {other:?}"),
+            }
+        }
+    }
+
     fn add_bot(name: &str, computer: Option<Id>) -> CommandCall {
         CommandCall::BotCreate(BotCreate {
             name: name.to_owned(),
             computer,
         })
+    }
+
+    /// Returns a distinct machine token so a Space can pair several fakes.
+    fn machine_token_n(seed: u8) -> String {
+        URL_SAFE_NO_PAD.encode([seed; 32])
+    }
+
+    /// Pairs a fake machine whose token is `token` and returns its Computer.
+    async fn paired_computer_with_token(
+        socket: &mut Socket,
+        running: &Running,
+        token: &str,
+    ) -> (Id, String) {
+        let response = pair_start(
+            running,
+            &pair_body("laptop", MACHINE_WORKSPACE, token, &machine_poll()),
+        )
+        .await;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        let code = body["code"].as_str().unwrap().to_owned();
+        let added = command(socket, Id::new(), add_computer(&code)).await;
+        let computer: Id = serde_json::from_value(added["id"].clone()).unwrap();
+        assert_eq!(added["kind"], "real");
+
+        (computer, token.to_owned())
     }
 
     /// Pairs a fake machine and approves it, returning its Computer and token.
@@ -8084,5 +8201,613 @@ mod tests {
             .count();
         assert_eq!(shared, 2, "two Bots share the one real Computer");
         assert_eq!(dir.path(), root, "the record lives in the Space's home");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_moves_to_another_real_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (first, _first_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(1)).await;
+        let (second, _second_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(2)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(first))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        let command_id = Id::new();
+        let moved = command(
+            &mut socket,
+            command_id,
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert_eq!(moved["bot"]["id"], json!(bot));
+        assert_eq!(moved["bot"]["computer"], json!(second));
+        assert_eq!(moved["from"]["id"], json!(first));
+        assert_eq!(moved["from"]["kind"], "real");
+        assert_eq!(moved["to"]["id"], json!(second));
+        assert_eq!(moved["to"]["kind"], "real");
+
+        // Replaying the command answers the recorded result and writes nothing.
+        let again = command(
+            &mut socket,
+            command_id,
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert_eq!(again, moved);
+
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["computer"]["id"], json!(second));
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        assert_eq!(
+            listed.as_array().map(Vec::len),
+            Some(2),
+            "a move never creates a Computer"
+        );
+
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let events = record(&root).await;
+        let moves: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::BotMoved)
+            .collect();
+        assert_eq!(moves.len(), 1, "one command writes one move event");
+        assert_eq!(
+            moves[0].data,
+            json!({"bot": bot, "from": first, "to": second})
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_checks_the_bot_and_both_computers() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (first, _first_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(3)).await;
+        let (second, _second_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(4)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(first))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let managed = command(&mut socket, Id::new(), add_bot("Managed", None)).await;
+        let managed_bot: Id = serde_json::from_value(managed["bot"]["id"].clone()).unwrap();
+        let managed_computer: Id =
+            serde_json::from_value(managed["computer"]["id"].clone()).unwrap();
+
+        let same = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: first,
+            },
+        )
+        .await;
+        match same {
+            Err((ErrorCode::InvalidArgument, message)) => assert!(
+                message.contains("already works on that Computer"),
+                "{message}"
+            ),
+            other => panic!("a Bot cannot move to its own Computer: {other:?}"),
+        }
+
+        let unknown_computer = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: Id::new(),
+            },
+        )
+        .await;
+        assert!(matches!(unknown_computer, Err((ErrorCode::NotFound, _))));
+
+        let unknown_bot = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot: Id::new(),
+                computer: second,
+            },
+        )
+        .await;
+        assert!(matches!(unknown_bot, Err((ErrorCode::NotFound, _))));
+
+        let managed_target = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: managed_computer,
+            },
+        )
+        .await;
+        match managed_target {
+            Err((ErrorCode::InvalidArgument, message)) => {
+                assert!(
+                    message.contains("a Bot moves to a real Computer"),
+                    "{message}"
+                );
+            }
+            other => panic!("a managed target is refused: {other:?}"),
+        }
+
+        let managed_source = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot: managed_bot,
+                computer: second,
+            },
+        )
+        .await;
+        match managed_source {
+            Err((ErrorCode::InvalidArgument, message)) => assert!(
+                message.contains("cannot move yet"),
+                "a managed source explains the gap: {message}"
+            ),
+            other => panic!("a Bot on a managed Computer cannot move: {other:?}"),
+        }
+
+        // Another User's Bot and Computer are not found, exactly like missing
+        // ones: the caller learns nothing about them.
+        let identity = crate::identity::Identity::open(&Home::open(running.server_home()).unwrap())
+            .await
+            .unwrap();
+        identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let mut grace = open_socket(&running, &grace_token).await;
+        let (grace_computer, _grace_machine) =
+            paired_computer_with_token(&mut grace, &running, &machine_token_n(5)).await;
+        let grace_created = command(
+            &mut grace,
+            Id::new(),
+            add_bot("Grace Bot", Some(grace_computer)),
+        )
+        .await;
+        let grace_bot: Id = serde_json::from_value(grace_created["bot"]["id"].clone()).unwrap();
+        let foreign_bot = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot: grace_bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert!(matches!(foreign_bot, Err((ErrorCode::NotFound, _))));
+        let foreign_computer = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: grace_computer,
+            },
+        )
+        .await;
+        assert!(matches!(foreign_computer, Err((ErrorCode::NotFound, _))));
+
+        // None of the refusals moved the Bot.
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["computer"]["id"], json!(first));
+        let moved = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert_eq!(moved["bot"]["computer"], json!(second));
+
+        grace.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_run_follows_its_bot_to_another_computer() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("shell", json!({"command": "pwd"})),
+            text("done on the new Computer"),
+        ])
+        .await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let (old, _old_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(6)).await;
+        let (new, new_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(7)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(old))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let mut device = connect_computer(&running, &new_machine, new).await;
+        wait_online(&mut socket, new).await;
+
+        // The old Computer is offline, so the run waits for it.
+        let queued = submit(&mut socket, chat, "run pwd", None).await;
+        let run = run_of(&queued);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(show_run(&mut socket, run).await["status"], "queued");
+
+        // Moving the Bot wakes its pump: the waiting run starts on the new
+        // Computer without the old one ever connecting.
+        let moved = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove { bot, computer: new },
+        )
+        .await;
+        assert_eq!(moved["bot"]["computer"], json!(new));
+        let (id, named, action) = match next_host_frame(&mut device).await {
+            HostFrame::Action { id, bot, action } => (id, bot, action),
+            other => panic!("expected an action frame, got {other:?}"),
+        };
+        assert_eq!(named, bot.to_string());
+        assert_eq!(
+            action,
+            WireAction::Shell {
+                command: "pwd".to_owned()
+            }
+        );
+        reply_action(
+            &mut device,
+            id,
+            ActionStatus::Succeeded,
+            "/home/ada/.neha/workspace/scout",
+        )
+        .await;
+
+        let shown = wait_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert_eq!(shown["actions"][0]["status"], "succeeded");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(
+            messages.as_array().unwrap().last().unwrap()["text"],
+            "done on the new Computer"
+        );
+
+        device.close(None).await.unwrap();
+        provider_task.abort();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_moves_of_one_bot_record_one_event() {
+        let (dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap().to_owned();
+        let mut first = open_socket(&running, &token).await;
+        let mut second = open_socket(&running, &token).await;
+        let (a, _a_machine) =
+            paired_computer_with_token(&mut first, &running, &machine_token_n(10)).await;
+        let (b, _b_machine) =
+            paired_computer_with_token(&mut first, &running, &machine_token_n(11)).await;
+        let (c, _c_machine) =
+            paired_computer_with_token(&mut first, &running, &machine_token_n(12)).await;
+        let created = command(&mut first, Id::new(), add_bot("Scout", Some(a))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // Hold the Bot's lock so both move commands are observably waiting:
+        // each reads the Bot's Computer (A) before taking the lock. Once it is
+        // released the first command moves; the other still holds A as what it
+        // saw, so it is refused instead of becoming a second, different move.
+        let held = running.server.runs.admit(bot).await;
+        let first_id = Id::new();
+        let second_id = Id::new();
+        send_command(
+            &mut first,
+            first_id,
+            CommandCall::BotMove { bot, computer: b },
+        )
+        .await;
+        send_command(
+            &mut second,
+            second_id,
+            CommandCall::BotMove { bot, computer: c },
+        )
+        .await;
+        expect_accepted(&mut first, first_id).await;
+        expect_accepted(&mut second, second_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(held);
+
+        let one = expect_answer(&mut first, first_id).await;
+        let two = expect_answer(&mut second, second_id).await;
+        let (winner, loser) = match (one, two) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            (one, two) => panic!("exactly one move must win: {one:?} / {two:?}"),
+        };
+        assert!(
+            matches!(loser.0, ErrorCode::InvalidArgument),
+            "the losing move is refused: {loser:?}"
+        );
+        assert!(
+            loser.1.contains("moved while the command was waiting"),
+            "{loser:?}"
+        );
+        let winner_computer: Id =
+            serde_json::from_value(winner["bot"]["computer"].clone()).unwrap();
+        assert!(winner_computer == b || winner_computer == c);
+        let target: Id = serde_json::from_value(winner["to"]["id"].clone()).unwrap();
+        assert_eq!(target, winner_computer);
+
+        let root = running.server_home();
+        first.close(None).await.unwrap();
+        second.close(None).await.unwrap();
+        running.shutdown().await;
+        let events = record(&root).await;
+        let moves: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::BotMoved)
+            .collect();
+        assert_eq!(moves.len(), 1, "only the winning move is recorded");
+        assert_eq!(moves[0].data["from"], json!(a));
+        assert_eq!(moves[0].data["to"], json!(winner_computer));
+
+        // The record replays: a restart keeps the Bot on the winning Computer.
+        let restarted = start(Home::open(dir.path()).unwrap(), 0).await.unwrap();
+        let restarted_token = sign_in(&restarted, "Ada").await;
+        let mut restarted_socket = open_socket(&restarted, &restarted_token).await;
+        let shown = command(
+            &mut restarted_socket,
+            Id::new(),
+            CommandCall::BotShow { bot },
+        )
+        .await;
+        assert_eq!(shown["computer"]["id"], json!(winner_computer));
+        restarted_socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_and_a_move_agree_on_the_records_order() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let rounds = 30;
+        let mut script = Vec::new();
+        for round in 0..rounds {
+            script.push(tool("shell", json!({"command": "echo hi"})));
+            script.push(text(&format!("done {round}")));
+        }
+        let (base, provider_task) = scripted_provider(script).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let (old, old_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(20)).await;
+        let (new, new_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(21)).await;
+        let mut old_device = connect_computer(&running, &old_machine, old).await;
+        let mut new_device = connect_computer(&running, &new_machine, new).await;
+        wait_online(&mut socket, old).await;
+        wait_online(&mut socket, new).await;
+
+        for round in 0..rounds {
+            let created = command(
+                &mut socket,
+                Id::new(),
+                add_bot(&format!("Scout{round}"), Some(old)),
+            )
+            .await;
+            let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+            let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+            let queued = submit(&mut socket, chat, "run echo", None).await;
+            let run = run_of(&queued);
+            // The pump and this move race for the Bot's admit lock. Whichever
+            // records first decides which Computer the run uses.
+            let moved = command(
+                &mut socket,
+                Id::new(),
+                CommandCall::BotMove { bot, computer: new },
+            )
+            .await;
+            assert_eq!(moved["bot"]["computer"], json!(new));
+
+            let (from_old, frame) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    tokio::select! {
+                        frame = next_host_frame(&mut old_device) => (true, frame),
+                        frame = next_host_frame(&mut new_device) => (false, frame),
+                    }
+                })
+                .await
+                .expect("the run must reach one of the Computers");
+            let (id, named, action) = match frame {
+                HostFrame::Action { id, bot, action } => (id, bot, action),
+                other => panic!("expected an action frame, got {other:?}"),
+            };
+            assert_eq!(named, bot.to_string());
+            assert_eq!(
+                action,
+                WireAction::Shell {
+                    command: "echo hi".to_owned()
+                }
+            );
+            let answer = format!("done {round}");
+            if from_old {
+                reply_action(&mut old_device, id, ActionStatus::Succeeded, &answer).await;
+            } else {
+                reply_action(&mut new_device, id, ActionStatus::Succeeded, &answer).await;
+            }
+            assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+            let events = running
+                .server
+                .store
+                .events_from(Seq::ZERO, 100_000)
+                .await
+                .unwrap()
+                .events;
+            let started = events
+                .iter()
+                .find(|event| {
+                    event.kind == EventKind::RunStarted && event.data["run"] == json!(run)
+                })
+                .expect("the run started")
+                .seq;
+            let moved = events
+                .iter()
+                .find(|event| event.kind == EventKind::BotMoved && event.data["bot"] == json!(bot))
+                .expect("the move was recorded")
+                .seq;
+            if started < moved {
+                assert!(
+                    from_old,
+                    "round {round}: a run started before the move must use the old Computer"
+                );
+            } else {
+                assert!(
+                    !from_old,
+                    "round {round}: a run started after the move must use the new Computer"
+                );
+            }
+        }
+
+        // Every round's interleaving replays without a projection error.
+        let root = running.server_home();
+        old_device.close(None).await.unwrap();
+        new_device.close(None).await.unwrap();
+        provider_task.abort();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(Home::open(root).unwrap(), 0).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_does_not_outrun_a_run_that_saw_the_old_computer() {
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap().to_owned();
+        let mut admin = open_socket(&running, &token).await;
+        let mut mover = open_socket(&running, &token).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("shell", json!({"command": "echo hi"})),
+            text("done"),
+        ])
+        .await;
+        command(&mut admin, Id::new(), provider_add(base)).await;
+        let (old, old_machine) =
+            paired_computer_with_token(&mut admin, &running, &machine_token_n(30)).await;
+        let (new, new_machine) =
+            paired_computer_with_token(&mut admin, &running, &machine_token_n(31)).await;
+        let mut old_device = connect_computer(&running, &old_machine, old).await;
+        let mut new_device = connect_computer(&running, &new_machine, new).await;
+        wait_online(&mut admin, old).await;
+        wait_online(&mut admin, new).await;
+        let created = command(&mut admin, Id::new(), add_bot("Scout", Some(old))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+
+        // Pause the pump after it snapshot the run on the old Computer.
+        let (reached, release) = crate::runs::pause_start_for_test(bot);
+        let queued = submit(&mut admin, chat, "run echo", None).await;
+        let run = run_of(&queued);
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+            .await
+            .expect("the pump reaches the pause");
+
+        // The move lands while the pump stands between its snapshot and
+        // `RunStarted`. With the per-Bot lock the move cannot commit until the
+        // pump records the start; without it, the move commits first.
+        let move_id = Id::new();
+        let mover_task = tokio::spawn(async move {
+            try_command(
+                &mut mover,
+                move_id,
+                CommandCall::BotMove { bot, computer: new },
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if running
+                .server
+                .store
+                .command(move_id)
+                .await
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        release.notify_one();
+        let moved = mover_task.await.unwrap().expect("the move succeeds");
+        assert_eq!(moved.1["bot"]["computer"], json!(new));
+
+        // The run still starts on the Computer it snapshot (the old one)...
+        let (from_old, frame) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                frame = next_host_frame(&mut old_device) => (true, frame),
+                frame = next_host_frame(&mut new_device) => (false, frame),
+            }
+        })
+        .await
+        .expect("the run starts");
+        assert!(
+            from_old,
+            "a run paused after its snapshot keeps the old Computer"
+        );
+        let (id, named, action) = match frame {
+            HostFrame::Action { id, bot, action } => (id, bot, action),
+            other => panic!("expected an action frame, got {other:?}"),
+        };
+        assert_eq!(named, bot.to_string());
+        assert_eq!(
+            action,
+            WireAction::Shell {
+                command: "echo hi".to_owned()
+            }
+        );
+        reply_action(&mut old_device, id, ActionStatus::Succeeded, "hi").await;
+        assert_eq!(wait_run(&mut admin, run).await["status"], "succeeded");
+
+        // ...and the record puts the move after that start.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let started = events
+            .iter()
+            .find(|event| event.kind == EventKind::RunStarted && event.data["run"] == json!(run))
+            .expect("the run started")
+            .seq;
+        let moved_seq = events
+            .iter()
+            .find(|event| event.kind == EventKind::BotMoved && event.data["bot"] == json!(bot))
+            .expect("the move was recorded")
+            .seq;
+        assert!(
+            started < moved_seq,
+            "RunStarted must be recorded before the interleaved move"
+        );
+
+        old_device.close(None).await.unwrap();
+        new_device.close(None).await.unwrap();
+        provider_task.abort();
+        admin.close(None).await.unwrap();
+        running.shutdown().await;
     }
 }

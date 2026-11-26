@@ -47,6 +47,12 @@ A managed Computer keeps its durable files in a workspace the Space holds. A rea
 
 A real Computer keeps its Bots' Workspaces in one directory on the machine. Each Bot has its own Workspace in that directory, and the actions of a run start in it.
 
+## Moving a Bot
+
+A move is recorded as an Authority event. A run fixes the Bot's Computer when it starts, so a run already under way ends on the old Computer, and a run that starts after the move uses the new one.
+
+Working files do not migrate. The old Computer keeps them, and the new Computer gives the Bot a Workspace of its own.
+
 ## Isolation
 
 A Computer is the unit of isolation.

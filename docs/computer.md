@@ -43,7 +43,7 @@ target/debug/neha computer run
 
 A saved pairing whose Workspace is inside the configuration directory is refused. Run `computer pair` again, or pair with `--workspace` outside that directory.
 
-Re-pairing adds a new Computer; the Bots on the old one stay bound to it. Their Workspaces and any queued work stay behind, and nothing moves automatically. Create a new Bot on the new Computer with `neha bot create --computer`, or wait for the capability that changes a Bot's Computer.
+Re-pairing adds a new Computer; the Bots on the old one stay bound to it, and their Workspaces and queued work stay there. Move a Bot to the new Computer with `neha bot move`; [Moving a Bot](#moving-a-bot) covers the details.
 
 ## Create a Bot on the machine
 
@@ -91,6 +91,22 @@ The daemon checks a Bot's folder before it serves it. A hard link, a symlink, or
 
 A machine whose `bubblewrap` cannot start a sandbox does not serve as a Computer.
 
+## Moving a Bot
+
+Move a Bot from one of your real Computers to another:
+
+```bash
+target/debug/neha bot move <bot-id> --computer <computer-id>
+```
+
+The command prints the Computer the Bot now works on. The Bot's memory, its Chats, and the Files it delivered stay with it.
+
+The old Computer keeps the Bot's folder, so work the Bot did not deliver stays there. Moving does not copy files: the Bot's first action on the new Computer creates its folder when it does not exist; when it does exist, for example when a second Computer on the same machine reuses one `--workspace`, the Bot uses the files already there. To show an empty folder on one machine, give the new Computer its own `--workspace`.
+
+A run already under way finishes on the old Computer. A run that starts after the move uses the new Computer, including a request that was still waiting in the queue.
+
+The old Computer may be offline when you move the Bot. If the new Computer is offline too, the move is still recorded, and waiting work runs when it comes back. A Bot on a managed Computer cannot move: create a new Bot on the target Computer instead.
+
 ## While the machine is offline
 
 A Computer is online while its daemon holds the channel to the Space. If the daemon stops, the Computer shows as offline in `neha computer list`, and a Message sent to one of its Bots waits in the record.
@@ -124,7 +140,7 @@ The machine ends the command it was running when the channel drops, so no action
 - The Space listens on loopback only, so this milestone pairs a machine on the host that runs the Space. Remote pairing needs a Space reachable over the network.
 - Granted folders and the `full-access` switch are not available. A Bot's write range stays its own Workspace, and its owner cannot widen that range.
 - A request cannot choose a working directory. Every run starts in the Bot's Workspace.
-- A Bot cannot change its Computer. It stays on the Computer it was created on.
+- Moving a Bot from a managed Computer is not available, and carrying its Workspace is not specified.
 - There is no approval gate. A Bot runs an action as soon as the Model asks for it.
 - The screen and process streams are not shown or carried by this channel yet.
 - A run interrupted by a lost connection fails and does not resume.

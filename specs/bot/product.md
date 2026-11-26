@@ -34,6 +34,10 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 
 [Model](../model/product.md) covers connecting Providers and choosing a Model.
 
+## Moving a Bot
+
+[Computer](../computer/product.md#assigning-a-computer) covers who can move a Bot and where. Its memory, its Chats, and the Files it delivered stay with it, and it starts in its own Workspace on the new Computer. Work it did not deliver stays on the old Computer.
+
 ## Memory
 
 A Bot keeps what it learns as memory entries. The default scope is the owner's Chats; a Chat entry belongs to that Chat's User, and a Group entry belongs to the Group.

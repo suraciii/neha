@@ -378,6 +378,18 @@ impl Projection for State {
                     },
                 );
             }
+            EventData::BotMoved(data) => {
+                let Some(bot) = self.bots.get_mut(&data.bot) else {
+                    return Err("a moved Bot must exist".to_owned());
+                };
+                if bot.computer != data.from {
+                    return Err("a move starts from the Bot's Computer".to_owned());
+                }
+                if !self.computers.contains_key(&data.to) {
+                    return Err("a move goes to an existing Computer".to_owned());
+                }
+                bot.computer = data.to;
+            }
             EventData::ComputerCreated(data) => {
                 self.computers.insert(
                     data.computer,
@@ -953,5 +965,110 @@ mod tests {
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.seq, Seq::from_i64(5).unwrap());
         assert_eq!(state.active_runs(bot_id), vec![view]);
+    }
+
+    #[test]
+    fn a_move_changes_the_bots_computer() {
+        let owner = Id::new();
+        let (from, to, bot, chat) = (Id::new(), Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, from);
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": to,
+                    "owner": owner,
+                    "kind": "real",
+                    "workspace": "/home/ada/neha",
+                }),
+                4,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].computer, from);
+
+        state
+            .apply(&event(
+                EventKind::BotMoved,
+                Author::User(owner),
+                serde_json::json!({"bot": bot, "from": from, "to": to}),
+                5,
+            ))
+            .unwrap();
+
+        assert_eq!(state.bots[&bot].computer, to);
+        assert_eq!(state.bots[&bot].id, bot);
+    }
+
+    #[test]
+    fn a_moved_bot_must_exist() {
+        let owner = Id::new();
+        let mut state = State::default();
+        let error = state
+            .apply(&event(
+                EventKind::BotMoved,
+                Author::User(owner),
+                serde_json::json!({"bot": Id::new(), "from": Id::new(), "to": Id::new()}),
+                1,
+            ))
+            .unwrap_err();
+
+        assert_eq!(error, "a moved Bot must exist");
+    }
+
+    #[test]
+    fn a_move_starts_from_the_bots_computer() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        let other = Id::new();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": other,
+                    "owner": owner,
+                    "kind": "real",
+                    "workspace": "/home/ada/neha",
+                }),
+                4,
+            ))
+            .unwrap();
+
+        let error = state
+            .apply(&event(
+                EventKind::BotMoved,
+                Author::User(owner),
+                serde_json::json!({"bot": bot, "from": other, "to": other}),
+                5,
+            ))
+            .unwrap_err();
+
+        assert_eq!(error, "a move starts from the Bot's Computer");
+        assert_eq!(state.bots[&bot].computer, computer);
+    }
+
+    #[test]
+    fn a_move_goes_to_an_existing_computer() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        let missing = Id::new();
+
+        let error = state
+            .apply(&event(
+                EventKind::BotMoved,
+                Author::User(owner),
+                serde_json::json!({"bot": bot, "from": computer, "to": missing}),
+                4,
+            ))
+            .unwrap_err();
+
+        assert_eq!(error, "a move goes to an existing Computer");
+        assert_eq!(state.bots[&bot].computer, computer);
     }
 }

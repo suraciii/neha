@@ -30,6 +30,8 @@ A real Computer keeps its files on the machine, and the Space keeps no copy.
 
 A Bot's page shows its Computer. The owner picks a managed one or one of the real Computers the owner owns.
 
+Only a Bot's owner can move it from one of their real Computers to another real Computer they own. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
+
 Several Bots can be assigned the same Computer, and then share its files and logins. The Bots on one Computer are not isolated from each other.
 
 ## Adding a real Computer
@@ -48,7 +50,7 @@ A paired Computer connects out to the Space and shows as online or offline.
 
 A Computer that is offline keeps its Bots and their memory, and its Bots work again when it comes back.
 
-A Message sent to a Bot whose Computer is offline waits until the Computer is back. The Chat shows the Computer as offline.
+A Message sent to a Bot waits while the Computer assigned to it is offline. Waiting work starts when that Computer is online, including after a move to another online Computer. A run that already started keeps the Computer it started on; [design](design.md#moving-a-bot) covers the move, and the Chat shows the offline Computer.
 
 ## The panel
 
@@ -94,3 +96,4 @@ A credential never appears in a Chat or a Group.
 ## Gaps
 
 - Waking a sleeping Computer is not yet specified and is low in priority.
+- Moving a Bot from a managed Computer to a real one is not yet specified, including how its Workspace is carried.
