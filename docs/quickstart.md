@@ -175,7 +175,7 @@ Ask the new Bot to work:
 target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
 ```
 
-The Bot works in its own Workspace on the machine, `~/Neha/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a real Computer](computer.md) covers the fence, pairing, and offline behavior.
+The Bot works in its own Workspace on the machine, `~/Neha/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, and the file tools check their own write paths. [Add a real Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
 
 ## Send a file
 

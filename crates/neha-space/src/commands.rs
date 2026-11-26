@@ -135,6 +135,9 @@ pub async fn execute(
         CommandCall::BotCreate(arguments) => {
             bot_create(context, account, command_id, fingerprint, arguments).await
         }
+        CommandCall::BotMove { bot, computer } => {
+            bot_move(context, account, command_id, fingerprint, bot, computer).await
+        }
         CommandCall::BotList => read(context.state, |state| {
             let bots: Vec<&BotView> = state
                 .bots
@@ -405,6 +408,98 @@ async fn bot_create(
         committed: appended.events.last().map(|event| event.seq),
         result,
         queued: None,
+        events: appended.events,
+    })
+}
+
+/// Moves a Bot to another real Computer its owner paired.
+///
+/// A move only writes the record: the Bot keeps its Chat, Messages, memory,
+/// and delivered Files, while its working files stay on the old machine. The
+/// run queue is woken so runs that were waiting for the old Computer start on
+/// the new one; a run already working keeps the Computer it started on.
+async fn bot_move(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    bot: Id,
+    computer: Id,
+) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+
+    let (bot_view, from_view, to_view) = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let bot_view = state
+            .owned_bot(bot, account.id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such Bot"))?;
+        let from_view = state
+            .computers
+            .get(&bot_view.computer)
+            .cloned()
+            .ok_or_else(|| ApiError::internal("the Bot has no Computer"))?;
+        let to_view = state
+            .computers
+            .get(&computer)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such Computer"))?;
+        if to_view.owner != account.id {
+            return Err(ApiError::not_found("no such Computer"));
+        }
+        (bot_view, from_view, to_view)
+    };
+    if to_view.kind != "real" {
+        return Err(ApiError::invalid_argument("a Bot moves to a real Computer"));
+    }
+    if from_view.kind != "real" {
+        return Err(ApiError::invalid_argument(
+            "a Bot on a managed Computer cannot move yet; create a Bot on the target Computer",
+        ));
+    }
+    if bot_view.computer == computer {
+        return Err(ApiError::invalid_argument(
+            "the Bot already works on that Computer",
+        ));
+    }
+
+    let mut moved = bot_view;
+    moved.computer = computer;
+    let result = json!({
+        "bot": moved,
+        "from": viewed_computer(&from_view, context.links),
+        "to": viewed_computer(&to_view, context.links),
+    });
+    let draft = EventDraft::new(
+        EventKind::BotMoved,
+        Author::User(account.id),
+        json!({"bot": bot, "from": from_view.id, "to": computer}),
+    );
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        // Wakes the Bot's pump: runs that were waiting for the old Computer
+        // can start now. A run already working keeps its start-time snapshot.
+        queued: Some(bot),
         events: appended.events,
     })
 }

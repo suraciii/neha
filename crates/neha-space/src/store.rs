@@ -608,6 +608,15 @@ mod tests {
                     }),
                 )
             }
+            EventKind::BotMoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "bot": Id::new(),
+                    "from": Id::new(),
+                    "to": Id::new(),
+                }),
+            ),
             EventKind::BotCreated => EventDraft::new(
                 kind,
                 Author::User(user),

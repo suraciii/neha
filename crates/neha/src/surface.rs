@@ -69,6 +69,13 @@ pub enum CommandCall {
     ComputerList,
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
+    /// Moves a Bot to another real Computer.
+    BotMove {
+        /// The Bot.
+        bot: Id,
+        /// The real Computer it should work on.
+        computer: Id,
+    },
     /// Lists the caller's Bots.
     BotList,
     /// Shows one Bot.
@@ -282,6 +289,20 @@ mod tests {
             serde_json::from_str("{\"name\":\"bot_create\",\"args\":{\"name\":\"Scout\"}}")
                 .unwrap();
         assert_eq!(old, command);
+    }
+
+    #[test]
+    fn bot_move_round_trips() {
+        let (bot, computer) = (Id::new(), Id::new());
+        let command = CommandCall::BotMove { bot, computer };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"name\":\"bot_move\""), "{text}");
+        assert!(text.contains(&format!("\"bot\":\"{bot}\"")), "{text}");
+        assert!(
+            text.contains(&format!("\"computer\":\"{computer}\"")),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 
     #[test]

@@ -37,6 +37,9 @@ pub enum EventKind {
     /// A Bot was created.
     #[serde(rename = "neha.bot.created")]
     BotCreated,
+    /// A Bot moved to another Computer.
+    #[serde(rename = "neha.bot.moved")]
+    BotMoved,
     /// A Computer was created.
     #[serde(rename = "neha.computer.created")]
     ComputerCreated,
@@ -77,6 +80,7 @@ impl EventKind {
             Self::UserJoined => "neha.user.joined",
             Self::ProviderAdded => "neha.provider.added",
             Self::BotCreated => "neha.bot.created",
+            Self::BotMoved => "neha.bot.moved",
             Self::ComputerCreated => "neha.computer.created",
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
@@ -105,6 +109,7 @@ impl EventKind {
             Self::UserJoined
             | Self::ProviderAdded
             | Self::BotCreated
+            | Self::BotMoved
             | Self::ComputerCreated
             | Self::ChatCreated => EventClass::Authority,
         }
@@ -119,6 +124,7 @@ impl FromStr for EventKind {
             "neha.user.joined" => Ok(Self::UserJoined),
             "neha.provider.added" => Ok(Self::ProviderAdded),
             "neha.bot.created" => Ok(Self::BotCreated),
+            "neha.bot.moved" => Ok(Self::BotMoved),
             "neha.computer.created" => Ok(Self::ComputerCreated),
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
@@ -200,7 +206,9 @@ pub struct Event {
 
 #[cfg(test)]
 mod tests {
-    use super::{Author, EventData, EventDraft, EventKind, FileAdded, FileError, RunQueued};
+    use super::{
+        Author, BotMoved, EventData, EventDraft, EventKind, FileAdded, FileError, RunQueued,
+    };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
     use crate::id::Id;
@@ -211,6 +219,7 @@ mod tests {
             EventKind::UserJoined,
             EventKind::ProviderAdded,
             EventKind::BotCreated,
+            EventKind::BotMoved,
             EventKind::ComputerCreated,
             EventKind::ChatCreated,
             EventKind::MessageAdded,
@@ -240,6 +249,7 @@ mod tests {
         assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionFinished.class(), EventClass::Authority);
         assert_eq!(EventKind::BotCreated.class(), EventClass::Authority);
+        assert_eq!(EventKind::BotMoved.class(), EventClass::Authority);
     }
 
     #[test]
@@ -279,6 +289,49 @@ mod tests {
             assert!(kind.validate_author(user, Some(Id::new())).is_err());
             assert!(kind.validate_author(bot, None).is_err());
         }
+    }
+
+    #[test]
+    fn a_bot_moved_round_trips() {
+        let data = BotMoved {
+            bot: Id::new(),
+            from: Id::new(),
+            to: Id::new(),
+        };
+        let value = serde_json::json!({
+            "bot": data.bot,
+            "from": data.from,
+            "to": data.to,
+        });
+
+        assert_eq!(
+            EventKind::BotMoved.decode(&value).unwrap(),
+            EventData::BotMoved(data.clone())
+        );
+        assert_eq!(
+            serde_json::from_value::<BotMoved>(value.clone()).unwrap(),
+            data
+        );
+
+        let mut unknown = value;
+        unknown["computer"] = serde_json::json!(Id::new());
+        assert!(
+            EventKind::BotMoved.decode(&unknown).is_err(),
+            "a move names exactly its Bot and two Computers"
+        );
+    }
+
+    #[test]
+    fn a_bot_moved_takes_a_user_author() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        assert!(EventKind::BotMoved.validate_author(user, None).is_ok());
+        assert!(EventKind::BotMoved.validate_author(bot, None).is_err());
+        assert!(
+            EventKind::BotMoved
+                .validate_author(user, Some(Id::new()))
+                .is_err()
+        );
     }
 
     #[test]
@@ -445,6 +498,8 @@ pub enum EventData {
     ProviderAdded(ProviderAdded),
     /// A Bot was created.
     BotCreated(BotCreated),
+    /// A Bot moved to another Computer.
+    BotMoved(BotMoved),
     /// A Computer was created.
     ComputerCreated(ComputerCreated),
     /// A Chat was created.
@@ -483,6 +538,7 @@ impl EventKind {
             Self::UserJoined => EventData::UserJoined(decode(data)?),
             Self::ProviderAdded => EventData::ProviderAdded(decode(data)?),
             Self::BotCreated => EventData::BotCreated(decode(data)?),
+            Self::BotMoved => EventData::BotMoved(decode(data)?),
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
@@ -519,6 +575,7 @@ impl EventKind {
             Self::UserJoined
             | Self::ProviderAdded
             | Self::BotCreated
+            | Self::BotMoved
             | Self::ComputerCreated
             | Self::ChatCreated => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
@@ -633,6 +690,18 @@ pub struct BotCreated {
     pub computer: Id,
     /// Its Chat with the owner.
     pub chat: Id,
+}
+
+/// The data of `neha.bot.moved`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotMoved {
+    /// The Bot that moved.
+    pub bot: Id,
+    /// The Computer it worked on.
+    pub from: Id,
+    /// The Computer it works on now.
+    pub to: Id,
 }
 
 /// The data of `neha.computer.created`.

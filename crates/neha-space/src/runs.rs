@@ -144,6 +144,39 @@ impl RunQueue {
     }
 }
 
+/// A test seam: when a test pauses a Bot, its pump waits between snapshotting
+/// the run's Computer and recording `RunStarted`, so a move can be
+/// interleaved deterministically.
+#[cfg(test)]
+type StartPause = (Arc<Notify>, Arc<Notify>);
+
+#[cfg(test)]
+static START_PAUSES: Mutex<Option<HashMap<Id, StartPause>>> = Mutex::new(None);
+
+/// Installs a pause for one Bot's next start; returns (reached, release).
+#[cfg(test)]
+pub(crate) fn pause_start_for_test(bot: Id) -> StartPause {
+    let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut pauses = START_PAUSES.lock().expect("start pause lock");
+    pauses
+        .get_or_insert_with(HashMap::new)
+        .insert(bot, pause.clone());
+
+    pause
+}
+
+#[cfg(test)]
+async fn pause_before_start(bot: Id) {
+    let pause = START_PAUSES
+        .lock()
+        .ok()
+        .and_then(|mut pauses| pauses.as_mut().and_then(|pauses| pauses.remove(&bot)));
+    if let Some((reached, release)) = pause {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
+
 /// Works the runs of one Bot, one at a time.
 async fn work(
     server: Arc<SpaceServer>,
@@ -158,11 +191,24 @@ async fn work(
         }
         // A wake stands for the whole backlog: keep working while the record
         // still holds a run of this Bot that waits.
-        while let Some(run) = next_queued(&server, bot) {
+        loop {
+            // The Bot's admit lock covers choosing a run, snapshotting the
+            // Computer it starts on, and recording `RunStarted`. A `bot_moved`
+            // takes the same lock, so the record's order decides which Computer
+            // the run uses: a run started before the move keeps the old one, and
+            // one started after it uses the new one. The lock is released before
+            // any wait and before the run itself, so commands and the run never
+            // block each other.
+            let admit = server.runs.admit(bot).await;
+            let Some(run) = next_queued(&server, bot) else {
+                drop(admit);
+                break;
+            };
             let pending = match commands::resume_pending(&server.state, &server.secrets, &run).await
             {
                 Ok(pending) => pending,
                 Err(error) => {
+                    drop(admit);
                     let reason = error.to_string();
                     if let Err(failure) = commands::fail_queued_run(
                         &server.store,
@@ -179,12 +225,16 @@ async fn work(
                     continue;
                 }
             };
+            #[cfg(test)]
+            pause_before_start(bot).await;
             if commands::start_run(&server.store, &server.state, &server.events, &pending)
                 .await
                 .is_err()
             {
+                drop(admit);
                 return;
             }
+            drop(admit);
             match commands::finish_run(
                 &server.store,
                 &server.state,

@@ -136,6 +136,14 @@ enum BotCommand {
         #[arg(long)]
         computer: Option<Id>,
     },
+    /// Move your Bot to another real Computer you own.
+    Move {
+        /// The Bot identifier.
+        bot: Id,
+        /// The real Computer it should work on.
+        #[arg(long)]
+        computer: Id,
+    },
     /// Show your Bot, its Chat, and its Computer.
     Show {
         /// The Bot identifier.
@@ -471,6 +479,18 @@ async fn bot(command: BotCommand) -> Result<()> {
             println!(
                 "Say hello with: neha chat send --bot {} \"hello\"",
                 id_of(&result["bot"], "id")?
+            );
+        }
+        BotCommand::Move { bot, computer } => {
+            let result =
+                client::command(&credential, CommandCall::BotMove { bot, computer }).await?;
+            println!(
+                "Bot {} ({}) now works on Computer {} ({}, online: {}).",
+                id_of(&result["bot"], "id")?,
+                text_of(&result["bot"], "name")?,
+                id_of(&result["to"], "id")?,
+                text_of(&result["to"], "kind")?,
+                result["to"]["online"].as_bool().unwrap_or(false),
             );
         }
         BotCommand::Show { bot } => {

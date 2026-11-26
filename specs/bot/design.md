@@ -22,6 +22,8 @@ The built-in loop sends a Bot's actions to the Computer: commands, file reads an
 
 An outside harness is a loop that runs on the Bot's Computer. Its work lands in the record as any Bot's work does.
 
+The Bot's Computer can change, and a move changes only where its actions run.
+
 ## State
 
 The record holds a run: its requests, its steps, the actions the Bot took, and what the Bot saw. A demonstration holds what the User did and saw while in control, and never holds a credential.
