@@ -1,4 +1,4 @@
-import { Show, createSignal, createStore, onSettled } from "solid-js";
+import { Show, createSignal, createStore, onCleanup, onSettled } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
@@ -91,8 +91,10 @@ export default function App() {
   const commands = new Commands();
   let runGeneration = 0;
   let following = false;
+  let activeRun: string | null = null;
   let refreshTimer: number | null = null;
   let refreshAgain = false;
+  let previewLoad = 0;
 
   onSettled(() => {
     const query = window.matchMedia("(max-width: 900px)");
@@ -108,6 +110,14 @@ export default function App() {
     }
 
     void boot();
+  });
+
+  onCleanup(() => {
+    if (refreshTimer !== null) {
+      window.clearTimeout(refreshTimer);
+      refreshTimer = null;
+    }
+    void commands.close();
   });
 
   async function startFollowing() {
@@ -152,14 +162,32 @@ export default function App() {
       const file = typeof data.file === "string";
       setPreview(chat, { text, file });
     }
-    if (chat && state.activeChat?.id === chat) {
-      if (event.kind === "neha.run.started") update({ working: true });
-      if (event.kind === "neha.run.finished") update({ working: false });
+    if (event.kind === "neha.run.finished") {
+      const run = typeof data.run === "string" ? data.run : null;
+      const known = activeRun ?? latestRunForActiveChat();
+      // RunFinished carries no Chat. Only the active Chat's Run may unlock it.
+      if (!run || run !== known) return;
+      activeRun = null;
+      update({ working: false });
       queueRefresh();
       return;
     }
-    if (event.kind === "neha.run.finished") update({ working: false });
+    if (chat && state.activeChat?.id === chat) {
+      if (event.kind === "neha.run.started") {
+        const run = typeof data.run === "string" ? data.run : null;
+        if (run) activeRun = run;
+        update({ working: true });
+      }
+      queueRefresh();
+      return;
+    }
     if (event.kind.startsWith("neha.run.") && state.working) queueRefresh();
+  }
+
+  function latestRunForActiveChat(): string | null {
+    const chat = state.activeChat;
+    if (!chat) return null;
+    return [...state.messages].reverse().find((message) => message.chat === chat.id && message.run)?.run ?? null;
   }
 
   function queueRefresh() {
@@ -225,10 +253,12 @@ export default function App() {
   }
 
   async function loadPreviews(chats: Chat[]) {
+    const generation = ++previewLoad;
     if (chats.length === 0) {
-      update({ previews: {} });
+      if (generation === previewLoad) update({ previews: {} });
       return;
     }
+    const before = new Map(chats.map((chat) => [chat.id, state.previews[chat.id]]));
     const previews: Record<string, Preview> = {};
     for (const chat of chats) {
       try {
@@ -239,11 +269,21 @@ export default function App() {
         previews[chat.id] = { error: true };
       }
     }
-    update({ previews });
+    if (generation !== previewLoad) return;
+    setState((draft) => {
+      for (const chat of chats) {
+        // A live event may have written a newer preview while this read ran.
+        const next = previews[chat.id];
+        if (next !== undefined && draft.previews[chat.id] === before.get(chat.id)) {
+          draft.previews[chat.id] = next;
+        }
+      }
+    });
   }
 
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
+    activeRun = null;
     update({ activeChat: chat, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
     try {
       const [messages, files, bot] = await Promise.all([
@@ -271,8 +311,10 @@ export default function App() {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (generation !== runGeneration) return;
       if (view.status === "running") {
+        activeRun = run;
         update({ working: true });
       } else {
+        activeRun = null;
         await refreshActive();
       }
     } catch {
@@ -285,8 +327,10 @@ export default function App() {
     if (!run) return;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
+      activeRun = view.status === "running" ? run : null;
       update({ working: view.status === "running" });
     } catch {
+      activeRun = null;
       update({ working: false });
     }
   }
@@ -440,6 +484,7 @@ export default function App() {
 
   function backToList() {
     runGeneration += 1;
+    activeRun = null;
     update({ activeChat: null, messages: [], files: {}, activeBot: null, activeComputer: null, working: false, error: null });
   }
 
@@ -579,18 +624,24 @@ function messageFor(reason: unknown): string {
 }
 
 const CURSOR_KEY = "neha.record.cursor";
+const MAX_CURSOR = "9223372036854775807";
+
+function isCursor(value: string | null): value is string {
+  if (!value || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
+  return value.length < MAX_CURSOR.length || (value.length === MAX_CURSOR.length && value <= MAX_CURSOR);
+}
 
 function readCursor(): string | null {
   try {
     const value = localStorage.getItem(CURSOR_KEY);
-    return value && /^(0|[1-9][0-9]*)$/.test(value) ? value : null;
+    return isCursor(value) ? value : null;
   } catch {
     return null;
   }
 }
 
 function saveCursor(cursor: string) {
-  if (!/^(0|[1-9][0-9]*)$/.test(cursor)) return;
+  if (!isCursor(cursor)) return;
   try {
     localStorage.setItem(CURSOR_KEY, cursor);
   } catch {

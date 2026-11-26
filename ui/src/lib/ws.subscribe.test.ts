@@ -9,6 +9,7 @@ class FakeSocket {
   static readonly OPEN = 1;
   static readonly CLOSED = 3;
   static instances: FakeSocket[] = [];
+  static pages: Array<{ cursor: string }> = [{ cursor: "5" }];
 
   readyState = FakeSocket.CONNECTING;
   readonly sent: Array<Record<string, unknown>> = [];
@@ -42,10 +43,16 @@ class FakeSocket {
       queueMicrotask(() => this.message({ type: "hello", version: 1 }));
     }
     if (frame.type === "subscribe") {
-      queueMicrotask(() =>
-        this.message({ type: "snapshot", cursor: "5", events: [] }),
-      );
+      for (const page of FakeSocket.pages) {
+        queueMicrotask(() =>
+          this.message({ type: "snapshot", cursor: page.cursor, events: [] }),
+        );
+      }
     }
+  }
+
+  closeLater() {
+    this.readyState = 2;
   }
 
   close() {
@@ -65,6 +72,7 @@ class FakeSocket {
 afterEach(() => {
   vi.unstubAllGlobals();
   FakeSocket.instances = [];
+  FakeSocket.pages = [{ cursor: "5" }];
 });
 
 describe("record subscription", () => {
@@ -105,6 +113,25 @@ describe("record subscription", () => {
     await commands.close();
   });
 
+  it("ignores a delayed close from a socket a newer one replaced", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const handlers: SubscriptionHandlers = { onSnapshot: vi.fn() };
+    const commands = new Commands();
+
+    await commands.subscribe(handlers, { cursor: "2" });
+    await Promise.resolve();
+    const first = FakeSocket.instances[0]!;
+    first.closeLater();
+    await commands.subscribe(handlers, { cursor: "5" });
+    await Promise.resolve();
+    const second = FakeSocket.instances[1];
+    expect(second).toBeDefined();
+    first.close();
+    expect(second!.readyState).toBe(FakeSocket.OPEN);
+    expect(second!.sent.some((frame) => frame.type === "subscribe")).toBe(true);
+    await commands.close();
+  });
+
   it("resubscribes from the last cursor after the socket closes", async () => {
     vi.useFakeTimers();
     try {
@@ -128,6 +155,20 @@ describe("record subscription", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("keeps every page of the opening snapshot initial", async () => {
+    FakeSocket.pages = [{ cursor: "4" }, { cursor: "5" }];
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const handlers: SubscriptionHandlers = { onSnapshot: vi.fn() };
+    const commands = new Commands();
+
+    await commands.subscribe(handlers);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handlers.onSnapshot).toHaveBeenNthCalledWith(1, [], "4", false);
+    expect(handlers.onSnapshot).toHaveBeenNthCalledWith(2, [], "5", false);
+    await commands.close();
   });
 
   it("starts at the beginning when no cursor exists", async () => {

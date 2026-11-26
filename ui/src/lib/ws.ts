@@ -64,7 +64,8 @@ type CommandName =
 interface Following {
   handlers: SubscriptionHandlers;
   cursor: string | null;
-  startedWithCursor: boolean;
+  /** True until the first live event; every page of the opening snapshot is initial. */
+  initialSnapshot: boolean;
   frameSent: boolean;
   limit: number;
 }
@@ -87,6 +88,8 @@ export class Commands {
     }
     this.socket?.close();
     this.socket = null;
+    this.connecting = null;
+    this.hello = null;
     this.rejectAll(new ProtocolError("closed", "The Space connection is closed."));
   }
 
@@ -102,7 +105,7 @@ export class Commands {
     this.following = {
       handlers,
       cursor: options.cursor ?? null,
-      startedWithCursor: Boolean(options.cursor),
+      initialSnapshot: !options.cursor,
       frameSent: false,
       limit: options.limit ?? 200,
     };
@@ -145,6 +148,7 @@ export class Commands {
       return;
     }
     following.frameSent = true;
+    following.initialSnapshot = following.cursor === null;
     const frame: Record<string, unknown> = {
       type: "subscribe",
       id: uuidv7(),
@@ -157,7 +161,8 @@ export class Commands {
   private async ensureConnected(): Promise<void> {
     if (this.socket?.readyState === WebSocket.OPEN) return;
     if (this.connecting) return this.connecting;
-    this.connecting = new Promise<void>((resolve, reject) => {
+
+    const connecting = new Promise<void>((resolve, reject) => {
       const scheme = location.protocol === "https:" ? "wss:" : "ws:";
       const socket = new WebSocket(`${scheme}//${location.host}/api/socket`);
       this.socket = socket;
@@ -175,6 +180,11 @@ export class Commands {
         if (settled) return;
         settled = true;
         window.clearTimeout(timer);
+        if (this.socket !== socket) {
+          socket.close();
+          reject(error);
+          return;
+        }
         this.rejectAll(error);
         reject(error);
         if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
@@ -182,10 +192,16 @@ export class Commands {
         }
       };
       socket.addEventListener("open", () => {
+        if (this.socket !== socket) {
+          fail(new ProtocolError("closed", "A newer Space connection replaced this one."));
+          socket.close();
+          return;
+        }
         if (this.following) this.following.frameSent = false;
         socket.send(JSON.stringify({ type: "hello", version: 1 }));
         this.hello = new Promise<void>((helloResolve, helloReject) => {
           const onHello = (event: MessageEvent) => {
+            if (this.socket !== socket) return;
             const frame = parse(event);
             if (frame?.type === "hello") {
               socket.removeEventListener("message", onHello);
@@ -198,11 +214,16 @@ export class Commands {
           socket.addEventListener("message", onHello);
         });
         this.hello.then(() => {
+          if (this.socket !== socket) {
+            fail(new ProtocolError("closed", "A newer Space connection replaced this one."));
+            return;
+          }
           this.sendSubscribe();
           succeed();
         }, fail);
       });
       socket.addEventListener("message", (event) => {
+        if (this.socket !== socket) return;
         const frame = parse(event);
         if (!frame) return;
         if (frame.type === "hello") return;
@@ -213,17 +234,16 @@ export class Commands {
           if (!following) return;
           const cursor = frame.cursor ?? following.cursor ?? "";
           if (cursor) following.cursor = cursor;
-          const resumed = following.startedWithCursor;
+          const resumed = !following.initialSnapshot;
           following.handlers.onSnapshot?.(frame.events ?? [], cursor, resumed);
           if (cursor) following.handlers.onCursor?.(cursor);
-          following.startedWithCursor = true;
           return;
         }
         if (frame.type === "event") {
           const following = this.following;
           if (!following || !frame.event) return;
           following.cursor = frame.event.seq;
-          following.startedWithCursor = true;
+          following.initialSnapshot = false;
           following.handlers.onEvent?.(frame.event);
           following.handlers.onCursor?.(frame.event.seq);
           return;
@@ -233,6 +253,8 @@ export class Commands {
             this.following?.handlers.onError?.(
               new ProtocolError(frame.code ?? "error", frame.message ?? "The subscription failed."),
             );
+            this.following = null;
+            this.rejectAll(new ProtocolError(frame.code ?? "error", frame.message ?? "The subscription failed."));
             socket.close();
             return;
           }
@@ -255,6 +277,14 @@ export class Commands {
         }
       });
       socket.addEventListener("close", () => {
+        if (this.socket !== socket) {
+          if (!settled) {
+            settled = true;
+            window.clearTimeout(timer);
+            reject(new ProtocolError("closed", "A newer Space connection replaced this one."));
+          }
+          return;
+        }
         this.socket = null;
         this.connecting = null;
         this.hello = null;
@@ -268,12 +298,19 @@ export class Commands {
         this.scheduleReconnect();
       });
       socket.addEventListener("error", () => {
+        if (this.socket !== socket) {
+          socket.close();
+          return;
+        }
         fail(new ProtocolError("network", "The browser cannot reach the Space."));
       });
-    }).finally(() => {
-      this.connecting = null;
     });
-    return this.connecting;
+    let guarded: Promise<void>;
+    guarded = connecting.finally(() => {
+      if (this.connecting === guarded) this.connecting = null;
+    });
+    this.connecting = guarded;
+    return guarded;
   }
 
   private scheduleReconnect(): void {

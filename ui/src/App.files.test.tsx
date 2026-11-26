@@ -15,20 +15,29 @@ const { space, FakeCommands } = vi.hoisted(() => {
   const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
   const computer = { id: "p1", owner: "u1", kind: "managed", online: true, workspace: "/w" };
   const chat = { id: "h1", owner: "u1", bot: "b1" };
+  const otherChat = { id: "h2", owner: "u1", bot: "b1" };
   const space = {
     account,
     bot,
     computer,
     chat,
+    otherChat,
     asked: [] as string[],
     sent: [] as unknown[],
     files: [] as FileSummary[],
     messages: [] as Message[],
+    otherMessages: [] as Message[],
+    chats: [chat] as Chat[],
+    chatDelay: null as null | ((chatId: string) => Promise<void>),
     handlers: null as SubscriptionHandlers | null,
   };
   class FakeCommands {
     async subscribe(handlers: SubscriptionHandlers): Promise<void> {
       space.handlers = handlers;
+    }
+
+    async close(): Promise<void> {
+      space.handlers = null;
     }
 
     async command<T>(name: string, args?: unknown): Promise<T> {
@@ -41,9 +50,12 @@ const { space, FakeCommands } = vi.hoisted(() => {
         case "bot_list":
           return [space.bot] as T;
         case "chat_list":
-          return [space.chat] as T;
-        case "chat_read":
-          return [...space.messages] as T;
+          return [...space.chats] as T;
+        case "chat_read": {
+          const asked = args as { chat: string };
+          await space.chatDelay?.(asked.chat);
+          return (asked.chat === space.chat.id ? [...space.messages] : [...space.otherMessages]) as T;
+        }
         case "file_list":
           return [...space.files] as T;
         case "bot_show":
@@ -95,10 +107,16 @@ function element<T extends Element>(view: ReturnType<typeof render>, selector: s
   return found;
 }
 
-async function openChat() {
+function renderApp() {
   vi.spyOn(api, "me").mockResolvedValue(space.account as Account);
-  const view = render(() => <App />);
+  return render(() => <App />);
+}
+
+async function openChat() {
+  const view = renderApp();
   await waitFor(() => expect(view.container.querySelector("form.composer")).toBeTruthy());
+  await waitFor(() => expect(space.asked).toContain("bot_show"));
+  flush();
   return view;
 }
 
@@ -129,6 +147,9 @@ beforeEach(() => {
   space.sent = [];
   space.files = [];
   space.messages = [];
+  space.otherMessages = [];
+  space.chats = [space.chat];
+  space.chatDelay = null;
   space.handlers = null;
 });
 
@@ -238,6 +259,85 @@ describe("App with Files", () => {
 
     flush(() => fireEvent.click(element(view, ".locale-switch")));
     expect(alertText(view)).toBe("文件上传失败，请重试。");
+  });
+
+  it("keeps a live preview for an inactive Chat while previews load", async () => {
+    space.chats = [space.chat, space.otherChat];
+    space.otherMessages.push({
+      id: "old",
+      chat: "h2",
+      author: { kind: "bot", id: "b1" },
+      acting: "u1",
+      text: "old preview",
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "2",
+      run: null,
+      file: null,
+    });
+    let release: (() => void) | undefined;
+    space.chatDelay = (chatId) =>
+      chatId === "h2" ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve();
+
+    const view = renderApp();
+    await waitFor(() => expect(space.handlers).not.toBeNull());
+    space.handlers?.onEvent?.({
+      seq: "3",
+      kind: "neha.message.added",
+      version: 1,
+      at: "2026-01-01T00:00:01.000Z",
+      author: { kind: "bot", id: "b1" },
+      data: { chat: "h2", text: "new live", file: null, run: null },
+    });
+
+    await waitFor(() => expect(release).toBeDefined());
+    release?.();
+    await waitFor(() => expect(view.container.querySelector("form.composer")).toBeTruthy());
+    await waitFor(() => expect(view.container.textContent).toContain("new live"));
+    expect(view.container.textContent).not.toContain("old preview");
+  });
+
+  it("does not unlock the active Chat when another Run finishes", async () => {
+    space.messages.push({
+      id: "m1",
+      chat: "h1",
+      author: { kind: "user", id: "u1" },
+      acting: null,
+      text: "please work",
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "3",
+      run: null,
+      file: null,
+    });
+    const view = await openChat();
+    space.handlers?.onEvent?.({
+      seq: "7",
+      kind: "neha.run.started",
+      version: 1,
+      at: "2026-01-01T00:00:00.000Z",
+      author: { kind: "bot", id: "b1" },
+      data: { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" },
+    });
+    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+
+    space.handlers?.onEvent?.({
+      seq: "8",
+      kind: "neha.run.finished",
+      version: 1,
+      at: "2026-01-01T00:00:01.000Z",
+      author: { kind: "bot", id: "b1" },
+      data: { run: "another-run", status: "failed", error: "nope" },
+    });
+    expect(element(view, ".msg--working")).toBeTruthy();
+
+    space.handlers?.onEvent?.({
+      seq: "9",
+      kind: "neha.run.finished",
+      version: 1,
+      at: "2026-01-01T00:00:02.000Z",
+      author: { kind: "bot", id: "b1" },
+      data: { run: "r1", status: "failed", error: "nope" },
+    });
+    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
   });
 
   it("refreshes the Chat from a live record event", async () => {
