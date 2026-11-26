@@ -42,7 +42,16 @@ use crate::client::{self, Credential};
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// The runtimes this machine opened, one per Bot, kept across reconnects.
-type Runtimes = Arc<Mutex<HashMap<String, Arc<LocalRuntime>>>>;
+/// What makes one cached runtime different from another.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RuntimeKey {
+    bot: String,
+    full_access: bool,
+    grants: Vec<String>,
+    cwd: Option<String>,
+}
+
+type Runtimes = Arc<Mutex<HashMap<RuntimeKey, Arc<LocalRuntime>>>>;
 
 /// How long the daemon waits before it reconnects to its Space.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -335,6 +344,11 @@ async fn connect_and_serve(
     denied: &[PathBuf],
     runtimes: Runtimes,
 ) -> Result<()> {
+    // A reconnect starts with fresh runtimes: descriptors opened for an older
+    // channel must not outlive it or serve a different access choice.
+    if let Ok(mut runtimes) = runtimes.lock() {
+        runtimes.clear();
+    }
     let mut request = socket_url(&config.space_url)?
         .into_client_request()
         .context("the Space URL is not usable")?;
@@ -716,42 +730,34 @@ fn machine(
 ) -> Result<Arc<LocalRuntime>, String> {
     // The Bot must be one identifier component; reject anything else before
     // touching the filesystem.
-    let folder = folder_for(&config.workspace, bot)?;
-    let mut key = format!(
-        "{bot}\0{}\0{}",
-        access.full_access,
-        access.write_roots.join("\0")
-    );
-    if let Some(working_dir) = working_dir {
-        key.push('\0');
-        key.push_str(working_dir);
-    }
+    folder_for(&config.workspace, bot)?;
+    let key = RuntimeKey {
+        bot: bot.to_owned(),
+        full_access: access.full_access,
+        grants: access.write_roots.clone(),
+        cwd: working_dir.map(ToOwned::to_owned),
+    };
     let mut runtimes = runtimes
         .lock()
         .map_err(|_| "the runtime table is locked".to_owned())?;
     match runtimes.entry(key) {
         Entry::Occupied(entry) => Ok(Arc::clone(entry.get())),
         Entry::Vacant(entry) => {
-            let mut grants = access.write_roots.clone();
-            let runtime = if let Some(working_dir) = working_dir {
-                // A run can ask to work in another folder. Its own folder stays
-                // writable, and the owner's grants still apply.
-                grants.push(folder.to_string_lossy().into_owned());
-                LocalRuntime::machine_with_hidden(working_dir, hidden.to_vec())
-                    .map_err(|error| error.to_string())?
-            } else {
-                // Open the workspace root without following a symlink, then walk
-                // the Bot's folder through descriptors: a swapped path component
-                // can never redirect the runtime outside its folder.
-                let root = LocalRuntime::open_workspace(&config.workspace)
-                    .map_err(|error| error.to_string())?;
-                LocalRuntime::machine_at(&root, bot, hidden.to_vec())
-                    .map_err(|error| error.to_string())?
-            };
-            let runtime = runtime
-                .with_denied(denied.to_vec())
-                .with_machine_access(access.full_access, &grants)
+            // Open the workspace root without following a symlink, then walk
+            // the Bot's folder through descriptors: a swapped path component
+            // can never redirect the runtime outside its folder.
+            let root = LocalRuntime::open_workspace(&config.workspace)
                 .map_err(|error| error.to_string())?;
+            let mut runtime = LocalRuntime::machine_at(&root, bot, hidden.to_vec())
+                .map_err(|error| error.to_string())?
+                .with_denied(denied.to_vec())
+                .with_machine_access(access.full_access, &access.write_roots)
+                .map_err(|error| error.to_string())?;
+            if let Some(working_dir) = working_dir {
+                runtime = runtime
+                    .with_working_dir(working_dir)
+                    .map_err(|error| error.to_string())?;
+            }
             Ok(Arc::clone(entry.insert(Arc::new(runtime))))
         }
     }
@@ -1497,13 +1503,13 @@ mod tests {
     use crate::client::{Credential, SignedIn};
 
     use super::{
-        Config, Runtimes, Socket, answer_is_yes, check_saved_origin, check_ticket_space,
-        choose_ticket, config_directory_from, confirmation_needed, credential_path_from,
-        decode_bytes, default_workspace_from, denied_paths_from, encode_bytes, execute_frame,
-        folder_for, found_tickets, hidden_roots_for, legacy_relative_credential_path,
-        migrate_legacy_credential_for, normalized_space_url, parse_ticket,
-        refuse_older_pairing_from, refuse_workspace, same_origin, saved_session_url, serve_channel,
-        socket_url, standard_config_directory, write_receipt,
+        Config, RuntimeKey, Runtimes, Socket, answer_is_yes, check_saved_origin,
+        check_ticket_space, choose_ticket, config_directory_from, confirmation_needed,
+        credential_path_from, decode_bytes, default_workspace_from, denied_paths_from,
+        encode_bytes, execute_frame, folder_for, found_tickets, hidden_roots_for,
+        legacy_relative_credential_path, migrate_legacy_credential_for, normalized_space_url,
+        parse_ticket, refuse_older_pairing_from, refuse_workspace, same_origin, saved_session_url,
+        serve_channel, socket_url, standard_config_directory, write_receipt,
     };
 
     /// One saved pairing that names a fixed Computer.
@@ -2556,7 +2562,12 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let runtime = LocalRuntime::new(&folder).unwrap();
         let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::from([(
-            bot.to_string(),
+            RuntimeKey {
+                bot: bot.to_string(),
+                full_access: false,
+                grants: Vec::new(),
+                cwd: None,
+            },
             Arc::new(runtime),
         )])));
         let config = Config {
@@ -2660,7 +2671,12 @@ mod tests {
         std::fs::create_dir_all(&folder).unwrap();
         let runtime = LocalRuntime::new(&folder).unwrap();
         let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::from([(
-            bot.to_string(),
+            RuntimeKey {
+                bot: bot.to_string(),
+                full_access: false,
+                grants: Vec::new(),
+                cwd: None,
+            },
             Arc::new(runtime),
         )])));
 

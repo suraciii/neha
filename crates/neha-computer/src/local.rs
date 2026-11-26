@@ -74,6 +74,9 @@ pub struct LocalRuntime {
     /// Extra folders the owner granted for writing, each opened as a
     /// directory descriptor so a later path swap cannot redirect a write.
     grants: Vec<(PathBuf, std::fs::File)>,
+    /// The directory a run works in. It is where relative paths resolve and
+    /// where the shell starts; it is not a writable root by itself.
+    cwd: Option<PathBuf>,
 }
 
 /// Which kind of machine a runtime drives.
@@ -114,6 +117,7 @@ impl LocalRuntime {
             in_flight: AtomicU32::new(0),
             full_access: false,
             grants: Vec::new(),
+            cwd: None,
         })
     }
 
@@ -257,6 +261,7 @@ impl LocalRuntime {
             in_flight: AtomicU32::new(0),
             full_access: false,
             grants: Vec::new(),
+            cwd: None,
         })
     }
 
@@ -305,13 +310,17 @@ impl LocalRuntime {
         }
         let mut roots = Vec::new();
         for grant in grants {
-            let root = std::fs::canonicalize(grant.trim()).map_err(RuntimeError::Io)?;
-            let metadata = std::fs::metadata(&root).map_err(RuntimeError::Io)?;
+            let Ok(root) = std::fs::canonicalize(grant.trim()) else {
+                // The Space may hold a grant from another machine or a folder
+                // that has since gone. It must not take the whole runtime down:
+                // that grant simply grants nothing here.
+                continue;
+            };
+            let Ok(metadata) = std::fs::metadata(&root) else {
+                continue;
+            };
             if !metadata.is_dir() {
-                return Err(RuntimeError::Access(format!(
-                    "the granted folder is not a directory: {}",
-                    root.display()
-                )));
+                continue;
             }
             if self.is_hidden(&root) || self.is_denied(&root) {
                 return Err(RuntimeError::Access(format!(
@@ -319,13 +328,48 @@ impl LocalRuntime {
                     root.display()
                 )));
             }
+            // A grant that contains a hidden root would re-expose it after the
+            // hidden tmpfs is mounted.
+            if self.hidden.iter().any(|hidden| hidden.starts_with(&root)) {
+                return Err(RuntimeError::Access(format!(
+                    "the granted folder contains a hidden path: {}",
+                    root.display()
+                )));
+            }
             if root == self.root || self.grants.iter().any(|(seen, _)| seen == &root) {
                 continue;
             }
-            let file = std::fs::File::open(&root).map_err(RuntimeError::Io)?;
+            let file = match std::fs::File::open(&root) {
+                Ok(file) => file,
+                Err(_) => continue,
+            };
             roots.push((root, file));
         }
         self.grants = roots;
+        Ok(self)
+    }
+
+    /// Sets the directory a run works in.
+    ///
+    /// The directory must exist; it is never created and never becomes a
+    /// writable root. Relative file paths resolve against it and the shell
+    /// starts there.
+    pub fn with_working_dir(mut self, directory: &str) -> Result<Self, RuntimeError> {
+        let path = std::fs::canonicalize(directory.trim()).map_err(RuntimeError::Io)?;
+        let metadata = std::fs::metadata(&path).map_err(RuntimeError::Io)?;
+        if !metadata.is_dir() {
+            return Err(RuntimeError::Access(format!(
+                "the working directory is not a folder: {}",
+                path.display()
+            )));
+        }
+        if self.is_hidden(&path) || self.is_denied(&path) {
+            return Err(RuntimeError::Access(format!(
+                "the working directory is hidden from this Computer: {}",
+                path.display()
+            )));
+        }
+        self.cwd = Some(path);
         Ok(self)
     }
 
@@ -361,6 +405,11 @@ impl LocalRuntime {
     }
 
     /// The path a model asked for, before any mode's rules apply.
+    /// The directory relative paths resolve against.
+    fn base(&self) -> &Path {
+        self.cwd.as_deref().unwrap_or(&self.root)
+    }
+
     fn requested(&self, input: &str) -> Result<PathBuf, String> {
         let input = input.trim();
         if input.is_empty() {
@@ -370,7 +419,7 @@ impl LocalRuntime {
         Ok(if requested.is_absolute() {
             requested.to_path_buf()
         } else {
-            self.root.join(requested)
+            self.base().join(requested)
         })
     }
 
@@ -477,23 +526,23 @@ impl LocalRuntime {
                 let target = if path.is_absolute() {
                     normalize_path(path)
                 } else {
-                    normalize_path(&self.root.join(path))
+                    normalize_path(&self.base().join(path))
                 };
                 if self.is_hidden(&target) || self.is_denied(&target) {
                     return Err(ByteError::Failed(hidden_error(shown)));
                 }
                 if self.full_access {
-                    if let Some(parent) = target.parent()
-                        && let Err(error) = std::fs::create_dir_all(parent)
-                    {
-                        return Err(ByteError::Failed(format!(
-                            "cannot create {}: {error}",
-                            parent.display()
-                        )));
-                    }
-                    std::fs::write(&target, bytes).map_err(|error| {
-                        ByteError::Failed(format!("cannot write {}: {error}", target.display()))
+                    // Full access writes what the machine user can, but still
+                    // goes through an opened root and no-follow components, so
+                    // a symlink cannot redirect the write around the hidden
+                    // roots the sandbox overlays.
+                    let relative = target
+                        .strip_prefix("/")
+                        .map_err(|_| ByteError::Failed("the path is not absolute".to_owned()))?;
+                    let root = std::fs::File::open("/").map_err(|error| {
+                        ByteError::Failed(format!("cannot open the machine root: {error}"))
                     })?;
+                    write_machine_file(&root, &relative.to_string_lossy(), bytes)?;
                     return Ok(shown.to_owned());
                 }
                 let written = if let Ok(relative) = target.strip_prefix(&self.root) {
@@ -786,30 +835,42 @@ impl LocalRuntime {
                 process
             }
             Mode::Machine { bwrap, folder } => {
-                if self.full_access {
-                    let mut process = Command::new("sh");
-                    process
-                        .arg("-c")
-                        .arg(command)
-                        .current_dir(&self.root)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .env_clear()
-                        .env("PATH", SHELL_PATH)
-                        .env("HOME", &self.root)
-                        .env("TMPDIR", SANDBOX_TMPDIR)
-                        .kill_on_drop(true);
-                    return process;
-                }
                 #[cfg(unix)]
                 let source = folder_mount_source();
                 #[cfg(not(unix))]
                 let source = self.root.as_os_str().to_owned();
-                let write_roots: Vec<PathBuf> =
-                    self.grants.iter().map(|(root, _)| root.clone()).collect();
-                let mut process =
-                    sandbox_command(bwrap, &source, &self.root, &self.hidden, &write_roots);
+                #[cfg(unix)]
+                let (write_roots, grant_fds): (
+                    Vec<(OsString, PathBuf)>,
+                    Vec<libc::c_int>,
+                ) = self
+                    .grants
+                    .iter()
+                    .map(|(root, file)| {
+                        use std::os::fd::AsRawFd as _;
+                        (
+                            (
+                                OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+                                root.clone(),
+                            ),
+                            file.as_raw_fd(),
+                        )
+                    })
+                    .unzip();
+                #[cfg(not(unix))]
+                let (write_roots, grant_fds): (
+                    Vec<(OsString, PathBuf)>,
+                    Vec<libc::c_int>,
+                ) = (Vec::new(), Vec::new());
+                let mut process = sandbox_command(
+                    bwrap,
+                    &source,
+                    &self.root,
+                    self.base(),
+                    &self.hidden,
+                    &write_roots,
+                    self.full_access,
+                );
                 // The parent keeps this descriptor close-on-exec, so other
                 // runtimes' folders are never inherited. In the child, after
                 // fork and before exec, move this runtime's folder descriptor
@@ -835,6 +896,11 @@ impl LocalRuntime {
                             if libc::fcntl(MOUNT_FD, libc::F_SETFD, 0) < 0 {
                                 return Err(std::io::Error::last_os_error());
                             }
+                            for fd in &grant_fds {
+                                if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                            }
                             Ok(())
                         });
                     }
@@ -851,7 +917,7 @@ impl LocalRuntime {
                 }
                 #[cfg(not(unix))]
                 process.arg("/bin/sh").arg("-c").arg(command);
-                process.current_dir(&self.root);
+                process.current_dir(self.base());
                 process
             }
         };
@@ -1043,7 +1109,14 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
         return Err("bwrap --version failed; install a working bubblewrap".to_owned());
     }
     let output = std::process::Command::new(bwrap)
-        .args(sandbox_args(folder.as_os_str(), folder, hidden, &[]))
+        .args(sandbox_args(
+            folder.as_os_str(),
+            folder,
+            folder,
+            hidden,
+            &[],
+            false,
+        ))
         .arg("/bin/sh")
         .arg("-c")
         .arg("true")
@@ -1081,14 +1154,20 @@ fn hidden_is_file(root: &Path) -> bool {
 fn sandbox_args(
     source: &OsStr,
     folder: &Path,
+    cwd: &Path,
     hidden: &[PathBuf],
-    write_roots: &[PathBuf],
+    write_roots: &[(OsString, PathBuf)],
+    full_access: bool,
 ) -> Vec<OsString> {
     let folder = folder.as_os_str();
-    let mut arguments: Vec<OsString> = ["--ro-bind", "/", "/"]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
+    let mut arguments: Vec<OsString> = if full_access {
+        ["--bind", "/", "/"]
+    } else {
+        ["--ro-bind", "/", "/"]
+    }
+    .into_iter()
+    .map(OsString::from)
+    .collect();
     // Hidden roots are mounted before /tmp's: a root inside /tmp must be
     // mounted while the host's /tmp is still what the sandbox sees. A
     // directory root is replaced by an empty tmpfs; a single hidden file (a
@@ -1120,16 +1199,18 @@ fn sandbox_args(
         .into_iter()
         .map(OsString::from),
     );
-    arguments.push(OsString::from("--bind"));
-    arguments.push(source.to_owned());
-    arguments.push(folder.to_owned());
-    for root in write_roots {
+    if !full_access {
         arguments.push(OsString::from("--bind"));
-        arguments.push(root.as_os_str().to_owned());
-        arguments.push(root.as_os_str().to_owned());
+        arguments.push(source.to_owned());
+        arguments.push(folder.to_owned());
+        for (source, target) in write_roots {
+            arguments.push(OsString::from("--bind"));
+            arguments.push(source.clone());
+            arguments.push(target.as_os_str().to_owned());
+        }
     }
     arguments.push(OsString::from("--chdir"));
-    arguments.push(folder.to_owned());
+    arguments.push(cwd.as_os_str().to_owned());
     arguments.push(OsString::from("--"));
 
     arguments
@@ -1154,11 +1235,20 @@ fn sandbox_command(
     bwrap: &Path,
     source: &OsStr,
     folder: &Path,
+    cwd: &Path,
     hidden: &[PathBuf],
-    write_roots: &[PathBuf],
+    write_roots: &[(OsString, PathBuf)],
+    full_access: bool,
 ) -> Command {
     let mut process = Command::new(bwrap);
-    process.args(sandbox_args(source, folder, hidden, write_roots));
+    process.args(sandbox_args(
+        source,
+        folder,
+        cwd,
+        hidden,
+        write_roots,
+        full_access,
+    ));
     process
 }
 
@@ -2188,6 +2278,7 @@ mod tests {
             in_flight: AtomicU32::new(0),
             full_access: false,
             grants: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -3773,8 +3864,10 @@ mod tests {
         let arguments = sandbox_args(
             folder.as_os_str(),
             &folder,
+            &folder,
             &[hidden_file.clone(), hidden_directory.clone()],
             &[],
+            false,
         );
         let shown: Vec<String> = arguments
             .iter()
@@ -4044,5 +4137,47 @@ mod tests {
             .await;
         assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "full");
+    }
+    #[tokio::test]
+    async fn a_working_directory_does_not_become_writable() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
+        let work = directory.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let runtime = runtime.with_working_dir(work.to_str().unwrap()).unwrap();
+        let pwd = runtime
+            .execute(Action::Shell {
+                command: "pwd".to_owned(),
+            })
+            .await;
+        assert_eq!(pwd.status, ActionStatus::Succeeded, "{pwd:?}");
+        assert!(
+            pwd.output.text.contains(work.to_str().unwrap()),
+            "{}",
+            pwd.output.text
+        );
+
+        // Starting there does not grant a write there.
+        let refused = runtime
+            .execute(Action::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "no".to_owned(),
+            })
+            .await;
+        assert_eq!(refused.status, ActionStatus::Failed, "{refused:?}");
+        assert!(!work.join("note.txt").exists());
+        // The own Workspace stays writable through an absolute path.
+        let own = runtime.workspace().join("own.txt");
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: own.to_string_lossy().into_owned(),
+                content: "yes".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
     }
 }
