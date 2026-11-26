@@ -20,7 +20,7 @@ publish = false
 # same dependency, not in advance.
 [workspace.dependencies]
 futures-util = "0.3"
-opendal = { version = "0.59", default-features = false, features = ["services-fs", "executors-tokio"] }
+opendal = { version = "0.59", default-features = false, features = ["services-fs", "services-s3", "executors-tokio", "http-transport-reqwest"] }
 reqwest = "0.12"
 serde = "1"
 serde_json = "1"
