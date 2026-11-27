@@ -26,9 +26,7 @@ Warm paper, forest green, and an editorial grotesk. The client reads as a calm i
 ### Voice
 
 - Calm, direct, and specific; no exclamation marks.
-- Product terms stay English in both locales: Space, Bot, Chat, Computer, Provider, Model.
 - Chinese copy separates Latin product terms from surrounding text with a space.
-- An error states what happened and what the User can do next.
 - A control names the action it takes.
 - A description is optional; do not restate a title, label, value, or action.
 
@@ -72,7 +70,7 @@ One rail, one sidebar, and one main area frame every surface. The product owns t
 | --- | --- | --- | --- |
 | Auth card | Card, title, fields, error, locale switch | Join, sign in, working, error | [AuthView.tsx](../../ui/src/components/AuthView.tsx) |
 | Setup | Two-step progress, provider and Bot panels | Step 1/2, working, error | [SetupView.tsx](../../ui/src/components/SetupView.tsx) |
-| Rail | Brand, Chats, Admin | Selected, idle | [Rail.tsx](../../ui/src/components/Rail.tsx) |
+| Rail | Brand, Chats, account role | Selected, idle | [Rail.tsx](../../ui/src/components/Rail.tsx) |
 | Sidebar | Compact brand, Chat list, count, footer | Empty, selected | [Sidebar.tsx](../../ui/src/components/Sidebar.tsx) |
 | Chat header | Bot, Computer kind, online state, attention | Online, offline, waiting | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Attention pill | Waiting label, compact icon | Waiting | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
@@ -90,10 +88,10 @@ The Approval Card's fields and answers are owned by [the message specification](
 These patterns state composition; behavior is in [product.md](product.md).
 
 - First run: a quiet shell and one raised setup surface.
-- Empty: text-only empty states; no empty-state cards or icons.
-- Waiting: one attention pill in the header and one raised Approval Card in the stream.
+- Empty: Chat-list and no-selection empty states are text-only; a Chat with no Messages uses the Bot avatar and prompt chips.
+- Waiting: one attention pill in the header; each waiting Approval has one raised Card in the stream.
 - Failure: one inline recovery line; no modal.
-- Narrow: one surface at a time, with Back at the top and the composer at the foot.
+- Narrow Chat: one surface at a time, with Back at the top and the composer at the foot.
 - Mobile: 40px primary controls, a 44px attachment row, and safe-area padding.
 - Localization: Latin product terms keep the display voice.
 
@@ -112,7 +110,6 @@ These patterns state composition; behavior is in [product.md](product.md).
 - Don't show implementation copy: no cookie names, byte counts, or storage details.
 - Don't use monospace outside code, commands, URLs, and machine data.
 - Don't combine a border and a shadow on one surface.
-- Don't add a second language switch to a surface.
 - Don't nest a card inside a card.
 - Don't label the one-action Approval `Allow` in the browser. The browser uses `Allow once`; the canonical answer remains Allow.
 
@@ -123,7 +120,7 @@ These patterns state composition; behavior is in [product.md](product.md).
 | Color | Warm paper, forest accent, amber attention; semantic roles; 4.5:1 body and placeholder contrast. | `--ground`, `--accent`, `--attention` in [styles.css](../../ui/src/styles.css) |
 | Type | 12px functional floor; 15px body; role-named scale. | `--font-*`, `--text-*` in [styles.css](../../ui/src/styles.css) |
 | Space | 4px rhythm. | `--sp-*` in [styles.css](../../ui/src/styles.css) |
-| Radius | Cards 12–16px; controls 8–10px; pills for small controls. | [styles.css](../../ui/src/styles.css) |
+| Radius | Raised cards 12–16px; File card 10px; controls 8–10px; pills for small controls. | [styles.css](../../ui/src/styles.css) |
 | Elevation | Border or shadow, not both; no default card shadow. | `--line` in [styles.css](../../ui/src/styles.css) |
 | Touch | 40px primary controls; 36px compact language switch. | [styles.css](../../ui/src/styles.css) |
 | Breakpoints | 900px product boundary; 1080, 560, and 360px visual breakpoints. | [product.md](product.md), [styles.css](../../ui/src/styles.css) |

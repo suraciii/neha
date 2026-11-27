@@ -30,7 +30,7 @@ The client has one primary navigation rail, one sidebar, and one main area.
 
 The rail selects what the sidebar contains. It has Chats, and the sidebar lists the User's Chats in record order.
 
-The main area shows the selected Chat. On a viewport narrower than 900 CSS pixels, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
+The main area shows the selected Chat. On a viewport 900 CSS pixels or narrower, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
 
 When the User has no Chats, the sidebar shows the Chat-list empty state. When the User has Chats and none is selected, the main area asks the User to select one.
 
@@ -38,7 +38,7 @@ When the User has no Chats, the sidebar shows the Chat-list empty state. When th
 
 A new Space has no Provider and no Bot. The main area then shows two steps.
 
-The shell remains during first run. On a viewport narrower than 900 CSS pixels, the steps fill the main area.
+The shell remains during first run. On a viewport 900 CSS pixels or narrower, the steps fill the main area.
 
 1. The Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
 2. The User creates a Bot with a name. A new Bot has one owned Chat and one Hosted Computer.
