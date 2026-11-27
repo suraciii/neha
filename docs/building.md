@@ -10,7 +10,7 @@
 - Docker, for the local S3 test store.
 - `bubblewrap` on Linux, for the sandbox that runs a Computer's shell commands, Local or Hosted.
 
-The workspace has no system-library dependencies. SQLite and aws-lc-sys compile C code that ships inside the crates, so a build needs a C compiler, and aws-lc-sys also needs cmake. The browser client's dependencies are installed from its committed lockfile.
+The workspace has no system-library dependencies. SQLite and aws-lc-sys compile C code that ships inside the crates, so a build needs a C compiler; aws-lc-sys also uses cmake for some targets and build configurations. The browser client's dependencies are installed from its committed lockfile.
 
 ## Commands
 
