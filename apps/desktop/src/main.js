@@ -134,10 +134,14 @@ async function loadAccount() {
   }
 }
 
-async function postJson(url, body, origin) {
+async function postJson(url, body) {
+  // This is a trusted main-process request, not a browser page, so it sends no
+  // Origin. Keeping the URL on loopback avoids the system resolver for
+  // arbitrary *.localhost names on Windows; the cookie is installed for the
+  // browser Space separately.
   const response = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json", origin },
+    headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!response.ok) {
@@ -147,16 +151,33 @@ async function postJson(url, body, origin) {
   return response;
 }
 
+function sessionCookieName(origin) {
+  const match = /^neha-([^.]+)\.localhost$/.exec(new URL(origin).hostname);
+  if (!match) throw new Error(`${origin} is not a browser Space origin`);
+  return `neha_session_${match[1]}`;
+}
+
 async function installCookie(response, origin) {
   const values = typeof response.headers.getSetCookie === "function"
     ? response.headers.getSetCookie()
     : [response.headers.get("set-cookie")];
   const pair = values.map(cookiePair).find(Boolean);
-  if (!pair) throw new Error("the Space did not return a session cookie");
+  let name = pair?.name;
+  let value = pair?.value;
+  if (!value) {
+    // A request with no Origin is the CLI shape: the Space returns the same
+    // session token in the body instead of a Set-Cookie header.
+    const body = await response.clone().json().catch(() => null);
+    if (typeof body?.token !== "string") {
+      throw new Error("the Space did not return a session token");
+    }
+    name = sessionCookieName(origin);
+    value = body.token;
+  }
   await session.defaultSession.cookies.set({
     url: origin,
-    name: pair.name,
-    value: pair.value,
+    name,
+    value,
     path: "/",
     httpOnly: true,
     sameSite: "strict",
@@ -171,7 +192,8 @@ async function discoverOrigin(loopback) {
 
 async function joinFirstAdmin(invite, browserUrl) {
   const inviteUrl = new URL(invite);
-  const origin = browserUrl ? new URL(browserUrl).origin : inviteUrl.origin;
+  const loopback = inviteUrl.origin;
+  const origin = browserUrl ? new URL(browserUrl).origin : loopback;
   const secret = inviteUrl.hash.replace(/^#/, "");
   if (!secret) throw new Error("the Space did not print a usable invitation");
   const displayName = defaultDisplayName(os.userInfo().username);
@@ -180,25 +202,26 @@ async function joinFirstAdmin(invite, browserUrl) {
   // the shell writing its credentials would leave an account no later launch
   // can sign in to.
   await saveAccount(displayName, password);
+  // Windows does not resolve arbitrary *.localhost names through the system
+  // resolver. Send the request to loopback, keep the browser Space's Origin
+  // (the server checks it), then store the cookie for the browser origin.
   const response = await postJson(
-    `${origin}/api/join`,
+    `${loopback}/api/join`,
     { secret, display_name: displayName, password },
-    origin,
   );
   await installCookie(response, origin);
   log(`created the first local Admin as ${displayName}`);
   return origin;
 }
 
-async function loginSavedAccount(origin) {
+async function loginSavedAccount(origin, loopback) {
   const account = await loadAccount();
   if (!account) {
     throw new Error("this Space already has an account, but no local desktop account was found");
   }
   const response = await postJson(
-    `${origin}/api/login`,
+    `${loopback}/api/login`,
     { display_name: account.displayName, password: account.password },
-    origin,
   );
   await installCookie(response, origin);
   log(`signed in as ${account.displayName}`);
@@ -387,11 +410,11 @@ async function openLocalSpace() {
     const restarted = await restartSpace();
     spaceUrl = restarted.listening;
     origin = await discoverOrigin(spaceUrl);
-    await loginSavedAccount(origin);
+    await loginSavedAccount(origin, spaceUrl);
   } else {
     spaceUrl = started.listening;
     origin = await discoverOrigin(spaceUrl);
-    await loginSavedAccount(origin);
+    await loginSavedAccount(origin, spaceUrl);
   }
   await startLocalComputer(spaceUrl, origin);
 
