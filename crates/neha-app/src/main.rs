@@ -2595,8 +2595,13 @@ fn validate_rule_arguments(
     if script_rule && tool != "run_skill_script" {
         bail!("--skill and --script match a skill's script; {tool} is not run_skill_script");
     }
-    if tool == "run_skill_script" && !script_rule {
+    // A server's tool may be named anything, a built-in spelling included;
+    // the server's id tells it from the built-in.
+    if server.is_none() && tool == "run_skill_script" && !script_rule {
         bail!("--tool run_skill_script needs --skill and --script");
+    }
+    if server.is_some() && script_rule {
+        bail!("a server rule names a server's tool, not a skill's script");
     }
     if script_rule && (command_prefix.is_some() || path_prefix.is_some()) {
         bail!("--skill and --script take no command or path prefix");

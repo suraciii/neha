@@ -19268,6 +19268,31 @@ mod tests {
             error.contains("not offered to this run") || error.contains("no longer enabled"),
             "{error}"
         );
+        // The refusal names the tool the Model used, and the reply's calls
+        // keep that same name, so a replay reads one name for the action.
+        let started: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::ActionStarted && event.data["run"] == json!(run)
+            })
+            .map(|event| &event.data)
+            .collect();
+        let replies: Vec<&Value> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::RunReply && event.data["run"] == json!(run))
+            .map(|event| &event.data)
+            .collect();
+        assert_eq!(started.len(), 1, "{started:?}");
+        let carded = replies
+            .iter()
+            .find(|reply| reply["step"] == json!(1))
+            .expect("the waiting step's reply");
+        assert_eq!(started[0]["tool"], json!("mcp__docs__search"));
+        assert_eq!(
+            carded["calls"][0]["model_name"],
+            json!("mcp__docs__search"),
+            "the reply keeps the name the Model used"
+        );
         socket.close(None).await.unwrap();
         provider_task.abort();
         server_task.abort();
@@ -19354,6 +19379,114 @@ mod tests {
         );
         socket.close(None).await.unwrap();
         server_task.abort();
+        running.shutdown().await;
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_token_leaves_the_server_unconnected() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, _log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+        let result = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpAdd(neha::surface::McpAdd {
+                name: "docs".to_owned(),
+                url,
+                scope: neha::record::McpScope::Space,
+                credential: Some(String::new()),
+            }),
+        )
+        .await;
+        assert_eq!(result["connected"], json!(false));
+        let list = command(&mut socket, Id::new(), CommandCall::McpList).await;
+        assert_eq!(list[0]["connected"], json!(false));
+        socket.close(None).await.unwrap();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wider_ask_rule_asks_for_another_servers_tool() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (docs_url, docs_log, docs_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+        let (other_url, other_log, other_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+        let docs = add_mcp_server(&mut socket, "docs", &docs_url, Some("token-1")).await;
+        let other = add_mcp_server(&mut socket, "other", &other_url, Some("token-2")).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "a"})),
+            text("first done"),
+            tool("mcp__other__search", json!({"query": "b"})),
+            text("second done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        for server in [docs, other] {
+            command(
+                &mut socket,
+                Id::new(),
+                CommandCall::BotMcpEnable { bot, server },
+            )
+            .await;
+        }
+        // The first call of the first server's tool asks, and Always allow
+        // writes a rule for that server alone.
+        let first = run_of(&submit(&mut socket, chat, "search docs", None).await);
+        wait_status(&mut socket, first, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "first_mcp_call");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, true).await;
+        assert_eq!(wait_run(&mut socket, first).await["status"], "succeeded");
+        // A rule that names no server asks for every server's tool of that name.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::RuleAdd {
+                bot,
+                effect: neha::record::RuleEffect::Ask,
+                tool: "search".to_owned(),
+                command_prefix: None,
+                path_prefix: None,
+                skill: None,
+                script: None,
+                server: None,
+            },
+        )
+        .await;
+        let second = run_of(&submit(&mut socket, chat, "search other", None).await);
+        wait_status(&mut socket, second, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(
+            approvals[0]["reason"], "rule",
+            "the wider Ask rule asks for another server's tool"
+        );
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, second).await["status"], "succeeded");
+        assert!(
+            other_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message["method"] == "tools/call")
+        );
+        assert!(
+            docs_log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|message| message["method"] == "tools/call")
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        docs_task.abort();
+        other_task.abort();
         running.shutdown().await;
     }
 }

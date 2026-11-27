@@ -1770,6 +1770,15 @@ pub struct RecordedCall {
     /// The MCP server the call names, when its tool belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<Id>,
+    /// The name the Model used for this call, when the record names the tool
+    /// by its server and original name.
+    ///
+    /// The loop's history and a replay read the name the Model saw, so a
+    /// record whose server no longer offers the tool still resumes with the
+    /// same conversation. An older record has none, and the Space forms the
+    /// name it would have offered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
     /// The arguments the tool runs with.
     pub arguments: serde_json::Value,
     /// Why the loop refused the call before anything ran; `None` when it can run.

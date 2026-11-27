@@ -229,9 +229,6 @@ impl McpClient {
                 }
                 tools.push(tool_from_json(tool)?);
             }
-            if pages >= MAX_TOOL_PAGES {
-                return Err(protocol_error("the MCP server lists too many pages"));
-            }
             let next = page
                 .get("nextCursor")
                 .and_then(Value::as_str)
@@ -240,6 +237,9 @@ impl McpClient {
             let Some(next) = next else {
                 return Ok(tools);
             };
+            if pages >= MAX_TOOL_PAGES {
+                return Err(protocol_error("the MCP server lists too many pages"));
+            }
             // A server that repeats a cursor would page forever.
             if !seen.insert(next.clone()) {
                 return Err(protocol_error("the MCP server repeated a page cursor"));
@@ -564,7 +564,8 @@ fn event_end(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
 fn matching_event(event: &[u8], id: u64) -> Option<Value> {
     let text = std::str::from_utf8(event).ok()?;
     let mut data = String::new();
-    for line in text.lines() {
+    // An event's field lines end with CR, LF, or CRLF.
+    for line in text.split(['\r', '\n']) {
         let Some(rest) = line.strip_prefix("data:") else {
             continue;
         };
@@ -1357,7 +1358,8 @@ mod tests {
                     "id": message["id"],
                     "result": {"tools": [{ "name": "search", "inputSchema": {} }]},
                 });
-                event_stream(format!("data: {answer}\r\r"))
+                // A CR-only stream may carry other fields before the data.
+                event_stream(format!("event: message\rdata: {answer}\r\r"))
             }),
         )
         .await;
@@ -1367,6 +1369,42 @@ mod tests {
         let tools = client.tools().await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "search");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn the_sixteenth_page_may_be_the_last() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                assert_eq!(message["method"], "tools/list");
+                let cursor = message["params"]["cursor"].as_str();
+                let page: u32 = cursor
+                    .and_then(|cursor| cursor.strip_prefix("page-"))
+                    .and_then(|page| page.parse().ok())
+                    .unwrap_or(1);
+                let mut result = json!({
+                    "tools": [{
+                        "name": format!("tool-{page}"),
+                        "inputSchema": {"type": "object"},
+                    }],
+                });
+                if page < 16 {
+                    result["nextCursor"] = json!(format!("page-{}", page + 1));
+                }
+                rpc_result(&message["id"], result)
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let tools = client.tools().await.unwrap();
+        assert_eq!(tools.len(), 16);
+        assert_eq!(tools[15].name, "tool-16");
         task.abort();
     }
 
