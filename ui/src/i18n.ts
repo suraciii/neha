@@ -223,6 +223,8 @@ const en = {
   "sidebar.settings.catalog": "Catalog",
   "sidebar.settings.computers": "Computers",
   "bots.new": "New Bot",
+  "bots.new.computer": "Computer",
+  "bots.new.noProvider": "This Space has no Provider yet, so it has no Model for a Bot to work with.",
   "bots.select.title": "Select a Bot to open its page.",
 
   "common.cancel": "Cancel",
@@ -588,6 +590,8 @@ const zh: Record<MessageKey, string> = {
   "sidebar.settings.catalog": "目录",
   "sidebar.settings.computers": "Computer",
   "bots.new": "新建 Bot",
+  "bots.new.computer": "Computer",
+  "bots.new.noProvider": "这个 Space 还没有 Provider，因此没有可供 Bot 使用的 Model。",
   "bots.select.title": "选择一个 Bot 打开它的页面。",
 
   "common.cancel": "取消",

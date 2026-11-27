@@ -97,7 +97,7 @@ const hostedComputer = {
 const chat = { id: "h1", owner: "u1", bot: "b1" } as unknown as Chat;
 const otherChat = { id: "h2", owner: "u1", bot: "b2" } as unknown as Chat;
 const thirdChat = { id: "h3", owner: "u1", bot: "b3" } as unknown as Chat;
-const computers = [computer, otherComputer, hostedComputer];
+const computers: Computer[] = [computer, otherComputer, hostedComputer];
 
 // The Bot that owns a Chat, like the Space answers bot_show.
 function botFor(id: string): Bot {
@@ -131,6 +131,10 @@ function project(known: Chat): Chat {
 // has not answered yet.
 let sendGate: Promise<void> | null = null;
 let openSend: (() => void) | null = null;
+// A create can be held open, so a test can act while the Space has not answered
+// it yet.
+let createGate: Promise<void> | null = null;
+let openCreate: (() => void) | null = null;
 let decideGate: Promise<void> | null = null;
 let openDecide: (() => void) | null = null;
 let approvalGate: Promise<void> | null = null;
@@ -151,6 +155,10 @@ export const space = {
   otherChat,
   thirdChat,
   asked: [] as string[],
+  // Every command the client sent, with its arguments as they arrived: a test
+  // reads the boundary rather than what a case chose to keep, so an argument
+  // the client should not have sent shows up.
+  frames: [] as { name: string; args?: unknown }[],
   sent: [] as unknown[],
   files: [] as FileSummary[],
   messages: [] as Message[],
@@ -197,7 +205,7 @@ export const space = {
   models: [] as Model[],
   // The Computers the Space knows, like computer_list answers. A Bot may move
   // between the paired Local ones.
-  computers: computers as Computer[],
+  computers: computers,
   // The rules each Bot holds, like rule_list answers.
   rules: [] as Rule[],
   // Every vendor the catalog knows, like catalog_list answers.
@@ -228,6 +236,7 @@ export const space = {
   // Puts the Space back where a test expects to find it.
   reset() {
     space.releaseSends();
+    space.releaseCreates();
     space.releaseDecide();
     space.releaseApprovals();
     space.computer.kind = "local";
@@ -248,6 +257,7 @@ export const space = {
     space.bot.thinking = null;
     space.bot.model = null;
     space.asked = [];
+    space.frames = [];
     space.sent = [];
     space.files = [];
     space.messages = [];
@@ -275,6 +285,10 @@ export const space = {
     space.creates = [];
     for (const key of Object.keys(made)) delete made[key];
     madeBots = 0;
+    // The Computers a test's creates made go with them.
+    for (let index = computers.length - 1; index >= 0; index -= 1) {
+      if (computers[index]?.id.startsWith("p-made-")) computers.splice(index, 1);
+    }
     space.resets = [];
     space.ruleAdds = [];
     space.ruleRemoves = [];
@@ -295,6 +309,17 @@ export const space = {
     openSend?.();
     openSend = null;
     sendGate = null;
+  },
+  // Holds a create open, so a test can act while the Space has not answered it.
+  holdCreates() {
+    createGate = new Promise<void>((resolve) => {
+      openCreate = resolve;
+    });
+  },
+  releaseCreates() {
+    openCreate?.();
+    openCreate = null;
+    createGate = null;
   },
   // Holds one Bot's rule reads open, so a test can act while that Bot's page
   // is still waiting on the rules its own write asked to read again.
@@ -385,6 +410,7 @@ export class FakeCommands {
 
   async command<T>(name: string, args?: unknown): Promise<T> {
     space.asked.push(name);
+    space.frames.push({ name, args });
     const refused = space.refuse[name];
     if (refused) throw refused;
     switch (name) {
@@ -430,11 +456,12 @@ export class FakeCommands {
       }
       case "bot_create": {
         // A Bot answers with itself, its Computer, and its Chat, and the Space
-        // records the create, so the client hears about its own write. Without a
-        // named Computer the Bot gets its own Hosted one.
+        // records the create as three events of its own, so the client hears
+        // about its own write and reads the workspace again.
         const asked = args as { name?: string; computer?: string };
         const name = (asked.name ?? "").trim();
         if (name === "") throw new Error("a Bot needs a name");
+        if (createGate) await createGate;
         space.creates.push({
           name,
           ...(asked.computer === undefined ? {} : { computer: asked.computer }),
@@ -442,12 +469,32 @@ export class FakeCommands {
         madeBots += 1;
         const id = `b-made-${madeBots}`;
         const chatId = `h-made-${madeBots}`;
-        const hosted = asked.computer === undefined || asked.computer === "hosted";
+        // Without a named Computer the Bot gets one of its own, which the Space
+        // makes for it; a named one is the Computer the User picked, and "local"
+        // is the paired one.
+        let target: Computer;
+        if (asked.computer === undefined || asked.computer === "hosted") {
+          target = {
+            id: `p-made-${madeBots}`,
+            owner: "u1",
+            kind: "hosted",
+            online: true,
+            workspace: `/hosted-${madeBots}`,
+            supports_grants: true,
+            supports_full_access: true,
+            sandboxed: true,
+          };
+          computers.push(target);
+        } else if (asked.computer === "local") {
+          target = computer;
+        } else {
+          target = computers.find((known) => known.id === asked.computer) ?? hostedComputer;
+        }
         const created: Bot = {
           id,
           owner: "u1",
           name,
-          computer: hosted ? hostedComputer.id : computer.id,
+          computer: target.id,
           chat: chatId,
           full_access: false,
           grants: [],
@@ -455,19 +502,36 @@ export class FakeCommands {
           model: null,
         };
         made[id] = created;
-        const opened = { id: chatId, owner: "u1", bot: id };
+        // The Chat the events name, held as the list holds it: what the Space
+        // projects it to be doing, which a test says and the record leaves
+        // alone until a run event does.
+        const opened = { id: chatId, owner: "u1", bot: id } as unknown as Chat;
         space.chats = [...space.chats, opened];
+        // A Bot that got a Computer of its own is a Computer the Space made, so
+        // that is the one event of the three; a named one already existed.
+        if (asked.computer === undefined || asked.computer === "hosted") {
+          emit("neha.computer.created", {
+            computer: target.id,
+            owner: "u1",
+            kind: target.kind,
+            workspace: target.workspace,
+          });
+        }
         emit("neha.bot.created", {
           bot: id,
           owner: "u1",
           name,
-          computer: created.computer,
+          computer: target.id,
           chat: chatId,
         });
+        emit("neha.chat.created", { chat: chatId, owner: "u1", bot: id });
         return {
           bot: { ...created },
-          computer: { ...computerFor(created.computer) },
-          chat: project(opened),
+          computer: { ...target },
+          // The answer names the Chat by identity, the way the Space does: it
+          // had not projected the Chat when it wrote the answer, so the Bot's
+          // own answer is what projects it.
+          chat: { id: chatId, owner: "u1", bot: id },
         } as T;
       }
       case "bot_update": {

@@ -6,12 +6,18 @@ A new build starts on the record the last build wrote and migrates it in place. 
 
 ## Back up the Space's home
 
-Stop the Space, then copy the home directory:
+Read the home the Space uses before you change anything: the `NEHA_HOME` line in its service unit, or the address and `Files are stored in…` lines its startup log prints. Do not set `NEHA_HOME` for a Space you did not start; the running process owns that value.
+
+Stop the Space, then copy that home to a path this run has not used:
 
 ```bash
-export NEHA_HOME="$HOME/.local/share/neha/demo"
-cp -a "$NEHA_HOME" "$NEHA_HOME.bak"
+HOME_DIR=/srv/neha/home
+BACKUP="$HOME_DIR-backup-$(date +%Y%m%d-%H%M%S).$$"
+cp -a "$HOME_DIR" "$BACKUP"
+printf 'backup: %s\n' "$BACKUP"
 ```
+
+`cp -a` writes inside a destination that already exists, so a second upgrade that reuses one path nests the copy inside itself. The timestamp and the shell's process id keep each run's path new. Write the path down: a rollback needs the same one.
 
 Copy the home while the Space is stopped, so the record and the objects in the File store agree. With an S3-compatible File store, copy the objects under the Space's prefix too; [Storage](storage.md#backup) gives the table and the restore steps.
 
@@ -31,19 +37,19 @@ Put the new `neha` where the Space's command or its service unit names it, and p
 
 ## Start the Space again
 
-Start the Space with the same `NEHA_HOME`:
+Start the Space with the same home its unit or its startup log named:
 
 ```bash
 target/debug/neha serve
 ```
 
-The Space migrates the record's schema in one step and prints its address as before. The Provider, the Bots, the Chats, and every File stay where they were. An open client loads the new build the next time it opens.
+A service manager passes that home itself. The Space migrates the record's schema in one step and prints its address as before. The Provider, the Bots, the Chats, and every File stay where they were. An open client loads the new build the next time it opens.
 
-A Local Computer is not part of the Space's home. Restart its daemon with the `neha computer run` of the same release; a daemon from another release is refused the same way.
+A Local Computer is not part of the Space's home. On that machine, replace the daemon binary with the one this release built, then start it again with `neha computer run`. The daemon and the Space must speak the same channel version, and a mismatch closes the connection.
 
 ## When the record is newer than the build
 
-A home that a newer build wrote does not start on an older one. The Space stops and names the version it found and the version this build writes:
+A home that a newer build wrote does not start on an older one. The Space stops and names the schema version it found and the version this build writes:
 
 ```text
 Error: the Space cannot start
@@ -52,10 +58,10 @@ Caused by:
     0: record error: schema error: schema version 7 is newer than 6
 ```
 
-Install the newer build, or put your copy back and run the older build again. The two numbers are the record's version and this build's version, so they change with each release.
+Install the newer build, or put your copy back and run the older build again. The two numbers are the record's schema version and this build's, and a build that changes no table and no record vocabulary keeps the version it had.
 
 ## What an upgrade does not do
 
 - Neha makes no backup of the Space's home before it migrates the record. The copy you make is the only one.
-- Neha restores a home and exports no record, so a rollback is your copy put back with the older binary.
-- Neha upgrades a Local Computer's daemon with the Space. Restart it with the `neha computer run` of the same release.
+- Neha restores no home and exports no record, so a rollback is the copy you put back yourself, with the older binary.
+- Neha upgrades no Local Computer's daemon. Replace the daemon binary on that machine with this release's, then start it with `neha computer run`.

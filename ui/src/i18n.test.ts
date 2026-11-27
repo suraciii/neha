@@ -11,6 +11,9 @@ describe("i18n", () => {
   it("translates product copy", () => {
     expect(t("auth.headline")).toBe("Put work in the hands of a team you can see.");
     expect(t("bots.new")).toBe("New Bot");
+    // A new Bot works on a Computer of its own unless one is chosen.
+    expect(t("bots.new.computer")).toBe("Computer");
+    expect(t("bots.new.noProvider")).toContain("Provider");
     flush(() => setLocale("zh-CN"));
     expect(t("auth.headline")).toBe("把工作交给一支你看得见的团队。");
   });
@@ -31,6 +34,8 @@ describe("i18n", () => {
     expect(t("chat.aria", { name: "Nova" })).toBe("与 Nova 的 Chat");
     // The action that makes a Bot, in the User's words.
     expect(t("bots.new")).toBe("新建 Bot");
+    expect(t("bots.new.computer")).toBe("Computer");
+    expect(t("bots.new.noProvider")).toContain("Provider");
   });
 
   it("names what a Chat waits for, in the reader's language", () => {

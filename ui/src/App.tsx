@@ -1430,36 +1430,48 @@ export default function App() {
   }
 
   // Creates a Bot, which answers with the Bot, its Computer, and the Chat the
-  // Space opened between them, so the new Bot's Chat is the one that opens.
-  // A create is one step of management: it answers whether the Bot is there, so
-  // the form that asked keeps itself open when it is not.
-  async function createBot(name: string): Promise<boolean> {
+  // Space opened between them, so the new Bot's Chat is the one that opens. The
+  // create is the one step that cannot be taken twice: once the Space has
+  // answered it the Bot is there, so everything after only reads, and a read
+  // that fails is never a reason to make another one. It answers what the Space
+  // said when it made no Bot, so the form that asked can say it in its own
+  // words, and nothing when the Bot is there.
+  async function createBot(name: string, computer?: string): Promise<string | null> {
+    // A Space with no Provider has no Model for a Bot to work with, so the
+    // client makes none.
+    if (state.providers.length === 0) return t("bots.new.noProvider");
     update({ busy: true, error: null });
+    let created: BotCreateResult;
     try {
-      const result = await commands.command<BotCreateResult>("bot_create", { name });
-      const [bots, chats] = await Promise.all([
-        commands.command<Bot[]>("bot_list"),
-        commands.command<Chat[]>("chat_list"),
-      ]);
-      update({
-        bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
-        chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
+      created = await commands.command<BotCreateResult>("bot_create", {
+        name,
+        ...(computer === undefined ? {} : { computer }),
       });
-      const sortedChats = [...chats].sort((left, right) => left.id.localeCompare(right.id));
-      await loadPreviews(sortedChats);
-      const chat = sortedChats.find((candidate) => candidate.id === result.chat.id) ?? chats[0];
-      // The Chat the Space opened with the Bot is the one that opens, the way
-      // the first run's own create leaves the User in it, from wherever the
-      // create was asked for.
-      setView("chats");
-      if (chat) await selectChat(chat);
-      return true;
     } catch (reason) {
-      update({ error: reason });
-      return false;
-    } finally {
-      update({ busy: false });
+      // The Space never confirmed the Bot, so the form may ask again.
+      update({ busy: false, error: reason });
+      return messageFor(reason);
     }
+    // The answer names the Chat by identity: the Space had not projected it
+    // yet, so all the page holds of it is its name, and the Bot's own answer —
+    // read when the Chat opens — and the events the create appended are what
+    // project it.
+    const opened = created.chat as Chat;
+    // The Bot is there from here on, and the create's own answer carries it and
+    // its Chat, so the page reads them from the answer rather than from the
+    // lists: a list that cannot be read leaves the Bot on the screen.
+    update({
+      bots: [...state.bots, created.bot].sort((left, right) => left.id.localeCompare(right.id)),
+      chats: [...state.chats, opened].sort((left, right) => left.id.localeCompare(right.id)),
+      busy: false,
+    });
+    await loadPreviews([opened]);
+    // The Chat the Space opened with the Bot is the one that opens, the way the
+    // first run's own create leaves the User in it, from wherever the create was
+    // asked for.
+    setView("chats");
+    await selectChat(opened);
+    return null;
   }
 
   function backToList() {
@@ -1829,6 +1841,9 @@ export default function App() {
     setView(next);
     update({ manageError: null });
     if (next === "settings") void loadSettings();
+    // The Bots surface is where a Bot is made, so it reads the Computers a new
+    // one may work on.
+    if (next === "bots") void refreshComputers();
   }
 
   // Leaves a management surface for the one before it, with no Bot selected.
@@ -1860,6 +1875,9 @@ export default function App() {
   // What a failed management command says, in the User's words.
   const manageErrorText = () => (state.manageError ? messageFor(state.manageError) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
+  // A Space with no Provider has no Model to work with, and the client creates
+  // no Bot before one exists.
+  const canCreateBot = () => state.providers.length > 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
   // A management surface fills the main area once it has something to show, so
   // a narrow viewport shows one surface at a time with a Back action.
@@ -1992,9 +2010,9 @@ export default function App() {
                 setSection(next);
                 setSectionOpen(true);
               }}
-              onCreateBot={(name) => createBot(name)}
-              error={errorText()}
-              busy={state.busy}
+              onCreateBot={(name, computer) => createBot(name, computer)}
+              computers={state.computers}
+              canCreateBot={canCreateBot()}
             />
             <main class="main">
               <Show when={showManage()}>

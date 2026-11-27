@@ -41,7 +41,7 @@ A Space migrates the record of an older version in place, in one transaction, an
 
 A Space refuses to start when the record's version is newer than its build's, and the refusal names both versions. An older build refuses a record a newer build migrated, so a downgrade needs the operator's own copy of the home.
 
-A Space makes no backup of its home before it migrates. [Storage](product.md#storage) covers what a backup holds.
+A Space makes no backup of its home before it migrates. [Storage](#storage) covers what a backup holds.
 
 ## Events
 
