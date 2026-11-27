@@ -57,13 +57,28 @@ export default function SetupView(props: SetupViewProps) {
     <div class="setup">
       <header class="setup__head">
         <div class="setup__top">
-          <p class="eyebrow">{providerReady() ? t("setup.step.two") : t("setup.step.one")}</p>
-          <LocaleSwitch />
+          <LocaleSwitch class="setup__locale" />
         </div>
         <h1>{providerReady() ? t("setup.bot.title") : t("setup.provider.title")}</h1>
         <p class="setup__lede">
           {providerReady() ? t("setup.bot.lede") : t("setup.provider.lede")}
         </p>
+        <div class="setup__progress-row">
+          <div
+            class="setup__progress"
+            role="progressbar"
+            aria-valuemin={1}
+            aria-valuemax={2}
+            aria-valuenow={providerReady() ? 2 : 1}
+            aria-valuetext={providerReady() ? t("setup.step.two") : t("setup.step.one")}
+          >
+            <span class="setup__progress-seg is-on" />
+            <span class={`setup__progress-seg ${providerReady() ? "is-on" : ""}`} />
+          </div>
+          <span class="setup__progress-text">
+            {providerReady() ? t("setup.step.two") : t("setup.step.one")}
+          </span>
+        </div>
       </header>
 
       <Show when={props.error}>
@@ -80,7 +95,6 @@ export default function SetupView(props: SetupViewProps) {
             <section class="panel">
               <div class="panel__head">
                 <div>
-                  <p class="panel__kicker">{t("setup.panel.provider")}</p>
                   <h2>
                     {props.providers.length === 1
                       ? t("setup.provider.connected.one")
@@ -109,10 +123,8 @@ export default function SetupView(props: SetupViewProps) {
             <form class="panel" onSubmit={createBot}>
               <div class="panel__head">
                 <div>
-                  <p class="panel__kicker">{t("setup.panel.bot")}</p>
                   <h2>{t("setup.bot.panelTitle")}</h2>
                 </div>
-                <span class="badge">{t("setup.bot.accessTitle")}</span>
               </div>
               <div class="panel__body">
                 <label class="field">
@@ -157,7 +169,6 @@ export default function SetupView(props: SetupViewProps) {
           <form class="panel" onSubmit={connectProvider}>
             <div class="panel__head">
               <div>
-                <p class="panel__kicker">{t("setup.panel.provider")}</p>
                 <h2>{t("setup.provider.panelTitle")}</h2>
               </div>
               <span class="badge">{t("setup.adminOnly")}</span>

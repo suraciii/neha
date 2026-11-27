@@ -17,7 +17,25 @@ describe("i18n", () => {
   it("interpolates names", () => {
     expect(t("chat.aria", { name: "Quill" })).toBe("Chat with Quill");
     flush(() => setLocale("zh-CN"));
-    expect(t("chat.aria", { name: "Quill" })).toBe("与Quill的 Chat");
+    expect(t("chat.aria", { name: "Quill" })).toBe("与 Quill 的 Chat");
+  });
+
+  it("keeps product terms and Chinese spacing", () => {
+    flush(() => setLocale("zh-CN"));
+    expect(t("chat.localComputer")).toBe("Local Computer");
+    expect(t("chat.hostedComputer")).toBe("Hosted Computer");
+    expect(t("sidebar.chats.one")).toBe("1 个 Chat");
+    expect(t("sidebar.chats.many", { count: 3 })).toBe("3 个 Chat");
+    expect(t("chat.new.title", { name: "Nova" })).toBe("和 Nova 打个招呼。");
+    expect(t("chat.aria", { name: "Nova" })).toBe("与 Nova 的 Chat");
+  });
+
+  it("keeps implementation copy out of the client", () => {
+    expect(t("auth.fine")).not.toContain("HttpOnly");
+    expect(t("auth.password.hint")).not.toContain("byte");
+    flush(() => setLocale("zh-CN"));
+    expect(t("auth.fine")).not.toContain("HttpOnly");
+    expect(t("setup.bot.nameHint")).not.toContain("任务板");
   });
 
   it("remembers the chosen locale", () => {

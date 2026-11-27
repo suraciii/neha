@@ -1,6 +1,6 @@
 # Client
 
-[product.md](product.md) states what the browser client shows. This page states the boundaries the Space and the client keep.
+[product.md](product.md) states what the browser client shows. This page states the boundaries the Space and the client keep. [design-system.md](design-system.md) states the UI/UX design that implements that behavior.
 
 ## Authority
 

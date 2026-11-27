@@ -8,6 +8,10 @@ Pull requests and pushes to `main` run the same gate. Split it into a fast pull-
 
 `just verify <directory>` runs the gate recipe by recipe and retains the source snapshot, tool versions, per-recipe timings, and output outside the repository.
 
+## Browser client
+
+A browser-client change is checked through the built client at 1440, 1080, 900, 390, and 320 CSS pixels in English and Chinese. A layout-changing interaction is also checked with reduced motion. Screenshots and recordings stay in the pull request; the repository keeps no visual evidence.
+
 ## Test quality
 
 Tests must catch meaningful failures, not serve as formalities.

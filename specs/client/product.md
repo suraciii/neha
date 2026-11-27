@@ -30,13 +30,15 @@ The client has one primary navigation rail, one sidebar, and one main area.
 
 The rail selects what the sidebar contains. It has Chats, and the sidebar lists the User's Chats in record order.
 
-The main area shows the selected Chat. On a viewport narrower than 900 CSS pixels, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
+The main area shows the selected Chat. On a viewport 900 CSS pixels or narrower, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
 
-The client shows an empty state when the User has no Chats.
+When the User has no Chats, the sidebar shows the Chat-list empty state. When the User has Chats and none is selected, the main area asks the User to select one.
 
 ## First run
 
 A new Space has no Provider and no Bot. The main area then shows two steps.
+
+The shell remains during first run. On a viewport 900 CSS pixels or narrower, the steps fill the main area.
 
 1. The Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
 2. The User creates a Bot with a name. A new Bot has one owned Chat and one Hosted Computer.
@@ -48,6 +50,8 @@ After the Bot is created, the client opens its Chat.
 ## A Chat
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
+
+The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online. While the Run the client follows waits for an Approval, the header marks the wait; the Approval Card remains in the stream. A Chat with no Messages shows the Bot's name and starting prompts.
 
 The composer sends one Message. Enter sends; Shift and Enter insert a new line. The composer does not accept an empty Message.
 
@@ -61,7 +65,15 @@ The client supports English (en-US) and Simplified Chinese (zh-CN).
 
 A first visit follows the browser language. The User can switch language from the sign-in card and from the signed-in client. The choice belongs to the browser and never changes the record.
 
+The client shows one language switch at a time. A count of Chats uses the product term Chat.
+
 Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provider, Model. Dates follow the active locale; times use a 24-hour clock in both locales.
+
+## Accessibility
+
+- Every control has an accessible name; focus is visible.
+- A waiting Approval is exposed as a status, not by color alone.
+- On a narrow viewport, controls meet the touch targets in [design-system.md](design-system.md).
 
 ## Page states
 

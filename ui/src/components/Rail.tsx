@@ -13,7 +13,13 @@ export default function Rail(props: RailProps) {
     <aside class="rail" aria-label={t("rail.primary")}>
       <Brand compact />
       <nav class="rail__nav">
-        <button class="rail__item is-active" type="button" aria-label={t("rail.chats")} title={t("rail.chats")}>
+        <button
+          class="rail__item is-active"
+          type="button"
+          aria-label={t("rail.chats")}
+          aria-current="page"
+          title={t("rail.chats")}
+        >
           <Icon name="message" size="lg" />
         </button>
       </nav>

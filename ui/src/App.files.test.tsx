@@ -612,15 +612,15 @@ describe("App with Computers", () => {
 
     expect(element(view, ".chat__sub").textContent).toContain("Local Computer");
     flush(() => fireEvent.click(element(view, ".locale-switch")));
-    expect(element(view, ".chat__sub").textContent).toContain("自己的 Computer");
+    expect(element(view, ".chat__sub").textContent).toContain("Local Computer");
   });
 
-  it("calls a Hosted Computer just a Computer", async () => {
+  it("names a Hosted Computer in the Chat header", async () => {
     space.computer.kind = "hosted";
     const view = await openChat();
 
     const header = element(view, ".chat__sub").textContent ?? "";
-    expect(header).toContain("Computer");
+    expect(header).toContain("Hosted Computer");
     expect(header).not.toContain("Local Computer");
   });
 });
