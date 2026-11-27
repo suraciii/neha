@@ -5,6 +5,7 @@
 //! reader resumes from.
 
 pub mod blobs;
+pub mod catalog;
 pub mod commands;
 pub mod computer_link;
 pub mod config;

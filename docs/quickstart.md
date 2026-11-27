@@ -71,15 +71,35 @@ target/debug/neha whoami
 
 ## Connect a Provider
 
-Add a Provider and its default Model. Put the API key in the environment or let the CLI prompt for it; never put it in the command line:
+Neha ships the models.dev catalog. Connect a vendor it knows; the vendor's address, protocol, Models, and capabilities come from the catalog:
+
+```bash
+target/debug/neha catalog list
+NEHA_PROVIDER_KEY=sk-... target/debug/neha provider connect openai
+```
+
+`neha catalog status` shows whether the built-in snapshot or a cached catalog is in use. `neha catalog refresh` fetches it again; a failed fetch keeps the last good copy. A vendor Neha cannot connect is listed with `(not connectable)`; an unsupported protocol is one reason, and a templated address or no tool-calling Model is another.
+
+For any other OpenAI-compatible endpoint, add it explicitly. `--discover` asks the endpoint for its Models; without it, name each Model:
 
 ```bash
 NEHA_PROVIDER_KEY=sk-... target/debug/neha provider add \
-  --base-url https://api.example.com/v1 \
-  --model example-chat
+  --base-url https://api.example.com/v1 --discover
+NEHA_PROVIDER_KEY=sk-... target/debug/neha provider add \
+  --base-url https://api.example.com/v1 --model example-chat
 ```
 
+`--protocol` selects `chat-completions` (the default), `openai-responses`, or `anthropic-messages`. Add `--thinks` when the Model can think, `--no-tools` when it cannot call tools, and `--thinking minimal|low|medium|high|max` to set the Space's default level (default `medium`). `neha provider refresh <provider>` reads the Models again.
+
 The API key is sealed with AES-256-GCM under a master key. The master key comes from `NEHA_MASTER_KEY`, or from `$NEHA_HOME/secrets/master.key`, which the Space creates with mode 0600.
+
+A fetched catalog is cached at `$NEHA_HOME/catalog/catalog.json`; without a cache, the built-in snapshot is used. `config.toml` can point at another catalog and change the background refresh interval; `refresh_hours = 0` disables it:
+
+```toml
+[catalog]
+url = "https://models.dev/api.json"
+refresh_hours = 24
+```
 
 List what the Space offers:
 
@@ -95,6 +115,8 @@ A new Bot gets its own Chat and its own Computer: a Hosted Computer unless you n
 ```bash
 target/debug/neha bot create Scout
 ```
+
+A Bot uses the Space's default Model and thinking level. Choose its own with `--model <model-id>` and `--thinking minimal|low|medium|high|max`; `neha bot show` prints them when set. `neha bot set <bot> --model <model-id> --thinking <level>` changes them later.
 
 The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's workspace:
 

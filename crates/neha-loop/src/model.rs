@@ -1,6 +1,7 @@
 //! The provider-neutral Model vocabulary the loop speaks.
 
 use neha::error::ErrorCode;
+use neha::surface::ThinkingLevel;
 use neha::usage::Usage;
 use serde::{Deserialize, Serialize};
 
@@ -100,6 +101,22 @@ impl Message {
     }
 }
 
+/// Provider-native state one step hands to the next.
+///
+/// The loop never interprets it. A different protocol, Provider, or Model
+/// must not receive it, so the adapter checks the identity before replaying.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Continuation {
+    /// The protocol that produced the state.
+    pub protocol: String,
+    /// The Provider that produced it.
+    pub provider: String,
+    /// The Model that produced it.
+    pub model: String,
+    /// The protocol's own state.
+    pub state: serde_json::Value,
+}
+
 /// A tool the Model may call.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSpec {
@@ -120,6 +137,10 @@ pub struct ModelRequest {
     pub tools: Vec<ToolSpec>,
     /// The largest reply in tokens.
     pub max_output: u32,
+    /// How much thought the Model should give this reply.
+    pub thinking: Option<ThinkingLevel>,
+    /// Provider-native state from the previous step.
+    pub continuation: Option<Continuation>,
 }
 
 /// One reply from a Model.
@@ -131,6 +152,8 @@ pub struct ModelReply {
     pub tool_calls: Vec<ToolCall>,
     /// The usage the Provider reported.
     pub usage: Usage,
+    /// Provider-native state the next step may need.
+    pub continuation: Option<Continuation>,
 }
 
 /// A Model call failed.

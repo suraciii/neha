@@ -26,6 +26,39 @@ A Bot's shell runs the same CLI with a short-lived run token instead of a sign-i
 
 `neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
 
+## Providers
+
+`neha provider connect <vendor>` connects a vendor the catalog knows, with the vendor's address, protocol, and Models.
+
+```bash
+NEHA_PROVIDER_KEY=... neha provider connect openai
+```
+
+`neha provider add` connects an endpoint and its Models. The key comes from `NEHA_PROVIDER_KEY` or the terminal prompt, never from the command line.
+
+```bash
+NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
+  --protocol chat-completions --model example-chat
+```
+
+`--discover` replaces the named Models with the endpoint's own `/models` answer. A failed discovery records nothing and asks for `--model`.
+
+`--protocol` is `chat-completions` (the default), `openai-responses`, or `anthropic-messages`. `--thinks` marks the Models as able to think, and `--no-tools` marks them as unable to call tools.
+
+`--thinking minimal|low|medium|high|max` sets the Space's default thinking level; without it the default is `medium`. A Model that is not marked `--thinks` ignores the level.
+
+`neha provider refresh <provider>` reads the Models again from the catalog or the endpoint. A Model whose name is unchanged keeps its identity; a removed Model is retired.
+
+`neha provider list` prints each Provider's vendor, protocol, and address. `neha model list` prints each Model's context, output, image, thinking levels, tools, and default state.
+
+## Catalog
+
+`neha catalog list` prints every vendor in the catalog, its protocol, Model count, and whether Neha can connect it. A vendor Neha cannot connect prints `(not connectable)`; an unsupported protocol is one reason.
+
+`neha catalog status` prints whether the built-in snapshot or the cache is in use, its age, and whether it is stale. `neha catalog refresh` fetches the catalog again; a failed fetch keeps the last known good copy.
+
+Only the Admin refreshes the catalog. The other catalog commands are reads.
+
 ## Computers
 
 A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on the machine where Neha runs.
@@ -46,7 +79,15 @@ Only the Computer's owner resets it, and only a Hosted Computer is reset. A Comp
 
 Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines. A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines and the Bot's own Model and thinking level when set.
+
+A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
+
+`neha bot create --model <model>` chooses the Bot's Model, and `--thinking minimal|low|medium|high|max` its level. Without them the Bot uses the Space's default. `neha model list` shows the Models and their levels.
+
+`neha bot set <bot> --model <model> --thinking <level>` changes the Bot's Model or level. A Model that cannot call tools refuses a run, and a level the Model does not accept is refused.
+
+The access commands below change a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses a file-access change because its Workspace is its only write range.
 
 `neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 

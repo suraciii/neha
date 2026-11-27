@@ -56,6 +56,19 @@ pub enum ClientFrame {
 pub enum CommandCall {
     /// Connects a Provider to the Space.
     ProviderAdd(ProviderAdd),
+    /// Connects a known vendor whose preset comes from the catalog.
+    ProviderConnect(ProviderConnect),
+    /// Discovers the Models a Provider offers now.
+    ProviderRefresh {
+        /// The Provider to refresh.
+        provider: Id,
+    },
+    /// Lists every Provider the catalog knows.
+    CatalogList,
+    /// Shows the catalog's cache state.
+    CatalogStatus,
+    /// Fetches the catalog again.
+    CatalogRefresh,
     /// Lists the Space's Providers.
     ProviderList,
     /// Lists the Space's Models.
@@ -164,11 +177,38 @@ pub struct ProviderAdd {
     pub base_url: String,
     /// The API key, which the Space stores encrypted.
     pub api_key: String,
-    /// The Models this Provider offers.
+    /// The Models this Provider offers, empty only when discovery is asked.
     pub models: Vec<ModelSpec>,
     /// The Model the Space uses by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// The Space's default thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
+    /// A catalog vendor, when the Models should come from the catalog.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// Ask the Provider for its Models instead of naming them.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub discover: bool,
+}
+
+/// The parameters of `provider_connect`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ProviderConnect {
+    /// The catalog vendor id, such as `openai`.
+    pub vendor: String,
+    /// The API key, which the Space stores encrypted.
+    pub api_key: String,
+    /// A base address that overrides the preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// A protocol that overrides the preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<ProviderProtocol>,
+    /// The Space's default thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// A provider protocol the Space can speak.
@@ -177,6 +217,39 @@ pub struct ProviderAdd {
 pub enum ProviderProtocol {
     /// OpenAI Chat Completions.
     ChatCompletions,
+    /// OpenAI Responses.
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    /// Anthropic Messages.
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages,
+}
+
+/// How much thought a Model should give a reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    /// Fastest and cheapest.
+    Minimal,
+    /// A little more thought.
+    Low,
+    /// The usual balance.
+    Medium,
+    /// More thought, more time, more cost.
+    High,
+    /// The most thought the Model offers.
+    Max,
+}
+
+impl ThinkingLevel {
+    /// Every level, cheapest first.
+    pub const ALL: [Self; 5] = [
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Max,
+    ];
 }
 
 /// A Model as the Admin declares it.
@@ -190,6 +263,25 @@ pub struct ModelSpec {
     pub max_output: u32,
     /// Whether the Model reads images.
     pub reads_images: bool,
+    /// Whether the Model can think before it answers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thinks: bool,
+    /// Whether the Model can call tools.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub tools: bool,
+    /// The thinking levels the Model supports; empty means every level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thinking_levels: Vec<ThinkingLevel>,
+}
+
+/// The default for capabilities every Model had before they were recorded.
+fn default_true() -> bool {
+    true
+}
+
+/// Whether a capability keeps its broad default on the wire.
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// The parameters of `bot_create`.
@@ -202,6 +294,12 @@ pub struct BotCreate {
     /// An absent value means a fresh Hosted Computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<BotComputer>,
+    /// The Bot's thinking level; absent uses the Space's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
+    /// The Bot's Model; absent uses the Space's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Id>,
 }
 
 /// The parameters of `bot_update`.
@@ -233,6 +331,12 @@ pub struct BotUpdate {
     /// One folder to take away from the grants the Bot has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_remove: Option<String>,
+    /// The Model the Bot uses; absent leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Id>,
+    /// The Bot's thinking level; absent leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// The Computer a `bot_create` asks for.
@@ -362,8 +466,9 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotComputer, BotCreate, ClientFrame, CommandCall, MessageSend, ModelSpec, PROTOCOL_VERSION,
-        ProviderAdd, ProviderProtocol, ServerFrame,
+        BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, MessageSend, ModelSpec,
+        PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol, ServerFrame,
+        ThinkingLevel,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -378,6 +483,9 @@ mod tests {
             command: CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+
+                thinking: None,
+                model: None,
             }),
         };
 
@@ -406,6 +514,9 @@ mod tests {
         let command = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
             computer: None,
+
+            thinking: None,
+            model: None,
         });
         let text = serde_json::to_string(&command).unwrap();
         assert!(
@@ -442,6 +553,9 @@ mod tests {
             let command = CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: Some(choice),
+
+                thinking: None,
+                model: None,
             });
             let text = serde_json::to_string(&command).unwrap();
             assert!(text.contains(&format!("\"computer\":\"{wire}\"")), "{text}");
@@ -460,6 +574,9 @@ mod tests {
         let command = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
             computer: Some(BotComputer::Id(computer)),
+
+            thinking: None,
+            model: None,
         });
         let text = serde_json::to_string(&command).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
@@ -485,13 +602,120 @@ mod tests {
                 context_limit: 128_000,
                 max_output: 8_192,
                 reads_images: false,
+
+                thinks: false,
+                tools: true,
+                thinking_levels: Vec::new(),
             }],
             default_model: Some("test-model".to_owned()),
+
+            thinking: None,
+            vendor: None,
+            discover: false,
         });
 
         let text = serde_json::to_string(&command).unwrap();
         assert!(text.contains("\"name\":\"provider_add\""));
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn provider_connect_names_its_vendor_and_overrides() {
+        let command = CommandCall::ProviderConnect(ProviderConnect {
+            vendor: "openai".to_owned(),
+            api_key: "secret".to_owned(),
+            base_url: Some("http://127.0.0.1:9000/v1".to_owned()),
+            protocol: Some(ProviderProtocol::OpenAiResponses),
+            thinking: Some(ThinkingLevel::High),
+        });
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"name\":\"provider_connect\""), "{text}");
+        assert!(text.contains("\"vendor\":\"openai\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+
+        let list = CommandCall::CatalogList;
+        assert_eq!(
+            serde_json::from_str::<CommandCall>("{\"name\":\"catalog_list\"}").unwrap(),
+            list
+        );
+    }
+
+    #[test]
+    fn bot_update_carries_a_model_and_thinking() {
+        let (bot, model) = (Id::new(), Id::new());
+        let update = CommandCall::BotUpdate(BotUpdate {
+            bot,
+            full_access: None,
+            full_access_consent: None,
+            grants: None,
+            grant_add: None,
+            grant_remove: None,
+            model: Some(model),
+            thinking: Some(ThinkingLevel::Low),
+        });
+        let text = serde_json::to_string(&update).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), update);
+        let old: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"bot_update\",\"args\":{{\"bot\":\"{bot}\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            old,
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            })
+        );
+    }
+
+    #[test]
+    fn provider_protocols_and_thinking_levels_round_trip() {
+        for (protocol, wire) in [
+            (ProviderProtocol::ChatCompletions, "chat_completions"),
+            (ProviderProtocol::OpenAiResponses, "openai_responses"),
+            (ProviderProtocol::AnthropicMessages, "anthropic_messages"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(protocol).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+        for (level, wire) in [
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(level).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+
+        let old: ProviderAdd = serde_json::from_value(serde_json::json!({
+            "protocol": "chat_completions",
+            "base_url": "http://127.0.0.1:9000/v1",
+            "api_key": "secret",
+            "models": [{
+                "name": "test-model",
+                "context_limit": 128000,
+                "max_output": 8192,
+                "reads_images": false
+            }]
+        }))
+        .unwrap();
+        assert!(!old.models[0].thinks);
+        assert_eq!(old.thinking, None);
+        let old_bot: BotCreate =
+            serde_json::from_value(serde_json::json!({"name": "Scout"})).unwrap();
+        assert_eq!(old_bot.thinking, None);
     }
 
     #[test]

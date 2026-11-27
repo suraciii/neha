@@ -23,12 +23,14 @@ use neha::record::{
 };
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, BotUpdate, CommandCall, FileSummary, MessageSend, ProviderAdd,
+    BotComputer, BotCreate, BotUpdate, CommandCall, FileSummary, MessageSend, ModelSpec,
+    ProviderAdd, ProviderConnect, ProviderProtocol, ThinkingLevel,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::blobs::Blobs;
+use crate::catalog::CatalogStore;
 use crate::computer_link::ComputerLinks;
 use crate::home::Home;
 use crate::identity::{Account, Identity, PairingRequest};
@@ -40,7 +42,9 @@ use crate::state::{
     ApprovalView, BotView, ChatView, ComputerView, ModelView, ProviderView, RuleView, RunStatus,
     State,
 };
-use crate::store::{AppendRequest, AppendResult, CommandRecord, Projection, Store};
+use crate::store::{
+    AppendRequest, AppendResult, CommandRecord, ContinuationWrite, Projection, Store,
+};
 
 use neha_computer::{
     Action, ActionResult, ActionStatus, ByteError, ComputerRuntime, LocalRuntime, ToolOutput,
@@ -104,6 +108,8 @@ pub struct PendingRun {
     pub provider: ProviderView,
     /// The Provider's API key.
     pub api_key: String,
+    /// The thinking level this run uses, when its Model can think.
+    pub thinking: Option<ThinkingLevel>,
     /// How a run this Space start recovered from the record continues.
     pub recovery: Option<RecoveryPlan>,
 }
@@ -170,6 +176,8 @@ pub struct CommandContext<'a> {
     pub runs: &'a crate::runs::RunQueue,
     /// The live event stream a command may broadcast on.
     pub events: &'a tokio::sync::broadcast::Sender<Event>,
+    /// The models.dev catalog and its cache.
+    pub catalog: &'a CatalogStore,
 }
 
 /// Runs one command for an account.
@@ -187,6 +195,26 @@ pub async fn execute(
                 return Err(ApiError::forbidden("only the Admin connects a Provider"));
             }
             provider_add(context, account, command_id, fingerprint, arguments).await
+        }
+        CommandCall::ProviderConnect(arguments) => {
+            if !account.is_admin {
+                return Err(ApiError::forbidden("only the Admin connects a Provider"));
+            }
+            provider_connect(context, account, command_id, fingerprint, arguments).await
+        }
+        CommandCall::ProviderRefresh { provider } => {
+            if !account.is_admin {
+                return Err(ApiError::forbidden("only the Admin refreshes a Provider"));
+            }
+            provider_refresh(context, account, command_id, fingerprint, provider).await
+        }
+        CommandCall::CatalogList => catalog_list(context).await,
+        CommandCall::CatalogStatus => catalog_status(context).await,
+        CommandCall::CatalogRefresh => {
+            if !account.is_admin {
+                return Err(ApiError::forbidden("only the Admin refreshes the catalog"));
+            }
+            catalog_refresh(context, account, command_id, fingerprint).await
         }
         CommandCall::ProviderList => read(context.state, |state| {
             serde_json::to_value(state.providers.values().collect::<Vec<_>>()).map_err(json_error)
@@ -832,6 +860,29 @@ async fn rule_remove(
     })
 }
 
+/// How one Provider will be recorded.
+struct ProviderPlan {
+    provider: Id,
+    protocol: ProviderProtocol,
+    base_url: String,
+    vendor: Option<String>,
+    models: Vec<ModelSpec>,
+    default_model: Option<String>,
+}
+
+/// The capability a Model has when nothing more specific is known.
+fn default_model_spec(name: String) -> ModelSpec {
+    ModelSpec {
+        name,
+        context_limit: 128_000,
+        max_output: 8_192,
+        reads_images: false,
+        thinks: false,
+        tools: true,
+        thinking_levels: Vec::new(),
+    }
+}
+
 async fn provider_add(
     context: &CommandContext<'_>,
     account: &Account,
@@ -839,17 +890,170 @@ async fn provider_add(
     fingerprint: String,
     arguments: ProviderAdd,
 ) -> Result<Outcome, ApiError> {
-    if arguments.models.is_empty() {
+    if arguments.discover && !arguments.models.is_empty() {
         return Err(ApiError::invalid_argument(
-            "a Provider needs at least one Model",
+            "a Provider either names its Models or discovers them, not both",
+        ));
+    }
+    if arguments.vendor.is_some() && !arguments.models.is_empty() {
+        return Err(ApiError::invalid_argument(
+            "a catalog vendor takes its Models from the catalog",
         ));
     }
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
-
     let provider = Id::new();
-    let models: Vec<Value> = arguments
+    let plan = if let Some(vendor) = &arguments.vendor {
+        catalog_plan(
+            context,
+            vendor,
+            Some(arguments.base_url.clone()).filter(|url| !url.trim().is_empty()),
+            Some(arguments.protocol),
+        )
+        .await?
+    } else if arguments.models.is_empty() {
+        if !arguments.discover {
+            return Err(ApiError::invalid_argument(
+                "a Provider needs at least one Model",
+            ));
+        }
+        let names = discover_models(&arguments.base_url, &arguments.api_key).await?;
+        ProviderPlan {
+            provider,
+            protocol: arguments.protocol,
+            base_url: arguments.base_url,
+            vendor: None,
+            models: names.into_iter().map(default_model_spec).collect(),
+            default_model: None,
+        }
+    } else {
+        ProviderPlan {
+            provider,
+            protocol: arguments.protocol,
+            base_url: arguments.base_url,
+            vendor: None,
+            models: arguments.models,
+            default_model: arguments.default_model,
+        }
+    };
+    record_provider(
+        context,
+        account,
+        command_id,
+        fingerprint,
+        plan,
+        arguments.api_key,
+        arguments.thinking,
+    )
+    .await
+}
+
+async fn provider_connect(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    arguments: ProviderConnect,
+) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+    let plan = catalog_plan(
+        context,
+        &arguments.vendor,
+        arguments.base_url,
+        arguments.protocol,
+    )
+    .await?;
+    record_provider(
+        context,
+        account,
+        command_id,
+        fingerprint,
+        plan,
+        arguments.api_key,
+        arguments.thinking,
+    )
+    .await
+}
+
+/// Builds a Provider plan from a catalog vendor.
+async fn catalog_plan(
+    context: &CommandContext<'_>,
+    vendor: &str,
+    base_url: Option<String>,
+    protocol: Option<ProviderProtocol>,
+) -> Result<ProviderPlan, ApiError> {
+    let catalog = context
+        .catalog
+        .catalog()
+        .await
+        .map_err(|error| ApiError::invalid_argument(error.to_string()))?;
+    let provider = catalog.provider(vendor).ok_or_else(|| {
+        ApiError::invalid_argument(format!("the catalog has no vendor {vendor:?}"))
+    })?;
+    let catalog_protocol = provider.protocol().ok_or_else(|| {
+        ApiError::invalid_argument(format!(
+            "the catalog vendor {vendor:?} speaks no protocol Neha implements"
+        ))
+    })?;
+    let protocol = protocol.unwrap_or(catalog_protocol);
+    let base_url = base_url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| provider.base_url())
+        .ok_or_else(|| {
+            ApiError::invalid_argument(format!(
+                "the catalog vendor {vendor:?} names no usable base URL; pass --base-url"
+            ))
+        })?;
+    if base_url.contains("${") {
+        return Err(ApiError::invalid_argument(
+            "the base URL still contains a catalog template; pass the resolved --base-url",
+        ));
+    }
+    let models = provider.models_for_space();
+    if models.is_empty() {
+        return Err(ApiError::invalid_argument(format!(
+            "the catalog vendor {vendor:?} names no usable Models"
+        )));
+    }
+    let default_model = Some(provider.default_model_name().ok_or_else(|| {
+        ApiError::invalid_argument(format!(
+            "the catalog vendor {vendor:?} names no Model that can call tools"
+        ))
+    })?);
+
+    Ok(ProviderPlan {
+        provider: Id::new(),
+        protocol,
+        base_url,
+        vendor: Some(vendor.to_owned()),
+        models,
+        default_model,
+    })
+}
+
+/// The levels a Model records; an undeclared set means every level.
+fn recorded_thinking_levels(model: &ModelSpec) -> Vec<ThinkingLevel> {
+    if model.thinks && model.thinking_levels.is_empty() {
+        ThinkingLevel::ALL.to_vec()
+    } else {
+        model.thinking_levels.clone()
+    }
+}
+
+/// Records a Provider and its encrypted key.
+async fn record_provider(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    plan: ProviderPlan,
+    api_key: String,
+    thinking: Option<ThinkingLevel>,
+) -> Result<Outcome, ApiError> {
+    let models: Vec<Value> = plan
         .models
         .iter()
         .map(|model| {
@@ -859,15 +1063,17 @@ async fn provider_add(
                 "context_limit": model.context_limit,
                 "max_output": model.max_output,
                 "reads_images": model.reads_images,
+                "thinks": model.thinks,
+                "tools": model.tools,
+                "thinking_levels": recorded_thinking_levels(model),
             })
         })
         .collect();
-    let default_model = arguments
+    let default_model = plan
         .default_model
         .as_ref()
         .and_then(|name| {
-            arguments
-                .models
+            plan.models
                 .iter()
                 .zip(&models)
                 .find(|(model, _)| &model.name == name)
@@ -875,17 +1081,26 @@ async fn provider_add(
         })
         .or_else(|| models.first().map(|model| model["id"].clone()))
         .ok_or_else(|| ApiError::invalid_argument("the default Model is not declared"))?;
+    let protocol = serde_json::to_value(plan.protocol).map_err(json_error)?;
+    let thinking = thinking.or(Some(ThinkingLevel::Medium));
     let data = json!({
-        "provider": provider,
-        "protocol": "chat_completions",
-        "base_url": arguments.base_url,
+        "provider": plan.provider,
+        "protocol": protocol,
+        "base_url": plan.base_url,
         "models": models,
         "default_model": default_model,
+        "thinking": thinking,
+        "vendor": plan.vendor,
     });
-    let result = json!({"provider": provider, "models": models});
+    let result = json!({
+        "provider": plan.provider,
+        "protocol": plan.protocol,
+        "base_url": plan.base_url,
+        "models": models,
+    });
     context
         .secrets
-        .store_provider_key(provider, &arguments.api_key)
+        .store_provider_key(plan.provider, &api_key)
         .map_err(|_| ApiError::internal("cannot store the Provider key"))?;
     let draft = EventDraft::new(EventKind::ProviderAdded, Author::User(account.id), data);
     let appended = match append(
@@ -901,12 +1116,12 @@ async fn provider_add(
     {
         Ok(appended) => appended,
         Err(error) => {
-            context.secrets.discard_provider_key(provider);
+            context.secrets.discard_provider_key(plan.provider);
             return Err(error);
         }
     };
     if appended.existing {
-        context.secrets.discard_provider_key(provider);
+        context.secrets.discard_provider_key(plan.provider);
         return recorded_outcome(context.store, command_id).await;
     }
 
@@ -916,6 +1131,265 @@ async fn provider_add(
         queued: None,
         events: appended.events,
     })
+}
+
+/// Refreshes a Provider's Model list from the catalog or its own endpoint.
+async fn provider_refresh(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    provider: Id,
+) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+    let (view, api_key) = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let view = state
+            .providers
+            .get(&provider)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such Provider"))?;
+        let api_key = context
+            .secrets
+            .provider_key(provider)
+            .map_err(|_| ApiError::internal("the Provider key is missing"))?;
+        (view, api_key)
+    };
+    let old_models: HashMap<String, ModelView> = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .models
+            .values()
+            .filter(|model| model.provider == provider)
+            .map(|model| (model.name.clone(), model.clone()))
+            .collect()
+    };
+    let old_default = old_models
+        .values()
+        .find(|model| model.is_default)
+        .map(|model| model.name.clone());
+    let was_space_default = old_default.is_some();
+    let (specs, default_name) = if let Some(vendor) = view.vendor.as_deref() {
+        let plan = catalog_plan(context, vendor, Some(view.base_url.clone()), None).await?;
+        (plan.models, plan.default_model)
+    } else {
+        let specs = discover_models(&view.base_url, &api_key)
+            .await?
+            .into_iter()
+            .map(|name| {
+                // Discovery names the Models; the Admin's existing
+                // capabilities for one are still the better answer.
+                if let Some(model) = old_models.get(&name) {
+                    ModelSpec {
+                        name,
+                        context_limit: model.context_limit,
+                        max_output: model.max_output,
+                        reads_images: model.reads_images,
+                        thinks: model.thinks,
+                        tools: model.tools,
+                        thinking_levels: model.thinking_levels.clone(),
+                    }
+                } else {
+                    default_model_spec(name)
+                }
+            })
+            .collect();
+        (specs, old_default.clone())
+    };
+    if specs.is_empty() {
+        return Err(ApiError::invalid_argument(
+            "the Provider listed no Models; keep the current ones",
+        ));
+    }
+    let models: Vec<Value> = specs
+        .iter()
+        .map(|model| {
+            json!({
+                "id": old_models
+                    .get(&model.name)
+                    .map_or_else(Id::new, |old| old.id),
+                "name": model.name,
+                "context_limit": model.context_limit,
+                "max_output": model.max_output,
+                "reads_images": model.reads_images,
+                "thinks": model.thinks,
+                "tools": model.tools,
+                "thinking_levels": recorded_thinking_levels(model),
+            })
+        })
+        .collect();
+    let default_name = if was_space_default {
+        old_default
+            .filter(|name| specs.iter().any(|model| &model.name == name))
+            .or_else(|| default_name.filter(|name| specs.iter().any(|model| &model.name == name)))
+            .or_else(|| {
+                specs
+                    .iter()
+                    .find(|model| model.tools)
+                    .or_else(|| specs.first())
+                    .map(|model| model.name.clone())
+            })
+    } else {
+        None
+    };
+    let default_model = default_name.as_deref().and_then(|name| {
+        models
+            .iter()
+            .find(|model| model["name"].as_str() == Some(name))
+            .map(|model| model["id"].clone())
+    });
+    let data = json!({
+        "provider": provider,
+        "models": models,
+        "default_model": default_model,
+    });
+    let result = json!({"provider": provider, "models": models});
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![EventDraft::new(
+            EventKind::ProviderModelsUpdated,
+            Author::User(account.id),
+            data,
+        )],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Lists every Provider the catalog knows.
+async fn catalog_list(context: &CommandContext<'_>) -> Result<Outcome, ApiError> {
+    let catalog = context.catalog.catalog().await.map_err(catalog_error)?;
+    let providers: Vec<Value> = catalog
+        .providers()
+        .map(|provider| {
+            json!({
+                "id": provider.id,
+                "name": provider.name,
+                "npm": provider.npm,
+                "protocol": provider.protocol(),
+                "selectable": provider.selectable(),
+                "api": provider.base_url(),
+                "env": provider.env,
+                "doc": provider.doc,
+                "model_count": provider.models.len(),
+            })
+        })
+        .collect();
+
+    Ok(Outcome {
+        committed: None,
+        result: Value::Array(providers),
+        queued: None,
+        events: Vec::new(),
+    })
+}
+
+/// Shows the catalog cache state.
+async fn catalog_status(context: &CommandContext<'_>) -> Result<Outcome, ApiError> {
+    let status = context.catalog.status().await.map_err(catalog_error)?;
+    Ok(Outcome {
+        committed: None,
+        result: serde_json::to_value(status).map_err(json_error)?,
+        queued: None,
+        events: Vec::new(),
+    })
+}
+
+/// Fetches the catalog again.
+async fn catalog_refresh(
+    context: &CommandContext<'_>,
+    _account: &Account,
+    command_id: Id,
+    fingerprint: String,
+) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+    let refreshed = context.catalog.refresh().await.map_err(catalog_error)?;
+    Ok(Outcome {
+        committed: None,
+        result: serde_json::to_value(refreshed).map_err(json_error)?,
+        queued: None,
+        events: Vec::new(),
+    })
+}
+
+fn catalog_error(error: crate::catalog::CatalogError) -> ApiError {
+    ApiError::unavailable(error.to_string())
+}
+
+/// Asks an OpenAI-compatible endpoint for its Model names.
+async fn discover_models(base_url: &str, api_key: &str) -> Result<Vec<String>, ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|_| ApiError::internal("cannot build the discovery client"))?;
+    let response = client
+        .get(format!("{}/models", base_url.trim_end_matches('/')))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::unavailable(format!(
+                "the Provider did not list its Models: {error}; declare them with --model"
+            ))
+        })?;
+    if !response.status().is_success() {
+        return Err(ApiError::invalid_argument(format!(
+            "the Provider answered {} when asked for its Models; declare them with --model",
+            response.status()
+        )));
+    }
+    let body: Value = response.json().await.map_err(|_| {
+        ApiError::invalid_argument(
+            "the Provider's Model list is not JSON; declare them with --model",
+        )
+    })?;
+    let entries = body
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| body.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut names = Vec::new();
+    for entry in entries {
+        let name = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| entry.as_str());
+        if let Some(name) = name
+            && !name.trim().is_empty()
+            && !names.iter().any(|seen| seen == name)
+        {
+            names.push(name.to_owned());
+        }
+    }
+    if names.is_empty() {
+        return Err(ApiError::invalid_argument(
+            "the Provider listed no Models; declare them with --model",
+        ));
+    }
+
+    Ok(names)
 }
 
 /// Returns one grant in the form the Space stores and shows.
@@ -994,7 +1468,8 @@ async fn bot_update(
     let added = update.grant_add.is_some();
     let removed = update.grant_remove.is_some();
     let grant_changes = usize::from(replaced) + usize::from(added) + usize::from(removed);
-    if update.full_access.is_none() && grant_changes == 0 {
+    let selection_change = update.model.is_some() || update.thinking.is_some();
+    if update.full_access.is_none() && grant_changes == 0 && !selection_change {
         return Err(ApiError::invalid_argument("a Bot update needs a change"));
     }
     if grant_changes > 1 {
@@ -1014,11 +1489,12 @@ async fn bot_update(
         let bot = state
             .owned_bot(update.bot, account.id)
             .ok_or_else(|| ApiError::not_found("no such Bot"))?;
+        let access_change = update.full_access.is_some() || grant_changes > 0;
         let hosted = state
             .computers
             .get(&bot.computer)
             .is_some_and(|computer| computer.kind == "hosted");
-        if hosted {
+        if hosted && access_change {
             return Err(ApiError::invalid_argument(
                 "file access changes apply only to a Local Computer; a Hosted Computer works only in its Workspace",
             ));
@@ -1107,6 +1583,30 @@ async fn bot_update(
             bot.grants = grants.clone();
             data["grants"] = json!(grants);
         }
+        let mut model = bot.model;
+        if let Some(selected) = update.model {
+            check_model_capability(&state, selected, "the selected Model does not exist")?;
+            bot.model = Some(selected);
+            model = Some(selected);
+            data["model"] = json!(selected);
+        }
+        if let Some(level) = update.thinking {
+            if let Some(selected) = model
+                && let Some(view) = state.models.get(&selected)
+            {
+                check_thinking_capability(view, level)?;
+            }
+            bot.thinking = Some(level);
+            data["thinking"] = json!(level);
+        } else if update.model.is_some()
+            && let Some(level) = bot.thinking
+            && let Some(selected) = model
+            && let Some(view) = state.models.get(&selected)
+        {
+            // Selecting another Model keeps the Bot's own level only when the
+            // new Model accepts it.
+            check_thinking_capability(view, level)?;
+        }
         let mut result = serde_json::to_value(bot).map_err(json_error)?;
         result["user"] = json!(account.id);
         (data, result)
@@ -1150,6 +1650,27 @@ async fn bot_create(
     }
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
+    }
+    {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        if let Some(selected) = arguments.model {
+            check_model_capability(&state, selected, "the selected Model does not exist")?;
+        }
+        if let Some(level) = arguments.thinking
+            && let Some(selected) = arguments.model.or_else(|| {
+                state
+                    .models
+                    .values()
+                    .find(|model| model.is_default)
+                    .map(|model| model.id)
+            })
+            && let Some(view) = state.models.get(&selected)
+        {
+            check_thinking_capability(view, level)?;
+        }
     }
 
     let bot = Id::new();
@@ -1207,7 +1728,7 @@ async fn bot_create(
     drafts.push(EventDraft::new(
         EventKind::BotCreated,
         Author::User(account.id),
-        json!({"bot": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat}),
+        json!({"bot": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat, "thinking": arguments.thinking, "model": arguments.model}),
     ));
     drafts.push(EventDraft::new(
         EventKind::ChatCreated,
@@ -1223,6 +1744,8 @@ async fn bot_create(
             "chat": chat,
             "full_access": false,
             "grants": Vec::<String>::new(),
+            "thinking": arguments.thinking,
+            "model": arguments.model,
         },
         "computer": computer_view,
         "chat": {"id": chat, "owner": account.id, "bot": bot},
@@ -1998,7 +2521,8 @@ pub async fn resume_pending(
     secrets: &Secrets,
     run: &crate::state::RunView,
 ) -> Result<PendingRun, ApiError> {
-    let (bot, model, provider, api_key) = preflight(state, run.chat, run.acting, secrets, None)?;
+    let (bot, model, provider, api_key, thinking) =
+        preflight(state, run.chat, run.acting, secrets, None)?;
     let chat = {
         let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
         state
@@ -2025,6 +2549,7 @@ pub async fn resume_pending(
         model,
         provider,
         api_key,
+        thinking,
         recovery: None,
     })
 }
@@ -2330,6 +2855,7 @@ pub async fn finish_run(
         pending,
         history,
         None,
+        None,
         neha::usage::Usage::default(),
         None,
     )
@@ -2448,6 +2974,11 @@ pub async fn resume_run(
                 return Ok(Finished::Completed(events));
             }
         };
+        let mut resume = Some(resume);
+        load_resume_continuation(store, run.id, &mut resume).await?;
+        let Some(resume) = resume else {
+            return Err(ApiError::internal("the resumed step is missing"));
+        };
         let pending = match resume_pending(state, secrets, run).await {
             Ok(pending) => pending,
             Err(error) => {
@@ -2473,6 +3004,7 @@ pub async fn resume_run(
             links,
             pending,
             history,
+            None,
             Some(resume),
             base_usage,
             None,
@@ -2525,10 +3057,28 @@ pub async fn resume_run(
             let ContinuePlan {
                 next_step,
                 history,
-                resume,
+                mut resume,
                 base_usage,
                 unknown,
             } = *plan;
+            let mut continuation = None;
+            if let Some(waiting) = resume.as_mut() {
+                if let Some(state) = store
+                    .continuation(run.id, waiting.step)
+                    .await
+                    .map_err(store_error)?
+                {
+                    waiting.continuation = Some(state);
+                }
+            } else if unknown.is_none()
+                && next_step > 1
+                && let Some(state) = store
+                    .continuation(run.id, next_step - 1)
+                    .await
+                    .map_err(store_error)?
+            {
+                continuation = Some(state);
+            }
             let pending = match resume_pending(state, secrets, run).await {
                 Ok(pending) => pending,
                 Err(error) => {
@@ -2554,6 +3104,7 @@ pub async fn resume_run(
                 links,
                 pending,
                 history,
+                continuation,
                 resume,
                 base_usage,
                 Some((next_step, unknown)),
@@ -2674,6 +3225,7 @@ async fn finish_run_with(
     links: &ComputerLinks,
     pending: PendingRun,
     history: Vec<neha_loop::Message>,
+    mut continuation: Option<neha_loop::Continuation>,
     resume: Option<Resume>,
     base_usage: neha::usage::Usage,
     recovery: Option<(u32, Option<crate::state::ActionView>)>,
@@ -2774,10 +3326,15 @@ async fn finish_run_with(
                             let ContinuePlan {
                                 next_step,
                                 history: replay,
-                                resume: replay_resume,
+                                resume: mut replay_resume,
                                 base_usage: replay_usage,
                                 ..
                             } = *plan;
+                            // The target step's state is authoritative; never
+                            // fall back to the previous completed step here.
+                            continuation = None;
+                            load_resume_continuation(store, pending.run, &mut replay_resume)
+                                .await?;
                             start_step = Some(next_step);
                             history = replay;
                             resume = replay_resume;
@@ -2866,11 +3423,15 @@ async fn finish_run_with(
             }
         }
     }
+    let protocol = provider_protocol(&pending.provider)?;
+    let provider_id = pending.provider.id.to_string();
     let space_model = SpaceModel::new(
         model,
         &pending.provider.base_url,
         &pending.api_key,
         &pending.model.name,
+        &provider_id,
+        protocol,
     );
     let log = RunLog {
         store,
@@ -2899,7 +3460,9 @@ async fn finish_run_with(
         ),
         history,
         pending.model.max_output,
-    );
+    )
+    .with_thinking(pending.thinking)
+    .with_continuation(continuation);
     if let Some(resume) = resume {
         // A resumed step's calls come from the record; the loop continues at
         // the call after the approved one.
@@ -3064,6 +3627,23 @@ async fn record_recovered_action(
 /// and the waiting step becomes a `Resume` whose `done` calls already have
 /// their results. A step whose actions do not line up with its calls, or an
 /// action that started and never finished, cannot be resumed.
+/// Loads the provider-native state a resumed step needs.
+async fn load_resume_continuation(
+    store: &Store,
+    run: Id,
+    resume: &mut Option<Resume>,
+) -> Result<(), ApiError> {
+    let Some(waiting) = resume.as_mut() else {
+        return Ok(());
+    };
+    waiting.continuation = store
+        .continuation(run, waiting.step)
+        .await
+        .map_err(store_error)?;
+
+    Ok(())
+}
+
 fn prepare_resume(
     state: &Mutex<State>,
     run: &crate::state::RunView,
@@ -3197,6 +3777,7 @@ fn prepare_resume(
         approved_action: Some(approval.action),
         usage: reply.usage.unwrap_or_default(),
         recovered: false,
+        continuation: None,
     };
 
     Ok((messages, resume, base_usage))
@@ -3432,6 +4013,7 @@ pub(crate) fn prepare_recovery(
         approved_action: None,
         usage: reply.usage.unwrap_or_default(),
         recovered: done == reply.calls.len(),
+        continuation: None,
     };
     Ok(RecoveryPlan::Continue(Box::new(ContinuePlan {
         next_step,
@@ -3834,25 +4416,53 @@ struct RunLog<'a> {
 }
 
 impl RunLog<'_> {
-    /// Appends the events of the run and streams them to subscribers.
-    async fn append(&self, drafts: Vec<EventDraft>) -> Result<(), LoopError> {
-        let command = Id::new();
-        let appended = append(
-            self.store,
-            self.state,
-            command,
-            format!("run.record:{command}"),
-            drafts,
-            None,
-            None,
-        )
-        .await
-        .map_err(|error| LoopError::Record(error.to_string()))?;
+    /// Appends one run command and streams its events to subscribers.
+    async fn record(&self, request: AppendRequest) -> Result<(), LoopError> {
+        let appended = self
+            .store
+            .append(request)
+            .await
+            .map_err(|error| LoopError::Record(error.to_string()))?;
+        if !appended.existing {
+            apply(self.state, &appended.events)
+                .map_err(|error| LoopError::Record(error.to_string()))?;
+        }
         for event in appended.events {
             let _ = self.events.send(event);
         }
 
         Ok(())
+    }
+
+    /// Appends the events of the run and streams them to subscribers.
+    async fn append(&self, drafts: Vec<EventDraft>) -> Result<(), LoopError> {
+        let command = Id::new();
+        self.record(AppendRequest::new(
+            command,
+            format!("run.record:{command}"),
+            drafts,
+        ))
+        .await
+    }
+
+    /// Appends the reply and the provider-native state in one transaction.
+    async fn append_reply(
+        &self,
+        drafts: Vec<EventDraft>,
+        step: u32,
+        continuation: Option<neha_loop::Continuation>,
+    ) -> Result<(), LoopError> {
+        let command = Id::new();
+        self.record(
+            AppendRequest::new(command, format!("run.record:{command}"), drafts).with_continuation(
+                ContinuationWrite {
+                    run: self.run,
+                    step,
+                    continuation,
+                },
+            ),
+        )
+        .await
     }
 
     /// Returns an event the Bot writes for the User it acts for.
@@ -3895,6 +4505,7 @@ impl Recorder for RunRecorder<'_> {
         content: Option<String>,
         calls: Vec<LoopCall>,
         usage: neha::usage::Usage,
+        continuation: Option<neha_loop::Continuation>,
     ) -> Result<(), LoopError> {
         self.calls.insert(step, calls.clone());
         let calls: Vec<Value> = calls
@@ -3909,16 +4520,20 @@ impl Recorder for RunRecorder<'_> {
             })
             .collect();
         self.log
-            .append(vec![self.log.bot_draft(
-                EventKind::RunReply,
-                json!({
-                    "run": self.log.run,
-                    "step": step,
-                    "content": content,
-                    "calls": calls,
-                    "usage": usage,
-                }),
-            )])
+            .append_reply(
+                vec![self.log.bot_draft(
+                    EventKind::RunReply,
+                    json!({
+                        "run": self.log.run,
+                        "step": step,
+                        "content": content,
+                        "calls": calls,
+                        "usage": usage,
+                    }),
+                )],
+                step,
+                continuation,
+            )
             .await
     }
 
@@ -4756,13 +5371,73 @@ fn bounded_run(run: &crate::state::RunView) -> Result<Value, ApiError> {
     }))
 }
 
+/// Checks that a Model exists and its Provider is connected.
+fn check_model_capability(state: &State, model: Id, missing: &str) -> Result<(), ApiError> {
+    let view = state
+        .models
+        .get(&model)
+        .ok_or_else(|| ApiError::invalid_argument(missing))?;
+    if !state.providers.contains_key(&view.provider) {
+        return Err(ApiError::invalid_argument("the Model has no Provider"));
+    }
+    if !view.tools {
+        return Err(ApiError::invalid_argument(
+            "the Model cannot call tools, so a Bot cannot use it",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Checks that a Model accepts a thinking level.
+fn check_thinking_capability(model: &ModelView, level: ThinkingLevel) -> Result<(), ApiError> {
+    if !model.thinks {
+        return Err(ApiError::invalid_argument(
+            "the Bot asks for thinking but its Model cannot think",
+        ));
+    }
+    if !model.accepted_thinking().contains(&level) {
+        return Err(ApiError::invalid_argument(
+            "the Model does not support that thinking level",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Picks the closest level a Model accepts.
+fn closest_thinking(model: &ModelView, wanted: ThinkingLevel) -> Option<ThinkingLevel> {
+    model
+        .accepted_thinking()
+        .into_iter()
+        .min_by_key(|level| i32::from(*level as u8).abs_diff(i32::from(wanted as u8)))
+}
+
+/// Uses the Space default when the Model accepts it, else the closest level.
+fn selected_default_thinking(
+    model: &ModelView,
+    default: Option<ThinkingLevel>,
+) -> Option<ThinkingLevel> {
+    let wanted = default.unwrap_or(ThinkingLevel::Medium);
+    Some(closest_thinking(model, wanted).unwrap_or(wanted))
+}
+
 fn preflight(
     state: &Mutex<State>,
     chat: Id,
     owner: Id,
     secrets: &Secrets,
     file: Option<Id>,
-) -> Result<(BotView, ModelView, ProviderView, String), ApiError> {
+) -> Result<
+    (
+        BotView,
+        ModelView,
+        ProviderView,
+        String,
+        Option<ThinkingLevel>,
+    ),
+    ApiError,
+> {
     let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
     state
         .owned_chat(chat, owner)
@@ -4780,10 +5455,17 @@ fn preflight(
         .get(&chat_view.bot)
         .cloned()
         .ok_or_else(|| ApiError::internal("the Chat has no Bot"))?;
-    let model = state
-        .default_model()
-        .cloned()
-        .ok_or_else(|| ApiError::invalid_argument("the Space has no default Model"))?;
+    let model = match bot.model {
+        Some(selected) => state
+            .models
+            .get(&selected)
+            .cloned()
+            .ok_or_else(|| ApiError::invalid_argument("the Bot's Model does not exist"))?,
+        None => state
+            .default_model()
+            .cloned()
+            .ok_or_else(|| ApiError::invalid_argument("the Space has no default Model"))?,
+    };
     let provider = state
         .providers
         .get(&model.provider)
@@ -4792,8 +5474,26 @@ fn preflight(
     let api_key = secrets
         .provider_key(provider.id)
         .map_err(|_| ApiError::invalid_argument("the Provider key is missing"))?;
+    if !model.tools {
+        return Err(ApiError::invalid_argument(
+            "the Bot's Model cannot call tools",
+        ));
+    }
+    let thinking = match bot.thinking {
+        Some(level) => {
+            check_thinking_capability(&model, level)?;
+            Some(level)
+        }
+        None if model.thinks => selected_default_thinking(&model, state.default_thinking),
+        None => None,
+    };
 
-    Ok((bot, model, provider, api_key))
+    Ok((bot, model, provider, api_key, thinking))
+}
+
+fn provider_protocol(provider: &ProviderView) -> Result<ProviderProtocol, ApiError> {
+    serde_json::from_value(serde_json::Value::String(provider.protocol.clone()))
+        .map_err(|_| ApiError::internal("the Provider records an unknown protocol"))
 }
 
 fn build_history(
@@ -5000,15 +5700,17 @@ mod tests {
 
     use super::{
         LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
-        grant_folder, grants_with, lasting_rule_path_at, normalized_grants, path_covers,
-        path_matches, path_matches_at, path_parent, persistable_grant, pinned_access,
-        prepare_recovery, prepare_resume, resolve_action_path, resumed_access, rule_covers,
-        rule_matches, run_access, under_root, verify_recovered_action,
+        grant_folder, grants_with, lasting_rule_path_at, load_resume_continuation,
+        normalized_grants, path_covers, path_matches, path_matches_at, path_parent,
+        persistable_grant, pinned_access, prepare_recovery, prepare_resume, resolve_action_path,
+        resumed_access, rule_covers, rule_matches, run_access, under_root, verify_recovered_action,
     };
+    use crate::home::Home;
     use crate::state::{AccessView, BotView, RuleView};
+    use crate::store::{AppendRequest, ContinuationWrite, Store};
     use neha::error::ErrorCode;
     use neha::id::Id;
-    use neha::record::RuleEffect;
+    use neha::record::{EventDraft, RuleEffect};
     use neha::seq::Seq;
 
     fn ask(tool: &str, command_prefix: Option<&str>, path_prefix: Option<&str>) -> RuleView {
@@ -5050,6 +5752,8 @@ mod tests {
             chat: Id::new(),
             full_access: false,
             grants: Vec::new(),
+            thinking: None,
+            model: None,
         }
     }
 
@@ -5211,6 +5915,91 @@ mod tests {
             vec!["/data/one".to_owned()],
             "a folder already granted is not recorded twice"
         );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_step_loads_only_its_own_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let run = Id::new();
+        let bot = Id::new();
+        let user = Id::new();
+        let first = neha_loop::Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_first"}]}),
+        };
+        let second = neha_loop::Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_second"}]}),
+        };
+        for (step, continuation) in [(1, first), (2, second.clone())] {
+            let reply = EventDraft::new(
+                EventKind::RunReply,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": step,
+                    "content": null,
+                    "calls": [{"call": format!("call-{step}"), "tool": "shell",
+                        "arguments": {"command": "true"}}],
+                    "usage": null,
+                }),
+            )
+            .acting(user);
+            store
+                .append(
+                    AppendRequest::new(Id::new(), format!("reply-{step}"), vec![reply])
+                        .with_continuation(ContinuationWrite {
+                            run,
+                            step,
+                            continuation: Some(continuation),
+                        }),
+                )
+                .await
+                .unwrap();
+        }
+        let mut resume = Some(neha_loop::Resume {
+            step: 2,
+            content: None,
+            calls: Vec::new(),
+            done: 0,
+            approved_action: None,
+            usage: neha::usage::Usage::default(),
+            recovered: false,
+            continuation: None,
+        });
+
+        load_resume_continuation(&store, run, &mut resume)
+            .await
+            .unwrap();
+
+        assert_eq!(resume.unwrap().continuation, Some(second));
+
+        let mut missing = Some(neha_loop::Resume {
+            step: 3,
+            content: None,
+            calls: Vec::new(),
+            done: 0,
+            approved_action: None,
+            usage: neha::usage::Usage::default(),
+            recovered: false,
+            continuation: Some(neha_loop::Continuation {
+                protocol: "openai_responses".to_owned(),
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+                state: json!({"items": []}),
+            }),
+        });
+        load_resume_continuation(&store, run, &mut missing)
+            .await
+            .unwrap();
+        assert_eq!(missing.unwrap().continuation, None);
+        store.close().await.unwrap();
     }
 
     #[test]

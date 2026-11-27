@@ -47,6 +47,9 @@ pub struct ProviderView {
     pub protocol: String,
     /// Its base address.
     pub base_url: String,
+    /// The catalog vendor it came from, when it had a preset.
+    #[serde(default)]
+    pub vendor: Option<String>,
 }
 
 /// A Model the Space offers.
@@ -64,8 +67,35 @@ pub struct ModelView {
     pub max_output: u32,
     /// Whether it reads images.
     pub reads_images: bool,
+    /// Whether it can think before it answers.
+    pub thinks: bool,
+    /// Whether it can call tools.
+    #[serde(default = "true_capability")]
+    pub tools: bool,
+    /// The thinking levels it supports; empty means every level.
+    #[serde(default)]
+    pub thinking_levels: Vec<neha::surface::ThinkingLevel>,
     /// Whether it is the Space's default.
     pub is_default: bool,
+}
+
+/// Models recorded before tools were a capability could call them.
+const fn true_capability() -> bool {
+    true
+}
+
+impl ModelView {
+    /// The thinking levels this Model accepts.
+    #[must_use]
+    pub fn accepted_thinking(&self) -> Vec<neha::surface::ThinkingLevel> {
+        if !self.thinks {
+            return Vec::new();
+        }
+        if self.thinking_levels.is_empty() {
+            return neha::surface::ThinkingLevel::ALL.to_vec();
+        }
+        self.thinking_levels.clone()
+    }
 }
 
 /// A Bot.
@@ -87,6 +117,12 @@ pub struct BotView {
     /// Extra folders outside its Workspace it may write.
     #[serde(default)]
     pub grants: Vec<String>,
+    /// Its thinking level; absent uses the Space's default.
+    #[serde(default)]
+    pub thinking: Option<neha::surface::ThinkingLevel>,
+    /// Its Model; absent uses the Space's default.
+    #[serde(default)]
+    pub model: Option<Id>,
 }
 
 /// A Computer.
@@ -372,6 +408,8 @@ pub struct State {
     pub providers: HashMap<Id, ProviderView>,
     /// The Models, by identifier.
     pub models: HashMap<Id, ModelView>,
+    /// The Space's default thinking level.
+    pub default_thinking: Option<neha::surface::ThinkingLevel>,
     /// The Bots, by identifier.
     pub bots: HashMap<Id, BotView>,
     /// The Computers, by identifier.
@@ -678,12 +716,14 @@ impl Projection for State {
                         id: data.provider,
                         protocol: data.protocol,
                         base_url: data.base_url,
+                        vendor: data.vendor,
                     },
                 );
                 if data.default_model.is_some() {
                     for model in self.models.values_mut() {
                         model.is_default = false;
                     }
+                    self.default_thinking = data.thinking;
                 }
                 for model in data.models {
                     self.models.insert(
@@ -695,6 +735,9 @@ impl Projection for State {
                             context_limit: model.context_limit,
                             max_output: model.max_output,
                             reads_images: model.reads_images,
+                            thinks: model.thinks,
+                            tools: model.tools,
+                            thinking_levels: model.thinking_levels,
                             is_default: data.default_model == Some(model.id),
                         },
                     );
@@ -711,6 +754,8 @@ impl Projection for State {
                         chat: data.chat,
                         full_access: false,
                         grants: Vec::new(),
+                        thinking: data.thinking,
+                        model: data.model,
                     },
                 );
             }
@@ -743,6 +788,63 @@ impl Projection for State {
                 }
                 if let Some(grants) = data.grants {
                     bot.grants = grants;
+                }
+                if let Some(model) = data.model {
+                    bot.model = Some(model);
+                }
+                if let Some(thinking) = data.thinking {
+                    bot.thinking = Some(thinking);
+                }
+            }
+            EventData::ProviderModelsUpdated(data) => {
+                if !self.providers.contains_key(&data.provider) {
+                    return Err("an updated Provider must exist".to_owned());
+                }
+                if let Some(default) = data.default_model
+                    && !data.models.iter().any(|model| model.id == default)
+                {
+                    return Err("an updated Provider's default Model must exist".to_owned());
+                }
+                let old: Vec<Id> = self
+                    .models
+                    .values()
+                    .filter(|model| model.provider == data.provider)
+                    .map(|model| model.id)
+                    .collect();
+                for id in &old {
+                    self.models.remove(id);
+                }
+                if data.default_model.is_some() {
+                    for model in self.models.values_mut() {
+                        model.is_default = false;
+                    }
+                }
+                for model in data.models {
+                    self.models.insert(
+                        model.id,
+                        ModelView {
+                            id: model.id,
+                            provider: data.provider,
+                            name: model.name,
+                            context_limit: model.context_limit,
+                            max_output: model.max_output,
+                            reads_images: model.reads_images,
+                            thinks: model.thinks,
+                            tools: model.tools,
+                            thinking_levels: model.thinking_levels,
+                            is_default: data.default_model == Some(model.id),
+                        },
+                    );
+                }
+                // A Bot whose Model disappeared falls back to the default;
+                // the next run's preflight then checks the new capabilities.
+                for bot in self.bots.values_mut() {
+                    if bot
+                        .model
+                        .is_some_and(|model| !self.models.contains_key(&model))
+                    {
+                        bot.model = None;
+                    }
                 }
             }
             EventData::ComputerCreated(data) => {
