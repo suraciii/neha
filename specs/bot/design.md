@@ -74,7 +74,7 @@ Full access is turned on by the owner's answer at the consent version the Space 
 
 A shell that writes outside the range is refused by the Computer's fence instead of being asked about.
 
-An Always allow on that approval grants the action's folder for later runs. The first action of a Local Computer can ask with that reason and shows no Always allow.
+An Always allow on that approval grants the action's folder for later runs. The first action of a Local Computer can ask with that reason and shows no Always allow. That grant needs the Bot's Computer to serve granted folders; a Computer that serves none, or that has not answered yet, refuses the answer and records no decision.
 
 A card whose folder no grant can store — a `..` climb, a relative form, or a NUL — also shows no Always allow, and the Space refuses `--always` for it; the action itself still runs once when allowed.
 

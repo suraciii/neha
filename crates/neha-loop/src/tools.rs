@@ -19,6 +19,15 @@ pub const WRITE_FILE: &str = "write_file";
 /// The list files tool.
 pub const LIST_FILES: &str = "list_files";
 
+/// Every built-in tool, by its wire name.
+pub const NAMES: [&str; 4] = [SHELL, READ_FILE, WRITE_FILE, LIST_FILES];
+
+/// Returns whether a tool name is one every Bot has.
+#[must_use]
+pub fn is_builtin(name: &str) -> bool {
+    NAMES.contains(&name)
+}
+
 /// Returns the tools every Bot has.
 #[must_use]
 pub fn specs() -> Vec<ToolSpec> {
@@ -171,7 +180,19 @@ struct WriteArguments {
 mod tests {
     use neha_computer::Action;
 
-    use super::{action, specs};
+    use super::{NAMES, action, is_builtin, specs};
+
+    #[test]
+    fn every_builtin_name_is_a_declared_tool() {
+        let declared: Vec<String> = specs().into_iter().map(|spec| spec.name).collect();
+        assert_eq!(declared, NAMES, "the rule check reads the declared tools");
+
+        for name in NAMES {
+            assert!(is_builtin(name), "{name} is a built-in tool");
+        }
+        assert!(!is_builtin("reed_file"), "a misspelt tool is not one");
+        assert!(!is_builtin(""), "an empty name is not a tool");
+    }
 
     #[test]
     fn every_tool_has_a_strict_schema() {

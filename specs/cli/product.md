@@ -51,6 +51,8 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 `neha provider list` prints each Provider's vendor, protocol, and address. `neha model list` prints each Model's context, output, image, thinking levels, tools, and default state.
 
+`neha model default <model>` sets the Space's default Model, as [Settings](../client/product.md#settings) does in the browser. Only the Admin sets it, and every Bot without its own Model uses it.
+
 ## Catalog
 
 `neha catalog list` prints every vendor in the catalog, its protocol, Model count, and whether Neha can connect it. A vendor Neha cannot connect prints `(not connectable)`; an unsupported protocol is one reason.
@@ -87,6 +89,10 @@ A Hosted Bot has no file access to change: its Workspace is the only place where
 
 `neha bot set <bot> --model <model> --thinking <level>` changes the Bot's Model or level. A Model that cannot call tools refuses a run, and a level the Model does not accept is refused.
 
+`neha bot set <bot> --reset-model` puts the Bot back on the Space's default Model, and `--reset-thinking` puts it back on the Space's default level; the command prints `Space default` for each. A reset names no value: giving `--model` with `--reset-model`, or `--thinking` with `--reset-thinking`, is refused. The browser's [Bot page](../client/product.md#bots) does the same.
+
+`neha bot rename <bot> <name>` changes the Bot's name; the browser's [Bot page](../client/product.md#bots) does the same.
+
 The access commands below change a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses a file-access change because its Workspace is its only write range.
 
 `neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
@@ -113,7 +119,9 @@ The directory MUST exist and be a folder. In granted mode a directory inside a h
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool the loop offers and belongs to a Local Bot; an unknown tool and a Hosted Bot are refused.
+
+A shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
 
 At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, when the card offers it, for a rule, what Always allow covers.
 

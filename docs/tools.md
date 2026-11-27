@@ -30,13 +30,14 @@ On a Hosted Computer, the shell sees this folder at `/workspace`; [Add a Local C
 Ask in the Chat. The Bot chooses the tools:
 
 ```bash
-target/debug/neha chat send "Create notes.txt with the text 'remember the milk', then read it back."
+target/debug/neha chat send "Create notes.txt with the text 'remember the milk', then read it back." | tee run.txt
+RUN_ID=$(awk '/^  run / {print $2; exit}' run.txt)
 ```
 
 The reply names what the Bot found. The run shows every step and action:
 
 ```bash
-target/debug/neha run show <run-id>
+target/debug/neha run show "$RUN_ID"
 ```
 
 ```text

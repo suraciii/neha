@@ -6,8 +6,9 @@ import Avatar from "./Avatar";
 import Brand from "./Brand";
 import Icon from "./Icon";
 
-// What the rail selects: the User's Chats, or the approvals that wait.
-export type RailView = "chats" | "attention";
+// What the rail selects: the User's Chats, the approvals that wait, or the
+// management surfaces.
+export type RailView = "chats" | "attention" | "bots" | "settings";
 
 interface RailProps {
   account: Account;
@@ -56,6 +57,26 @@ export default function Rail(props: RailProps) {
               {props.attentionCount}
             </span>
           </Show>
+        </button>
+        <button
+          class={`rail__item${props.view === "bots" ? " is-active" : ""}`}
+          type="button"
+          aria-label={t("rail.bots")}
+          aria-current={props.view === "bots" ? "page" : undefined}
+          title={t("rail.bots")}
+          onClick={() => props.onSelect("bots")}
+        >
+          <Icon name="cpu" size="lg" />
+        </button>
+        <button
+          class={`rail__item${props.view === "settings" ? " is-active" : ""}`}
+          type="button"
+          aria-label={t("rail.settings")}
+          aria-current={props.view === "settings" ? "page" : undefined}
+          title={t("rail.settings")}
+          onClick={() => props.onSelect("settings")}
+        >
+          <Icon name="settings" size="lg" />
         </button>
       </nav>
       <div class="rail__spacer" />

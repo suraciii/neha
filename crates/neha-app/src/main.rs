@@ -191,6 +191,11 @@ enum CatalogCommand {
 enum ModelCommand {
     /// List the Models the Space offers.
     List,
+    /// Make a Model the Space's default Model.
+    Default {
+        /// The Model the Space uses by default from now on.
+        model: Id,
+    },
 }
 
 #[derive(Subcommand)]
@@ -221,6 +226,12 @@ enum BotCommand {
         /// The Bot's thinking level: minimal, low, medium, high, max.
         #[arg(long, value_parser = parse_thinking)]
         thinking: Option<ThinkingLevel>,
+        /// Use the Space's default Model again.
+        #[arg(long)]
+        reset_model: bool,
+        /// Use the Space's default thinking level again.
+        #[arg(long)]
+        reset_thinking: bool,
     },
     /// Move your Bot to another real Computer you own.
     Move {
@@ -229,6 +240,13 @@ enum BotCommand {
         /// The real Computer it should work on.
         #[arg(long)]
         computer: Id,
+    },
+    /// Rename your Bot.
+    Rename {
+        /// The Bot identifier.
+        bot: Id,
+        /// Its new name.
+        name: String,
     },
     /// Show your Bot's file access.
     Access {
@@ -464,9 +482,10 @@ impl From<RuleEffectChoice> for RuleEffect {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Both rustls providers are in the dependency graph (reqwest 0.12 and
-    // 0.13). The command socket chooses one explicitly before it connects.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // The dependency graph carries one rustls provider (aws-lc-rs, pulled in
+    // by reqwest's `rustls` feature). The command socket chooses it explicitly
+    // before it connects.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     match Cli::parse().command {
         Top::Serve { port, ui, domain } => serve(port, ui, domain).await,
         Top::Join { link, name } => join(&link, &name).await,
@@ -850,6 +869,19 @@ async fn model(command: ModelCommand) -> Result<()> {
                 );
             }
         }
+        ModelCommand::Default { model } => {
+            let result = client::command(&credential, CommandCall::ModelDefault { model }).await?;
+            let name = result["models"]
+                .as_array()
+                .and_then(|models| {
+                    models
+                        .iter()
+                        .find(|view| view["id"] == serde_json::json!(model))
+                })
+                .and_then(|view| view["name"].as_str())
+                .unwrap_or_default();
+            println!("The default Model is now {model} ({name}).");
+        }
     }
 
     Ok(())
@@ -974,6 +1006,9 @@ fn recorded_form(grant: &str) -> String {
 fn access_update(bot: Id) -> BotUpdate {
     BotUpdate {
         bot,
+        name: None,
+        reset_model: false,
+        reset_thinking: false,
         full_access: None,
         full_access_consent: None,
         grants: None,
@@ -1098,25 +1133,33 @@ async fn bot(command: BotCommand) -> Result<()> {
             bot,
             model,
             thinking,
+            reset_model,
+            reset_thinking,
         } => {
-            if model.is_none() && thinking.is_none() {
-                bail!("a Bot update names --model, --thinking, or both");
+            if model.is_none() && thinking.is_none() && !reset_model && !reset_thinking {
+                bail!("a Bot update names --model, --thinking, --reset-model, or --reset-thinking");
             }
             let result = client::command(
                 &credential,
                 CommandCall::BotUpdate(BotUpdate {
                     model,
                     thinking,
+                    reset_model,
+                    reset_thinking,
                     ..access_update(bot)
                 }),
             )
             .await?;
             println!("Updated Bot {}.", id_of(&result, "id")?);
-            if let Some(model) = result["model"].as_str() {
-                println!("  model: {model}");
+            match result["model"].as_str() {
+                Some(model) => println!("  model: {model}"),
+                None if reset_model => println!("  model: Space default"),
+                None => {}
             }
-            if let Some(thinking) = result["thinking"].as_str() {
-                println!("  thinking: {thinking}");
+            match result["thinking"].as_str() {
+                Some(thinking) => println!("  thinking: {thinking}"),
+                None if reset_thinking => println!("  thinking: Space default"),
+                None => {}
             }
         }
         BotCommand::Move { bot, computer } => {
@@ -1129,6 +1172,21 @@ async fn bot(command: BotCommand) -> Result<()> {
                 id_of(&result["to"], "id")?,
                 text_of(&result["to"], "kind")?,
                 result["to"]["online"].as_bool().unwrap_or(false),
+            );
+        }
+        BotCommand::Rename { bot, name } => {
+            let result = client::command(
+                &credential,
+                CommandCall::BotUpdate(BotUpdate {
+                    name: Some(name),
+                    ..access_update(bot)
+                }),
+            )
+            .await?;
+            println!(
+                "Renamed Bot {} to {}.",
+                id_of(&result, "id")?,
+                text_of(&result, "name")?
             );
         }
         BotCommand::Access { bot } => {
@@ -2555,6 +2613,8 @@ mod tests {
                     bot,
                     model: selected,
                     thinking,
+                    reset_model,
+                    reset_thinking,
                 },
         } = update.command
         else {
@@ -2563,6 +2623,35 @@ mod tests {
         assert_eq!(bot, model);
         assert_eq!(selected, Some(model));
         assert_eq!(thinking, Some(neha::surface::ThinkingLevel::Low));
+        assert!(!reset_model, "choosing a Model is not a reset");
+        assert!(!reset_thinking, "choosing a level is not a reset");
+
+        let reset = Cli::try_parse_from([
+            "neha",
+            "bot",
+            "set",
+            &model.to_string(),
+            "--reset-model",
+            "--reset-thinking",
+        ])
+        .unwrap();
+        let Top::Bot {
+            command:
+                super::BotCommand::Set {
+                    model: selected,
+                    thinking,
+                    reset_model,
+                    reset_thinking,
+                    ..
+                },
+        } = reset.command
+        else {
+            panic!("expected bot set");
+        };
+        assert!(selected.is_none());
+        assert!(thinking.is_none());
+        assert!(reset_model);
+        assert!(reset_thinking);
     }
 
     #[test]

@@ -241,7 +241,11 @@ mod tests {
         let computer = Id::new();
         let bot = Id::new();
         let (frames, outgoing) = mpsc::channel(crate::computer_link::FRAME_QUEUE);
-        let link = links.connect(computer, frames);
+        let link = links.connect(
+            computer,
+            frames,
+            crate::computer_link::AccessCapabilities::SUPPORTED,
+        );
         let runtime = RemoteRuntime::new(
             Arc::clone(&link),
             bot,

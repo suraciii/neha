@@ -70,8 +70,8 @@ One rail, one sidebar, and one main area frame every signed-in surface. The prod
 | --- | --- | --- | --- |
 | Auth card | Card, title, fields, error, locale switch | Join, sign in, working, error | [AuthView.tsx](../../ui/src/components/AuthView.tsx) |
 | Setup | Two-step progress, provider and Bot panels | Step 1/2, working, error | [SetupView.tsx](../../ui/src/components/SetupView.tsx) |
-| Rail | Brand, Chats, Needs attention, account role | Selected, idle | [Rail.tsx](../../ui/src/components/Rail.tsx) |
-| Sidebar | Compact brand, Chat list, count, footer | Empty, selected | [Sidebar.tsx](../../ui/src/components/Sidebar.tsx) |
+| Rail | Brand, Chats, Needs attention, Bots, Settings, account role | Selected, idle | [Rail.tsx](../../ui/src/components/Rail.tsx) |
+| Sidebar | Compact brand, Chat or Bot list, settings sections, count, footer | Empty, selected | [Sidebar.tsx](../../ui/src/components/Sidebar.tsx) |
 | Chat header | Bot, Computer kind, online state, attention | Online, offline, working, waiting, failed | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Attention pill | Waiting label, compact icon | Waiting | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Chat empty | Avatar, heading, body, prompt chips | No Messages | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
@@ -88,7 +88,7 @@ The Approval Card's fields and answers are owned by [the message specification](
 These patterns state composition; behavior is in [product.md](product.md).
 
 - First run: a quiet shell and raised setup panels.
-- Empty: Chat-list and no-selection empty states are text-only; a Chat with no Messages uses the Bot avatar and prompt chips.
+- Empty: the Chat-list, Bot-list, and no-selection empty states are text-only; a Chat with no Messages uses the Bot avatar and prompt chips.
 - Waiting: the followed Run uses one header attention pill; each waiting Approval has one raised Card in the stream.
 - Failure: one inline recovery line; no modal.
 - Narrow Chat: one surface at a time, with Back at the top and the composer at the foot.

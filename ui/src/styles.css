@@ -1735,6 +1735,223 @@ code,
   color: var(--ink);
 }
 
+/* ---------------------------------------------------------- management --- */
+
+/* The Bot page and the Settings surface: one header, then the panels that hold
+   what the owner changes. The shell and its panels are the Chat's and the
+   setup steps', so a management page reads as the same product. */
+.page {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  overflow-y: auto;
+}
+
+.page__head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 64px;
+  padding: 10px 22px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+}
+
+.page__back {
+  display: none;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--ink-3);
+}
+
+.page__titles {
+  min-width: 0;
+  flex: 1;
+}
+
+.page__titles h1 {
+  font-size: 17px;
+  line-height: 1.2;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.page__sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 2px;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+
+.page__error {
+  margin: 16px 22px 0;
+}
+
+.page__note {
+  margin: 12px 22px 0;
+  color: var(--accent-2);
+  font-size: var(--text-sm);
+}
+
+.page__empty {
+  margin: auto;
+  padding: 32px;
+  color: var(--ink-3);
+}
+
+.page__body {
+  width: min(100% - 44px, 720px);
+  margin: 0 auto;
+  padding-bottom: 48px;
+}
+
+.page__body > .panel:first-child {
+  margin-top: 24px;
+}
+
+/* A footer that holds one action: the action sits at the end. */
+.panel__foot--end {
+  justify-content: flex-end;
+}
+
+/* A form inside a panel keeps the panel's own rhythm. */
+.panel__form {
+  display: grid;
+  gap: 16px;
+}
+
+/* One entry of a management list: the Bot or the Settings section it opens. */
+.conv__icon {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  flex: none;
+  border-radius: 7px;
+  background: var(--sunken);
+  color: var(--ink-3);
+}
+
+.rows {
+  display: grid;
+  gap: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-md);
+  background: var(--sunken);
+}
+
+.row__text {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.row__name {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.row__meta {
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+  overflow-wrap: anywhere;
+}
+
+.row__remove {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border-radius: var(--r-sm);
+  color: var(--ink-3);
+  transition: background 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+.row__remove:hover:not(:disabled) {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.rows__empty {
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+
+.chip--ask {
+  border-color: var(--attention-line);
+  background: var(--attention-soft);
+  color: var(--attention);
+}
+
+.chip--allow {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.chip--default {
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+/* The full-access switch: a native control, so focus and the answer stay the
+   platform's own. */
+.check {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--text-sm);
+}
+
+.check input {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  accent-color: var(--accent);
+}
+
+/* The risk a widening answer carries, in the attention color: it is the one
+   moment the page asks the User to stop and read. */
+.risk {
+  display: grid;
+  gap: 12px;
+  padding: 12px;
+  border: 1px solid var(--attention-line);
+  border-radius: var(--r-md);
+  background: var(--attention-soft);
+  color: var(--attention);
+}
+
+.risk__text {
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.risk__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.field__hint--warn {
+  color: var(--attention);
+}
+
 /* -------------------------------------------------------------- setup --- */
 
 .setup {
@@ -2038,8 +2255,10 @@ code,
 }
 
 @media (max-width: 900px) {
+  /* The rail stays: it is the only way to a management surface, and 60px fits
+     even a 360px viewport beside the list. */
   .app {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: auto minmax(0, 1fr);
     padding-left: env(safe-area-inset-left);
     padding-right: env(safe-area-inset-right);
   }
@@ -2059,12 +2278,9 @@ code,
   a {
     touch-action: manipulation;
   }
-  /* Keep primary form actions on the touch floor when the rail gives way. */
+  /* Keep primary form actions on the touch floor. */
   .btn {
     min-height: 40px;
-  }
-  .rail {
-    display: none;
   }
   .sidebar {
     display: flex;
@@ -2075,10 +2291,12 @@ code,
   .main {
     display: none;
   }
-  .app--chat .sidebar {
+  /* One surface at a time: the open Chat or management page fills the main
+     area and the Back action returns to its list. */
+  .app--detail .sidebar {
     display: none;
   }
-  .app--chat .main {
+  .app--detail .main {
     display: flex;
   }
   .app--setup .sidebar {
@@ -2091,6 +2309,27 @@ code,
     display: grid;
     width: 40px;
     height: 40px;
+  }
+  .page__back {
+    display: grid;
+    width: 40px;
+    height: 40px;
+  }
+  .page__head {
+    gap: 10px;
+    padding-inline: 12px;
+  }
+  .page__error,
+  .page__note {
+    margin-inline: 14px;
+  }
+  .page__body {
+    width: 100%;
+    padding: 0 14px 40px;
+  }
+  .risk__actions .btn {
+    min-width: 40px;
+    min-height: 40px;
   }
   .chat__head {
     gap: 10px;
@@ -2212,6 +2451,7 @@ html[lang="zh-CN"] .sidebar__title,
 html[lang="zh-CN"] .setup__head h1,
 html[lang="zh-CN"] .panel__head h2,
 html[lang="zh-CN"] .chat__titles h1,
+html[lang="zh-CN"] .page__titles h1,
 html[lang="zh-CN"] .chat__empty h2,
 html[lang="zh-CN"] .select-chat h2 {
   letter-spacing: 0;
