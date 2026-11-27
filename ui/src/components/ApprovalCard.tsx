@@ -42,7 +42,10 @@ export default function ApprovalCard(props: ApprovalCardProps) {
     )
       return null;
     if (approval.lasting_scope !== undefined) {
-      const said = approval.lasting_scope.trim();
+      // The Space's own words, spelled as the record spells them: a folder it
+      // names can end in a space, and tidying the sentence here would name
+      // another folder than the answer covers. An empty scope names none.
+      const said = approval.lasting_scope;
       return said ? t("chat.approval.lastingScope", { scope: said }) : null;
     }
     const local = localScope(approval);
@@ -50,6 +53,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   };
   const long = () => isLongSummary(props.approval.summary);
   const folded = () => long() && !expanded();
+  // The directory the run works in, when it named one: the action lands there,
+  // so the card names it next to the action it belongs to. The Space records
+  // the directory it normalized, and a last name that ends in a space is its
+  // own directory, so the card shows the recorded spelling exactly.
+  const cwd = () => props.approval.cwd || null;
 
   return (
     <article class="msg msg--bot approval" aria-live="polite">
@@ -72,6 +80,9 @@ export default function ApprovalCard(props: ApprovalCardProps) {
           >
             {expanded() ? t("chat.approval.showLess") : t("chat.approval.showFull")}
           </button>
+        </Show>
+        <Show when={cwd()}>
+          {(path) => <p class="approval__cwd">{t("chat.approval.cwd", { path: path() })}</p>}
         </Show>
         <p class="approval__reason">{reason()}</p>
         <p class="approval__undo">{undo()}</p>

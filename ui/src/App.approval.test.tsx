@@ -108,6 +108,31 @@ describe("App with approvals", () => {
     expect(view.container.querySelector(".approval__scope")).toBeNull();
   });
 
+  it("names the directory the run works in, in the reader's language", async () => {
+    space.approvals.push(
+      { ...firstUse, approval: "a1", cwd: "/work/logs" },
+      // A run that named no directory says nothing about one.
+      { ...firstUse, approval: "a2" },
+      // An empty one is no directory at all.
+      { ...firstUse, approval: "a3", cwd: "" },
+      { ...firstUse, approval: "a4", cwd: null },
+    );
+    const view = await openChat();
+
+    expect(lines(view, ".approval__cwd")).toEqual(["in /work/logs"]);
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
+    expect(lines(view, ".approval__cwd")).toEqual(["在 /work/logs"]);
+  });
+
+  it("names the directory as the record spells it, space and all", async () => {
+    // A directory whose last name ends in a space is its own directory, not the
+    // one beside it, so the card shows the recorded spelling exactly.
+    space.approvals.push({ ...firstUse, approval: "a1", cwd: "/work/logs " });
+    const view = await openChat();
+
+    expect(lines(view, ".approval__cwd")).toEqual(["in /work/logs "]);
+  });
+
   it("takes the Space's word on whether an action can be undone", async () => {
     space.approvals.push(
       { ...firstUse, approval: "a1", undoable: "unknown" },
@@ -213,6 +238,24 @@ describe("App with approvals", () => {
     expect(card(view)).toContain("A rule you set asks before this action.");
     expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow once", "Deny"]);
     expect(view.container.querySelector(".approval__scope")).toBeNull();
+  });
+
+  it("shows a granted folder as the record spells it, space and all", async () => {
+    // A folder the Space granted can end in a space; tidying the sentence would
+    // name another folder than the answer covers.
+    space.approvals.push({
+      ...firstUse,
+      approval: "a1",
+      tool: "write_file",
+      summary: "write_file: /work/logs /out.txt",
+      reason: "grant",
+      lasting_scope: "writes under /work/logs ",
+    });
+    const view = await openChat();
+
+    expect(element(view, ".approval__scope").textContent).toBe(
+      "Always allow covers: writes under /work/logs ",
+    );
   });
 
   it("offers no Always allow when the Space, or the path, says none can last", async () => {

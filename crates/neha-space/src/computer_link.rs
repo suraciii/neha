@@ -120,7 +120,18 @@ impl ComputerLink {
     }
 
     /// Reads a File's bytes from the Computer and waits for them.
-    pub async fn read(&self, id: u64, bot: Id, path: &str, working_dir: Option<&str>) -> Answer {
+    ///
+    /// The access the run pinned travels with the request: a read that
+    /// verifies an action from an interrupted run must reach what that action
+    /// could.
+    pub async fn read(
+        &self,
+        id: u64,
+        bot: Id,
+        path: &str,
+        working_dir: Option<&str>,
+        access: &neha_computer::channel::AccessFrame,
+    ) -> Answer {
         self.request(
             id,
             HostFrame::Read {
@@ -128,13 +139,24 @@ impl ComputerLink {
                 bot: bot.to_string(),
                 path: path.to_owned(),
                 working_dir: working_dir.map(ToOwned::to_owned),
+                access: access.clone(),
             },
         )
         .await
     }
 
     /// Writes a File's bytes on the Computer and waits for its answer.
-    pub async fn write(&self, id: u64, bot: Id, path: &str, bytes: Vec<u8>) -> Answer {
+    ///
+    /// The run's access travels with the request, as for a read; the Computer
+    /// keeps a File delivery inside the Bot's folder whatever it says.
+    pub async fn write(
+        &self,
+        id: u64,
+        bot: Id,
+        path: &str,
+        bytes: Vec<u8>,
+        access: &neha_computer::channel::AccessFrame,
+    ) -> Answer {
         self.request(
             id,
             HostFrame::Write {
@@ -142,6 +164,7 @@ impl ComputerLink {
                 bot: bot.to_string(),
                 path: path.to_owned(),
                 bytes: URL_SAFE_NO_PAD.encode(bytes),
+                access: access.clone(),
             },
         )
         .await
@@ -468,9 +491,14 @@ mod tests {
     async fn reads_and_writes_name_their_bot_and_encode_bytes() {
         let (_links, _computer, link, mut outgoing) = connected();
         let bot = Id::new();
+        let access = neha_computer::channel::AccessFrame {
+            full_access: true,
+            write_roots: vec!["/data/shared".to_owned()],
+        };
         let reader = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.read(2, bot, "notes.txt", None).await }
+            let access = access.clone();
+            async move { link.read(2, bot, "notes.txt", None, &access).await }
         });
         assert_eq!(
             outgoing.recv().await.unwrap(),
@@ -479,6 +507,7 @@ mod tests {
                 bot: bot.to_string(),
                 path: "notes.txt".to_owned(),
                 working_dir: None,
+                access: access.clone(),
             }
         );
         link.deliver(2, Answer::Bytes(b"hello".to_vec()));
@@ -486,7 +515,11 @@ mod tests {
 
         let writer = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.write(3, bot, "out.bin", b"hello".to_vec()).await }
+            let access = access.clone();
+            async move {
+                link.write(3, bot, "out.bin", b"hello".to_vec(), &access)
+                    .await
+            }
         });
         assert_eq!(
             outgoing.recv().await.unwrap(),
@@ -495,6 +528,7 @@ mod tests {
                 bot: bot.to_string(),
                 path: "out.bin".to_owned(),
                 bytes: URL_SAFE_NO_PAD.encode(b"hello"),
+                access,
             }
         );
         link.deliver(3, Answer::Bytes(Vec::new()));
@@ -506,7 +540,10 @@ mod tests {
         let (links, computer, link, _outgoing) = connected();
         let waiting = tokio::spawn({
             let link = Arc::clone(&link);
-            async move { link.read(4, Id::new(), "/etc/hostname", None).await }
+            async move {
+                link.read(4, Id::new(), "/etc/hostname", None, &Default::default())
+                    .await
+            }
         });
         tokio::task::yield_now().await;
 
@@ -537,7 +574,10 @@ mod tests {
         let signal = old.closed_signal();
         let waiting = tokio::spawn({
             let old = Arc::clone(&old);
-            async move { old.read(4, Id::new(), "/etc/hostname", None).await }
+            async move {
+                old.read(4, Id::new(), "/etc/hostname", None, &Default::default())
+                    .await
+            }
         });
         tokio::task::yield_now().await;
 

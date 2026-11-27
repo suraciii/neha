@@ -13,7 +13,8 @@ use rand::Rng as _;
 
 use neha::id::Id;
 use neha::record::{
-    ActionStatus, ApprovalReason, Author, Event, EventData, RuleEffect, RunReply, Undoability,
+    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
+    RuleEffect, RunReply, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -174,6 +175,22 @@ pub struct ActionView {
     pub error: Option<String>,
 }
 
+/// The access a run's actions carry, fixed when it starts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccessView {
+    /// Whether full access was on when the run started.
+    pub full_access: bool,
+    /// The folders the owner had granted when the run started.
+    pub grants: Vec<String>,
+    /// Whether the run's directory was recorded as a write root for it.
+    ///
+    /// A record written before the marker existed has it false: the directory
+    /// is not widened into a write root on restore, and the run is refused
+    /// with a message that asks for the message to be sent again.
+    #[serde(default)]
+    pub cwd_writable: bool,
+}
+
 /// A run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunView {
@@ -206,7 +223,16 @@ pub struct RunView {
     pub approval: Option<Id>,
     /// The directory the run works in, when it named one.
     pub cwd: Option<String>,
-    /// A write folder allowed for the next action after a one-time grant.
+    /// Whether the User named that directory for this run, which makes it a
+    /// write root for this run alone.
+    ///
+    /// A record written before the marker existed cannot tell, so it is false
+    /// and a restore refuses the run instead of widening its directory into a
+    /// write root. It is not part of the wire view.
+    #[serde(skip)]
+    pub cwd_writable: bool,
+    /// A write folder allowed for the next action: the action an answered
+    /// grant approval resumed, whether or not the answer also lasts.
     pub once_grant: Option<String>,
     /// The Computer the run started on, from the projection's replay.
     ///
@@ -214,6 +240,14 @@ pub struct RunView {
     /// it began on. It is not part of the wire view.
     #[serde(skip)]
     pub computer: Option<Id>,
+    /// The access the run's actions carry, fixed when it started.
+    ///
+    /// A change to the Bot's access after the start applies to the next run,
+    /// not this one. A record written before the event existed has none, and
+    /// the Bot's current access answers for it. It is not part of the wire
+    /// view.
+    #[serde(skip)]
+    pub access: Option<AccessView>,
     /// The completed steps, in order.
     pub steps: Vec<StepView>,
     /// The actions, in order.
@@ -259,6 +293,8 @@ pub struct ApprovalView {
     pub lasting_scope: Option<String>,
     /// The folder a grant answer covers, when the reason is a grant.
     pub grant_folder: Option<String>,
+    /// The directory the run works in, when it named one.
+    pub cwd: Option<String>,
     /// Whether the action can still be undone after it runs.
     pub undoable: Undoability,
     /// The answer, once the acting User gave one.
@@ -696,7 +732,14 @@ impl Projection for State {
                     .get_mut(&data.bot)
                     .ok_or("an updated Bot must exist")?;
                 if let Some(full_access) = data.full_access {
-                    bot.full_access = full_access;
+                    // Full access widened the record without a versioned
+                    // answer before this rule: such a record replays as
+                    // granted, and only the owner's new explicit answer turns
+                    // it on again.
+                    let consented = data
+                        .full_access_version
+                        .is_some_and(|version| version == FULL_ACCESS_CONSENT_VERSION);
+                    bot.full_access = full_access && consented;
                 }
                 if let Some(grants) = data.grants {
                     bot.grants = grants;
@@ -786,8 +829,10 @@ impl Projection for State {
                         error: None,
                         approval: None,
                         cwd: None,
+                        cwd_writable: false,
                         once_grant: None,
                         computer: None,
+                        access: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
                     },
@@ -820,8 +865,10 @@ impl Projection for State {
                             error: None,
                             approval: None,
                             cwd: None,
+                            cwd_writable: false,
                             once_grant: None,
                             computer,
+                            access: None,
                             steps: Vec::new(),
                             actions: Vec::new(),
                         });
@@ -837,6 +884,24 @@ impl Projection for State {
                     return Err("a run context is recorded before the run starts".to_owned());
                 }
                 run.cwd = Some(data.working_dir);
+                run.cwd_writable = data.writable;
+            }
+            EventData::RunAccess(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a run's access must belong to a started run")?;
+                if run.started.is_none() {
+                    return Err("a run's access is recorded after it starts".to_owned());
+                }
+                if run.access.is_some() {
+                    return Err("a run's access is recorded once".to_owned());
+                }
+                run.access = Some(AccessView {
+                    full_access: data.full_access,
+                    grants: data.grants,
+                    cwd_writable: data.cwd_writable,
+                });
             }
             EventData::RunFinished(data) => {
                 self.recovered_runs.remove(&data.run);
@@ -938,6 +1003,10 @@ impl Projection for State {
                 }
                 run.status = RunStatus::Waiting;
                 run.approval = Some(data.approval);
+                // The card shows the directory the run works in, so the User
+                // answers knowing where the action lands. A record written
+                // before runs named a directory has none to project.
+                let cwd = run.cwd.clone();
                 self.approvals.push(ApprovalView {
                     approval: data.approval,
                     run: data.run,
@@ -957,6 +1026,7 @@ impl Projection for State {
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
                     grant_folder: data.grant_folder,
+                    cwd,
                     undoable: data.undoable,
                     decided: None,
                     seq: event.seq,
@@ -1010,9 +1080,11 @@ impl Projection for State {
                         // Bot, the folder, and the machine: that also answers
                         // the first use of this machine.
                         self.first_use_allowed.insert((bot, acting, computer));
-                        if !data.lasting {
-                            run.once_grant = scope;
-                        }
+                        // The folder is allowed for the action this answer
+                        // resumed, whether or not the answer also lasts for
+                        // later runs. A lasting answer updates the Bot, which
+                        // the run's pinned access deliberately ignores.
+                        run.once_grant = scope;
                     }
                 }
             }
@@ -1070,7 +1142,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::{RunStatus, State};
+    use super::{AccessView, FULL_ACCESS_CONSENT_VERSION, RunStatus, State};
     use crate::store::Projection as _;
 
     fn event(kind: EventKind, author: Author, data: serde_json::Value, seq: i64) -> Event {
@@ -1321,6 +1393,133 @@ mod tests {
                 ))
                 .is_err(),
             "a first use is not an ambiguous rule ask"
+        );
+    }
+
+    #[test]
+    fn an_approval_carries_the_directory_its_run_works_in() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let mut state = State::default();
+        let created = |kind, data, seq| event(kind, Author::User(owner), data, seq);
+        state
+            .apply(&created(
+                EventKind::ComputerCreated,
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::BotCreated,
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::ChatCreated,
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+
+        let bot_author = Author::Bot(bot);
+        // Queues one run, records the directory it works in when the run named
+        // one, starts it, and asks for an approval inside it.
+        let ask = |state: &mut State, run: Id, working_dir: Option<&str>, seq: i64| {
+            let run_data = serde_json::json!({
+                "run": run,
+                "chat": chat,
+                "bot": bot,
+                "command": Id::new(),
+                "message": Id::new(),
+            });
+            state
+                .apply(&acted_event(
+                    EventKind::RunQueued,
+                    bot_author,
+                    owner,
+                    run_data.clone(),
+                    seq,
+                ))
+                .unwrap();
+            if let Some(working_dir) = working_dir {
+                state
+                    .apply(&acted_event(
+                        EventKind::RunContext,
+                        bot_author,
+                        owner,
+                        serde_json::json!({
+                            "run": run,
+                            "working_dir": working_dir,
+                            "writable": true,
+                        }),
+                        seq + 1,
+                    ))
+                    .unwrap();
+            }
+            state
+                .apply(&acted_event(
+                    EventKind::RunStarted,
+                    bot_author,
+                    owner,
+                    run_data,
+                    seq + 2,
+                ))
+                .unwrap();
+            state
+                .apply(&acted_event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    owner,
+                    serde_json::json!({
+                        "approval": Id::new(),
+                        "run": run,
+                        "bot": bot,
+                        "computer": computer,
+                        "chat": chat,
+                        "acting": owner,
+                        "action": Id::new(),
+                        "index": 0,
+                        "step": 1,
+                        "call": "call-1",
+                        "tool": "shell",
+                        "arguments": {"command": "true"},
+                        "summary": "shell: true",
+                        "reason": "rule",
+                        "rule": null,
+                        "lasting_scope": null,
+                        "undoable": "no",
+                    }),
+                    seq + 3,
+                ))
+                .unwrap();
+        };
+
+        // A record from before runs named a directory has none to project.
+        ask(&mut state, Id::new(), None, 4);
+        assert_eq!(state.approvals[0].cwd, None);
+
+        // The directory the run named is the one its card shows.
+        ask(&mut state, Id::new(), Some("/work/logs"), 8);
+        assert_eq!(
+            state.approvals[1].cwd.as_deref(),
+            Some("/work/logs"),
+            "the card names where the run works"
         );
     }
 
@@ -1875,6 +2074,7 @@ mod tests {
                 serde_json::json!({
                     "bot": bot,
                     "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION,
                     "grants": ["/data/shared"],
                 }),
                 4,
@@ -1896,6 +2096,160 @@ mod tests {
             "an update leaves other fields"
         );
         assert!(state.bots[&bot].grants.is_empty());
+    }
+
+    #[test]
+    fn a_run_access_is_pinned_when_it_starts() {
+        let owner = Id::new();
+        let (computer, bot_id, chat) = (Id::new(), Id::new(), Id::new());
+        let (run, command, message) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        let bot = Author::Bot(bot_id);
+        let run_data = serde_json::json!({
+            "run": run,
+            "chat": chat,
+            "bot": bot_id,
+            "command": command,
+            "message": message,
+        });
+        state
+            .apply(&event(EventKind::RunQueued, bot, run_data.clone(), 4))
+            .unwrap();
+        state
+            .apply(&event(EventKind::RunStarted, bot, run_data, 5))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::RunAccess,
+                bot,
+                serde_json::json!({
+                    "run": run,
+                    "full_access": false,
+                    "grants": ["/data/shared"],
+                }),
+                6,
+            ))
+            .unwrap();
+
+        // A change to the Bot after the start applies to the next run.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": bot_id,
+                    "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION,
+                    "grants": ["/etc"],
+                }),
+                7,
+            ))
+            .unwrap();
+        assert!(state.bots[&bot_id].full_access);
+        assert_eq!(
+            state.runs[&run].access,
+            Some(AccessView {
+                full_access: false,
+                grants: vec!["/data/shared".to_owned()],
+                cwd_writable: false,
+            }),
+            "the run keeps the access it started with"
+        );
+
+        // The access is recorded once, and only after the run starts.
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::RunAccess,
+                    bot,
+                    serde_json::json!({"run": run, "full_access": true, "grants": []}),
+                    8,
+                ))
+                .is_err(),
+            "a run's access is recorded once"
+        );
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::RunAccess,
+                    bot,
+                    serde_json::json!({"run": Id::new(), "full_access": true, "grants": []}),
+                    9,
+                ))
+                .is_err(),
+            "a run's access needs a run that started"
+        );
+    }
+
+    #[test]
+    fn a_full_access_from_an_old_record_replays_as_granted() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        let user = Author::User(owner);
+
+        // A record written before the owner's answer was versioned never
+        // widens access on replay: the Bot restores as granted.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "full_access": true}),
+                4,
+            ))
+            .unwrap();
+        assert!(
+            !state.bots[&bot].full_access,
+            "an unversioned full access restores as granted"
+        );
+
+        // Only a versioned answer turns it on.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({
+                    "bot": bot,
+                    "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION + 1,
+                }),
+                5,
+            ))
+            .unwrap();
+        assert!(
+            !state.bots[&bot].full_access,
+            "a consent this build does not know restores as granted"
+        );
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({
+                    "bot": bot,
+                    "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION,
+                }),
+                6,
+            ))
+            .unwrap();
+        assert!(
+            state.bots[&bot].full_access,
+            "the versioned answer allows it"
+        );
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "full_access": false}),
+                7,
+            ))
+            .unwrap();
+        assert!(
+            !state.bots[&bot].full_access,
+            "turning it off needs no consent"
+        );
     }
 
     #[test]

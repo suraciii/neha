@@ -21,7 +21,9 @@ export function undoableOf(approval: Approval): Undoable {
 // What an Always allow would cover, as far as this page can tell without the
 // Space's own words: the action's arguments first, else its summary. It follows
 // the Space's derivation, so it too gives up on a path that is blank or leaves
-// the Workspace.
+// the Workspace. A raw path is trimmed once, at the boundary where the Model
+// typed it, exactly as the Space does; a component that survives that trim
+// keeps every character it was given, so `logs ` stays `logs `.
 export function localScope(approval: Approval): Scope | null {
   if (approval.tool === "shell") {
     const raw = typeof approval.arguments?.command === "string" ? approval.arguments.command : detailOf(approval);
