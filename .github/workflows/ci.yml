@@ -293,14 +293,17 @@ jobs:
               throw "the remote Space exited before the desktop could open it"
             }
             $remotePort = ([Uri]$url).Port
-            $probe = "http://127.0.0.1:$remotePort/"
+            Start-Sleep -Milliseconds 800
+            $probe = New-Object System.Net.Sockets.TcpClient
             try {
-              Invoke-WebRequest -Uri $probe -UseBasicParsing -TimeoutSec 10 | Out-Null
-              Write-Host "remote Space answered at $probe"
+              $probe.Connect("127.0.0.1", $remotePort)
+              Write-Host "remote Space accepted a connection on 127.0.0.1:$remotePort"
             } catch {
               Get-Content $remoteOut -ErrorAction SilentlyContinue | Write-Host
               Get-Content $remoteErr -ErrorAction SilentlyContinue | Write-Host
-              throw "the remote Space did not answer at $probe"
+              throw "the remote Space did not accept a connection on 127.0.0.1:$remotePort: $($_.Exception.Message)"
+            } finally {
+              $probe.Close()
             }
             $desktopHome = Join-Path $env:RUNNER_TEMP "neha-desktop-remote"
             Remove-Item -Recurse -Force $desktopHome -ErrorAction SilentlyContinue
