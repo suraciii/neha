@@ -1,0 +1,15 @@
+[package]
+name = "neha-wire"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+neha = { path = "../neha" }
+neha-space = { path = "../neha-space" }
+ts-rs.workspace = true
+
+[lints]
+workspace = true

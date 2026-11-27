@@ -16,6 +16,13 @@ clippy:
 test:
     cargo test --locked --workspace
 
+# Regenerate the client's wire types from the Rust definitions and fail when
+# the committed files differ. The export runs in one process into a fresh
+# directory, so the comparison also catches a removed type's stale file and a
+# generated file nobody committed.
+wire-types:
+    @tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT; TS_RS_EXPORT_DIR="$tmp" cargo run --locked -q -p neha-wire --bin neha-wire; diff -ru ui/src/generated "$tmp"
+
 # Run the Space tests with the S3 tests switched on; the environment comes from docs/storage.md.
 test-s3:
     cargo test --locked -p neha-space
@@ -70,7 +77,7 @@ check-specs-tests:
     python3 scripts/test_check_specs.py
 
 # The full gate. Pull requests and main run the same recipes.
-ci: check-python-cache check-python check-specs fmt clippy test deny doc ui-check desktop-check
+ci: check-python-cache check-python check-specs fmt clippy test wire-types deny doc ui-check desktop-check
 
 # Run the gate and retain source provenance, output, and exit status.
 verify evidence_dir:

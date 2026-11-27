@@ -10,6 +10,7 @@ import type {
   Chat,
   ChatStatus,
   Computer,
+  EventKind,
   FileSummary,
   Message,
   Model,
@@ -86,11 +87,16 @@ const hostedComputer = {
   kind: "hosted",
   online: true,
   workspace: "/hosted",
+  supports_grants: true,
+  supports_full_access: true,
   sandboxed: true,
 };
-const chat = { id: "h1", owner: "u1", bot: "b1" };
-const otherChat = { id: "h2", owner: "u1", bot: "b2" };
-const thirdChat = { id: "h3", owner: "u1", bot: "b3" };
+// A fresh Chat carries only what its creation events name: a test that wants
+// the Space to project a state sets `space.statuses` and `space.activeRuns`,
+// and one that wants the page to read the record leaves them away.
+const chat = { id: "h1", owner: "u1", bot: "b1" } as unknown as Chat;
+const otherChat = { id: "h2", owner: "u1", bot: "b2" } as unknown as Chat;
+const thirdChat = { id: "h3", owner: "u1", bot: "b3" } as unknown as Chat;
 const computers = [computer, otherComputer, hostedComputer];
 
 // The Bot that owns a Chat, like the Space answers bot_show.
@@ -251,7 +257,7 @@ export const space = {
     space.approvals = [];
     space.decisions = [];
     space.decidesDone = 0;
-    space.providers = [{ id: "v1", protocol: "chat_completions", base_url: "http://provider" }];
+    space.providers = [{ id: "v1", protocol: "chat_completions", base_url: "http://provider", vendor: null }];
     space.models = [];
     space.rules = [];
     space.vendors = [];
@@ -340,7 +346,7 @@ export const space = {
 // One event the Space writes to the record, delivered live to the page that
 // follows it. The commands that change the record write their event, so a page
 // hears about its own answer the same way it hears about everyone else's.
-function emit(kind: string, data: Record<string, unknown>) {
+function emit(kind: EventKind, data: Record<string, unknown>) {
   space.seq += 1;
   space.handlers?.onEvent?.({
     seq: String(space.seq),
@@ -493,6 +499,8 @@ export class FakeCommands {
           rule: `rule${space.rules.length + 1}`,
           bot: asked.bot,
           user: "u1",
+          // The rule's cursor is the event's cursor, which `emit` writes next.
+          seq: String(space.seq + 1),
           effect: asked.effect,
           tool: asked.tool,
           command_prefix: (asked.command_prefix as string | null) ?? null,
@@ -526,6 +534,7 @@ export class FakeCommands {
             age_seconds: null,
             stale: false,
             provider_count: 0,
+            cache_path: "/home/catalog.json",
             model_count: 0,
           }),
           source: "https://models.dev/api.json",

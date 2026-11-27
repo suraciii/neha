@@ -43,6 +43,8 @@ Neha's clients, its Computers, and Model providers talk to the Space on three pl
 
 The command surface carries typed commands and events between the Space and each client, GUI, CLI, or Bot, over one WebSocket; files travel over HTTP. [CLI](../specs/cli/design.md) states the Laws, including versioning and capability negotiation.
 
+The Rust types are the single source of the client's wire types. [`crates/neha-wire`](../crates/neha-wire/src/main.rs) writes them into [`ui/src/generated`](../ui/src/generated), [`ui/src/types.ts`](../ui/src/types.ts) re-exports them under the names the client reads, and `just wire-types` in `just ci` fails when the committed files drift. A wire change starts in Rust; the generated files are not edited by hand.
+
 ### Computer channel
 
 A Computer connects out and listens on no network port. Control and data share one HTTPS connection, and each screen is its own outbound WebSocket. [Computer](../specs/computer/design.md) states the Laws.
@@ -72,6 +74,7 @@ crates/
   neha-space/     the server: HTTP, command surface, storage
   neha-computer/  the resident Computer
   neha-app/       the `neha` binary: serve, computer, and the CLI subcommands
+  neha-wire/      generates the client's TypeScript wire types
 apps/
   desktop/        the Electron shell, outside the core workspace
 ui/               the Solid client shared by Web, desktop, and Android, outside the core workspace

@@ -1058,24 +1058,7 @@ struct LoginRequest {
 #[derive(Serialize)]
 struct SessionResponse {
     token: String,
-    account: AccountBody,
-}
-
-#[derive(Serialize)]
-struct AccountBody {
-    id: neha::id::Id,
-    display_name: String,
-    is_admin: bool,
-}
-
-impl From<Account> for AccountBody {
-    fn from(account: Account) -> Self {
-        Self {
-            id: account.id,
-            display_name: account.display_name,
-            is_admin: account.is_admin,
-        }
-    }
+    account: Account,
 }
 
 async fn join(
@@ -1117,7 +1100,6 @@ async fn join(
         .map_err(|error| ApiError::internal(error.to_string()))?;
     server.consume_invite();
 
-    let account = AccountBody::from(account);
     let browser = browser_request(&server, &headers);
     let cookie = browser.then(|| server.session_headers(&token));
     let response = if browser {
@@ -1157,7 +1139,6 @@ async fn login(
         .await
     {
         Ok((account, token)) => {
-            let account = AccountBody::from(account);
             let browser = browser_request(&server, &headers);
             let cookie = browser.then(|| server.session_headers(&token));
             let response = if browser {
@@ -1242,8 +1223,8 @@ fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
     })
 }
 
-async fn me(Authed { account }: Authed) -> Json<AccountBody> {
-    Json(account.into())
+async fn me(Authed { account }: Authed) -> Json<Account> {
+    Json(account)
 }
 
 #[derive(Serialize)]

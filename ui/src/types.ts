@@ -1,261 +1,70 @@
-export interface Account {
-  id: string;
-  display_name: string;
-  is_admin: boolean;
-}
+// The client's view of the wire.
+//
+// The shapes the Space sends are generated from the Rust definitions into
+// `./generated` and re-exported here under the names the client reads, so a
+// wire change starts in Rust. `just wire-types` regenerates the files and
+// fails when the committed ones differ.
+//
+// The types below that are not re-exported have no Rust counterpart: command
+// results the Space builds as JSON, the activity the client derives from
+// events, and the `run_show` answer, which the Space bounds at read time.
 
-export interface Provider {
-  id: string;
-  protocol: string;
-  base_url: string;
-  // The catalog vendor the Provider came from, when it had a preset.
-  vendor?: string | null;
-}
+import type { CatalogRefresh, CatalogStatus } from "./generated/catalog";
+import type { ErrorCode } from "./generated/error";
+import type { Account } from "./generated/identity";
+import type {
+  ActionStatus,
+  ApprovalReason,
+  Author,
+  Event as WireEvent,
+  EventKind,
+  RunStatus,
+  Undoability,
+} from "./generated/record";
+import type {
+  ActionView,
+  BotView,
+  ChatStatus,
+  ChatView,
+  ComputerView,
+  MessageView,
+  ModelView,
+  ProviderView,
+  RuleView,
+  StepView,
+} from "./generated/state";
+import type {
+  ClientFrame,
+  CommandCall,
+  FileSummary,
+  ServerFrame,
+  ThinkingLevel,
+} from "./generated/surface";
+import type { Usage } from "./generated/usage";
 
-// How much thought a Model gives a reply.
-export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "max";
+export type { Account };
+export type { CatalogRefresh as CatalogRefreshResult, CatalogStatus };
+export type { ErrorCode };
+export type { ActionStatus, ApprovalReason, Author, ChatStatus, EventKind, RunStatus };
+export type { WireEvent as RecordEvent };
+export type { Undoability as Undoable };
+export type { ClientFrame, CommandCall, FileSummary, ServerFrame, ThinkingLevel };
+export type { Usage };
+export type {
+  BotView as Bot,
+  ChatView as Chat,
+  ComputerView as Computer,
+  MessageView as Message,
+  ModelView as Model,
+  ProviderView as Provider,
+  RuleView as Rule,
+  StepView as RunStepView,
+};
 
-export interface Model {
-  id: string;
-  provider: string;
-  name: string;
-  context_limit: number;
-  max_output: number;
-  reads_images: boolean;
-  // Whether it can think before it answers.
-  thinks: boolean;
-  // Whether it can call tools.
-  tools: boolean;
-  // The thinking levels it accepts; empty means every level.
-  thinking_levels: ThinkingLevel[];
-  is_default: boolean;
-}
-
-export interface Bot {
-  id: string;
-  owner: string;
-  name: string;
-  computer: string;
-  chat: string;
-  // Whether it may write outside its Workspace fence.
-  full_access: boolean;
-  // Extra folders outside its Workspace it may write.
-  grants: string[];
-  // Its thinking level; absent uses the Space's default.
-  thinking?: ThinkingLevel | null;
-  // Its Model; absent uses the Space's default.
-  model?: string | null;
-}
-
-export interface Computer {
-  id: string;
-  owner: string;
-  kind: string;
-  online: boolean;
-  workspace: string;
-  // Whether the daemon on this Computer takes granted folders. A Space that
-  // names nothing leaves it unset, and an unnamed capability is one the page
-  // does not offer.
-  supports_grants?: boolean;
-  // Whether the daemon on this Computer may run without its sandbox.
-  supports_full_access?: boolean;
-  // Whether the daemon on this Computer fences a Bot's commands. A Computer that
-  // has not answered yet leaves it unset: nothing is known about its machine, so
-  // nothing is claimed about what a Bot's shell runs as.
-  sandboxed?: boolean | null;
-}
-
-// What a Chat's active Run is doing, as the Space projects it.
-export type ChatStatus = "idle" | "working" | "waiting" | "failed";
-
-export interface Chat {
-  id: string;
-  owner: string;
-  bot: string;
-  // The Space projects the Chat's state. A Space that says nothing leaves the
-  // Chat idle.
-  status?: ChatStatus;
-  // The Run the Chat works on, when it has one.
-  active_run?: string | null;
-}
-
-// One approval the User has not answered yet, as the attention list names it.
-// Each pending approval is its own entry: a Chat with two of them lists two.
-export interface AttentionEntry {
-  approval: Approval;
-  chat: Chat;
-  botName: string;
-  // What the approval asks for, in the record's words.
-  detail: string;
-}
-
-export interface Author {
-  kind: "user" | "bot";
-  id: string;
-}
-
-export interface Message {
-  id: string;
-  chat: string;
-  author: Author;
-  acting: string | null;
-  text: string;
-  at: string;
-  seq: string;
-  run: string | null;
-  file: string | null;
-}
-
-// One File as the client reads it.
-export interface FileSummary {
-  id: string;
-  chat: string;
-  name: string;
-  media_type: string;
-  size: number;
-  sha256: string;
-  author: Author;
-  acting?: string;
-  at: string;
-  seq: string;
-}
-
-export interface ProviderResult {
-  provider: Provider;
-  models: Model[];
-}
-
-export interface BotResult {
-  bot: Bot;
-  computer: Computer;
-  chat: Chat;
-}
-
-// The answer a Bot's move carries: where it works now, and where it left.
-export interface BotMoveResult {
-  bot: Bot;
-  from: Computer;
-  to: Computer;
-}
-
-// What a catalog refresh answers: the cache it read, and whether it changed.
-export interface CatalogRefreshResult {
-  status: CatalogStatus;
-  changed: boolean;
-}
-
-// One lasting rule about what a Bot may do without asking.
-export interface Rule {
-  rule: string;
-  bot: string;
-  user: string;
-  // Whether matching actions ask or run without asking.
-  effect: "ask" | "allow";
-  tool: string;
-  // The shell command prefix a matching shell action starts with.
-  command_prefix: string | null;
-  // The path prefix a matching file action's path starts with.
-  path_prefix: string | null;
-}
-
-// One vendor the catalog knows, as the Space names it.
-export interface CatalogVendor {
-  id: string;
-  name: string;
-  // The protocol the Space speaks to it, when it can speak one.
-  protocol: string | null;
-  // Whether the catalog names enough to connect it without overrides.
-  selectable: boolean;
-  // The base address the catalog names.
-  api: string | null;
-  // How many Models the vendor offers.
-  model_count: number;
-}
-
-// The cache state of the Space's catalog.
-export interface CatalogStatus {
-  // Where the catalog in use came from: the built-in snapshot, or a URL.
-  source: string;
-  builtin: boolean;
-  etag: string | null;
-  // When the cached catalog was fetched, in unix seconds.
-  fetched_at: number | null;
-  // When the cache was last confirmed current, in unix seconds.
-  checked_at: number | null;
-  // How long ago the cache was last confirmed, in seconds.
-  age_seconds: number | null;
-  // Whether the cache is older than the refresh interval.
-  stale: boolean;
-  provider_count: number;
-  model_count: number;
-}
-
-// How a run is doing, from queued to finished. A running run that asks for
-// an approval waits until the User answers.
-export type RunStatus = "queued" | "running" | "waiting" | "succeeded" | "failed";
-
-// The command result that starts a run: the Space accepts it into the queue.
-export interface SendResult {
-  run: string;
-  status: "queued";
-  position: number;
-}
-
-export interface ApiErrorBody {
-  code: string;
-  message: string;
-}
-
-export interface RunView {
-  id: string;
-  chat: string;
-  bot: string;
-  acting: string;
-  command: string;
-  message: string;
-  status: RunStatus;
-  seq: string;
-  // The run's place in its Bot's queue; only a queued run has one.
-  position?: number;
-  // The approval a waiting run stops for.
-  approval?: string | null;
-  reply: string | null;
-  error: string | null;
-  usage: unknown;
-  // The steps the run recorded, in order, so a reopened Chat shows what the
-  // run already did.
-  steps?: RunStepView[];
-  // The actions the run recorded, in order.
-  actions?: RunActionView[];
-}
-
-// One step of a run, as the Space answers run_show.
-export interface RunStepView {
-  // The step number, starting at one.
-  index: number;
-  // How many tool calls the step asked for.
-  tool_calls: number;
-}
-
-// One action of a run, as the Space answers run_show.
-export interface RunActionView {
-  id: string;
-  step: number;
-  tool: string;
-  // How the action ended.
-  status: "succeeded" | "failed" | "timed_out" | "unknown";
-  // The failure, when it failed.
-  error?: string | null;
-}
-
-// Why a Bot asked before an action: the first use of the User's own Computer,
-// or a rule the User set to be asked.
-export type ApprovalReason = "first_use_local" | "rule" | "grant";
-
-// Whether an action can be undone, as far as the Space knows.
-export type Undoable = "no" | "unknown";
-
-// One action a Bot waits to run until the User answers.
+// The Approval card: `neha.approval.requested` carries the ask, and the
+// approval listing adds the answer fields, so the answer fields stay optional
+// and nullable: the event spells silence as an absent key, an empty answer as
+// null.
 export interface Approval {
   approval: string;
   run: string;
@@ -271,21 +80,84 @@ export interface Approval {
   // No rule could judge this action's form, so the Space asked instead.
   ambiguous?: boolean | null;
   rule?: string | null;
-  // Whether the action can be undone, as far as the Space knows.
-  undoable?: Undoable | null;
-  // What an Always allow would cover, in the Space's words: null when the Space
-  // says no lasting rule can come from this action, absent when it says nothing.
+  undoable?: Undoability | null;
   lasting_scope?: string | null;
-  // The directory the run works in, when it named one: the action lands there.
   cwd?: string | null;
-  // The machine the action would run on, and the User who answers.
   computer?: string | null;
   acting?: string | null;
-  // The call's position among its step's calls, and the call's identifier.
   index?: number | null;
   call?: string | null;
-  // The User's answer, once given. The Space lists only approvals still waiting.
   decided?: boolean | null;
+  // The folder a grant answer covers, when the reason is a grant.
+  grant_folder?: string | null;
+  // The cursor of `approval.requested`.
+  seq?: string;
+}
+
+// One approval the User has not answered yet, as the attention list names it.
+// Each pending approval is its own entry: a Chat with two of them lists two.
+export interface AttentionEntry {
+  approval: Approval;
+  chat: ChatView;
+  botName: string;
+  // What the approval asks for, in the record's words.
+  detail: string;
+}
+
+export interface BotResult {
+  bot: BotView;
+  computer: ComputerView;
+  chat: ChatView;
+}
+
+// The answer of `bot_create`: the Bot and its Computer, and the Chat the event
+// named before any projection of it existed, so the Chat carries identity only.
+export interface BotCreateResult {
+  bot: BotView;
+  computer: ComputerView;
+  chat: Pick<ChatView, "id" | "owner" | "bot">;
+}
+
+// The answer a Bot's move carries: where it works now, and where it left.
+export interface BotMoveResult {
+  bot: BotView;
+  from: ComputerView;
+  to: ComputerView;
+}
+
+// One vendor the catalog knows, as `catalog_list` names it. The command builds
+// the answer as JSON, so the shape is stated here.
+export interface CatalogVendor {
+  id: string;
+  name: string;
+  npm: string;
+  // The protocol the Space speaks to it, when it can speak one.
+  protocol: string | null;
+  // Whether the catalog names enough to connect it without overrides.
+  selectable: boolean;
+  // The base address the catalog names.
+  api: string | null;
+  // The environment variables that hold the vendor's API key.
+  env: string[];
+  doc: string | null;
+  // How many Models the vendor offers.
+  model_count: number;
+}
+
+// The command result that starts a run: the Space accepts it into the queue.
+export interface SendResult {
+  run: string;
+  status: "queued";
+  position: number;
+  // The directory the run works in, when the request named one.
+  cwd?: string;
+}
+
+export interface ApiErrorBody {
+  // The Space's stable code, or the client's name for a failure that arrived
+  // without one.
+  code: ErrorCode | "http_error";
+  message: string;
 }
 
 // The answer the Space records for one approval.
@@ -335,20 +207,52 @@ export interface RunActivity {
 
 export type Preview = { text: string; file: boolean } | { error: true } | null;
 
-// One recorded event as the subscription carries it.
-export interface RecordEvent {
+// The `run_show` answer. The Space starts from the projection's RunView and
+// adds a queued run's position; a very large run is bounded, so its actions
+// keep a summary and `truncated` is set.
+export interface RunView {
+  id: string;
+  chat: string;
+  bot: string;
+  acting: string;
+  command: string;
+  message: string;
+  status: RunStatus;
   seq: string;
-  kind: string;
-  version: number;
-  at: string;
-  author: Author;
-  acting?: string;
-  command?: string;
-  data: Record<string, unknown>;
+  // The run's place in its Bot's queue; only a queued run has one.
+  position?: number;
+  // The approval a waiting run stops for.
+  approval?: string | null;
+  // The directory the run works in, when it named one.
+  cwd?: string | null;
+  // The write folder allowed for the next action, when an answered grant set one.
+  once_grant?: string | null;
+  reply: string | null;
+  error: string | null;
+  usage: Usage | null;
+  // The steps the run recorded, in order, so a reopened Chat shows what the
+  // run already did.
+  steps?: StepView[];
+  // The actions the run recorded, in order.
+  actions?: RunActionView[];
+  // Whether the answer was bounded; a bounded answer's actions may lack an
+  // output or arguments.
+  truncated?: boolean;
 }
 
-// The public VAPID key and the Space's current mute.
+// One action of a run, as the Space answers run_show. A bounded answer keeps
+// only the summary of an action, so its arguments and counters may be absent.
+export type RunActionView = Omit<ActionView, "output" | "arguments" | "omitted_bytes"> & {
+  output?: string | null;
+  arguments?: unknown;
+  omitted_bytes?: number;
+};
+
+// The HTTP bodies of the push endpoints. They are not the command surface: the
+// Space declares them beside the routes in `server.rs`, as private structs the
+// client never shares, so the client states them here.
 export interface PushStatus {
+  // The public VAPID key, and the Space's current mute.
   key: string;
   muted_until: number | null;
 }
