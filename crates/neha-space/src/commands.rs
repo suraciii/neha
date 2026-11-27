@@ -974,6 +974,16 @@ async fn bot_update(
     fingerprint: String,
     update: BotUpdate,
 ) -> Result<Outcome, ApiError> {
+    // Widening access needs the owner's answer at this rule, not just the
+    // word "on": a client written before the answer was versioned never sends
+    // the version, so it cannot turn full access on. Nothing is recorded.
+    if update.full_access == Some(true)
+        && update.full_access_consent != Some(FULL_ACCESS_CONSENT_VERSION)
+    {
+        return Err(ApiError::invalid_argument(format!(
+            "turning full access on needs the current answer (version {FULL_ACCESS_CONSENT_VERSION})"
+        )));
+    }
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
@@ -1420,7 +1430,11 @@ async fn message_send(
             EventDraft::new(
                 EventKind::RunContext,
                 Author::Bot(bot.id),
-                json!({"run": run, "working_dir": cwd}),
+                json!({
+                    "run": run,
+                    "working_dir": cwd,
+                    "writable": true,
+                }),
             )
             .acting(account.id),
         );
@@ -1700,6 +1714,7 @@ pub async fn start_run(
                 "run": pending.run,
                 "full_access": pending.access.full_access,
                 "grants": pending.access.grants,
+                "cwd_writable": pending.access.cwd_writable,
             }),
         )
         .acting(pending.acting),
@@ -1741,16 +1756,7 @@ pub async fn resume_pending(
     };
 
     let computer = run.computer.unwrap_or(bot.computer);
-    let access = if run.started.is_none() {
-        // The run has not started: the start records the Bot's current access
-        // under the Bot's admit lock.
-        crate::state::AccessView {
-            full_access: bot.full_access,
-            grants: bot.grants.clone(),
-        }
-    } else {
-        pinned_access(run)
-    };
+    let access = resumed_access(run, &bot)?;
 
     Ok(PendingRun {
         run: run.id,
@@ -2331,20 +2337,51 @@ fn bot_environment(
     ])
 }
 
-/// The access one run's actions carry, fixed when the run started.
+/// The access one started run's actions carry, fixed when the run started.
 ///
 /// A record written before the access event existed has none pinned. It
-/// continues with the conservative granted access: no full access and no
-/// grants, so an old record cannot widen what its run reaches. A run that has
-/// not started yet names the Bot's current access instead, because its start
-/// records that snapshot.
+/// continues with the conservative granted access: no full access, no grants,
+/// and no writable directory, so an old record cannot widen what its run
+/// reaches.
 fn pinned_access(run: &crate::state::RunView) -> crate::state::AccessView {
     run.access
         .clone()
         .unwrap_or_else(|| crate::state::AccessView {
             full_access: false,
             grants: Vec::new(),
+            cwd_writable: false,
         })
+}
+
+/// Returns the access a restored run continues with, or why it cannot.
+///
+/// A run that has not started takes the Bot's current access, because its
+/// start records that snapshot. A started run keeps the access it pinned. A
+/// record written before the directory marker existed cannot tell whether its
+/// directory was a write root the User named for that run, and the daemon has
+/// no way to treat a working directory as read-only: such a run fails with a
+/// message that asks the User to send it again instead of restoring a write
+/// root the old record never authorized.
+fn resumed_access(
+    run: &crate::state::RunView,
+    bot: &BotView,
+) -> Result<crate::state::AccessView, ApiError> {
+    let access = if run.started.is_none() {
+        crate::state::AccessView {
+            full_access: bot.full_access,
+            grants: bot.grants.clone(),
+            cwd_writable: run.cwd_writable,
+        }
+    } else {
+        pinned_access(run)
+    };
+    if run.cwd.is_some() && !access.cwd_writable {
+        return Err(ApiError::conflict(
+            "this run was recorded before Neha marked its directory writable; send the message again",
+        ));
+    }
+
+    Ok(access)
 }
 
 /// The write access one run's actions carry to its Computer.
@@ -2361,6 +2398,7 @@ fn run_access(
 ) -> neha_computer::channel::AccessFrame {
     let mut write_roots = access.grants.clone();
     if !access.full_access
+        && access.cwd_writable
         && let Some(cwd) = cwd
     {
         write_roots.push(cwd.to_owned());
@@ -4009,12 +4047,26 @@ fn action_path(path: &str) -> Option<String> {
     Some(neha::folder::lexical(trimmed))
 }
 
+/// Returns a recorded working directory in the form rules and cards read it.
+///
+/// The Space recorded the directory already normalized at the edge where the
+/// User typed it, so it keeps every component, including a last component
+/// that ends in a space. That raw-path normalization must not run again here:
+/// trimming would resolve relative paths — and name the folder on a card —
+/// against another directory than the run works in. A record this version
+/// cannot read as a folder has no comparable form (`None`).
+fn recorded_cwd(cwd: &str) -> Option<String> {
+    neha::folder::normalize_recorded(cwd).ok()
+}
+
 /// The target a raw action path names for this run.
 ///
 /// With no named working directory a relative path is still relative to the
 /// Bot's Workspace, as it always was. When the run named one, a relative path
-/// is resolved against that directory before rules, the card, or a lasting
-/// scope look at it; the Space then judges the same target the daemon uses.
+/// is resolved against that recorded directory before rules, the card, or a
+/// lasting scope look at it; the Space then judges the same target the daemon
+/// uses. Only the action argument is a raw path and trimmed here; the recorded
+/// directory is read as it was recorded.
 fn resolve_action_path(path: &str, cwd: Option<&str>) -> Option<String> {
     let path = action_path(path)?;
     if path.starts_with('/') {
@@ -4023,7 +4075,7 @@ fn resolve_action_path(path: &str, cwd: Option<&str>) -> Option<String> {
     let Some(cwd) = cwd else {
         return Some(path);
     };
-    let base = action_path(cwd)?;
+    let base = recorded_cwd(cwd)?;
     Some(neha::folder::lexical(&format!(
         "{}/{path}",
         base.trim_end_matches('/')
@@ -4237,9 +4289,14 @@ fn grant_folder(
     if access.full_access {
         return None;
     }
-    // The run's working directory, normalized. A directory the Space cannot
+    // The run's working directory, normalized, is a write root only when the
+    // record says the User named it for this run. A directory the Space cannot
     // name stays `None`, which leaves the write to the daemon's fence.
-    let root = cwd.and_then(action_path);
+    let root = if access.cwd_writable {
+        cwd.and_then(recorded_cwd)
+    } else {
+        None
+    };
     let (folder, scope) = match call.tool.as_str() {
         // Only `write_file` writes the machine and asks for a folder.
         neha_loop::tools::WRITE_FILE => {
@@ -4678,10 +4735,11 @@ mod tests {
         LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
         grant_folder, grants_with, lasting_rule_path_at, normalized_grants, path_covers,
         path_matches, path_matches_at, path_parent, persistable_grant, pinned_access,
-        prepare_recovery, prepare_resume, resolve_action_path, rule_covers, rule_matches,
-        run_access, under_root, verify_recovered_action,
+        prepare_recovery, prepare_resume, resolve_action_path, resumed_access, rule_covers,
+        rule_matches, run_access, under_root, verify_recovered_action,
     };
-    use crate::state::{AccessView, RuleView};
+    use crate::state::{AccessView, BotView, RuleView};
+    use neha::error::ErrorCode;
     use neha::id::Id;
     use neha::record::RuleEffect;
     use neha::seq::Seq;
@@ -4712,6 +4770,19 @@ mod tests {
         crate::state::AccessView {
             full_access,
             grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
+            cwd_writable: true,
+        }
+    }
+
+    fn bot_view() -> BotView {
+        BotView {
+            id: Id::new(),
+            owner: Id::new(),
+            name: "Scout".to_owned(),
+            computer: Id::new(),
+            chat: Id::new(),
+            full_access: false,
+            grants: Vec::new(),
         }
     }
 
@@ -4731,6 +4802,7 @@ mod tests {
             error: None,
             approval: None,
             cwd: None,
+            cwd_writable: false,
             once_grant: None,
             computer: None,
             access,
@@ -4748,18 +4820,78 @@ mod tests {
             AccessView {
                 full_access: false,
                 grants: Vec::new(),
+                cwd_writable: false,
             }
         );
         assert_eq!(
             pinned_access(&run_view(Some(AccessView {
                 full_access: true,
                 grants: vec!["/data/shared".to_owned()],
+                cwd_writable: true,
             }))),
             AccessView {
                 full_access: true,
                 grants: vec!["/data/shared".to_owned()],
+                cwd_writable: true,
             },
             "a pinned access is never replaced by the fallback"
+        );
+    }
+
+    #[test]
+    fn a_restored_run_needs_its_directory_marked_writable() {
+        let bot = bot_view();
+
+        // A queued run from before the marker named a directory, but the
+        // record never said it was a write root: starting it now would widen
+        // what the old record authorized.
+        let mut legacy = run_view(None);
+        legacy.started = None;
+        legacy.cwd = Some("/var/tmp/logs ".to_owned());
+        legacy.cwd_writable = false;
+        let refused =
+            resumed_access(&legacy, &bot).expect_err("an unmarked directory is not a root");
+        assert_eq!(refused.code(), ErrorCode::Conflict);
+        assert!(refused.to_string().contains("send the message again"));
+
+        // A run recorded by this build named it for the run, so it keeps its
+        // directory as a write root.
+        let mut fresh = run_view(None);
+        fresh.started = None;
+        fresh.cwd = Some("/var/tmp/logs ".to_owned());
+        fresh.cwd_writable = true;
+        assert_eq!(
+            resumed_access(&fresh, &bot).unwrap(),
+            AccessView {
+                full_access: false,
+                grants: Vec::new(),
+                cwd_writable: true,
+            }
+        );
+
+        // A started run keeps the access it pinned, and a started run with no
+        // pinned access but no directory continues conservatively.
+        let mut pinned = run_view(Some(AccessView {
+            full_access: false,
+            grants: vec!["/data/shared".to_owned()],
+            cwd_writable: true,
+        }));
+        pinned.cwd = Some("/var/tmp/logs ".to_owned());
+        assert_eq!(
+            resumed_access(&pinned, &bot).unwrap(),
+            AccessView {
+                full_access: false,
+                grants: vec!["/data/shared".to_owned()],
+                cwd_writable: true,
+            }
+        );
+        assert_eq!(
+            resumed_access(&run_view(None), &bot).unwrap(),
+            AccessView {
+                full_access: false,
+                grants: Vec::new(),
+                cwd_writable: false,
+            }
         );
     }
 

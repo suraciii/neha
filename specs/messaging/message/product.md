@@ -39,7 +39,7 @@ When a rule asks and the action can make a lasting rule, the card shows what Alw
 
 It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
 
-An approval that asks for a folder the owner has not granted offers Always allow, which grants that folder for later runs. That reason also names the first action of a Local Computer, whose card shows no Always allow.
+After first use, an approval for a folder the owner has not granted offers Always allow, which grants that folder for later runs, only when a grant can store the folder. [Bot design](../../bot/design.md#approvals) states which folders a grant can store. That reason also names the first action of a Local Computer, whose card shows no Always allow.
 
 A rule-triggered approval also offers no Always allow when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path.
 

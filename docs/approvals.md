@@ -39,7 +39,7 @@ target/debug/neha approval allow <approval-id>
 target/debug/neha approval deny <approval-id>
 ```
 
-`neha approval show <approval-id>` prints where the action sits, the directory its run works in when the run named one, and its full arguments. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. On an approval for a folder the owner has not granted, `--always` grants that folder instead, and `neha bot access <bot-id>` shows it among the Bot's grants. A Deny ends the run, and the Bot says that it stopped.
+`neha approval show <approval-id>` prints where the action sits, the directory its run works in when the run named one, and its full arguments. The directory its run works in is read exactly as the run recorded it, so a name that ends in a space keeps it and a relative path is matched against that same directory. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. On an approval for a folder the owner has not granted, `--always` grants that folder instead, and `neha bot access <bot-id>` shows it among the Bot's grants. A Deny ends the run, and the Bot says that it stopped.
 
 ## What an Always allow covers
 

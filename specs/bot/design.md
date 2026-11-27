@@ -54,7 +54,9 @@ A Hosted Computer's recovery, reset, or replacement stops its runs between two a
 
 A run records the access it starts with, so a resumed run keeps the access it began with even after the owner changes the Bot's access.
 
-A run recorded before the Space kept that snapshot resumes with conservative granted access: no full access and no grants. Such a run writes only its Workspace and the working directory it named.
+A run recorded before the Space kept that snapshot resumes with conservative granted access: no full access and no grants.
+
+A run whose record names a working directory the Space never marked writable does not resume; it fails and asks the User to send the message again, and that directory is not made a write root.
 
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 
@@ -67,6 +69,8 @@ The Space allows by default. It waits when the action is the first one on a Loca
 A `write_file` that would write outside the Bot's write range also waits for the owner. [Computer](../computer/design.md#isolation) states that range, and the run's own working directory is part of it.
 
 Only a `write_file` of a Bot with granted folders raises that approval, and only when the Space can locate its target: an absolute path, or a relative one resolved against the run's own working directory. Full access raises none.
+
+Full access is turned on by the owner's answer at the consent version the Space states. A request without that version is refused, and nothing is recorded.
 
 A shell that writes outside the range is refused by the Computer's fence instead of being asked about.
 

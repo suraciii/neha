@@ -656,13 +656,21 @@ fn checked_grant(path: &std::path::Path) -> Result<String> {
 
 /// Returns the folder a revoke names, preferring the path the record shows.
 ///
-/// A grant stores a folder's canonical path. A path the record still shows is
-/// removed exactly as recorded, so a folder that later became a symlink
-/// revokes its own grant instead of the link's target. Only when no recorded
-/// grant names the path does a live path get resolved as an alias — the same
-/// argument then removes the grant a symlink path added — and a path that is
-/// gone is matched by the value the record holds.
+/// A grant stores a folder's canonical path. The argument is compared as the
+/// User spelled it first, without trimming anything: a directory name that
+/// ends in a space keeps it, so `logs ` cannot take the grant for `logs`. Only
+/// after that does the raw path get normalized at the edge and resolved as a
+/// live alias — the same argument then removes the grant a symlink path added
+/// — and a path that is gone is matched by the value the record holds.
 fn revocable_grant(path: &std::path::Path, shown: &[String]) -> Result<String> {
+    let spelled = path.to_string_lossy();
+    // The exact spelling, keeping every component. A path that is not a
+    // folder form at all falls through to the edge normalization below.
+    if let Ok(exact) = neha::folder::normalize_recorded(&spelled)
+        && let Some(recorded) = recorded_grant(shown, &exact)
+    {
+        return Ok(recorded);
+    }
     let normalized = normalized_grant(path)?;
     if let Some(recorded) = recorded_grant(shown, &normalized) {
         return Ok(recorded);
@@ -700,6 +708,7 @@ fn access_update(bot: Id) -> BotUpdate {
     BotUpdate {
         bot,
         full_access: None,
+        full_access_consent: None,
         grants: None,
         grant_add: None,
         grant_remove: None,
@@ -879,6 +888,11 @@ async fn bot(command: BotCommand) -> Result<()> {
                 &credential,
                 BotUpdate {
                     full_access: Some(full_access),
+                    // The confirmation asked for this range under this rule;
+                    // the Space records the answer only when it carries the
+                    // version it states.
+                    full_access_consent: full_access
+                        .then_some(neha::record::FULL_ACCESS_CONSENT_VERSION),
                     ..access_update(bot)
                 },
             )
@@ -3222,6 +3236,33 @@ mod tests {
             )
             .unwrap(),
             granted
+        );
+    }
+
+    #[test]
+    fn a_revoke_keeps_a_name_that_ends_in_a_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let plain = directory.path().join("logs");
+        let spaced = directory.path().join("logs ");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(&spaced).unwrap();
+        let plain_grant = checked_grant(&plain).unwrap();
+        let spaced_grant = checked_grant(&spaced).unwrap();
+        let shown = vec![plain_grant.clone(), spaced_grant.clone()];
+
+        // The argument's trailing space is the name: the exact spelling wins
+        // over the trimmed form, so `logs ` cannot take the grant for `logs`.
+        assert_eq!(
+            revocable_grant(&spaced, &shown).unwrap(),
+            spaced_grant,
+            "the exact spelling names its own folder"
+        );
+        assert_eq!(revocable_grant(&plain, &shown).unwrap(), plain_grant);
+        // A raw spelling normalized at the edge still names the folder.
+        let slash = format!("{}/", plain.display());
+        assert_eq!(
+            revocable_grant(std::path::Path::new(&slash), &shown).unwrap(),
+            plain_grant
         );
     }
 

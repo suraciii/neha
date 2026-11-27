@@ -213,6 +213,13 @@ pub struct BotUpdate {
     /// Whether it may write outside its Workspace fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_access: Option<bool>,
+    /// The version of the owner's answer that allows full access.
+    ///
+    /// A request that turns full access on must carry the version this build
+    /// states: a client written before the answer was versioned never sends
+    /// it, so it cannot widen a Bot's access by asking for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_access_consent: Option<u16>,
     /// The complete list of extra folders it may write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<String>>,

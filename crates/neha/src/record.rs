@@ -365,6 +365,7 @@ mod tests {
             "run": run,
             "full_access": false,
             "grants": ["/data/shared", "/var/tmp/notes"],
+            "cwd_writable": true,
         });
 
         let EventData::RunAccess(access) = EventKind::RunAccess.decode(&value).unwrap() else {
@@ -376,6 +377,7 @@ mod tests {
                 run,
                 full_access: false,
                 grants: vec!["/data/shared".to_owned(), "/var/tmp/notes".to_owned()],
+                cwd_writable: true,
             }
         );
 
@@ -1381,6 +1383,14 @@ pub struct RunContext {
     pub run: Id,
     /// The directory it works in.
     pub working_dir: String,
+    /// Whether the User named that directory for this run, which makes it a
+    /// write root for this run alone.
+    ///
+    /// Absent in a record written before the marker existed: such a run cannot
+    /// be restored, because starting it here would widen the old record into a
+    /// write root the record never authorized.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 /// The data of `neha.run.access`.
@@ -1397,6 +1407,13 @@ pub struct RunAccess {
     pub full_access: bool,
     /// The folders the owner had granted when the run started.
     pub grants: Vec<String>,
+    /// Whether the run's directory was recorded as a write root for it.
+    ///
+    /// Absent in a record written before the marker existed: a run with a
+    /// directory and no marker cannot be restored. A run with no directory
+    /// never needs it.
+    #[serde(default)]
+    pub cwd_writable: bool,
 }
 
 /// The data of `neha.run.finished`.

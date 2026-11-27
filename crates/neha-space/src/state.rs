@@ -182,6 +182,13 @@ pub struct AccessView {
     pub full_access: bool,
     /// The folders the owner had granted when the run started.
     pub grants: Vec<String>,
+    /// Whether the run's directory was recorded as a write root for it.
+    ///
+    /// A record written before the marker existed has it false: the directory
+    /// is not widened into a write root on restore, and the run is refused
+    /// with a message that asks for the message to be sent again.
+    #[serde(default)]
+    pub cwd_writable: bool,
 }
 
 /// A run.
@@ -216,6 +223,14 @@ pub struct RunView {
     pub approval: Option<Id>,
     /// The directory the run works in, when it named one.
     pub cwd: Option<String>,
+    /// Whether the User named that directory for this run, which makes it a
+    /// write root for this run alone.
+    ///
+    /// A record written before the marker existed cannot tell, so it is false
+    /// and a restore refuses the run instead of widening its directory into a
+    /// write root. It is not part of the wire view.
+    #[serde(skip)]
+    pub cwd_writable: bool,
     /// A write folder allowed for the next action: the action an answered
     /// grant approval resumed, whether or not the answer also lasts.
     pub once_grant: Option<String>,
@@ -795,6 +810,7 @@ impl Projection for State {
                         error: None,
                         approval: None,
                         cwd: None,
+                        cwd_writable: false,
                         once_grant: None,
                         computer: None,
                         access: None,
@@ -830,6 +846,7 @@ impl Projection for State {
                             error: None,
                             approval: None,
                             cwd: None,
+                            cwd_writable: false,
                             once_grant: None,
                             computer,
                             access: None,
@@ -848,6 +865,7 @@ impl Projection for State {
                     return Err("a run context is recorded before the run starts".to_owned());
                 }
                 run.cwd = Some(data.working_dir);
+                run.cwd_writable = data.writable;
             }
             EventData::RunAccess(data) => {
                 let run = self
@@ -863,6 +881,7 @@ impl Projection for State {
                 run.access = Some(AccessView {
                     full_access: data.full_access,
                     grants: data.grants,
+                    cwd_writable: data.cwd_writable,
                 });
             }
             EventData::RunFinished(data) => {
@@ -1425,7 +1444,11 @@ mod tests {
                         EventKind::RunContext,
                         bot_author,
                         owner,
-                        serde_json::json!({"run": run, "working_dir": working_dir}),
+                        serde_json::json!({
+                            "run": run,
+                            "working_dir": working_dir,
+                            "writable": true,
+                        }),
                         seq + 1,
                     ))
                     .unwrap();
@@ -2110,6 +2133,7 @@ mod tests {
             Some(AccessView {
                 full_access: false,
                 grants: vec!["/data/shared".to_owned()],
+                cwd_writable: false,
             }),
             "the run keeps the access it started with"
         );

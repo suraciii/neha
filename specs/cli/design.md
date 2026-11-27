@@ -45,6 +45,8 @@ Within one major version, a newer Space accepts an older caller.
 
 A caller and a Space tell each other what they can do. A missing capability that is optional fails only the command that needs it. A missing capability that protects data or authority ends the connection and names the upgrade.
 
+Turning full access on needs the consent version the Space states. An older caller that sends none is refused, and nothing is recorded.
+
 ## Streams
 
 A client reads events from a cursor and resumes from it after a reconnect. A cursor the Space can no longer serve gives the client a fresh snapshot.

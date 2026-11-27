@@ -139,7 +139,7 @@ The old Computer may be offline when you move the Bot. If the new Computer is of
 
 A Computer is online while its daemon holds the channel to the Space. If the daemon stops, the Computer shows as offline in `neha computer list`, and a Message sent to one of its Bots waits in the record.
 
-The Space and the daemon must come from the same release: they speak one channel version, and either end refuses a connection from the other version. A daemon left on an older release connects and is refused, so restart it with the `neha computer run` of this release.
+The Space and the daemon must come from the same release. The channel speaks version 2, and the Space refuses a daemon whose channel version does not match. A daemon left on an older release connects and is refused; restart it with the `neha computer run` of this release.
 
 `neha chat send` waits up to 180 seconds for the run to end. If the run is still queued, the command stops with `the run did not end within 180s`, and the Message and its run stay in the record.
 
@@ -148,6 +148,8 @@ When the daemon starts again with `neha computer run`, it reconnects and queued 
 If the connection drops while an action runs, the Space records that action as unknown and fails the run. The Bot tells the Chat that it lost its Computer. The run does not resume.
 
 If the Space itself stops while a run works, the next start continues the run from its record. Completed steps replay into the Model's context; an action that started and never returned is checked, not run again: a `write_file` counts as done only when the file holds exactly the requested content, and any other unfinished action makes the run fail with its result unknown. A step whose Model reply never arrived is called again from its start; that call may be billed twice even though the Space did not keep its usage. A recovered continuation can still fail if its Provider is unavailable. The Bot answers once, and no recorded action runs twice.
+
+A run recorded before the Space recorded the access it starts with continues with granted access only: no full access and no grants. A run whose record names a working directory from before the Space marked one writable does not continue: the Bot asks you to send the message again, and that directory is not made a write root.
 
 The machine ends the command it was running when the channel drops, so no action keeps running unattended.
 
@@ -194,7 +196,7 @@ neha bot full-access <bot-id> on
 neha bot full-access <bot-id> off
 ```
 
-`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. The path is trimmed once where you type it, and a folder name that ends in a space is its own folder: `logs` and `logs ` are different. `neha bot revoke <bot-id> <path>` takes one away, and it also takes away a grant whose folder is gone, matching the path `neha bot access <bot-id>` shows. `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this. Each run fixes the access when it starts, so a change made while a run works applies to the next run.
+`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. The path is trimmed once where you type it, and a folder name that ends in a space is its own folder: `logs` and `logs ` are different. `neha bot revoke <bot-id> <path>` takes one away, and it also takes away a grant whose folder is gone, matching the path `neha bot access <bot-id>` shows. A revoke compares the path exactly as you spell it first, so keep a trailing space by quoting the path: `neha bot revoke <bot-id> '/data/logs '` takes the grant for `/data/logs ` and leaves `/data/logs` alone. `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this. Each run fixes the access when it starts, so a change made while a run works applies to the next run.
 
 `neha bot full-access <bot-id> on` gives the Bot the daemon process's own file rights and starts no sandbox for it, so the Bot writes and deletes what the machine's user can and its shell sees the machine's own `/tmp`, `/dev`, and process view. The risk it prints names what that reaches: the Bot can read the Computer's configuration directory, `~/.config/neha` by default, which holds the saved pairing, the machine's token, and the CLI's session credential. Turn full access on only when the Bot needs that range; `off` restores the fence. `on` asks for confirmation at a terminal and needs `--yes` without one; `off` asks for nothing.
 
@@ -208,6 +210,6 @@ A run can start its actions in another directory with `neha chat send --cwd`:
 neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
 ```
 
-On a Local Computer, `--cwd` names the directory the run starts in; without it the run starts in the Bot's Workspace. A Hosted Computer starts every run in its own workspace and ignores the option. The directory must be absolute, must already exist, and must be a folder.
+On a Local Computer, `--cwd` names the directory the run starts in; without it the run starts in the Bot's Workspace. A Hosted Computer starts every run in its own workspace and ignores the option. The directory must be absolute, must already exist, and must be a folder. A directory whose name ends in a space is typed with a trailing `/.`, which folds away and keeps the space: `--cwd '/data/logs /.'` records `/data/logs `. A path that ends in the space itself is trimmed and names the folder next to it.
 
 The directory is that run's write root: the Bot's shell and its file tools may write inside it for that run, and it grants nothing to a later run. The directory is recorded with the run and appears on an approval card. In granted mode the Computer refuses a run whose directory sits inside a hidden root or holds one. The shell mounts an outside write root as writable only when its tree holds no link or special file and stays inside the scan limits; the file tools check every write path. Reading still follows the machine user's rights, except in granted mode, where the Computer's configuration directory stays hidden.

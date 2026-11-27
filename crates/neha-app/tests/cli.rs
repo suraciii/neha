@@ -2208,14 +2208,72 @@ async fn a_folder_name_that_ends_in_a_space_keeps_its_name() {
         !plain.join("granted.txt").exists(),
         "the grant must not open the folder whose name has no space"
     );
-    let access = run(
+    // A rule for the recorded directory matches a relative path resolved
+    // against it, and the card shows that directory. The daemon receives the
+    // action only after the answer.
+    let rule = run(
         &computer.home,
         &computer.credential,
-        &["bot", "access", &computer.bot],
+        &[
+            "rule",
+            "add",
+            "--bot",
+            &computer.bot,
+            "--effect",
+            "ask",
+            "--tool",
+            "write_file",
+            "--path-prefix",
+            &format!("{}/.", spaced.display()),
+        ],
+    );
+    assert!(rule.contains("write_file"), "{rule}");
+    script.call(
+        "write_file",
+        serde_json::json!({"path": "asked.txt", "content": "asked"}),
+    );
+    script.say("The rule let me ask.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--cwd",
+            &spaced_spelling,
+            "write with a rule",
+        ],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    assert!(
+        !spaced.join("asked.txt").exists(),
+        "an action the rule asks about must not reach the daemon before the answer"
+    );
+    let card = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(card.contains("write_file"), "{card}");
+    assert!(
+        card.contains(&format!("{}/asked.txt", spaced.display())),
+        "the card shows the recorded directory: {card}"
+    );
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
     );
     assert!(
-        access.contains(&format!("grant {}", spaced.display())),
-        "the access listing shows the folder's real name: {access}"
+        allowed.contains(&format!("Allowed {approval} for run {run_id}.")),
+        "{allowed}"
+    );
+    wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert_eq!(
+        std::fs::read_to_string(spaced.join("asked.txt")).unwrap(),
+        "asked"
     );
 
     drop(computer);
@@ -2469,6 +2527,39 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     assert!(
         !revoked.contains(&format!("grant {first_path}")),
         "the recorded grant is removed, not the link's target: {revoked}"
+    );
+
+    // `logs` and `logs ` are two folders the record may show. A revoke names
+    // the exact spelling it is given, so a trailing space cannot take the
+    // grant for the folder beside it.
+    let plain_folder = directory.path().join("logs");
+    let spaced_folder = directory.path().join("logs ");
+    std::fs::create_dir(&plain_folder).unwrap();
+    std::fs::create_dir(&spaced_folder).unwrap();
+    let plain_path = plain_folder.to_str().unwrap().to_owned();
+    let spaced_path = spaced_folder.to_str().unwrap().to_owned();
+    let spaced_spelling = format!("{spaced_path}/.");
+    for path in [&plain_path, &spaced_spelling] {
+        let granted = run(&home, &credential, &["bot", "grant", &bot, path]);
+        assert!(granted.contains("grant "), "{granted}");
+    }
+    let revoked = run(&home, &credential, &["bot", "revoke", &bot, &spaced_path]);
+    assert!(
+        revoked.contains(&format!("grant {plain_path}")),
+        "the folder without the space keeps its grant: {revoked}"
+    );
+    assert!(
+        !revoked.contains(&format!("grant {spaced_path}\n")),
+        "the exact spelling removes the folder with the space: {revoked}"
+    );
+    let revoked = run(&home, &credential, &["bot", "revoke", &bot, &plain_path]);
+    assert!(
+        !revoked.contains(&format!("grant {plain_path}\n")),
+        "the folder without the space is removed by its own name: {revoked}"
+    );
+    assert!(
+        revoked.contains(&format!("grant {second_path}")),
+        "only the earlier grant remains: {revoked}"
     );
 
     // Two grants that arrive together both survive: each command adds to the
