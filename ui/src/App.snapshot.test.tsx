@@ -46,6 +46,13 @@ function approval(id: string, run: string, tool = "shell"): Approval {
   };
 }
 
+// Presses the button the User presses, by what it says.
+function press(view: View, label: string) {
+  const button = Array.from(view.container.querySelectorAll("button")).find((candidate) => candidate.textContent === label);
+  if (!button) throw new Error(`no ${label} button in the view`);
+  fireEvent.click(button);
+}
+
 // What each Chat in the list says about its state.
 function badges(view: View): string[] {
   return Array.from(view.container.querySelectorAll(".conv__badge")).map((badge) => badge.textContent ?? "");
@@ -406,6 +413,81 @@ describe("App with a Chat the Space already knows", () => {
     expect(element(view, ".chat__attention").textContent).toContain("Waiting");
     expect(view.container.querySelector(".activity__tools")).toBeNull();
     expect(view.container.querySelector('[data-approval="a2"]')).toBeTruthy();
+  });
+
+  it("keeps the composer closed while a Run the page no longer follows works", async () => {
+    // r1 was let work while the page was away, and the Space follows r2 now,
+    // which waits for an approval.
+    space.messages.push(request("m1", "r1", "first ask"));
+    space.messages.push(request("m2", "r2", "second ask"));
+    space.statuses["h1"] = "working";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = { status: "running", steps: [{ index: 1, tool_calls: 1 }] };
+    const view = await openChat();
+
+    // The page follows r1, the Run the Space named.
+    await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
+    space.resume([]);
+    await waitFor(() => expect(space.runShows).toEqual(["r1", "r1"]));
+
+    // The Space follows r2 now, and r2 waits for an approval.
+    space.activeRuns["h1"] = "r2";
+    space.statuses["h1"] = "waiting";
+    space.runs["r2"] = { status: "waiting", approval: "a2" };
+    space.approvals.push(approval("a2", "r2", "read_file"));
+    space.resume([]);
+    await waitFor(() => expect(space.runShows).toContain("r2"));
+
+    // r1 still works, so the Chat is busy: the composer stays closed even
+    // though the page waits on r2.
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+
+    // The User turns r2 down. Its Run failed, but r1 still works: the failure
+    // must not open the composer, and the Chat does not read as failed.
+    press(view, "Deny");
+    await waitFor(() => expect(element(view, ".approval").textContent).toContain("Denied"));
+    record("neha.run.finished", { run: "r2", status: "failed", reply: null, usage: null, error: "the User turned this down" });
+    await drain();
+    expect(view.container.querySelector(".chat__state--failed")).toBeNull();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+
+    // r1 ends: the Chat is free, and the composer takes a new Message.
+    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    await drain();
+    expect(view.container.querySelector(".chat__state--failed")).toBeNull();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+  });
+
+  it("drops a read the page sent before the Space named another Run", async () => {
+    // The read about r1 is still on its way when the Space names r2.
+    space.messages.push(request("m1", "r1", "first ask"));
+    space.messages.push(request("m2", "r2", "second ask"));
+    space.statuses["h1"] = "working";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = {
+      status: "running",
+      steps: [{ index: 1, tool_calls: 1 }],
+      actions: [{ id: "a9", step: 1, tool: "write_file", status: "succeeded" }],
+    };
+    space.runs["r2"] = { status: "running", steps: [] };
+    space.holdRunShow("r1");
+    const view = await openChat();
+    await waitFor(() => expect(space.runShows).toEqual(["r1"]));
+
+    // The Space follows r2 now: the page expects r2, and the read it sent about
+    // r1 is still on its way.
+    space.activeRuns["h1"] = "r2";
+    space.holdRunShow("r2");
+    space.resume([]);
+    await waitFor(() => expect(space.runShows).toEqual(["r1", "r2"]));
+
+    // Both answers land: the late one about r1 does not fill the card, and the
+    // Run it described does not become the one the page follows.
+    space.releaseRunShow("r1");
+    space.releaseRunShow("r2");
+    await drain();
+    expect(view.container.textContent).not.toContain("write_file");
+    expect(element(view, ".activity__tools").textContent).not.toContain("write_file");
   });
 
   it("follows the Run the Bot names, not the one the list named", async () => {

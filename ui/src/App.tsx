@@ -213,9 +213,13 @@ export default function App() {
   // was already running when it opened. It only moves forward, queued → running,
   // and back to running once an approval it waited for is granted.
   let followed: { run: string; step: RunStep } | null = null;
-  // How many times the page changed the Run it follows. A read that is still on
-  // its way carries the version it was sent with, and an answer that arrives
-  // after the page moved on is dropped.
+  // The Run the page expects to follow, from the last word it has about the
+  // Chat: the Space's, or a live event's. It is set before a read is sent, so a
+  // read that is still on its way can tell that the page moved on.
+  let expectedRun: string | null = null;
+  // How many times the Run the page expects to follow changed. A read that is
+  // still on its way carries the version it was sent with, and an answer that
+  // arrives after the page moved on is dropped.
   let followVersion = 0;
   // Runs the record already reported finished: a late command result or answer
   // must not revive them.
@@ -377,6 +381,7 @@ export default function App() {
   // Follows one Run and shows the furthest state the page knows for it.
   function followRun(run: string, step: RunStep, position?: number) {
     if (settledRuns.has(run)) return;
+    expectRun(run);
     followed = { run, step };
     update((draft) => {
       draft.queue = step === "queued" ? { status: "queued", position } : null;
@@ -415,27 +420,42 @@ export default function App() {
 
   function clearFollowed() {
     followed = null;
-    followVersion += 1;
+    expectRun(null);
     setActivity(null);
     update({ queue: null });
   }
 
-  // The Space names a different Run than the page follows: the page follows the
-  // one it names. The old follow goes, and with it the place that Run held in
-  // the Chat's projection, so the Run that works while the page follows another
-  // does not keep the Chat busy and its late events do not fill the card.
-  function followNamed(run: string | null | undefined) {
-    if (!followed || followed.run === run) return;
-    const stale = followed.run;
-    followed = null;
+  // The Run the page expects to follow changed. Every change counts, so a read
+  // that is still on its way can tell from its answer that the page moved on.
+  function expectRun(run: string | null) {
+    if (expectedRun === run) return;
+    expectedRun = run;
     followVersion += 1;
-    // The place the page held in the queue belonged to that Run.
+  }
+
+  // The Space names a Run other than the one the page follows: the page follows
+  // the one it names. The old follow goes, and with it the card that showed its
+  // work and the place the page held in the queue. The Run itself keeps its
+  // place in the Chat's projection: it still works, and the Chat stays busy
+  // until it ends or the Space says the Chat is idle. A Chat the Space names no
+  // Run for keeps whatever it holds: the page reads its history, and its status
+  // is the Space's word.
+  function followNamed(run: string | null | undefined) {
+    const named = run ?? null;
+    if (!named || expectedRun === named) return;
+    expectRun(named);
+    followed = null;
     update({ queue: null });
-    const chat = runChats.get(stale);
-    if (!chat) return;
+    setActivity(null);
+  }
+
+  // The Space says a Chat holds no Run and is idle: the page lets go of the Runs
+  // it still holds for it, so a Run that works while the page follows another
+  // does not keep the Chat busy after the Space says the Chat is free.
+  function releaseRuns(chat: string) {
     setState((draft) => {
       const runs = draft.runs[chat];
-      if (runs) delete runs.active[stale];
+      if (runs) runs.active = {};
     });
   }
 
@@ -444,7 +464,11 @@ export default function App() {
   function finishFollowing(run: string, outcome: RunOutcome = { failed: false, error: null }) {
     settledRuns.add(run);
     const wasFollowing = isFollowing(run);
-    if (wasFollowing) followed = null;
+    if (wasFollowing) {
+      followed = null;
+      // The Run the page expected is over, so it expects none.
+      expectRun(null);
+    }
     const chat = state.activeChat;
     endRun(chat?.id, run, outcome);
     forgetRunAttention(run);
@@ -649,6 +673,9 @@ export default function App() {
         // User let work while the page was away, not the one it last heard
         // about.
         followNamed(answered.active_run);
+        // A Chat the Space says holds no Run and is idle keeps nothing: the page
+        // lets go of the Runs it still holds for it.
+        if (answered.active_run === null && answered.status === "idle") releaseRuns(answered.id);
         update({ activeChat: answered });
         await refreshActive(answered, runGeneration);
       }
@@ -1057,12 +1084,18 @@ export default function App() {
     if (!run || !isCurrentChat(chat, generation)) return;
     // Only a Run the Space named may write the Chat's state back.
     const holds = named !== null;
+    // The page expects the Run it is about to read, so an answer about a Run
+    // the Space no longer names is dropped: a Run the page only reads for its
+    // history still fills its card, and a late answer about a Run the page
+    // moved on from does not.
+    expectRun(run);
     const sent = followVersion;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
       // The page moved on to another Run while the answer was on its way.
       if (followVersion !== sent) return;
+      if (expectedRun !== run) return;
       if (followed && followed.run !== run) return;
       if (holds) applyRunView(view);
       else restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
@@ -1083,12 +1116,15 @@ export default function App() {
     const named = chat.active_run;
     const run = followed?.run ?? (named === null ? null : (named ?? newestRequestRun(messages)));
     if (!run || settledRuns.has(run)) return;
+    // The page expects the Run it is about to read.
+    expectRun(run);
     const sent = followVersion;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
       // The page moved on to another Run while the answer was on its way.
       if (followVersion !== sent) return;
+      if (expectedRun !== run) return;
       if (followed && followed.run !== run) return;
       applyRunView(view);
     } catch {
