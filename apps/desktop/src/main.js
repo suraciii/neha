@@ -22,6 +22,7 @@ const START_TIMEOUT_MS = 20_000;
 const READY_GRACE_MS = 300;
 
 let server;
+let localComputer;
 let mainWindow;
 let stopping = false;
 
@@ -39,6 +40,44 @@ function accountFile() {
 
 function spaceHome() {
   return process.env.NEHA_HOME || path.join(userDataDir(), "space");
+}
+
+function computerHome() {
+  return path.join(userDataDir(), "computer");
+}
+
+function computerWorkspace() {
+  return path.join(userDataDir(), "workspace");
+}
+
+function computerConfigFile() {
+  return path.join(computerHome(), "computer.json");
+}
+
+function standardConfigDirectory() {
+  if (process.platform === "win32") {
+    const base = process.env.LOCALAPPDATA || process.env.APPDATA;
+    return base ? path.join(base, "Neha") : null;
+  }
+  if (process.env.XDG_CONFIG_HOME && path.isAbsolute(process.env.XDG_CONFIG_HOME)) {
+    return path.join(process.env.XDG_CONFIG_HOME, "neha");
+  }
+  return path.join(os.homedir(), ".config", "neha");
+}
+
+function ticketFileFor(origin) {
+  const match = /^neha-([^.]+)\.localhost$/.exec(new URL(origin).hostname);
+  const config = standardConfigDirectory();
+  if (!match || !config) return null;
+  return path.join(config, "spaces", match[1], "local-computer.ticket");
+}
+
+function spaceEnv() {
+  return { ...process.env, NEHA_HOME: spaceHome() };
+}
+
+function computerEnv() {
+  return { ...process.env, NEHA_COMPUTER_HOME: computerHome() };
 }
 
 function binaryPath() {
@@ -191,7 +230,7 @@ function startSpace() {
     let browser;
     let settled = false;
     const child = spawn(binary, ["serve", "--port", "0", "--ui", ui], {
-      env: { ...process.env, NEHA_HOME: spaceHome() },
+      env: spaceEnv(),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -226,21 +265,135 @@ function startSpace() {
     child.stderr.on("data", (chunk) => process.stderr.write(`[space] ${chunk}`));
     child.once("error", (error) => fail(error));
     child.once("exit", (code, signal) => {
-      server = undefined;
+      if (server === child) server = undefined;
       fail(new Error(`the Space exited before it was ready (${code ?? signal})`));
     });
   });
 }
 
+function waitForExit(child, timeoutMs = 2_000) {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve();
+      return;
+    }
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      finish();
+    }, timeoutMs);
+    child.once("exit", finish);
+    child.once("error", finish);
+  });
+}
+
+async function restartSpace() {
+  const old = server;
+  server = undefined;
+  if (old) {
+    old.kill("SIGTERM");
+    await waitForExit(old);
+  }
+  return startSpace();
+}
+
+async function runPairing(spaceUrl, ticketFile) {
+  fs.mkdirSync(computerHome(), { recursive: true });
+  fs.mkdirSync(computerWorkspace(), { recursive: true });
+  const args = [
+    "computer",
+    "pair",
+    "--yes",
+    "--space",
+    spaceUrl,
+    "--workspace",
+    computerWorkspace(),
+  ];
+  if (ticketFile && fs.existsSync(ticketFile)) {
+    args.push("--ticket-file", ticketFile);
+  }
+  const child = spawn(binaryPath(), args, {
+    env: computerEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  child.stdout.on("data", (chunk) => process.stdout.write(`[pair] ${chunk}`));
+  child.stderr.on("data", (chunk) => process.stderr.write(`[pair:err] ${chunk}`));
+  await waitForExit(child, 15_000);
+  return child.exitCode === 0;
+}
+
+async function startLocalComputer(spaceUrl, origin) {
+  if (process.platform === "darwin") {
+    log("the Local Computer is not available on macOS yet");
+    return;
+  }
+  let paired = fs.existsSync(computerConfigFile());
+  if (paired) {
+    // The Space picks a fresh loopback port on every launch. The saved token
+    // and Computer id stay valid; only the address has to move with it.
+    try {
+      const config = JSON.parse(fs.readFileSync(computerConfigFile(), "utf8"));
+      if (config.space_url !== spaceUrl) {
+        config.space_url = spaceUrl;
+        fs.writeFileSync(computerConfigFile(), JSON.stringify(config), { mode: 0o600 });
+        log(`moved the saved Local Computer pairing to ${spaceUrl}`);
+      }
+    } catch (error) {
+      log("the saved Local Computer pairing is unreadable; pairing again:", error.message);
+      paired = false;
+    }
+  }
+  if (!paired) {
+    paired = await runPairing(spaceUrl, ticketFileFor(origin));
+    if (!paired) {
+      log("the Local Computer could not pair; Chat is still available");
+      return;
+    }
+  }
+  localComputer = spawn(binaryPath(), [
+    "computer",
+    "run",
+    "--workspace",
+    computerWorkspace(),
+  ], {
+    env: computerEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  localComputer.stdout.on("data", (chunk) => process.stdout.write(`[computer] ${chunk}`));
+  localComputer.stderr.on("data", (chunk) => process.stderr.write(`[computer:err] ${chunk}`));
+  localComputer.once("exit", (code, signal) => {
+    log(`the Local Computer exited (${code ?? signal})`);
+  });
+  log(`started the Local Computer at ${computerWorkspace()}`);
+}
+
 async function openLocalSpace() {
   const started = await startSpace();
   let origin;
+  let spaceUrl;
   if (started.invite) {
     origin = await joinFirstAdmin(started.invite, started.browser);
+    // The Space writes its local-computer ticket when it starts with an
+    // existing Admin, not at the moment the invitation is accepted. Restart
+    // once, then sign in to the new port.
+    const restarted = await restartSpace();
+    spaceUrl = restarted.listening;
+    origin = await discoverOrigin(spaceUrl);
+    await loginSavedAccount(origin);
   } else {
-    origin = await discoverOrigin(started.listening);
+    spaceUrl = started.listening;
+    origin = await discoverOrigin(spaceUrl);
     await loginSavedAccount(origin);
   }
+  await startLocalComputer(spaceUrl, origin);
 
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -294,6 +447,12 @@ async function openLocalSpace() {
 function stopServer() {
   if (stopping) return;
   stopping = true;
+  if (localComputer && !localComputer.killed) {
+    const child = localComputer;
+    localComputer = undefined;
+    child.kill("SIGTERM");
+    setTimeout(() => child.kill("SIGKILL"), 500).unref();
+  }
   if (server && !server.killed) {
     const child = server;
     server = undefined;

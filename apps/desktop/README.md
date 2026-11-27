@@ -1,12 +1,11 @@
 # Neha Desktop
 
 The local-first desktop shell. It starts the bundled Space, creates the first
-local Admin without showing the invitation form, and loads the existing browser
-client.
+local Admin without showing the invitation form, starts the Local Computer, and
+loads the existing browser client. No separate server is installed or operated.
 
-This is the first slice of the Windows desktop work. It currently uses the local
-`target/debug/neha` or an explicit `NEHA_BIN`; packaging the sidecar and Windows
-Local Computer are follow-up work.
+The shell currently uses the local `target/debug/neha` or an explicit `NEHA_BIN`;
+the packaged Windows build stages a release `neha.exe` under `resources`.
 
 ## Run
 
@@ -32,11 +31,33 @@ Environment:
 
 On a fresh Space the shell reads the one-time invitation, creates the first
 Admin with the local OS account name and a generated internal password, stores
-the password with Electron `safeStorage` (Windows DPAPI), and loads the client.
+the password with Electron `safeStorage` (Windows DPAPI), restarts the Space so
+it writes its one-use Local Computer ticket, pairs this machine, starts the
+Local Computer daemon, and loads the client.
 
-On a Space that already has an account, the shell discovers the browser origin,
-signs in with the stored account, and loads the client. The invitation form is
-not shown in either path.
+On a Space that already has an account, the shell updates the saved Computer
+pairing to the new loopback port, starts the daemon, signs in, and loads the
+client. The invitation form is not shown in either path.
+
+## Windows Local Computer
+
+The Windows runtime is a managed Bot folder: its file tools stay inside the
+folder, but its shell runs with the machine user's rights and has **no OS
+sandbox** in this slice. Approvals are the command boundary. Do not treat it as
+equivalent to the Linux bubblewrap fence yet.
+
+## Package for Windows
+
+From this directory:
+
+```sh
+pnpm package:win
+```
+
+The script builds the release sidecar (`x86_64-pc-windows-gnu` on Linux,
+`x86_64-pc-windows-msvc` on Windows), builds the UI, stages both under
+`resources/`, and runs electron-builder NSIS. The result is
+`dist/Neha-Setup-<version>.exe`; it is unsigned.
 
 ## Test
 
@@ -45,5 +66,5 @@ pnpm test
 ```
 
 The tests cover the startup-line parser, cookie parsing, display-name fallback,
-and generated passwords. The Electron integration is exercised manually with a
-real Space until the packaging and native CI slices exist.
+and generated passwords. The Electron/Local Computer integration is exercised
+manually with a real Space until native Windows CI exists.

@@ -211,7 +211,11 @@ The machine ends the command it was running when the channel drops, so no action
 - A Hosted Computer does not ask before an action yet; [Approvals](approvals.md) covers the gate for a Local Computer.
 - An approval of a run no User is with does not expire yet, and a Question, a Group approval, and an independent reviewer are not available.
 - The screen and process streams are not shown or carried by this channel yet.
-- Only Linux is supported for a Local Computer; the desktop app does not turn a machine into a Computer yet.
+- A Local Computer runs on Linux under bubblewrap. On Windows it runs as a
+  managed Bot folder: file tools stay inside that folder, but commands run with
+  the machine user's rights and are not OS-sandboxed; approvals are the command
+  boundary. macOS is not supported. The desktop app starts the Local Computer
+  automatically on Linux and Windows.
 
 ## File access and a run's directory
 
