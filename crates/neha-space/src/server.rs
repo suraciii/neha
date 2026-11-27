@@ -467,13 +467,13 @@ async fn start_with(
         (Some(_), None) | (None, _) => None,
     };
     server.runs.wake_all(&server);
-    let browser_url = server
+    let invite_base = server
         .public_url
         .clone()
-        .unwrap_or_else(|| format!("http://{}:{}", server.browser_host, addr.port()));
+        .unwrap_or_else(|| format!("http://{addr}"));
     let invite = server
         .invite_secret()
-        .map(|secret| format!("{browser_url}/invite#{secret}"));
+        .map(|secret| format!("{invite_base}/invite#{secret}"));
     let router = server.router();
     let task = tokio::spawn(async move {
         let _ = axum::serve(
