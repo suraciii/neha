@@ -1,6 +1,6 @@
 # Let a Bot work on its Computer
 
-This guide shows a Bot using the built-in tools to work in its Computer's workspace: a shell, file reads, file writes, and file listing. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist. It describes the Hosted Computer of that quick start; [Add a Local Computer](computer.md) covers a Bot on a machine of its own.
+This guide shows a Bot using the built-in tools to work in its Computer's workspace: a shell, file reads, file writes, and file listing. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist. It describes a Bot on a Hosted Computer; [Add a Local Computer](computer.md) covers a machine of its own.
 
 ## What the Bot has
 
@@ -22,6 +22,8 @@ The workspace lives under `NEHA_HOME`:
 ```text
 $NEHA_HOME/computers/<computer-id>/workspace
 ```
+
+On a Hosted Computer, the shell sees this folder at `/workspace`; [Add a Local Computer](computer.md#the-hosted-computer) covers the sandbox.
 
 ## Ask for work
 
@@ -66,16 +68,18 @@ The final reply still prints on standard output; progress prints on standard err
 
 ## Limits
 
-The local runtime enforces these limits, and an action that breaks one returns an error to the Model instead of failing the whole run:
+The runtime enforces these limits, and an action that breaks one returns an error to the Model instead of failing the whole run:
 
 - A path must stay inside the workspace. Absolute paths outside it, `..` climbs, and any symlink in the path is refused, including a dangling symlink a write could follow.
 - A shell command has 30 seconds. When it runs past the limit, the Space kills the whole process group.
-- The shell starts with an empty environment and only `PATH`, `HOME` (the workspace), and `TMPDIR` (the workspace's `.tmp`) set. Provider keys and other Space secrets are not in that environment. The runtime is not isolated, so a shell command still has the Space user's file access; run only prompts you trust.
+- The shell starts with an empty environment plus `PATH`, `HOME`, `TMPDIR`, and the Bot's `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`. `HOME` is the Workspace, and `TMPDIR` is the sandbox's own `/tmp`; Provider keys and other Space secrets are not in that environment.
+- On a Hosted Computer, the shell runs in a `bubblewrap` sandbox: the machine's system directories are read-only, the Workspace is the only place where files persist, and the process list, `/dev`, `/proc`, and `/tmp` are the sandbox's own. The sandbox shares the machine's network and cannot see the Space's record, secrets, File store, or another Computer's Workspace. [Computers](computer.md#the-hosted-computer) covers the sandbox and the layouts it refuses.
+- On a Local Computer in granted mode, the shell runs in a sandbox that allows persistent writes only in the Workspace, the folders its owner granted, and the run's `--cwd` directory; with full access the shell runs directly as the machine's user, with no sandbox. The file tools check their own write paths. Reading follows the machine user's rights, except the Computer's configuration directory in granted mode, so run only prompts you trust.
 - A tool result keeps its first 8 KiB and last 24 KiB and names the omitted byte count, including output beyond the capture limit. A write is limited to 64 KiB. A file read reads at most 8 MiB, then shows its first 8 KiB and last 24 KiB with the omitted count.
 - A run stops after 8 steps. If the Model keeps asking for tools, the Bot answers with a failure Message and the Space stays available.
 
 ## What the milestone does not do
 
-- The Computer is not isolated. The runtime executes real commands in a workspace directory with the Space user's permissions; it is a development and local-use implementation. Do not run a Space exposed to other machines or with prompts you do not trust.
+- A Hosted Computer's sandbox is not an independent machine image: it has no screen or browser and shares the Space machine's network.
 - An unattended approval does not expire yet, and a Hosted Computer does not ask before an action. [Approvals](approvals.md) covers the gate that works on a Local Computer.
 - A Local Computer runs the same tools in the Bot's Workspace on that machine. The file tools check write paths. In granted mode the shell runs in a sandbox that allows persistent writes only in the Bot's Workspace, the folders its owner granted, and the run's `--cwd` directory; with full access the shell runs directly as the machine's user, with no sandbox. [Add a Local Computer](computer.md#the-bots-workspace-and-the-write-fence) covers the range and [offline behavior](computer.md#while-the-machine-is-offline).

@@ -8,7 +8,6 @@ import ApprovalCard from "./ApprovalCard";
 import Avatar from "./Avatar";
 import FileCard from "./FileCard";
 import Icon from "./Icon";
-import LocaleSwitch from "./LocaleSwitch";
 
 interface ChatViewProps {
   account: Account;
@@ -108,26 +107,35 @@ export default function ChatView(props: ChatViewProps) {
         <div class="chat__titles">
           <h1>{title()}</h1>
           <p class="chat__sub">
-            {props.bot ? t("chat.bot") : t("chat.loading")}
-            <span class="chat__dot" />
-            {props.computer?.kind === "local" ? t("chat.localComputer") : t("chat.computer")}
-            <span class="chat__dot" />
-            <span class={props.computer?.online ? "state-text state-text--online" : "state-text"}>
-              {props.computer?.online ? t("chat.online") : t("chat.offline")}
-            </span>
-            <Show when={props.waiting}>
-              <span class="chat__dot" />
-              <span class="state-text state-text--waiting">{t("chat.waiting")}</span>
+            <Show when={props.computer} fallback={<span>{t("chat.loading")}</span>}>
+              {(computer) => (
+                <>
+                  <span>
+                    {computer().kind === "local"
+                      ? t("chat.localComputer")
+                      : t("chat.hostedComputer")}
+                  </span>
+                  <span class="chat__dot" />
+                  <span class={computer().online ? "state-text state-text--online" : "state-text"}>
+                    {computer().online ? t("chat.online") : t("chat.offline")}
+                  </span>
+                </>
+              )}
             </Show>
           </p>
         </div>
-        <LocaleSwitch class="chat__locale" />
-        <div class="chat__actions">
-          <span class="chip">
-            <Icon name="lock" size="sm" />
-            {t("chat.ownerOnly")}
+        <Show when={props.waiting}>
+          <span
+            class="chat__attention"
+            role="status"
+            aria-label={t("chat.waiting")}
+            title={t("chat.waiting")}
+          >
+            <Icon name="alert" size="sm" />
+            <span class="chat__attention-long">{t("chat.waiting")}</span>
+            <span class="chat__attention-short">{t("chat.waiting.short")}</span>
           </span>
-        </div>
+        </Show>
       </header>
 
       <Show when={props.error}>
@@ -142,7 +150,13 @@ export default function ChatView(props: ChatViewProps) {
           when={props.messages.length > 0 || props.approvals.length > 0}
           fallback={
             <div class="chat__empty">
-              <p class="eyebrow">{t("chat.new.eyebrow")}</p>
+              <Show when={props.bot}>
+                {(bot) => (
+                  <div class="chat__empty-avatar">
+                    <Avatar name={bot().name} />
+                  </div>
+                )}
+              </Show>
               <h2>
                 {props.bot ? t("chat.new.title", { name: props.bot.name }) : t("chat.opening")}
               </h2>

@@ -32,7 +32,11 @@ A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on 
 
 It finds the startup ticket the Space wrote under the machine's Neha configuration directory, or asks the Space for one as the signed-in User; either way it pairs the Space the ticket names. `--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
 
-`neha computer list` shows the Computers the User owns, Local and Hosted. `neha bot create --computer` takes one of these:
+`neha computer list` shows the Computers the User owns, Local and Hosted. `neha computer reset <computer>` clears a Hosted Computer's Workspace: every file and folder inside it is deleted, and the Workspace folder stays.
+
+Only the Computer's owner resets it, and only a Hosted Computer is reset. A Computer with a queued, running, or waiting run refuses a reset until that run ends, and a second reset of an empty Workspace succeeds.
+
+`neha bot create --computer` takes one of these:
 
 | Value | What happens |
 | --- | --- |
@@ -40,9 +44,9 @@ It finds the startup ticket the Space wrote under the machine's Neha configurati
 | `hosted` | A new Hosted Computer, one for the Bot |
 | A Local Computer id | The Computer with that id |
 
-Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
+Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines. A Hosted Bot has no file access to change: its Workspace is its only write range.
 
 `neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 
@@ -54,7 +58,7 @@ Only the Bot's owner can change a Bot's access. A run uses the access recorded w
 
 `on` prints the risk, which names the configuration directory the Bot can then read, and asks for confirmation at a terminal. Without a terminal it needs `--yes`, and `off` asks for no confirmation.
 
-`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. A Hosted Computer starts every run in the Bot's own workspace.
+`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. A Hosted Computer runs only in the Bot's own Workspace, and a run that names another directory fails.
 
 The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run. A path that is not absolute is refused.
 

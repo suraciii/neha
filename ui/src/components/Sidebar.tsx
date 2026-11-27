@@ -3,7 +3,7 @@ import { For, Show, createMemo } from "solid-js";
 import { t } from "../i18n";
 import type { Account, Bot, Chat, Preview } from "../types";
 import Avatar from "./Avatar";
-import Icon from "./Icon";
+import Brand from "./Brand";
 import LocaleSwitch from "./LocaleSwitch";
 
 interface SidebarProps {
@@ -31,12 +31,13 @@ export default function Sidebar(props: SidebarProps) {
   return (
     <aside class="sidebar" aria-label={t("sidebar.chats")}>
       <header class="sidebar__head">
+        <Brand compact />
         <div>
           <h1 class="sidebar__title">{t("sidebar.chats")}</h1>
           <p class="sidebar__sub">
             {props.chats.length === 1
-              ? t("sidebar.conversation.one")
-              : t("sidebar.conversation.many", { count: props.chats.length })}
+              ? t("sidebar.chats.one")
+              : t("sidebar.chats.many", { count: props.chats.length })}
           </p>
         </div>
       </header>
@@ -46,9 +47,6 @@ export default function Sidebar(props: SidebarProps) {
           when={props.chats.length > 0}
           fallback={
             <div class="side-empty">
-              <span class="side-empty__icon">
-                <Icon name="message" size="lg" />
-              </span>
               <p class="side-empty__title">{t("sidebar.empty.title")}</p>
               <p class="side-empty__text">{t("sidebar.empty.text")}</p>
             </div>

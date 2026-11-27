@@ -45,13 +45,13 @@ The invitation is valid once and only while this Space runs. Keep the terminal o
 
 ## Join as the Admin in the browser
 
-Open the `Open in a browser` invitation link. The client asks for a display name and a password of at least eight bytes.
+Open the `Open in a browser` invitation link. The client asks for a display name and a password of at least eight characters; the Space checks at least eight bytes.
 
 The first User is the Admin. The browser keeps the session in an HttpOnly cookie; no token appears in the page or its URL.
 
 The browser client is served from `ui/dist`. `neha serve` finds it automatically, or takes `--ui <directory>` or `NEHA_UI_DIR`.
 
-The sign-in card has a language switch for English and Simplified Chinese. The signed-in client keeps the switch in the first-run setup header, the Chat list footer, and the Chat header; the choice persists in the browser and does not change the record.
+The sign-in card has a language switch for English and Simplified Chinese. The signed-in client keeps the switch in the Chat list footer; the first-run setup header carries it at narrow widths, where the sidebar is hidden. The choice persists in the browser and does not change the record.
 
 ## Join as the Admin from the CLI
 
@@ -90,7 +90,7 @@ target/debug/neha model list
 
 ## Create a Bot and chat
 
-A new Bot gets its own Chat and its own Computer:
+A new Bot gets its own Chat and its own Computer: a Hosted Computer unless you name a Local one.
 
 ```bash
 target/debug/neha bot create Scout
@@ -174,7 +174,7 @@ target/debug/neha computer list
 target/debug/neha bot create Runner --computer <computer-id>
 ```
 
-Without `--computer`, a new Bot goes on your Local Computer while one is paired; the target default is a Hosted Computer.
+Without `--computer`, a new Bot goes on a new Hosted Computer; `--computer local` puts it on your paired Local Computer.
 
 Ask the new Bot to work:
 
@@ -215,8 +215,9 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 ## What this milestone does not do
 
-- The Hosted Computer is an in-process workspace and is not isolated. Its shell and file tools execute real commands and real file operations with the Space user's permissions. Do not run a Space exposed to other machines or with prompts you do not trust.
-- A Hosted Computer runs without the approval gate yet, and an unattended run's approval does not expire yet. [Approvals](approvals.md) covers the gate on a Local Computer.
+- The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Bot's Workspace as the only place where files persist; it has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
+- A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
+- An unattended run's approval does not expire yet.
 - One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, search, or notifications.
 - The browser client does not stream a reply. It shows a working state until the Run finishes.

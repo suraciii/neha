@@ -52,9 +52,24 @@ fn serve(home: &Path) -> (SpaceProcess, String, Option<String>) {
 /// before the fixture is handed back. A start that fails is retried; when
 /// every attempt fails, the panic carries the Space's own stderr.
 fn serve_on(home: &Path, port: u16) -> (SpaceProcess, String, Option<String>) {
+    serve_on_with(home, port, None)
+}
+
+/// Starts a Space whose `PATH` does not contain `bubblewrap`, to exercise the
+/// Hosted Computer's availability check.
+fn serve_without_bwrap(home: &Path) -> (SpaceProcess, String, Option<String>) {
+    serve_on_with(home, 0, Some(std::ffi::OsStr::new("/nonexistent")))
+}
+
+/// Starts `neha serve` on one loopback port with an optional `PATH` override.
+fn serve_on_with(
+    home: &Path,
+    port: u16,
+    path: Option<&std::ffi::OsStr>,
+) -> (SpaceProcess, String, Option<String>) {
     let mut failures = String::new();
     for attempt in 1..=3 {
-        match serve_once(home, port) {
+        match serve_once(home, port, path) {
             Ok(space) => return space,
             Err(error) => {
                 eprintln!("neha serve failed on start {attempt}:\n{error}");
@@ -75,15 +90,26 @@ fn space_port(url: &str) -> u16 {
 }
 
 /// Starts one `neha serve` and waits until it answers on its own address.
-fn serve_once(home: &Path, port: u16) -> Result<(SpaceProcess, String, Option<String>), String> {
-    let mut child = Command::new(BIN)
+fn serve_once(
+    home: &Path,
+    port: u16,
+    path: Option<&std::ffi::OsStr>,
+) -> Result<(SpaceProcess, String, Option<String>), String> {
+    let mut command = Command::new(BIN);
+    command
         .args(["serve", "--port", &port.to_string()])
         .env("NEHA_HOME", home)
         // The Space writes its one-use pairing ticket into the per-user
         // configuration directory; keep that inside the fixture.
         .env("XDG_CONFIG_HOME", home.join("xdg"))
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    // Keep the Space from finding the fixture's bubblewrap when a test asks
+    // for a machine that cannot provide Hosted.
+    if let Some(path) = path {
+        command.env("PATH", path);
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot run neha serve: {error}"))?;
     let received = line_reader(child.stdout.take().unwrap());
@@ -1111,21 +1137,25 @@ fn local_computer(directory: tempfile::TempDir, provider: &str, script: &Script)
 /// Pairs a Local Computer into a fresh Space and creates one Bot on it.
 ///
 /// The pairing and the Bot creation take the paths a User takes, and the Bot
-/// is created without naming a Computer so the default (Local) is itself under
-/// test. A `directory` outside `/tmp` keeps the sandbox's fresh `/tmp` out of
-/// a fence assertion.
+/// names the Local Computer explicitly because a new Bot defaults to Hosted.
+/// A `directory` outside `/tmp` keeps the sandbox's fresh `/tmp` out of a
+/// fence assertion.
 fn bare_local_computer(directory: tempfile::TempDir, provider: &str) -> LocalComputer {
     let home = directory.path().join("home");
     let credential = directory.path().join("session").join("credential.json");
     let (server, url) = space_with_admin(directory.path(), Some(provider));
     let paired = pair_computer(&home, &credential, &url, &directory.path().join("machine"));
-    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let created = run(
+        &home,
+        &credential,
+        &["bot", "create", "Scout", "--computer", "local"],
+    );
     let bot = first_word(&field(&created, "Created Bot "));
     let chat = field(&created, "Chat:");
     assert_eq!(
         field(&created, "Computer:"),
         paired.computer,
-        "a Bot created without --computer lands on the paired Local Computer"
+        "an explicit Local Computer creates the Bot there"
     );
     assert!(
         paired
@@ -2394,29 +2424,28 @@ async fn a_full_access_writes_outside_the_workspace_until_it_is_turned_off() {
 
 #[test]
 fn a_bot_owner_manages_file_access_from_the_cli() {
+    if !local_computer_ready() {
+        return;
+    }
+    // File access belongs to a Local Computer: a new Bot defaults to Hosted,
+    // which has only its Workspace and refuses access changes, so this Bot
+    // names the Local Computer. The provider is never called here.
     let directory = tempfile::tempdir().unwrap();
-    let home = directory.path().join("home");
-    let credential = directory.path().join("session").join("credential.json");
-    let (server, _url, invite) = serve(&home);
-    let invite = invite.expect("a fresh Space prints an invitation");
-    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
-    let created = run(&home, &credential, &["bot", "create", "Writer"]);
-    let bot = first_word(&field(&created, "Created Bot "));
+    let computer = bare_local_computer(directory, "http://127.0.0.1:1");
+    let base = computer.path().to_path_buf();
+    let home = computer.home.clone();
+    let credential = computer.credential.clone();
+    let bot = computer.bot.clone();
 
     // A grant names a folder that exists: a relative path, a `..` climb, and a
     // folder nobody created are all refused.
-    let shared = directory.path().join("shared");
+    let shared = base.join("shared");
     std::fs::create_dir(&shared).unwrap();
     let shared_path = shared.to_str().unwrap().to_owned();
     let bad = [
         "shared".to_owned(),
         format!("{shared_path}/../shared"),
-        directory
-            .path()
-            .join("missing")
-            .to_str()
-            .unwrap()
-            .to_owned(),
+        base.join("missing").to_str().unwrap().to_owned(),
     ];
     for bad in &bad {
         let refused = cli(&home, &credential, &["bot", "grant", &bot, bad]);
@@ -2480,9 +2509,9 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
 
     // A symlink names the folder it points at: a grant stores the canonical
     // folder, and revoking the same symlink takes that grant away.
-    let real = directory.path().join("real-folder");
+    let real = base.join("real-folder");
     std::fs::create_dir(&real).unwrap();
-    let link = directory.path().join("linked-folder");
+    let link = base.join("linked-folder");
     std::os::unix::fs::symlink(&real, &link).unwrap();
     let canonical = std::fs::canonicalize(&real).unwrap();
     let symlinked = run(
@@ -2507,8 +2536,8 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     // A granted folder may become a symlink to another granted folder after
     // it was recorded. Revoking the recorded path takes that grant away, not
     // the folder the link now names.
-    let first_folder = directory.path().join("first-folder");
-    let second_folder = directory.path().join("second-folder");
+    let first_folder = base.join("first-folder");
+    let second_folder = base.join("second-folder");
     std::fs::create_dir(&first_folder).unwrap();
     std::fs::create_dir(&second_folder).unwrap();
     let first_path = first_folder.to_str().unwrap().to_owned();
@@ -2517,7 +2546,7 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
         let granted = run(&home, &credential, &["bot", "grant", &bot, path]);
         assert!(granted.contains(&format!("grant {path}")), "{granted}");
     }
-    std::fs::rename(&first_folder, directory.path().join("moved-folder")).unwrap();
+    std::fs::rename(&first_folder, base.join("moved-folder")).unwrap();
     std::os::unix::fs::symlink(&second_folder, &first_folder).unwrap();
     let revoked = run(&home, &credential, &["bot", "revoke", &bot, &first_path]);
     assert!(
@@ -2532,8 +2561,8 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     // `logs` and `logs ` are two folders the record may show. A revoke names
     // the exact spelling it is given, so a trailing space cannot take the
     // grant for the folder beside it.
-    let plain_folder = directory.path().join("logs");
-    let spaced_folder = directory.path().join("logs ");
+    let plain_folder = base.join("logs");
+    let spaced_folder = base.join("logs ");
     std::fs::create_dir(&plain_folder).unwrap();
     std::fs::create_dir(&spaced_folder).unwrap();
     let plain_path = plain_folder.to_str().unwrap().to_owned();
@@ -2564,8 +2593,8 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
 
     // Two grants that arrive together both survive: each command adds to the
     // list the Space holds instead of writing back a stale copy.
-    let concurrent_first = directory.path().join("concurrent-a");
-    let concurrent_second = directory.path().join("concurrent-b");
+    let concurrent_first = base.join("concurrent-a");
+    let concurrent_second = base.join("concurrent-b");
     std::fs::create_dir(&concurrent_first).unwrap();
     std::fs::create_dir(&concurrent_second).unwrap();
     let spawn_grant = |path: &Path| {
@@ -2601,7 +2630,7 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
         );
     }
 
-    drop(server);
+    drop(computer);
 }
 
 /// Waits until `approval list` shows an approval for one run, and returns it.
@@ -2736,27 +2765,21 @@ async fn a_runs_access_is_fixed_when_it_starts() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_runs_directory_is_shown_normalized_and_cannot_climb() {
-    let directory = tempfile::tempdir().unwrap();
-    let home = directory.path().join("home");
-    let credential = directory.path().join("session").join("credential.json");
+    if !local_computer_ready() {
+        return;
+    }
+    // A run directory is a Local Computer's write root; a Hosted Computer
+    // works only in its Workspace and refuses one (covered by the Hosted run
+    // tests), so this run names the Local Computer.
     let (base, provider_task) = fake_provider().await;
-    let (server, _url, invite) = serve(&home);
-    let invite = invite.expect("a fresh Space prints an invitation");
-    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
-    run(
-        &home,
-        &credential,
-        &[
-            "provider",
-            "add",
-            "--base-url",
-            &base,
-            "--model",
-            "test-model",
-        ],
-    );
-    let created = run(&home, &credential, &["bot", "create", "Scout"]);
-    let chat = field(&created, "Chat:");
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-cwd-")
+        .tempdir_in("/var/tmp")
+        .expect("the run-directory test needs a writable /var/tmp outside /tmp");
+    let computer = bare_local_computer(directory, &base);
+    let home = computer.home.clone();
+    let credential = computer.credential.clone();
+    let chat = computer.chat.clone();
 
     // A directory that climbs with `..` or is not absolute is refused where
     // the run is made, not recorded and handed to the Computer.
@@ -2799,7 +2822,7 @@ async fn a_runs_directory_is_shown_normalized_and_cannot_climb() {
         "run show names the granted directory:\n{shown}"
     );
 
-    drop(server);
+    drop(computer);
     provider_task.abort();
 }
 
@@ -2809,14 +2832,17 @@ fn a_tty_confirms_full_access_before_it_turns_on() {
         eprintln!("skipping the TTY confirmation test: script(1) is not available");
         return;
     }
+    if !local_computer_ready() {
+        return;
+    }
+    // Full access belongs to a Local Computer: a new Bot defaults to Hosted,
+    // which has only its Workspace and refuses the change. The provider is
+    // never called here.
     let directory = tempfile::tempdir().unwrap();
-    let home = directory.path().join("home");
-    let credential = directory.path().join("session").join("credential.json");
-    let (server, _url, invite) = serve(&home);
-    let invite = invite.expect("a fresh Space prints an invitation");
-    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
-    let created = run(&home, &credential, &["bot", "create", "Writer"]);
-    let bot = first_word(&field(&created, "Created Bot "));
+    let computer = bare_local_computer(directory, "http://127.0.0.1:1");
+    let home = computer.home.clone();
+    let credential = computer.credential.clone();
+    let bot = computer.bot.clone();
 
     // The risk comes before the question, and anything but yes refuses.
     let mut tty = TtyCli::spawn(&home, &credential, &["bot", "full-access", &bot, "on"]);
@@ -2852,7 +2878,7 @@ fn a_tty_confirms_full_access_before_it_turns_on() {
     let access = run(&home, &credential, &["bot", "access", &bot]);
     assert!(access.contains("full access: on"), "{access}");
 
-    drop(server);
+    drop(computer);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3038,7 +3064,7 @@ async fn a_bot_runs_on_a_local_computer() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_local_computer_pairs_without_a_code_and_takes_the_default_bot() {
+async fn a_local_computer_pairs_without_a_code_and_takes_a_bot_on_it() {
     if !local_computer_ready() {
         return;
     }
@@ -3079,9 +3105,29 @@ async fn a_local_computer_pairs_without_a_code_and_takes_the_default_bot() {
         "pairing spends the Space's one-use ticket"
     );
 
-    // `bot create` without a Computer lands on the paired Local Computer, whose
+    // An explicit Local Computer lands the Bot on the paired Computer, whose
     // listing and `bot show` name it as Local and say where it works.
     assert_eq!(field(&computer.created, "Computer:"), computer.computer);
+
+    // Pairing the machine does not change the default: a Bot created without
+    // a Computer still gets its own Hosted one.
+    let default = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "create", "Default"],
+    );
+    let default_bot = first_word(&field(&default, "Created Bot "));
+    assert_ne!(
+        field(&default, "Computer:"),
+        computer.computer,
+        "a paired Local Computer is not the default"
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "show", &default_bot],
+    );
+    assert!(shown.contains("(Hosted, online: true)"), "{shown}");
     let listed = format!("{}  local  online  ", computer.computer);
     assert!(
         computer.listed.lines().any(|line| line == listed),
@@ -3832,14 +3878,27 @@ fn a_move_to_an_unknown_or_hosted_computer_is_refused() {
     drop(server);
 }
 
-#[test]
-fn a_bot_created_with_computer_hosted_works_in_the_space() {
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_created_with_computer_hosted_works_in_the_space() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
     let credential = directory.path().join("session").join("credential.json");
     let (server, _url, invite) = serve(&home);
     let invite = invite.expect("a fresh Space prints an invitation");
     run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let (base, script, provider_task) = scripted_provider().await;
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
 
     // `--computer hosted` is a keyword naming a fresh Hosted Computer.
     let explicit = run(
@@ -3848,6 +3907,7 @@ fn a_bot_created_with_computer_hosted_works_in_the_space() {
         &["bot", "create", "Other", "--computer", "hosted"],
     );
     let bot = first_word(&field(&explicit, "Created Bot "));
+    let chat = field(&explicit, "Chat:");
     let hosted = field(&explicit, "Computer:");
     let shown = run(&home, &credential, &["bot", "show", &bot]);
     assert!(
@@ -3865,6 +3925,58 @@ fn a_bot_created_with_computer_hosted_works_in_the_space() {
             .lines()
             .any(|line| line.starts_with(&format!("{hosted}  hosted  online  "))),
         "`computer list` shows the Hosted Computer:\n{listing}"
+    );
+
+    // A Hosted shell runs in its own minimal rootfs and can call the CLI a
+    // Bot skill needs. The workspace is the only place that survives.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "neha --help >/dev/null && printf hosted > hosted.txt"}),
+    );
+    script.say("I ran the shell on my Hosted Computer.");
+    let sent = run(
+        &home,
+        &credential,
+        &["chat", "send", "run the hosted check", "--chat", &chat],
+    );
+    assert!(
+        sent.contains("I ran the shell on my Hosted Computer."),
+        "{sent}"
+    );
+    let hosted_file = workspace.join("hosted.txt");
+    assert_eq!(std::fs::read_to_string(&hosted_file).unwrap(), "hosted");
+
+    let reset = run(&home, &credential, &["computer", "reset", &hosted]);
+    assert!(
+        reset.contains(&format!("Reset Computer {hosted} (hosted).")),
+        "{reset}"
+    );
+    assert!(!hosted_file.exists(), "reset clears the workspace");
+    assert!(
+        workspace.is_dir(),
+        "reset keeps the workspace folder itself"
+    );
+
+    // A Hosted run works only in its Workspace: a named host directory is
+    // refused before a Provider request.
+    let cwd = cli(
+        &home,
+        &credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &chat,
+            "--cwd",
+            "/tmp",
+            "elsewhere",
+        ],
+    );
+    assert!(!cwd.status.success(), "Hosted must refuse a host cwd");
+    let stderr = String::from_utf8_lossy(&cwd.stderr);
+    assert!(
+        stderr.contains("works only in its Workspace"),
+        "stderr: {stderr}"
     );
 
     // Without a Local Computer paired, the default is Hosted as well.
@@ -3894,6 +4006,31 @@ fn a_bot_created_with_computer_hosted_works_in_the_space() {
     assert!(
         stderr.contains("there is no Local Computer; run `neha computer pair` on this machine"),
         "stderr: {stderr}"
+    );
+
+    provider_task.abort();
+    drop(server);
+}
+
+#[test]
+fn a_hosted_bot_is_refused_when_bubblewrap_is_missing() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve_without_bwrap(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    let refused = cli(&home, &credential, &["bot", "create", "Scout"]);
+    assert!(!refused.status.success(), "Hosted must not fall back");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("cannot provide an isolated Hosted Computer"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("--computer local"),
+        "the error names the alternative: {stderr}"
     );
 
     drop(server);

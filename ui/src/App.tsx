@@ -736,7 +736,6 @@ export default function App() {
                     when={needsSetup()}
                     fallback={
                       <div class="select-chat">
-                        <p class="eyebrow">{t("select.eyebrow")}</p>
                         <h2>{t("select.title")}</h2>
                       </div>
                     }

@@ -63,10 +63,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
     <article class="msg msg--bot approval" aria-live="polite">
       <Avatar name={props.botName} small />
       <div class="msg__body">
-        <div class="msg__meta">
+        <div class="approval__head">
           <b>{props.botName}</b>
-          <span>{t("chat.approval.asks", { tool: props.approval.tool })}</span>
+          <span>{t("chat.approval.heading")}</span>
         </div>
+        <span class="approval__tool mono">{props.approval.tool}</span>
         <code class={`approval__summary ${folded() ? "approval__summary--folded" : ""}`}>
           {escapeControls(props.approval.summary)}
         </code>
@@ -109,7 +110,7 @@ export default function ApprovalCard(props: ApprovalCardProps) {
               disabled={props.pending}
               onClick={() => props.onDecide(props.approval, true, false)}
             >
-              {t("chat.approval.allow")}
+              {t("chat.approval.allowOnce")}
             </button>
             <Show when={scope()}>
               <button

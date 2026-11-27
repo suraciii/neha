@@ -1798,7 +1798,15 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             runs: &server.runs,
                             events: &server.events,
                         };
+                        let reset = matches!(command, CommandCall::ComputerReset { .. });
                         let outcome = commands::execute(&context, &account, id, command).await;
+                        // A Message that arrived during a reset queued a run
+                        // whose pump saw the reset mark and stopped. Wake the
+                        // pumps whether the reset succeeded or failed: the mark
+                        // is gone either way.
+                        if reset {
+                            server.runs.wake_all(&server);
+                        }
                         let result = match outcome {
                             Ok(outcome) => {
                                 broadcast(&server, &outcome.events);
@@ -5867,6 +5875,10 @@ mod tests {
             .join("computers")
             .join(computer.to_string())
             .join("workspace");
+        // A Hosted workspace already has a `.tmp` directory, so replace it with
+        // a file: the runtime cannot create its working folder and must fail
+        // the run instead of starting on a half-prepared Computer.
+        std::fs::remove_dir_all(workspace.join(".tmp")).unwrap();
         std::fs::write(workspace.join(".tmp"), "not a directory").unwrap();
 
         let result = send(&mut socket, chat, "hello").await;
@@ -9683,7 +9695,234 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_bot_prefers_the_paired_local_computer_and_takes_choices() {
+    async fn a_hosted_computers_workspace_can_be_reset() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates, _recorded) =
+            gated_provider(vec![hold("held answer")]).await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        std::fs::write(workspace.join("note.txt"), "keep me").unwrap();
+        std::fs::create_dir(workspace.join("folder")).unwrap();
+        std::fs::write(workspace.join("folder").join("inner.txt"), "also me").unwrap();
+
+        let cursor_before = running.server.store.last_seq().await.unwrap();
+        let command_id = Id::new();
+        let (committed, result) = try_command(
+            &mut socket,
+            command_id,
+            CommandCall::ComputerReset { computer },
+        )
+        .await
+        .unwrap();
+        assert!(committed.is_none(), "a reset writes no event");
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor_before
+        );
+        assert_eq!(result["computer"], json!(computer));
+        assert_eq!(result["kind"], "hosted");
+        assert!(
+            std::fs::read_dir(&workspace).unwrap().next().is_none(),
+            "reset clears every entry of the workspace"
+        );
+        assert!(workspace.is_dir(), "reset keeps the workspace directory");
+
+        // A repeated command id answers from the record instead of clearing
+        // again: work written after the first reset must survive, even while a
+        // new run holds the Computer.
+        std::fs::write(workspace.join("late.txt"), "after the reset").unwrap();
+        let queued = submit(&mut socket, chat, "hold the next run", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "running").await;
+        let cursor_before_retry = running.server.store.last_seq().await.unwrap();
+        let (again_committed, again) = try_command(
+            &mut socket,
+            command_id,
+            CommandCall::ComputerReset { computer },
+        )
+        .await
+        .unwrap();
+        assert!(again_committed.is_none());
+        assert_eq!(again, result);
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor_before_retry
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("late.txt")).unwrap(),
+            "after the reset"
+        );
+        gates[0].open();
+        wait_run(&mut socket, run).await;
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refuses_a_hosted_workspace_symlink() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
+        let (_bot, _chat, computer) = tool_bot(&mut socket, base).await;
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        let target = running.server_home().join("not-a-workspace");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), "do not delete").unwrap();
+        std::fs::remove_dir_all(&workspace).unwrap();
+        std::os::unix::fs::symlink(&target, &workspace).unwrap();
+
+        let reset = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer },
+        )
+        .await;
+        assert!(reset.is_err(), "a symlinked Workspace is not cleared");
+        assert_eq!(
+            std::fs::read_to_string(target.join("keep.txt")).unwrap(),
+            "do not delete"
+        );
+
+        std::fs::remove_file(&workspace).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_reset_command_id_cannot_clear_two_computers() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let first = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("First", Some(BotComputer::Hosted)),
+        )
+        .await;
+        let second = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Second", Some(BotComputer::Hosted)),
+        )
+        .await;
+        let first_computer: Id = serde_json::from_value(first["computer"]["id"].clone()).unwrap();
+        let second_computer: Id = serde_json::from_value(second["computer"]["id"].clone()).unwrap();
+        let second_workspace = running
+            .server_home()
+            .join("computers")
+            .join(second_computer.to_string())
+            .join("workspace");
+        std::fs::write(second_workspace.join("keep.txt"), "keep").unwrap();
+
+        let command_id = Id::new();
+        command(
+            &mut socket,
+            command_id,
+            CommandCall::ComputerReset {
+                computer: first_computer,
+            },
+        )
+        .await;
+        let conflict = try_command(
+            &mut socket,
+            command_id,
+            CommandCall::ComputerReset {
+                computer: second_computer,
+            },
+        )
+        .await;
+        assert!(
+            matches!(conflict, Err((ErrorCode::IdempotencyConflict, _))),
+            "one command id cannot reset two Computers: {conflict:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_workspace.join("keep.txt")).unwrap(),
+            "keep",
+            "the second Computer is untouched"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_refuses_a_busy_hosted_computer_and_a_local_one() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (local, _machine) = paired_computer(&mut socket, &running).await;
+        let local_bot = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Local", Some(BotComputer::Local)),
+        )
+        .await;
+        assert_eq!(local_bot["computer"]["id"], json!(local));
+        let local_reset = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer: local },
+        )
+        .await;
+        match local_reset {
+            Err((ErrorCode::InvalidArgument, message)) => assert!(
+                message.contains("only a Hosted Computer can be reset"),
+                "{message}"
+            ),
+            other => panic!("a Local Computer cannot be reset: {other:?}"),
+        }
+
+        let (base, provider_task, gates, _recorded) =
+            gated_provider(vec![hold("held answer")]).await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
+        let queued = submit(&mut socket, chat, "hold this run", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "running").await;
+
+        let busy = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer },
+        )
+        .await;
+        match busy {
+            Err((ErrorCode::Conflict, message)) => {
+                assert!(message.contains("run in progress"), "{message}")
+            }
+            other => panic!("a busy Hosted Computer is not reset: {other:?}"),
+        }
+
+        gates[0].open();
+        wait_run(&mut socket, run).await;
+        let reset = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer },
+        )
+        .await;
+        assert_eq!(reset["computer"], json!(computer));
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_defaults_to_hosted_and_takes_choices() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
 
@@ -9705,11 +9944,12 @@ mod tests {
             other => panic!("a missing Local Computer is named: {other:?}"),
         }
 
-        // Once a machine pairs, an unnamed Bot lands on its Local Computer.
+        // Pairing a machine does not change the default: an unnamed Bot still
+        // gets its own Hosted Computer. Choosing Local stays explicit.
         let (computer, _machine) = paired_computer(&mut socket, &running).await;
         let default = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
-        assert_eq!(default["computer"]["id"], json!(computer));
-        assert_eq!(default["computer"]["kind"], "local");
+        assert_eq!(default["computer"]["kind"], "hosted");
+        assert_ne!(default["computer"]["id"], json!(computer));
         let explicit = command(
             &mut socket,
             Id::new(),
@@ -13495,20 +13735,22 @@ mod tests {
         .await;
         let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
 
-        // A Hosted Computer has no fence yet (M2-B): the directory a run
-        // names grants nothing there and asks nothing either.
+        // A Hosted Computer works only in its Workspace: a run that names a
+        // host directory fails before it starts, and never asks for a folder.
         let queued = submit_in(&mut socket, chat, "write", &cwd).await;
-        let run = run_of(&queued);
-        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "failed");
+        assert!(
+            finished["text"]
+                .as_str()
+                .unwrap()
+                .contains("a Hosted Computer works only in its Workspace"),
+            "{}",
+            finished["text"]
+        );
         assert!(
             approvals_in(&mut socket, None).await.is_empty(),
             "a Hosted Computer never asks for a folder"
-        );
-        let shown = show_run(&mut socket, run).await;
-        assert_eq!(shown["actions"][0]["tool"], "write_file");
-        assert_eq!(
-            shown["actions"][0]["status"], "failed",
-            "the in-process runtime still fences the write"
         );
 
         socket.close(None).await.unwrap();
@@ -13981,7 +14223,14 @@ mod tests {
     async fn a_bot_update_adds_and_removes_grants_atomically() {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        // Grants belong to a Local Computer; a Hosted Bot has none to change.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let add = |grant: &str| bot_update(bot, None, None, Some(grant), None);
         let remove = |grant: &str| bot_update(bot, None, None, None, Some(grant));
@@ -14345,7 +14594,14 @@ mod tests {
     async fn a_grant_name_that_ends_in_a_space_survives_the_grant_table() {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        // Grants belong to a Local Computer; a Hosted Bot has none to change.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let add = |grant: &str| bot_update(bot, None, None, Some(grant), None);
 
@@ -14391,7 +14647,14 @@ mod tests {
     async fn concurrent_bot_updates_do_not_lose_each_other() {
         let (_dir, running, invite) = running().await;
         let (mut socket, token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        // Grants belong to a Local Computer; a Hosted Bot has none to change.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
 
         // Four commands from four connections arrive together; every grant
@@ -14536,7 +14799,13 @@ mod tests {
     async fn a_bot_update_sets_full_access_and_grants_for_its_owner() {
         let (dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let command_id = Id::new();
         let update = CommandCall::BotUpdate(neha::surface::BotUpdate {
@@ -14621,7 +14890,15 @@ mod tests {
     async fn turning_full_access_on_needs_the_current_answer() {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        // Full access applies to a Local Computer; a Hosted Bot has only its
+        // Workspace and refuses the update before the answer is considered.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let request = |consent: Option<u16>| {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
@@ -14697,6 +14974,31 @@ mod tests {
             json!(neha::record::FULL_ACCESS_CONSENT_VERSION)
         );
 
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_bot_refuses_file_access_changes() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        // The answer a Local Computer needs is sent too: this Bot is Hosted,
+        // so the refusal must name the Computer rather than the answer.
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(true), None, None, None),
+        )
+        .await;
+        match refused {
+            Err((ErrorCode::InvalidArgument, message)) => assert!(
+                message.contains("Hosted Computer works only in its Workspace"),
+                "{message}"
+            ),
+            other => panic!("a Hosted Bot has no file access to change: {other:?}"),
+        }
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }

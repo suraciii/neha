@@ -20,9 +20,11 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 
 ## Keeping files
 
-A Hosted Computer keeps its Bots' files when it stops and after a recovery.
+A Hosted Computer keeps its Bot's Workspace in the Space, and a restart of the Space keeps it.
 
-Recovering or resetting a Hosted Computer builds a new machine from each Bot's last saved files; work since that save is lost.
+Resetting a Hosted Computer clears its Bot's Workspace: every file and folder inside it is deleted, and the Workspace folder stays.
+
+Only the Computer's owner resets it.
 
 A Local Computer keeps each Bot's Workspace on the machine, and the Space keeps no copy.
 
@@ -68,6 +70,8 @@ A Bot can ask the User to take control, for example to sign in.
 
 A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a Hosted Computer, a Bot operates the browser. Programs with windows of their own run only on a Local Computer.
 
+A Bot on a Hosted Computer works only in its Workspace.
+
 On a Local Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read. [Design](design.md#isolation) hides the Computer's own configuration directory from a Bot with granted folders.
 
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
@@ -99,9 +103,10 @@ A credential never appears in a Chat or a Group.
 
 ## Gaps
 
-- A new Bot starts on the owner's Local Computer when one is paired; the target default is Hosted.
+- A provider-backed Hosted Computer is not yet specified, including its start, stop, recovery, and destruction.
+- Saving a Workspace and restoring one are not yet specified.
+- A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
 - Waking a sleeping Computer is not yet specified and is low in priority.
 - Revoking a Computer's credential is not yet specified.
-- A Hosted Computer runs inside the Space's process; a provider-backed Hosted machine is not yet specified.
 - Adding a Computer on another machine is not yet specified.
 - Moving a Bot to or from a Hosted Computer is not yet specified, including how its Workspace is carried.

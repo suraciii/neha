@@ -11,10 +11,15 @@ specs/
     ├── VISION.md          # Feature vision (optional)
     ├── product.md         # Required — product behavior
     ├── design.md          # Optional — boundaries, invariants
+    ├── design-system.md   # Optional — UI/UX design
     └── {sub-topic}/       # Same shape, nested on demand
 ```
 
 A specification directory is created with the capability it describes. `VISION.md` is created when the product purpose is decided.
+
+`design-system.md` is optional. It owns UI/UX design: design language, visual rules, component patterns, and accessibility design.
+
+It MUST link to `product.md` for behavior and `design.md` for technical boundaries. It MUST NOT become a second product or technical specification.
 
 ## Vision template
 
@@ -29,7 +34,9 @@ Vision headings come from a fixed vocabulary, so every `VISION.md` reads alike:
 
 The product's `VISION.md` uses Why, What, and Principles. A topic's `VISION.md` uses every heading, because a capability earns its place by a problem, a shape, what the shape unlocks, and the moments it serves.
 
-State everything positively: what the product is not follows from what it is, and Why this way states reasons rather than the alternatives it beat. Architecture goes in `design.md`, behavior in `product.md`, and rejected alternatives in the owning Issue or pull request. User stories live in [USER-STORIES.md](USER-STORIES.md); a topic's User stories section links to the entries it serves.
+State everything positively: what the product is not follows from what it is, and Why this way states reasons rather than the alternatives it beat.
+
+Architecture goes in `design.md`, behavior in `product.md`, UI/UX design in `design-system.md`, and rejected alternatives in the owning Issue or pull request. User stories live in [USER-STORIES.md](USER-STORIES.md); a topic's User stories section links to the entries it serves.
 
 ## Rules
 
@@ -49,6 +56,7 @@ State everything positively: what the product is not follows from what it is, an
 ## Detail placement
 
 - `product.md` states durable product behavior and invariants. It MUST NOT contain test procedures, fixtures, exact tolerances, command transcripts, or evidence matrices.
+- `design-system.md` states durable UI/UX design rules: design language, visual constraints, component patterns, and accessibility design. Exact token values and component implementation stay in the client.
 - Tests own concrete cases, fixtures, tolerances, byte-identity checks, failure injection, and step sequences.
 - Help, schemas, and code own exhaustive field, option, and parameter inventories.
 - Issues and pull requests own migration steps, implementation gaps, counts, dates, and rejected alternatives.
@@ -77,11 +85,11 @@ Choose the smallest form that makes the target contract clear:
 
 ## Ownership
 
-A capability directory is owned by the capability it names. Its `product.md` owns observable product behavior; its optional `design.md` owns boundaries and invariants. Write each rule in its owning document and link from dependent capabilities.
+A capability directory is owned by the capability it names. Its `product.md` owns observable product behavior; its optional `design.md` owns boundaries and invariants; its optional `design-system.md` owns UI/UX design. Write each rule in its owning document and link from dependent capabilities.
 
 ## Context Layers
 
 - **Product Vision** (`VISION.md`, optional) → why the product exists.
 - **Domain Language** ([CONTEXT.md](../CONTEXT.md)) → what each term is.
-- **Spec Documents** (`product.md` / `design.md`) → what the product does.
+- **Spec Documents** (`product.md` / `design.md` / `design-system.md`) → what the product does and how it looks.
 - **Code** → the implementation.

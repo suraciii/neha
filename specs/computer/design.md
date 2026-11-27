@@ -27,7 +27,7 @@ A Local Computer runs Neha as a persistent process. The process holds one outgoi
 
 A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket and the token the machine keeps.
 
-The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange, and a Hosted Computer uses the same channel on the Space's own machine.
+The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange. A Hosted Computer runs its actions inside the Space; a provider-backed Hosted Computer would use the same channel.
 
 The Space sends each action with an id, and the Computer answers that id with the action's result. Each action has a time limit, including one that moves a File's bytes, and an action that runs past its limit ends as timed out.
 
@@ -35,15 +35,15 @@ A connection that ends makes every action in flight unknown. The process reconne
 
 ## The machine
 
-A Local Computer runs on the machine where Neha runs, which its owner paired. A Hosted Computer runs as a machine a provider starts.
+A Local Computer runs on the machine where Neha runs, which its owner paired. A Hosted Computer runs in a sandbox on the Space's machine.
 
-A provider implements four operations as one contract: start and stop a machine, show its screen, run a process on it, and read and write its files.
+A provider-backed Hosted Computer would run as a machine a provider starts, with four operations: start and stop a machine, show its screen, run a process on it, and read and write its files. That form is not specified yet.
 
-The record names a Computer's kind and a provider's machine. That machine reference only speeds up a reconnect; it never holds durable data.
+The record names a Computer's kind. A provider-backed Computer would also name its machine, and that reference would only speed up a reconnect; it would never hold durable data.
 
 ## The workspace
 
-A Hosted Computer keeps each Bot's Workspace in the Space. A Local Computer keeps each Bot's Workspace on the machine, under `~/.neha/workspaces/<bot-id>/` by default, and the Space keeps no copy.
+A Hosted Computer keeps each Bot's Workspace in the Space, and a restart of the Space keeps it. A Local Computer keeps each Bot's Workspace on the machine, under `~/.neha/workspaces/<bot-id>/` by default, and the Space keeps no copy.
 
 A Local Computer keeps its Bots' Workspaces under one root, and the machine's owner can choose another root for it. Each Bot has its own Workspace there, and the actions of a run start in it.
 
@@ -63,6 +63,12 @@ Bots assigned to one Computer share its files, processes, and logins. The Space 
 
 On a Local Computer with granted folders, a Bot's write range is its own Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path, and the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
 
+On a Hosted Computer, a Bot's shell runs in a sandbox that starts from an empty root. The sandbox mounts the Space machine's system directories read-only, and the Bot's Workspace at `/workspace` is the one place where files persist.
+
+The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`, and it ends with the Space process. The Space's record, Vault, File store, and another Computer's Workspace are not mounted in it.
+
+The sandbox shares the machine's network, so the Bot's shell reaches the Space's loopback for `neha file get` and `neha chat send --file`. The file tools stay in the Workspace, and the sandbox's other writable places are its own `/tmp` and `/dev/shm`.
+
 A machine that cannot start its sandbox does not serve as a Computer.
 
 A Local Computer's configuration directory is hidden from a Bot with granted folders. It holds the saved pairing and the token, at `~/.config/neha` by default, and the file tools and the shell cannot reach it.
@@ -81,27 +87,13 @@ A Local Computer's owner grants what a Bot on it can reach. [product.md](product
 
 ## Lifecycle
 
-A Computer is created, started, stopped, recovered, reset, and destroyed.
+A Hosted Computer is created with its Bot, and only its owner resets it. A Local Computer is paired; no command resets it.
 
-Stopping a Hosted Computer saves its Bots' Workspaces and takes the machine offline. Starting brings a Computer online again.
+Resetting clears every entry inside the Bot's Workspace and keeps the Workspace folder. It restores no file and writes no event. Repeating the same command returns its recorded result instead of clearing again.
 
-Recovery first saves what it can from the machine, then builds each Bot's Workspace from its last save. Reset builds each Bot's Workspace from its last save and saves nothing.
+A reset runs only when the Bot has no queued, running, or waiting run. No run starts while a reset is in progress.
 
-A run stops between two actions before saved Workspaces are replaced, and the Bot says when work was interrupted.
-
-Destroying a Computer deletes its saved Workspaces.
-
-## Saving a workspace
-
-The Space saves a Hosted Bot's Workspace when a run completes or fails, before a stop, and before a stop that follows inactivity.
-
-A save skips rebuildable paths: caches, package stores, dependency directories, build output, and logs.
-
-A Bot's Workspace over the Space's size limit is not saved. The User is told, and the work stays on the machine.
-
-A restore accepts only relative paths of directories and regular files, and writes nothing outside the workspace.
-
-Saves of one Computer happen one at a time. A run that starts during a save waits for it.
+Starting, stopping, recovering, and destroying a provider-backed Hosted Computer, and saving and restoring a Workspace, are not yet specified.
 
 ## Files
 

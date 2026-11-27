@@ -146,8 +146,7 @@ enum BotCommand {
         name: String,
         /// Where the Bot works: local, hosted, or a Computer id.
         ///
-        /// Defaults to the owner's Local Computer when one is paired, and a
-        /// fresh Hosted Computer otherwise.
+        /// A fresh Hosted Computer when omitted.
         #[arg(long, value_name = "LOCAL|HOSTED|ID")]
         computer: Option<String>,
     },
@@ -226,6 +225,11 @@ enum ComputerCommand {
     Add {
         /// The pairing code the machine printed.
         code: String,
+    },
+    /// Clear a Hosted Computer's Workspace.
+    Reset {
+        /// The Hosted Computer identifier.
+        computer: Id,
     },
     /// List the Computers you own.
     List,
@@ -954,6 +958,13 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
             println!("Added Computer {id} ({}).", text_of(&computer, "kind")?);
             println!("  Workspace: {}", text_of(&computer, "workspace")?);
             println!("Create a Bot on it with: neha bot create <name> --computer {id}");
+        }
+        ComputerCommand::Reset { computer } => {
+            let credential = Credential::load()?;
+            let result =
+                client::command(&credential, CommandCall::ComputerReset { computer }).await?;
+            let id = id_of(&result, "computer")?;
+            println!("Reset Computer {id} ({}).", text_of(&result, "kind")?);
         }
         ComputerCommand::List => {
             let credential = Credential::load()?;
@@ -2240,6 +2251,18 @@ mod tests {
                 assert!(yes);
             }
             _ => panic!("the pair command did not parse"),
+        }
+    }
+
+    #[test]
+    fn computer_reset_takes_one_computer() {
+        let id = neha::id::Id::new().to_string();
+        let cli = Cli::try_parse_from(["neha", "computer", "reset", &id]).unwrap();
+        match cli.command {
+            Top::Computer {
+                command: ComputerCommand::Reset { computer },
+            } => assert_eq!(computer.to_string(), id),
+            _ => panic!("the reset command did not parse"),
         }
     }
 
