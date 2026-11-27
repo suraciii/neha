@@ -163,13 +163,57 @@ describe("App run activity", () => {
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
 
-    record("neha.file.added", { chat: "h1", file: "f1", name: "report.pdf", media_type: "application/pdf", size: 2048, sha256: "ab".repeat(32) });
+    // The Bot's reply carries the File, and names the Run that made it.
+    record("neha.message.added", { chat: "h1", message: "m2", text: "here is the report", file: "f1", run: "r1" });
     // The File names itself once the Chat reads the record again.
     await waitFor(() => expect(view.container.querySelector(".activity__tools")).toBeTruthy());
     openCard(view);
     await waitFor(() => expect(view.container.querySelector(".activity .file-card")).toBeTruthy());
     expect(element(view, ".activity .file-card").textContent).toContain("report.pdf");
     expect(element(view, ".activity .file-card").getAttribute("href")).toBe("/api/files/f1");
+  });
+
+  it("takes a newer word about an action the record already reported", async () => {
+    workingChat();
+    // The Space compacted this Run: it knows the action, but not how it ended.
+    space.runs["r1"] = {
+      status: "running",
+      steps: [{ index: 1, tool_calls: 1 }],
+      actions: [{ id: "act1", step: 1, tool: "shell", status: "unknown" }],
+    };
+    space.statuses["h1"] = "working";
+    space.activeRuns["h1"] = "r1";
+    const view = await openChat();
+    await waitFor(() => expect(space.runShows).toContain("r1"));
+    openCard(view);
+    expect(stepRows(view)).toEqual(["Step 1shellUnknown"]);
+
+    // The record says the action ended, and the card takes that word.
+    space.runs["r1"] = {
+      status: "running",
+      steps: [{ index: 1, tool_calls: 1 }],
+      actions: [{ id: "act1", step: 1, tool: "shell", status: "succeeded" }],
+    };
+    space.resume([]);
+    await waitFor(() => expect(stepRows(view)).toEqual(["Step 1shellSucceeded"]));
+  });
+
+  it("shows the reason when a Run failed before its first step", async () => {
+    workingChat();
+    // The Provider could not be reached, so the Run failed with no step and no
+    // action behind it: its reason is all the record holds.
+    space.statuses["h1"] = "working";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = { status: "failed", steps: [], actions: [], error: "the Provider is not reachable" };
+    const view = await openChat();
+    await waitFor(() => expect(space.runShows).toContain("r1"));
+
+    // The card is there, opened, with the reason the Run gave.
+    await waitFor(() => expect(element(view, ".activity__reason").textContent).toContain("the Provider is not reachable"));
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("true");
+    expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
+    // The Run is over, so the composer opens again.
+    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
   });
 
   it("opens itself with the reason when the Run fails", async () => {

@@ -35,6 +35,8 @@ let sendGate: Promise<void> | null = null;
 let openSend: (() => void) | null = null;
 let decideGate: Promise<void> | null = null;
 let openDecide: (() => void) | null = null;
+let approvalGate: Promise<void> | null = null;
+let openApproval: (() => void) | null = null;
 
 export const space = {
   account,
@@ -69,6 +71,8 @@ export const space = {
       approval?: string;
       steps?: { index: number; tool_calls: number }[];
       actions?: { id: string; step: number; tool: string; status: string; error?: string | null }[];
+      // Why the Run failed, when it did before any step or action.
+      error?: string | null;
     }
   >,
   runShows: [] as string[],
@@ -90,6 +94,7 @@ export const space = {
   reset() {
     space.releaseSends();
     space.releaseDecide();
+    space.releaseApprovals();
     space.computer.kind = "local";
     space.asked = [];
     space.sent = [];
@@ -121,6 +126,18 @@ export const space = {
     openSend = null;
     sendGate = null;
   },
+  // An approval read can be held open, so a test can answer while the Space's
+  // word about the record is still in flight.
+  holdApprovals() {
+    approvalGate = new Promise<void>((resolve) => {
+      openApproval = resolve;
+    });
+  },
+  releaseApprovals() {
+    openApproval?.();
+    openApproval = null;
+    approvalGate = null;
+  },
   holdDecide() {
     decideGate = new Promise<void>((resolve) => {
       openDecide = resolve;
@@ -147,6 +164,22 @@ export const space = {
     space.handlers?.onSnapshot?.(events, `s${space.seq}`, true);
   },
 };
+
+// One event the Space writes to the record, delivered live to the page that
+// follows it. The commands that change the record write their event, so a page
+// hears about its own answer the same way it hears about everyone else's.
+function emit(kind: string, data: Record<string, unknown>) {
+  space.seq += 1;
+  space.handlers?.onEvent?.({
+    seq: String(space.seq),
+    kind,
+    version: 1,
+    at: "2026-01-01T00:00:00.000Z",
+    author: { kind: "user", id: "u1" },
+    acting: "u1",
+    data,
+  });
+}
 
 export class FakeCommands {
   async subscribe(handlers: SubscriptionHandlers): Promise<void> {
@@ -184,10 +217,12 @@ export class FakeCommands {
         return [...space.files] as T;
       case "approval_list": {
         // Like the Space's JSON, each answer carries its own copies, and names
-        // only the approvals the asked Chat waits for.
-        const asked = args as { chat: string };
+        // only the approvals the User may still answer: the asked Chat's, or
+        // every Chat's when the call names none.
+        const asked = args as { chat?: string };
+        if (approvalGate) await approvalGate;
         return space.approvals
-          .filter((approval) => approval.chat === asked.chat)
+          .filter((approval) => asked.chat === undefined || approval.chat === asked.chat)
           .map((approval) => ({ ...approval })) as T;
       }
       case "bot_show": {
@@ -232,6 +267,16 @@ export class FakeCommands {
           if (decideGate) await decideGate;
           const waiting = space.approvals.find((known) => known.approval === decided.approval);
           if (waiting) space.approvals = space.approvals.filter((known) => known !== waiting);
+          // The Space writes the decision to the record, so the page hears
+          // about its own answer the same way it hears about any other.
+          emit("neha.approval.decided", {
+            approval: decided.approval,
+            run: waiting?.run ?? "r0",
+            allow: decided.allow,
+            lasting: decided.lasting,
+            user: "u1",
+            rule: null,
+          });
           return {
             approval: decided.approval,
             run: waiting?.run ?? "r0",
@@ -259,7 +304,7 @@ export class FakeCommands {
           position: known.position,
           approval: known.status === "waiting" ? (known.approval ?? null) : null,
           reply: null,
-          error: null,
+          error: known.error ?? null,
           usage: null,
           steps: known.steps ?? [],
           actions: known.actions ?? [],

@@ -69,7 +69,9 @@ The Space projects one state for each Chat: working, waiting, failed, or idle. T
 
 A queued, running, or resumed run projects working, and a run that waits for an Approval or an answer projects waiting. A run that ended in failure projects failed, and that state stays until the next run for the Chat starts. A Chat whose record holds no such run projects idle, including a record written before the projection existed.
 
-The projection names one `active_run`: the waiting run when one waits, otherwise the working run with the earliest sequence, and none when the state is idle or failed. A record that holds no `active_run` reads as idle, and a `RunStarted` with no end in the record reads as working.
+The projection names one `active_run`: the waiting run when one waits, otherwise the working run with the earliest sequence, and none when the state is failed or idle. None does not mean idle, because a failed state also names no active run.
+
+An old `ChatView` with no `status` reads as idle, and with no `active_run` reads as null. Replaying the record builds the same projection from the run and approval events: a `RunStarted` with no end in the record reads as working, and several waiting runs name the one with the earliest sequence.
 
 A client reads the state from a snapshot and follows the live events from the snapshot's cursor. When the client's cursor reaches the snapshot's, the state it holds equals the state the projection gives.
 

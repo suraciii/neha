@@ -181,6 +181,109 @@ describe("App with a Chat the Space already knows", () => {
     expect(badges(view)).toEqual(["Waiting"]);
   });
 
+  it("keeps the waiting Run's wait when a later Run of the same Chat ends", async () => {
+    // Two requests in the Chat: r1 waits for an approval, and r2 queues behind
+    // it. The Space names r1 as the Run the Chat follows.
+    space.messages.push(request("m1", "r1", "first request"));
+    space.messages.push(request("m2", "r2", "second request"));
+    space.statuses["h1"] = "waiting";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = { status: "waiting", approval: "a1" };
+    space.runs["r2"] = { status: "queued", position: 2 };
+    space.approvals.push({
+      approval: "a1",
+      run: "r1",
+      bot: "b1",
+      chat: "h1",
+      action: "act1",
+      step: 1,
+      tool: "shell",
+      summary: "printf hi > a.txt",
+      reason: "first_use_local",
+    });
+    const view = await openChat();
+
+    // The page starts from what the Space said, without any event landing.
+    expect(element(view, ".chat__attention").textContent).toContain("Waiting");
+    expect(badges(view)).toEqual(["Waiting"]);
+    expect(element(view, ".attention__count").textContent).toBe("1");
+    expect(view.container.querySelector('[data-approval="a1"]')).toBeTruthy();
+
+    // The later Run leaves the queue, and then finishes, while r1 still waits.
+    record("neha.run.started", { chat: "h1", run: "r2", bot: "b1", command: "c2", message: "m2" });
+    await waitFor(() => expect(element(view, ".chat__attention").textContent).toContain("Waiting"));
+    record("neha.run.finished", { run: "r2", status: "succeeded", reply: null, usage: null, error: null });
+    await drain();
+
+    // r1 is still the Run the Chat waits on, and its approval still waits.
+    expect(element(view, ".chat__attention").textContent).toContain("Waiting");
+    expect(view.container.querySelector(".chat__state--working")).toBeNull();
+    expect(view.container.querySelector('[data-approval="a1"]')).toBeTruthy();
+    expect(element(view, ".attention__count").textContent).toBe("1");
+  });
+
+  it("follows the Run the Bot names, not the one the list named", async () => {
+    // Two requests in the Chat, each waiting for its own approval. The Space
+    // names r1 as the Run the Chat follows.
+    space.messages.push(request("m1", "r1", "first request"));
+    space.messages.push(request("m2", "r2", "second request"));
+    space.statuses["h1"] = "waiting";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = { status: "waiting", approval: "a1" };
+    space.runs["r2"] = { status: "waiting", approval: "a2" };
+    space.approvals.push({
+      approval: "a1",
+      run: "r1",
+      bot: "b1",
+      chat: "h1",
+      action: "act1",
+      step: 1,
+      tool: "shell",
+      summary: "printf hi > a.txt",
+      reason: "first_use_local",
+    });
+    const view = await openChat();
+    // The page read the list twice by now: at the start, and after the
+    // snapshot. Both times it named r1.
+    await waitFor(() =>
+      expect(space.asked.filter((name) => name === "chat_list").length).toBeGreaterThanOrEqual(2),
+    );
+
+    // r1 was answered while the page sat, and the Chat now waits on r2.
+    space.activeRuns["h1"] = "r2";
+    const read = space.runShows.length;
+    fireEvent.click(element(view, ".conv:nth-of-type(1)"));
+    await waitFor(() => expect(space.runShows.length).toBeGreaterThan(read));
+
+    // The page reads the record about the Run the Bot names, not the older one
+    // the list still carried, and the Chat still waits.
+    expect(space.runShows[read]).toBe("r2");
+    expect(element(view, ".chat__attention").textContent).toContain("Waiting");
+    expect(badges(view)).toEqual(["Waiting"]);
+  });
+
+  it("opens the composer when the Bot says the Chat is idle, though the list said Working", async () => {
+    // The list read while the Run worked, and it named no Run for the Chat.
+    space.statuses["h1"] = "working";
+    const view = await openChat();
+    // The page read the list twice by now: at the start, and after the
+    // snapshot. Both said Working.
+    await waitFor(() =>
+      expect(space.asked.filter((name) => name === "chat_list").length).toBeGreaterThanOrEqual(2),
+    );
+
+    // The Run ended while the page sat, and the Bot's own answer knows it.
+    space.statuses["h1"] = "idle";
+    fireEvent.click(element(view, ".conv:nth-of-type(1)"));
+    await drain();
+
+    // The Bot's word is the newest one the page has, so the Chat is idle.
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    expect(view.container.querySelector(".activity")).toBeNull();
+    expect(view.container.querySelector(".chat__attention")).toBeNull();
+    expect(badges(view)).toEqual([]);
+  });
+
   it("keeps the composer closed while the Chat's Run works", async () => {
     space.statuses["h1"] = "working";
     space.activeRuns["h1"] = "r1";

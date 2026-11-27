@@ -49,6 +49,11 @@ function submit(view: ReturnType<typeof render>) {
   fireEvent.submit(element(view, "form.composer"));
 }
 
+// The card starts folded, so a test that reads inside it opens it first.
+function openCard(view: ReturnType<typeof render>) {
+  fireEvent.click(element<HTMLButtonElement>(view, ".activity__head"));
+}
+
 // The record starts a queued Run.
 function startRun(run: string) {
   space.runs[run] = { status: "running" };
@@ -477,6 +482,64 @@ describe("App with Files", () => {
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
     expect(queueText(view)).toBeUndefined();
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+  });
+
+  it("leaves a File another Run produced out of the Run it follows", async () => {
+    // Two Files sit in the Chat's records: one our Run made, one another Run of
+    // the same Bot made.
+    const theirs: FileSummary = {
+      id: "f9",
+      chat: "h1",
+      name: "theirs.txt",
+      media_type: "text/plain",
+      size: 12,
+      sha256: "cd".repeat(32),
+      author: { kind: "bot", id: "b1" },
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "20",
+    };
+    const mine: FileSummary = {
+      id: "f1",
+      chat: "h1",
+      name: "mine.txt",
+      media_type: "text/plain",
+      size: 12,
+      sha256: "ef".repeat(32),
+      author: { kind: "bot", id: "b1" },
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "21",
+    };
+    space.files.push(theirs, mine);
+
+    const view = await openChat();
+    type(view, "first");
+    submit(view);
+    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    startRun("r1");
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
+
+    // Another client queued a second Run behind ours in this Chat. The page
+    // keeps following its own.
+    space.runs["r9"] = { status: "queued", position: 1 };
+    record("neha.run.queued", { chat: "h1", run: "r9", bot: "b1", command: "c9", message: "m9" });
+    await drain();
+    expect(element(view, ".activity")).toBeTruthy();
+
+    // The other Run's reply carries its File and names that Run, so the page
+    // keeps the File out of the work of the Run it follows.
+    record("neha.message.added", { chat: "h1", message: "m9", text: "here is theirs", file: "f9", run: "r9" });
+    await drain();
+    openCard(view);
+    expect(view.container.querySelector(".activity .file-card")).toBeNull();
+    expect(view.container.querySelector(".activity")?.textContent ?? "").not.toContain("theirs.txt");
+
+    // Our own Run's reply carries its File and names our Run, and the card
+    // names that one.
+    record("neha.message.added", { chat: "h1", message: "m3", text: "here is mine", file: "f1", run: "r1" });
+    await waitFor(() => expect(view.container.querySelector(".activity .file-card")).toBeTruthy());
+    const card = view.container.querySelector(".activity")?.textContent ?? "";
+    expect(card).toContain("mine.txt");
+    expect(card).not.toContain("theirs.txt");
   });
 
   it("takes no second Message while a Run is unfinished", async () => {

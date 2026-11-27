@@ -7,6 +7,7 @@ import type {
   Account,
   Approval,
   Bot,
+  ChatStatus,
   Computer,
   FileSummary,
   Message,
@@ -29,17 +30,15 @@ interface ChatViewProps {
   approvals: Approval[];
   // A command is in flight; the composer waits for its answer.
   submitting: boolean;
-  // The followed Run is running; the Bot is working.
-  working: boolean;
-  // The followed Run waits for an approval.
-  waiting: boolean;
+  // What the Chat is doing, from the merged projection of its Runs. The
+  // header, its marks, and the composer all read this one word, so a Run the
+  // page does not follow still shows in the Chat.
+  status: ChatStatus;
   // The followed Run waits; the Chat shows the place it holds.
   queue: RunProgress | null;
   // A Run of this Chat is active, whether or not this page follows it, so the
   // composer takes no second Message while the Bot works.
   busy: boolean;
-  // The followed Run failed; the header marks it and its reason stays reachable.
-  failed: boolean;
   // The followed Run's tool activity, while it has any.
   activity: RunActivity | null;
   // The approval the User asked to see, so the Chat scrolls to its card.
@@ -64,7 +63,7 @@ export default function ChatView(props: ChatViewProps) {
   let picker: HTMLInputElement | undefined;
 
   createEffect(
-    () => ({ count: props.messages.length, working: props.working }),
+    () => ({ count: props.messages.length, status: props.status }),
     () => {
       queueMicrotask(() => {
         if (stream) stream.scrollTop = stream.scrollHeight;
@@ -133,11 +132,14 @@ export default function ChatView(props: ChatViewProps) {
   }
 
   const title = () => props.bot?.name ?? t("chat.title");
+  // What the Chat waits for: an approval, or the Bot's work.
+  const waiting = () => props.status === "waiting";
+  const failed = () => props.status === "failed";
 
   // Why the composer takes no Message: the Run waits in the queue, waits for an
   // approval, or works.
   const closedReason = () =>
-    props.waiting
+    waiting()
       ? t("chat.composer.waiting", { name: title() })
       : t("chat.composer.busy", { name: title() });
 
@@ -168,7 +170,7 @@ export default function ChatView(props: ChatViewProps) {
             </Show>
           </p>
         </div>
-        <Show when={props.waiting}>
+        <Show when={waiting()}>
           <span
             class="chat__attention"
             role="status"
@@ -180,13 +182,13 @@ export default function ChatView(props: ChatViewProps) {
             <span class="chat__attention-short">{t("chat.waiting.short")}</span>
           </span>
         </Show>
-        <Show when={props.busy && !props.waiting && !props.failed}>
+        <Show when={props.busy && !waiting() && !failed()}>
           <span class="chat__state" role="status" aria-label={t("chat.working")} title={t("chat.working")}>
             <Icon name="clock" size="sm" />
             <span class="chat__state-long">{t("chat.working")}</span>
           </span>
         </Show>
-        <Show when={props.failed}>
+        <Show when={failed()}>
           <span
             class="chat__state chat__state--failed"
             role="status"
@@ -292,7 +294,7 @@ export default function ChatView(props: ChatViewProps) {
                 activity={activity()}
                 botName={props.bot?.name ?? "Bot"}
                 files={props.files}
-                failed={props.failed}
+                failed={failed()}
               />
             )}
           </Show>
