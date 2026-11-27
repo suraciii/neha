@@ -41,6 +41,20 @@ pub struct AppendRequest {
     pub result: Option<serde_json::Value>,
     /// Another command whose result this append confirms in the same transaction.
     pub confirmation: Option<Confirmation>,
+    /// Provider-native state to write in the same transaction, when this
+    /// append records a Model reply.
+    pub continuation: Option<ContinuationWrite>,
+}
+
+/// Provider-native state recorded beside the Model reply that produced it.
+#[derive(Clone, Debug)]
+pub struct ContinuationWrite {
+    /// The run.
+    pub run: Id,
+    /// The step.
+    pub step: u32,
+    /// The state; `None` removes a failed step's stale state.
+    pub continuation: Option<neha_loop::Continuation>,
 }
 
 /// A result written for another command in the same transaction.
@@ -62,6 +76,7 @@ impl AppendRequest {
             events,
             result: None,
             confirmation: None,
+            continuation: None,
         }
     }
 
@@ -76,6 +91,13 @@ impl AppendRequest {
     #[must_use]
     pub fn with_confirmation(mut self, command: Id, result: serde_json::Value) -> Self {
         self.confirmation = Some(Confirmation { command, result });
+        self
+    }
+
+    /// Records provider-native state with the reply.
+    #[must_use]
+    pub fn with_continuation(mut self, continuation: ContinuationWrite) -> Self {
+        self.continuation = Some(continuation);
         self
     }
 }
@@ -278,6 +300,38 @@ impl Store {
             .await
             .map_err(|_| StoreError::WriterGone)?;
         answer.await.map_err(|_| StoreError::WriterGone)?
+    }
+
+    /// Returns the provider-native state recorded for one run step.
+    pub async fn continuation(
+        &self,
+        run: Id,
+        step: u32,
+    ) -> Result<Option<neha_loop::Continuation>, StoreError> {
+        let row = sqlx::query(
+            "SELECT protocol, provider, model, state FROM run_continuations \
+             WHERE run = ? AND step = ?",
+        )
+        .bind(run.to_string())
+        .bind(i64::from(step))
+        .fetch_optional(&self.reader)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let protocol: String = row.try_get("protocol")?;
+        let provider: String = row.try_get("provider")?;
+        let model: String = row.try_get("model")?;
+        let stored: String = row.try_get("state")?;
+        let state =
+            serde_json::from_str(&stored).map_err(|_| corrupt("continuation state is not JSON"))?;
+
+        Ok(Some(neha_loop::Continuation {
+            protocol,
+            provider,
+            model,
+            state,
+        }))
     }
 
     /// Claims a command identifier before an idempotent effect runs.
@@ -546,6 +600,18 @@ async fn append(
         .parse()
         .map_err(|_| corrupt("last_seq is not a number"))?;
     let mut events = Vec::with_capacity(request.events.len());
+    let finished_runs: Vec<String> = request
+        .events
+        .iter()
+        .filter(|draft| draft.kind == EventKind::RunFinished)
+        .filter_map(|draft| {
+            draft
+                .data
+                .get("run")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
 
     for draft in request.events {
         last += 1;
@@ -594,6 +660,43 @@ async fn append(
             .await?;
         if updated.rows_affected() != 1 {
             return Err(corrupt("the command to confirm is not recorded"));
+        }
+    }
+    for run in finished_runs {
+        sqlx::query("DELETE FROM run_continuations WHERE run = ?")
+            .bind(run)
+            .execute(&mut *transaction)
+            .await?;
+    }
+    if let Some(continuation) = request.continuation {
+        let run = continuation.run.to_string();
+        let step = i64::from(continuation.step);
+        match continuation.continuation {
+            Some(state) => {
+                let stored =
+                    serde_json::to_string(&state.state).map_err(|_| corrupt("continuation"))?;
+                sqlx::query(
+                    "INSERT INTO run_continuations (run, step, protocol, provider, model, state) \
+                     VALUES (?, ?, ?, ?, ?, ?) \
+                     ON CONFLICT(run, step) DO UPDATE SET protocol = excluded.protocol, \
+                     provider = excluded.provider, model = excluded.model, state = excluded.state",
+                )
+                .bind(run)
+                .bind(step)
+                .bind(state.protocol)
+                .bind(state.provider)
+                .bind(state.model)
+                .bind(stored)
+                .execute(&mut *transaction)
+                .await?;
+            }
+            None => {
+                sqlx::query("DELETE FROM run_continuations WHERE run = ? AND step = ?")
+                    .bind(run)
+                    .bind(step)
+                    .execute(&mut *transaction)
+                    .await?;
+            }
         }
     }
     transaction.commit().await?;
@@ -789,7 +892,7 @@ mod tests {
     use sqlx::Connection as _;
     use sqlx::sqlite::SqliteConnectOptions;
 
-    use super::{AppendRequest, Projection, Store, StoreError};
+    use super::{AppendRequest, ContinuationWrite, Projection, Store, StoreError};
     use crate::home::Home;
 
     async fn open() -> (tempfile::TempDir, Home, Store) {
@@ -1331,6 +1434,117 @@ mod tests {
         assert_eq!(collector.0[0].seq.as_i64(), 1);
         assert_eq!(collector.0[1].seq.as_i64(), 2);
         assert_eq!(cursor.as_i64(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reply_continuation_is_written_with_its_reply() {
+        let (_dir, _home, store) = open().await;
+        let run = Id::new();
+        let user = Id::new();
+        let bot = Id::new();
+        let continuation = neha_loop::Continuation {
+            protocol: "anthropic_messages".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: serde_json::json!({"blocks": [{"type": "thinking", "signature": "sig"}]}),
+        };
+        let reply = EventDraft::new(
+            EventKind::RunReply,
+            Author::Bot(bot),
+            serde_json::json!({
+                "run": run,
+                "step": 1,
+                "content": null,
+                "calls": [{"call": "call-1", "tool": "shell", "arguments": {"command": "true"}}],
+                "usage": null,
+            }),
+        )
+        .acting(user);
+        store
+            .append(
+                AppendRequest::new(Id::new(), "run.reply", vec![reply]).with_continuation(
+                    ContinuationWrite {
+                        run,
+                        step: 1,
+                        continuation: Some(continuation.clone()),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.continuation(run, 1).await.unwrap(),
+            Some(continuation.clone())
+        );
+
+        // A later failed retry of the same step clears the stale state.
+        let reply = EventDraft::new(
+            EventKind::RunReply,
+            Author::Bot(bot),
+            serde_json::json!({
+                "run": run,
+                "step": 2,
+                "content": null,
+                "calls": [{"call": "call-2", "tool": "shell", "arguments": {"command": "true"}}],
+                "usage": null,
+            }),
+        )
+        .acting(user);
+        store
+            .append(
+                AppendRequest::new(Id::new(), "run.reply.2", vec![reply]).with_continuation(
+                    ContinuationWrite {
+                        run,
+                        step: 2,
+                        continuation: Some(continuation),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .append(
+                AppendRequest::new(
+                    Id::new(),
+                    "run.reply.2.clear",
+                    vec![EventDraft::new(
+                    EventKind::RunStep,
+                    Author::Bot(bot),
+                    serde_json::json!({"run": run, "step": 2, "usage": null, "tool_calls": 1}),
+                )
+                .acting(user)],
+                )
+                .with_continuation(ContinuationWrite {
+                    run,
+                    step: 2,
+                    continuation: None,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.continuation(run, 2).await.unwrap(), None);
+
+        let finished = EventDraft::new(
+            EventKind::RunFinished,
+            Author::Bot(bot),
+            serde_json::json!({
+                "run": run,
+                "status": "succeeded",
+                "reply": Id::new(),
+                "usage": null,
+            }),
+        )
+        .acting(user);
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "run.finished",
+                vec![finished],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(store.continuation(run, 1).await.unwrap(), None);
     }
 
     #[tokio::test]

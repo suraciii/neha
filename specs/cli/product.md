@@ -26,6 +26,21 @@ A Bot's shell runs the same CLI with a short-lived run token instead of a sign-i
 
 `neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
 
+## Providers
+
+`neha provider add` connects a Provider and its Models. The key comes from `NEHA_PROVIDER_KEY` or the terminal prompt, never from the command line.
+
+```bash
+NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
+  --protocol chat-completions --model example-chat
+```
+
+`--protocol` is `chat-completions` (the default), `openai-responses`, or `anthropic-messages`. `--thinks` marks the Models as able to think.
+
+`--thinking minimal|low|medium|high|max` sets the Space's default thinking level; without it the default is `medium`. A Model that is not marked `--thinks` ignores the level.
+
+`neha provider list` prints each Provider's protocol and address. `neha model list` prints each Model's context, output, image, thinking, and default state.
+
 ## Computers
 
 A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on the machine where Neha runs.
@@ -46,7 +61,13 @@ Only the Computer's owner resets it, and only a Hosted Computer is reset. A Comp
 
 Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines. A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines and the Bot's own thinking level when set.
+
+A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
+
+`neha bot create --thinking minimal|low|medium|high|max` chooses the Bot's level; without it the Bot uses the Space's default. `neha model list` shows which Models can think.
+
+`neha bot update <bot>` changes a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses the change because its Workspace is its only write range.
 
 `neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 

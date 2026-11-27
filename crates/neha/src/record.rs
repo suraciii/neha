@@ -1018,6 +1018,9 @@ pub struct ProviderAdded {
     /// The default Model.
     #[serde(default)]
     pub default_model: Option<Id>,
+    /// The Space's default thinking level.
+    #[serde(default)]
+    pub thinking: Option<crate::surface::ThinkingLevel>,
 }
 
 /// One Model a Provider offers.
@@ -1034,6 +1037,9 @@ pub struct ModelData {
     pub max_output: u32,
     /// Whether it reads images.
     pub reads_images: bool,
+    /// Whether it can think before it answers.
+    #[serde(default)]
+    pub thinks: bool,
 }
 
 /// The data of `neha.bot.created`.
@@ -1050,6 +1056,9 @@ pub struct BotCreated {
     pub computer: Id,
     /// Its Chat with the owner.
     pub chat: Id,
+    /// Its thinking level; absent uses the Space's default.
+    #[serde(default)]
+    pub thinking: Option<crate::surface::ThinkingLevel>,
 }
 
 /// The data of `neha.bot.moved`.

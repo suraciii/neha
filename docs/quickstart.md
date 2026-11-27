@@ -79,6 +79,14 @@ NEHA_PROVIDER_KEY=sk-... target/debug/neha provider add \
   --model example-chat
 ```
 
+`--protocol` selects `chat-completions` (the default), `openai-responses`, or `anthropic-messages`. Add `--thinks` when the Model can think, and `--thinking minimal|low|medium|high|max` to set the Space's default level (default `medium`):
+
+```bash
+NEHA_PROVIDER_KEY=... target/debug/neha provider add \
+  --base-url https://api.example.com/v1 \
+  --protocol openai-responses --model example-chat --thinks --thinking high
+```
+
 The API key is sealed with AES-256-GCM under a master key. The master key comes from `NEHA_MASTER_KEY`, or from `$NEHA_HOME/secrets/master.key`, which the Space creates with mode 0600.
 
 List what the Space offers:
@@ -95,6 +103,8 @@ A new Bot gets its own Chat and its own Computer: a Hosted Computer unless you n
 ```bash
 target/debug/neha bot create Scout
 ```
+
+A Bot uses the Space's default thinking level. Choose its own with `--thinking minimal|low|medium|high|max`; `neha bot show` prints its own level when set.
 
 The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's workspace:
 

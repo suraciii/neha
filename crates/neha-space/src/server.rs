@@ -2605,7 +2605,8 @@ mod tests {
     use crate::blobs::test_s3;
     use crate::config::S3Storage;
     use crate::home::Home;
-    use crate::store::{AppendRequest, Store};
+    use crate::secrets::Secrets;
+    use crate::store::{AppendRequest, ContinuationWrite, Store};
 
     async fn running() -> (tempfile::TempDir, Running, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -2779,6 +2780,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::surface::{
         BotComputer, BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
+        ThinkingLevel,
     };
     use serde_json::Value;
     use tokio::net::TcpStream;
@@ -2818,7 +2820,7 @@ mod tests {
     }
 
     /// Holds a scripted reply until the test opens its gate.
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct Gate(std::sync::Arc<tokio::sync::watch::Sender<bool>>);
 
     impl Gate {
@@ -3072,6 +3074,140 @@ mod tests {
         }
     }
 
+    /// Renders one SSE event carrying JSON data.
+    fn sse(event: &str, data: Value) -> String {
+        format!("event: {event}\ndata: {data}\n\n")
+    }
+
+    /// The script and the requests one [`protocol_provider`] serves.
+    #[derive(Clone, Default)]
+    struct ProtocolProvider {
+        /// The raw SSE replies, in order.
+        replies: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        /// Every JSON request body, in order.
+        recorded: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    impl ProtocolProvider {
+        /// Returns the next scripted SSE reply.
+        fn next_reply(&self) -> String {
+            self.replies.lock().unwrap().pop_front().unwrap_or_default()
+        }
+    }
+
+    async fn protocol_reply(
+        axum::extract::State(provider): axum::extract::State<ProtocolProvider>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::response::Response {
+        provider.recorded.lock().unwrap().push(body);
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(provider.next_reply()))
+            .unwrap()
+    }
+
+    /// A scripted Provider speaking one wire protocol, and the requests it saw.
+    ///
+    /// Every call pops the next raw SSE reply, so a test drives one run step
+    /// per reply without sleeping or reaching the network.
+    async fn protocol_provider(
+        protocol: ProviderProtocol,
+        replies: Vec<String>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use axum::Router;
+        use axum::routing::post;
+
+        let route = match protocol {
+            ProviderProtocol::ChatCompletions => "/v1/chat/completions",
+            ProviderProtocol::OpenAiResponses => "/v1/responses",
+            ProviderProtocol::AnthropicMessages => "/v1/messages",
+        };
+        let provider = ProtocolProvider {
+            replies: std::sync::Arc::new(std::sync::Mutex::new(replies.into())),
+            recorded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let recorded = std::sync::Arc::clone(&provider.recorded);
+        let app = Router::new()
+            .route(route, post(protocol_reply))
+            .with_state(provider);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task, recorded)
+    }
+
+    type GatedReply = (String, Option<Gate>);
+    type GatedReplies = std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<GatedReply>>>;
+
+    /// A scripted protocol Provider where each reply may wait on its gate.
+    #[derive(Clone, Default)]
+    struct GatedProtocolProvider {
+        replies: GatedReplies,
+        recorded: std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    }
+
+    async fn gated_protocol_reply(
+        axum::extract::State(provider): axum::extract::State<GatedProtocolProvider>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> axum::response::Response {
+        provider.recorded.lock().unwrap().push(body);
+        let (body, gate) = provider
+            .replies
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_default();
+        if let Some(gate) = gate {
+            let mut receiver = gate.0.subscribe();
+            wait_for_gate(receiver.clone()).await;
+            let _ = receiver.borrow_and_update();
+        }
+        axum::response::Response::builder()
+            .header(axum::http::header::CONTENT_TYPE, "text/event-stream")
+            .body(axum::body::Body::from(body))
+            .unwrap()
+    }
+
+    async fn gated_protocol_provider(
+        protocol: ProviderProtocol,
+        replies: Vec<(String, Option<Gate>)>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        use axum::Router;
+        use axum::routing::post;
+
+        let route = match protocol {
+            ProviderProtocol::ChatCompletions => "/v1/chat/completions",
+            ProviderProtocol::OpenAiResponses => "/v1/responses",
+            ProviderProtocol::AnthropicMessages => "/v1/messages",
+        };
+        let provider = GatedProtocolProvider {
+            replies: std::sync::Arc::new(std::sync::Mutex::new(replies.into())),
+            recorded: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let recorded = std::sync::Arc::clone(&provider.recorded);
+        let app = Router::new()
+            .route(route, post(gated_protocol_reply))
+            .with_state(provider);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/v1"), task, recorded)
+    }
+
     async fn open_socket(running: &Running, token: &str) -> Socket {
         let mut request = format!("ws://{}/api/socket", running.addr)
             .into_client_request()
@@ -3147,8 +3283,33 @@ mod tests {
                 context_limit: 128_000,
                 max_output: 8_192,
                 reads_images: false,
+                thinks: false,
             }],
             default_model: Some("test-model".to_owned()),
+            thinking: None,
+        })
+    }
+
+    /// The `ProviderAdd` that connects one Model over the given protocol.
+    fn provider_add_on(
+        base_url: String,
+        protocol: ProviderProtocol,
+        thinks: bool,
+        thinking: Option<ThinkingLevel>,
+    ) -> CommandCall {
+        CommandCall::ProviderAdd(ProviderAdd {
+            protocol,
+            base_url,
+            api_key: "sk-test".to_owned(),
+            models: vec![ModelSpec {
+                name: "test-model".to_owned(),
+                context_limit: 128_000,
+                max_output: 8_192,
+                reads_images: false,
+                thinks,
+            }],
+            default_model: Some("test-model".to_owned()),
+            thinking,
         })
     }
 
@@ -3189,6 +3350,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3229,6 +3391,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3261,6 +3424,7 @@ mod tests {
         let create = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
             computer: None,
+            thinking: None,
         });
 
         let (first_seq, first) = try_command(&mut socket, command_id, create.clone())
@@ -3289,6 +3453,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3447,6 +3612,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3652,6 +3818,7 @@ mod tests {
                     command: CommandCall::BotCreate(BotCreate {
                         name: "Scout".to_owned(),
                         computer: None,
+                        thinking: None,
                     }),
                 })
                 .unwrap()
@@ -3693,6 +3860,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3702,6 +3870,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Other".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3767,6 +3936,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3815,6 +3985,7 @@ mod tests {
         let bot_command = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
             computer: None,
+            thinking: None,
         });
         let first = command(&mut socket, create, bot_command.clone()).await;
         let second = command(&mut socket, create, bot_command).await;
@@ -3848,6 +4019,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3900,6 +4072,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -3995,6 +4168,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -4036,6 +4210,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -4142,6 +4317,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -4293,6 +4469,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -4317,6 +4494,7 @@ mod tests {
                     command: CommandCall::BotCreate(BotCreate {
                         name: "Live".to_owned(),
                         computer: None,
+                        thinking: None,
                     }),
                 })
                 .unwrap()
@@ -4478,6 +4656,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -4539,13 +4718,31 @@ mod tests {
     }
 
     async fn tool_bot(socket: &mut Socket, base: String) -> (Id, Id, Id) {
-        command(socket, Id::new(), provider_add(base)).await;
+        tool_bot_on(socket, base, ProviderProtocol::ChatCompletions, false, None).await
+    }
+
+    /// Connects a Provider speaking `protocol` and creates the Hosted Bot the
+    /// tool tests run.
+    async fn tool_bot_on(
+        socket: &mut Socket,
+        base: String,
+        protocol: ProviderProtocol,
+        thinks: bool,
+        thinking: Option<ThinkingLevel>,
+    ) -> (Id, Id, Id) {
+        command(
+            socket,
+            Id::new(),
+            provider_add_on(base, protocol, thinks, thinking),
+        )
+        .await;
         let bot = command(
             socket,
             Id::new(),
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -4791,6 +4988,838 @@ mod tests {
         restarted.shutdown().await;
     }
 
+    /// The first OpenAI Responses reply: a reasoning item and a `write_file` call.
+    fn responses_write_file_reply() -> String {
+        let arguments = r#"{"path":"note.txt","content":"hello"}"#;
+        [
+            sse(
+                "response.output_item.added",
+                json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "write_file",
+                        "arguments": "",
+                    },
+                }),
+            ),
+            sse(
+                "response.function_call_arguments.delta",
+                json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "output_index": 0,
+                    "delta": arguments,
+                }),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "function_call",
+                        "id": "fc_1",
+                        "call_id": "call_1",
+                        "name": "write_file",
+                        "arguments": arguments,
+                    },
+                }),
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_1",
+                        "status": "completed",
+                        "output": [
+                            {"type": "reasoning", "id": "rs_1", "summary": []},
+                            {
+                                "type": "function_call",
+                                "id": "fc_1",
+                                "call_id": "call_1",
+                                "name": "write_file",
+                                "arguments": arguments,
+                            },
+                        ],
+                        "usage": {
+                            "input_tokens": 120,
+                            "output_tokens": 30,
+                            "input_tokens_details": {
+                                "cached_tokens": 20,
+                                "cache_write_tokens": 5,
+                            },
+                            "output_tokens_details": {"reasoning_tokens": 10},
+                        },
+                    },
+                }),
+            ),
+        ]
+        .concat()
+    }
+
+    /// The second OpenAI Responses reply: the final text.
+    fn responses_text_reply() -> String {
+        let message = json!({
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "done"}],
+        });
+        [
+            sse(
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": "msg_1",
+                    "output_index": 0,
+                    "delta": "done",
+                }),
+            ),
+            sse(
+                "response.output_item.done",
+                json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": message,
+                }),
+            ),
+            sse(
+                "response.completed",
+                json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_2",
+                        "status": "completed",
+                        "output": [message],
+                        "usage": {"input_tokens": 150, "output_tokens": 12},
+                    },
+                }),
+            ),
+        ]
+        .concat()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_sends_its_thinking_level_to_each_protocol() {
+        let (_dir1, running1, invite1) = running().await;
+        let (mut socket, _token) = admin(&running1, &invite1).await;
+
+        let (base, provider_task, recorded) = protocol_provider(
+            ProviderProtocol::OpenAiResponses,
+            vec![responses_text_reply(), responses_text_reply()],
+        )
+        .await;
+        let (_bot, chat, _computer) = tool_bot_on(
+            &mut socket,
+            base,
+            ProviderProtocol::OpenAiResponses,
+            true,
+            Some(ThinkingLevel::High),
+        )
+        .await;
+        send(&mut socket, chat, "answer").await;
+        let low = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Low".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::Low),
+            }),
+        )
+        .await;
+        let low_chat: Id = serde_json::from_value(low["chat"]["id"].clone()).unwrap();
+        send(&mut socket, low_chat, "answer").await;
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["reasoning"]["effort"], "high");
+            assert_eq!(requests[1]["reasoning"]["effort"], "low");
+        }
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running1.shutdown().await;
+
+        let (_dir2, running2, invite2) = running().await;
+        let (mut socket2, _token2) = admin(&running2, &invite2).await;
+        let (base2, provider_task2, recorded2) = protocol_provider(
+            ProviderProtocol::AnthropicMessages,
+            vec![anthropic_text_reply()],
+        )
+        .await;
+        let (_bot2, chat2, _computer2) = tool_bot_on(
+            &mut socket2,
+            base2,
+            ProviderProtocol::AnthropicMessages,
+            true,
+            Some(ThinkingLevel::High),
+        )
+        .await;
+        send(&mut socket2, chat2, "answer").await;
+        {
+            let requests2 = recorded2.lock().unwrap();
+            assert_eq!(requests2.len(), 1);
+            assert_eq!(requests2[0]["thinking"]["type"], "enabled");
+            assert_eq!(requests2[0]["thinking"]["budget_tokens"], 8191);
+        }
+        socket2.close(None).await.unwrap();
+        provider_task2.abort();
+        running2.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_unknown_write_reloads_its_own_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let (base, provider_task, recorded) = protocol_provider(
+            ProviderProtocol::OpenAiResponses,
+            vec![responses_text_reply()],
+        )
+        .await;
+
+        let user = Id::new();
+        let provider = Id::new();
+        let model = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let message = Id::new();
+        let run = Id::new();
+        let command = Id::new();
+        let action = Id::new();
+        let workspace = home.workspace_dir(computer);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("note.txt"), "hello").unwrap();
+        let continuation = neha_loop::Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: provider.to_string(),
+            model: "test-model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_recovered"}]}),
+        };
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(user),
+                json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventDraft::new(
+                EventKind::ProviderAdded,
+                Author::User(user),
+                json!({
+                    "provider": provider,
+                    "protocol": "openai_responses",
+                    "base_url": base,
+                    "models": [{
+                        "id": model,
+                        "name": "test-model",
+                        "context_limit": 128000,
+                        "max_output": 8192,
+                        "reads_images": false,
+                        "thinks": true,
+                    }],
+                    "default_model": model,
+                    "thinking": "high",
+                }),
+            ),
+            EventDraft::new(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                json!({
+                    "computer": computer,
+                    "owner": user,
+                    "kind": "hosted",
+                    "workspace": workspace.to_string_lossy(),
+                }),
+            ),
+            EventDraft::new(
+                EventKind::BotCreated,
+                Author::User(user),
+                json!({
+                    "bot": bot,
+                    "owner": user,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                    "thinking": null,
+                }),
+            ),
+            EventDraft::new(
+                EventKind::ChatCreated,
+                Author::User(user),
+                json!({"chat": chat, "owner": user, "bot": bot}),
+            ),
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({"message": message, "chat": chat, "text": "write it", "run": run}),
+            ),
+            EventDraft::new(
+                EventKind::RunQueued,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": command,
+                    "message": message,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": command,
+                    "message": message,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunStep,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "usage": {"uncached_input": 1, "cache_read": 0,
+                        "cache_write": 0, "output": 1, "reasoning": 0},
+                    "tool_calls": 1,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunReply,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "content": null,
+                    "calls": [{
+                        "call": "call-1",
+                        "tool": "write_file",
+                        "arguments": {"path": "note.txt", "content": "hello"},
+                        "refused": null,
+                    }],
+                    "usage": null,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::ActionStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": "write_file",
+                    "arguments": {"path": "note.txt", "content": "hello"},
+                }),
+            )
+            .acting(user),
+        ];
+        store
+            .append(
+                AppendRequest::new(command, "seed-unknown-write", drafts).with_continuation(
+                    ContinuationWrite {
+                        run,
+                        step: 1,
+                        continuation: Some(continuation),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        Secrets::load(&home)
+            .unwrap()
+            .store_provider_key(provider, "sk-test")
+            .unwrap();
+        store.close().await.unwrap();
+
+        let running = start(home, 0).await.unwrap();
+        for _ in 0..500 {
+            let status = running
+                .server
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .get(&run)
+                .map(|run| run.status);
+            if matches!(
+                status,
+                Some(crate::state::RunStatus::Succeeded | crate::state::RunStatus::Failed)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let state = running.server.state.lock().unwrap();
+            assert_eq!(
+                state.runs[&run].status,
+                crate::state::RunStatus::Succeeded,
+                "the verified write lets the run continue: {:?}",
+                state.runs[&run].error
+            );
+        }
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]["input"].to_string().contains("rs_recovered"),
+                "the recovered step loads its own continuation: {}",
+                requests[0]
+            );
+        }
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_run_reuses_the_native_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().expect("a fresh Space invites");
+        let (mut socket, token) = admin(&running, &invite).await;
+
+        let (sender, _receiver) = tokio::sync::watch::channel(false);
+        let gate = Gate(std::sync::Arc::new(sender));
+        let (base, provider_task, recorded) = gated_protocol_provider(
+            ProviderProtocol::OpenAiResponses,
+            vec![
+                (responses_write_file_reply(), None),
+                (responses_text_reply(), Some(gate.clone())),
+                (responses_text_reply(), None),
+            ],
+        )
+        .await;
+        let (_bot, chat, _computer) = tool_bot_on(
+            &mut socket,
+            base,
+            ProviderProtocol::OpenAiResponses,
+            false,
+            None,
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "write note.txt", None).await;
+        let run = run_of(&queued);
+        for _ in 0..500 {
+            if recorded.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2, "the step asks for its next reply");
+            assert!(
+                requests[1]["input"].to_string().contains("rs_1"),
+                "the live next step replays the reasoning item: {}",
+                requests[1]
+            );
+        }
+
+        // Stop the Space while the second request is in flight. The first
+        // step and its native state are already recorded.
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+
+        let restarted = start(test_home(&root), 0).await.unwrap();
+        let mut socket = open_socket(&restarted, &token).await;
+        gate.open();
+        let shown = wait_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
+        {
+            let requests = recorded.lock().unwrap();
+            assert!(requests.len() >= 3);
+            assert!(
+                requests[2]["input"].to_string().contains("rs_1"),
+                "the recovered step reloads the reasoning item: {}",
+                requests[2]
+            );
+        }
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_writes_a_file_over_openai_responses() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task, recorded) = protocol_provider(
+            ProviderProtocol::OpenAiResponses,
+            vec![responses_write_file_reply(), responses_text_reply()],
+        )
+        .await;
+        let (_bot, chat, computer) = tool_bot_on(
+            &mut socket,
+            base,
+            ProviderProtocol::OpenAiResponses,
+            false,
+            None,
+        )
+        .await;
+
+        let result = send(&mut socket, chat, "write note.txt").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["text"], "done");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert_eq!(shown["steps"].as_array().unwrap().len(), 2);
+        let actions = shown["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["tool"], "write_file");
+        assert_eq!(actions[0]["status"], "succeeded");
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(shown["usage"]["uncached_input"], 245);
+        assert_eq!(shown["usage"]["cache_read"], 20);
+        assert_eq!(shown["usage"]["cache_write"], 5);
+        assert_eq!(shown["usage"]["output"], 42);
+        assert_eq!(shown["usage"]["reasoning"], 10);
+
+        // The protocol the Admin named is the one the Space records.
+        let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
+        assert_eq!(providers.as_array().unwrap().len(), 1);
+        assert_eq!(providers[0]["protocol"], "openai_responses");
+
+        // The second call replays the Provider's native output, its reasoning
+        // item included, and does not repeat the normalized function call.
+        let bodies = recorded.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one call per step");
+        let tools = bodies[0]["tools"].as_array().unwrap();
+        let write = tools
+            .iter()
+            .find(|tool| tool["name"] == "write_file")
+            .expect("write_file is offered");
+        assert_eq!(write["type"], "function");
+        assert!(write["parameters"]["properties"]["content"].is_object());
+        let input = bodies[1]["input"].as_array().unwrap();
+        let reasoning = input
+            .iter()
+            .find(|item| item["type"] == "reasoning")
+            .expect("the reasoning item reaches the next call");
+        assert_eq!(reasoning["id"], "rs_1");
+        let calls = input
+            .iter()
+            .filter(|item| item["type"] == "function_call" && item["call_id"] == "call_1")
+            .count();
+        assert_eq!(calls, 1, "the native call replaces the normalized one");
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call_output" && item["call_id"] == "call_1"),
+            "the tool result reaches the next call"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    /// The first Anthropic Messages reply: thinking, then a `write_file` call.
+    fn anthropic_write_file_reply() -> String {
+        let arguments = r#"{"path":"note.txt","content":"hello"}"#;
+        [
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "test-model",
+                        "usage": {
+                            "input_tokens": 100,
+                            "cache_read_input_tokens": 10,
+                            "cache_creation_input_tokens": 5,
+                            "output_tokens": 1,
+                        },
+                    },
+                }),
+            ),
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                }),
+            ),
+            sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "I should write the note."},
+                }),
+            ),
+            sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "signature_delta", "signature": "sig-abc"},
+                }),
+            ),
+            sse(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "write_file",
+                        "input": {},
+                    },
+                }),
+            ),
+            sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "input_json_delta", "partial_json": arguments},
+                }),
+            ),
+            sse(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 1}),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use"},
+                    "usage": {
+                        "output_tokens": 20,
+                        "output_tokens_details": {"thinking_tokens": 6},
+                    },
+                }),
+            ),
+            sse("message_stop", json!({"type": "message_stop"})),
+        ]
+        .concat()
+    }
+
+    /// The second Anthropic Messages reply: the final text.
+    fn anthropic_text_reply() -> String {
+        [
+            sse(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg_2",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "test-model",
+                        "usage": {
+                            "input_tokens": 140,
+                            "cache_read_input_tokens": 30,
+                            "cache_creation_input_tokens": 3,
+                            "output_tokens": 1,
+                        },
+                    },
+                }),
+            ),
+            sse(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                }),
+            ),
+            sse(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "done"},
+                }),
+            ),
+            sse(
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            sse(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn"},
+                    "usage": {
+                        "output_tokens": 12,
+                        "output_tokens_details": {"thinking_tokens": 2},
+                    },
+                }),
+            ),
+            sse("message_stop", json!({"type": "message_stop"})),
+        ]
+        .concat()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_writes_a_file_over_anthropic_messages() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task, recorded) = protocol_provider(
+            ProviderProtocol::AnthropicMessages,
+            vec![anthropic_write_file_reply(), anthropic_text_reply()],
+        )
+        .await;
+        let (_bot, chat, computer) = tool_bot_on(
+            &mut socket,
+            base,
+            ProviderProtocol::AnthropicMessages,
+            true,
+            Some(ThinkingLevel::Medium),
+        )
+        .await;
+
+        let result = send(&mut socket, chat, "write note.txt").await;
+
+        assert_eq!(result["status"], "succeeded");
+        assert_eq!(result["text"], "done");
+        let run: Id = serde_json::from_value(result["run"].clone()).unwrap();
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["status"], "succeeded");
+        assert_eq!(shown["steps"].as_array().unwrap().len(), 2);
+        let actions = shown["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["tool"], "write_file");
+        assert_eq!(actions[0]["status"], "succeeded");
+        let workspace = running
+            .server_home()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(shown["usage"]["uncached_input"], 240);
+        assert_eq!(shown["usage"]["cache_read"], 40);
+        assert_eq!(shown["usage"]["cache_write"], 8);
+        assert_eq!(shown["usage"]["output"], 32);
+        assert_eq!(shown["usage"]["reasoning"], 8);
+
+        // The protocol the Admin named is the one the Space records.
+        let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
+        assert_eq!(providers.as_array().unwrap().len(), 1);
+        assert_eq!(providers[0]["protocol"], "anthropic_messages");
+
+        let bodies = recorded.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2, "one call per step");
+        assert_eq!(bodies[0]["thinking"]["type"], "enabled");
+        let tools = bodies[1]["tools"].as_array().unwrap();
+        let write = tools
+            .iter()
+            .find(|tool| tool["name"] == "write_file")
+            .expect("write_file is offered");
+        assert!(write["input_schema"]["properties"]["content"].is_object());
+        // The second call replays the Provider's native assistant blocks, so
+        // the thinking block keeps the signature that proves its provenance.
+        let messages = bodies[1]["messages"].as_array().unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message["role"] == "assistant")
+            .expect("the assistant turn reaches the next call");
+        let blocks = assistant["content"].as_array().unwrap();
+        let thinking = blocks
+            .iter()
+            .find(|block| block["type"] == "thinking")
+            .expect("the thinking block reaches the next call");
+        assert_eq!(thinking["thinking"], "I should write the note.");
+        assert_eq!(thinking["signature"], "sig-abc");
+        assert!(
+            blocks
+                .iter()
+                .any(|block| block["type"] == "tool_use" && block["id"] == "toolu_1"),
+            "the native tool_use block replaces the normalized call"
+        );
+        assert!(
+            messages.iter().any(|message| {
+                message["content"].as_array().is_some_and(|blocks| {
+                    blocks.iter().any(|block| {
+                        block["type"] == "tool_result" && block["tool_use_id"] == "toolu_1"
+                    })
+                })
+            }),
+            "the tool result reaches the next call"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn provider_add_remembers_each_protocol() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        for (protocol, wire) in [
+            (ProviderProtocol::ChatCompletions, "chat_completions"),
+            (ProviderProtocol::OpenAiResponses, "openai_responses"),
+            (ProviderProtocol::AnthropicMessages, "anthropic_messages"),
+        ] {
+            let added = command(
+                &mut socket,
+                Id::new(),
+                provider_add_on(format!("http://127.0.0.1:1/{wire}"), protocol, false, None),
+            )
+            .await;
+            assert_eq!(added["models"][0]["name"], "test-model");
+        }
+
+        let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
+        let mut protocols: Vec<&str> = providers
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|provider| provider["protocol"].as_str().unwrap())
+            .collect();
+        protocols.sort_unstable();
+        assert_eq!(
+            protocols,
+            ["anthropic_messages", "chat_completions", "openai_responses"]
+        );
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bot_runs_a_shell_command() {
         let (_dir, running, invite) = running().await;
@@ -4923,6 +5952,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -5144,6 +6174,7 @@ mod tests {
                 CommandCall::BotCreate(BotCreate {
                     name: name.to_owned(),
                     computer: None,
+                    thinking: None,
                 }),
             )
             .await;
@@ -5278,6 +6309,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -5383,6 +6415,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -5580,6 +6613,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -6261,6 +7295,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -6623,6 +7658,7 @@ mod tests {
             CommandCall::BotCreate(BotCreate {
                 name: "Helper".to_owned(),
                 computer: None,
+                thinking: None,
             }),
         )
         .await;
@@ -7299,6 +8335,7 @@ mod tests {
         CommandCall::BotCreate(BotCreate {
             name: name.to_owned(),
             computer,
+            thinking: None,
         })
     }
 
@@ -11698,6 +12735,7 @@ mod tests {
                 events: legacy(queued_message, queued, queued_command, false),
                 result: None,
                 confirmation: None,
+                continuation: None,
             })
             .await
             .unwrap();
@@ -11710,6 +12748,7 @@ mod tests {
                 events: legacy(started_message, started, started_command, true),
                 result: None,
                 confirmation: None,
+                continuation: None,
             })
             .await
             .unwrap();

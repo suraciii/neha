@@ -16,7 +16,7 @@ use neha_computer::{ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Message, Model, ModelFailure, ModelRequest, ToolCall};
+use crate::model::{Continuation, Message, Model, ModelFailure, ModelRequest, ToolCall};
 use crate::tools;
 
 /// The largest raw tool-call arguments string a step event keeps whole.
@@ -30,6 +30,10 @@ pub struct RunRequest {
     pub history: Vec<Message>,
     /// The largest Model reply in tokens.
     pub max_output: u32,
+    /// How much thought the Model should give each reply.
+    pub thinking: Option<neha::surface::ThinkingLevel>,
+    /// Provider-native state from the step before this request, when resuming.
+    pub continuation: Option<Continuation>,
     /// How many steps the run may take.
     pub max_steps: usize,
     /// The step to finish first, when the run resumes after an approval or a
@@ -48,6 +52,8 @@ impl RunRequest {
             system: system.into(),
             history,
             max_output,
+            thinking: None,
+            continuation: None,
             max_steps: 8,
             resume: None,
             start_step: 1,
@@ -75,6 +81,20 @@ impl RunRequest {
         self.start_step = step;
         self
     }
+
+    /// Sets the thinking level every Model call in the run uses.
+    #[must_use]
+    pub fn with_thinking(mut self, thinking: Option<neha::surface::ThinkingLevel>) -> Self {
+        self.thinking = thinking;
+        self
+    }
+
+    /// Sets the provider-native state a recovered run continues from.
+    #[must_use]
+    pub fn with_continuation(mut self, continuation: Option<Continuation>) -> Self {
+        self.continuation = continuation;
+        self
+    }
 }
 
 /// A step that waited for an approval and now continues.
@@ -97,6 +117,8 @@ pub struct Resume {
     /// Whether every call of this step already has a recorded result. The
     /// loop then records the step and moves on without running an action.
     pub recovered: bool,
+    /// Provider-native state the reply produced.
+    pub continuation: Option<Continuation>,
 }
 
 /// A tool call as the record keeps it.
@@ -175,6 +197,7 @@ pub trait Recorder {
         content: Option<String>,
         calls: Vec<RecordedCall>,
         usage: Usage,
+        continuation: Option<Continuation>,
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 
     /// Asks whether one action may start under `action`. A call the loop
@@ -224,6 +247,8 @@ where
         system,
         history,
         max_output,
+        thinking,
+        continuation,
         max_steps,
         resume,
         start_step,
@@ -235,6 +260,10 @@ where
     // A resumed run finishes the step that waited before it calls the Model,
     // and its usage starts from that step's reply.
     let mut resume = resume;
+    let mut continuation = resume
+        .as_ref()
+        .and_then(|resume| resume.continuation.clone())
+        .or(continuation);
     let first_step = resume.as_ref().map_or(start_step, |resume| resume.step);
     let mut usage = resume
         .as_ref()
@@ -252,8 +281,10 @@ where
                     approved_action,
                     usage,
                     recovered,
+                    continuation: step_continuation,
                     ..
                 } = resume;
+                continuation = step_continuation.or(continuation);
                 let calls = resumed_calls(calls)?;
                 // The results of the done calls end the history, and the
                 // reply's calls come before them.
@@ -271,6 +302,8 @@ where
                         messages: messages.clone(),
                         tools: tools::specs(),
                         max_output,
+                        thinking,
+                        continuation: continuation.clone(),
                     })
                     .await
                 {
@@ -284,7 +317,13 @@ where
                     // A step with no actions completes when the Model answers,
                     // but its reply still belongs in the record.
                     recorder
-                        .reply(step, reply.content.clone(), Vec::new(), reply.usage)
+                        .reply(
+                            step,
+                            reply.content.clone(),
+                            Vec::new(),
+                            reply.usage,
+                            reply.continuation.clone(),
+                        )
                         .await?;
                     recorder.step(step, reply.usage, 0).await?;
                     return Ok(final_reply(reply.content, usage));
@@ -296,8 +335,10 @@ where
                         reply.content.clone(),
                         calls.iter().map(|call| call.recorded.clone()).collect(),
                         reply.usage,
+                        reply.continuation.clone(),
                     )
                     .await?;
+                continuation = reply.continuation;
                 messages.push(Message::assistant_with_calls(
                     reply.content,
                     reply.tool_calls,
@@ -566,7 +607,9 @@ mod tests {
         Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest,
         WaitingApproval, call_id, run,
     };
-    use crate::model::{Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall};
+    use crate::model::{
+        Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
+    };
 
     #[derive(Default)]
     struct FakeModel {
@@ -720,6 +763,7 @@ mod tests {
             content: Option<String>,
             calls: Vec<RecordedCall>,
             usage: Usage,
+            _continuation: Option<Continuation>,
         ) -> Result<(), LoopError> {
             self.record("reply")?;
             self.replies.push((step, content, calls, usage));
@@ -792,6 +836,7 @@ mod tests {
                 output: 1,
                 ..Usage::default()
             },
+            continuation: None,
         })
     }
 
@@ -811,6 +856,7 @@ mod tests {
                 output: 2,
                 ..Usage::default()
             },
+            continuation: None,
         })
     }
 
@@ -841,6 +887,7 @@ mod tests {
                 ..Usage::default()
             },
             recovered: false,
+            continuation: None,
         }
     }
 
@@ -986,6 +1033,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reply_continuation_reaches_the_next_step() {
+        let continuation = Continuation {
+            protocol: "anthropic_messages".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"blocks": [{"type": "thinking", "signature": "sig"}]}),
+        };
+        let model = FakeModel::with(vec![
+            Ok(ModelReply {
+                content: Some("let me look".to_owned()),
+                tool_calls: vec![call("call-7", "read_file", json!({"path": "a.txt"}))],
+                usage: Usage::default(),
+                continuation: Some(continuation.clone()),
+            }),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].continuation, None);
+        assert_eq!(requests[1].continuation, Some(continuation));
+    }
+
+    #[tokio::test]
     async fn a_reply_is_recorded_before_its_actions_are_approved() {
         let model = FakeModel::with(vec![
             Ok(ModelReply {
@@ -995,6 +1079,7 @@ mod tests {
                     output: 3,
                     ..Usage::default()
                 },
+                continuation: None,
             }),
             reply("done"),
         ]);
@@ -1434,6 +1519,7 @@ mod tests {
                     approved_action: None,
                     usage: usage_for_resume,
                     recovered: true,
+                    continuation: None,
                 }),
             )
             .await,
@@ -1558,6 +1644,7 @@ mod tests {
                 output: 2,
                 ..Usage::default()
             },
+            continuation: None,
         });
         let model = FakeModel::with(vec![calls, reply("done")]);
         let runtime = FakeRuntime::default();
