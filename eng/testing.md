@@ -2,7 +2,7 @@
 
 ## The gate
 
-`just ci` is the single gate. It runs the Python hygiene checks, the documentation checks, formatting, type checks, Clippy, the workspace test suite, and the documentation build.
+`just ci` is the single gate. It runs the Python hygiene checks, the documentation checks, formatting, Clippy, the workspace test suite, and the documentation build.
 
 Pull requests and pushes to `main` run the same gate. Split it into a fast pull-request gate and a full main gate when the total cost exceeds ten minutes on a hosted runner.
 

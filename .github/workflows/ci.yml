@@ -1,5 +1,7 @@
 name: CI
 
+# A pull request gates the change on Linux and Windows in parallel; a merge
+# re-runs the gate on main. Packaging runs in nightly.yml.
 on:
   push:
     branches: [main]
@@ -9,8 +11,10 @@ permissions:
   contents: read
 
 concurrency:
+  # Pull requests replace their superseded run; merges queue, so a burst of
+  # merges runs the newest commit instead of each one.
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   gate:
@@ -18,23 +22,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      # The gate does not need debug symbols in CI.
+      # No debug symbols in CI.
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
-      # Run the fence tests against the bubblewrap installed below; without
-      # NEHA_TEST_BWRAP they would skip.
+      # Run the fence and S3 tests against the package and store below.
       NEHA_TEST_BWRAP: '1'
-      # Run the S3 tests against the SeaweedFS service started below;
-      # without NEHA_TEST_S3 they would skip.
       NEHA_TEST_S3: '1'
       NEHA_TEST_S3_ENDPOINT: 'http://127.0.0.1:8333'
       NEHA_TEST_S3_BUCKET: 'neha'
       NEHA_TEST_S3_REGION: 'us-east-1'
       AWS_ACCESS_KEY_ID: 'neha'
       AWS_SECRET_ACCESS_KEY: 'neha-secret'
-      # SeaweedFS does not check signatures; the S3 client still signs.
-      # The store the configuration names must win: this URL is a trap.
+      # The configured endpoint must win: this URL is a trap.
       AWS_ENDPOINT_URL: 'http://127.0.0.1:1'
     steps:
       - uses: actions/checkout@v4
@@ -64,43 +64,24 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
 
-      - name: Install bubblewrap
+      # Ubuntu 24.04 blocks unprivileged user namespaces, and this bubblewrap is
+      # not setuid.
+      - name: Prepare the fence sandbox
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bubblewrap
-
-      # Ubuntu 24.04 restricts unprivileged user namespaces by default, and
-      # bubblewrap here is not setuid. The gate runs the fence tests, so it
-      # lifts the restriction for this runner only.
-      - name: Allow the fence sandbox
-        run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
 
-      - name: Start SeaweedFS
-        run: docker run -d --name neha-s3 -p 8333:8333 chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 server -s3 -dir=/data
-
-      - name: Wait for SeaweedFS
-        run: |
-          for attempt in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8333/ >/dev/null; then
-              echo "SeaweedFS is ready after $attempt attempt(s)"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo 'SeaweedFS did not become ready in time' >&2
-          exit 1
-
-      - name: Create the test bucket
-        run: curl -fsS -X PUT http://127.0.0.1:8333/neha
-
-      - name: Collect SeaweedFS logs
-        if: failure()
-        run: docker logs neha-s3 || true
+      - name: Start the S3 test store
+        run: eng/s3.sh up
 
       - name: Run gate with evidence
         run: just verify "$RUNNER_TEMP/verification"
+
+      - name: Collect the S3 store's logs
+        if: failure()
+        run: eng/s3.sh logs || true
 
       - name: Preserve verification evidence
         if: always()
@@ -110,15 +91,16 @@ jobs:
           path: ${{ runner.temp }}/verification
           if-no-files-found: error
 
+  # Windows-only code does not compile on Linux.
   windows:
-    name: Windows build
+    name: Windows check
+    if: github.event_name == 'pull_request'
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
-      CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -127,211 +109,12 @@ jobs:
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
         with:
-          version: 11.21.0
-
-      - name: Install Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
+          # One cache family with the nightly installer, which refreshes it.
+          shared-key: windows
 
       - name: Check the Rust workspace
         run: cargo check --locked --workspace
 
-      - name: Build the Windows sidecar
-        run: cargo build --locked --release -p neha-app
-
       - name: Test the Windows runtime
         run: cargo test --locked -p neha-computer --test windows_shell
-
-      - name: Install the UI
-        run: pnpm --dir ui install --frozen-lockfile
-
-      - name: Build the UI
-        # The Linux gate owns UI behavior tests; Windows only needs the native
-        # Vite build and the packaging path. The jsdom tests exceed their 5s
-        # per-test budget on the Windows runner.
-        run: pnpm --dir ui build
-
-      - name: Install the desktop shell
-        run: pnpm --dir apps/desktop install --frozen-lockfile
-
-      - name: Test the desktop shell
-        run: pnpm --dir apps/desktop test
-
-      - name: Build the Windows installer
-        run: pnpm --dir apps/desktop package:win
-
-      - name: Upload the installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: neha-windows-installer
-          path: apps/desktop/dist/Neha-Setup-*.exe
-          if-no-files-found: error
-
-      - name: Install the Windows app
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem apps/desktop/dist/Neha-Setup-*.exe | Select-Object -First 1
-          if (-not $installer) { throw "installer was not built" }
-          $process = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -PassThru -Wait
-          if ($process.ExitCode -ne 0) { throw "installer exited $($process.ExitCode)" }
-          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
-            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
-            Select-Object -First 1
-          if (-not $app) { throw "Neha.exe or its sidecar was not installed" }
-          if (-not (Test-Path (Join-Path $app.Directory "resources\ui\index.html"))) {
-            throw "the installed UI is missing"
-          }
-          if (-not (Test-Path (Join-Path $app.Directory "resources\ui\desktop.html"))) {
-            throw "the installed Space chooser is missing"
-          }
-          Write-Host "installed $($app.FullName)"
-          & (Join-Path $app.Directory "resources\neha.exe") --version | Write-Host
-
-      - name: Launch the installed desktop app
-        shell: pwsh
-        run: |
-          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
-            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
-            Select-Object -First 1
-          if (-not $app) { throw "Neha.exe was not installed" }
-          $env:NEHA_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "neha-desktop-home"
-          Remove-Item -Recurse -Force $env:NEHA_DESKTOP_HOME -ErrorAction SilentlyContinue
-          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-chooser.png"
-          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop.err.log"
-          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop.out.log"
-          $process = Start-Process -FilePath $app.FullName `
-            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
-            -RedirectStandardError $stderr -RedirectStandardOutput $stdout
-          if (-not $process.WaitForExit(180000)) {
-            Stop-Process -Id $process.Id -Force
-            throw "the desktop app did not exit"
-          }
-          if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
-          if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
-          if ($process.ExitCode -ne 0) { throw "the desktop app exited $($process.ExitCode)" }
-          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the desktop app did not write a chooser screenshot" }
-          if (-not (Select-String -Path $stderr -Pattern "loaded the Space chooser" -Quiet)) {
-            throw "the first launch did not open the Space chooser"
-          }
-          if (Select-String -Path $stderr -Pattern "starting the local Space" -Quiet) {
-            throw "the chooser must not start a Space before the User chooses"
-          }
-          Write-Host "chooser screenshot: $env:NEHA_DESKTOP_CAPTURE"
-
-      - name: Open the local Space sign-in page
-        shell: pwsh
-        run: |
-          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
-            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
-            Select-Object -First 1
-          if (-not $app) { throw "Neha.exe was not installed" }
-          $localHome = Join-Path $env:RUNNER_TEMP "neha-desktop-local"
-          Remove-Item -Recurse -Force $localHome -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $localHome | Out-Null
-          Set-Content -Path (Join-Path $localHome "desktop-space.json") `
-            -Value '{"version":1,"mode":"local","localComputer":false}' -Encoding ascii
-          $env:NEHA_DESKTOP_HOME = $localHome
-          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-local-login.png"
-          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop-local.err.log"
-          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop-local.out.log"
-          $process = Start-Process -FilePath $app.FullName `
-            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
-            -RedirectStandardError $stderr -RedirectStandardOutput $stdout
-          if (-not $process.WaitForExit(180000)) {
-            Stop-Process -Id $process.Id -Force
-            throw "the local desktop launch did not exit"
-          }
-          if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
-          if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
-          if ($process.ExitCode -ne 0) { throw "the local desktop launch exited $($process.ExitCode)" }
-          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the local launch did not write a screenshot" }
-          if (-not (Select-String -Path $stdout -Pattern "Invite:" -Quiet)) {
-            throw "the local Space did not open its invitation page"
-          }
-          if (Select-String -Path $stderr -Pattern "started the Local Computer" -Quiet) {
-            throw "the local Computer must wait for the in-launcher checkbox and a signed-in session"
-          }
-          Write-Host "local login screenshot: $env:NEHA_DESKTOP_CAPTURE"
-
-      - name: Open a remote Space sign-in page
-        shell: pwsh
-        run: |
-          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
-            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
-            Select-Object -First 1
-          if (-not $app) { throw "Neha.exe was not installed" }
-          $remoteHome = Join-Path $env:RUNNER_TEMP "neha-remote-space"
-          Remove-Item -Recurse -Force $remoteHome -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Force -Path $remoteHome | Out-Null
-          $remoteOut = Join-Path $env:RUNNER_TEMP "neha-remote-space.out.log"
-          $remoteErr = Join-Path $env:RUNNER_TEMP "neha-remote-space.err.log"
-          $env:NEHA_HOME = $remoteHome
-          $sidecar = Join-Path $app.Directory "resources\neha.exe"
-          $ui = Join-Path $app.Directory "resources\ui"
-          $space = Start-Process -FilePath $sidecar `
-            -ArgumentList @("serve", "--port", "0", "--ui", $ui) -PassThru `
-            -RedirectStandardOutput $remoteOut -RedirectStandardError $remoteErr
-          try {
-            $url = $null
-            for ($i = 0; $i -lt 60; $i++) {
-              Start-Sleep -Milliseconds 500
-              if (Test-Path $remoteOut) {
-                $match = Select-String -Path $remoteOut -Pattern "Open in a browser: (\S+)" | Select-Object -First 1
-                if ($match) { $url = $match.Matches[0].Groups[1].Value; break }
-              }
-            }
-            if (-not $url) { throw "the remote Space did not print a browser URL" }
-            Write-Host "remote Space URL: $url"
-            if ($space.HasExited) {
-              Get-Content $remoteOut -ErrorAction SilentlyContinue | Write-Host
-              Get-Content $remoteErr -ErrorAction SilentlyContinue | Write-Host
-              throw "the remote Space exited before the desktop could open it"
-            }
-            $remotePort = ([Uri]$url).Port
-            Start-Sleep -Milliseconds 800
-            $probe = New-Object System.Net.Sockets.TcpClient
-            try {
-              $probe.Connect("127.0.0.1", $remotePort)
-              Write-Host "remote Space accepted a connection on 127.0.0.1:$remotePort"
-            } catch {
-              Get-Content $remoteOut -ErrorAction SilentlyContinue | Write-Host
-              Get-Content $remoteErr -ErrorAction SilentlyContinue | Write-Host
-              throw "the remote Space did not accept a connection on 127.0.0.1:$remotePort: $($_.Exception.Message)"
-            } finally {
-              $probe.Close()
-            }
-            $desktopHome = Join-Path $env:RUNNER_TEMP "neha-desktop-remote"
-            Remove-Item -Recurse -Force $desktopHome -ErrorAction SilentlyContinue
-            New-Item -ItemType Directory -Force -Path $desktopHome | Out-Null
-            $selection = @{ version = 1; mode = "remote"; spaceUrl = $url } | ConvertTo-Json -Compress
-            Set-Content -Path (Join-Path $desktopHome "desktop-space.json") -Value $selection -Encoding ascii
-            $env:NEHA_DESKTOP_HOME = $desktopHome
-            $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-remote.png"
-            $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop-remote.err.log"
-            $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop-remote.out.log"
-            $process = Start-Process -FilePath $app.FullName `
-              -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
-              -RedirectStandardError $stderr -RedirectStandardOutput $stdout
-            if (-not $process.WaitForExit(180000)) {
-              Stop-Process -Id $process.Id -Force
-              throw "the remote desktop launch did not exit"
-            }
-            if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
-            if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
-            if ($process.ExitCode -ne 0) { throw "the remote desktop launch exited $($process.ExitCode)" }
-            if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the remote launch did not write a screenshot" }
-            if (-not (Select-String -Path $stderr -Pattern "opened the remote Space at" -Quiet)) {
-              throw "the remote Space page did not load"
-            }
-            if (Select-String -Path $stderr -Pattern "starting the local Space" -Quiet) {
-              throw "the remote choice must not start a local Space"
-            }
-            Write-Host "remote screenshot: $env:NEHA_DESKTOP_CAPTURE"
-          } finally {
-            if ($space -and -not $space.HasExited) { Stop-Process -Id $space.Id -Force }
-          }
