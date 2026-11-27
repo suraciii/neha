@@ -1537,6 +1537,9 @@ fn fresh_hosted(
         LocalRuntime::hosted_with_hidden(&workspace, vec![context.home.root().to_path_buf()])
     {
         let _ = std::fs::remove_dir_all(&workspace);
+        if let Some(parent) = workspace.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
         return Err(ApiError::invalid_argument(format!(
             "this machine cannot provide an isolated Hosted Computer: {error}; pair a Local Computer and use `--computer local` instead"
         )));
@@ -1554,8 +1557,9 @@ fn fresh_hosted(
 
 /// Clears a Hosted Computer's Workspace.
 ///
-/// The reset only changes files on the Space's disk; it is not a record event.
-/// A retry is therefore harmless and simply clears an already empty Workspace.
+/// The reset only changes files on the Space's disk; it writes no event. The
+/// command identifier is claimed in the record before the clear, so a retry
+/// returns the first result and two retries cannot both clear the folder.
 async fn computer_reset(
     context: &CommandContext<'_>,
     account: &Account,
@@ -1563,9 +1567,6 @@ async fn computer_reset(
     fingerprint: String,
     computer: Id,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
-    }
     let (workspace, bot) = {
         let mut state = context
             .state
@@ -1614,6 +1615,34 @@ async fn computer_reset(
         // the Space's own data.
         (context.home.workspace_dir(computer), bot)
     };
+    let claimed = context.store.claim_command(command_id, &fingerprint).await;
+    let claimed = match claimed {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            end_reset(context, computer)?;
+            return Err(store_error(error));
+        }
+    };
+    if let Some(record) = claimed {
+        end_reset(context, computer)?;
+        let Some(recorded) = record.result else {
+            return Err(ApiError::conflict(
+                "a previous reset with this command id did not finish; use a new command id",
+            ));
+        };
+        if recorded.get("user") != Some(&json!(account.id)) {
+            return Err(ApiError::forbidden(
+                "a recorded reset belongs to another User",
+            ));
+        }
+        return Ok(Outcome {
+            committed: None,
+            result: recorded,
+            queued: None,
+            events: Vec::new(),
+        });
+    }
+
     let root = context.home.root().to_path_buf();
     let expected = Path::new("computers")
         .join(computer.to_string())
@@ -1636,51 +1665,52 @@ async fn computer_reset(
     })
     .await;
     let cleared = match cleared {
-        Ok(Ok(workspace)) => Ok(workspace),
-        Ok(Err(error)) => Err(ApiError::internal(format!(
-            "cannot reset the Computer workspace: {error}"
-        ))),
-        Err(error) => Err(ApiError::internal(format!(
-            "cannot reset the Computer workspace: {error}"
-        ))),
-    };
-    let result = json!({"computer": computer, "bot": bot, "kind": "hosted"});
-    let outcome = match cleared {
-        Ok(_) => {
-            let drafts = vec![EventDraft::new(
-                EventKind::ComputerReset,
-                Author::User(account.id),
-                json!({"computer": computer}),
-            )];
-            match append(
-                context.store,
-                context.state,
-                command_id,
-                fingerprint,
-                drafts,
-                Some(result.clone()),
-                None,
-            )
-            .await
-            {
-                Ok(appended) => Ok(Outcome {
-                    committed: appended.events.last().map(|event| event.seq),
-                    result,
-                    queued: None,
-                    events: appended.events,
-                }),
-                Err(error) => Err(error),
-            }
+        Ok(Ok(workspace)) => workspace,
+        Ok(Err(error)) => {
+            let _ = end_reset(context, computer);
+            return Err(ApiError::internal(format!(
+                "cannot reset the Computer workspace: {error}"
+            )));
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            let _ = end_reset(context, computer);
+            return Err(ApiError::internal(format!(
+                "cannot reset the Computer workspace: {error}"
+            )));
+        }
     };
+    let _ = cleared;
+    let result = json!({
+        "computer": computer,
+        "bot": bot,
+        "kind": "hosted",
+        "user": account.id,
+    });
+    let settled = context
+        .store
+        .settle_command(command_id, result.clone())
+        .await;
+    end_reset(context, computer)?;
+    match settled {
+        Ok(()) => Ok(Outcome {
+            committed: None,
+            result,
+            queued: None,
+            events: Vec::new(),
+        }),
+        Err(error) => Err(store_error(error)),
+    }
+}
+
+/// Drops the in-memory reset mark after a command's effect finished or failed.
+fn end_reset(context: &CommandContext<'_>, computer: Id) -> Result<(), ApiError> {
     let mut state = context
         .state
         .lock()
         .map_err(|_| ApiError::internal("state lock"))?;
     state.end_reset(computer);
-    drop(state);
-    outcome
+
+    Ok(())
 }
 
 /// Removes every entry of a Workspace without following a symlink.

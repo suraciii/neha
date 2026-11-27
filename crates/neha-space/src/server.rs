@@ -9667,6 +9667,7 @@ mod tests {
         std::fs::create_dir(workspace.join("folder")).unwrap();
         std::fs::write(workspace.join("folder").join("inner.txt"), "also me").unwrap();
 
+        let cursor_before = running.server.store.last_seq().await.unwrap();
         let command_id = Id::new();
         let (committed, result) = try_command(
             &mut socket,
@@ -9675,6 +9676,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(committed.is_none(), "a reset writes no event");
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor_before
+        );
         assert_eq!(result["computer"], json!(computer));
         assert_eq!(result["kind"], "hosted");
         assert!(
@@ -9693,8 +9699,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(again_committed, committed);
+        assert!(again_committed.is_none());
         assert_eq!(again, result);
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor_before
+        );
         assert_eq!(
             std::fs::read_to_string(workspace.join("late.txt")).unwrap(),
             "after the reset"
@@ -9736,6 +9746,65 @@ mod tests {
 
         std::fs::remove_file(&workspace).unwrap();
         std::fs::create_dir(&workspace).unwrap();
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_reset_command_id_cannot_clear_two_computers() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let first = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("First", Some(BotComputer::Hosted)),
+        )
+        .await;
+        let second = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Second", Some(BotComputer::Hosted)),
+        )
+        .await;
+        let first_computer: Id = serde_json::from_value(first["computer"]["id"].clone()).unwrap();
+        let second_computer: Id = serde_json::from_value(second["computer"]["id"].clone()).unwrap();
+        let second_workspace = running
+            .server_home()
+            .join("computers")
+            .join(second_computer.to_string())
+            .join("workspace");
+        std::fs::write(second_workspace.join("keep.txt"), "keep").unwrap();
+
+        let command_id = Id::new();
+        command(
+            &mut socket,
+            command_id,
+            CommandCall::ComputerReset {
+                computer: first_computer,
+            },
+        )
+        .await;
+        let conflict = try_command(
+            &mut socket,
+            command_id,
+            CommandCall::ComputerReset {
+                computer: second_computer,
+            },
+        )
+        .await;
+        assert!(
+            matches!(conflict, Err((ErrorCode::IdempotencyConflict, _))),
+            "one command id cannot reset two Computers: {conflict:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second_workspace.join("keep.txt")).unwrap(),
+            "keep",
+            "the second Computer is untouched"
+        );
+
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;

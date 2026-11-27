@@ -715,10 +715,6 @@ impl Projection for State {
                 );
                 self.computer_order.push(data.computer);
             }
-            // A reset changes files on the Space's disk, not the record's
-            // state. It is recorded so a repeated command answers from the
-            // record instead of clearing the Workspace again.
-            EventData::ComputerReset(_) => {}
             EventData::ChatCreated(data) => {
                 self.chats.insert(
                     data.chat,

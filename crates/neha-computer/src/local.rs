@@ -180,35 +180,7 @@ impl LocalRuntime {
             .into_iter()
             .map(|root| std::fs::canonicalize(&root).map_err(RuntimeError::Io))
             .collect::<Result<_, _>>()?;
-        let cli_dir = default_cli_dir();
-        for root in &hidden {
-            if root == Path::new("/") {
-                return Err(RuntimeError::NoSandbox(
-                    "NEHA_HOME cannot be the file-system root".to_owned(),
-                ));
-            }
-            for system in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
-                let Ok(system) = std::fs::canonicalize(system) else {
-                    continue;
-                };
-                if root.starts_with(&system) {
-                    return Err(RuntimeError::NoSandbox(format!(
-                        "NEHA_HOME is inside {system}; a Hosted sandbox would mount that directory. Move NEHA_HOME outside the system directories",
-                        system = system.display()
-                    )));
-                }
-            }
-            if let Some(cli_dir) = cli_dir
-                .as_deref()
-                .and_then(|dir| std::fs::canonicalize(dir).ok())
-                && root.starts_with(&cli_dir)
-            {
-                return Err(RuntimeError::NoSandbox(
-                    "NEHA_HOME is inside the CLI directory; a Hosted sandbox would mount that directory"
-                        .to_owned(),
-                ));
-            }
-        }
+        validate_hosted_mounts(&hidden, default_cli_dir().as_deref())?;
         // The old managed runtime ran with the Space user's rights, so a
         // Workspace can already hold a hard link or symlink to a host file.
         // Refuse it before the writable bind: a reset is the owner's repair.
@@ -1502,6 +1474,48 @@ fn sandbox_args(
     arguments.push(OsString::from("--"));
 
     arguments
+}
+
+/// Refuses a Hosted layout whose read-only mounts would expose a protected
+/// root.
+///
+/// The sandbox mounts the system directories and the CLI's directory. The
+/// Space home must not sit inside either mount, and the CLI directory must not
+/// sit inside the Space home: in both cases the read-only mount would still
+/// reveal the record, a secret, or another Workspace.
+fn validate_hosted_mounts(hidden: &[PathBuf], cli_dir: Option<&Path>) -> Result<(), RuntimeError> {
+    let cli_dir = cli_dir
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(RuntimeError::Io)?;
+    for root in hidden {
+        if root == Path::new("/") {
+            return Err(RuntimeError::NoSandbox(
+                "NEHA_HOME cannot be the file-system root".to_owned(),
+            ));
+        }
+        for system in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+            let Ok(system) = std::fs::canonicalize(system) else {
+                continue;
+            };
+            if root.starts_with(&system) {
+                return Err(RuntimeError::NoSandbox(format!(
+                    "NEHA_HOME is inside {}; a Hosted sandbox would mount that directory. Move NEHA_HOME outside the system directories",
+                    system.display()
+                )));
+            }
+        }
+        if let Some(cli_dir) = &cli_dir
+            && (root.starts_with(cli_dir) || cli_dir.starts_with(root))
+        {
+            return Err(RuntimeError::NoSandbox(
+                "NEHA_HOME and the CLI directory overlap; a Hosted sandbox would mount one of them"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// The bubblewrap arguments that give one Hosted shell a minimal rootfs.
@@ -4835,6 +4849,21 @@ mod tests {
         let missing = directory.path().join("missing-workspace");
         let error = probe_hosted(&bwrap, &missing)
             .expect_err("a missing workspace cannot be mounted into a Hosted sandbox");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_cli_directory_inside_the_home_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let cli = home.join("target").join("debug");
+        std::fs::create_dir_all(&cli).unwrap();
+        let error = super::validate_hosted_mounts(std::slice::from_ref(&home), Some(&cli))
+            .expect_err("a CLI inside the protected home would expose that subtree");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+
+        let error = super::validate_hosted_mounts(std::slice::from_ref(&cli), Some(&home))
+            .expect_err("a home inside the CLI directory would expose the home");
         assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
     }
 
