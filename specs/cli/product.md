@@ -59,6 +59,16 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 Only the Admin refreshes the catalog. The other catalog commands are reads.
 
+## Plugins and tools
+
+`neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only the Admin MAY do.
+
+The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the browser, never from the command line. `neha mcp list` prints each server, its scope, who connected it, and whether it is connected.
+
+`neha plugin install <source>[@<commit>]` installs a package from a source the Admin allows. `neha plugin list` prints each package, its commit, and what it brought.
+
+`neha skill add <path> [--bot <bot>]` adds a skill to the Space's library or to a Bot's. `neha bot mcp enable <bot> <server>` and `neha bot skill enable <bot> <skill>` give a Bot a server or a skill; `disable` takes it away.
+
 ## Computers
 
 A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on the machine where Neha runs.
@@ -107,7 +117,7 @@ The directory MUST exist and be a folder. In granted mode a directory inside a h
 
 ## Approvals
 
-`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, a lasting rule, or a folder the owner has not granted.
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, the first call of a server's tool, the first run of a skill's script, a lasting rule, or a folder the owner has not granted.
 
 `neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
 

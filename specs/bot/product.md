@@ -58,7 +58,7 @@ As a conversation grows past what the Model can hold, the Bot summarizes its old
 
 ## Skills
 
-A skill is a reusable set of instructions for how to do a task. A Bot uses the skills its owner enables for it, and a User can name one in a Chat to use it for that request. [Plugin](../plugin/product.md) covers installing skills.
+A Bot uses the skills its owner enables for it, and a User can name one in a Chat to use it for that request. [Plugin](../plugin/product.md) covers adding and installing skills.
 
 A skill's entry records the Bot or Space it belongs to and where it came from.
 
@@ -92,9 +92,13 @@ A Bot does what it was asked without asking. It asks before an action that goes 
 
 It also asks before the first action it runs on a Local Computer, once for each Bot, acting User, and Local Computer, and before an action a lasting Ask rule names.
 
+It also asks before the first call of a tool an MCP server gives the Bot and the acting User, and before the first run of a skill's script for them. An Always allow there covers that tool or that script.
+
 Only the User the Bot acts for answers the approval. An Allow runs the action once, and an Always allow also covers later actions of that kind.
 
-An Always allow covers the same tool and either a shell command that starts with the approved command's first word or a file path from the approved action's directory, including files below it. For a tool with no command or path, it covers every action of that tool.
+On a Computer, an Always allow covers the same tool and either a shell command that starts with the approved command's first word or a file path from the approved action's directory, including files below it. For a tool with no command or path, other than `run_skill_script`, it covers every action of that tool.
+
+On a server's tool, an Always allow covers every call of that tool; on a skill's script, that script alone.
 
 A file at the Workspace root makes the covered directory the Workspace root, so relative paths in the Workspace are covered and absolute ones are not. The first use of a Local Computer offers no Always allow, and no lasting rule covers it.
 

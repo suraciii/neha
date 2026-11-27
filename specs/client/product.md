@@ -57,12 +57,14 @@ account in.
 
 The client has one primary navigation rail, one sidebar, and one main area.
 
-The rail selects what the client shows. It has Chats and Needs attention.
+The rail selects what the client shows. It has Chats, Needs attention, Integrations, and Skills.
 
 | Entry | What it opens |
 | --- | --- |
 | Chats | The sidebar lists the User's Chats in record order |
 | Needs attention | The sidebar lists the items that wait for the User's answer |
+| Integrations | The MCP servers and installed packages, grouped by what brought them |
+| Skills | The skills the Space holds and the skills of the User's Bots |
 
 With Chats selected, the main area shows the selected Chat. On a viewport 900 CSS pixels or narrower, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
 
@@ -93,7 +95,9 @@ A Chat shows its Messages oldest first, grouped by day. A User Message aligns to
 
 The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online.
 
-The header shows the Chat's [state](../space/design.md#chat-state): working, waiting for an Approval, or failed. The Approval Card remains in the stream while the Run waits.
+The header shows the Chat's [state](../space/design.md#chat-state): working, waiting for an Approval, or failed. The Approval Card remains in the stream while the Run waits. An Approval for a server's tool names the server and the tool.
+
+A Message MAY carry an interactive Card from a tool; [Plugin](../plugin/product.md#cards) states what the Card can do.
 
 A Chat with no Messages shows the Bot's name and starting prompts.
 
@@ -113,6 +117,16 @@ An action appears when it starts and updates with its result when it completes. 
 
 The Needs attention entry opens the [Needs attention view](../messaging/notification/product.md#needs-attention). Each item names its Bot, and selecting one opens the Chat where the item waits.
 
+## Integrations
+
+The Integrations view lists the MCP servers the Space and the signed-in User hold, and the packages the Admin installed. Each server shows whether it is connected, who connected it, and the Bots that use it.
+
+[Plugin](../plugin/product.md) states who adds or installs what. A server added with a sign-in opens the browser's sign-in, and the client never shows a credential after it is saved.
+
+## Skills
+
+The Skills view lists the skills the Space holds and the skills of the User's Bots; adding and enabling follow [Plugin](../plugin/product.md#skills).
+
 ## Language
 
 The client supports English (en-US) and Simplified Chinese (zh-CN).
@@ -121,7 +135,7 @@ A first visit follows the browser language. The User can switch language from th
 
 The client shows one language switch at a time. A count of Chats uses the product term Chat.
 
-Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provider, Model. Dates follow the active locale; times use a 24-hour clock in both locales.
+Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provider, Model, Plugin, MCP server. Dates follow the active locale; times use a 24-hour clock in both locales.
 
 ## Accessibility
 
