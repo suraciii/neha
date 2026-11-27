@@ -21,7 +21,7 @@ publish = false
 [workspace.dependencies]
 futures-util = "0.3"
 opendal = { version = "0.59", default-features = false, features = ["services-fs", "services-s3", "executors-tokio", "http-transport-reqwest"] }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13", default-features = false }
 serde = "1"
 serde_json = "1"
 thiserror = "2"

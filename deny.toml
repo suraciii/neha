@@ -1,0 +1,40 @@
+# Dependency policy. `cargo deny check` runs in `just ci` and rejects a
+# dependency that is vulnerable, yanked, under a license that cannot ship in a
+# GPL-3.0-only program, or fetched from outside crates.io.
+
+[advisories]
+# Vulnerabilities always fail. An unmaintained advisory on a direct dependency
+# fails too, which is the signal to replace it; `cargo-deny` 0.22 states that
+# scope with `unmaintained` and defaults it to "workspace".
+yanked = "deny"
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+# Workspace crates are private and carry the GPL-3.0-only license themselves.
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

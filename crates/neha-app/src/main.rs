@@ -464,9 +464,10 @@ impl From<RuleEffectChoice> for RuleEffect {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Both rustls providers are in the dependency graph (reqwest 0.12 and
-    // 0.13). The command socket chooses one explicitly before it connects.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // The dependency graph carries one rustls provider (aws-lc-rs, pulled in
+    // by reqwest's `rustls` feature). The command socket chooses it explicitly
+    // before it connects.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     match Cli::parse().command {
         Top::Serve { port, ui, domain } => serve(port, ui, domain).await,
         Top::Join { link, name } => join(&link, &name).await,

@@ -4,12 +4,13 @@
 
 - Rust, pinned by [`rust-toolchain.toml`](../rust-toolchain.toml); the MSRV is 1.94.
 - `just` for the recipes in [Justfile](../Justfile).
+- `cargo-deny` for the dependency policy check, installed with `cargo install cargo-deny --locked`.
 - Python 3 for the documentation and hygiene checks in `scripts/`.
 - Node 24 and pnpm 11 for the browser client under `ui/`.
 - Docker, for the local S3 test store.
 - `bubblewrap` on Linux, for the sandbox that runs a Computer's shell commands, Local or Hosted.
 
-The Rust workspace has no native dependencies. The browser client's dependencies are installed from its committed lockfile.
+The workspace has no system-library dependencies. SQLite and aws-lc-sys compile C code that ships inside the crates, so a build needs a C compiler, and aws-lc-sys also needs cmake. The browser client's dependencies are installed from its committed lockfile.
 
 ## Commands
 
@@ -26,6 +27,7 @@ pnpm --dir ui build
 just fmt          # formatting check
 just clippy       # lints; warnings fail
 just test         # workspace tests
+just deny         # licenses, advisories, duplicate versions, registry sources
 just test-s3      # neha-space tests with the S3 tests switched on
 just doc          # documentation build; warnings fail
 just check-specs  # links, headings, modal case, presentation
