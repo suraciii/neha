@@ -46,7 +46,7 @@ Only the Computer's owner resets it, and only a Hosted Computer is reset. A Comp
 
 Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot update <bot>` changes a Bot's file access. Only the Bot's owner can change it, and the next run uses the new access.
+`neha bot update <bot>` changes a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses the change because its Workspace is its only write range.
 
 `--full-access on` gives it the daemon's own file rights and removes the shell fence. `--full-access off` restores the Bot's Workspace fence.
 

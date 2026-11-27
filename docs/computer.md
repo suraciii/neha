@@ -121,7 +121,7 @@ A Space restart keeps it, and no command is needed. It is not an independent ima
 
 A run that is queued, running, or waiting refuses the reset with a conflict until it ends. A second reset of an empty Workspace succeeds, and a reset restores no file.
 
-The Space machine needs `bubblewrap` for a Hosted Computer. Where it cannot start the sandbox, `bot create` fails and names `--computer local` as the alternative; it does not fall back.
+The Space machine needs `bubblewrap` for a Hosted Computer. Where it cannot start the sandbox, `bot create` fails and names `--computer local` as the alternative; it does not fall back. The Space also refuses a Hosted Computer when `NEHA_HOME` would be inside a read-only system directory or the CLI directory, or when an existing Workspace holds a link.
 
 ## The Bot's Workspace and the write fence
 

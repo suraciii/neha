@@ -79,7 +79,7 @@ A Local Computer's owner grants what a Bot on it can reach. [product.md](product
 
 A Hosted Computer is created with its Bot, and only its owner resets it. A Local Computer is paired; no command resets it.
 
-Resetting clears every entry inside the Bot's Workspace and keeps the Workspace folder. A reset restores no file, writes no event, and a second reset of an empty Workspace succeeds.
+Resetting clears every entry inside the Bot's Workspace and keeps the Workspace folder. It records the reset and restores no file. Repeating the same command returns its recorded result instead of clearing again.
 
 A reset runs only when the Bot has no queued, running, or waiting run. No run starts while a reset is in progress.
 

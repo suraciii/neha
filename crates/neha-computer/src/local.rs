@@ -142,7 +142,86 @@ impl LocalRuntime {
     /// The sandbox is probed here, so a Space never promises a Hosted Computer
     /// on a machine where bubblewrap cannot start it.
     pub fn hosted(workspace: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
-        let mut runtime = Self::managed(workspace.into())?;
+        Self::hosted_with_hidden(workspace, Vec::new())
+    }
+
+    /// Opens a Hosted workspace with the roots its sandbox must not expose.
+    ///
+    /// A Hosted sandbox mounts the Space machine's system directories and the
+    /// CLI's directory read-only. If the Space home lives under one of those
+    /// mounts, the sandbox would expose the record, secrets, or another
+    /// Workspace despite the read-only mount, so this constructor refuses that
+    /// layout instead of starting it. The Space passes its home here.
+    pub fn hosted_with_hidden(
+        workspace: impl Into<PathBuf>,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        let requested = workspace.into();
+        std::fs::create_dir_all(&requested)?;
+        let workspace = std::fs::canonicalize(&requested)?;
+        // The path is built from the Space's resolved home and a Computer id,
+        // so a difference after resolving means a symlink sits on it. A later
+        // bind would follow that link and expose or write another directory.
+        Self::hosted_checked(requested, workspace, hidden)
+    }
+
+    fn hosted_checked(
+        requested: PathBuf,
+        workspace: PathBuf,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        if requested != workspace {
+            return Err(RuntimeError::UnsafeFolder(format!(
+                "the Hosted Workspace path uses a symlink: {}",
+                requested.display()
+            )));
+        }
+        let hidden: Vec<PathBuf> = hidden
+            .into_iter()
+            .map(|root| std::fs::canonicalize(&root).map_err(RuntimeError::Io))
+            .collect::<Result<_, _>>()?;
+        let cli_dir = default_cli_dir();
+        for root in &hidden {
+            if root == Path::new("/") {
+                return Err(RuntimeError::NoSandbox(
+                    "NEHA_HOME cannot be the file-system root".to_owned(),
+                ));
+            }
+            for system in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+                let Ok(system) = std::fs::canonicalize(system) else {
+                    continue;
+                };
+                if root.starts_with(&system) {
+                    return Err(RuntimeError::NoSandbox(format!(
+                        "NEHA_HOME is inside {system}; a Hosted sandbox would mount that directory. Move NEHA_HOME outside the system directories",
+                        system = system.display()
+                    )));
+                }
+            }
+            if let Some(cli_dir) = cli_dir
+                .as_deref()
+                .and_then(|dir| std::fs::canonicalize(dir).ok())
+                && root.starts_with(&cli_dir)
+            {
+                return Err(RuntimeError::NoSandbox(
+                    "NEHA_HOME is inside the CLI directory; a Hosted sandbox would mount that directory"
+                        .to_owned(),
+                ));
+            }
+        }
+        // The old managed runtime ran with the Space user's rights, so a
+        // Workspace can already hold a hard link or symlink to a host file.
+        // Refuse it before the writable bind: a reset is the owner's repair.
+        #[cfg(unix)]
+        {
+            let folder = Self::open_workspace(&workspace)?;
+            scan_bot_folder(&folder, &workspace).map_err(|error| {
+                RuntimeError::UnsafeFolder(format!(
+                    "{error}; reset the Hosted Computer to clear its Workspace"
+                ))
+            })?;
+        }
+        let mut runtime = Self::managed(workspace)?;
         let bwrap = find_bwrap().ok_or_else(no_sandbox)?;
         probe_hosted(&bwrap, &runtime.root)?;
         runtime.hosted = Some(bwrap);
@@ -4757,5 +4836,50 @@ mod tests {
         let error = probe_hosted(&bwrap, &missing)
             .expect_err("a missing workspace cannot be mounted into a Hosted sandbox");
         assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_workspace_inside_a_system_mount_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let error =
+            LocalRuntime::hosted_with_hidden(&workspace, vec![std::path::PathBuf::from("/usr")])
+                .err()
+                .expect("a home under a mounted system directory would leak");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_workspace_symlink_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("workspace");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = LocalRuntime::hosted(&link)
+            .err()
+            .expect("a Workspace that is a symlink cannot be bound as the writable root");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_workspace_holding_a_link_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "host bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+        let error = LocalRuntime::hosted(&workspace)
+            .err()
+            .expect("a linked entry could change a host file through the writable bind");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
+
+        std::fs::remove_file(workspace.join("link")).unwrap();
+        std::fs::hard_link(&outside, workspace.join("hard")).unwrap();
+        let error = LocalRuntime::hosted(&workspace)
+            .err()
+            .expect("a hard link would share an inode with a host file");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
     }
 }

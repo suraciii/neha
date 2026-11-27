@@ -193,7 +193,9 @@ pub async fn execute(
         CommandCall::ComputerList => read(context.state, |state| {
             list_computers(state, context.links, account.id)
         }),
-        CommandCall::ComputerReset { computer } => computer_reset(context, account, computer).await,
+        CommandCall::ComputerReset { computer } => {
+            computer_reset(context, account, command_id, fingerprint, computer).await
+        }
         CommandCall::BotCreate(arguments) => {
             bot_create(context, account, command_id, fingerprint, arguments).await
         }
@@ -912,6 +914,24 @@ async fn bot_update(
     if update.full_access.is_none() && update.grants.is_none() {
         return Err(ApiError::invalid_argument("a Bot update needs a change"));
     }
+    {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let bot = state
+            .owned_bot(update.bot, account.id)
+            .ok_or_else(|| ApiError::not_found("no such Bot"))?;
+        let hosted = state
+            .computers
+            .get(&bot.computer)
+            .is_some_and(|computer| computer.kind == "hosted");
+        if hosted {
+            return Err(ApiError::invalid_argument(
+                "file access changes apply only to a Local Computer; a Hosted Computer works only in its Workspace",
+            ));
+        }
+    }
     let grants = update.grants.map(|grants| {
         let mut checked = Vec::new();
         for grant in grants {
@@ -1513,7 +1533,9 @@ fn fresh_hosted(
     // A Hosted Computer is the Space's isolated environment. Do not record one
     // on a machine where that environment cannot start: the User would get a
     // Bot that cannot work, and the record would outlive the failure.
-    if let Err(error) = LocalRuntime::hosted(&workspace) {
+    if let Err(error) =
+        LocalRuntime::hosted_with_hidden(&workspace, vec![context.home.root().to_path_buf()])
+    {
         let _ = std::fs::remove_dir_all(&workspace);
         return Err(ApiError::invalid_argument(format!(
             "this machine cannot provide an isolated Hosted Computer: {error}; pair a Local Computer and use `--computer local` instead"
@@ -1537,8 +1559,13 @@ fn fresh_hosted(
 async fn computer_reset(
     context: &CommandContext<'_>,
     account: &Account,
+    command_id: Id,
+    fingerprint: String,
     computer: Id,
 ) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
     let (workspace, bot) = {
         let mut state = context
             .state
@@ -1582,43 +1609,78 @@ async fn computer_reset(
         // From here the pump must not start a run on this Computer: the clear
         // would race the run's first write. The mark is dropped before return.
         state.begin_reset(computer);
-        (std::path::PathBuf::from(&view.workspace), bot)
+        // The runtime and the reset both derive the folder from the Computer,
+        // not from a recorded path a stale or edited record could redirect at
+        // the Space's own data.
+        (context.home.workspace_dir(computer), bot)
     };
     let root = context.home.root().to_path_buf();
+    let expected = Path::new("computers")
+        .join(computer.to_string())
+        .join("workspace");
+    let requested = workspace.clone();
     let cleared = tokio::task::spawn_blocking(move || {
-        let workspace = std::fs::canonicalize(&workspace)?;
-        if !workspace.starts_with(&root) {
+        let workspace = std::fs::canonicalize(&requested)?;
+        if workspace != requested
+            || workspace == root
+            || !workspace.starts_with(&root)
+            || !workspace.ends_with(&expected)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
-                "the Workspace is outside the Space home",
+                "the Workspace is not this Computer's folder under the Space home",
             ));
         }
         clear_workspace(&workspace)?;
         Ok::<_, std::io::Error>(workspace)
     })
     .await;
-    let result = {
-        let mut state = context
-            .state
-            .lock()
-            .map_err(|_| ApiError::internal("state lock"))?;
-        state.end_reset(computer);
-        cleared
-    };
-    match result {
-        Ok(Ok(_)) => Ok(Outcome {
-            committed: None,
-            result: json!({"computer": computer, "bot": bot, "kind": "hosted"}),
-            queued: None,
-            events: Vec::new(),
-        }),
+    let cleared = match cleared {
+        Ok(Ok(workspace)) => Ok(workspace),
         Ok(Err(error)) => Err(ApiError::internal(format!(
             "cannot reset the Computer workspace: {error}"
         ))),
         Err(error) => Err(ApiError::internal(format!(
             "cannot reset the Computer workspace: {error}"
         ))),
-    }
+    };
+    let result = json!({"computer": computer, "bot": bot, "kind": "hosted"});
+    let outcome = match cleared {
+        Ok(_) => {
+            let drafts = vec![EventDraft::new(
+                EventKind::ComputerReset,
+                Author::User(account.id),
+                json!({"computer": computer}),
+            )];
+            match append(
+                context.store,
+                context.state,
+                command_id,
+                fingerprint,
+                drafts,
+                Some(result.clone()),
+                None,
+            )
+            .await
+            {
+                Ok(appended) => Ok(Outcome {
+                    committed: appended.events.last().map(|event| event.seq),
+                    result,
+                    queued: None,
+                    events: appended.events,
+                }),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    let mut state = context
+        .state
+        .lock()
+        .map_err(|_| ApiError::internal("state lock"))?;
+    state.end_reset(computer);
+    drop(state);
+    outcome
 }
 
 /// Removes every entry of a Workspace without following a symlink.
@@ -2364,7 +2426,10 @@ async fn finish_run_with(
                 };
                 return finish_completion(store, state, pending, outcome).await;
             }
-            match LocalRuntime::hosted(home.workspace_dir(computer)) {
+            match LocalRuntime::hosted_with_hidden(
+                home.workspace_dir(computer),
+                vec![home.root().to_path_buf()],
+            ) {
                 Ok(runtime) => {
                     RunRuntime::Managed(runtime.with_timeout(tool_timeout).with_env(bot_env))
                 }

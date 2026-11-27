@@ -46,6 +46,9 @@ pub enum EventKind {
     /// A Computer was created.
     #[serde(rename = "neha.computer.created")]
     ComputerCreated,
+    /// A Hosted Computer's Workspace was cleared.
+    #[serde(rename = "neha.computer.reset")]
+    ComputerReset,
     /// A Chat was created.
     #[serde(rename = "neha.chat.created")]
     ChatCreated,
@@ -104,6 +107,7 @@ impl EventKind {
             Self::BotMoved => "neha.bot.moved",
             Self::BotUpdated => "neha.bot.updated",
             Self::ComputerCreated => "neha.computer.created",
+            Self::ComputerReset => "neha.computer.reset",
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
             Self::FileAdded => "neha.file.added",
@@ -148,6 +152,7 @@ impl EventKind {
             | Self::BotMoved
             | Self::BotUpdated
             | Self::ComputerCreated
+            | Self::ComputerReset
             | Self::ChatCreated => EventClass::Authority,
         }
     }
@@ -164,6 +169,7 @@ impl FromStr for EventKind {
             "neha.bot.moved" => Ok(Self::BotMoved),
             "neha.bot.updated" => Ok(Self::BotUpdated),
             "neha.computer.created" => Ok(Self::ComputerCreated),
+            "neha.computer.reset" => Ok(Self::ComputerReset),
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
             "neha.file.added" => Ok(Self::FileAdded),
@@ -779,6 +785,8 @@ pub enum EventData {
     BotUpdated(BotUpdated),
     /// A Computer was created.
     ComputerCreated(ComputerCreated),
+    /// A Hosted Computer's Workspace was cleared.
+    ComputerReset(ComputerReset),
     /// A Chat was created.
     ChatCreated(ChatCreated),
     /// A Message was added.
@@ -830,6 +838,7 @@ impl EventKind {
             Self::BotMoved => EventData::BotMoved(decode(data)?),
             Self::BotUpdated => EventData::BotUpdated(decode(data)?),
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
+            Self::ComputerReset => EventData::ComputerReset(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
             Self::FileAdded => {
@@ -875,6 +884,7 @@ impl EventKind {
             | Self::BotMoved
             | Self::BotUpdated
             | Self::ComputerCreated
+            | Self::ComputerReset
             | Self::ChatCreated => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
                     return Err(EventDataError::Author);
@@ -1087,6 +1097,14 @@ pub struct ComputerCreated {
     pub kind: ComputerKind,
     /// The Computer's workspace directory.
     pub workspace: String,
+}
+
+/// The data of `neha.computer.reset`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComputerReset {
+    /// The Hosted Computer whose Workspace was cleared.
+    pub computer: Id,
 }
 
 /// The data of `neha.chat.created`.
