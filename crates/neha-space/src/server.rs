@@ -65,6 +65,8 @@ const SOURCE_ATTEMPTS: usize = 20;
 const LOGIN_WINDOW: Duration = Duration::from_secs(15 * 60);
 const LOGIN_NAMES: usize = 1024;
 const HEARTBEAT: Duration = Duration::from_secs(30);
+/// How long a browser session cookie lasts: 400 days.
+const SESSION_MAX_AGE_SECONDS: u64 = 400 * 24 * 60 * 60;
 /// How many pairing attempts one User may have in a window.
 const PAIRING_ATTEMPTS: usize = 10;
 /// The window pairing attempts are counted over.
@@ -118,6 +120,8 @@ pub struct SpaceServer {
     ui: Option<PathBuf>,
     session_cookie: String,
     browser_host: String,
+    /// The authority the browser uses: the public origin or the local host and port.
+    browser_authority: Mutex<Option<String>>,
     /// The public https origin a trusted TLS proxy forwards to this Space.
     public_url: Option<String>,
 }
@@ -199,6 +203,7 @@ impl SpaceServer {
             ui,
             session_cookie,
             browser_host,
+            browser_authority: Mutex::new(None),
             public_url,
         })
     }
@@ -316,6 +321,12 @@ impl Running {
             .unwrap_or_else(|| format!("http://{}:{}", self.browser_host, self.addr.port()))
     }
 
+    /// Returns the public HTTPS origin, when the Space serves one.
+    #[must_use]
+    pub fn public_url(&self) -> Option<String> {
+        self.server.public_url.clone()
+    }
+
     /// Returns the browser invitation, when the Space has no Admin yet.
     #[must_use]
     pub fn browser_invite(&self) -> Option<String> {
@@ -377,9 +388,11 @@ pub async fn start_with_ui(
     start_with_ui_public(home, port, ui, public_url_from_env()?).await
 }
 
-/// Starts a UI-serving Space with an explicit public origin. Tests use this;
-/// `start_with_ui` reads `NEHA_PUBLIC_URL`.
-pub(crate) async fn start_with_ui_public(
+/// Starts a UI-serving Space with an explicit public origin.
+///
+/// The origin is a full `https://` origin. `--domain` builds one from a host;
+/// tests pass an origin directly.
+pub async fn start_with_ui_public(
     home: Home,
     port: u16,
     ui: Option<PathBuf>,
@@ -390,7 +403,7 @@ pub(crate) async fn start_with_ui_public(
         port,
         ui,
         neha_computer::local::DEFAULT_TIMEOUT,
-        public_url,
+        normalize_public_url(public_url)?,
     )
     .await
 }
@@ -422,6 +435,14 @@ async fn start_with(
     // cannot listen must not make a run, reach a Provider, or record a failure.
     let listener = TcpListener::bind(("127.0.0.1", port)).await?;
     let addr = listener.local_addr()?;
+    let browser_authority = match &server.public_url {
+        Some(public) => public.strip_prefix("https://").unwrap_or(public).to_owned(),
+        None => format!("{}:{}", server.browser_host, addr.port()),
+    };
+    *server
+        .browser_authority
+        .lock()
+        .expect("browser authority lock") = Some(browser_authority);
     if let Ok(mut state) = server.state.lock() {
         state.url = Some(format!("http://{addr}"));
     }
@@ -496,15 +517,18 @@ async fn start_with(
 }
 
 async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
     let host = request
         .headers()
         .get(HOST)
-        .and_then(|value| value.to_str().ok());
-    let browser_host = host
-        .and_then(split_authority)
-        .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&server.browser_host));
-    if !host.is_some_and(loopback_host) && !browser_host {
-        return ApiError::forbidden("the Host header must name loopback").into_response();
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let Some(host) = host.as_deref() else {
+        return ApiError::forbidden("the Host header must name this Space").into_response();
+    };
+    let browser_host = is_browser_authority(&server, host);
+    if !loopback_host(host) && !browser_host {
+        return ApiError::forbidden("the Host header must name this Space").into_response();
     }
     let origin = request
         .headers()
@@ -516,14 +540,54 @@ async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: N
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("Bearer "));
     if let Some(origin) = origin {
-        let same_site =
-            host.is_some_and(|host| same_authority(origin, host, server.browser_scheme()));
+        let same_site = same_authority(origin, host, server.browser_scheme());
         if (!same_site || !browser_host) && !bearer {
             return ApiError::forbidden("a browser Origin must name this Space").into_response();
         }
     }
 
-    next.run(request).await
+    let mut response = next.run(request).await;
+    add_security_headers(&mut response, &server, host);
+    if path == "/healthz" || path == "/api" || path.starts_with("/api/") {
+        response
+            .headers_mut()
+            .insert("cache-control", HeaderValue::from_static("no-store"));
+    }
+    response
+}
+
+/// Adds the headers every response uses, and HSTS on a public origin.
+fn add_security_headers(response: &mut Response, server: &SpaceServer, host: &str) {
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    if let Ok(value) = HeaderValue::from_str(&content_security_policy(server, host)) {
+        headers.insert("content-security-policy", value);
+    }
+    if server.public_url.is_some() {
+        headers.insert(
+            "strict-transport-security",
+            HeaderValue::from_static("max-age=31536000"),
+        );
+    }
+}
+
+/// Names the origin the client may load from and talk to.
+fn content_security_policy(server: &SpaceServer, host: &str) -> String {
+    let (http, ws) = match &server.public_url {
+        Some(public) => (public.clone(), public.replacen("https://", "wss://", 1)),
+        None => (format!("http://{host}"), format!("ws://{host}")),
+    };
+    format!(
+        "default-src 'self'; base-uri 'none'; object-src 'none'; frame-ancestors 'none'; \
+         form-action 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+         font-src 'self'; manifest-src 'self'; worker-src 'self'; \
+         connect-src 'self' {http} {ws}"
+    )
 }
 
 fn same_authority(origin: &str, host: &str, scheme: &str) -> bool {
@@ -537,7 +601,44 @@ fn same_authority(origin: &str, host: &str, scheme: &str) -> bool {
         return false;
     }
     let authority = rest.split('/').next().unwrap_or(rest);
-    authority.eq_ignore_ascii_case(host)
+    canonical_authority(authority, scheme)
+        .zip(canonical_authority(host, scheme))
+        .is_some_and(|(origin, host)| origin == host)
+}
+
+/// Returns the host and non-default port of an authority, lowercased.
+fn canonical_authority(value: &str, scheme: &str) -> Option<String> {
+    let (host, port) = split_authority(value)?;
+    let default = if scheme == "https" { 443 } else { 80 };
+    let port = match port {
+        None => None,
+        Some(port) => {
+            let port = port.parse::<u16>().ok().filter(|port| *port != 0)?;
+            (port != default).then_some(port)
+        }
+    };
+    let host = host.to_ascii_lowercase();
+    let host = if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    Some(match port {
+        Some(port) => format!("{host}:{port}"),
+        None => host,
+    })
+}
+
+/// Returns whether `host` is the authority the browser uses for this Space.
+fn is_browser_authority(server: &SpaceServer, host: &str) -> bool {
+    let scheme = server.browser_scheme();
+    match server.browser_authority() {
+        Some(expected) => canonical_authority(&expected, scheme)
+            .zip(canonical_authority(host, scheme))
+            .is_some_and(|(expected, host)| expected == host),
+        None => split_authority(host)
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case(&server.browser_host)),
+    }
 }
 
 fn public_url_from_env() -> Result<Option<String>, ServerError> {
@@ -547,7 +648,18 @@ fn public_url_from_env() -> Result<Option<String>, ServerError> {
     let value = value
         .to_str()
         .ok_or_else(|| ServerError::PublicUrl("the public URL is not UTF-8".to_owned()))?;
-    let url = reqwest::Url::parse(value)
+    normalize_public_url(Some(value.to_owned()))
+}
+
+/// Validates a public HTTPS origin and returns its canonical form.
+///
+/// `--domain` builds `https://<domain>`; `NEHA_PUBLIC_URL` supplies a full
+/// origin. Both end here, so the Space stores one canonical origin.
+fn normalize_public_url(public_url: Option<String>) -> Result<Option<String>, ServerError> {
+    let Some(value) = public_url else {
+        return Ok(None);
+    };
+    let url = reqwest::Url::parse(&value)
         .map_err(|error| ServerError::PublicUrl(format!("{value}: {error}")))?;
     if url.scheme() != "https" {
         return Err(ServerError::PublicUrl(
@@ -581,6 +693,39 @@ fn loopback_host(value: &str) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// Returns the client address, trusting a forwarded one only from loopback.
+///
+/// A TLS proxy on the Space's machine connects from loopback and appends the
+/// client to `X-Forwarded-For`; a proxy on another machine does not get to
+/// name the client. Only the final appended value counts.
+fn client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+    if !peer.is_loopback() {
+        return peer;
+    }
+    // Select the final raw field first. A malformed field must fail closed to
+    // the peer, not expose an earlier client-supplied field.
+    let Some(value) = headers.get_all("x-forwarded-for").iter().next_back() else {
+        return peer;
+    };
+    let Some(value) = value.to_str().ok() else {
+        return peer;
+    };
+    forwarded_ip(value)
+        .filter(|address| !address.is_loopback())
+        .unwrap_or(peer)
+}
+
+/// Returns the final address in one forwarded field, or `None` when it is not
+/// an address. Earlier values are the client's claim, not the proxy's.
+fn forwarded_ip(value: &str) -> Option<IpAddr> {
+    let last = value.split(',').next_back()?.trim().trim_matches('"');
+    let last = last
+        .strip_prefix('[')
+        .and_then(|last| last.strip_suffix(']'))
+        .unwrap_or(last);
+    last.parse().ok()
 }
 
 fn split_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -751,11 +896,7 @@ async fn client_file(
     uri: Uri,
 ) -> Response {
     let host = headers.get(HOST).and_then(|value| value.to_str().ok());
-    let host_name = host
-        .and_then(split_authority)
-        .map(|(host, _)| host)
-        .unwrap_or_default();
-    if !host_name.eq_ignore_ascii_case(&server.browser_host) {
+    if !host.is_some_and(|host| is_browser_authority(&server, host)) {
         let port = host
             .and_then(split_authority)
             .and_then(|(_, port)| port)
@@ -804,12 +945,28 @@ async fn client_file(
         return ApiError::not_found("no such file").into_response();
     };
     let content_type = content_type(&target);
+    let cache = cache_control(&root, &target);
     let mut response = ([(axum::http::header::CONTENT_TYPE, content_type)], bytes).into_response();
-    response.headers_mut().insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
     response
+        .headers_mut()
+        .insert("cache-control", HeaderValue::from_static(cache));
+    response
+}
+
+/// Returns how long a browser may keep a served client file.
+fn cache_control(root: &Path, target: &Path) -> &'static str {
+    let relative = target.strip_prefix(root).unwrap_or(target);
+    if relative.starts_with("assets") {
+        // Vite names every built asset after its content.
+        "public, max-age=31536000, immutable"
+    } else if relative.starts_with("fonts") {
+        "public, max-age=604800"
+    } else if relative.starts_with("icons") {
+        "public, max-age=86400"
+    } else {
+        // The entry point, the worker, and the manifest name the next build.
+        "no-cache"
+    }
 }
 
 fn content_type(path: &Path) -> &'static str {
@@ -819,6 +976,7 @@ fn content_type(path: &Path) -> &'static str {
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("json") | Some("map") => "application/json",
+        Some("webmanifest") => "application/manifest+json",
         Some("woff2") => "font/woff2",
         Some("woff") => "font/woff",
         Some("png") => "image/png",
@@ -932,11 +1090,12 @@ async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
+    let source = client_ip(source.ip(), &headers);
     if !server
         .login
         .lock()
         .expect("login lock")
-        .allows(&request.display_name, source.ip())
+        .allows(&request.display_name, source)
     {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -969,7 +1128,7 @@ async fn login(
                 .login
                 .lock()
                 .expect("login lock")
-                .record(&request.display_name, source.ip());
+                .record(&request.display_name, source);
             Err(ApiError::new(
                 StatusCode::UNAUTHORIZED,
                 ErrorCode::Unauthorized,
@@ -981,6 +1140,14 @@ async fn login(
 }
 
 impl SpaceServer {
+    /// Returns the authority the browser uses for this Space.
+    fn browser_authority(&self) -> Option<String> {
+        self.browser_authority
+            .lock()
+            .ok()
+            .and_then(|authority| authority.clone())
+    }
+
     fn browser_scheme(&self) -> &'static str {
         if self.public_url.is_some() {
             "https"
@@ -997,7 +1164,7 @@ impl SpaceServer {
             ""
         };
         let cookie = format!(
-            "{}={token}; Path=/; HttpOnly; SameSite=Strict{secure}",
+            "{}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={SESSION_MAX_AGE_SECONDS}{secure}",
             self.session_cookie
         );
         if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
@@ -1019,17 +1186,12 @@ fn session_cookie_name(home: &Path) -> String {
 
 fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
     let origin = headers.get(ORIGIN).and_then(|value| value.to_str().ok());
-    let host = headers
-        .get(HOST)
-        .and_then(|value| value.to_str().ok())
-        .and_then(split_authority)
-        .map(|(host, _)| host);
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
     origin.is_some_and(|origin| {
-        host.is_some_and(|host| host.eq_ignore_ascii_case(&server.browser_host))
-            && headers
-                .get(HOST)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|host| same_authority(origin, host, server.browser_scheme()))
+        host.is_some_and(|host| {
+            is_browser_authority(server, host)
+                && same_authority(origin, host, server.browser_scheme())
+        })
     })
 }
 
@@ -2218,8 +2380,7 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
                     .headers
                     .get(HOST)
                     .and_then(|value| value.to_str().ok())
-                    .and_then(split_authority)
-                    .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&server.browser_host));
+                    .is_some_and(|host| is_browser_authority(server, host));
                 browser_host
                     .then(|| cookie_token(&parts.headers, &server.session_cookie))
                     .flatten()
@@ -2797,6 +2958,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ui = tempfile::tempdir().unwrap();
         std::fs::write(ui.path().join("index.html"), "<!doctype html>").unwrap();
+        std::fs::create_dir(ui.path().join("assets")).unwrap();
+        std::fs::write(ui.path().join("assets/app-abc.js"), "console.log(1)").unwrap();
+        std::fs::write(
+            ui.path().join("sw.js"),
+            "self.addEventListener('fetch', () => {})",
+        )
+        .unwrap();
+        std::fs::write(ui.path().join("manifest.webmanifest"), "{}").unwrap();
+        std::fs::create_dir(ui.path().join("icons")).unwrap();
+        std::fs::write(ui.path().join("icons/icon-192.png"), b"png").unwrap();
         let running = start_with_ui_public(
             test_home(dir.path()),
             0,
@@ -2806,14 +2977,45 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(running.browser_url(), "https://space.example.com");
+        assert_eq!(
+            running.public_url().as_deref(),
+            Some("https://space.example.com")
+        );
         let invite = running.invite.clone().expect("a fresh Space invites");
         assert!(invite.starts_with("https://space.example.com/invite#"));
-        join(&running, &invite, "Ada", "correct horse battery").await;
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap();
+
+        // A public browser joins through the proxy and receives the same
+        // Secure, persistent session cookie as it gets on sign-in.
+        let secret = invite.split_once('#').unwrap().1;
+        let joined = client
+            .post(format!("{}/api/join", running.url()))
+            .header("host", "space.example.com")
+            .header("origin", "https://space.example.com")
+            .json(&json!({
+                "secret": secret,
+                "display_name": "Ada",
+                "password": "correct horse battery",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(joined.status(), reqwest::StatusCode::OK);
+        let joined_cookie = joined
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(joined_cookie.contains("; Secure"), "{joined_cookie}");
+        assert!(
+            joined_cookie.contains("; Max-Age=34560000"),
+            "{joined_cookie}"
+        );
 
         // A loopback request must move to the public TLS origin, not to the
         // Space's private browser hostname.
@@ -2829,6 +3031,98 @@ mod tests {
             "https://space.example.com/"
         );
 
+        // The public page is served directly, never redirected, and carries the
+        // headers a browser needs from a TLS origin.
+        let page = client
+            .get(format!("{}/", running.url()))
+            .header("host", "space.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            page.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(page.headers().get("cache-control").unwrap(), "no-cache");
+        assert_eq!(
+            page.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(page.headers().get("x-frame-options").unwrap(), "DENY");
+        assert_eq!(
+            page.headers().get("referrer-policy").unwrap(),
+            "no-referrer"
+        );
+        assert_eq!(
+            page.headers().get("strict-transport-security").unwrap(),
+            "max-age=31536000"
+        );
+        let csp = page
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("connect-src 'self' https://space.example.com wss://space.example.com"),
+            "{csp}"
+        );
+        assert!(csp.contains("worker-src 'self'"), "{csp}");
+
+        // A phone installs from the same origin; the worker and manifest must
+        // revalidate, while a content-named asset never does.
+        let manifest = client
+            .get(format!("{}/manifest.webmanifest", running.url()))
+            .header("host", "space.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            manifest.headers().get("content-type").unwrap(),
+            "application/manifest+json"
+        );
+        assert_eq!(manifest.headers().get("cache-control").unwrap(), "no-cache");
+
+        let worker = client
+            .get(format!("{}/sw.js", running.url()))
+            .header("host", "space.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(worker.headers().get("cache-control").unwrap(), "no-cache");
+
+        let asset = client
+            .get(format!("{}/assets/app-abc.js", running.url()))
+            .header("host", "space.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            asset.headers().get("content-type").unwrap(),
+            "text/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            asset.headers().get("cache-control").unwrap(),
+            "public, max-age=31536000, immutable"
+        );
+
+        let health = client
+            .get(format!("{}/healthz", running.url()))
+            .header("host", "space.example.com")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.headers().get("cache-control").unwrap(), "no-store");
+
+        let evil = client
+            .get(running.url())
+            .header("host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(evil.status(), reqwest::StatusCode::FORBIDDEN);
+
         // A browser request through the proxy carries the public Host and the
         // matching https Origin; it receives the Secure session cookie.
         let login = client
@@ -2842,6 +3136,18 @@ mod tests {
         assert_eq!(login.status(), reqwest::StatusCode::OK);
         let cookie = login.headers().get("set-cookie").unwrap().to_str().unwrap();
         assert!(cookie.contains("; Secure"), "{cookie}");
+        assert!(cookie.contains("; Max-Age=34560000"), "{cookie}");
+
+        // The cookie authenticates on the public authority.
+        let session = cookie.split(';').next().unwrap();
+        let me = client
+            .get(format!("{}/api/me", running.url()))
+            .header("host", "space.example.com")
+            .header("cookie", session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(me.status(), reqwest::StatusCode::OK);
 
         // A page on another scheme is not this Space.
         let wrong_scheme = client
@@ -2854,7 +3160,146 @@ mod tests {
             .unwrap();
         assert_eq!(wrong_scheme.status(), reqwest::StatusCode::FORBIDDEN);
 
+        // The default port and its omission name one authority.
+        let default_port = client
+            .post(format!("{}/api/login", running.url()))
+            .header("host", "space.example.com:443")
+            .header("origin", "https://space.example.com")
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(default_port.status(), reqwest::StatusCode::OK);
+
+        // Another port is another browser origin.
+        let wrong_port = client
+            .post(format!("{}/api/login", running.url()))
+            .header("host", "space.example.com:8443")
+            .header("origin", "https://space.example.com:8443")
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_port.status(), reqwest::StatusCode::FORBIDDEN);
+
+        // The page itself follows the same authority.
+        let default_page = client
+            .get(format!("{}/", running.url()))
+            .header("host", "space.example.com:443")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(default_page.status(), reqwest::StatusCode::OK);
+
         running.shutdown().await;
+    }
+
+    #[test]
+    fn a_public_origin_keeps_an_explicit_port() {
+        assert_eq!(
+            super::normalize_public_url(Some("https://space.example.com:443/".to_owned()))
+                .unwrap()
+                .unwrap(),
+            "https://space.example.com"
+        );
+        assert_eq!(
+            super::normalize_public_url(Some("https://space.example.com:8443".to_owned()))
+                .unwrap()
+                .unwrap(),
+            "https://space.example.com:8443"
+        );
+        assert!(super::normalize_public_url(Some("http://space.example.com".to_owned())).is_err());
+        assert!(
+            super::normalize_public_url(Some("https://space.example.com/path".to_owned())).is_err()
+        );
+        assert!(
+            super::normalize_public_url(Some("https://user@space.example.com".to_owned())).is_err()
+        );
+        assert!(super::normalize_public_url(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_authority_omits_only_its_default_port() {
+        assert!(super::same_authority(
+            "https://space.example.com",
+            "space.example.com:443",
+            "https"
+        ));
+        assert!(super::same_authority(
+            "https://space.example.com:8443",
+            "space.example.com:8443",
+            "https"
+        ));
+        assert!(super::same_authority(
+            "https://space.example.com",
+            "SPACE.EXAMPLE.COM",
+            "https"
+        ));
+        assert!(super::same_authority(
+            "http://neha-abc.localhost:7337",
+            "neha-abc.localhost:7337",
+            "http"
+        ));
+        assert!(!super::same_authority(
+            "https://space.example.com",
+            "space.example.com:8443",
+            "https"
+        ));
+        assert!(!super::same_authority(
+            "https://space.example.com",
+            "space.example.com",
+            "http"
+        ));
+        assert!(!super::same_authority(
+            "https://space.example.com:notaport",
+            "space.example.com",
+            "https"
+        ));
+        assert!(!super::same_authority(
+            "https://space.example.com",
+            "127.0.0.1:443",
+            "https"
+        ));
+    }
+
+    #[test]
+    fn a_forwarded_address_is_used_only_from_a_loopback_proxy() {
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let headers = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        let proxy = std::net::IpAddr::from([127, 0, 0, 1]);
+        let client = std::net::IpAddr::from([203, 0, 113, 7]);
+        let remote = std::net::IpAddr::from([192, 0, 2, 1]);
+        assert_eq!(
+            super::client_ip(proxy, &headers("10.0.0.4, 203.0.113.7")),
+            client
+        );
+        assert_eq!(super::client_ip(remote, &headers("203.0.113.7")), remote);
+        assert_eq!(super::client_ip(proxy, &headers("garbage")), proxy);
+        assert_eq!(
+            super::client_ip(proxy, &headers("203.0.113.7, 127.0.0.1")),
+            proxy
+        );
+        assert_eq!(super::forwarded_ip("10.0.0.4, 203.0.113.7"), Some(client));
+        assert_eq!(super::forwarded_ip("203.0.113.7, garbage"), None);
+        assert_eq!(super::forwarded_ip("127.0.0.1"), Some(proxy));
+
+        let mut fields = HeaderMap::new();
+        fields.append("x-forwarded-for", HeaderValue::from_static("198.51.100.9"));
+        fields.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        assert_eq!(super::client_ip(proxy, &fields), client);
+
+        let mut invalid = HeaderMap::new();
+        invalid.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
+        invalid.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(&[0xFF]).expect("obs-text is a header value"),
+        );
+        assert_eq!(super::client_ip(proxy, &invalid), proxy);
     }
 
     #[tokio::test(flavor = "multi_thread")]

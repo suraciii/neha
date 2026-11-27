@@ -684,11 +684,14 @@ pub async fn command(credential: &Credential, command: CommandCall) -> Result<Va
     command_on(&mut socket, command).await
 }
 
+/// Maps the Space's HTTP origin to the command socket's scheme.
+fn socket_url(url: &str) -> String {
+    url.replacen("http://", "ws://", 1)
+        .replacen("https://", "wss://", 1)
+}
+
 async fn connect(credential: &Credential) -> Result<Socket> {
-    let url = credential
-        .url
-        .replacen("http://", "ws://", 1)
-        .replacen("https://", "wss://", 1);
+    let url = socket_url(&credential.url);
     let mut request = format!("{url}/api/socket")
         .into_client_request()
         .context("the Space URL is not usable")?;
@@ -741,6 +744,22 @@ mod tests {
         Credential, PairedComputer, SignedIn, disposition_name, pair_body, pair_url,
         pair_with_ticket, read_for_upload, request_ticket, ticket_url, wait_for_run_within,
     };
+
+    #[test]
+    fn a_public_origin_uses_wss() {
+        assert_eq!(
+            super::socket_url("https://space.example.com"),
+            "wss://space.example.com"
+        );
+        assert_eq!(
+            super::socket_url("https://space.example.com:8443"),
+            "wss://space.example.com:8443"
+        );
+        assert_eq!(
+            super::socket_url("http://127.0.0.1:7337"),
+            "ws://127.0.0.1:7337"
+        );
+    }
 
     /// The CLI's credential for a Space at this address.
     fn credential_at(address: std::net::SocketAddr) -> Credential {

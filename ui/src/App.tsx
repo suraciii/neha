@@ -9,6 +9,7 @@ import { t, type MessageKey } from "./i18n";
 import { api, ApiError } from "./lib/api";
 import { MAX_FILE_BYTES,
   MAX_FILE_LABEL, formatBytes, indexFiles, mediaTypeFor } from "./lib/files";
+import { watchViewportHeight } from "./lib/viewport";
 import { Commands, ProtocolError } from "./lib/ws";
 import type {
   Account,
@@ -193,6 +194,7 @@ export default function App() {
     });
   }
   const [ready, setReady] = createSignal(false);
+  const [offline, setOffline] = createSignal(false);
   const [authMode, setAuthMode] = createSignal<AuthMode>("login");
   const [authSecret, setAuthSecret] = createSignal("");
   const [isMobile, setIsMobile] = createSignal(false);
@@ -208,6 +210,10 @@ export default function App() {
   let calibrating = false;
   let calibrateAgain = false;
   let previewLoad = 0;
+  let mediaQuery: MediaQueryList | null = null;
+  let onMediaChange: ((event: MediaQueryListEvent) => void) | null = null;
+  let onPopState: (() => void) | null = null;
+  let stopViewport: (() => void) | null = null;
 
   // The Run this page follows: the newest one it submitted, or the one its Chat
   // was already running when it opened. It only moves forward, queued → running,
@@ -544,9 +550,28 @@ export default function App() {
   }
 
   onSettled(() => {
-    const query = window.matchMedia("(max-width: 900px)");
-    setIsMobile(query.matches);
-    query.addEventListener("change", (event) => setIsMobile(event.matches));
+    mediaQuery = window.matchMedia("(max-width: 900px)");
+    setIsMobile(mediaQuery.matches);
+    onMediaChange = (event) => {
+      setIsMobile(event.matches);
+      // A Chat chosen while the window was wide still needs its Back entry.
+      if (event.matches && state.activeChat) rememberChat(state.activeChat, true);
+    };
+    mediaQuery.addEventListener("change", onMediaChange);
+    stopViewport = watchViewportHeight();
+
+    onPopState = () => {
+      if (!isMobile()) return;
+      const chatId = history.state?.nehaChat;
+      if (!chatId) {
+        backToList();
+        return;
+      }
+      // Forward reopens the Chat its entry names.
+      const chat = state.chats.find((candidate) => candidate.id === chatId);
+      if (chat) void selectChat(chat);
+    };
+    window.addEventListener("popstate", onPopState);
 
     const secret = location.hash.replace(/^#/, "");
     if (location.pathname === "/invite") {
@@ -564,6 +589,9 @@ export default function App() {
       window.clearTimeout(refreshTimer);
       refreshTimer = null;
     }
+    if (mediaQuery && onMediaChange) mediaQuery.removeEventListener("change", onMediaChange);
+    if (onPopState) window.removeEventListener("popstate", onPopState);
+    if (stopViewport) stopViewport();
     void commands.close();
   });
 
@@ -956,13 +984,20 @@ export default function App() {
   }
 
   async function boot() {
+    setOffline(false);
+    setReady(false);
     try {
       const account = await api.me();
       await enter(account);
     } catch (reason) {
-      if (!(reason instanceof ApiError && reason.status === 401)) {
-        setAuthMode("login");
+      if (reason instanceof ApiError && reason.status === 401) {
+        // The Space is there and this browser is signed out.
+        setReady(true);
+        return;
       }
+      // The installed client keeps its shell and lets the User retry; an
+      // unreachable Space is not the same as a signed-out browser.
+      setOffline(true);
       setReady(true);
     }
   }
@@ -992,8 +1027,19 @@ export default function App() {
       });
       await loadPreviews(chats);
       const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
-      const target = active ?? (!isMobile() ? chats[0] : undefined);
+      // A reload keeps the Chat entry; reopen that Chat in the same entry.
+      const restored: string | null = isMobile() ? (history.state?.nehaChat ?? null) : null;
+      const target =
+        active ??
+        (!isMobile()
+          ? chats[0]
+          : restored
+            ? chats.find((chat) => chat.id === restored)
+            : undefined);
       if (target) await selectChat(target);
+      if (isMobile() && restored && !chats.some((chat) => chat.id === restored)) {
+        history.replaceState(null, "");
+      }
     } catch (reason) {
       update({ error: reason });
     } finally {
@@ -1031,6 +1077,7 @@ export default function App() {
   }
 
   async function selectChat(chat: Chat, focus?: string | null) {
+    rememberChat(chat);
     const generation = ++runGeneration;
     followed = null;
     setActivity(null);
@@ -1308,6 +1355,24 @@ export default function App() {
     update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, queue: null, deciding: null, error: null });
   }
 
+  // The mobile Chat is a view of the list's page. Give it one history entry so
+  // the system Back closes the Chat instead of leaving the client, and replace
+  // that entry when another Chat opens.
+  function rememberChat(chat: Chat, force = false) {
+    if (!force && !isMobile()) return;
+    const entry = { nehaChat: chat.id };
+    if (history.state?.nehaChat) history.replaceState(entry, "");
+    else history.pushState(entry, "");
+  }
+
+  function closeChat() {
+    if (isMobile() && history.state?.nehaChat) {
+      history.back();
+      return;
+    }
+    backToList();
+  }
+
   const errorText = () => (state.error ? messageFor(state.error) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
@@ -1385,12 +1450,13 @@ export default function App() {
 
   return (
     <Show when={ready()} fallback={<Boot />}>
-      <Show
-        when={state.account}
-        fallback={
-          <AuthView mode={authMode()} secret={authSecret()} onAuthed={(account) => void enter(account)} />
-        }
-      >
+      <Show when={!offline()} fallback={<Offline onRetry={() => void boot()} />}>
+        <Show
+          when={state.account}
+          fallback={
+            <AuthView mode={authMode()} secret={authSecret()} onAuthed={(account) => void enter(account)} />
+          }
+        >
         {(account) => (
           <div class={`app${showChat() ? " app--chat" : ""}${needsSetup() ? " app--setup" : ""}`}>
             <Rail
@@ -1459,14 +1525,33 @@ export default function App() {
                   error={errorText()}
                   onSend={sendMessage}
                   onDecide={decideApproval}
-                  onBack={backToList}
+                  onBack={closeChat}
                 />
               </Show>
             </main>
           </div>
         )}
+        </Show>
       </Show>
     </Show>
+  );
+}
+
+function Offline(props: { onRetry: () => void }) {
+  return (
+    <div class="offline" role="alert">
+      <span class="boot__mark">
+        <svg viewBox="0 0 32 32" aria-hidden="true">
+          <path d="M16 4.5 27 16 16 27.5 5 16Z" />
+          <path d="M16 11.4 20.6 16 16 20.6 11.4 16Z" />
+        </svg>
+      </span>
+      <h1 class="offline__title">{t("boot.offline.title")}</h1>
+      <p class="offline__text">{t("boot.offline.text")}</p>
+      <button class="btn btn--quiet" type="button" onClick={props.onRetry}>
+        {t("boot.retry")}
+      </button>
+    </div>
   );
 }
 

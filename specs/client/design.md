@@ -18,15 +18,15 @@ Owned by client. The Space serves the client, and the command surface carries ev
 
 The Space serves the built client from a directory. The directory defaults to `ui/dist` and can be set with `--ui` or `NEHA_UI_DIR`.
 
-The Space listens on `127.0.0.1` and serves the browser client from a hostname stable for its home, under `.localhost`. The session cookie is host-only on that hostname. The Space does not accept a browser session on `127.0.0.1` or `localhost`.
+A Space without a public origin listens on `127.0.0.1` and serves the browser client from a hostname stable for its home, under `.localhost`. The session cookie is host-only on that hostname. The Space does not accept a browser session on `127.0.0.1` or `localhost`.
 
-A Space MAY sit behind a trusted TLS proxy that forwards to loopback. When
-`NEHA_PUBLIC_URL` names its `https://` origin, that origin is the browser
-hostname.
+A Space that a browser reaches over a network sits behind a trusted TLS proxy that forwards to loopback. The public origin is named by `NEHA_PUBLIC_URL`, a full `https://` origin, or by `--domain`/`NEHA_DOMAIN`, a host with an optional port.
 
-The Space accepts that Host and Origin, issues a `Secure` cookie, and redirects
-loopback requests to it. The proxy MUST preserve the public Host and Origin and
-terminate TLS; the Space still listens on loopback only.
+That origin is the browser hostname. The Space accepts its `Host` and `https` `Origin`, issues a `Secure` session cookie, and redirects a loopback browser request to it. The proxy MUST preserve the public `Host` and `Origin` and terminate TLS; the Space still listens on loopback only.
+
+The Space sends HSTS on the public origin, a Content Security Policy limited to its own origin, and cache rules that keep the shell fresh and content-named assets immutable.
+
+Without a public origin, the browser client uses its local hostname over `http`. An Origin is accepted only when it names the request's own host with the scheme the Space serves.
 
 A path that does not name a file returns `index.html`, the browser entry point. The build also carries `desktop.html`, the desktop chooser entry point. A missing or escaping entry point is a start error, not a partial page.
 

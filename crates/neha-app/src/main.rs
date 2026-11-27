@@ -38,6 +38,11 @@ enum Top {
         /// The browser client directory; defaults to NEHA_UI_DIR or ui/dist.
         #[arg(long)]
         ui: Option<std::path::PathBuf>,
+        /// The public domain users reach through a TLS proxy, such as
+        /// neha.example.com; defaults to NEHA_DOMAIN. Use NEHA_PUBLIC_URL for
+        /// a full https origin.
+        #[arg(long)]
+        domain: Option<String>,
     },
     /// Join a Space from its invitation link.
     Join {
@@ -459,8 +464,11 @@ impl From<RuleEffectChoice> for RuleEffect {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Both rustls providers are in the dependency graph (reqwest 0.12 and
+    // 0.13). The command socket chooses one explicitly before it connects.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     match Cli::parse().command {
-        Top::Serve { port, ui } => serve(port, ui).await,
+        Top::Serve { port, ui, domain } => serve(port, ui, domain).await,
         Top::Join { link, name } => join(&link, &name).await,
         Top::Login { name, server } => login(&name, server).await,
         Top::Whoami => whoami(),
@@ -477,7 +485,7 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn serve(port: u16, ui: Option<std::path::PathBuf>) -> Result<()> {
+async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>) -> Result<()> {
     let home = Home::from_env()
         .context("NEHA_HOME is not set; set it to the directory that holds this Space")?;
     let ui = ui
@@ -488,12 +496,40 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>) -> Result<()> {
     {
         bail!("the browser client at {} has no index.html", path.display());
     }
+    let domain = match domain.or_else(|| std::env::var("NEHA_DOMAIN").ok()) {
+        Some(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                bail!("--domain needs a host");
+            }
+            Some(value)
+        }
+        None => None,
+    };
+    if let Some(domain) = &domain
+        && (domain.contains("://")
+            || domain.contains('/')
+            || domain.contains('?')
+            || domain.contains('#'))
+    {
+        bail!("--domain takes a host[:port], not a URL or path");
+    }
+    let public_url = domain.map(|domain| format!("https://{domain}"));
     let has_ui = ui.is_some();
-    let running = neha_space::start_with_ui(home, port, ui)
-        .await
-        .context("the Space cannot start")?;
+    let running = match public_url {
+        Some(public_url) => {
+            neha_space::start_with_ui_public(home, port, ui, Some(public_url)).await
+        }
+        None => neha_space::start_with_ui(home, port, ui).await,
+    }
+    .context("the Space cannot start")?;
+    let public = running.public_url();
+    let cli_server = public.clone().unwrap_or_else(|| running.url());
 
     println!("Neha is listening on {}", running.url());
+    if let Some(public) = &public {
+        println!("Public: {public}");
+    }
     if let Some(invite) = &running.invite {
         println!("Invite: {invite}");
         if has_ui {
@@ -507,15 +543,9 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>) -> Result<()> {
         }
     } else if has_ui {
         println!("Open {} in a browser.", running.browser_url());
-        println!(
-            "Sign in from the CLI with: neha login --name <name> --server {}",
-            running.url()
-        );
+        println!("Sign in from the CLI with: neha login --name <name> --server {cli_server}");
     } else {
-        println!(
-            "Sign in with: neha login --name <name> --server {}",
-            running.url()
-        );
+        println!("Sign in with: neha login --name <name> --server {cli_server}");
         println!("Build ui/ with `pnpm --dir ui build` to use the browser client.");
     }
     println!("Files are stored in {}", running.storage());

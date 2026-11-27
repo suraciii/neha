@@ -93,6 +93,8 @@ These patterns state composition; behavior is in [product.md](product.md).
 - Failure: one inline recovery line; no modal.
 - Narrow Chat: one surface at a time, with Back at the top and the composer at the foot.
 - Mobile: 40px primary controls, a 44px attachment row, and safe-area padding.
+- Mobile fields: form fields use at least 16px text so the browser does not zoom on focus.
+- Installed: the client fills the dynamic viewport and keeps the composer above the keyboard.
 - Localization: Latin product terms keep the display voice.
 
 ### Accessibility
