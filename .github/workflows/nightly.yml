@@ -230,7 +230,7 @@ jobs:
             } catch {
               Get-Content $remoteOut -ErrorAction SilentlyContinue | Write-Host
               Get-Content $remoteErr -ErrorAction SilentlyContinue | Write-Host
-              throw "the remote Space did not accept a connection on 127.0.0.1:$remotePort: $($_.Exception.Message)"
+              throw "the remote Space did not accept a connection on 127.0.0.1:${remotePort}: $($_.Exception.Message)"
             } finally {
               $probe.Close()
             }
