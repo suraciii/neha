@@ -1043,6 +1043,15 @@ async fn mcp_add(
         credential,
         ..arguments
     };
+    // One rule for every registration: a token holds only what a bearer token
+    // takes, so no JSON escaping can hide it from a text search later.
+    if let Some(credential) = &arguments.credential
+        && !neha::record::McpServerAdded::valid_credential(credential)
+    {
+        return Err(ApiError::invalid_argument(
+            "an MCP credential holds only the characters a bearer token takes",
+        ));
+    }
     let existing = {
         let state = context
             .state
@@ -5444,11 +5453,7 @@ impl RedactingRuntime<'_> {
                     parts.push(format!("[image {name}]"));
                 }
                 crate::mcp::McpContent::Other(value) => {
-                    parts.push(
-                        serde_json::to_string(&value)
-                            .unwrap_or_default()
-                            .replace(&credential, "[redacted]"),
-                    );
+                    parts.push(serialized_redacted(&value, &credential));
                 }
             }
         }
@@ -5886,6 +5891,29 @@ fn mcp_declaration_fits(tool: &crate::mcp::McpTool) -> bool {
         && tool.input_schema.get("type").and_then(Value::as_str) == Some("object")
         && serde_json::to_vec(&tool.input_schema)
             .is_ok_and(|schema| schema.len() <= MAX_MCP_SCHEMA_BYTES)
+}
+
+/// Serializes one JSON value with every decoded string redacted of the token.
+fn serialized_redacted(value: &Value, credential: &str) -> String {
+    fn redacted(value: &Value, credential: &str) -> Value {
+        match value {
+            Value::String(text) => Value::String(text.replace(credential, "[redacted]")),
+            Value::Array(items) => Value::Array(
+                items
+                    .iter()
+                    .map(|item| redacted(item, credential))
+                    .collect(),
+            ),
+            Value::Object(entries) => Value::Object(
+                entries
+                    .iter()
+                    .map(|(key, entry)| (key.clone(), redacted(entry, credential)))
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
+    serde_json::to_string(&redacted(value, credential)).unwrap_or_default()
 }
 
 /// Whether a tool declaration would carry a credential into a model request.
@@ -6661,7 +6689,7 @@ impl Recorder for RunRecorder<'_> {
         &mut self,
         action: Id,
         call: &LoopCall,
-    ) -> Result<neha_loop::Dispatched, LoopError> {
+    ) -> Result<neha_loop::Authorization, LoopError> {
         let state = self
             .log
             .state
@@ -6672,33 +6700,52 @@ impl Recorder for RunRecorder<'_> {
             .iter()
             .find(|approval| approval.run == self.log.run && approval.action == action)
         else {
-            return Ok(neha_loop::Dispatched::default());
+            return Ok(neha_loop::Authorization::Allow(
+                neha_loop::Dispatched::default(),
+            ));
         };
         if let Some(server) = approval.server {
-            // The answer names one server's tool. A replay whose call now
-            // resolves to another server must not borrow that answer.
+            // The answer names one server's tool. The offer must still name
+            // that identity: a replay whose call now resolves to another
+            // server, or to another tool under the same name, must not run
+            // under the answer.
             if call.server.is_some_and(|known| known != server)
                 || call
                     .tool_name
                     .as_deref()
                     .is_some_and(|name| name != approval.tool)
             {
-                return Err(LoopError::Record(
+                return Ok(neha_loop::Authorization::Refuse(
                     "the answer names a server's tool the call no longer names".to_owned(),
                 ));
             }
-            return Ok(neha_loop::Dispatched {
+            let Some(tool) = self.mcp.get(&call.tool) else {
+                return Ok(neha_loop::Authorization::Refuse(
+                    "the MCP server's tool is no longer offered to this run".to_owned(),
+                ));
+            };
+            if tool.server != server
+                || tool.tool != approval.tool
+                || !mcp_call_identity_matches(call, tool)
+            {
+                return Ok(neha_loop::Authorization::Refuse(
+                    "the MCP server's tool is no longer the one the answer named".to_owned(),
+                ));
+            }
+            return Ok(neha_loop::Authorization::Allow(neha_loop::Dispatched {
                 script: None,
                 mcp: Some(neha_loop::McpIdentity {
                     server,
                     tool: approval.tool.clone(),
                 }),
-            });
+            }));
         }
         let Some(skill) = approval.skill else {
             // A card for a Computer action carries no identity: the recorded
             // action runs the call the record already names.
-            return Ok(neha_loop::Dispatched::default());
+            return Ok(neha_loop::Authorization::Allow(
+                neha_loop::Dispatched::default(),
+            ));
         };
         let trusted = |value: Option<&String>, what: &'static str| {
             value
@@ -6706,14 +6753,14 @@ impl Recorder for RunRecorder<'_> {
                 .ok_or_else(|| LoopError::Record(format!("the card names no {what}")))
         };
 
-        Ok(neha_loop::Dispatched {
+        Ok(neha_loop::Authorization::Allow(neha_loop::Dispatched {
             script: Some(neha_loop::ScriptIdentity {
                 skill,
                 name: trusted(approval.script.as_ref(), "script")?,
                 sha256: trusted(approval.script_sha256.as_ref(), "digest")?,
             }),
             mcp: None,
-        })
+        }))
     }
 
     async fn action_started(
@@ -8499,6 +8546,37 @@ mod tests {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
             "a provider takes this name: {name}"
         );
+    }
+
+    #[test]
+    fn no_two_server_tools_share_a_model_name() {
+        let server = Id::new();
+        let tool = |name: &str| super::ExposedMcpTool {
+            model_name: String::new(),
+            server,
+            server_name: "docs".to_owned(),
+            tool: name.to_owned(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+        };
+        // Names that fold to one another, a long name, and plain names all
+        // keep an identity of their own.
+        let catalog = super::McpCatalog::build(vec![
+            tool("search"),
+            tool("a.b"),
+            tool("a_b"),
+            tool(&"x".repeat(80)),
+            tool("write_file"),
+        ]);
+        let specs = catalog.specs();
+        assert_eq!(specs.len(), 5);
+        let mut names: Vec<&str> = specs.iter().map(|tool| tool.name.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), 5, "every identity keeps a name: {names:?}");
+        for name in names {
+            assert!(name.len() <= super::MAX_TOOL_NAME_BYTES, "{name}");
+        }
     }
 
     #[test]

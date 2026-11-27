@@ -229,15 +229,16 @@ pub trait Recorder {
         action: Id,
     ) -> impl Future<Output = Result<Authorization, LoopError>> + Send;
 
-    /// Returns the script identity of an action the User already answered.
+    /// Returns what an action the User already answered may do.
     ///
     /// The action runs under its recorded identifier, so the Space resolves
-    /// the identity from the record instead of asking again.
+    /// the identity from the record instead of asking again; the answer is
+    /// refused when the offer no longer names that identity.
     fn authorized_action(
         &mut self,
         action: Id,
         call: &RecordedCall,
-    ) -> impl Future<Output = Result<Dispatched, LoopError>> + Send;
+    ) -> impl Future<Output = Result<Authorization, LoopError>> + Send;
 
     /// Records an action before it runs, with the identities the Space
     /// resolved for it.
@@ -467,7 +468,17 @@ where
                     // no longer offers cannot run under it, and recording a
                     // refused call credits no first run.
                     if tools.iter().any(|tool| tool.name == call.recorded.tool) {
-                        dispatched = recorder.authorized_action(action, &call.recorded).await?;
+                        match recorder.authorized_action(action, &call.recorded).await? {
+                            Authorization::Allow(answered) => dispatched = answered,
+                            Authorization::Refuse(reason) => refused = Some(reason),
+                            // An answered call cannot ask again: a record that
+                            // says otherwise is not one this loop can replay.
+                            Authorization::Wait(_) => {
+                                return Err(LoopError::Record(
+                                    "an answered call asked again".to_owned(),
+                                ));
+                            }
+                        }
                     } else {
                         refused = Some(format!(
                             "the tool {:?} is not offered to this run",
@@ -958,8 +969,8 @@ mod tests {
             &mut self,
             _action: Id,
             _call: &RecordedCall,
-        ) -> Result<Dispatched, LoopError> {
-            Ok(Dispatched::default())
+        ) -> Result<Authorization, LoopError> {
+            Ok(Authorization::Allow(Dispatched::default()))
         }
 
         async fn action_started(
