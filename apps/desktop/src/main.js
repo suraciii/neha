@@ -59,13 +59,19 @@ function unsandboxedConsentFile() {
   return path.join(computerHome(), "unsandboxed-consent.json");
 }
 
+function hasUnsandboxedConsent() {
+  try {
+    const consent = JSON.parse(fs.readFileSync(unsandboxedConsentFile(), "utf8"));
+    return consent?.version === 1 && consent?.accepted === true;
+  } catch {
+    return false;
+  }
+}
+
 async function confirmUnsandboxedMode() {
   if (process.platform !== "win32") return true;
   if (process.env.NEHA_DESKTOP_DECLINE_UNSANDBOXED === "1") return false;
-  try {
-    fs.readFileSync(unsandboxedConsentFile(), "utf8");
-    return true;
-  } catch {}
+  if (hasUnsandboxedConsent()) return true;
   const answer = await dialog.showMessageBox({
     type: "warning",
     title: "Windows Local Computer",
@@ -83,7 +89,7 @@ async function confirmUnsandboxedMode() {
   fs.mkdirSync(computerHome(), { recursive: true });
   fs.writeFileSync(
     unsandboxedConsentFile(),
-    JSON.stringify({ accepted: true, at: new Date().toISOString() }, null, 2),
+    JSON.stringify({ version: 1, accepted: true, at: new Date().toISOString() }, null, 2),
     { mode: 0o600 },
   );
   return true;
