@@ -45,13 +45,13 @@ The invitation is valid once and only while this Space runs. Keep the terminal o
 
 ## Join as the Admin in the browser
 
-Open the `Open in a browser` invitation link. The client asks for a display name and a password of at least eight bytes.
+Open the `Open in a browser` invitation link. The client asks for a display name and a password of at least eight characters; the Space checks at least eight bytes.
 
 The first User is the Admin. The browser keeps the session in an HttpOnly cookie; no token appears in the page or its URL.
 
 The browser client is served from `ui/dist`. `neha serve` finds it automatically, or takes `--ui <directory>` or `NEHA_UI_DIR`.
 
-The sign-in card has a language switch for English and Simplified Chinese. The signed-in client keeps the switch in the first-run setup header, the Chat list footer, and the Chat header; the choice persists in the browser and does not change the record.
+The sign-in card has a language switch for English and Simplified Chinese. The signed-in client keeps the switch in the Chat list footer; the first-run setup header carries it at narrow widths, where the sidebar is hidden. The choice persists in the browser and does not change the record.
 
 ## Join as the Admin from the CLI
 
