@@ -927,6 +927,13 @@ impl Projection for State {
                     bot.thinking = Some(thinking);
                 }
             }
+            EventData::BotRenamed(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("a renamed Bot must exist")?;
+                bot.name = data.name;
+            }
             EventData::ProviderModelsUpdated(data) => {
                 if !self.providers.contains_key(&data.provider) {
                     return Err("an updated Provider must exist".to_owned());
@@ -3106,6 +3113,46 @@ mod tests {
         assert_eq!(error, "a move goes to an existing Computer");
         assert_eq!(state.bots[&bot].computer, computer);
     }
+    #[test]
+    fn a_bot_rename_changes_only_its_name() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        assert_eq!(
+            state.bots[&bot].name, "Scout",
+            "the Bot keeps the name it was created with"
+        );
+
+        state
+            .apply(&event(
+                EventKind::BotRenamed,
+                Author::User(owner),
+                serde_json::json!({"bot": bot, "name": "Scout the Second"}),
+                4,
+            ))
+            .unwrap();
+
+        assert_eq!(state.bots[&bot].name, "Scout the Second");
+        assert_eq!(state.bots[&bot].owner, owner);
+        assert_eq!(state.bots[&bot].chat, chat);
+    }
+
+    #[test]
+    fn a_renamed_bot_must_exist() {
+        let mut state = State::default();
+        let error = state
+            .apply(&event(
+                EventKind::BotRenamed,
+                Author::User(Id::new()),
+                serde_json::json!({"bot": Id::new(), "name": "Scout"}),
+                1,
+            ))
+            .unwrap_err();
+
+        assert_eq!(error, "a renamed Bot must exist");
+    }
+
     #[test]
     fn a_bot_update_changes_only_what_it_names() {
         let owner = Id::new();

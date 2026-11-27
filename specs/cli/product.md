@@ -51,6 +51,8 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 `neha provider list` prints each Provider's vendor, protocol, and address. `neha model list` prints each Model's context, output, image, thinking levels, tools, and default state.
 
+`neha model default <model>` sets the Space's default Model, as [Settings](../client/product.md#settings) does in the browser. Only the Admin sets it, and every Bot without its own Model uses it.
+
 ## Catalog
 
 `neha catalog list` prints every vendor in the catalog, its protocol, Model count, and whether Neha can connect it. A vendor Neha cannot connect prints `(not connectable)`; an unsupported protocol is one reason.
@@ -86,6 +88,8 @@ A Hosted Bot has no file access to change: its Workspace is the only place where
 `neha bot create --model <model>` chooses the Bot's Model, and `--thinking minimal|low|medium|high|max` its level. Without them the Bot uses the Space's default. `neha model list` shows the Models and their levels.
 
 `neha bot set <bot> --model <model> --thinking <level>` changes the Bot's Model or level. A Model that cannot call tools refuses a run, and a level the Model does not accept is refused.
+
+`neha bot rename <bot> <name>` changes the Bot's name; the browser's [Bot page](../client/product.md#bots) does the same.
 
 The access commands below change a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses a file-access change because its Workspace is its only write range.
 

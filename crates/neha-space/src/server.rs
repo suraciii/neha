@@ -3944,6 +3944,29 @@ mod tests {
         })
     }
 
+    /// The `ProviderAdd` that connects two Models, defaulting to the first.
+    fn provider_add_two(base_url: String) -> CommandCall {
+        let model = |name: &str| ModelSpec {
+            name: name.to_owned(),
+            context_limit: 128_000,
+            max_output: 8_192,
+            reads_images: false,
+            thinks: false,
+            tools: true,
+            thinking_levels: Vec::new(),
+        };
+        CommandCall::ProviderAdd(ProviderAdd {
+            protocol: ProviderProtocol::ChatCompletions,
+            base_url,
+            api_key: "sk-test".to_owned(),
+            models: vec![model("alpha"), model("beta")],
+            default_model: Some("alpha".to_owned()),
+            thinking: None,
+            vendor: None,
+            discover: false,
+        })
+    }
+
     /// The `ProviderAdd` that connects one Model over the given protocol.
     fn provider_add_on(
         base_url: String,
@@ -7308,6 +7331,7 @@ mod tests {
             Id::new(),
             CommandCall::BotUpdate(BotUpdate {
                 bot: bot_id,
+                name: None,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -7324,6 +7348,7 @@ mod tests {
             Id::new(),
             CommandCall::BotUpdate(BotUpdate {
                 bot: bot_id,
+                name: None,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -13228,6 +13253,7 @@ mod tests {
     ) -> CommandCall {
         CommandCall::BotUpdate(neha::surface::BotUpdate {
             bot,
+            name: None,
             full_access,
             full_access_consent: (full_access == Some(true))
                 .then_some(neha::record::FULL_ACCESS_CONSENT_VERSION),
@@ -14234,6 +14260,7 @@ mod tests {
             Id::new(),
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot: local.bot,
+                name: None,
                 full_access: None,
                 full_access_consent: None,
                 grants: Some(vec!["/tmp".to_owned(), "/etc".to_owned()]),
@@ -14959,6 +14986,7 @@ mod tests {
             Id::new(),
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot: local.bot,
+                name: None,
                 full_access: None,
                 full_access_consent: None,
                 grants: Some(vec!["/tmp".to_owned()]),
@@ -17579,6 +17607,7 @@ mod tests {
         let command_id = Id::new();
         let update = CommandCall::BotUpdate(neha::surface::BotUpdate {
             bot,
+            name: None,
             full_access: Some(true),
             full_access_consent: Some(neha::record::FULL_ACCESS_CONSENT_VERSION),
             grants: Some(vec!["/data/shared".to_owned(), "/data/team".to_owned()]),
@@ -17623,6 +17652,7 @@ mod tests {
             Id::new(),
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot,
+                name: None,
                 full_access: None,
                 full_access_consent: None,
                 grants: Some(vec!["relative/folder".to_owned()]),
@@ -17678,6 +17708,7 @@ mod tests {
         let request = |consent: Option<u16>| {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot,
+                name: None,
                 full_access: Some(true),
                 full_access_consent: consent,
                 grants: None,
@@ -17757,6 +17788,214 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_owner_renames_its_bot() {
+        let (dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let update = |name: Option<String>| {
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                name,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            })
+        };
+
+        // The Space trims the name, exactly as `bot create` trims one.
+        let command_id = Id::new();
+        let renamed = command(
+            &mut socket,
+            command_id,
+            update(Some("  Pathfinder  ".to_owned())),
+        )
+        .await;
+        assert_eq!(renamed["id"], json!(bot));
+        assert_eq!(renamed["name"], json!("Pathfinder"));
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["name"], json!("Pathfinder"));
+
+        // The rename is one event of its own and changes nothing else.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let renames: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::BotRenamed)
+            .collect();
+        assert_eq!(renames.len(), 1, "the rename is recorded once");
+        assert_eq!(
+            renames[0].data,
+            json!({"bot": bot, "name": "Pathfinder"}),
+            "a rename names its Bot and new name"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::BotUpdated),
+            "a rename records no access update"
+        );
+
+        // A retried command replays its confirmation and records nothing.
+        let last = running.server.store.last_seq().await.unwrap();
+        let retried = command(
+            &mut socket,
+            command_id,
+            update(Some("  Pathfinder  ".to_owned())),
+        )
+        .await;
+        assert_eq!(retried, renamed);
+        assert_eq!(running.server.store.last_seq().await.unwrap(), last);
+
+        // A name is required: a blank one is refused and records nothing.
+        let blank = try_command(&mut socket, Id::new(), update(Some("   ".to_owned()))).await;
+        assert!(
+            matches!(blank, Err((ErrorCode::InvalidArgument, ref message)) if message.contains("needs a name")),
+            "{blank:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), last);
+
+        // A rename and a selection change in one command record both events.
+        let combined = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                name: Some("Pathfinder II".to_owned()),
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: Some(ThinkingLevel::Low),
+            }),
+        )
+        .await;
+        assert_eq!(combined["name"], json!("Pathfinder II"));
+        assert_eq!(combined["thinking"], json!("low"));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::BotRenamed)
+                .count(),
+            2,
+            "a combined update records its rename as its own event"
+        );
+        let updates: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::BotUpdated)
+            .collect();
+        assert_eq!(updates.len(), 1, "the selection change is one update");
+        assert_eq!(
+            updates[0].data,
+            json!({"bot": bot, "thinking": "low"}),
+            "the update event carries only its own change"
+        );
+
+        // A rename replays from the record after a restart.
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(
+            shown["bot"]["name"],
+            json!("Pathfinder II"),
+            "the record replays the renamed Bot"
+        );
+        assert_eq!(shown["bot"]["thinking"], json!("low"));
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_a_bots_owner_renames_it() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace_token).await;
+
+        // Another account cannot rename a Bot it does not own, and nothing is
+        // recorded for the refusal.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                name: Some("Hijacked".to_owned()),
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::NotFound, _))),
+            "a Bot the account does not own is not found: {refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["name"], json!("Scout"));
+
+        // The same account renames the Bot it does own.
+        let created = command(&mut grace_socket, Id::new(), add_bot("Helper", None)).await;
+        let helper: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let renamed = command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot: helper,
+                name: Some("Reader".to_owned()),
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert_eq!(renamed["name"], json!("Reader"));
+
+        grace_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_bot_refuses_file_access_changes() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -17779,6 +18018,165 @@ mod tests {
         }
         socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_admin_makes_one_model_the_space_default() {
+        let (dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_two("http://127.0.0.1:1/v1".to_owned()),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(added["provider"].clone()).unwrap();
+        let alpha: Id = serde_json::from_value(added["models"][0]["id"].clone()).unwrap();
+        let beta: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+        let defaults = |models: &[Value]| {
+            models
+                .iter()
+                .filter(|model| model["is_default"] == json!(true))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let models = models.as_array().unwrap();
+        assert_eq!(defaults(models).len(), 1);
+        assert_eq!(defaults(models)[0]["id"], json!(alpha));
+
+        // The Admin moves the default to the other Model of the Provider.
+        let command_id = Id::new();
+        let changed = command(
+            &mut socket,
+            command_id,
+            CommandCall::ModelDefault { model: beta },
+        )
+        .await;
+        assert_eq!(changed["provider"], json!(provider));
+        assert_eq!(changed["default_model"], json!(beta));
+
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let models = models.as_array().unwrap();
+        assert_eq!(models.len(), 2, "the whole Model list stays");
+        let default = defaults(models);
+        assert_eq!(default.len(), 1, "exactly one Model is the default");
+        assert_eq!(default[0]["id"], json!(beta));
+        assert!(
+            models.iter().any(|model| model["id"] == json!(alpha)),
+            "the other Model keeps its identity"
+        );
+
+        // The record holds one Provider refresh naming the whole Model list.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let refreshed: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::ProviderModelsUpdated)
+            .collect();
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].data["provider"], json!(provider));
+        assert_eq!(refreshed[0].data["default_model"], json!(beta));
+        let recorded = refreshed[0].data["models"].as_array().unwrap();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded.iter().any(|model| model["id"] == json!(alpha)));
+        assert!(recorded.iter().any(|model| model["id"] == json!(beta)));
+
+        // A retried command replays its confirmation and writes nothing.
+        let last = running.server.store.last_seq().await.unwrap();
+        let retried = command(
+            &mut socket,
+            command_id,
+            CommandCall::ModelDefault { model: beta },
+        )
+        .await;
+        assert_eq!(retried, changed);
+        assert_eq!(running.server.store.last_seq().await.unwrap(), last);
+
+        // A second Provider's Model is a different default: connecting it
+        // moves the default, and naming the first Provider's Model back moves
+        // the one default again without losing the other Provider's Models.
+        let other = command(
+            &mut socket,
+            Id::new(),
+            provider_add("http://127.0.0.1:2/v1".to_owned()),
+        )
+        .await;
+        let other_provider: Id = serde_json::from_value(other["provider"].clone()).unwrap();
+        let other_model: Id = serde_json::from_value(other["models"][0]["id"].clone()).unwrap();
+        let moved = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: beta },
+        )
+        .await;
+        assert_eq!(moved["provider"], json!(provider));
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let models = models.as_array().unwrap();
+        assert_eq!(defaults(models).len(), 1);
+        assert_eq!(defaults(models)[0]["id"], json!(beta));
+        assert!(models.iter().any(|model| model["id"] == json!(other_model)));
+        assert!(
+            models
+                .iter()
+                .any(|model| model["provider"] == json!(other_provider))
+        );
+
+        // A Model the Space does not offer cannot become the default.
+        let before = running.server.store.last_seq().await.unwrap();
+        let missing = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: Id::new() },
+        )
+        .await;
+        assert!(
+            matches!(missing, Err((ErrorCode::NotFound, ref message)) if message.contains("no such Model")),
+            "{missing:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+
+        // Only the Admin sets the Space's default Model.
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace_token).await;
+        let refused = try_command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: alpha },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::Forbidden, _))),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+        grace_socket.close(None).await.unwrap();
+
+        // The default replays from the record after a restart.
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let models = models.as_array().unwrap();
+        let default = defaults(models);
+        assert_eq!(default.len(), 1, "the replay holds one default");
+        assert_eq!(default[0]["id"], json!(beta), "the default replays");
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

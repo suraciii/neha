@@ -2,23 +2,77 @@
 // Tests import `space` to set up and read what happened, and hand
 // `FakeCommands` to the client in place of its WebSocket.
 import type { SubscriptionHandlers } from "../lib/ws";
-import type { Approval, Chat, ChatStatus, FileSummary, Message, RecordEvent, RunView } from "../types";
+import type {
+  Approval,
+  Bot,
+  CatalogStatus,
+  CatalogVendor,
+  Chat,
+  ChatStatus,
+  Computer,
+  FileSummary,
+  Message,
+  Model,
+  Provider,
+  RecordEvent,
+  Rule,
+  RunView,
+} from "../types";
 
 const account = { id: "u1", display_name: "Ada", is_admin: true };
-const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
-const otherBot = { id: "b2", owner: "u1", name: "Quill", computer: "p1", chat: "h2" };
-const thirdBot = { id: "b3", owner: "u1", name: "Sage", computer: "p1", chat: "h3" };
+const bot = {
+  id: "b1",
+  owner: "u1",
+  name: "Scout",
+  computer: "p1",
+  chat: "h1",
+  full_access: false,
+  grants: [] as string[],
+  thinking: null,
+  model: null,
+};
+const otherBot = {
+  id: "b2",
+  owner: "u1",
+  name: "Quill",
+  computer: "p1",
+  chat: "h2",
+  full_access: false,
+  grants: [] as string[],
+  thinking: null,
+  model: null,
+};
+const thirdBot = {
+  id: "b3",
+  owner: "u1",
+  name: "Sage",
+  computer: "p1",
+  chat: "h3",
+  full_access: false,
+  grants: [] as string[],
+  thinking: null,
+  model: null,
+};
 const computer = { id: "p1", owner: "u1", kind: "local", online: true, workspace: "/w" };
+// Another paired Local Computer, which is where a Bot may move.
+const otherComputer = { id: "p9", owner: "u1", kind: "local", online: false, workspace: "/other" };
 const chat = { id: "h1", owner: "u1", bot: "b1" };
 const otherChat = { id: "h2", owner: "u1", bot: "b2" };
 const thirdChat = { id: "h3", owner: "u1", bot: "b3" };
+const computers = [computer, otherComputer];
 
 // The Bot that owns a Chat, like the Space answers bot_show.
-function botFor(id: string) {
+function botFor(id: string): Bot {
   if (id === otherBot.id) return otherBot;
   if (id === thirdBot.id) return thirdBot;
   return bot;
 }
+
+// The Computer a Bot works on, like the Space answers bot_show.
+function computerFor(id: string): Computer {
+  return computers.find((known) => known.id === id) ?? computer;
+}
+
 // One Chat as the Space projects it: its own state, and the Run it follows.
 function project(known: Chat): Chat {
   const status = space.statuses[known.id];
@@ -44,6 +98,7 @@ export const space = {
   otherBot,
   thirdBot,
   computer,
+  otherComputer,
   chat,
   otherChat,
   thirdChat,
@@ -88,6 +143,36 @@ export const space = {
   decisions: [] as { approval: string; allow: boolean; lasting: boolean }[],
   // Decisions that settled in the fake Space.
   decidesDone: 0,
+  // The Providers the Space has connected, like provider_list answers.
+  providers: [] as Provider[],
+  // The Models the Space offers, like model_list answers.
+  models: [] as Model[],
+  // The Computers the Space knows, like computer_list answers. A Bot may move
+  // between the paired Local ones.
+  computers: computers as Computer[],
+  // The rules each Bot holds, like rule_list answers.
+  rules: [] as Rule[],
+  // Every vendor the catalog knows, like catalog_list answers.
+  vendors: [] as CatalogVendor[],
+  // What the catalog's cache holds, like catalog_status answers.
+  catalog: null as CatalogStatus | null,
+  // The Bot updates, in order, with everything the client sent.
+  updates: [] as Record<string, unknown>[],
+  // The moves and the resets the Space was asked for.
+  moves: [] as { bot: string; computer: string }[],
+  resets: [] as string[],
+  // The rules the Space was asked to add and to remove.
+  ruleAdds: [] as unknown[],
+  ruleRemoves: [] as string[],
+  // The Providers the Space connected and refreshed, and the Models made default.
+  connects: [] as unknown[],
+  refreshes: [] as string[],
+  defaults: [] as string[],
+  // The catalog reads the Space was asked for.
+  catalogRefreshes: 0,
+  // A command the Space refuses, with the error it answers. A test sets one to
+  // see what the page does when the Space says no.
+  refuse: {} as Record<string, Error | undefined>,
   // The seq of the last event the client read.
   seq: 100,
   // Puts the Space back where a test expects to find it.
@@ -96,6 +181,14 @@ export const space = {
     space.releaseDecide();
     space.releaseApprovals();
     space.computer.kind = "local";
+    space.computer.online = true;
+    space.otherComputer.kind = "local";
+    space.bot.name = "Scout";
+    space.bot.computer = "p1";
+    space.bot.full_access = false;
+    space.bot.grants = [];
+    space.bot.thinking = null;
+    space.bot.model = null;
     space.asked = [];
     space.sent = [];
     space.files = [];
@@ -114,6 +207,21 @@ export const space = {
     space.approvals = [];
     space.decisions = [];
     space.decidesDone = 0;
+    space.providers = [{ id: "v1", protocol: "chat_completions", base_url: "http://provider" }];
+    space.models = [];
+    space.rules = [];
+    space.vendors = [];
+    space.catalog = null;
+    space.updates = [];
+    space.moves = [];
+    space.resets = [];
+    space.ruleAdds = [];
+    space.ruleRemoves = [];
+    space.connects = [];
+    space.refreshes = [];
+    space.defaults = [];
+    space.catalogRefreshes = 0;
+    space.refuse = {};
     space.seq = 100;
   },
   holdSends() {
@@ -201,14 +309,16 @@ export class FakeCommands {
 
   async command<T>(name: string, args?: unknown): Promise<T> {
     space.asked.push(name);
+    const refused = space.refuse[name];
+    if (refused) throw refused;
     switch (name) {
       case "provider_list":
-        return [{ id: "v1", protocol: "chat_completions", base_url: "http://provider" }] as T;
+        return space.providers.map((known) => ({ ...known })) as T;
       case "model_list":
-        return [] as T;
+        return space.models.map((known) => ({ ...known })) as T;
       case "bot_list":
         // Each Chat's Bot answers, like the Space lists them.
-        return space.chats.map((known) => botFor(known.bot)) as T;
+        return space.chats.map((known) => ({ ...botFor(known.bot) })) as T;
       case "chat_list":
         // Like the Space's JSON, each answer carries its own copies, with what
         // the Space projects the Chat to be doing and the Run it follows.
@@ -230,11 +340,154 @@ export class FakeCommands {
           .filter((approval) => asked.chat === undefined || approval.chat === asked.chat)
           .map((approval) => ({ ...approval })) as T;
       }
+      case "computer_list":
+        return space.computers.map((known) => ({ ...known })) as T;
       case "bot_show": {
         const asked = args as { bot: string };
         const known = botFor(asked.bot);
         const own = space.chats.find((entry) => entry.bot === known.id) ?? space.chat;
-        return { bot: known, computer: space.computer, chat: project(own) } as T;
+        return {
+          bot: { ...known },
+          computer: { ...computerFor(known.computer) },
+          chat: project(own),
+        } as T;
+      }
+      case "bot_update": {
+        // A Space answers with the Bot it now holds, and writes the change to
+        // the record, so the page hears about its own write.
+        const asked = args as Record<string, unknown> & { bot: string };
+        space.updates.push(asked);
+        const known = botFor(asked.bot);
+        const changed: Record<string, unknown> = {};
+        if (typeof asked.name === "string") {
+          known.name = asked.name;
+          changed.name = asked.name;
+        }
+        if (Array.isArray(asked.grants)) {
+          known.grants = [...(asked.grants as string[])];
+          changed.grants = known.grants;
+        }
+        if (typeof asked.grant_add === "string" && !known.grants.includes(asked.grant_add)) {
+          known.grants = [...known.grants, asked.grant_add].sort();
+          changed.grants = known.grants;
+        }
+        if (typeof asked.grant_remove === "string") {
+          known.grants = known.grants.filter((known2) => known2 !== asked.grant_remove);
+          changed.grants = known.grants;
+        }
+        if (typeof asked.full_access === "boolean") {
+          known.full_access = asked.full_access;
+          changed.full_access = asked.full_access;
+        }
+        if ("model" in asked) {
+          known.model = (asked.model as string | null) ?? null;
+          changed.model = known.model;
+        }
+        if ("thinking" in asked) {
+          known.thinking = (asked.thinking as Bot["thinking"]) ?? null;
+          changed.thinking = known.thinking;
+        }
+        emit("neha.bot.updated", { bot: known.id, ...changed });
+        return { ...known, user: "u1" } as T;
+      }
+      case "bot_move": {
+        const asked = args as { bot: string; computer: string };
+        space.moves.push(asked);
+        const known = botFor(asked.bot);
+        const target = space.computers.find((entry) => entry.id === asked.computer);
+        if (!target) throw new Error("the fake Space has no such Computer");
+        const from = known.computer;
+        known.computer = target.id;
+        emit("neha.bot.moved", { bot: known.id, from, to: target.id });
+        return { bot: { ...known }, from: { ...computerFor(from) }, to: { ...target } } as T;
+      }
+      case "computer_reset": {
+        const asked = args as { computer: string };
+        space.resets.push(asked.computer);
+        return { computer: asked.computer } as T;
+      }
+      case "rule_list": {
+        const asked = args as { bot?: string };
+        return space.rules
+          .filter((known) => asked.bot === undefined || known.bot === asked.bot)
+          .map((known) => ({ ...known })) as T;
+      }
+      case "rule_add": {
+        const asked = args as Record<string, unknown> & { bot: string; effect: Rule["effect"]; tool: string };
+        space.ruleAdds.push(asked);
+        const rule: Rule = {
+          rule: `rule${space.rules.length + 1}`,
+          bot: asked.bot,
+          user: "u1",
+          effect: asked.effect,
+          tool: asked.tool,
+          command_prefix: (asked.command_prefix as string | null) ?? null,
+          path_prefix: (asked.path_prefix as string | null) ?? null,
+        };
+        space.rules = [...space.rules, rule];
+        emit("neha.rule.added", { rule: rule.rule, bot: rule.bot });
+        return rule as T;
+      }
+      case "rule_remove": {
+        const asked = args as { rule: string };
+        space.ruleRemoves.push(asked.rule);
+        space.rules = space.rules.filter((known) => known.rule !== asked.rule);
+        emit("neha.rule.removed", { rule: asked.rule });
+        return { rule: asked.rule } as T;
+      }
+      case "catalog_list":
+        return space.vendors.map((known) => ({ ...known })) as T;
+      case "catalog_status":
+        return space.catalog ? ({ ...space.catalog } as T) : (null as T);
+      case "catalog_refresh": {
+        // A refresh reads the catalog again, which replaces the cache it holds.
+        space.catalogRefreshes += 1;
+        space.catalog = {
+          ...(space.catalog ?? {
+            source: "https://models.dev/api.json",
+            builtin: false,
+            etag: null,
+            fetched_at: null,
+            checked_at: null,
+            age_seconds: null,
+            stale: false,
+            provider_count: 0,
+            model_count: 0,
+          }),
+          source: "https://models.dev/api.json",
+          builtin: false,
+          fetched_at: 1_764_000_000,
+          checked_at: 1_764_000_000,
+          age_seconds: 1,
+          stale: false,
+        };
+        return { status: { ...space.catalog }, changed: true } as T;
+      }
+      case "provider_connect": {
+        const asked = args as Record<string, unknown> & { vendor: string; api_key: string };
+        space.connects.push(asked);
+        const vendor = space.vendors.find((known) => known.id === asked.vendor);
+        const provider: Provider = {
+          id: `v${space.providers.length + 1}`,
+          protocol: vendor?.protocol ?? (asked.protocol as Provider["protocol"]) ?? "chat_completions",
+          base_url: (asked.base_url as string) ?? vendor?.api ?? "http://vendor",
+          vendor: asked.vendor,
+        };
+        space.providers = [...space.providers, provider];
+        emit("neha.provider.added", { provider: provider.id });
+        return { provider, models: [] } as T;
+      }
+      case "provider_refresh": {
+        const asked = args as { provider: string };
+        space.refreshes.push(asked.provider);
+        emit("neha.provider.models_updated", { provider: asked.provider });
+        return { provider: asked.provider, models: [] } as T;
+      }
+      case "model_default": {
+        const asked = args as { model: string };
+        space.defaults.push(asked.model);
+        space.models = space.models.map((known) => ({ ...known, is_default: known.id === asked.model }));
+        return { model: asked.model } as T;
       }
       case "message_send": {
         if (sendGate) await sendGate;

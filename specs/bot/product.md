@@ -22,15 +22,17 @@ A Bot works once the Space has a Provider.
 
 ## The Bot's page
 
-A Bot has a page with its name, picture, Computer, access, and Model. The owner edits all of them; other Users read them.
+A Bot has a page with its name, picture, Computer, access, and Model. The owner edits them; other Users read them.
 
 | Field | What it holds | Who changes it |
 | --- | --- | --- |
-| Name | The Bot's name | The owner |
+| Name | The Bot's name | The owner, on the page or with `neha bot rename` |
 | Picture | The Bot's avatar | The owner |
-| Computer | The Hosted or Local Computer it lives on | The owner |
-| Access | Who else can use it: only the owner, everyone, or named Users | The owner |
-| Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner |
+| Computer | The Hosted or Local Computer it lives on | The owner, on the page or with `neha bot move` |
+| Access | Who else can use the Bot, the folders it can write, whether it has full access, and its Ask and Allow rules | The owner |
+| Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner; the Admin sets the Space's default |
+
+The page shows what the Bot can reach on its Computer: the granted folders, full access, and the rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.
 
 [Model](../model/product.md) covers connecting Providers and choosing a Model.
 
@@ -160,3 +162,5 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 - The Bot's page does not show approvals yet.
 - An independent reviewer of approvals is not yet specified.
 - A template shared across Spaces is not yet specified.
+- Changing a Bot's picture is not yet available.
+- Changing who else can use a Bot is not yet available; it arrives when a Bot is shared among several Users.

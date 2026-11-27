@@ -8,7 +8,12 @@ export interface Provider {
   id: string;
   protocol: string;
   base_url: string;
+  // The catalog vendor the Provider came from, when it had a preset.
+  vendor?: string | null;
 }
+
+// How much thought a Model gives a reply.
+export type ThinkingLevel = "minimal" | "low" | "medium" | "high" | "max";
 
 export interface Model {
   id: string;
@@ -17,6 +22,12 @@ export interface Model {
   context_limit: number;
   max_output: number;
   reads_images: boolean;
+  // Whether it can think before it answers.
+  thinks: boolean;
+  // Whether it can call tools.
+  tools: boolean;
+  // The thinking levels it accepts; empty means every level.
+  thinking_levels: ThinkingLevel[];
   is_default: boolean;
 }
 
@@ -26,6 +37,14 @@ export interface Bot {
   name: string;
   computer: string;
   chat: string;
+  // Whether it may write outside its Workspace fence.
+  full_access: boolean;
+  // Extra folders outside its Workspace it may write.
+  grants: string[];
+  // Its thinking level; absent uses the Space's default.
+  thinking?: ThinkingLevel | null;
+  // Its Model; absent uses the Space's default.
+  model?: string | null;
 }
 
 export interface Computer {
@@ -100,6 +119,65 @@ export interface BotResult {
   bot: Bot;
   computer: Computer;
   chat: Chat;
+}
+
+// The answer a Bot's move carries: where it works now, and where it left.
+export interface BotMoveResult {
+  bot: Bot;
+  from: Computer;
+  to: Computer;
+}
+
+// What a catalog refresh answers: the cache it read, and whether it changed.
+export interface CatalogRefreshResult {
+  status: CatalogStatus;
+  changed: boolean;
+}
+
+// One lasting rule about what a Bot may do without asking.
+export interface Rule {
+  rule: string;
+  bot: string;
+  user: string;
+  // Whether matching actions ask or run without asking.
+  effect: "ask" | "allow";
+  tool: string;
+  // The shell command prefix a matching shell action starts with.
+  command_prefix: string | null;
+  // The path prefix a matching file action's path starts with.
+  path_prefix: string | null;
+}
+
+// One vendor the catalog knows, as the Space names it.
+export interface CatalogVendor {
+  id: string;
+  name: string;
+  // The protocol the Space speaks to it, when it can speak one.
+  protocol: string | null;
+  // Whether the catalog names enough to connect it without overrides.
+  selectable: boolean;
+  // The base address the catalog names.
+  api: string | null;
+  // How many Models the vendor offers.
+  model_count: number;
+}
+
+// The cache state of the Space's catalog.
+export interface CatalogStatus {
+  // Where the catalog in use came from: the built-in snapshot, or a URL.
+  source: string;
+  builtin: boolean;
+  etag: string | null;
+  // When the cached catalog was fetched, in unix seconds.
+  fetched_at: number | null;
+  // When the cache was last confirmed current, in unix seconds.
+  checked_at: number | null;
+  // How long ago the cache was last confirmed, in seconds.
+  age_seconds: number | null;
+  // Whether the cache is older than the refresh interval.
+  stale: boolean;
+  provider_count: number;
+  model_count: number;
 }
 
 // How a run is doing, from queued to finished. A running run that asks for

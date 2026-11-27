@@ -222,6 +222,12 @@ pub async fn execute(
         CommandCall::ModelList => read(context.state, |state| {
             serde_json::to_value(state.models.values().collect::<Vec<_>>()).map_err(json_error)
         }),
+        CommandCall::ModelDefault { model } => {
+            if !account.is_admin {
+                return Err(ApiError::forbidden("only the Admin sets the default Model"));
+            }
+            model_default(context, account, command_id, fingerprint, model).await
+        }
         CommandCall::ComputerAdd { code } => {
             computer_add(context, account, command_id, fingerprint, code).await
         }
@@ -1275,6 +1281,98 @@ async fn provider_refresh(
     })
 }
 
+/// Records one Model's current capabilities as one entry of a Model list.
+fn recorded_model(model: &ModelView) -> Value {
+    json!({
+        "id": model.id,
+        "name": model.name,
+        "context_limit": model.context_limit,
+        "max_output": model.max_output,
+        "reads_images": model.reads_images,
+        "thinks": model.thinks,
+        "tools": model.tools,
+        "thinking_levels": model.thinking_levels,
+    })
+}
+
+/// Makes one Model the Space's default Model.
+///
+/// The default belongs to the Model's Provider: the record gets the Provider's
+/// current Models again with this one named as their default, so a Model keeps
+/// its identity and the projection holds exactly one default.
+async fn model_default(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    model: Id,
+) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+    let (provider, models) = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let selected = state
+            .models
+            .get(&model)
+            .ok_or_else(|| ApiError::not_found("no such Model"))?;
+        let provider = selected.provider;
+        if !state.providers.contains_key(&provider) {
+            return Err(ApiError::invalid_argument("the Model has no Provider"));
+        }
+        let mut provider_models: Vec<&ModelView> = state
+            .models
+            .values()
+            .filter(|view| view.provider == provider)
+            .collect();
+        // The record names the Models in a stable order, whatever order the
+        // projection's map holds them in.
+        provider_models.sort_by_key(|view| view.id);
+        let models: Vec<Value> = provider_models
+            .iter()
+            .map(|view| recorded_model(view))
+            .collect();
+        (provider, models)
+    };
+    let data = json!({
+        "provider": provider,
+        "models": models,
+        "default_model": model,
+    });
+    let result = json!({
+        "provider": provider,
+        "models": models,
+        "default_model": model,
+    });
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![EventDraft::new(
+            EventKind::ProviderModelsUpdated,
+            Author::User(account.id),
+            data,
+        )],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
 /// Lists every Provider the catalog knows.
 async fn catalog_list(context: &CommandContext<'_>) -> Result<Outcome, ApiError> {
     let catalog = context.catalog.catalog().await.map_err(catalog_error)?;
@@ -1461,6 +1559,18 @@ async fn bot_update(
             "turning full access on needs the current answer (version {FULL_ACCESS_CONSENT_VERSION})"
         )));
     }
+    // A name is trimmed at the Space, exactly as `bot create` trims one: two
+    // clients that send the same name padded differently record one name.
+    let name = match update.name.as_deref() {
+        Some(name) => {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(ApiError::invalid_argument("a Bot needs a name"));
+            }
+            Some(name.to_owned())
+        }
+        None => None,
+    };
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
@@ -1469,7 +1579,8 @@ async fn bot_update(
     let removed = update.grant_remove.is_some();
     let grant_changes = usize::from(replaced) + usize::from(added) + usize::from(removed);
     let selection_change = update.model.is_some() || update.thinking.is_some();
-    if update.full_access.is_none() && grant_changes == 0 && !selection_change {
+    let name_change = name.is_some();
+    if update.full_access.is_none() && grant_changes == 0 && !selection_change && !name_change {
         return Err(ApiError::invalid_argument("a Bot update needs a change"));
     }
     if grant_changes > 1 {
@@ -1534,7 +1645,14 @@ async fn bot_update(
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
-    let (data, result) = {
+    // A rename is its own event; the update event keeps the access and
+    // selection changes it always carried.
+    let other_changes = update.full_access.is_some()
+        || replacement.is_some()
+        || add.is_some()
+        || remove.is_some()
+        || selection_change;
+    let (renamed, data, result) = {
         let state = context
             .state
             .lock()
@@ -1607,20 +1725,36 @@ async fn bot_update(
             // new Model accepts it.
             check_thinking_capability(view, level)?;
         }
+        let mut renamed = None;
+        if let Some(name) = name {
+            bot.name = name.clone();
+            renamed = Some(name);
+        }
         let mut result = serde_json::to_value(bot).map_err(json_error)?;
         result["user"] = json!(account.id);
-        (data, result)
+        (renamed, data, result)
     };
+    let mut drafts = Vec::new();
+    if let Some(name) = renamed {
+        drafts.push(EventDraft::new(
+            EventKind::BotRenamed,
+            Author::User(account.id),
+            json!({"bot": update.bot, "name": name}),
+        ));
+    }
+    if other_changes {
+        drafts.push(EventDraft::new(
+            EventKind::BotUpdated,
+            Author::User(account.id),
+            data,
+        ));
+    }
     let appended = append(
         context.store,
         context.state,
         command_id,
         fingerprint,
-        vec![EventDraft::new(
-            EventKind::BotUpdated,
-            Author::User(account.id),
-            data,
-        )],
+        drafts,
         Some(result.clone()),
         None,
     )

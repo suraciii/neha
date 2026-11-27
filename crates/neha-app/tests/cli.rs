@@ -5383,3 +5383,119 @@ async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
     drop(computer);
     provider_task.abort();
 }
+
+#[test]
+fn a_bot_owner_renames_it_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = first_word(&field(&created, "Created Bot "));
+    assert!(run(&home, &credential, &["bot", "list"]).contains("Scout"));
+
+    // The Space trims the name the owner sends, so the name it shows is the
+    // name it recorded.
+    let renamed = run(
+        &home,
+        &credential,
+        &["bot", "rename", &bot, "  Pathfinder  "],
+    );
+    assert!(renamed.contains("Renamed Bot"), "{renamed}");
+    assert!(renamed.contains("Pathfinder"), "{renamed}");
+    let listed = run(&home, &credential, &["bot", "list"]);
+    assert!(listed.contains("Pathfinder"), "{listed}");
+    assert!(!listed.contains("Scout"), "{listed}");
+
+    // A blank name is refused and the old name stays.
+    let blank = cli(&home, &credential, &["bot", "rename", &bot, "   "]);
+    assert!(!blank.status.success());
+    let stderr = String::from_utf8_lossy(&blank.stderr);
+    assert!(stderr.contains("needs a name"), "{stderr}");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains("Pathfinder"), "{shown}");
+
+    // The rename replays from the record after a restart.
+    let port = space_port(&url);
+    drop(server);
+    let (_server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(restarted_url, url, "the Space restarts on its own address");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains("Pathfinder"), "{shown}");
+}
+
+#[test]
+fn the_admin_changes_the_default_model_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "alpha",
+            "--model",
+            "beta",
+        ],
+    );
+    let id_of = |listing: &str, name: &str| -> String {
+        listing
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(name))
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_else(|| panic!("no Model {name} in:\n{listing}"))
+            .to_owned()
+    };
+    let default_lines = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .filter(|line| line.contains("default"))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+
+    let listed = run(&home, &credential, &["model", "list"]);
+    let alpha = id_of(&listed, "alpha");
+    let beta = id_of(&listed, "beta");
+    let defaults = default_lines(&listed);
+    assert_eq!(defaults.len(), 1, "{listed}");
+    assert!(defaults[0].starts_with(&alpha), "{listed}");
+
+    // The Admin moves the Space's default to the other Model.
+    let changed = run(&home, &credential, &["model", "default", &beta]);
+    assert!(changed.contains(&beta), "{changed}");
+    assert!(changed.contains("beta"), "{changed}");
+    let listed = run(&home, &credential, &["model", "list"]);
+    let defaults = default_lines(&listed);
+    assert_eq!(defaults.len(), 1, "one Model stays default:\n{listed}");
+    assert!(defaults[0].starts_with(&beta), "{listed}");
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.starts_with(&alpha) && !line.contains("default")),
+        "the other Model is still offered:\n{listed}"
+    );
+
+    // A Model this Space does not offer cannot become the default.
+    let missing = neha::id::Id::new().to_string();
+    let refused = cli(&home, &credential, &["model", "default", &missing]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("no such Model"), "{stderr}");
+
+    // The default replays from the record after a restart.
+    let port = space_port(&url);
+    drop(server);
+    let (_server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(restarted_url, url, "the Space restarts on its own address");
+    let listed = run(&home, &credential, &["model", "list"]);
+    let defaults = default_lines(&listed);
+    assert_eq!(defaults.len(), 1, "the replay holds one default:\n{listed}");
+    assert!(defaults[0].starts_with(&beta), "{listed}");
+}

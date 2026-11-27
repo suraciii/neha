@@ -191,6 +191,11 @@ enum CatalogCommand {
 enum ModelCommand {
     /// List the Models the Space offers.
     List,
+    /// Make a Model the Space's default Model.
+    Default {
+        /// The Model the Space uses by default from now on.
+        model: Id,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,6 +234,13 @@ enum BotCommand {
         /// The real Computer it should work on.
         #[arg(long)]
         computer: Id,
+    },
+    /// Rename your Bot.
+    Rename {
+        /// The Bot identifier.
+        bot: Id,
+        /// Its new name.
+        name: String,
     },
     /// Show your Bot's file access.
     Access {
@@ -850,6 +862,19 @@ async fn model(command: ModelCommand) -> Result<()> {
                 );
             }
         }
+        ModelCommand::Default { model } => {
+            let result = client::command(&credential, CommandCall::ModelDefault { model }).await?;
+            let name = result["models"]
+                .as_array()
+                .and_then(|models| {
+                    models
+                        .iter()
+                        .find(|view| view["id"] == serde_json::json!(model))
+                })
+                .and_then(|view| view["name"].as_str())
+                .unwrap_or_default();
+            println!("The default Model is now {model} ({name}).");
+        }
     }
 
     Ok(())
@@ -974,6 +999,7 @@ fn recorded_form(grant: &str) -> String {
 fn access_update(bot: Id) -> BotUpdate {
     BotUpdate {
         bot,
+        name: None,
         full_access: None,
         full_access_consent: None,
         grants: None,
@@ -1129,6 +1155,21 @@ async fn bot(command: BotCommand) -> Result<()> {
                 id_of(&result["to"], "id")?,
                 text_of(&result["to"], "kind")?,
                 result["to"]["online"].as_bool().unwrap_or(false),
+            );
+        }
+        BotCommand::Rename { bot, name } => {
+            let result = client::command(
+                &credential,
+                CommandCall::BotUpdate(BotUpdate {
+                    name: Some(name),
+                    ..access_update(bot)
+                }),
+            )
+            .await?;
+            println!(
+                "Renamed Bot {} to {}.",
+                id_of(&result, "id")?,
+                text_of(&result, "name")?
             );
         }
         BotCommand::Access { bot } => {

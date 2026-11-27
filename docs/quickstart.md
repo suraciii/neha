@@ -208,6 +208,25 @@ The first action on this Local Computer asks for approval. At the card, type `a`
 
 The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>` by default, and `pwd` prints that folder. The machine needs `bubblewrap`: each shell command runs in a sandbox that allows persistent writes only in the Bot's Workspace, the folders its owner granted, and the directory a run names with `--cwd`, unless the Bot has full access, and the file tools check their own write paths. Files move through the Bot's shell with `neha file get` and `neha chat send --file`. [Add a Local Computer](computer.md) covers the fence, pairing, offline behavior, and [moving a Bot](computer.md#moving-a-bot).
 
+## Manage a Bot in the browser
+
+The signed-in client has four entries in its rail: Chats, Needs attention, Bots, and Settings. Open Bots and pick a Bot to open its page.
+
+The page shows the Bot's name, its picture, its Computer and whether it is online, its Model and thinking level, and its access. Change the name there. Choose another Model or thinking level for the Bot; without one it uses the Space's default.
+
+For a Bot on a Local Computer, the page shows the folders the Bot may write and whether it has full access. Grant a folder there, or turn full access on: the page states the risk and asks you to confirm before anything changes. The page also lists the Bot's Ask and Allow rules, and you can add and remove them there.
+
+Settings shows the Space's Providers and Models, the catalog's state, and the Computers you own. Set the Space's default Model there. A Hosted Computer offers a reset in that list; it asks for confirmation first, and it deletes every file and folder inside the Bot's Workspace.
+
+The CLI does the same work. Rename a Bot and set the default Model:
+
+```bash
+target/debug/neha bot rename <bot-id> "Scout"
+target/debug/neha model default <model-id>
+```
+
+[Approvals](approvals.md) covers the rules and the answers, and [Add a Local Computer](computer.md#file-access-and-a-runs-directory) covers the folders and full access.
+
 ## Send a file
 
 A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it. This Space now has two Chats, so name the Bot:
@@ -262,5 +281,6 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
 - One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
-- The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait. It does not show Groups, Tasks, search, or notifications.
+- The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, search, or notifications.
+- The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
 - The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

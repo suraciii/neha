@@ -50,9 +50,19 @@ export interface SubscribeOptions {
 
 type CommandName =
   | "provider_add"
+  | "provider_connect"
+  | "provider_refresh"
   | "provider_list"
+  | "catalog_list"
+  | "catalog_status"
+  | "catalog_refresh"
   | "model_list"
+  | "model_default"
+  | "computer_list"
+  | "computer_reset"
   | "bot_create"
+  | "bot_update"
+  | "bot_move"
   | "bot_list"
   | "bot_show"
   | "chat_list"
@@ -61,7 +71,10 @@ type CommandName =
   | "approval_list"
   | "approval_decide"
   | "message_send"
-  | "run_show";
+  | "run_show"
+  | "rule_list"
+  | "rule_add"
+  | "rule_remove";
 
 interface Following {
   handlers: SubscriptionHandlers;

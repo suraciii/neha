@@ -53,6 +53,8 @@ A Model that cannot read images is marked in every picker, and a Bot that works 
 
 The Space has a default Model and thinking level. Every Bot uses them unless its owner chooses a Model and a thinking level for that Bot.
 
+The Admin changes the default Model in [Settings](../client/product.md#settings) or with [`neha model default`](../cli/product.md#providers). Each Provider's default Model is the Space's default Model, and a Provider that does not offer it marks no default. The default thinking level stays the one the Admin gave when the Provider connected.
+
 A Bot's chosen Model MUST be connected and able to call tools. Its thinking level MUST be one the Model accepts.
 
 | Thinking level | What it means |
