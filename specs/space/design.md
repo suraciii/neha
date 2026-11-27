@@ -55,9 +55,26 @@ An approval from a genuine Ask rule or a first use has `ambiguous` false, and a 
 
 Each is an Authority event, so a reader that does not know one stops and asks for an upgrade.
 
+## Bot events
+
+The record holds these kinds for a Bot:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.bot.created` | The Bot, its owner, its name, its Computer, and its Chat |
+| `neha.bot.moved` | The Bot and the Computer it moved from and to |
+| `neha.bot.updated` | A change to the Bot's file access, its Model, or its thinking level |
+| `neha.bot.renamed` | The Bot and the name its owner gave it |
+
+An owner renames a Bot with a `bot_update` that names the new name. The Space records the rename as its own `neha.bot.renamed` event, which is a Presentation event: a reader that does not know the kind skips it and shows the Bot under its earlier name.
+
+A rename changes no authority, so the Bot's owner, its access, and its rules stay as they were.
+
+A `bot_update` that clears the Bot's Model or its thinking level records the clear on the same `neha.bot.updated` event, and a replay leaves the field empty so the Bot uses the Space's default. A record written before that flag replays as no clear. The Space refuses a clear and a choice together, so one event never holds both.
+
 ## Event visibility
 
-Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.provider.added`) go to every account. An event the account cannot see still advances its cursor.
+Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.provider.added`, `neha.provider.models_updated`) go to every account, because each one's data is already readable through `provider list` or `model list`. An event the account cannot see still advances its cursor.
 
 ## Projections
 

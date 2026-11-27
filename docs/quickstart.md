@@ -114,14 +114,18 @@ A new Bot gets its own Chat and its own Computer: a Hosted Computer unless you n
 
 ```bash
 target/debug/neha bot create Scout
+BOT_ID=$(target/debug/neha bot list | awk '$2 == "Scout" {print $1; exit}')
+CHAT_ID=$(target/debug/neha chat list | awk '{print $1; exit}')
 ```
+
+`neha bot list` prints each Bot's id, name, and Chat; `neha chat list` prints each Chat's id and Bot. The two lines above keep the ids in the shell for the rest of this guide.
 
 A Bot uses the Space's default Model and thinking level. Choose its own with `--model <model-id>` and `--thinking minimal|low|medium|high|max`; `neha bot show` prints them when set. `neha bot set <bot> --model <model-id> --thinking <level>` changes them later.
 
 The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's workspace:
 
 ```bash
-target/debug/neha bot show <bot-id>
+target/debug/neha bot show "$BOT_ID"
 ```
 
 Send a Message and wait for the Bot's reply, including any steps it took on its Computer. With one Chat, no identifier is needed:
@@ -130,11 +134,10 @@ Send a Message and wait for the Bot's reply, including any steps it took on its 
 target/debug/neha chat send "hello"
 ```
 
-The CLI prints the Bot's reply and the run that produced it. Read the whole Chat or inspect the run's steps and actions:
+The CLI prints the Bot's reply and the run that produced it. Read the whole Chat:
 
 ```bash
-target/debug/neha chat read <chat-id>
-target/debug/neha run show <run-id>
+target/debug/neha chat read "$CHAT_ID"
 ```
 
 A Bot can also write files, read them back, and run shell commands in its Computer's workspace. [Let a Bot work on its Computer](tools.md) shows how.
@@ -151,10 +154,11 @@ Send a request that keeps the Bot busy, such as a shell command that waits:
 target/debug/neha chat send "Run 'sleep 5' in the shell, then tell me the exit code."
 ```
 
-Wait until the first terminal prints `running`, then send a second request from another terminal while the first command runs:
+Wait until the first terminal prints `running`, then send a second request from another terminal while the first command runs. Keep the run id the reply prints:
 
 ```bash
-target/debug/neha chat send "Then list the open questions."
+target/debug/neha chat send "Then list the open questions." | tee reply.txt
+RUN_ID=$(awk '/^  run / {print $2; exit}' reply.txt)
 ```
 
 If the second command prints `queued (position 1)`, the first run had already ended; send the request sooner to see it wait at position 2.
@@ -168,7 +172,7 @@ The second command prints `queued (position 2)` and later the Bot's reply. Its l
 Read that run from the record:
 
 ```bash
-target/debug/neha run show <run-id>
+target/debug/neha run show "$RUN_ID"
 ```
 
 `neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
@@ -183,7 +187,7 @@ The Space runs in one terminal. Open another terminal and pair this machine. The
 target/debug/neha computer pair
 ```
 
-Answer `y`. It prints `Paired Computer <id> with <url>.`; use that id below. Then start the daemon and keep this terminal open:
+Answer `y`. It prints `Paired Computer <id> with <url>.`; the Computer belongs to you. Then start the daemon and keep this terminal open:
 
 ```bash
 target/debug/neha computer run
@@ -193,7 +197,8 @@ In another terminal, list the Computers and create a Bot on the Local one. `comp
 
 ```bash
 target/debug/neha computer list
-target/debug/neha bot create Runner --computer <computer-id>
+target/debug/neha bot create Runner --computer local
+RUNNER_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
 ```
 
 Without `--computer`, a new Bot goes on a new Hosted Computer; `--computer local` puts it on your paired Local Computer.
@@ -201,7 +206,7 @@ Without `--computer`, a new Bot goes on a new Hosted Computer; `--computer local
 Ask the new Bot to work:
 
 ```bash
-target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
+target/debug/neha chat send --bot "$RUNNER_ID" "pwd; echo hi > a.txt"
 ```
 
 The first action on this Local Computer asks for approval. At the card, type `a` to allow it once; [Approvals](approvals.md) covers the other answers.
@@ -212,17 +217,21 @@ The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>`
 
 The signed-in client has four entries in its rail: Chats, Needs attention, Bots, and Settings. Open Bots and pick a Bot to open its page.
 
-The page shows the Bot's name, its picture, its Computer and whether it is online, its Model and thinking level, and its access. Change the name there. Choose another Model or thinking level for the Bot; without one it uses the Space's default.
+The page shows the Bot's name, its picture made from the initials of its name, its Computer and whether it is online, its Model and thinking level, and its access. Change the name there. Choose another Model or thinking level for the Bot; without one it uses the Space's default, and clearing one puts it back on that default. Move the Bot to another Local Computer you own from that page.
 
 For a Bot on a Local Computer, the page shows the folders the Bot may write and whether it has full access. Grant a folder there, or turn full access on: the page states the risk and asks you to confirm before anything changes. The page also lists the Bot's Ask and Allow rules, and you can add and remove them there.
 
-Settings shows the Space's Providers and Models, the catalog's state, and the Computers you own. Set the Space's default Model there. A Hosted Computer offers a reset in that list; it asks for confirmation first, and it deletes every file and folder inside the Bot's Workspace.
+Settings shows the Space's Providers and Models, the catalog's state, and every Computer you own with its kind and whether it is online. Set the Space's default Model there.
 
-The CLI does the same work. Rename a Bot and set the default Model:
+A Hosted Computer offers a reset in that list; it asks for confirmation first, and it deletes every file and folder inside the Bot's Workspace. Moving a Bot between your Local Computers stays on its page.
+
+The CLI does the same work. Read the ids from the lists, then rename a Bot and set the default Model:
 
 ```bash
-target/debug/neha bot rename <bot-id> "Scout"
-target/debug/neha model default <model-id>
+BOT_ID=$(target/debug/neha bot list | awk '$2 == "Scout" {print $1; exit}')
+target/debug/neha bot rename "$BOT_ID" "Scout Two"
+MODEL_ID=$(target/debug/neha model list | awk 'NR==1 {print $1}')
+target/debug/neha model default "$MODEL_ID"
 ```
 
 [Approvals](approvals.md) covers the rules and the answers, and [Add a Local Computer](computer.md#file-access-and-a-runs-directory) covers the folders and full access.
@@ -233,7 +242,7 @@ A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work o
 
 ```bash
 printf 'remember the milk\n' > notes.txt
-target/debug/neha chat send --file notes.txt --bot <bot-id> "Read the attached file and tell me what it says."
+target/debug/neha chat send --file notes.txt --bot "$RUNNER_ID" "Read the attached file and tell me what it says."
 ```
 
 [Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.
@@ -283,4 +292,5 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, search, or notifications.
 - The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
+- A Bot on a Hosted Computer does not ask before an action yet, so its page offers no Ask or Allow rule to add or remove.
 - The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

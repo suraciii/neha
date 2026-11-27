@@ -27,7 +27,7 @@ Under Advanced, a connection names its protocol: chat completions, which is the 
 
 The Admin can refresh a Provider's Models from its catalog entry or its endpoint. A refresh keeps a Model's identity when its name stays, and retires Models the Provider no longer offers.
 
-A fresh known-vendor connection defaults to a Model that calls tools. The Admin can disconnect a Provider; Bots that used its Models fall back to the Space's default.
+A fresh known-vendor connection defaults to a Model that calls tools.
 
 ## Catalog
 
@@ -53,7 +53,9 @@ A Model that cannot read images is marked in every picker, and a Bot that works 
 
 The Space has a default Model and thinking level. Every Bot uses them unless its owner chooses a Model and a thinking level for that Bot.
 
-The Admin changes the default Model in [Settings](../client/product.md#settings) or with [`neha model default`](../cli/product.md#providers). Each Provider's default Model is the Space's default Model, and a Provider that does not offer it marks no default. The default thinking level stays the one the Admin gave when the Provider connected.
+The Admin changes the default Model in [Settings](../client/product.md#settings) or with [`neha model default`](../cli/product.md#providers). Each Provider's default Model is the Space's default Model, and a Provider that does not offer it marks no default.
+
+Changing the default Model changes no thinking level; the Space's default level comes from a Provider connection.
 
 A Bot's chosen Model MUST be connected and able to call tools. Its thinking level MUST be one the Model accepts.
 
@@ -74,3 +76,4 @@ When a Provider fails or runs out, the Bot says so as a Message and the work is 
 - Signing in with a subscription plan instead of an API key is not yet specified.
 - Fallback Models, used when the chosen Model fails, are not yet specified.
 - Cost by Model is not yet specified.
+- Disconnecting a Provider is not yet available. When it is, Bots that used its Models fall back to the Space's default.

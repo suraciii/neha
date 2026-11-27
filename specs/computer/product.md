@@ -80,6 +80,8 @@ On a Computer that several Bots share, one Bot at a time controls the keyboard a
 
 On a Linux Local Computer, the owner sets its access: granted folders, or full access. A Windows Local Computer has no such access model.
 
+A Local Computer states which access it supports, and a client offers only what the Computer states. The browser disables the controls a Computer does not support, and the CLI refuses a command that asks for them and names what the Computer does not support. An owner always revokes a grant and turns full access off.
+
 With granted folders, a Bot writes and deletes files only in its Workspace, the granted folders, and the run's own working directory. With full access, Neha starts no sandbox, and the Bot writes, deletes, and reads with the machine user's own file rights, including the Computer's configuration directory.
 
 The approval gate applies to full access as it does to granted folders. [Bot](../bot/product.md#asking-before-an-action) covers when a Bot asks.

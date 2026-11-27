@@ -169,6 +169,10 @@ pub struct CommandContext<'a> {
     /// Serializes answers and rule changes, so two clients cannot decide one
     /// approval or add one rule twice.
     pub approvals: &'a tokio::sync::Mutex<()>,
+    /// Serializes Provider writes: a refresh reads the record's default before
+    /// its HTTP call and writes after it, so nothing else may write a Provider
+    /// in between.
+    pub provider_writes: &'a tokio::sync::Mutex<()>,
     /// The run queue. A command that changes a Bot's authority takes the Bot's
     /// admit lock, so its read and its event cannot interleave with a run
     /// start's read and event: the record's order then decides which access a
@@ -667,6 +671,13 @@ async fn rule_add(
     if tool.is_empty() {
         return Err(ApiError::invalid_argument("a rule needs a tool"));
     }
+    // A rule names a tool the Bot loop can run. A misspelt name would be
+    // recorded and never match, so it is refused at the edge that records it.
+    if !neha_loop::tools::is_builtin(&tool) {
+        return Err(ApiError::invalid_argument(format!(
+            "there is no tool named {tool}"
+        )));
+    }
     let command_prefix = match command_prefix {
         Some(prefix) => {
             let prefix = prefix.trim();
@@ -712,7 +723,7 @@ async fn rule_add(
         ));
     }
 
-    let (existing_rule, owned) = {
+    let (existing_rule, owned, hosted) = {
         let state = context
             .state
             .lock()
@@ -729,10 +740,25 @@ async fn rule_add(
                     && rule.path_prefix == path_prefix
             })
             .cloned();
-        (existing, state.owned_bot(bot, account.id).is_some())
+        let owned = state.owned_bot(bot, account.id).is_some();
+        let hosted = state.bots.get(&bot).is_some_and(|view| {
+            state
+                .computers
+                .get(&view.computer)
+                .is_some_and(|computer| computer.kind == "hosted")
+        });
+        (existing, owned, hosted)
     };
     if !owned {
         return Err(ApiError::not_found("no such Bot"));
+    }
+    // A Hosted Computer runs inside its sandbox with no approval step, so a
+    // rule would never match there: refuse to record one the User would
+    // believe was in force.
+    if hosted {
+        return Err(ApiError::invalid_argument(
+            "rules apply only to a Bot on a Local Computer; a Hosted Computer never asks",
+        ));
     }
     if let Some(rule) = existing_rule {
         // The same rule made twice is the rule that already exists. Record the
@@ -818,25 +844,24 @@ async fn rule_remove(
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
-    let (view, owned) = {
+    let view = {
         let state = context
             .state
             .lock()
             .map_err(|_| ApiError::internal("state lock"))?;
-        let view = state
+        // The maker or the Bot's owner is part of the lookup: a rule another
+        // account cannot remove looks exactly like a rule that does not
+        // exist, so the answer never tells which rules the Space holds.
+        state
             .rules
             .iter()
-            .find(|view| view.rule == rule)
+            .find(|view| {
+                view.rule == rule
+                    && (view.user == account.id || state.owned_bot(view.bot, account.id).is_some())
+            })
             .cloned()
-            .ok_or_else(|| ApiError::not_found("no such Rule"))?;
-        let owned = state.owned_bot(view.bot, account.id).is_some();
-        (view, owned)
+            .ok_or_else(|| ApiError::not_found("no such Rule"))?
     };
-    if view.user != account.id && !owned {
-        return Err(ApiError::forbidden(
-            "only the rule's maker or the Bot's owner removes it",
-        ));
-    }
     let draft = EventDraft::new(
         EventKind::RuleRemoved,
         Author::User(account.id),
@@ -909,6 +934,12 @@ async fn provider_add(
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
+    // Provider writes are serialized: a refresh reads the default before its
+    // HTTP call and writes after it, so no other Provider write may interleave.
+    let _provider_write = context.provider_writes.lock().await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
     let provider = Id::new();
     let plan = if let Some(vendor) = &arguments.vendor {
         catalog_plan(
@@ -962,6 +993,10 @@ async fn provider_connect(
     fingerprint: String,
     arguments: ProviderConnect,
 ) -> Result<Outcome, ApiError> {
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
+    let _provider_write = context.provider_writes.lock().await;
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
@@ -1150,6 +1185,12 @@ async fn provider_refresh(
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
+    // The default is read before the Provider answers and written after it:
+    // hold the Provider writes so a default change cannot land in between.
+    let _provider_write = context.provider_writes.lock().await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
     let (view, api_key) = {
         let state = context
             .state
@@ -1310,6 +1351,10 @@ async fn model_default(
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
+    let _provider_write = context.provider_writes.lock().await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
     let (provider, models) = {
         let state = context
             .state
@@ -1322,6 +1367,14 @@ async fn model_default(
         let provider = selected.provider;
         if !state.providers.contains_key(&provider) {
             return Err(ApiError::invalid_argument("the Model has no Provider"));
+        }
+        // Every Bot that inherits the Space's default needs the Model to call
+        // tools; a default that cannot would strand every Bot without a Model
+        // of its own.
+        if !selected.tools {
+            return Err(ApiError::invalid_argument(
+                "the Model cannot call tools, so a Bot cannot use it",
+            ));
         }
         let mut provider_models: Vec<&ModelView> = state
             .models
@@ -1571,6 +1624,18 @@ async fn bot_update(
         }
         None => None,
     };
+    // A reset and a choice answer the same question; taking both would make
+    // the result depend on their order, so the Space refuses the request.
+    if update.reset_model && update.model.is_some() {
+        return Err(ApiError::invalid_argument(
+            "a Bot update resets or chooses its Model, not both",
+        ));
+    }
+    if update.reset_thinking && update.thinking.is_some() {
+        return Err(ApiError::invalid_argument(
+            "a Bot update resets or chooses its thinking level, not both",
+        ));
+    }
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
@@ -1578,7 +1643,10 @@ async fn bot_update(
     let added = update.grant_add.is_some();
     let removed = update.grant_remove.is_some();
     let grant_changes = usize::from(replaced) + usize::from(added) + usize::from(removed);
-    let selection_change = update.model.is_some() || update.thinking.is_some();
+    let selection_change = update.model.is_some()
+        || update.thinking.is_some()
+        || update.reset_model
+        || update.reset_thinking;
     let name_change = name.is_some();
     if update.full_access.is_none() && grant_changes == 0 && !selection_change && !name_change {
         return Err(ApiError::invalid_argument("a Bot update needs a change"));
@@ -1601,14 +1669,37 @@ async fn bot_update(
             .owned_bot(update.bot, account.id)
             .ok_or_else(|| ApiError::not_found("no such Bot"))?;
         let access_change = update.full_access.is_some() || grant_changes > 0;
-        let hosted = state
+        let computer = state
             .computers
             .get(&bot.computer)
-            .is_some_and(|computer| computer.kind == "hosted");
-        if hosted && access_change {
+            .ok_or_else(|| ApiError::internal("the Bot has no Computer"))?;
+        if computer.kind == "hosted" && access_change {
             return Err(ApiError::invalid_argument(
                 "file access changes apply only to a Local Computer; a Hosted Computer works only in its Workspace",
             ));
+        }
+        // A Local Computer declares what its machine can serve. Widening
+        // access it cannot serve is refused here, before anything is
+        // recorded; removing a grant or turning full access off stays
+        // possible so an owner can always narrow access.
+        if computer.kind == "local"
+            && let Some(access) = context.links.access_capabilities(computer.id)
+        {
+            let grant_widening = update
+                .grants
+                .as_ref()
+                .is_some_and(|grants| !grants.is_empty())
+                || update.grant_add.is_some();
+            if grant_widening && !access.grants {
+                return Err(ApiError::invalid_argument(
+                    "this Local Computer does not support granted folders",
+                ));
+            }
+            if update.full_access == Some(true) && !access.full_access {
+                return Err(ApiError::invalid_argument(
+                    "this Local Computer does not support full access",
+                ));
+            }
         }
     }
     let replacement = update
@@ -1701,6 +1792,10 @@ async fn bot_update(
             bot.grants = grants.clone();
             data["grants"] = json!(grants);
         }
+        if update.reset_model {
+            bot.model = None;
+            data["reset_model"] = json!(true);
+        }
         let mut model = bot.model;
         if let Some(selected) = update.model {
             check_model_capability(&state, selected, "the selected Model does not exist")?;
@@ -1708,7 +1803,10 @@ async fn bot_update(
             model = Some(selected);
             data["model"] = json!(selected);
         }
-        if let Some(level) = update.thinking {
+        if update.reset_thinking {
+            bot.thinking = None;
+            data["reset_thinking"] = json!(true);
+        } else if let Some(level) = update.thinking {
             if let Some(selected) = model
                 && let Some(view) = state.models.get(&selected)
             {
@@ -1782,8 +1880,11 @@ async fn bot_create(
     if name.is_empty() {
         return Err(ApiError::invalid_argument("a Bot needs a name"));
     }
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
+    // A recorded create answers only its creator: its result names the Bot,
+    // the Chat, and the Computer, so another account that knows the command
+    // id and parameters must not read it.
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
     }
     {
         let state = context
@@ -1883,12 +1984,13 @@ async fn bot_create(
         },
         "computer": computer_view,
         "chat": {"id": chat, "owner": account.id, "bot": bot},
+        "user": account.id,
     });
     let appended = match append(
         context.store,
         context.state,
         command_id,
-        fingerprint,
+        fingerprint.clone(),
         drafts,
         Some(result.clone()),
         None,
@@ -1907,7 +2009,9 @@ async fn bot_create(
         if let Some(workspace) = &created_workspace {
             let _ = std::fs::remove_dir_all(workspace);
         }
-        return recorded_outcome(context.store, command_id).await;
+        return replay_owned(context.store, command_id, &fingerprint, account)
+            .await?
+            .ok_or_else(|| ApiError::internal("the recorded Bot create vanished"));
     }
 
     Ok(Outcome {
@@ -1932,10 +2036,10 @@ async fn bot_move(
     bot: Id,
     computer: Id,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
-    }
-
+    // Authorization runs before any replay: the recorded result names the Bot
+    // and both Computers, so an account that does not own them must not read
+    // it. Both checks still hold after the Bot moved, so the owner's retry
+    // reaches its recorded answer below.
     let (bot_view, from_view, to_view) = {
         let state = context
             .state
@@ -1960,6 +2064,9 @@ async fn bot_move(
         }
         (bot_view, from_view, to_view)
     };
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
     if to_view.kind != "local" {
         return Err(ApiError::invalid_argument(
             "a Bot moves to a Local Computer",
@@ -2166,8 +2273,10 @@ async fn computer_add(
     fingerprint: String,
     code: String,
 ) -> Result<Outcome, ApiError> {
-    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
-        return existing_outcome(context.store, command_id, record).await;
+    if let Some(outcome) =
+        replay_owned_computer(context.store, command_id, &fingerprint, account).await?
+    {
+        return Ok(outcome);
     }
     // Take the attempt's place before any lookup: two connections cannot both
     // read a count below the limit and then both proceed.
@@ -2232,12 +2341,14 @@ async fn computer_add(
         kind: "local".to_owned(),
         online: false,
         workspace,
+        supports_grants: true,
+        supports_full_access: true,
     });
     let appended = match append(
         context.store,
         context.state,
         command_id,
-        fingerprint,
+        fingerprint.clone(),
         vec![draft],
         Some(result.clone()),
         None,
@@ -2261,7 +2372,9 @@ async fn computer_add(
         // A replayed command already recorded its Computer; this claim cannot
         // be the one the record names, so give it back.
         let _ = context.identity.release_pairing(account.id, computer).await;
-        return recorded_outcome(context.store, command_id).await;
+        return replay_owned_computer(context.store, command_id, &fingerprint, account)
+            .await?
+            .ok_or_else(|| ApiError::internal("the recorded Computer add vanished"));
     }
 
     Ok(Outcome {
@@ -2362,6 +2475,8 @@ fn fresh_hosted(
         kind: "hosted".to_owned(),
         online: true,
         workspace: workspace.to_string_lossy().into_owned(),
+        supports_grants: true,
+        supports_full_access: true,
     };
 
     Ok((computer, view, Some(workspace)))
@@ -2579,6 +2694,15 @@ fn clear_workspace(path: &std::path::Path) -> std::io::Result<()> {
 fn viewed_computer(computer: &ComputerView, links: &ComputerLinks) -> ComputerView {
     let mut computer = computer.clone();
     computer.online = computer.kind != "local" || links.online(computer.id);
+    // A real Computer declares which access its machine can serve. The links
+    // keep the last declaration after it disconnects, so an offline machine
+    // does not show a control its runtime refuses.
+    if computer.kind == "local"
+        && let Some(access) = links.access_capabilities(computer.id)
+    {
+        computer.supports_grants = access.grants;
+        computer.supports_full_access = access.full_access;
+    }
 
     computer
 }
@@ -5773,6 +5897,34 @@ async fn replay_owned(
             "a recorded command belongs to another User",
         ));
     }
+    Ok(Some(existing_outcome(store, command_id, record).await?))
+}
+
+/// Returns a recorded Computer add's outcome, but only to the account that
+/// paired the Computer the answer names.
+///
+/// The answer is a `ComputerView`, whose `owner` is the account that paired
+/// it; a result written before that check answered any caller, so it is
+/// refused rather than replayed.
+async fn replay_owned_computer(
+    store: &Store,
+    command_id: Id,
+    fingerprint: &str,
+    account: &Account,
+) -> Result<Option<Outcome>, ApiError> {
+    let Some(record) = existing(store, command_id, fingerprint).await? else {
+        return Ok(None);
+    };
+    let owner = record
+        .result
+        .as_ref()
+        .and_then(|result| result.get("owner"))
+        .and_then(Value::as_str)
+        .and_then(|owner| owner.parse::<Id>().ok());
+    if owner != Some(account.id) {
+        return Err(ApiError::not_found("no such Computer"));
+    }
+
     Ok(Some(existing_outcome(store, command_id, record).await?))
 }
 

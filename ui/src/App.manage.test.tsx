@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
 import { fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
@@ -5,7 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
-import { drain, element, record, renderApp, useView } from "./test/view";
+import { drain, element, openChat, record, renderApp, useView } from "./test/view";
 import type { Model, Rule } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
@@ -27,6 +30,20 @@ const thinker: Model = {
   tools: true,
   is_default: true,
   thinking_levels: ["minimal", "medium", "high"],
+};
+
+// A Model that answers but never thinks.
+const plain: Model = {
+  id: "m3",
+  provider: "v1",
+  name: "Atlas plain",
+  context_limit: 200_000,
+  max_output: 16_000,
+  reads_images: false,
+  thinks: false,
+  tools: true,
+  is_default: false,
+  thinking_levels: [],
 };
 
 const quiet: Model = {
@@ -100,13 +117,14 @@ async function openBots(): Promise<View> {
 }
 
 // Opens the Settings surface on the section the test names: Providers, Models,
-// or the catalog.
-async function openSettings(section = 1): Promise<View> {
+// Computers, or the catalog.
+async function openSettings(section = "Providers"): Promise<View> {
   const view = renderApp();
   await waitFor(() => expect(element(view, ".rail__item:nth-of-type(4)")).toBeTruthy());
   flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(3));
-  flush(() => fireEvent.click(element(view, `.conv:nth-of-type(${section})`)));
+  // The sidebar lists every section the Settings surface opens.
+  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+  flush(() => fireEvent.click(button(view, section)));
   await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
   return view;
 }
@@ -216,10 +234,20 @@ describe("App management", () => {
     const view = await openBots();
     const fullAccess = field<HTMLInputElement>(view, "full_access");
 
-    // The switch arms the risk first; it writes nothing yet.
+    // The switch arms the risk first; it writes nothing yet. The risk says what
+    // the Bot can read before the confirm button is pressed, not after.
     flush(() => fireEvent.click(fullAccess));
     expect(space.updates).toHaveLength(0);
     await waitFor(() => expect(element(view, ".risk__text").textContent).toContain("read and change any file"));
+    const risk = () => element(view, ".risk__text").textContent ?? "";
+    // With the sandbox off the Bot can also read Neha's configuration
+    // directory: the saved pairing, the machine's token, and CLI sessions.
+    expect(risk()).toContain("~/.config/neha");
+    expect(risk()).toContain("machine's token");
+    expect(risk()).toContain("CLI sessions");
+    // The confirm button is on screen while the risk is, so the answer comes
+    // after the risk has been read.
+    expect(button(view, "Turn on full access")).toBeTruthy();
 
     // Taking the risk back leaves the Bot as it was.
     press(view, "Cancel");
@@ -297,9 +325,11 @@ describe("App management", () => {
     await waitFor(() => expect(space.ruleRemoves).toEqual(["rule1"]));
     await waitFor(() => expect(panelText(view, "Ask and Allow rules")).toContain("No rule is set."));
 
-    // A new rule names its effect, its tool, and what it covers.
+    // A new rule names its effect, its tool, and what it covers. The tool comes
+    // from the set every Bot has, so the page cannot name one the Space would
+    // refuse.
     choose(view, "rule_effect", "ask");
-    type(view, "rule_tool", "write_file");
+    choose(view, "rule_tool", "write_file");
     type(view, "rule_path", "/data");
     await waitFor(() => expect(button(view, "Add rule").disabled).toBe(false));
     press(view, "Add rule");
@@ -366,7 +396,9 @@ describe("App management", () => {
     await waitFor(() => expect(space.connects).toHaveLength(1));
     expect(space.connects[0]).toMatchObject({ vendor: "openai", api_key: "sk-test" });
     // The new Provider is listed, and the key is never shown again.
-    await waitFor(() => expect(element(view, ".row__name").textContent).toBe("https://api.openai.com/v1"));
+    await waitFor(() =>
+      expect(element(view, ".row__name").textContent).toBe("https://api.openai.com/v1"),
+    );
     await waitFor(() => expect(field<HTMLInputElement>(view, "api_key").value).toBe(""));
     await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Models refreshed"));
   });
@@ -376,7 +408,7 @@ describe("App management", () => {
       thinker,
       { ...quiet, tools: true, is_default: false, thinking_levels: ["low"] },
     ];
-    const view = await openSettings(2);
+    const view = await openSettings("Models");
 
     // The default Model says so, and the others offer the change.
     const rows = view.container.querySelectorAll(".row");
@@ -407,7 +439,7 @@ describe("App management", () => {
       provider_count: 42,
       model_count: 900,
     };
-    const view = await openSettings(3);
+    const view = await openSettings("Catalog");
 
     const facts = view.container.querySelectorAll(".fact");
     expect(facts[0]?.textContent).toContain("https://models.dev/api.json");
@@ -445,7 +477,7 @@ describe("App management", () => {
       provider_count: 3,
       model_count: 40,
     };
-    const view = await openSettings(3);
+    const view = await openSettings("Catalog");
 
     const facts = view.container.querySelectorAll(".fact");
     expect(facts[0]?.textContent).toContain("Built-in snapshot");
@@ -475,12 +507,410 @@ describe("App management", () => {
     expect(view.container.querySelector(".page__body")).toBeNull();
   });
 
-  it("names a management change the record reports", async () => {
-    const view = await openBots();
-    // Another client renamed the Bot, and the page shows its name.
+  it("shows a rename another client made", async () => {
+    const view = await openChat();
+    // Another client renamed the Bot: the record says so.
     space.bot.name = "Renamed";
-    record("neha.bot.updated", { bot: "b1", name: "Renamed" });
+    record("neha.bot.renamed", { bot: "b1", name: "Renamed" });
+    // The Chat on screen names the Bot, so it shows the new name at once.
+    await waitFor(() => expect(element(view, ".chat__titles h1").textContent).toBe("Renamed"));
+
+    // The management surface reads the Bot again, so its page names the new Bot
+    // too.
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
+    await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(1));
+    flush(() => fireEvent.click(element(view, ".conv")));
     await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Renamed"));
     await drain();
+  });
+
+  it("takes a Model back to the Space's default", async () => {
+    space.models = [thinker, plain];
+    const view = await openBots();
+
+    // The Bot's own choice travels as the choice it made.
+    choose(view, "bot_model", "m1");
+    choose(view, "bot_thinking", "high");
+    press(view, "Save Model");
+    await waitFor(() => expect(space.updates).toHaveLength(1));
+    expect(space.updates[0]).toMatchObject({ model: "m1", thinking: "high" });
+    await waitFor(() => expect(button(view, "Save Model").disabled).toBe(true));
+
+    // A Model that cannot think sends no level at all: an empty one would leave
+    // the Bot on a level the Model does not have.
+    choose(view, "bot_model", "m3");
+    press(view, "Save Model");
+    await waitFor(() => expect(space.updates).toHaveLength(2));
+    expect(space.updates[1]).toMatchObject({ model: "m3", reset_thinking: true });
+    expect(space.updates[1]).not.toHaveProperty("thinking");
+    await waitFor(() => expect(button(view, "Save Model").disabled).toBe(true));
+
+    // Back to the default is a field of its own: the Space holds the default,
+    // and an absent Model leaves the Bot's own choice alone. The level the page
+    // shows is the default Model's own, so it travels with the choice.
+    choose(view, "bot_model", "");
+    press(view, "Save Model");
+    await waitFor(() => expect(space.updates).toHaveLength(3));
+    expect(space.updates[2]).toMatchObject({ bot: "b1", reset_model: true, thinking: "minimal" });
+    expect(space.updates[2]).not.toHaveProperty("model");
+    // The page shows the Bot following the Space's default again.
+    await waitFor(() => expect(panelText(view, "Model")).toContain("Space default"));
+  });
+
+  it("drops a Bot page write that lands after another Bot was opened", async () => {
+    // A second Chat gives the Space a second Bot, which is where the User goes
+    // while the first page's write is still on its way.
+    space.chats = [space.chat, space.otherChat];
+    const view = renderApp();
+    await waitFor(() => expect(element(view, ".rail__item:nth-of-type(3)")).toBeTruthy());
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
+    await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(2));
+    flush(() => fireEvent.click(element(view, ".conv")));
+    await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+    type(view, "bot_name", "Nova");
+    press(view, "Save name");
+    await waitFor(() => expect(space.asked).toContain("bot_update"));
+
+    // The answer lands after the User opened another Bot's page.
+    flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
+    await waitFor(() =>
+      expect(element(view, ".page__titles h1").textContent).toBe(space.otherBot.name),
+    );
+    await drain();
+
+    // The write the first page asked for never reaches the page now open: its
+    // name is the one the second Bot's page holds.
+    expect(element(view, ".page__titles h1").textContent).toBe(space.otherBot.name);
+    expect(view.container.querySelector('[name="bot_name"]')).toHaveProperty(
+      "value",
+      space.otherBot.name,
+    );
+    // The Bot the User closed keeps the name its own page asked for.
+    expect(space.bot.name).toBe("Nova");
+  });
+
+  it("clears the Workspace of the Computer the Bot on screen works on", async () => {
+    space.computer.kind = "hosted";
+    space.bot.computer = "p5";
+    const view = await openBots();
+    await waitFor(() => expect(panelText(view, "Computer")).toContain("/hosted"));
+
+    press(view, "Reset Workspace");
+    await waitFor(() => expect(button(view, "Press again to reset")).toBeTruthy());
+    press(view, "Press again to reset");
+    await waitFor(() => expect(space.resets).toEqual(["p5"]));
+  });
+
+  it("lists every Computer the Space can use in Settings", async () => {
+    space.bot.computer = "p1";
+    space.otherBot.computer = "p9";
+    const view = await openSettings("Computers");
+
+    const rows = view.container.querySelectorAll(".rows .row");
+    // Both paired Local Computers and the Hosted one are listed, including the
+    // one no Bot works on.
+    expect(rows).toHaveLength(3);
+    expect(rows[0]?.textContent).toContain("/w");
+    expect(rows[0]?.textContent).toContain("Local Computer");
+    expect(rows[0]?.textContent).toContain("Online");
+    // A Computer's Bots and what each may write are on its row.
+    expect(rows[0]?.textContent).toContain("Scout");
+    expect(rows[0]?.textContent).toContain("Only its Workspace");
+    expect(rows[1]?.textContent).toContain("No Bot works here");
+
+    // The Bot chip opens that Bot's page.
+    flush(() => fireEvent.click(button(view, "Scout · Only its Workspace")));
+    await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Scout"));
+    // Coming back returns to the Computers list, not to the Chats.
+    flush(() => fireEvent.click(element(view, ".page__back")));
+    await waitFor(() => expect(panelText(view, "Computers")).toContain("/w"));
+  });
+
+  it("resets a Hosted Computer from the Computers list", async () => {
+    space.bot.computer = "p1";
+    const view = await openSettings("Computers");
+
+    const rows = view.container.querySelectorAll(".rows .row");
+    // Only a Hosted Computer offers a reset: a Local one belongs to its machine.
+    expect(rows[0]?.textContent).not.toContain("Reset Workspace");
+    expect(rows[2]?.textContent).toContain("Reset Workspace");
+    flush(() => fireEvent.click(button(view, "Reset Workspace")));
+    // The first press only arms it, and says what it clears.
+    expect(space.resets).toHaveLength(0);
+    await waitFor(() => expect(button(view, "Press again to reset")).toBeTruthy());
+
+    press(view, "Press again to reset");
+    await waitFor(() => expect(space.resets).toEqual(["p5"]));
+    await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Workspace cleared"));
+  });
+
+  it("says when one Provider offers no Models", async () => {
+    space.providers = [
+      { id: "v1", protocol: "chat_completions", base_url: "http://one" },
+      { id: "v2", protocol: "chat_completions", base_url: "http://two" },
+    ];
+    space.models = [thinker];
+    const view = await openSettings("Models");
+
+    const rows = view.container.querySelectorAll(".rows .row");
+    // The Provider with Models lists them, and the one without says so where
+    // its Models would be.
+    expect(rows).toHaveLength(2);
+    expect(rows[0]?.textContent).toContain("Atlas");
+    expect(rows[0]?.textContent).toContain("http://one");
+    expect(rows[1]?.textContent).toContain("This Provider offers no Models yet.");
+    // A Space with no Provider at all keeps its own empty state, which the
+    // "says when nothing is connected yet" test reads.
+  });
+
+  it("keeps a Model that cannot call tools from being the default", async () => {
+    space.models = [thinker, quiet];
+    const view = await openSettings("Models");
+
+    const rows = view.container.querySelectorAll(".row");
+    expect(rows[0]?.textContent).toContain("Space default");
+    // The quiet Model cannot answer a Chat, so the Space would refuse it.
+    const offer = rows[1]?.querySelector("button") as HTMLButtonElement;
+    expect(offer.textContent).toBe("Make default");
+    expect(offer.disabled).toBe(true);
+    expect(offer.title).toBe("This Model cannot call tools, so it cannot be the default.");
+    // Pressing it writes nothing.
+    flush(() => fireEvent.click(offer));
+    await drain();
+    expect(space.defaults).toEqual([]);
+  });
+
+  it("sends no override when Advanced stays closed", async () => {
+    space.providers = [];
+    space.vendors = [
+      {
+        id: "openai",
+        name: "OpenAI",
+        protocol: "openai_responses",
+        selectable: true,
+        api: "https://api.openai.com/v1",
+        model_count: 12,
+      },
+    ];
+    const view = await openSettings();
+    choose(view, "vendor", "openai");
+    type(view, "api_key", "sk-test");
+
+    // The catalog's own protocol and base URL stand, so nothing is overridden.
+    press(view, "Connect Provider");
+    await waitFor(() => expect(space.connects).toHaveLength(1));
+    expect(space.connects[0]).toEqual({ vendor: "openai", api_key: "sk-test" });
+    expect(space.connects[0]).not.toHaveProperty("base_url");
+    expect(space.connects[0]).not.toHaveProperty("protocol");
+    expect(space.connects[0]).not.toHaveProperty("thinking");
+    // The new Provider carries the catalog's preset, not one the page made up.
+    await waitFor(() =>
+      expect(element(view, ".row__name").textContent).toBe("https://api.openai.com/v1"),
+    );
+  });
+
+  it("never sends one vendor's base URL with another vendor's key", async () => {
+    space.providers = [];
+    space.vendors = [
+      {
+        id: "openai",
+        name: "OpenAI",
+        protocol: "openai_responses",
+        selectable: true,
+        api: "https://api.openai.com/v1",
+        model_count: 12,
+      },
+      {
+        id: "anthropic",
+        name: "Anthropic",
+        protocol: "anthropic_messages",
+        selectable: true,
+        api: "https://api.anthropic.com/v1",
+        model_count: 4,
+      },
+    ];
+    const view = await openSettings();
+
+    // The Admin connected one vendor through an override they filled in.
+    choose(view, "vendor", "openai");
+    type(view, "api_key", "sk-openai");
+    press(view, "Advanced");
+    type(view, "connect_base_url", "https://proxy.example/v1");
+    press(view, "Connect Provider");
+    await waitFor(() => expect(space.connects).toHaveLength(1));
+    expect(space.connects[0]).toMatchObject({
+      vendor: "openai",
+      base_url: "https://proxy.example/v1",
+    });
+    // The key and the override are never shown again once they are spent.
+    await waitFor(() => expect(field<HTMLInputElement>(view, "api_key").value).toBe(""));
+    await waitFor(() => expect(field<HTMLInputElement>(view, "connect_base_url").value).toBe(""));
+
+    // The next vendor is chosen and only its own key is pasted. The base URL
+    // and the overrides of the first vendor are gone with it.
+    choose(view, "vendor", "anthropic");
+    expect(field<HTMLInputElement>(view, "api_key").value).toBe("");
+    expect(field<HTMLInputElement>(view, "connect_base_url").value).toBe("");
+    type(view, "api_key", "sk-anthropic");
+    press(view, "Connect Provider");
+    await waitFor(() => expect(space.connects).toHaveLength(2));
+    expect(space.connects[1]).toEqual({ vendor: "anthropic", api_key: "sk-anthropic" });
+    // The second Provider carries the catalog's preset for its own vendor.
+    await waitFor(() => expect(space.providers[1]?.base_url).toBe("https://api.anthropic.com/v1"));
+  });
+
+  it("adds no rule to a Bot a Hosted Computer runs", async () => {
+    space.computer.kind = "hosted";
+    space.rules = [askRule()];
+    const view = await openBots();
+
+    // The rules the Bot still holds are listed, and can be taken away.
+    expect(panelText(view, "Ask and Allow rules")).toContain("shell");
+
+    // The page says why nothing can be added, and offers no form to add it.
+    const rules = panelText(view, "Ask and Allow rules");
+    expect(rules).toContain("A Hosted Computer applies no Ask or Allow rule");
+    expect(view.container.querySelector('[name="rule_effect"]')).toBeNull();
+    expect(view.container.querySelector('[name="rule_tool"]')).toBeNull();
+    expect(
+      Array.from(view.container.querySelectorAll("button")).some(
+        (known) => known.textContent?.trim() === "Add rule",
+      ),
+    ).toBe(false);
+  });
+
+  it("offers no grant or full access a Computer's daemon refuses", async () => {
+    // The daemon on this Computer names no capability it does not have: what it
+    // allows is decided by the machine.
+    space.computer.supports_grants = false;
+    space.computer.supports_full_access = false;
+    const view = await openBots();
+
+    expect(panelText(view, "Granted folders")).toContain(
+      "What this Computer allows is decided by its machine.",
+    );
+    expect(view.container.querySelector('[name="grant_path"]')).toBeNull();
+    expect(panelText(view, "Full access")).toContain(
+      "What this Computer allows is decided by its machine.",
+    );
+    expect(view.container.querySelector('[name="full_access"]')).toBeNull();
+    // Pressing nothing writes nothing.
+    expect(space.updates).toHaveLength(0);
+  });
+
+  it("shows the default Model another client chose", async () => {
+    space.models = [
+      thinker,
+      { ...quiet, tools: true, is_default: false, thinking_levels: ["low"] },
+    ];
+    const view = await openSettings("Models");
+
+    const before = view.container.querySelectorAll(".row");
+    expect(before[0]?.textContent).toContain("Space default");
+    expect(before[1]?.textContent).toContain("Make default");
+
+    // Another client made the second Model the one every Bot starts from.
+    space.models = space.models.map((known) => ({ ...known, is_default: known.id === "m2" }));
+    record("neha.provider.models_updated", { provider: "v1" });
+    await waitFor(() => {
+      const after = view.container.querySelectorAll(".row");
+      expect(after[0]?.textContent).toContain("Make default");
+      expect(after[1]?.textContent).toContain("Space default");
+    });
+  });
+
+  it("marks a reply that arrived while a management page was open", async () => {
+    const view = await openChat();
+    // The Chat is being read: no mark yet.
+    expect(view.container.querySelector(".conv__badge")).toBeNull();
+
+    // The User opens the Settings surface, which leaves the Chat open behind it.
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+    await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+
+    // A reply to the Chat the User is not reading is new activity: the Chats
+    // list is behind the Settings surface, and it says so when it comes back.
+    record("neha.message.added", { chat: "h1", text: "on its way", run: "r1" });
+    flush(() => fireEvent.click(element(view, ".page__back")));
+    await waitFor(() => expect(view.container.querySelector(".page__body")).toBeNull());
+    expect(element(view, ".conv__badge").textContent).toBe("New activity");
+    // Opening the Chat answers it.
+    flush(() => fireEvent.click(element(view, ".conv")));
+    await waitFor(() => expect(view.container.querySelector(".conv__badge")).toBeNull());
+  });
+
+  it("reaches a management surface through the rail on a narrow viewport", async () => {
+    // A narrow viewport shows one surface at a time, so the rail is the only way
+    // to a management surface: it stays, and Back returns to where the User was.
+    const wide = window.matchMedia;
+    try {
+      Object.defineProperty(window, "matchMedia", {
+        writable: true,
+        value: (query: string) => ({
+          matches: true,
+          media: query,
+          addEventListener: () => undefined,
+          removeEventListener: () => undefined,
+        }),
+      });
+      const view = renderApp();
+      await waitFor(() => expect(element(view, ".rail__item:nth-of-type(4)")).toBeTruthy());
+
+      // The rail opens the Settings surface, and Back returns to the Chats the
+      // User came from, with no Chat open.
+      flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+      await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+      expect(panelText(view, "Providers")).toBeTruthy();
+      flush(() => fireEvent.click(element(view, ".page__back")));
+      await waitFor(() => expect(view.container.querySelector(".page__body")).toBeNull());
+      expect(element(view, ".select-chat")).toBeTruthy();
+
+      // A Bot page opened from the Settings returns to the Settings, which is
+      // where the User was before they opened it.
+      flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+      await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+      flush(() => fireEvent.click(button(view, "Computers")));
+      await waitFor(() => expect(panelText(view, "Computers")).toBeTruthy());
+      flush(() => fireEvent.click(button(view, "Scout · Only its Workspace")));
+      await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Scout"));
+      flush(() => fireEvent.click(element(view, ".page__back")));
+      await waitFor(() => expect(panelText(view, "Computers")).toBeTruthy());
+    } finally {
+      window.matchMedia = wide;
+    }
+  });
+
+  it("keeps the rail a narrow viewport can reach", () => {
+    // The rail is the only way to a management surface, so the narrow layout
+    // keeps it: a hidden rail would leave a narrow User no way to the Bots or
+    // the Settings. The layout itself is a stylesheet rule, so the rule is what
+    // the page holds.
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
+    expect(narrow).not.toMatch(/\.rail\s*\{[^}]*display:\s*none/);
+  });
+
+  it("names a rule's tool from the set every Bot has", async () => {
+    const view = await openBots();
+    const tools = field<HTMLSelectElement>(view, "rule_tool");
+
+    // The tools are the ones the execution side runs, and nothing else.
+    expect(Array.from(tools.options).map((option) => option.value)).toEqual([
+      "",
+      "shell",
+      "read_file",
+      "write_file",
+      "list_files",
+    ]);
+    // The form stays closed until a tool is chosen.
+    expect(button(view, "Add rule").disabled).toBe(true);
+    choose(view, "rule_tool", "read_file");
+    await waitFor(() => expect(button(view, "Add rule").disabled).toBe(false));
+
+    // A file rule covers a path prefix.
+    type(view, "rule_path", "/data");
+    press(view, "Add rule");
+    await waitFor(() => expect(space.ruleAdds).toHaveLength(1));
+    expect(space.ruleAdds[0]).toMatchObject({ tool: "read_file", path_prefix: "/data" });
   });
 });

@@ -4,8 +4,10 @@ import { locale, t, type MessageKey } from "../i18n";
 import { dayLabel } from "../lib/format";
 import type {
   Account,
+  Bot,
   CatalogStatus,
   CatalogVendor,
+  Computer,
   Model,
   Provider,
   ThinkingLevel,
@@ -30,6 +32,10 @@ interface SettingsPageProps {
   account: Account;
   providers: Provider[];
   models: Model[];
+  // Every Computer this Space can use, which is what the Computers section lists.
+  computers: Computer[];
+  // Every Bot, so a Computer says which Bots work on it.
+  bots: Bot[];
   // Every vendor the catalog knows that this Space can connect.
   vendors: CatalogVendor[];
   catalog: CatalogStatus | null;
@@ -38,6 +44,10 @@ interface SettingsPageProps {
   busy: boolean;
   error: string | null;
   onBack: () => void;
+  // Clears a Hosted Computer's Workspace, once the Admin confirms it.
+  onReset: (computer: string) => Promise<boolean>;
+  // Opens one Bot's page from a Computer that has Bots on it.
+  onOpenBot: (bot: Bot) => void;
   onConnect: (input: {
     vendor: string;
     apiKey: string;
@@ -48,6 +58,61 @@ interface SettingsPageProps {
   onRefresh: (provider: string) => Promise<boolean>;
   onDefault: (model: string) => Promise<boolean>;
   onCatalog: () => Promise<boolean>;
+}
+
+// Where a Model comes from, which is the base URL of its Provider.
+function baseUrlOf(providers: Provider[], model: Model): string {
+  return providers.find((known) => known.id === model.provider)?.base_url ?? "";
+}
+
+// What a Computer is called in the User's words.
+function kindOf(computer: Computer): string {
+  return computer.kind === "local" ? t("chat.localComputer") : t("chat.hostedComputer");
+}
+
+// One Model, with what it can do and the offer to make it the default. A Model
+// that cannot call tools cannot answer a Chat, so the Space refuses it as the
+// default, and the page says so rather than offering a change that fails.
+function ModelRow(props: {
+  model: Model;
+  baseUrl: string;
+  admin: boolean;
+  busy: boolean;
+  onDefault: (model: string) => void;
+}) {
+  const model = () => props.model;
+  return (
+    <div class="row">
+      <span class="row__text">
+        <span class="row__name mono">{model().name}</span>
+        <span class="row__meta">{props.baseUrl}</span>
+        <span class="chips">
+          <span class="chip">{t("bot.model.context", { limit: model().context_limit })}</span>
+          <span class="chip">{t("bot.model.output", { limit: model().max_output })}</span>
+          <span class="chip">
+            {model().reads_images ? t("bot.model.readsImages") : t("bot.model.noImages")}
+          </span>
+          <span class="chip">
+            {model().tools ? t("bot.model.callsTools") : t("bot.model.noTools")}
+          </span>
+          <Show when={model().is_default}>
+            <span class="chip chip--default">{t("settings.models.default")}</span>
+          </Show>
+        </span>
+      </span>
+      <Show when={props.admin && !model().is_default}>
+        <button
+          class="btn btn--quiet"
+          type="button"
+          disabled={props.busy || !model().tools}
+          title={model().tools ? undefined : t("settings.models.setDefault.noTools")}
+          onClick={() => props.onDefault(model().id)}
+        >
+          {t("settings.models.setDefault")}
+        </button>
+      </Show>
+    </div>
+  );
 }
 
 // The protocol a connection names, in the Admin's words.
@@ -66,7 +131,9 @@ export default function SettingsPage(props: SettingsPageProps) {
   const [vendor, setVendor] = createSignal("");
   const [apiKey, setApiKey] = createSignal("");
   const [baseUrl, setBaseUrl] = createSignal("");
-  const [protocol, setProtocol] = createSignal<string>(PROTOCOLS[0]);
+  // An empty choice keeps the catalog's preset: an override travels only when
+  // the Admin opens Advanced and fills it.
+  const [protocol, setProtocol] = createSignal<string>("");
   const [thinking, setThinking] = createSignal<string>("");
   const [advanced, setAdvanced] = createSignal(false);
   // What the last accepted change did, so a quiet write still answers.
@@ -75,19 +142,35 @@ export default function SettingsPage(props: SettingsPageProps) {
   const canConnect = () =>
     props.account.is_admin && !props.busy && vendor() !== "" && apiKey() !== "";
   const connectable = () => props.vendors.filter((known) => known.selectable);
+  // The Models each Provider offers, in the Providers' own order, so a Provider
+  // that offers none still says so where its Models would be. A Model whose
+  // Provider the list does not name keeps its own place, so no Model is lost.
+  const modelGroups = () => {
+    const named = new Set(props.providers.map((known) => known.id));
+    const groups = props.providers.map((provider) => ({
+      label: provider.base_url,
+      models: props.models.filter((model) => model.provider === provider.id),
+    }));
+    const rest = props.models.filter((model) => !named.has(model.provider));
+    return rest.length === 0 ? groups : [...groups, { label: "", models: rest }];
+  };
 
   async function connect() {
     if (!canConnect()) return;
     setNote(null);
+    // An override travels only when the Admin opened Advanced and filled it.
+    // The catalog's own preset stands otherwise, so a key never reaches a base
+    // URL the Admin did not ask for.
     const done = await props.onConnect({
       vendor: vendor(),
       apiKey: apiKey(),
-      baseUrl: baseUrl().trim() === "" ? null : baseUrl().trim(),
-      protocol: advanced() ? protocol() : null,
+      baseUrl: advanced() && baseUrl().trim() !== "" ? baseUrl().trim() : null,
+      protocol: advanced() && protocol() !== "" ? protocol() : null,
       thinking: advanced() && thinking() !== "" ? (thinking() as ThinkingLevel) : null,
     });
     // The key is never shown again, so the form starts over either way.
     setApiKey("");
+    setBaseUrl("");
     if (done) setNote(t("settings.providers.refreshed"));
   }
 
@@ -114,7 +197,34 @@ export default function SettingsPage(props: SettingsPageProps) {
       ? t("sidebar.settings.providers")
       : props.section === "models"
         ? t("sidebar.settings.models")
-        : t("sidebar.settings.catalog");
+        : props.section === "computers"
+          ? t("sidebar.settings.computers")
+          : t("sidebar.settings.catalog");
+
+  // The Bots that work on one Computer, and what each of them may write. A
+  // Local Computer's access belongs to its Bots, so this is where the summary
+  // lives; the Bot's own page is where it changes.
+  const botsOn = (computer: Computer) => props.bots.filter((bot) => bot.computer === computer.id);
+  const accessOf = (bot: Bot): string =>
+    bot.full_access
+      ? t("settings.computers.access.full")
+      : bot.grants.length === 0
+        ? t("settings.computers.access.none")
+        : t("settings.computers.access.folders", { count: bot.grants.length });
+
+  // The Computer whose reset the Admin armed with a first press. Clearing a
+  // Workspace deletes its files, so it asks twice wherever it is asked from.
+  const [armedReset, setArmedReset] = createSignal<string | null>(null);
+
+  async function reset(computer: string) {
+    if (props.busy) return;
+    if (armedReset() !== computer) {
+      setArmedReset(computer);
+      return;
+    }
+    setArmedReset(null);
+    if (await props.onReset(computer)) setNote(t("settings.computers.reset.done"));
+  }
 
   return (
     <section class="page" aria-label={t("rail.settings")}>
@@ -205,7 +315,15 @@ export default function SettingsPage(props: SettingsPageProps) {
                       class="input"
                       name="vendor"
                       value={vendor()}
-                      onChange={(event) => setVendor(event.currentTarget.value)}
+                      onChange={(event) => {
+                        setVendor(event.currentTarget.value);
+                        // A key, a base URL, and an override belong to the vendor
+                        // they were given for.
+                        setApiKey("");
+                        setBaseUrl("");
+                        setProtocol("");
+                        setThinking("");
+                      }}
                     >
                       <option value="">{t("settings.providers.connect")}</option>
                       <For each={connectable()}>
@@ -259,6 +377,7 @@ export default function SettingsPage(props: SettingsPageProps) {
                           value={protocol()}
                           onChange={(event) => setProtocol(event.currentTarget.value)}
                         >
+                          <option value="">{t("settings.providers.protocol.default")}</option>
                           <For each={PROTOCOLS}>
                             {(known) => <option value={known}>{protocolLabel(known)}</option>}
                           </For>
@@ -305,7 +424,7 @@ export default function SettingsPage(props: SettingsPageProps) {
             <div class="panel__body">
               <p class="panel__note">{t("settings.models.hint")}</p>
               <Show
-                when={props.models.length > 0}
+                when={modelGroups().length > 0}
                 fallback={
                   <div class="side-empty">
                     <p class="side-empty__title">{t("settings.models.empty.title")}</p>
@@ -314,39 +433,29 @@ export default function SettingsPage(props: SettingsPageProps) {
                 }
               >
                 <div class="rows">
-                  <For each={props.models}>
-                    {(model) => (
-                      <div class="row">
-                        <span class="row__text">
-                          <span class="row__name mono">{model.name}</span>
-                          <span class="row__meta">
-                            {props.providers.find((known) => known.id === model.provider)?.base_url ?? ""}
-                          </span>
-                          <span class="chips">
-                            <span class="chip">{t("bot.model.context", { limit: model.context_limit })}</span>
-                            <span class="chip">{t("bot.model.output", { limit: model.max_output })}</span>
-                            <span class="chip">
-                              {model.reads_images ? t("bot.model.readsImages") : t("bot.model.noImages")}
+                  <For each={modelGroups()}>
+                    {(group) => (
+                      <>
+                        <For each={group.models}>
+                          {(model) => (
+                            <ModelRow
+                              model={model}
+                              baseUrl={baseUrlOf(props.providers, model)}
+                              admin={props.account.is_admin}
+                              busy={props.busy}
+                              onDefault={(id) => void makeDefault(id)}
+                            />
+                          )}
+                        </For>
+                        <Show when={group.models.length === 0}>
+                          <div class="row">
+                            <span class="row__text">
+                              <span class="row__name mono">{group.label}</span>
+                              <span class="row__meta">{t("settings.models.empty.provider")}</span>
                             </span>
-                            <span class="chip">
-                              {model.tools ? t("bot.model.callsTools") : t("bot.model.noTools")}
-                            </span>
-                            <Show when={model.is_default}>
-                              <span class="chip chip--default">{t("settings.models.default")}</span>
-                            </Show>
-                          </span>
-                        </span>
-                        <Show when={props.account.is_admin && !model.is_default}>
-                          <button
-                            class="btn btn--quiet"
-                            type="button"
-                            disabled={props.busy}
-                            onClick={() => void makeDefault(model.id)}
-                          >
-                            {t("settings.models.setDefault")}
-                          </button>
+                          </div>
                         </Show>
-                      </div>
+                      </>
                     )}
                   </For>
                 </div>
@@ -414,6 +523,83 @@ export default function SettingsPage(props: SettingsPageProps) {
               </Show>
               <Show when={props.catalog?.builtin}>
                 <p class="panel__note">{t("settings.catalog.kept")}</p>
+              </Show>
+            </div>
+          </section>
+        </Show>
+
+        <Show when={props.section === "computers"}>
+          <section class="panel">
+            <div class="panel__head">
+              <div>
+                <h2>{t("sidebar.settings.computers")}</h2>
+              </div>
+              <span class="badge">{props.computers.length}</span>
+            </div>
+            <div class="panel__body">
+              <p class="panel__note">{t("settings.computers.hint")}</p>
+              <Show
+                when={props.computers.length > 0}
+                fallback={
+                  <div class="side-empty">
+                    <p class="side-empty__title">{t("settings.computers.empty.title")}</p>
+                    <p class="side-empty__text">{t("settings.computers.empty.text")}</p>
+                  </div>
+                }
+              >
+                <div class="rows">
+                  <For each={props.computers}>
+                    {(computer) => (
+                      <div class="row">
+                        <span class="row__text">
+                          <span class="row__name mono">{computer.workspace}</span>
+                          <span class="row__meta">
+                            {kindOf(computer)} ·{" "}
+                            {computer.online ? t("chat.online") : t("chat.offline")}
+                          </span>
+                          <span class="chips">
+                            <Show
+                              when={botsOn(computer).length > 0}
+                              fallback={
+                                <span class="chip">{t("settings.computers.bots.none")}</span>
+                              }
+                            >
+                              <For each={botsOn(computer)}>
+                                {(bot) => (
+                                  <button
+                                    class="chip chip--button"
+                                    type="button"
+                                    onClick={() => props.onOpenBot(bot)}
+                                  >
+                                    {bot.name} · {accessOf(bot)}
+                                  </button>
+                                )}
+                              </For>
+                            </Show>
+                          </span>
+                        </span>
+                        {/* A reset clears a Hosted Workspace's files, and only a
+                            Hosted Computer can be reset. */}
+                        <Show when={computer.kind === "hosted"}>
+                          <button
+                            class={`btn ${
+                              armedReset() === computer.id ? "btn--danger" : "btn--quiet"
+                            }`}
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() => void reset(computer.id)}
+                          >
+                            <Icon name="repeat" size="sm" />
+                            {armedReset() === computer.id
+                              ? t("bot.computer.reset.armed")
+                              : t("bot.computer.reset")}
+                          </button>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <p class="panel__note">{t("bot.computer.reset.hint")}</p>
               </Show>
             </div>
           </section>

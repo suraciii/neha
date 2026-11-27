@@ -8,6 +8,10 @@ import Icon from "./Icon";
 // How much thought a Model can give, cheapest first.
 const LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "max"];
 
+// The tools every Bot has. A rule names one of these, so the page offers the
+// set the execution side runs rather than a name it would refuse.
+const TOOLS = ["shell", "read_file", "write_file", "list_files"];
+
 // What the page holds while the User works on it. A draft only clears when
 // another Bot is opened, so a refresh never takes what the User typed.
 interface Draft {
@@ -132,14 +136,21 @@ export default function BotPage(props: BotPageProps) {
   // A Hosted Computer works only in its own Workspace, so it takes no grant and
   // no full access.
   const hosted = () => props.computer?.kind !== "local";
+  // What this Computer's daemon allows. A Space that names no capability leaves
+  // the control off: an unnamed capability is one the page does not offer, so a
+  // Windows Computer never opens a grant it would refuse.
+  const grantsOpen = () => (props.computer?.supports_grants ?? false) === true;
+  const fullOpen = () => (props.computer?.supports_full_access ?? false) === true;
   const fullOn = () => (props.bot?.full_access ?? false) || draft().armedFull;
   const renamed = () => {
     const name = draft().name.trim();
     return name !== "" && name !== (props.bot?.name ?? "");
   };
+  // A Bot that follows the Space's default holds nothing of its own, which the
+  // draft spells "": the two are the same choice, read the same way.
   const moved = () => draft().model !== (props.bot?.model ?? "");
-  const reThought = () => draft().thinking !== (props.bot?.thinking ?? null);
-  const ruleReady = () => draft().tool.trim() !== "";
+  const reThought = () => draft().thinking !== (props.bot?.thinking ?? "");
+  const ruleReady = () => draft().tool !== "";
   // The other Local Computers this Space knows, which is where a Bot may move.
   const targets = () =>
     props.computers.filter((known) => known.kind === "local" && known.id !== props.computer?.id);
@@ -166,8 +177,10 @@ export default function BotPage(props: BotPageProps) {
 
   async function saveModel() {
     if (props.busy || (!moved() && !reThought())) return;
+    // An empty choice means the Space's default, which the Space holds as a
+    // field of its own rather than as an absent Model or level.
     const model = draft().model === "" ? null : draft().model;
-    const thinking = reThought() ? (draft().thinking as ThinkingLevel) : null;
+    const thinking = draft().thinking === "" ? null : (draft().thinking as ThinkingLevel);
     await props.onModel(model, thinking);
   }
 
@@ -507,56 +520,61 @@ export default function BotPage(props: BotPageProps) {
                   fallback={<p class="panel__note">{t("bot.folders.hosted")}</p>}
                 >
                   <Show
-                    when={shown().grants.length > 0}
-                    fallback={<p class="rows__empty">{t("bot.folders.empty")}</p>}
+                    when={grantsOpen()}
+                    fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
                   >
-                    <div class="rows">
-                      <For each={shown().grants}>
-                        {(path) => (
-                          <div class="row">
-                            <Icon name="folder" size="sm" />
-                            <span class="row__text mono">{path}</span>
-                            <button
-                              class="row__remove"
-                              type="button"
-                              aria-label={t("bot.folders.remove", { path })}
-                              title={t("bot.folders.remove", { path })}
-                              disabled={props.busy}
-                              onClick={() => void props.onGrantRemove(path)}
-                            >
-                              <Icon name="x" size="sm" />
-                            </button>
-                          </div>
-                        )}
-                      </For>
-                    </div>
+                    <Show
+                      when={shown().grants.length > 0}
+                      fallback={<p class="rows__empty">{t("bot.folders.empty")}</p>}
+                    >
+                      <div class="rows">
+                        <For each={shown().grants}>
+                          {(path) => (
+                            <div class="row">
+                              <Icon name="folder" size="sm" />
+                              <span class="row__text mono">{path}</span>
+                              <button
+                                class="row__remove"
+                                type="button"
+                                aria-label={t("bot.folders.remove", { path })}
+                                title={t("bot.folders.remove", { path })}
+                                disabled={props.busy}
+                                onClick={() => void props.onGrantRemove(path)}
+                              >
+                                <Icon name="x" size="sm" />
+                              </button>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                    <form
+                      class="field"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void grant();
+                      }}
+                    >
+                      <span class="field__label">{t("bot.folders.add")}</span>
+                      <div class="field-row">
+                        <input
+                          class="input mono"
+                          name="grant_path"
+                          placeholder={t("bot.folders.placeholder")}
+                          value={draft().grant}
+                          onInput={(event) => patch({ grant: event.currentTarget.value })}
+                        />
+                        <button
+                          class="btn btn--quiet"
+                          type="submit"
+                          disabled={props.busy || draft().grant.trim() === ""}
+                        >
+                          {props.busy ? t("bot.folders.adding") : t("common.add")}
+                        </button>
+                      </div>
+                      <span class="field__hint">{t("bot.folders.hint")}</span>
+                    </form>
                   </Show>
-                  <form
-                    class="field"
-                    onSubmit={(event) => {
-                      event.preventDefault();
-                      void grant();
-                    }}
-                  >
-                    <span class="field__label">{t("bot.folders.add")}</span>
-                    <div class="field-row">
-                      <input
-                        class="input mono"
-                        name="grant_path"
-                        placeholder={t("bot.folders.placeholder")}
-                        value={draft().grant}
-                        onInput={(event) => patch({ grant: event.currentTarget.value })}
-                      />
-                      <button
-                        class="btn btn--quiet"
-                        type="submit"
-                        disabled={props.busy || draft().grant.trim() === ""}
-                      >
-                        {props.busy ? t("bot.folders.adding") : t("common.add")}
-                      </button>
-                    </div>
-                    <span class="field__hint">{t("bot.folders.hint")}</span>
-                  </form>
                 </Show>
               </div>
             </section>
@@ -570,45 +588,50 @@ export default function BotPage(props: BotPageProps) {
                   when={!hosted()}
                   fallback={<p class="panel__note">{t("bot.fullAccess.hosted")}</p>}
                 >
-                  <label class="check">
-                    <input
-                      type="checkbox"
-                      name="full_access"
-                      checked={fullOn()}
-                      disabled={props.busy}
-                      onChange={(event) => {
-                        if (event.currentTarget.checked) patch({ armedFull: true });
-                        else void fullAccess(false);
-                      }}
-                    />
-                    <span>{t("bot.fullAccess.label")}</span>
-                  </label>
-                  <Show when={shown().full_access}>
-                    <p class="panel__note" role="status">
-                      {t("bot.fullAccess.on")}
-                    </p>
-                  </Show>
-                  <Show when={draft().armedFull}>
-                    <div class="risk">
-                      <p class="risk__text">{t("bot.fullAccess.risk")}</p>
-                      <div class="risk__actions">
-                        <button
-                          class="btn btn--primary"
-                          type="button"
-                          disabled={props.busy}
-                          onClick={() => void fullAccess(true)}
-                        >
-                          {t("bot.fullAccess.confirm")}
-                        </button>
-                        <button
-                          class="btn btn--quiet"
-                          type="button"
-                          onClick={() => patch({ armedFull: false })}
-                        >
-                          {t("common.cancel")}
-                        </button>
+                  <Show
+                    when={fullOpen()}
+                    fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
+                  >
+                    <label class="check">
+                      <input
+                        type="checkbox"
+                        name="full_access"
+                        checked={fullOn()}
+                        disabled={props.busy}
+                        onChange={(event) => {
+                          if (event.currentTarget.checked) patch({ armedFull: true });
+                          else void fullAccess(false);
+                        }}
+                      />
+                      <span>{t("bot.fullAccess.label")}</span>
+                    </label>
+                    <Show when={shown().full_access}>
+                      <p class="panel__note" role="status">
+                        {t("bot.fullAccess.on")}
+                      </p>
+                    </Show>
+                    <Show when={draft().armedFull}>
+                      <div class="risk">
+                        <p class="risk__text">{t("bot.fullAccess.risk")}</p>
+                        <div class="risk__actions">
+                          <button
+                            class="btn btn--primary"
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() => void fullAccess(true)}
+                          >
+                            {t("bot.fullAccess.confirm")}
+                          </button>
+                          <button
+                            class="btn btn--quiet"
+                            type="button"
+                            onClick={() => patch({ armedFull: false })}
+                          >
+                            {t("common.cancel")}
+                          </button>
+                        </div>
                       </div>
-                    </div>
+                    </Show>
                   </Show>
                 </Show>
               </div>
@@ -650,68 +673,85 @@ export default function BotPage(props: BotPageProps) {
                   </div>
                 </Show>
 
-                <form
-                  class="panel__form"
-                  onSubmit={(event) => {
-                    event.preventDefault();
-                    void addRule();
-                  }}
+                {/* A Hosted run applies no rule, so the page adds none and says
+                    why: a rule here would not protect this Bot. */}
+                <Show
+                  when={hosted()}
+                  fallback={
+                    <form
+                      class="panel__form"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void addRule();
+                      }}
+                    >
+                      <div class="field-row">
+                          <label class="field">
+                            <span class="field__label">{t("bot.rules.effect")}</span>
+                            <select
+                              class="input"
+                              name="rule_effect"
+                              value={draft().effect}
+                              onChange={(event) =>
+                                patch({ effect: event.currentTarget.value as Rule["effect"] })
+                              }
+                            >
+                              <option value="ask">{t("bot.rules.effect.ask")}</option>
+                              <option value="allow">{t("bot.rules.effect.allow")}</option>
+                            </select>
+                          </label>
+                          <label class="field">
+                            <span class="field__label">{t("bot.rules.tool")}</span>
+                            <select
+                              class="input mono"
+                              name="rule_tool"
+                              value={draft().tool}
+                              onChange={(event) => patch({ tool: event.currentTarget.value })}
+                            >
+                              <option value="">{t("bot.rules.tool.choose")}</option>
+                              <For each={TOOLS}>
+                                {(tool) => <option value={tool}>{tool}</option>}
+                              </For>
+                            </select>
+                          </label>
+                        </div>
+                        <div class="field-row">
+                          <label class="field">
+                            <span class="field__label">{t("bot.rules.commandPrefix")}</span>
+                            <input
+                              class="input mono"
+                              name="rule_command"
+                              placeholder="git"
+                              value={draft().command}
+                              onInput={(event) => patch({ command: event.currentTarget.value })}
+                            />
+                          </label>
+                          <label class="field">
+                            <span class="field__label">{t("bot.rules.pathPrefix")}</span>
+                            <input
+                              class="input mono"
+                              name="rule_path"
+                              placeholder="/data"
+                              value={draft().path}
+                              onInput={(event) => patch({ path: event.currentTarget.value })}
+                            />
+                          </label>
+                        </div>
+                        <div class="panel__foot panel__foot--end">
+                          <button
+                            class="btn btn--primary"
+                            type="submit"
+                            disabled={props.busy || !ruleReady()}
+                          >
+                            {props.busy ? t("bot.rules.adding") : t("bot.rules.add")}
+                          </button>
+                        </div>
+                      <span class="field__hint">{t("bot.rules.hint")}</span>
+                    </form>
+                  }
                 >
-                  <div class="field-row">
-                    <label class="field">
-                      <span class="field__label">{t("bot.rules.effect")}</span>
-                      <select
-                        class="input"
-                        name="rule_effect"
-                        value={draft().effect}
-                        onChange={(event) =>
-                          patch({ effect: event.currentTarget.value as Rule["effect"] })
-                        }
-                      >
-                        <option value="ask">{t("bot.rules.effect.ask")}</option>
-                        <option value="allow">{t("bot.rules.effect.allow")}</option>
-                      </select>
-                    </label>
-                    <label class="field">
-                      <span class="field__label">{t("bot.rules.tool")}</span>
-                      <input
-                        class="input mono"
-                        name="rule_tool"
-                        placeholder="shell"
-                        value={draft().tool}
-                        onInput={(event) => patch({ tool: event.currentTarget.value })}
-                      />
-                    </label>
-                  </div>
-                  <div class="field-row">
-                    <label class="field">
-                      <span class="field__label">{t("bot.rules.commandPrefix")}</span>
-                      <input
-                        class="input mono"
-                        name="rule_command"
-                        placeholder="git"
-                        value={draft().command}
-                        onInput={(event) => patch({ command: event.currentTarget.value })}
-                      />
-                    </label>
-                    <label class="field">
-                      <span class="field__label">{t("bot.rules.pathPrefix")}</span>
-                      <input
-                        class="input mono"
-                        name="rule_path"
-                        placeholder="/data"
-                        value={draft().path}
-                        onInput={(event) => patch({ path: event.currentTarget.value })}
-                      />
-                    </label>
-                  </div>
-                  <div class="panel__foot panel__foot--end">
-                    <button class="btn btn--primary" type="submit" disabled={props.busy || !ruleReady()}>
-                      {props.busy ? t("bot.rules.adding") : t("bot.rules.add")}
-                    </button>
-                  </div>
-                  <span class="field__hint">{t("bot.rules.hint")}</span>
-                </form>
+                  <p class="panel__note">{t("bot.rules.hosted")}</p>
+                </Show>
               </div>
             </section>
           </div>

@@ -226,6 +226,12 @@ enum BotCommand {
         /// The Bot's thinking level: minimal, low, medium, high, max.
         #[arg(long, value_parser = parse_thinking)]
         thinking: Option<ThinkingLevel>,
+        /// Use the Space's default Model again.
+        #[arg(long)]
+        reset_model: bool,
+        /// Use the Space's default thinking level again.
+        #[arg(long)]
+        reset_thinking: bool,
     },
     /// Move your Bot to another real Computer you own.
     Move {
@@ -1000,6 +1006,8 @@ fn access_update(bot: Id) -> BotUpdate {
     BotUpdate {
         bot,
         name: None,
+        reset_model: false,
+        reset_thinking: false,
         full_access: None,
         full_access_consent: None,
         grants: None,
@@ -1124,25 +1132,33 @@ async fn bot(command: BotCommand) -> Result<()> {
             bot,
             model,
             thinking,
+            reset_model,
+            reset_thinking,
         } => {
-            if model.is_none() && thinking.is_none() {
-                bail!("a Bot update names --model, --thinking, or both");
+            if model.is_none() && thinking.is_none() && !reset_model && !reset_thinking {
+                bail!("a Bot update names --model, --thinking, --reset-model, or --reset-thinking");
             }
             let result = client::command(
                 &credential,
                 CommandCall::BotUpdate(BotUpdate {
                     model,
                     thinking,
+                    reset_model,
+                    reset_thinking,
                     ..access_update(bot)
                 }),
             )
             .await?;
             println!("Updated Bot {}.", id_of(&result, "id")?);
-            if let Some(model) = result["model"].as_str() {
-                println!("  model: {model}");
+            match result["model"].as_str() {
+                Some(model) => println!("  model: {model}"),
+                None if reset_model => println!("  model: Space default"),
+                None => {}
             }
-            if let Some(thinking) = result["thinking"].as_str() {
-                println!("  thinking: {thinking}");
+            match result["thinking"].as_str() {
+                Some(thinking) => println!("  thinking: {thinking}"),
+                None if reset_thinking => println!("  thinking: Space default"),
+                None => {}
             }
         }
         BotCommand::Move { bot, computer } => {
@@ -2596,6 +2612,8 @@ mod tests {
                     bot,
                     model: selected,
                     thinking,
+                    reset_model,
+                    reset_thinking,
                 },
         } = update.command
         else {
@@ -2604,6 +2622,35 @@ mod tests {
         assert_eq!(bot, model);
         assert_eq!(selected, Some(model));
         assert_eq!(thinking, Some(neha::surface::ThinkingLevel::Low));
+        assert!(!reset_model, "choosing a Model is not a reset");
+        assert!(!reset_thinking, "choosing a level is not a reset");
+
+        let reset = Cli::try_parse_from([
+            "neha",
+            "bot",
+            "set",
+            &model.to_string(),
+            "--reset-model",
+            "--reset-thinking",
+        ])
+        .unwrap();
+        let Top::Bot {
+            command:
+                super::BotCommand::Set {
+                    model: selected,
+                    thinking,
+                    reset_model,
+                    reset_thinking,
+                    ..
+                },
+        } = reset.command
+        else {
+            panic!("expected bot set");
+        };
+        assert!(selected.is_none());
+        assert!(thinking.is_none());
+        assert!(reset_model);
+        assert!(reset_thinking);
     }
 
     #[test]

@@ -34,7 +34,7 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 
 The page shows what the Bot can reach on its Computer: the granted folders, full access, and the rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.
 
-[Model](../model/product.md) covers connecting Providers and choosing a Model.
+The owner chooses the Bot's Model and thinking level, and clears each back to the Space's default. A clear and a choice in one change are refused, so the result never depends on their order. [Model](../model/product.md) covers connecting Providers and choosing a Model.
 
 ## Moving a Bot
 
@@ -102,6 +102,8 @@ A file at the Workspace root makes the covered directory the Workspace root, so 
 
 An Ask rule makes the Bot ask before a kind of action, and an Allow rule lets it proceed without asking. Which rule wins, which forms a rule cannot judge, and what an Always allow writes follow [design](design.md#approvals).
 
+A rule belongs to a Bot on a Local Computer. A Bot on a Hosted Computer takes no rule: a Hosted Computer does not ask before an action yet, so the Space refuses one rather than record it.
+
 While a Bot waits for an answer, its other work goes on.
 
 A Deny ends the run, and the Bot says that it stopped.
@@ -162,5 +164,5 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 - The Bot's page does not show approvals yet.
 - An independent reviewer of approvals is not yet specified.
 - A template shared across Spaces is not yet specified.
-- Changing a Bot's picture is not yet available.
+- Changing a Bot's picture is not yet available; a Bot's picture is the initials of its name, and a User cannot upload or replace one.
 - Changing who else can use a Bot is not yet available; it arrives when a Bot is shared among several Users.

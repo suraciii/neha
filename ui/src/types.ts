@@ -53,6 +53,12 @@ export interface Computer {
   kind: string;
   online: boolean;
   workspace: string;
+  // Whether the daemon on this Computer takes granted folders. A Space that
+  // names nothing leaves it unset, and an unnamed capability is one the page
+  // does not offer.
+  supports_grants?: boolean;
+  // Whether the daemon on this Computer may run without its sandbox.
+  supports_full_access?: boolean;
 }
 
 // What a Chat's active Run is doing, as the Space projects it.

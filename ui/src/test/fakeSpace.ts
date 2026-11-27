@@ -53,13 +53,37 @@ const thirdBot = {
   thinking: null,
   model: null,
 };
-const computer = { id: "p1", owner: "u1", kind: "local", online: true, workspace: "/w" };
+const computer = {
+  id: "p1",
+  owner: "u1",
+  kind: "local",
+  online: true,
+  workspace: "/w",
+  supports_grants: true,
+  supports_full_access: true,
+};
 // Another paired Local Computer, which is where a Bot may move.
-const otherComputer = { id: "p9", owner: "u1", kind: "local", online: false, workspace: "/other" };
+const otherComputer = {
+  id: "p9",
+  owner: "u1",
+  kind: "local",
+  online: false,
+  workspace: "/other",
+  supports_grants: true,
+  supports_full_access: true,
+};
+// A Computer the Space runs itself, which only a reset can clear.
+const hostedComputer = {
+  id: "p5",
+  owner: "u1",
+  kind: "hosted",
+  online: true,
+  workspace: "/hosted",
+};
 const chat = { id: "h1", owner: "u1", bot: "b1" };
 const otherChat = { id: "h2", owner: "u1", bot: "b2" };
 const thirdChat = { id: "h3", owner: "u1", bot: "b3" };
-const computers = [computer, otherComputer];
+const computers = [computer, otherComputer, hostedComputer];
 
 // The Bot that owns a Chat, like the Space answers bot_show.
 function botFor(id: string): Bot {
@@ -99,6 +123,7 @@ export const space = {
   thirdBot,
   computer,
   otherComputer,
+  hostedComputer,
   chat,
   otherChat,
   thirdChat,
@@ -183,6 +208,11 @@ export const space = {
     space.computer.kind = "local";
     space.computer.online = true;
     space.otherComputer.kind = "local";
+    space.computer.supports_grants = true;
+    space.computer.supports_full_access = true;
+    space.otherComputer.supports_grants = true;
+    space.otherComputer.supports_full_access = true;
+    space.hostedComputer.kind = "hosted";
     space.bot.name = "Scout";
     space.bot.computer = "p1";
     space.bot.full_access = false;
@@ -361,7 +391,9 @@ export class FakeCommands {
         const changed: Record<string, unknown> = {};
         if (typeof asked.name === "string") {
           known.name = asked.name;
-          changed.name = asked.name;
+          // A rename is its own event, and it names the Bot and its new name.
+          // What else changed travels as the Bot's own update.
+          emit("neha.bot.renamed", { bot: known.id, name: asked.name });
         }
         if (Array.isArray(asked.grants)) {
           known.grants = [...(asked.grants as string[])];
@@ -383,11 +415,23 @@ export class FakeCommands {
           known.model = (asked.model as string | null) ?? null;
           changed.model = known.model;
         }
+        // Back to the Space's default is a field of its own, so an absent
+        // Model or level never means it.
+        if (asked.reset_model === true) {
+          known.model = null;
+          changed.model = null;
+        }
         if ("thinking" in asked) {
           known.thinking = (asked.thinking as Bot["thinking"]) ?? null;
           changed.thinking = known.thinking;
         }
-        emit("neha.bot.updated", { bot: known.id, ...changed });
+        if (asked.reset_thinking === true) {
+          known.thinking = null;
+          changed.thinking = null;
+        }
+        if (Object.keys(changed).length > 0) {
+          emit("neha.bot.updated", { bot: known.id, ...changed });
+        }
         return { ...known, user: "u1" } as T;
       }
       case "bot_move": {
@@ -487,7 +531,17 @@ export class FakeCommands {
         const asked = args as { model: string };
         space.defaults.push(asked.model);
         space.models = space.models.map((known) => ({ ...known, is_default: known.id === asked.model }));
-        return { model: asked.model } as T;
+        const chosen = space.models.find((known) => known.id === asked.model);
+        const provider = chosen?.provider ?? "";
+        // The Provider's Models changed, so the page hears about it.
+        emit("neha.provider.models_updated", { provider });
+        return {
+          provider,
+          models: space.models
+            .filter((known) => known.provider === provider)
+            .map((known) => ({ ...known })),
+          default_model: asked.model,
+        } as T;
       }
       case "message_send": {
         if (sendGate) await sendGate;

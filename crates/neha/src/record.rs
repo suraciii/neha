@@ -271,8 +271,8 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        Author, BotMoved, BotRenamed, ComputerKind, EventData, EventDataError, EventDraft,
-        EventKind, FileAdded, FileError, RunAccess, RunQueued,
+        Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, EventData, EventDataError,
+        EventDraft, EventKind, FileAdded, FileError, RunAccess, RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -486,6 +486,27 @@ mod tests {
                 .validate_author(user, Some(Id::new()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_bot_update_reset_is_additive() {
+        let bot = Id::new();
+        // An update written before the reset fields names neither: it must
+        // replay as not resetting anything.
+        let old = serde_json::json!({"bot": bot, "model": null});
+        let EventData::BotUpdated(update) = EventKind::BotUpdated.decode(&old).unwrap() else {
+            panic!("bot_update decodes to its data");
+        };
+        assert!(!update.reset_model);
+        assert!(!update.reset_thinking);
+
+        let reset = serde_json::json!({"bot": bot, "reset_model": true, "reset_thinking": true});
+        let EventData::BotUpdated(update) = EventKind::BotUpdated.decode(&reset).unwrap() else {
+            panic!("bot_update decodes to its data");
+        };
+        assert!(update.reset_model);
+        assert!(update.reset_thinking);
+        assert_eq!(serde_json::from_value::<BotUpdated>(reset).unwrap(), update);
     }
 
     #[test]
@@ -1247,6 +1268,15 @@ pub struct BotUpdated {
     /// Its thinking level; absent leaves it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<crate::surface::ThinkingLevel>,
+    /// Whether it goes back to the Space's default Model.
+    ///
+    /// A record written before the field replays false, so an old update
+    /// never clears a Model the owner chose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_model: bool,
+    /// Whether it goes back to the Space's default thinking level.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_thinking: bool,
 }
 
 /// The data of `neha.bot.renamed`.

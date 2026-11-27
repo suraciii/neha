@@ -5499,3 +5499,100 @@ fn the_admin_changes_the_default_model_from_the_cli() {
     assert_eq!(defaults.len(), 1, "the replay holds one default:\n{listed}");
     assert!(defaults[0].starts_with(&beta), "{listed}");
 }
+
+#[test]
+fn a_bot_owner_resets_its_model_and_thinking_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "alpha",
+            "--thinks",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let model = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("alpha"))
+        .map(first_word)
+        .expect("the Model is listed");
+    let created = run(
+        &home,
+        &credential,
+        &[
+            "bot",
+            "create",
+            "Scout",
+            "--model",
+            &model,
+            "--thinking",
+            "low",
+        ],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains(&format!("model: {model}")), "{shown}");
+    assert!(shown.contains("thinking: low"), "{shown}");
+
+    // A reset and a choice at once is refused.
+    let refused = cli(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--model", &model, "--reset-model"],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("resets or chooses its Model"), "{stderr}");
+
+    // Each reset restores one Space default and leaves the other choice.
+    let reset = run(&home, &credential, &["bot", "set", &bot, "--reset-model"]);
+    assert!(reset.contains("model: Space default"), "{reset}");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        !shown.contains("model:"),
+        "the Model reset applies:\n{shown}"
+    );
+    assert!(shown.contains("thinking: low"), "{shown}");
+
+    let reset = run(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--reset-thinking"],
+    );
+    assert!(reset.contains("thinking: Space default"), "{reset}");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        !shown.contains("thinking:"),
+        "the level reset applies:\n{shown}"
+    );
+
+    // Neither reset flag alone is a change the CLI accepts.
+    let empty = cli(&home, &credential, &["bot", "set", &bot]);
+    assert!(!empty.status.success());
+    let stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(stderr.contains("--reset-model"), "{stderr}");
+
+    // The resets replay from the record after a restart.
+    let port = space_port(&url);
+    drop(server);
+    let (_server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(restarted_url, url, "the Space restarts on its own address");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        !shown.contains("model:"),
+        "the Model reset replays:\n{shown}"
+    );
+    assert!(
+        !shown.contains("thinking:"),
+        "the level reset replays:\n{shown}"
+    );
+}

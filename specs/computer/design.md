@@ -33,6 +33,10 @@ The Space sends each action with an id, and the Computer answers that id with th
 
 A connection that ends makes every action in flight unknown. The process reconnects while it runs, and the Space shows the Computer offline until it does.
 
+The greeting a Computer sends when its channel opens states whether its machine serves granted folders and whether it serves a Bot's full access. A greeting that names neither keeps both, so a daemon written before the statement keeps the behavior it had.
+
+The Space keeps the statement with the Computer after its channel drops, and the Computer's view carries it. A client offers only the access the statement names, and a command that widens access past it is refused.
+
 ## The machine
 
 A Local Computer runs on the machine where Neha runs, which its owner paired. A Hosted Computer runs in a sandbox on the Space's machine.

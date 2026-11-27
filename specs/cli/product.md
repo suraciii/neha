@@ -89,6 +89,8 @@ A Hosted Bot has no file access to change: its Workspace is the only place where
 
 `neha bot set <bot> --model <model> --thinking <level>` changes the Bot's Model or level. A Model that cannot call tools refuses a run, and a level the Model does not accept is refused.
 
+`neha bot set <bot> --reset-model` puts the Bot back on the Space's default Model, and `--reset-thinking` puts it back on the Space's default level; the command prints `Space default` for each. A reset names no value: giving `--model` with `--reset-model`, or `--thinking` with `--reset-thinking`, is refused. The browser's [Bot page](../client/product.md#bots) does the same.
+
 `neha bot rename <bot> <name>` changes the Bot's name; the browser's [Bot page](../client/product.md#bots) does the same.
 
 The access commands below change a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses a file-access change because its Workspace is its only write range.
@@ -117,7 +119,9 @@ The directory MUST exist and be a folder. In granted mode a directory inside a h
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool; a shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool the loop offers and belongs to a Local Bot; an unknown tool and a Hosted Bot are refused.
+
+A shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
 
 At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, when the card offers it, for a rule, what Always allow covers.
 

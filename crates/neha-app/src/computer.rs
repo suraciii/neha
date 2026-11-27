@@ -396,6 +396,10 @@ async fn connect_and_serve(
             // Windows runs a managed folder without an OS fence. The Space
             // accepts a truthful false only when its operator opted in.
             sandbox: !cfg!(windows),
+            // A Windows managed runtime has no OS fence, so it serves neither
+            // granted folders nor a run directory nor full access.
+            supports_grants: !cfg!(windows),
+            supports_full_access: !cfg!(windows),
         },
     )
     .await?;
@@ -2725,6 +2729,10 @@ mod tests {
             // Windows runs a managed folder without an OS fence. The Space
             // accepts a truthful false only when its operator opted in.
             sandbox: !cfg!(windows),
+            // A Windows managed runtime has no OS fence, so it serves neither
+            // granted folders nor a run directory nor full access.
+            supports_grants: !cfg!(windows),
+            supports_full_access: !cfg!(windows),
         };
         socket
             .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
@@ -2853,6 +2861,8 @@ mod tests {
             computer: "01890a5d-ac96-774b-bcce-b302099a8057".to_owned(),
             workspace: workspace.to_string_lossy().into_owned(),
             sandbox: true,
+            supports_grants: true,
+            supports_full_access: true,
         };
         socket
             .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))

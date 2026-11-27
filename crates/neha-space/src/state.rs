@@ -138,6 +138,16 @@ pub struct ComputerView {
     pub online: bool,
     /// The Computer's workspace directory.
     pub workspace: String,
+    /// Whether its owner may grant it folders and name a run's directory.
+    ///
+    /// A real Computer declares this in its channel greeting; the projection
+    /// keeps the broad default and [`crate::commands`] overlays what the
+    /// machine said.
+    #[serde(default = "true_capability")]
+    pub supports_grants: bool,
+    /// Whether its owner may turn a Bot's full access on.
+    #[serde(default = "true_capability")]
+    pub supports_full_access: bool,
 }
 
 /// The live state of a Chat, projected from its runs.
@@ -920,8 +930,14 @@ impl Projection for State {
                 if let Some(grants) = data.grants {
                     bot.grants = grants;
                 }
+                if data.reset_model {
+                    bot.model = None;
+                }
                 if let Some(model) = data.model {
                     bot.model = Some(model);
+                }
+                if data.reset_thinking {
+                    bot.thinking = None;
                 }
                 if let Some(thinking) = data.thinking {
                     bot.thinking = Some(thinking);
@@ -994,6 +1010,8 @@ impl Projection for State {
                         kind: data.kind.as_str().to_owned(),
                         online: true,
                         workspace: data.workspace,
+                        supports_grants: true,
+                        supports_full_access: true,
                     },
                 );
                 self.computer_order.push(data.computer);
@@ -3151,6 +3169,66 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, "a renamed Bot must exist");
+    }
+
+    #[test]
+    fn a_bot_update_resets_the_choices_it_names() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let model = Id::new();
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        let user = Author::User(owner);
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "model": model, "thinking": "low"}),
+                4,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].model, Some(model));
+        assert_eq!(
+            state.bots[&bot].thinking,
+            Some(neha::surface::ThinkingLevel::Low)
+        );
+
+        // An old update without the reset fields never clears a choice.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "grants": []}),
+                5,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].model, Some(model));
+        assert!(state.bots[&bot].thinking.is_some());
+
+        // A reset names the one field it clears.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "reset_model": true}),
+                6,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].model, None);
+        assert!(
+            state.bots[&bot].thinking.is_some(),
+            "a Model reset leaves the level alone"
+        );
+
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "reset_thinking": true}),
+                7,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].thinking, None);
     }
 
     #[test]

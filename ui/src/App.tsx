@@ -238,6 +238,16 @@ export default function App() {
   const [section, setSection] = createSignal<SettingsSection>("providers");
   // The Bot whose page is open, so a read that lands late can tell.
   const [pageBotId, setPageBotId] = createSignal<string | null>(null);
+  // The management surfaces the User came through, oldest first, so Back
+  // returns to the one before the surface they are leaving: a narrow viewport
+  // shows one surface at a time.
+  const [manageTrail, setManageTrail] = createSignal<RailView[]>([]);
+
+  // Remembers a surface Back will return to. The same surface twice in a row is
+  // one step, not two.
+  function pushTrail(entry: RailView) {
+    setManageTrail((trail) => (trail[trail.length - 1] === entry ? trail : [...trail, entry]));
+  }
   // The approval the User asked to see, so its Chat scrolls to its card.
   const [focus, setFocus] = createSignal<string | null>(null);
   const commands = new Commands();
@@ -790,14 +800,27 @@ export default function App() {
       event.kind === "neha.provider.added"
     ) {
       void loadWorkspace();
+      // A Computer another client paired is one the Settings surface lists.
+      if (event.kind === "neha.computer.created") void refreshComputers();
       return;
     }
     // A Bot's page reads its own Bot, its Computers, and its rules again, so a
     // change another client made shows without a reload.
-    if (event.kind === "neha.bot.updated" || event.kind === "neha.bot.moved") {
+    if (
+      event.kind === "neha.bot.updated" ||
+      event.kind === "neha.bot.moved" ||
+      event.kind === "neha.bot.renamed"
+    ) {
       void refreshBots();
       const opened = pageBotId();
       if (opened) void reloadPageBot(opened);
+      // A rename renames the Chat on screen too: its header names the Bot, so
+      // it shows the new name without waiting for a read.
+      const name = typeof data.name === "string" ? data.name : null;
+      const bot = typeof data.bot === "string" ? data.bot : null;
+      if (bot !== null && name !== null && state.activeBot?.id === bot) {
+        update({ activeBot: { ...state.activeBot, name } });
+      }
       return;
     }
     if (event.kind === "neha.rule.added" || event.kind === "neha.rule.removed") {
@@ -820,10 +843,10 @@ export default function App() {
       // belongs to that Run's work: only a Bot reply does. A File the User
       // uploaded is theirs, and a File another Run of the same Bot made is
       // that Run's.
-      if (event.author.kind === "bot" && carried && run && chat === state.activeChat?.id && isFollowing(run)) {
+      if (event.author.kind === "bot" && carried && run && readsChat(chat) && isFollowing(run)) {
         noteFile(run, carried);
       }
-      if (event.author.kind === "bot" && chat !== state.activeChat?.id) markUnread(chat);
+      if (event.author.kind === "bot" && !readsChat(chat)) markUnread(chat);
     }
     if (event.kind === "neha.run.queued") {
       if (run && chat) {
@@ -910,6 +933,10 @@ export default function App() {
       queueRefresh();
     }
   }
+
+  // A Chat the User is reading. A management surface leaves the Chat open, but
+  // the User is not reading it there, so its new activity is still new.
+  const readsChat = (chat: string) => view() === "chats" && state.activeChat?.id === chat;
 
   // A Bot Message that arrived while another Chat was on screen is new activity
   // for that Chat. Opening it answers the mark.
@@ -1440,6 +1467,9 @@ export default function App() {
   // Opens one Bot's page: the Bot, its Computer, the Computers it may move to,
   // its Models, and its rules.
   async function selectPageBot(bot: Bot) {
+    // A Bot's page is a step deeper than the surface it was opened from, so Back
+    // returns to that surface.
+    pushTrail(view());
     setPageBotId(bot.id);
     update({ pageBot: null, pageComputer: null, rules: [], manageError: null, managing: true });
     await reloadPageBot(bot.id);
@@ -1478,6 +1508,9 @@ export default function App() {
     update({ managing: true, manageError: null });
     try {
       const bot = await commands.command<Bot>("bot_update", { bot: id, ...patch });
+      // A write that lands after the User opened another Bot is dropped: the
+      // page it would write belongs to a Bot the User is no longer reading.
+      if (pageBotId() !== id) return false;
       const [computers, rules] = await Promise.all([
         commands.command<Computer[]>("computer_list"),
         commands.command<Rule[]>("rule_list", { bot: id }),
@@ -1486,6 +1519,7 @@ export default function App() {
       await refreshBots();
       return true;
     } catch (reason) {
+      if (pageBotId() !== id) return false;
       update({ manageError: reason, managing: false });
       return false;
     }
@@ -1497,10 +1531,18 @@ export default function App() {
 
   // Sends only what changed: a Bot without its own Model or level follows the
   // Space's default, and an absent field leaves the Bot's own choice alone.
+  // Going back to the default is a field of its own, because an absent Model or
+  // level leaves the choice alone.
   async function saveBotModel(model: string | null, thinking: ThinkingLevel | null) {
     const patch: Record<string, unknown> = {};
-    if (model !== (state.pageBot?.model ?? null)) patch.model = model;
-    if (thinking !== (state.pageBot?.thinking ?? null)) patch.thinking = thinking;
+    if (model !== (state.pageBot?.model ?? null)) {
+      if (model === null) patch.reset_model = true;
+      else patch.model = model;
+    }
+    if (thinking !== (state.pageBot?.thinking ?? null)) {
+      if (thinking === null) patch.reset_thinking = true;
+      else patch.thinking = thinking;
+    }
     if (Object.keys(patch).length === 0) return;
     await updateBot(patch);
   }
@@ -1526,15 +1568,20 @@ export default function App() {
     update({ managing: true, manageError: null });
     try {
       const shown = await commands.command<BotMoveResult>("bot_move", { bot: id, computer });
+      if (pageBotId() !== id) return;
       update({ pageBot: shown.bot, pageComputer: shown.to, managing: false });
       await refreshBots();
     } catch (reason) {
+      if (pageBotId() !== id) return;
       update({ manageError: reason, managing: false });
     }
   }
 
   async function resetWorkspace() {
-    const computer = state.pageComputer?.id;
+    // The Bot on screen names its Computer, which is the one the reset clears.
+    // Reading it from the page's own Bot keeps the reset on the Computer the
+    // User asked about, whichever Bot they have opened since.
+    const computer = state.pageBot?.computer;
     if (!computer) return;
     update({ managing: true, manageError: null });
     try {
@@ -1545,12 +1592,46 @@ export default function App() {
     }
   }
 
+  // Reads the Computers this Space can use, which the Settings surface lists and
+  // a Bot page moves between.
+  async function refreshComputers() {
+    try {
+      const computers = await commands.command<Computer[]>("computer_list");
+      update({ computers });
+    } catch {
+      // A failed read keeps the Computers the page already shows.
+    }
+  }
+
+  // Clears a Hosted Computer's Workspace from the Computers list, which is
+  // where an Admin finds one before they know which Bot works on it.
+  async function resetComputer(computer: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("computer_reset", { computer });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Opens one Bot's page from a Computer in the Settings surface, leaving the
+  // Settings where Back returns to.
+  function openBotPage(bot: Bot) {
+    void selectPageBot(bot);
+    setView("bots");
+  }
+
   // Reads one Bot's rules again, so a change shows without a page reload.
   async function refreshRules() {
     const id = state.pageBot?.id;
     if (!id) return;
     try {
       const rules = await commands.command<Rule[]>("rule_list", { bot: id });
+      if (pageBotId() !== id) return;
       update({ rules });
     } catch {
       // A failed read keeps the rules the page already shows.
@@ -1568,9 +1649,11 @@ export default function App() {
     update({ managing: true, manageError: null });
     try {
       await commands.command("rule_add", { bot: id, ...rule });
+      if (pageBotId() !== id) return;
       const rules = await commands.command<Rule[]>("rule_list", { bot: id });
       update({ rules, managing: false });
     } catch (reason) {
+      if (pageBotId() !== id) return;
       update({ manageError: reason, managing: false });
     }
   }
@@ -1591,11 +1674,12 @@ export default function App() {
   async function loadSettings() {
     update({ managing: true, manageError: null });
     try {
-      const [vendors, catalog] = await Promise.all([
+      const [vendors, catalog, computers] = await Promise.all([
         commands.command<CatalogVendor[]>("catalog_list"),
         commands.command<CatalogStatus>("catalog_status"),
+        commands.command<Computer[]>("computer_list"),
       ]);
-      update({ vendors, catalog, managing: false });
+      update({ vendors, catalog, computers, managing: false });
     } catch (reason) {
       update({ manageError: reason, managing: false });
     }
@@ -1675,16 +1759,23 @@ export default function App() {
     }
   }
 
-  // Opens a management surface, reading what it shows before it appears.
+  // Opens a management surface, reading what it shows before it appears. The
+  // surface the User is leaving goes on the trail, so Back returns to it: a
+  // narrow viewport shows one surface at a time.
   function openManage(next: RailView) {
+    // The surface the User is leaving is the one Back returns to.
+    if (view() === "bots" || view() === "settings") pushTrail(view());
     setView(next);
     update({ manageError: null });
     if (next === "settings") void loadSettings();
   }
 
-  // Leaves a management surface for the Chats, with nothing selected.
+  // Leaves a management surface for the one before it, with no Bot selected.
+  // The Chats are where the trail runs out.
   function closeManage() {
-    setView("chats");
+    const trail = manageTrail();
+    setManageTrail(trail.slice(0, -1));
+    setView(trail[trail.length - 1] ?? "chats");
     setPageBotId(null);
     update({ pageBot: null, pageComputer: null, manageError: null });
   }
@@ -1855,12 +1946,16 @@ export default function App() {
                     account={account()}
                     providers={state.providers}
                     models={state.models}
+                    computers={state.computers}
+                    bots={state.bots}
                     vendors={state.vendors}
                     catalog={state.catalog}
                     section={section()}
                     busy={state.managing}
                     error={manageErrorText()}
                     onBack={closeManage}
+                    onReset={(computer) => resetComputer(computer)}
+                    onOpenBot={(bot) => openBotPage(bot)}
                     onConnect={(input) => connectVendor(input)}
                     onRefresh={(provider) => refreshProviderModels(provider)}
                     onDefault={(model) => makeDefaultModel(model)}

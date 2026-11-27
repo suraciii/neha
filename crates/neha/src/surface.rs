@@ -349,6 +349,17 @@ pub struct BotUpdate {
     /// The Bot's thinking level; absent leaves it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingLevel>,
+    /// Whether it goes back to the Space's default Model.
+    ///
+    /// The Space refuses a reset together with a Model: a request either
+    /// chooses one or restores the default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_model: bool,
+    /// Whether it goes back to the Space's default thinking level.
+    ///
+    /// The Space refuses a reset together with a level.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_thinking: bool,
 }
 
 /// The Computer a `bot_create` asks for.
@@ -658,6 +669,8 @@ mod tests {
         let update = CommandCall::BotUpdate(BotUpdate {
             bot,
             name: None,
+            reset_model: false,
+            reset_thinking: false,
             full_access: None,
             full_access_consent: None,
             grants: None,
@@ -677,6 +690,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -689,11 +704,48 @@ mod tests {
     }
 
     #[test]
+    fn a_bot_update_can_reset_a_choice() {
+        let bot = Id::new();
+        let reset = CommandCall::BotUpdate(BotUpdate {
+            bot,
+            name: None,
+            reset_model: true,
+            reset_thinking: true,
+            full_access: None,
+            full_access_consent: None,
+            grants: None,
+            grant_add: None,
+            grant_remove: None,
+            model: None,
+            thinking: None,
+        });
+        let text = serde_json::to_string(&reset).unwrap();
+        assert!(text.contains("\"reset_model\":true"), "{text}");
+        assert!(text.contains("\"reset_thinking\":true"), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), reset);
+
+        // An update written before the flags sends neither: they read false,
+        // so such a client never clears a choice.
+        let old: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"bot_update\",\"args\":{{\"bot\":\"{bot}\",\"model\":\"{}\"}}}}",
+            Id::new()
+        ))
+        .unwrap();
+        let CommandCall::BotUpdate(old) = old else {
+            panic!("bot_update decodes to its parameters");
+        };
+        assert!(!old.reset_model);
+        assert!(!old.reset_thinking);
+    }
+
+    #[test]
     fn a_bot_update_names_its_new_name_when_it_has_one() {
         let bot = Id::new();
         let named = CommandCall::BotUpdate(BotUpdate {
             bot,
             name: Some("Scout".to_owned()),
+            reset_model: false,
+            reset_thinking: false,
             full_access: None,
             full_access_consent: None,
             grants: None,
@@ -717,6 +769,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,

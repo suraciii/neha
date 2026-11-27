@@ -33,10 +33,11 @@ run <run-id> is waiting for approval <approval-id>; answer with `neha approval a
 List the approvals that wait for you, then answer one:
 
 ```bash
-target/debug/neha approval list
-target/debug/neha approval show <approval-id>
-target/debug/neha approval allow <approval-id>
-target/debug/neha approval deny <approval-id>
+target/debug/neha approval list | tee approvals.txt
+APPROVAL_ID=$(awk 'NR==1 {print $1; exit}' approvals.txt)
+target/debug/neha approval show "$APPROVAL_ID"
+target/debug/neha approval allow "$APPROVAL_ID"
+target/debug/neha approval deny "$APPROVAL_ID"
 ```
 
 `neha approval show <approval-id>` prints where the action sits, the directory its run works in when the run named one, and its full arguments. The directory its run works in is read exactly as the run recorded it, so a name that ends in a space keeps it and a relative path is matched against that same directory. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. On an approval for a folder the owner has not granted, `--always` grants that folder instead, and `neha bot access <bot-id>` shows it among the Bot's grants. A Deny ends the run, and the Bot says that it stopped.
@@ -57,14 +58,16 @@ For a file at the Workspace root, the covered directory is the Workspace root: r
 
 ## Lasting rules
 
-List, add, and remove lasting rules:
+List, add, and remove lasting rules, with the Bot's id in `BOT_ID`:
 
 ```bash
 target/debug/neha rule list
-target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-prefix rm
-target/debug/neha rule add --bot <bot-id> --effect allow --tool read_file --path-prefix /home/ada/docs
-target/debug/neha rule add --bot <bot-id> --effect ask --tool write_file --path-prefix /home/ada/reports
-target/debug/neha rule remove <rule-id>
+BOT_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
+target/debug/neha rule add --bot "$BOT_ID" --effect ask --tool shell --command-prefix rm
+target/debug/neha rule add --bot "$BOT_ID" --effect allow --tool read_file --path-prefix /home/ada/docs
+target/debug/neha rule add --bot "$BOT_ID" --effect ask --tool write_file --path-prefix /home/ada/reports
+RULE_ID=$(target/debug/neha rule list | awk 'NR==1 {print $1; exit}')
+target/debug/neha rule remove "$RULE_ID"
 ```
 
 An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets it proceed without asking.
@@ -82,7 +85,7 @@ A path made only of whitespace is ambiguous when the tool has a rule. A director
 Create an Ask rule for every shell command:
 
 ```bash
-target/debug/neha rule add --bot <bot-id> --effect ask --tool shell
+target/debug/neha rule add --bot "$BOT_ID" --effect ask --tool shell
 ```
 
 Before the Bot runs `printf 'hello'`, the approval asks. Choose Always allow: Neha adds an Allow rule for `shell` with the command's first word, `printf`. The Ask rule has no prefix, so the new Allow rule does not cover it: other shell commands still ask, and `printf` commands no longer ask because the longer prefix wins.
@@ -92,7 +95,7 @@ Before the Bot runs `printf 'hello'`, the approval asks. Choose Always allow: Ne
 Instead, make the Ask rule name only `printf` commands:
 
 ```bash
-target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-prefix printf
+target/debug/neha rule add --bot "$BOT_ID" --effect ask --tool shell --command-prefix printf
 ```
 
 Choose Always allow on that approval: the new Allow rule has the same `printf` prefix. It covers the Ask rule, so Neha removes the Ask rule, and `printf` commands no longer ask.

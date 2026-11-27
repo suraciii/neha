@@ -41,6 +41,26 @@ pub const FRAME_TIMEOUT: Duration = if cfg!(test) {
     Duration::from_secs(10)
 };
 
+/// What a Computer's greeting said its machine can serve.
+///
+/// The Space records this from the channel handshake and keeps it for the
+/// Computer: an offline machine must not offer a control its runtime refuses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AccessCapabilities {
+    /// Whether the owner may grant folders and name a run's directory.
+    pub grants: bool,
+    /// Whether the owner may turn a Bot's full access on.
+    pub full_access: bool,
+}
+
+impl AccessCapabilities {
+    /// The capabilities a Computer that declared nothing had.
+    pub const SUPPORTED: Self = Self {
+        grants: true,
+        full_access: true,
+    };
+}
+
 /// What a request waits for.
 #[derive(Debug)]
 pub enum Answer {
@@ -282,6 +302,11 @@ pub fn answer(frame: DeviceFrame) -> Option<(u64, Answer)> {
 /// Every Computer channel a Space has, by Computer.
 pub struct ComputerLinks {
     links: Mutex<HashMap<Id, Arc<ComputerLink>>>,
+    /// The access capabilities each Computer last declared. Kept after the
+    /// channel goes away: a machine's runtime does not change with its
+    /// connection, and a Bot update while it is offline still must not widen
+    /// access the machine cannot serve.
+    access: Mutex<HashMap<Id, AccessCapabilities>>,
     /// The Space-wide request counter; every request on every channel uses it.
     next_id: Arc<AtomicU64>,
 }
@@ -298,6 +323,7 @@ impl ComputerLinks {
     pub fn new() -> Self {
         Self {
             links: Mutex::new(HashMap::new()),
+            access: Mutex::new(HashMap::new()),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -321,8 +347,27 @@ impl ComputerLinks {
             .cloned()
     }
 
+    /// Returns the access capabilities the Computer last declared.
+    #[must_use]
+    pub fn access_capabilities(&self, computer: Id) -> Option<AccessCapabilities> {
+        self.access
+            .lock()
+            .expect("computer access lock")
+            .get(&computer)
+            .copied()
+    }
+
     /// Registers a Computer's new channel, replacing one that still lingers.
-    pub fn connect(&self, computer: Id, frames: mpsc::Sender<HostFrame>) -> Arc<ComputerLink> {
+    pub fn connect(
+        &self,
+        computer: Id,
+        frames: mpsc::Sender<HostFrame>,
+        access: AccessCapabilities,
+    ) -> Arc<ComputerLink> {
+        self.access
+            .lock()
+            .expect("computer access lock")
+            .insert(computer, access);
         let link = Arc::new(ComputerLink::new(computer, frames));
         let replaced = self
             .links
@@ -391,7 +436,7 @@ mod tests {
         let links = ComputerLinks::new();
         let computer = Id::new();
         let (frames, outgoing) = mpsc::channel(FRAME_QUEUE);
-        let link = links.connect(computer, frames);
+        let link = links.connect(computer, frames, super::AccessCapabilities::SUPPORTED);
 
         (links, computer, link, outgoing)
     }
@@ -582,7 +627,14 @@ mod tests {
         tokio::task::yield_now().await;
 
         let (frames, _new_outgoing) = mpsc::channel(FRAME_QUEUE);
-        let new = links.connect(computer, frames);
+        let new = links.connect(
+            computer,
+            frames,
+            super::AccessCapabilities {
+                grants: false,
+                full_access: false,
+            },
+        );
 
         assert!(old.is_closed());
         assert!(*signal.borrow(), "the old handler is told to stop reading");
@@ -599,6 +651,26 @@ mod tests {
             links.link(computer),
             Some(link) if Arc::ptr_eq(&link, &new)
         ));
+        assert_eq!(
+            links.access_capabilities(computer),
+            Some(super::AccessCapabilities {
+                grants: false,
+                full_access: false,
+            }),
+            "the reconnect replaced what the Computer declared"
+        );
+    }
+
+    #[test]
+    fn a_disconnected_computer_keeps_the_access_it_declared() {
+        let (links, computer, link, _outgoing) = connected();
+        assert!(links.disconnect(&link));
+        assert!(!links.online(computer));
+        assert_eq!(
+            links.access_capabilities(computer),
+            Some(super::AccessCapabilities::SUPPORTED),
+            "an offline Computer still answers for its runtime"
+        );
     }
 
     #[tokio::test]

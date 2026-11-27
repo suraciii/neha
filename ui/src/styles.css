@@ -2142,8 +2142,10 @@ code,
 }
 
 @media (max-width: 900px) {
+  /* The rail stays: it is the only way to a management surface, and 60px fits
+     even a 360px viewport beside the list. */
   .app {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: auto minmax(0, 1fr);
     padding-left: env(safe-area-inset-left);
     padding-right: env(safe-area-inset-right);
   }
@@ -2163,12 +2165,9 @@ code,
   a {
     touch-action: manipulation;
   }
-  /* Keep primary form actions on the touch floor when the rail gives way. */
+  /* Keep primary form actions on the touch floor. */
   .btn {
     min-height: 40px;
-  }
-  .rail {
-    display: none;
   }
   .sidebar {
     display: flex;

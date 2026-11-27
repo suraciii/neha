@@ -49,7 +49,7 @@ use tokio::task::JoinHandle;
 use crate::blobs::{Blobs, BlobsError};
 use crate::catalog::CatalogStore;
 use crate::commands;
-use crate::computer_link::{self, ComputerLinks};
+use crate::computer_link::{self, AccessCapabilities, ComputerLinks};
 use crate::config::{Config, ConfigError, Storage};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError, PairingState};
@@ -109,6 +109,9 @@ pub struct SpaceServer {
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
     /// Serializes approval answers and rule changes.
     pub(crate) approvals: tokio::sync::Mutex<()>,
+    /// Serializes Provider writes, so a refresh and a default change cannot
+    /// each build their Model list from a read the other replaced.
+    pub(crate) provider_writes: tokio::sync::Mutex<()>,
     /// Local-ticket pair attempts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
     /// The ticket file this start wrote for its Admin, with its digest.
@@ -195,6 +198,7 @@ impl SpaceServer {
             links: ComputerLinks::new(),
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
             approvals: tokio::sync::Mutex::new(()),
+            provider_writes: tokio::sync::Mutex::new(()),
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -1750,7 +1754,17 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
                     computer: named,
                     workspace: _,
                     sandbox,
-                }) => Some((version, named, sandbox)),
+                    supports_grants,
+                    supports_full_access,
+                }) => Some((
+                    version,
+                    named,
+                    sandbox,
+                    AccessCapabilities {
+                        grants: supports_grants,
+                        full_access: supports_full_access,
+                    },
+                )),
                 _ => None,
             }
         }
@@ -1759,7 +1773,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
     // A daemon that cannot fence its machine never runs unless the Space
     // operator explicitly opted in to unsandboxed Local Computers. A connection
     // that names another Computer would act as that Computer: both are refused.
-    let Some((version, named, sandbox)) = hello else {
+    let Some((version, named, sandbox, access)) = hello else {
         return;
     };
     if version != CHANNEL_VERSION
@@ -1775,7 +1789,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
 
     let (sink, mut stream) = socket.split();
     let (frames, mut outgoing) = mpsc::channel::<HostFrame>(computer_link::FRAME_QUEUE);
-    let link = server.links.connect(computer, frames.clone());
+    let link = server.links.connect(computer, frames.clone(), access);
     // When a Computer reconnects, it replaces its old link and this handler
     // must stop: the Space already failed the old link's requests, and two
     // readers acting as one Computer would race each other.
@@ -2071,6 +2085,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             links: &server.links,
                             pairings: &server.pairings,
                             approvals: &server.approvals,
+                            provider_writes: &server.provider_writes,
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
@@ -2346,7 +2361,10 @@ async fn catch_up(
 /// Returns whether one account may see an event.
 ///
 /// This milestone has no Groups: an event belongs to the User who wrote it,
-/// to the User a Bot wrote it for, or to the Space itself.
+/// to the User a Bot wrote it for, or to the Space itself. A Space-wide event
+/// is one every account can already read through `provider list` or
+/// `model list`: the Provider's address and its Models are not per-account
+/// secrets, so a settings page open in another account follows them too.
 fn visible_to(account: Id, event: &neha::record::Event) -> bool {
     if matches!(event.author, neha::record::Author::User(author) if author == account) {
         return true;
@@ -2357,7 +2375,9 @@ fn visible_to(account: Id, event: &neha::record::Event) -> bool {
 
     matches!(
         event.kind,
-        neha::record::EventKind::UserJoined | neha::record::EventKind::ProviderAdded
+        neha::record::EventKind::UserJoined
+            | neha::record::EventKind::ProviderAdded
+            | neha::record::EventKind::ProviderModelsUpdated
     )
 }
 
@@ -4879,6 +4899,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_bot_create_answers_only_its_creator() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let command_id = Id::new();
+        let call = add_bot("Scout", None);
+        let created = command(&mut socket, command_id, call.clone()).await;
+        assert!(
+            created["user"].is_string(),
+            "the result names the User it belongs to"
+        );
+
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace).await;
+        let refused = try_command(&mut grace_socket, command_id, call).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::Forbidden, _))),
+            "another account cannot read a recorded Bot create: {refused:?}"
+        );
+        let bots = command(&mut socket, Id::new(), CommandCall::BotList).await;
+        assert_eq!(bots.as_array().unwrap().len(), 1, "one Bot was created");
+
+        grace_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_message_send_replay_changes_nothing() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -5436,7 +5489,12 @@ mod tests {
             .filter(|event| {
                 matches!(event.author, Author::User(author) if author == admin)
                     || event.acting == Some(admin)
-                    || matches!(event.kind, EventKind::UserJoined | EventKind::ProviderAdded)
+                    || matches!(
+                        event.kind,
+                        EventKind::UserJoined
+                            | EventKind::ProviderAdded
+                            | EventKind::ProviderModelsUpdated
+                    )
             })
             .map(|event| event.seq.as_i64())
             .collect();
@@ -5447,6 +5505,90 @@ mod tests {
             "the stream skipped a visible event or showed a hidden one"
         );
         socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_models_update_reaches_every_account() {
+        let (_dir, running, invite) = running().await;
+        let (mut admin_socket, _token) = admin(&running, &invite).await;
+        let added = command(
+            &mut admin_socket,
+            Id::new(),
+            provider_add_models(
+                "http://127.0.0.1:1/v1".to_owned(),
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec("slow", false, true, Vec::new()),
+                ],
+            ),
+        )
+        .await;
+        let slow: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+
+        // A second account opens its Settings: the snapshot holds the
+        // Provider but no Model update yet.
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace_token).await;
+        let (cursor, events) = snapshot_events(&mut grace_socket).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::ProviderAdded),
+            "the Provider is Space-wide"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::ProviderModelsUpdated)
+        );
+
+        // The Admin moves the default while Grace's Settings is open.
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: slow },
+        )
+        .await;
+
+        let update = loop {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                next_frame(&mut grace_socket),
+            )
+            .await
+            .expect("the subscription follows the record");
+            match frame {
+                ServerFrame::Event { event } if event.kind == EventKind::ProviderModelsUpdated => {
+                    break event;
+                }
+                ServerFrame::Event { .. } | ServerFrame::Heartbeat { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        };
+        assert_eq!(update.data["default_model"], json!(slow));
+        assert!(update.seq > cursor);
+
+        // A subscription opened after the change reads it from the record.
+        let mut later = open_socket(&running, &grace_token).await;
+        let (_cursor, events) = snapshot_events(&mut later).await;
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::ProviderModelsUpdated
+                    && event.data["default_model"] == json!(slow)
+            }),
+            "a later subscriber sees the Model update"
+        );
+
+        later.close(None).await.unwrap();
+        grace_socket.close(None).await.unwrap();
+        admin_socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 
@@ -7137,6 +7279,123 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_default_change_waits_for_the_refresh_it_races() {
+        use axum::Router;
+        use axum::routing::get;
+
+        // The models endpoint answers only when the test releases it, so a
+        // refresh is provably in flight while the default changes.
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let app = {
+            let arrived = std::sync::Arc::clone(&arrived);
+            let release = std::sync::Arc::clone(&release);
+            Router::new().route(
+                "/v1/models",
+                get(move || {
+                    let arrived = std::sync::Arc::clone(&arrived);
+                    let release = std::sync::Arc::clone(&release);
+                    async move {
+                        arrived.notify_one();
+                        release.notified().await;
+                        axum::Json(json!({
+                            "data": [{"id": "fast"}, {"id": "slow"}],
+                        }))
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let models_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                format!("http://{addr}/v1"),
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec("slow", false, true, Vec::new()),
+                ],
+            ),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(added["provider"].clone()).unwrap();
+        let fast: Id = serde_json::from_value(added["models"][0]["id"].clone()).unwrap();
+        let slow: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+
+        let mut refresh_socket = open_socket(&running, &token).await;
+        let refresh = tokio::spawn(async move {
+            try_command(
+                &mut refresh_socket,
+                Id::new(),
+                CommandCall::ProviderRefresh { provider },
+            )
+            .await
+        });
+        arrived.notified().await;
+
+        let mut default_socket = open_socket(&running, &token).await;
+        let mut default_change = tokio::spawn(async move {
+            try_command(
+                &mut default_socket,
+                Id::new(),
+                CommandCall::ModelDefault { model: slow },
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut default_change)
+                .await
+                .is_err(),
+            "a default change must wait for the refresh that is writing the Provider"
+        );
+
+        release.notify_one();
+        refresh.await.unwrap().expect("the refresh succeeds");
+        let changed = default_change
+            .await
+            .unwrap()
+            .expect("the default change succeeds");
+        assert_eq!(changed.1["default_model"], json!(slow));
+
+        // The record's order is the refresh, then the default: the refresh
+        // kept the default it read and the later change moved it.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let updates: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::ProviderModelsUpdated)
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].data["default_model"], json!(fast));
+        assert_eq!(updates[1].data["default_model"], json!(slow));
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let defaults: Vec<&Value> = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|model| model["is_default"] == json!(true))
+            .collect();
+        assert_eq!(defaults.len(), 1, "one default stays");
+        assert_eq!(defaults[0]["name"], "slow");
+
+        socket.close(None).await.unwrap();
+        models_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_provider_without_discovery_is_declared_manually() {
         use axum::Router;
         use axum::http::StatusCode;
@@ -7332,6 +7591,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot: bot_id,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -7349,6 +7610,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot: bot_id,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -9926,7 +10189,7 @@ mod tests {
     use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, WireAction};
     use neha_computer::{ActionStatus, ToolOutput};
 
-    use crate::computer_link::Answer;
+    use crate::computer_link::{AccessCapabilities, Answer};
     use crate::identity::MAX_PENDING_PAIRINGS;
 
     use super::MAX_PAIRING_FIELD_BYTES;
@@ -10149,11 +10412,31 @@ mod tests {
 
     /// Sends a Hello frame as a fake machine would.
     async fn send_hello(socket: &mut Socket, version: u32, computer: &str, sandbox: bool) {
+        send_hello_with(
+            socket,
+            version,
+            computer,
+            sandbox,
+            AccessCapabilities::SUPPORTED,
+        )
+        .await;
+    }
+
+    /// Sends a Hello frame that declares which access this machine serves.
+    async fn send_hello_with(
+        socket: &mut Socket,
+        version: u32,
+        computer: &str,
+        sandbox: bool,
+        access: AccessCapabilities,
+    ) {
         let frame = DeviceFrame::Hello {
             version,
             computer: computer.to_owned(),
             workspace: MACHINE_WORKSPACE.to_owned(),
             sandbox,
+            supports_grants: access.grants,
+            supports_full_access: access.full_access,
         };
         socket
             .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -10163,8 +10446,25 @@ mod tests {
 
     /// Connects a fake machine and greets as the Computer the token names.
     async fn connect_computer(running: &Running, token: &str, computer: Id) -> Socket {
+        connect_computer_with(running, token, computer, AccessCapabilities::SUPPORTED).await
+    }
+
+    /// Connects a fake machine that serves a particular access model.
+    async fn connect_computer_with(
+        running: &Running,
+        token: &str,
+        computer: Id,
+        access: AccessCapabilities,
+    ) -> Socket {
         let mut socket = raw_computer(running, token).await;
-        send_hello(&mut socket, CHANNEL_VERSION, &computer.to_string(), true).await;
+        send_hello_with(
+            &mut socket,
+            CHANNEL_VERSION,
+            &computer.to_string(),
+            true,
+            access,
+        )
+        .await;
 
         socket
     }
@@ -11408,6 +11708,91 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_computer_that_cannot_serve_access_refuses_it() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let machine = machine_token_n(41);
+        let (computer, machine) = paired_computer_with_token(&mut socket, &running, &machine).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let unsupported = AccessCapabilities {
+            grants: false,
+            full_access: false,
+        };
+        let mut device = connect_computer_with(&running, &machine, computer, unsupported).await;
+        wait_online(&mut socket, computer).await;
+
+        // The Computer's view says which access this machine serves.
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed["kind"], "local");
+        assert_eq!(listed["supports_grants"], json!(false));
+        assert_eq!(listed["supports_full_access"], json!(false));
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["computer"]["supports_grants"], json!(false));
+
+        // Widening the access this machine cannot serve is refused before
+        // anything is recorded.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, Some("/data/shared"), None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "this Local Computer does not support granted folders"),
+            "{refused:?}"
+        );
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(true), None, None, None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "this Local Computer does not support full access"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused access change records nothing"
+        );
+
+        // The declaration outlives the channel: an offline machine still does
+        // not offer a control its runtime refuses.
+        device.close(None).await.unwrap();
+        wait_offline(&mut socket, computer).await;
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed["online"], json!(false));
+        assert_eq!(listed["supports_grants"], json!(false));
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, Some("/data/shared"), None),
+        )
+        .await;
+        assert!(matches!(refused, Err((ErrorCode::InvalidArgument, _))));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_bot_moves_to_another_real_computer() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -11469,6 +11854,51 @@ mod tests {
             moves[0].data,
             json!({"bot": bot, "from": first, "to": second})
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_move_answers_only_the_bots_owner() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (first, _first_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(61)).await;
+        let (second, _second_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(62)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(first))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let command_id = Id::new();
+        let call = CommandCall::BotMove {
+            bot,
+            computer: second,
+        };
+        let moved = command(&mut socket, command_id, call.clone()).await;
+        assert_eq!(moved["bot"]["id"], json!(bot));
+
+        // Another account that knows the identifier and parameters reads
+        // nothing, and the move happens once.
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace).await;
+        let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::NotFound, _))),
+            "a foreign recorded move is not found: {refused:?}"
+        );
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["computer"]["id"], json!(second));
+
+        // The owner still gets its recorded answer.
+        let again = command(&mut socket, command_id, call).await;
+        assert_eq!(again, moved);
+
+        grace_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -13204,6 +13634,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            provider_writes: &server.provider_writes,
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
@@ -13254,6 +13685,8 @@ mod tests {
         CommandCall::BotUpdate(neha::surface::BotUpdate {
             bot,
             name: None,
+            reset_model: false,
+            reset_thinking: false,
             full_access,
             full_access_consent: (full_access == Some(true))
                 .then_some(neha::record::FULL_ACCESS_CONSENT_VERSION),
@@ -13731,6 +14164,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            provider_writes: &server.provider_writes,
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
@@ -13836,7 +14270,29 @@ mod tests {
             CommandCall::RuleRemove { rule: rule_id },
         )
         .await;
-        assert!(matches!(not_maker, Err(error) if error.code == ErrorCode::Forbidden));
+        assert!(
+            matches!(not_maker, Err(error) if error.code == ErrorCode::NotFound),
+            "another account's rule is not found, never forbidden"
+        );
+        // A rule that does not exist answers exactly the same way, so the
+        // answer cannot tell whether the Space holds it.
+        let unknown_rule = command_context(&running);
+        let stranger = crate::identity::Account {
+            id: Id::new(),
+            display_name: "Eve".to_owned(),
+            is_admin: false,
+        };
+        let missing = crate::commands::execute(
+            &unknown_rule,
+            &stranger,
+            Id::new(),
+            CommandCall::RuleRemove { rule: Id::new() },
+        )
+        .await;
+        assert!(
+            matches!(missing, Err(error) if error.code == ErrorCode::NotFound),
+            "a missing rule is not found"
+        );
 
         // A prefix only fits the tool kind that takes it.
         let wrong_prefix = try_command(
@@ -14261,6 +14717,8 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot: local.bot,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: Some(vec!["/tmp".to_owned(), "/etc".to_owned()]),
@@ -14987,6 +15445,8 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot: local.bot,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: Some(vec!["/tmp".to_owned()]),
@@ -16086,10 +16546,55 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_computer_add_answers_only_its_pairer() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (_device, code) = pair_machine(&running).await;
+        let command_id = Id::new();
+        let call = add_computer(&code);
+        let added = command(&mut socket, command_id, call.clone()).await;
+        assert!(added["owner"].is_string(), "the answer names its owner");
+
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace).await;
+        let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::NotFound, _))),
+            "another account cannot read a recorded Computer add: {refused:?}"
+        );
+        let again = command(&mut socket, command_id, call).await;
+        assert_eq!(again, added, "the owner gets its recorded answer");
+        let computers = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        assert_eq!(
+            computers.as_array().unwrap().len(),
+            1,
+            "one Computer exists"
+        );
+
+        grace_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_recorded_command_answers_only_its_owner() {
         let (_dir, running, invite) = running().await;
         let (mut admin_socket, _admin_token) = admin(&running, &invite).await;
-        let created = command(&mut admin_socket, Id::new(), add_bot("Scout", None)).await;
+        // Rules apply to a Local Computer; pairing one is enough here.
+        let (computer, _machine) =
+            paired_computer_with_token(&mut admin_socket, &running, &machine_token_n(51)).await;
+        let created = command(
+            &mut admin_socket,
+            Id::new(),
+            add_bot("Scout", Some(computer)),
+        )
+        .await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let made = command(
             &mut admin_socket,
@@ -17608,6 +18113,8 @@ mod tests {
         let update = CommandCall::BotUpdate(neha::surface::BotUpdate {
             bot,
             name: None,
+            reset_model: false,
+            reset_thinking: false,
             full_access: Some(true),
             full_access_consent: Some(neha::record::FULL_ACCESS_CONSENT_VERSION),
             grants: Some(vec!["/data/shared".to_owned(), "/data/team".to_owned()]),
@@ -17653,6 +18160,8 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: Some(vec!["relative/folder".to_owned()]),
@@ -17709,6 +18218,8 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot,
                 name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: Some(true),
                 full_access_consent: consent,
                 grants: None,
@@ -17797,6 +18308,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot,
                 name,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -17871,6 +18384,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot,
                 name: Some("Pathfinder II".to_owned()),
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -17951,6 +18466,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot,
                 name: Some("Hijacked".to_owned()),
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -17978,6 +18495,8 @@ mod tests {
             CommandCall::BotUpdate(BotUpdate {
                 bot: helper,
                 name: Some("Reader".to_owned()),
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -18018,6 +18537,131 @@ mod tests {
         }
         socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_owner_resets_its_model_and_thinking() {
+        let (dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                "http://127.0.0.1:1/v1".to_owned(),
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec(
+                        "thinker",
+                        true,
+                        true,
+                        vec![ThinkingLevel::Low, ThinkingLevel::High],
+                    ),
+                ],
+            ),
+        )
+        .await;
+        let thinker: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::Low),
+                model: Some(thinker),
+            }),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let update = |reset_model: bool,
+                      reset_thinking: bool,
+                      model: Option<Id>,
+                      thinking: Option<ThinkingLevel>| {
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                name: None,
+                reset_model,
+                reset_thinking,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model,
+                thinking,
+            })
+        };
+
+        // A reset and a choice in one request is refused before any record.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            update(true, false, Some(thinker), None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("resets or chooses its Model")),
+            "{refused:?}"
+        );
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            update(false, true, None, Some(ThinkingLevel::Low)),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("resets or chooses its thinking level")),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+
+        // Resetting one choice leaves the other.
+        let reset_model = command(&mut socket, Id::new(), update(true, false, None, None)).await;
+        assert_eq!(reset_model["model"], json!(null));
+        assert_eq!(reset_model["thinking"], json!("low"));
+
+        let reset_thinking = command(&mut socket, Id::new(), update(false, true, None, None)).await;
+        assert_eq!(reset_thinking["thinking"], json!(null));
+
+        // The record holds the reset flags, not a quiet change of another
+        // field.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let updates: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::BotUpdated)
+            .collect();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].data, json!({"bot": bot, "reset_model": true}));
+        assert_eq!(updates[1].data, json!({"bot": bot, "reset_thinking": true}));
+
+        // A restart replays both resets.
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(
+            shown["bot"]["model"],
+            json!(null),
+            "the Model reset replays"
+        );
+        assert_eq!(
+            shown["bot"]["thinking"],
+            json!(null),
+            "the level reset replays"
+        );
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -18180,10 +18824,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_that_cannot_call_tools_cannot_be_the_default() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                "http://127.0.0.1:1/v1".to_owned(),
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec("no-tools", false, false, Vec::new()),
+                ],
+            ),
+        )
+        .await;
+        let no_tools: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: no_tools },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "the Model cannot call tools, so a Bot cannot use it"),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let default = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["is_default"] == json!(true))
+            .expect("a default stays");
+        assert_eq!(default["name"], "fast");
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_rule_remove_replays_one_confirmation() {
         let (_dir, running, invite) = running().await;
         let (mut socket, token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let (computer, _machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(52)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let made = command(
             &mut socket,
@@ -18221,10 +18909,79 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_names_a_declared_tool() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (computer, _machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(71)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // A misspelt tool would be recorded and never match.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Ask, "reed_file", None, None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "there is no tool named reed_file"),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+
+        let made = command(
+            &mut socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Ask, "read_file", None, None),
+        )
+        .await;
+        assert!(made["rule"].is_string());
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_bot_records_no_rule() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // A Hosted Computer never asks, so a rule there would never match.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            add_rule(bot, neha::record::RuleEffect::Allow, "shell", None, None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("Hosted Computer never asks")),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+        let rules = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::RuleList { bot: Some(bot) },
+        )
+        .await;
+        assert!(rules.as_array().unwrap().is_empty());
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_rule_add_replays_its_recorded_result() {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
-        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let (computer, _machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(53)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
         let command_id = Id::new();
         let call = add_rule(bot, neha::record::RuleEffect::Allow, "shell", None, None);

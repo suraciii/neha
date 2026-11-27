@@ -133,13 +133,13 @@ The page shows the Bot's name, its picture, its Computer, its Model, and its acc
 
 The owner changes the Bot's name on the page. The page shows the Computer's kind and whether it is online, and the owner moves a Local Bot to another Local Computer they own. A Hosted Bot does not move.
 
-The owner chooses the Bot's Model and thinking level on the page. Without one of its own, the Bot uses the Space's default, which the Admin sets in Settings. [Model](../model/product.md#choosing) covers the choice.
+The owner chooses the Bot's Model and thinking level on the page, and clears each back to the Space's default. Without one of its own, the Bot uses the Space's default, which the Admin sets in Settings. [Model](../model/product.md#choosing) covers the choice.
 
-A Local Bot's page shows the folders it can write and whether it has full access. The owner grants a folder, revokes one, and turns full access on or off there.
+A Local Bot's page shows the folders it can write and whether it has full access. The owner grants a folder, revokes one, and turns full access on or off there. The page offers only the access the Bot's Computer supports.
 
 Turning full access on states the risk and asks the owner to confirm, as the CLI does at a terminal. [Computer](../computer/product.md#what-a-bot-can-do) owns the access model.
 
-The page lists the Bot's Ask and Allow rules, and the owner adds and removes them there. [Bot](../bot/product.md#asking-before-an-action) owns what a rule covers.
+A Local Bot's page lists its Ask and Allow rules, and the owner adds and removes them there. A Hosted Bot's page offers no rule to add or remove. [Bot](../bot/product.md#asking-before-an-action) owns what a rule covers.
 
 The page shows who can use the Bot, and changing that is not yet available.
 
@@ -147,21 +147,21 @@ The page shows who can use the Bot, and changing that is not yet available.
 
 The Settings entry opens the Space's settings in the main area. Every User reads them, and only the Admin changes them.
 
-The settings list the Space's Providers, each with its protocol and address, and the Models each Provider offers. The Admin connects a Provider, disconnects one, and refreshes its Models there. [Model](../model/product.md#providers) covers connecting one.
+The settings list the Space's Providers, each with its protocol and address, and the Models each Provider offers. The Admin connects a Provider and refreshes its Models there. [Model](../model/product.md#providers) covers connecting one.
 
 The settings show the catalog's state: the snapshot or the cache in use, its age, and whether it is stale. The Admin refreshes the catalog there. [Model](../model/product.md#catalog) covers the catalog.
 
 The Admin sets the Space's default Model in the settings. [Model](../model/product.md#choosing) covers the default and what a Bot inherits.
 
-A Space with no Provider shows that empty state with the action that connects one. A Provider with no Models shows that empty state.
+A Space with no Provider shows that empty state with the action that connects one. Each Provider's Models list shows its own empty state when it offers none.
 
 ## Computers
 
-The settings list the Computers the User owns, Local and Hosted, with each one's online state. [Computer](../computer/product.md) owns what a Computer is.
+The settings list every Computer the User owns, Local and Hosted, with its kind and whether it is online. [Computer](../computer/product.md) owns what a Computer is.
 
 The owner resets a Hosted Computer from that list. The reset asks for confirmation and names what it deletes. [Computer](../computer/product.md#keeping-files) covers the reset.
 
-The owner also moves a Bot between their Local Computers from that list.
+A Bot moves on its own page, between the Local Computers its owner owns.
 
 ## Language
 
