@@ -541,7 +541,7 @@ impl CatalogProvider {
                 name: model.id.clone(),
                 context_limit: model.context_limit,
                 max_output: model.max_output,
-                reads_images: model.attachment,
+                reads_images: model.reads_images,
                 // A reasoning Model with no level this build can spell is
                 // not offered as a thinking Model.
                 thinks: model.reasoning && !model.thinking_levels.is_empty(),
@@ -607,8 +607,8 @@ pub struct CatalogModel {
     pub reasoning: bool,
     /// Whether the Model can call tools.
     pub tool_call: bool,
-    /// Whether the Model reads images.
-    pub attachment: bool,
+    /// Whether the Model reads images as input.
+    pub reads_images: bool,
     /// The context window in tokens.
     pub context_limit: u32,
     /// The largest output in tokens.
@@ -811,7 +811,7 @@ struct WireModel {
     #[serde(default)]
     name: String,
     #[serde(default)]
-    attachment: bool,
+    modalities: Option<WireModalities>,
     #[serde(default)]
     reasoning: bool,
     #[serde(default)]
@@ -832,7 +832,7 @@ impl WireModel {
         let Self {
             id,
             name,
-            attachment,
+            modalities,
             reasoning,
             tool_call,
             release_date,
@@ -849,7 +849,9 @@ impl WireModel {
             name,
             reasoning,
             tool_call,
-            attachment,
+            reads_images: modalities
+                .map(|modalities| modalities.input.iter().any(|kind| kind == "image"))
+                .unwrap_or(false),
             context_limit: limit
                 .context
                 .filter(|limit| *limit > 0)
@@ -862,6 +864,16 @@ impl WireModel {
             status: status.filter(|status| !status.is_empty()),
         }
     }
+}
+
+/// The input and output kinds one model accepts on the wire.
+#[derive(Debug, Default, Deserialize)]
+struct WireModalities {
+    #[serde(default)]
+    input: Vec<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    output: Vec<String>,
 }
 
 /// One model's limits on the wire; an absent limit is zero here.
@@ -1164,6 +1176,12 @@ mod tests {
         let anthropic = catalog.provider("anthropic").unwrap();
         let claude = &anthropic.models["claude-sonnet-5"];
         assert_eq!(claude.thinking_levels, super::ALL_THINKING_LEVELS);
+
+        // `attachment` says a file can be attached, not that it is an image.
+        let pdf = &catalog.provider("nano-gpt").unwrap().models["qwen/qwen3-32b"];
+        assert!(!pdf.reads_images);
+        assert!(pdf.tool_call);
+        assert!(openai.models["gpt-4.1"].reads_images);
     }
 
     #[test]
@@ -1179,7 +1197,7 @@ mod tests {
                         "one": {
                             "id": "one",
                             "name": "One",
-                            "attachment": true,
+                            "modalities": {"input": ["text", "image"]},
                             "reasoning": true,
                             "tool_call": true,
                             "reasoning_options": [

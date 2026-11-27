@@ -41,6 +41,8 @@ A refresh uses the cached ETag, keeps the last known good catalog when the netwo
 
 Each Model has a name, its Provider, and these capabilities: context window, largest output, reads images, calls tools, and thinks. The catalog states them for a known vendor; the Admin states them for a manual Model.
 
+The catalog's image capability comes from its input modalities: a Model reads images only when `image` is among them. File attachment support alone does not make a Model an image reader.
+
 A Model's thinking levels come from the catalog's reasoning options. A Model that cannot think has no level; a Model that can think accepts the levels named for it, or every level when none are named.
 
 The Admin can correct a Model's capabilities from a self-hosted server. Manual values win over the catalog.

@@ -6364,6 +6364,62 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_responses_provider_refreshes_its_discovered_models() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                axum::Json(json!({
+                    "data": [{"id": "one"}, {"id": "two"}],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+
+        let added = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::OpenAiResponses,
+                base_url: format!("http://{addr}/v1"),
+                api_key: "sk-test".to_owned(),
+                models: Vec::new(),
+                default_model: None,
+                thinking: None,
+                vendor: None,
+                discover: true,
+            }),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(added["provider"].clone()).unwrap();
+        let refreshed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        let names: Vec<&str> = refreshed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["one", "two"]);
+
+        socket.close(None).await.unwrap();
+        task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_bot_uses_the_model_and_thinking_its_owner_chose() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;

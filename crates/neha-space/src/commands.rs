@@ -1180,7 +1180,7 @@ async fn provider_refresh(
     let (specs, default_name) = if let Some(vendor) = view.vendor.as_deref() {
         let plan = catalog_plan(context, vendor, Some(view.base_url.clone()), None).await?;
         (plan.models, plan.default_model)
-    } else if view.protocol == provider_protocol_wire(ProviderProtocol::ChatCompletions) {
+    } else {
         let specs = discover_models(&view.base_url, &api_key)
             .await?
             .into_iter()
@@ -1203,10 +1203,6 @@ async fn provider_refresh(
             })
             .collect();
         (specs, old_default.clone())
-    } else {
-        return Err(ApiError::invalid_argument(
-            "this Provider has no discovery: connect it from the catalog or declare its Models",
-        ));
     };
     if specs.is_empty() {
         return Err(ApiError::invalid_argument(
@@ -1339,14 +1335,6 @@ async fn catalog_refresh(
 
 fn catalog_error(error: crate::catalog::CatalogError) -> ApiError {
     ApiError::unavailable(error.to_string())
-}
-
-/// Returns the wire form of one protocol.
-fn provider_protocol_wire(protocol: ProviderProtocol) -> String {
-    serde_json::to_value(protocol)
-        .ok()
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .unwrap_or_default()
 }
 
 /// Asks an OpenAI-compatible endpoint for its Model names.

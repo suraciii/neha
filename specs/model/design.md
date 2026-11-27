@@ -28,6 +28,8 @@ The provider-native output a later tool step needs, such as a reasoning item or 
 
 A Model's capabilities and limits come from the catalog unless the Provider's configuration states them. The Provider record stores the resolved values, so a run reads one source: its Model's record. Manual values win over the catalog.
 
+The catalog's `attachment` flag says a file can be attached, not that the Model reads images. Image input comes only from an `image` entry in the catalog's input modalities; a Model with no modalities reads no images.
+
 A Model that cannot call tools never enters the loop. The loop's tool schemas are its only way to act, so a text-only Model is refused before a step starts.
 
 ## Catalog
