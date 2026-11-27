@@ -35,11 +35,14 @@ The first launch shows **Choose a Space**:
 - **This computer** starts a private bundled Space and opens its normal
   first-run invitation; the User creates the first Admin and signs in there.
 - **Existing Space** takes an `https://` address (loopback `http://` is allowed
-  for development), checks it, and loads that Space's normal sign-in page.
+  for development), checks it, and loads that Space page: a normal sign-in, or
+  the invitation page when the address is an invitation link.
 
 The choice is saved in `desktop-space.json` under the app's user data. Later
 launches open that Space directly. A missing or expired session shows the
-Space's own sign-in page; the shell never signs in for the User. **Neha →
+Space's own sign-in page; the shell never signs in for the User. A remote Space
+must be served over `https`, normally by a trusted TLS proxy in front of its
+loopback listener with `NEHA_PUBLIC_URL` set; see [Quick start](../../docs/quickstart.md#connect-a-remote-client). **Neha →
 Change Space…** (`Ctrl/Cmd+Shift+K`) clears the choice, stops the local Space,
 and returns to the chooser.
 

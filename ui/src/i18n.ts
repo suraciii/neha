@@ -45,8 +45,10 @@ const en = {
   "desktop.connect": "Connect",
   "desktop.connecting": "Connecting…",
   "desktop.localComputer.title": "Also use this computer's Local Computer",
-  "desktop.localComputer.text":
+  "desktop.localComputer.text.windows":
     "Commands run with your account's rights in the Bot's folder. This build has no other sandbox. Only enable it for Bots you trust.",
+  "desktop.localComputer.text.other":
+    "Commands run in the Bot's folder under this platform's Local Computer fence. Only enable it for Bots you trust.",
   "desktop.fine": "The desktop app uses the same Space and the same sign-in as the web client.",
   "desktop.unavailable": "Open Neha from the desktop app to choose a Space.",
   "desktop.error.local": "The local Space could not start. Check the desktop logs.",
@@ -220,8 +222,10 @@ const zh: Record<MessageKey, string> = {
   "desktop.connect": "连接",
   "desktop.connecting": "正在连接…",
   "desktop.localComputer.title": "同时使用这台电脑的 Local Computer",
-  "desktop.localComputer.text":
+  "desktop.localComputer.text.windows":
     "命令会以你的账号权限在 Bot 文件夹中运行。这个构建没有其他沙箱。只为你信任的 Bot 启用。",
+  "desktop.localComputer.text.other":
+    "命令会在 Bot 文件夹中运行，并受这个平台 Local Computer 的既有围栏约束。只为你信任的 Bot 启用。",
   "desktop.fine": "桌面端和 Web 端使用同一个 Space、同一套登录。",
   "desktop.unavailable": "请从桌面应用打开 Neha 来选择 Space。",
   "desktop.error.local": "本地 Space 无法启动。请查看桌面日志。",

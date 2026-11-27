@@ -23,6 +23,10 @@ export default function DesktopLauncher() {
   const [error, setError] = createSignal<string | null>(null);
 
   const bridge = () => window.nehaDesktop;
+  const localComputerText = () =>
+    /Windows/i.test(navigator.userAgent)
+      ? t("desktop.localComputer.text.windows")
+      : t("desktop.localComputer.text.other");
 
   async function chooseLocal() {
     if (busy() || !bridge()) return;
@@ -119,7 +123,7 @@ export default function DesktopLauncher() {
                   {t("desktop.localComputer.title")}
                 </span>
                 <span class="desktop__consent-text">
-                  {t("desktop.localComputer.text")}
+                  {localComputerText()}
                 </span>
               </span>
             </label>

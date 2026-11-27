@@ -20,6 +20,14 @@ The Space serves the built client from a directory. The directory defaults to `u
 
 The Space listens on `127.0.0.1` and serves the browser client from a hostname stable for its home, under `.localhost`. The session cookie is host-only on that hostname. The Space does not accept a browser session on `127.0.0.1` or `localhost`.
 
+A Space MAY sit behind a trusted TLS proxy that forwards to loopback. When
+`NEHA_PUBLIC_URL` names its `https://` origin, that origin is the browser
+hostname.
+
+The Space accepts that Host and Origin, issues a `Secure` cookie, and redirects
+loopback requests to it. The proxy MUST preserve the public Host and Origin and
+terminate TLS; the Space still listens on loopback only.
+
 A path that does not name a file returns `index.html`, the browser entry point. The build also carries `desktop.html`, the desktop chooser entry point. A missing or escaping entry point is a start error, not a partial page.
 
 The Space does not serve its home directory or any file outside the client directory, except a File's bytes from the File store. A client directory that contains the Space home, or sits inside it, is a start error.

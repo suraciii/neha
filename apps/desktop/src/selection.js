@@ -22,7 +22,10 @@ function normalizeRemoteUrl(value) {
   if (url.protocol !== "https:" && !(url.protocol === "http:" && isLoopbackHost(url.hostname))) {
     throw new Error("a remote Space must use https; only a loopback Space may use http");
   }
-  return url.origin;
+  // Keep the path and fragment: a remote invitation is an /invite#secret URL,
+  // not just the origin. The desktop loads this exact page so the Space's own
+  // join screen receives the secret.
+  return url.href;
 }
 
 /**
@@ -40,4 +43,26 @@ function probeUrl(origin) {
   return url.href;
 }
 
-module.exports = { isLoopbackHost, normalizeRemoteUrl, probeUrl };
+/**
+ * Returns the settled remote page to remember after a navigation, or null when
+ * the page is still an invitation or belongs to another origin.
+ *
+ * The current origin, not the saved invitation origin, is authoritative: a
+ * loopback address may redirect to the Space's canonical `*.localhost` host
+ * before the User joins, and the one-use invite must not survive that join.
+ */
+function settledRemoteUrl(selection, currentOrigin, url) {
+  if (selection?.mode !== "remote" || !currentOrigin) return null;
+  try {
+    const current = new URL(currentOrigin);
+    const next = new URL(url);
+    if (next.origin !== current.origin) return null;
+    if (next.pathname.startsWith("/invite")) return null;
+    if (selection.spaceUrl === next.href) return null;
+    return next.href;
+  } catch {
+    return null;
+  }
+}
+
+module.exports = { isLoopbackHost, normalizeRemoteUrl, probeUrl, settledRemoteUrl };

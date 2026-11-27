@@ -21,7 +21,7 @@ const path = require("node:path");
 const readline = require("node:readline");
 const { pathToFileURL } = require("node:url");
 
-const { normalizeRemoteUrl, probeUrl } = require("./selection");
+const { normalizeRemoteUrl, probeUrl, settledRemoteUrl } = require("./selection");
 const { parseStartupLine } = require("./startup");
 
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -39,6 +39,7 @@ protocol.registerSchemesAsPrivileged([
 
 let server;
 let localComputer;
+let pairing;
 let loginWatcher;
 let mainWindow;
 let currentOrigin;
@@ -109,11 +110,16 @@ function uiDir() {
 }
 
 function computerEnv() {
-  return { ...process.env, NEHA_COMPUTER_HOME: computerHome() };
+  const env = { ...process.env, NEHA_COMPUTER_HOME: computerHome() };
+  delete env.NEHA_PUBLIC_URL;
+  return env;
 }
 
 function spaceEnv(useLocalComputer) {
   const env = { ...process.env, NEHA_HOME: spaceHome() };
+  // The bundled Space is private. A shell configured for a public proxy must
+  // not change its origin or cookie host.
+  delete env.NEHA_PUBLIC_URL;
   if (process.platform === "win32" && useLocalComputer) {
     // The explicit Windows Local Computer has no OS sandbox. The launcher
     // records the owner's choice and this is the only place that turns the
@@ -218,12 +224,23 @@ function createWindow() {
   });
   installMenu();
 
-  mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (!navigationAllowed(url)) {
-      event.preventDefault();
-      log(`blocked navigation to ${url}`);
-    }
-  });
+  for (const eventName of ["will-navigate", "will-redirect"]) {
+    mainWindow.webContents.on(eventName, (event, url) => {
+      if (!navigationAllowed(url)) {
+        event.preventDefault();
+        log(`blocked ${eventName} to ${url}`);
+      } else if (eventName === "will-redirect") {
+        // A canonical loopback -> *.localhost redirect is now this window's
+        // origin; keep later same-origin navigation allowed.
+        currentOrigin = new URL(url).origin;
+      }
+    });
+  }
+  for (const eventName of ["did-navigate", "did-navigate-in-page"]) {
+    mainWindow.webContents.on(eventName, (_event, url) => {
+      rememberSettledRemoteUrl(url);
+    });
+  }
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (new URL(url).protocol === "https:") void shell.openExternal(url);
     return { action: "deny" };
@@ -257,14 +274,38 @@ function installMenu() {
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
 
+function isLoopbackName(hostname) {
+  return (
+    hostname === "127.0.0.1" ||
+    hostname === "localhost" ||
+    hostname === "[::1]" ||
+    hostname === "::1"
+  );
+}
+
+function canonicalSpaceRedirect(next) {
+  if (!currentOrigin) return false;
+  const current = new URL(currentOrigin);
+  if (!isLoopbackName(current.hostname)) return false;
+  if (current.port !== next.port) return false;
+  return /^neha-[a-f0-9]+\.localhost$/.test(next.hostname);
+}
+
 function navigationAllowed(url) {
   try {
     const next = new URL(url);
     if (next.protocol === UI_SCHEME && next.hostname === "ui") return true;
+    if (canonicalSpaceRedirect(next)) return true;
     return currentOrigin !== null && next.origin === currentOrigin;
   } catch {
     return false;
   }
+}
+
+function rememberSettledRemoteUrl(url) {
+  const selection = readSelection();
+  const settled = settledRemoteUrl(selection, currentOrigin, url);
+  if (settled) writeSelection({ mode: "remote", spaceUrl: settled });
 }
 
 async function showUrl(url) {
@@ -400,6 +441,11 @@ function stopLocalComputer() {
     loginWatcher.abort();
     loginWatcher = undefined;
   }
+  if (pairing) {
+    const child = pairing;
+    pairing = undefined;
+    killTree(child);
+  }
   if (localComputer) {
     const child = localComputer;
     localComputer = undefined;
@@ -415,11 +461,19 @@ function sessionCookieName(origin) {
 
 function wait(ms, signal) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    signal.addEventListener("abort", () => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
+      return;
+    }
+    const onAbort = () => {
       clearTimeout(timer);
       reject(new Error("aborted"));
-    }, { once: true });
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
@@ -433,7 +487,8 @@ function watchForLocalLogin(origin, spaceUrl) {
         const cookies = await session.defaultSession.cookies.get({ url: origin });
         const cookie = cookies.find((item) => item.name === cookieName && item.value);
         if (cookie) {
-          await startLocalComputer(spaceUrl, origin, cookie);
+          if (controller.signal.aborted) return;
+          await startLocalComputer(spaceUrl, origin, cookie, controller.signal);
           return;
         }
         await wait(500, controller.signal);
@@ -446,13 +501,14 @@ function watchForLocalLogin(origin, spaceUrl) {
   })();
 }
 
-async function requestTicket(spaceUrl, cookie) {
+async function requestTicket(spaceUrl, cookie, signal) {
   // The session cookie is scoped to the Space's browser host, while this
   // trusted main-process request goes to loopback. Send its token the way the
   // CLI does, so the ticket endpoint authenticates without a browser Host.
   const response = await fetch(`${spaceUrl}/api/computer/ticket`, {
     method: "POST",
     headers: { authorization: `Bearer ${cookie.value}` },
+    signal,
   });
   if (!response.ok) {
     throw new Error(`the Space did not issue a Local Computer ticket (${response.status})`);
@@ -472,7 +528,8 @@ async function writeTicketFile(origin, spaceUrl, ticket) {
   return file;
 }
 
-async function runPairing(spaceUrl, ticketFile) {
+async function runPairing(spaceUrl, ticketFile, signal) {
+  if (signal.aborted) return false;
   fs.mkdirSync(computerHome(), { recursive: true });
   fs.mkdirSync(computerWorkspace(), { recursive: true });
   const args = [
@@ -491,13 +548,21 @@ async function runPairing(spaceUrl, ticketFile) {
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+  pairing = child;
+  const abort = () => killTree(child);
+  signal.addEventListener("abort", abort, { once: true });
   child.stdout.on("data", (chunk) => process.stdout.write(`[pair] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[pair:err] ${chunk}`));
-  const code = await new Promise((resolve) => {
-    child.once("error", () => resolve(1));
-    child.once("exit", (value) => resolve(value ?? 1));
-  });
-  return code === 0;
+  try {
+    const code = await new Promise((resolve) => {
+      child.once("error", () => resolve(1));
+      child.once("exit", (value) => resolve(value ?? 1));
+    });
+    return !signal.aborted && code === 0;
+  } finally {
+    signal.removeEventListener("abort", abort);
+    if (pairing === child) pairing = undefined;
+  }
 }
 
 async function waitForComputerConnected(child, timeoutMs = 10_000) {
@@ -518,7 +583,8 @@ async function waitForComputerConnected(child, timeoutMs = 10_000) {
   });
 }
 
-async function startLocalComputer(spaceUrl, origin, cookie) {
+async function startLocalComputer(spaceUrl, origin, cookie, signal) {
+  if (signal.aborted) return;
   if (process.platform === "darwin") {
     log("the Local Computer is not available on macOS yet");
     return;
@@ -538,13 +604,15 @@ async function startLocalComputer(spaceUrl, origin, cookie) {
     }
   }
   if (!paired) {
-    const ticket = await requestTicket(spaceUrl, cookie);
+    const ticket = await requestTicket(spaceUrl, cookie, signal);
+    if (signal.aborted) return;
     const file = await writeTicketFile(origin, spaceUrl, ticket);
-    if (!(await runPairing(spaceUrl, file))) {
-      log("the Local Computer could not pair; Chat is still available");
+    if (!(await runPairing(spaceUrl, file, signal))) {
+      if (!signal.aborted) log("the Local Computer could not pair; Chat is still available");
       return;
     }
   }
+  if (signal.aborted) return;
   localComputer = spawn(binaryPath(), [
     "computer",
     "run",
@@ -580,7 +648,8 @@ async function openLocalSpace(useLocalComputer) {
 }
 
 async function openRemoteSpace(input, persist = true) {
-  const origin = normalizeRemoteUrl(input);
+  const location = normalizeRemoteUrl(input);
+  const origin = new URL(location).origin;
   // Do not follow a redirect here: the Space may redirect to its browser host
   // (`*.localhost`), which Node cannot resolve on Windows. Chromium resolves it
   // when the window loads the address.
@@ -593,8 +662,8 @@ async function openRemoteSpace(input, persist = true) {
   }
   stopLocalComputer();
   await stopSpace();
-  if (persist) writeSelection({ mode: "remote", spaceUrl: origin });
-  await showUrl(`${origin}/`);
+  if (persist) writeSelection({ mode: "remote", spaceUrl: location });
+  await showUrl(location);
   log(`opened the remote Space at ${origin}`);
 }
 
@@ -697,7 +766,8 @@ if (!app.requestSingleInstanceLock()) {
     } catch (error) {
       log(error?.stack || String(error));
       if (error?.cause) log("cause:", error.cause);
-      clearSelection();
+      // A saved Space may be temporarily offline. Keep the choice so the next
+      // launch retries it; only Change Space forgets it.
       await stopLocalComputer();
       await stopSpace();
       await showLauncher();

@@ -219,6 +219,23 @@ target/debug/neha chat send --file notes.txt --bot <bot-id> "Read the attached f
 
 [Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.
 
+## Connect a remote client
+
+A Space that a desktop or phone client reaches over the network sits behind a
+trusted TLS proxy. The proxy forwards to the Space's loopback listener and
+preserves the public `Host` and `Origin` headers. Start the Space with its
+public origin:
+
+```sh
+NEHA_PUBLIC_URL=https://space.example.com neha serve
+```
+
+The printed invitation uses that public origin. The Space accepts the proxy's
+Host and `https` Origin, issues a `Secure` session cookie, and redirects a
+loopback browser request to the public origin. Do not expose the loopback
+listener directly; terminate TLS at the proxy. A desktop client connects with
+the Space URL, or with the invitation link for a Space that has no Admin yet.
+
 ## Restart and sign in again
 
 Stop the Space with Ctrl-C. Start it again with the same `NEHA_HOME`:

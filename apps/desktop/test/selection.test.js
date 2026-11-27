@@ -1,15 +1,18 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
-const { normalizeRemoteUrl, probeUrl } = require("../src/selection");
+const { normalizeRemoteUrl, probeUrl, settledRemoteUrl } = require("../src/selection");
 
-test("accepts an https Space and keeps its origin", () => {
-  assert.equal(normalizeRemoteUrl(" https://space.example.com/chat "), "https://space.example.com");
+test("accepts an https Space and keeps its path", () => {
+  assert.equal(
+    normalizeRemoteUrl(" https://space.example.com/chat "),
+    "https://space.example.com/chat",
+  );
 });
 
 test("accepts loopback http for local development", () => {
-  assert.equal(normalizeRemoteUrl("http://127.0.0.1:7337"), "http://127.0.0.1:7337");
-  assert.equal(normalizeRemoteUrl("http://neha-abc.localhost:7337"), "http://neha-abc.localhost:7337");
+  assert.equal(normalizeRemoteUrl("http://127.0.0.1:7337"), "http://127.0.0.1:7337/");
+  assert.equal(normalizeRemoteUrl("http://neha-abc.localhost:7337"), "http://neha-abc.localhost:7337/");
 });
 
 test("refuses plaintext remote Spaces", () => {
@@ -22,6 +25,29 @@ test("refuses addresses carrying credentials", () => {
 
 test("refuses values that are not URLs", () => {
   assert.throws(() => normalizeRemoteUrl("space.example.com"), /address/);
+});
+
+test("settles a consumed invite against the canonical redirected origin", () => {
+  const selection = {
+    mode: "remote",
+    spaceUrl: "http://127.0.0.1:7337/invite#secret",
+  };
+  assert.equal(
+    settledRemoteUrl(
+      selection,
+      "http://neha-abc.localhost:7337",
+      "http://neha-abc.localhost:7337/",
+    ),
+    "http://neha-abc.localhost:7337/",
+  );
+  assert.equal(
+    settledRemoteUrl(
+      selection,
+      "http://neha-abc.localhost:7337",
+      "http://neha-abc.localhost:7337/invite#secret",
+    ),
+    null,
+  );
 });
 
 test("probes a localhost Space through loopback", () => {
