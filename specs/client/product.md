@@ -51,7 +51,7 @@ After the Bot is created, the client opens its Chat.
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
 
-The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online. While an Approval waits, the header marks the wait; the Approval Card remains in the stream. A Chat with no Messages shows the Bot's name and starting prompts.
+The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online. While the Run the client follows waits for an Approval, the header marks the wait; the Approval Card remains in the stream. A Chat with no Messages shows the Bot's name and starting prompts.
 
 The composer sends one Message. Enter sends; Shift and Enter insert a new line. The composer does not accept an empty Message.
 

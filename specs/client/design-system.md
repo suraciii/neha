@@ -62,7 +62,7 @@ Motion explains a change; it never decorates. The client honors reduced motion a
 
 ### Layout
 
-One rail, one sidebar, and one main area frame every surface. The product owns the narrow breakpoint; the visual breakpoints and shell sizes live in [styles.css](../../ui/src/styles.css). The setup steps fill the main area on a narrow viewport; the Chat list and Chat share that viewport after setup.
+One rail, one sidebar, and one main area frame every signed-in surface. The product owns the narrow breakpoint; the visual breakpoints and shell sizes live in [styles.css](../../ui/src/styles.css). The setup steps fill the main area on a narrow viewport; the Chat list and Chat share that viewport after setup.
 
 ### Components
 
@@ -87,7 +87,7 @@ The Approval Card's fields and answers are owned by [the message specification](
 
 These patterns state composition; behavior is in [product.md](product.md).
 
-- First run: a quiet shell and one raised setup surface.
+- First run: a quiet shell and raised setup panels.
 - Empty: Chat-list and no-selection empty states are text-only; a Chat with no Messages uses the Bot avatar and prompt chips.
 - Waiting: one attention pill in the header; each waiting Approval has one raised Card in the stream.
 - Failure: one inline recovery line; no modal.
@@ -107,7 +107,7 @@ These patterns state composition; behavior is in [product.md](product.md).
 - Do reuse an existing component and state.
 - Do keep one accent and one attention color.
 - Don't place a kicker or eyebrow above a heading.
-- Don't show implementation copy: no cookie names, byte counts, or storage details.
+- Don't show internal implementation copy: no cookie names, storage details, or protocol diagnostics; a File's size is user data.
 - Don't use monospace outside code, commands, URLs, and machine data.
 - Don't combine a border and a shadow on one surface.
 - Don't nest a card inside a card.
