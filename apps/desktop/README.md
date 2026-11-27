@@ -97,5 +97,5 @@ pnpm test
 The unit tests cover startup-line parsing, Space-address validation, and the
 launcher's consent and remote choices. The nightly Windows installer job installs
 the app, captures the chooser, opens the local invitation page, and opens a
-remote login page. Windows runtime tests cover the Local Computer fence. A GUI
+remote invitation page. Windows runtime tests cover the Local Computer fence. A GUI
 session on a developer machine is still the place to inspect the window chrome.

@@ -187,7 +187,7 @@ jobs:
           }
           Write-Host "local login screenshot: $env:NEHA_DESKTOP_CAPTURE"
 
-      - name: Open a remote Space sign-in page
+      - name: Open a remote Space invitation page
         shell: pwsh
         run: |
           $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |

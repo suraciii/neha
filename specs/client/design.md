@@ -44,7 +44,8 @@ desktop bridge.
 The local choice starts the bundled Space. The remote choice does not start a
 sidecar and loads only the chosen `https://` origin, or a loopback `http://`
 origin for development. The window MUST NOT navigate outside the chosen
-origin.
+origin, except the narrow loopback-to-canonical-`*.localhost` redirect a local
+Space uses for its browser host.
 
 The shell MAY read the local Space's `HttpOnly` cookie from its own Electron
 session to ask the Space for a Local Computer ticket after sign-in. It sends the
