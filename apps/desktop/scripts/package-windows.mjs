@@ -26,12 +26,14 @@ function run(command, args, extraEnv = {}) {
   // ordinary checkouts can live under "C:\\Users\\Ada Lovelace\\neha".
   const batch = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
   const file = batch ? (process.env.ComSpec || "cmd.exe") : command;
-  const argv = batch
-    ? ["/D", "/S", "/C", [command, ...args].map(quoteWindowsArg).join(" ")]
-    : args;
+  const payload = [command, ...args].map(quoteWindowsArg).join(" ");
+  const argv = batch ? ["/D", "/S", "/C", `"${payload}"`] : args;
   const result = spawnSync(file, argv, {
     cwd: desktop,
     stdio: "inherit",
+    // cmd.exe must receive the already-quoted /C payload verbatim; otherwise
+    // libuv quotes it a second time and a space-containing path splits.
+    windowsVerbatimArguments: batch,
     env: { ...process.env, ...extraEnv },
   });
   if (result.status !== 0) process.exit(result.status ?? 1);
