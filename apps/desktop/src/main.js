@@ -400,6 +400,24 @@ async function runPairing(spaceUrl, ticketFile) {
   return child.exitCode === 0;
 }
 
+function waitForComputerConnected(child, timeoutMs = 10_000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.stdout.on("data", (chunk) => {
+      if (chunk.toString().includes("Connected to")) finish();
+    });
+    child.once("exit", finish);
+    child.once("error", finish);
+  });
+}
+
 async function startLocalComputer(spaceUrl, origin) {
   if (process.platform === "darwin") {
     log("the Local Computer is not available on macOS yet");
@@ -448,6 +466,7 @@ async function startLocalComputer(spaceUrl, origin) {
     log(`the Local Computer exited (${code ?? signal})`);
   });
   log(`started the Local Computer at ${computerWorkspace()}`);
+  await waitForComputerConnected(localComputer);
 }
 
 async function openLocalSpace() {
