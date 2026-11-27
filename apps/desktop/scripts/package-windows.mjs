@@ -17,6 +17,7 @@ function run(command, args, extraEnv = {}) {
   const result = spawnSync(command, args, {
     cwd: desktop,
     stdio: "inherit",
+    shell: process.platform === "win32",
     env: { ...process.env, ...extraEnv },
   });
   if (result.status !== 0) process.exit(result.status ?? 1);
