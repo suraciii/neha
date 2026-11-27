@@ -6,11 +6,11 @@ A new build starts on the record the last build wrote and migrates it in place. 
 
 ## Back up the Space's home
 
-Read the home the Space uses before you change anything: the `NEHA_HOME` line in its service unit, or the address and `Files are stored in…` lines its startup log prints. Do not set `NEHA_HOME` for a Space you did not start; the running process owns that value.
+Confirm the home the Space uses before you change anything: the `NEHA_HOME` line in the Space's service configuration, such as a systemd unit, or the environment the Space was started with. The startup log names the address the Space listens on and where the bytes of Files live, which is `a directory in this Space` for a local store. Neither line names the home that holds the record. Do not set `NEHA_HOME` for a Space you did not start; the running process owns that value.
 
 Set `HOME_DIR` to that path once and use it for the rest of this guide. Keep one shell open for the whole upgrade, so the variable survives.
 
-Stop the Space, then copy the home to a path this run has not used:
+Stop the Space, then copy the home to a path this run has not used. The path below is an example; put your own home in `HOME_DIR`:
 
 ```bash
 HOME_DIR=/srv/neha/home
