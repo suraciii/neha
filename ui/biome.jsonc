@@ -1,0 +1,38 @@
+{
+  // The client's lint and format policy. `just ci` runs `biome check` through
+  // the package's `check` script, next to the type check and the tests.
+  "$schema": "https://biomejs.dev/schemas/2.6.9/schema.json",
+  "files": {
+    // Generated wire types are written by `just wire-types`; formatting them
+    // would break the drift check that compares them byte for byte.
+    "includes": ["**", "!**/dist", "!src/generated", "!**/*.svg"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended"
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "jsxQuoteStyle": "double",
+      "semicolons": "always",
+      "trailingCommas": "all"
+    }
+  },
+  "assist": {
+    "enabled": true,
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}
