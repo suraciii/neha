@@ -1,0 +1,19 @@
+{
+  "name": "neha-desktop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local-first Neha desktop shell",
+  "main": "src/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "start:headless": "electron . --no-sandbox",
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "electron": "45.5.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

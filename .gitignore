@@ -21,3 +21,7 @@ __pycache__/
 # The browser client's dependencies and build output are local state.
 ui/node_modules/
 ui/dist/
+
+# The desktop shell's dependencies and packaged output are local state.
+apps/desktop/node_modules/
+apps/desktop/dist/
