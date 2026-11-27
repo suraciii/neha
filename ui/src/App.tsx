@@ -1,4 +1,4 @@
-import { Show, createSignal, createStore, onCleanup, onSettled } from "solid-js";
+import { Show, createMemo, createSignal, createStore, onCleanup, onSettled } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
@@ -13,8 +13,10 @@ import { Commands, ProtocolError } from "./lib/ws";
 import type {
   Account,
   Approval,
+  AttentionEntry,
   Bot,
   Chat,
+  ChatStatus,
   Computer,
   Decision,
   FileSummary,
@@ -25,9 +27,11 @@ import type {
   BotResult,
   Preview,
   RecordEvent,
+  RunActivity,
   RunProgress,
   RunView,
   SendResult,
+  ToolAction,
 } from "./types";
 
 type AuthMode = "join" | "login" | "missing-invite";
@@ -38,6 +42,58 @@ type RunStep = "queued" | "running" | "waiting";
 // How far a Run has come. It only moves up, until a decision lets it work again.
 function rank(step: RunStep): number {
   return step === "queued" ? 0 : step === "running" ? 1 : 2;
+}
+
+// How the followed Run ended: whether it failed, and why.
+interface RunOutcome {
+  failed: boolean;
+  error: string | null;
+}
+
+function outcomeOf(status: RunView["status"], error: string | null): RunOutcome {
+  return { failed: status === "failed", error: status === "failed" ? error : null };
+}
+
+// How the record says a Run ended, from the events that name it.
+function outcomeFrom(data: Record<string, unknown>): RunOutcome {
+  const error = typeof data.error === "string" ? data.error : null;
+  return { failed: data.status === "failed", error: data.status === "failed" ? error : null };
+}
+
+// How the record says one action ended. An action that ran past its time limit
+// failed; one whose result never returned is unknown.
+function actionStatusOf(status: unknown): ToolAction["status"] {
+  if (status === "succeeded") return "succeeded";
+  if (status === "failed" || status === "timed_out") return "failed";
+  if (status === "unknown") return "unknown";
+  return "unknown";
+}
+
+// The step an event names, when it names one.
+function stepOf(data: Record<string, unknown>): number {
+  return typeof data.step === "number" ? data.step : 0;
+}
+
+// The action an event names, when it names one.
+function actionOf(data: Record<string, unknown>): string {
+  return typeof data.action === "string" ? data.action : "";
+}
+
+// The tool an event names, when it names one.
+function toolOf(data: Record<string, unknown>): string {
+  return typeof data.tool === "string" ? data.tool : "";
+}
+
+// The failed Run's activity: what it did, and why it failed.
+function failActivity(current: RunActivity | null, run: string, error: string | null): RunActivity {
+  const mine = current && current.run === run ? current : null;
+  return {
+    run,
+    step: mine?.step ?? 0,
+    actions: mine ? mine.actions.map((action) => ({ ...action })) : [],
+    files: mine ? [...mine.files] : [],
+    error,
+  };
 }
 
 interface State {
@@ -63,39 +119,58 @@ interface State {
   waiting: boolean;
   // The followed Run waits; the Chat shows the place it holds.
   queue: RunProgress | null;
+  // The followed Run failed; the header marks it until the next Run.
+  failed: boolean;
+  // What each Chat is doing, from the Space's projection and the record's
+  // live events. A Chat the record has not touched is idle.
+  chatStatus: Record<string, ChatStatus>;
+  // The Chats that received a Bot Message while another Chat was on screen.
+  unread: Record<string, boolean>;
+  // The approvals waiting in Chats other than the one on screen, by Chat.
+  attention: Record<string, Approval>;
   // The approval whose answer is on its way to the Space.
   deciding: string | null;
   busy: boolean;
   error: unknown | null;
 }
 
-const emptyState: State = {
-  account: null,
-  providers: [],
-  models: [],
-  bots: [],
-  chats: [],
-  previews: {},
-  activeChat: null,
-  messages: [],
-  files: {},
-  approvals: [],
-  activeBot: null,
-  activeComputer: null,
-  submitting: false,
-  working: false,
-  waiting: false,
-  queue: null,
-  deciding: null,
-  busy: false,
-  error: null,
-};
+// The state a page starts from. Each page builds its own, so the containers one
+// page writes never belong to another.
+function emptyState(): State {
+  return {
+    account: null,
+    providers: [],
+    models: [],
+    bots: [],
+    chats: [],
+    previews: {},
+    activeChat: null,
+    messages: [],
+    files: {},
+    approvals: [],
+    activeBot: null,
+    activeComputer: null,
+    submitting: false,
+    working: false,
+    waiting: false,
+    queue: null,
+    failed: false,
+    chatStatus: {},
+    unread: {},
+    attention: {},
+    deciding: null,
+    busy: false,
+    error: null,
+  };
+}
 
 export default function App() {
-  const [state, setState] = createStore<State>({ ...emptyState });
-  function update(patch: Partial<State>) {
+  const [state, setState] = createStore<State>(emptyState());
+  // Writes the fields the caller names, or lets the caller write the store.
+  function update(patch: Partial<State> | ((draft: State) => void)) {
     setState((draft) => {
-      Object.assign(draft, patch);
+      if (typeof patch === "function") patch(draft);
+      else Object.assign(draft, patch);
     });
   }
   function setPreview(chatId: string, next: Preview) {
@@ -129,6 +204,71 @@ export default function App() {
   // Runs the record already reported finished: a late command result or answer
   // must not revive them.
   const settledRuns = new Set<string>();
+  // The Chat each Run this page heard about works in, from the events that name
+  // both. A Run's end names no Chat, so the page remembers it here.
+  const runChats = new Map<string, string>();
+  // The followed Run's tool activity, while it has any.
+  const [activity, setActivity] = createSignal<RunActivity | null>(null);
+
+  function noteRun(run: string, chat: string) {
+    if (!runChats.has(run)) runChats.set(run, chat);
+  }
+
+  // The Run moved to a new step, so the card counts the newest one.
+  function noteStep(run: string, step: number) {
+    setActivity((current) => {
+      if (!current || current.run !== run) return current;
+      return { ...current, step: Math.max(current.step, step) };
+    });
+  }
+
+  // The Run asked a tool to do something.
+  function startAction(run: string, step: number, action: string, tool: string) {
+    setActivity((current) => {
+      if (!current || current.run !== run) return current;
+      const known = current.actions.find((entry) => entry.action === action);
+      if (known) return { ...current, step: Math.max(current.step, step) };
+      return {
+        ...current,
+        step: Math.max(current.step, step),
+        actions: [...current.actions, { action, step, tool, status: "running", error: null }],
+      };
+    });
+  }
+
+  // The tool's action ended, one way or another. An action the page only heard
+  // the end of still belongs to the card.
+  function finishAction(run: string, step: number, action: string, status: ToolAction["status"], error: string | null) {
+    setActivity((current) => {
+      if (!current || current.run !== run) return current;
+      const known = current.actions.find((entry) => entry.action === action);
+      const done = { ...(known ?? { action, step, tool: "", status: "running", error: null }), status, error: status === "failed" ? error : null };
+      const actions = known
+        ? current.actions.map((entry) => (entry.action === action ? done : entry))
+        : [...current.actions, done];
+      return { ...current, step: Math.max(current.step, step), actions };
+    });
+  }
+
+  // The Run produced a File, so the card can show it beside the actions.
+  function noteFile(run: string, id: string) {
+    setActivity((current) => {
+      if (!current || current.run !== run || current.files.includes(id)) return current;
+      return { ...current, files: [...current.files, id] };
+    });
+  }
+
+  function setChatStatus(chat: string, status: ChatStatus) {
+    setState((draft) => {
+      draft.chatStatus[chat] = status;
+    });
+  }
+
+  // What a Chat is doing: the record's live answer first, else the Space's
+  // projection, else idle.
+  function statusOf(chat: Chat): ChatStatus {
+    return state.chatStatus[chat.id] ?? chat.status ?? "idle";
+  }
 
   // Whether the Chat on screen still belongs to this piece of work.
   function isCurrentChat(chat: Chat, generation: number): boolean {
@@ -149,9 +289,16 @@ export default function App() {
   function followRun(run: string, step: RunStep, position?: number) {
     if (settledRuns.has(run)) return;
     followed = { run, step };
-    if (step === "queued") update({ working: false, waiting: false, queue: { status: "queued", position } });
-    else if (step === "running") update({ working: true, waiting: false, queue: null });
-    else update({ working: false, waiting: true, queue: null });
+    update((draft) => {
+      draft.working = step === "running";
+      draft.waiting = step === "waiting";
+      draft.queue = step === "queued" ? { status: "queued", position } : null;
+      draft.failed = false;
+      if (draft.activeChat) {
+        draft.chatStatus[draft.activeChat.id] = step === "waiting" ? "waiting" : "working";
+      }
+    });
+    setActivity((current) => (current?.run === run ? current : { run, step: 0, actions: [], files: [], error: null }));
   }
 
   // Moves the followed Run forward: queued, then running, then waiting. An
@@ -182,14 +329,43 @@ export default function App() {
 
   function clearFollowed() {
     followed = null;
-    update({ working: false, waiting: false, queue: null });
+    setActivity(null);
+    update((draft) => {
+      draft.working = false;
+      draft.waiting = false;
+      draft.queue = null;
+      if (draft.activeChat) draft.chatStatus[draft.activeChat.id] = "idle";
+    });
   }
 
   // The record says this Run ended. Only the Run still followed may settle the
   // Chat: a late answer about an earlier Run must not drop a newer one.
-  function finishFollowing(run: string) {
+  function finishFollowing(run: string, outcome: RunOutcome = { failed: false, error: null }) {
     settledRuns.add(run);
-    if (isFollowing(run)) clearFollowed();
+    if (!isFollowing(run)) return;
+    followed = null;
+    update((draft) => {
+      draft.working = false;
+      draft.waiting = false;
+      draft.queue = null;
+      draft.failed = outcome.failed;
+      if (draft.activeChat) {
+        draft.chatStatus[draft.activeChat.id] = outcome.failed ? "failed" : "idle";
+      }
+    });
+    // A failed Run keeps one line in the stream, with its reason behind it; a
+    // Run that answered leaves its reply Message in place.
+    setActivity((current) => {
+      if (!outcome.failed) return null;
+      const mine = current && current.run === run ? current : null;
+      return {
+        run,
+        step: mine?.step ?? 0,
+        actions: mine ? mine.actions.map((action) => ({ ...action })) : [],
+        files: mine ? [...mine.files] : [],
+        error: outcome.error,
+      };
+    });
   }
 
   function isUnfinished(status: RunView["status"]): status is RunStep {
@@ -202,7 +378,7 @@ export default function App() {
     if (view.status === "queued") advanceRun(view.id, "queued", view.position);
     else if (view.status === "running") advanceRun(view.id, "running");
     else if (view.status === "waiting") advanceRun(view.id, "waiting");
-    else finishFollowing(view.id);
+    else finishFollowing(view.id, outcomeOf(view.status, view.error));
   }
 
   onSettled(() => {
@@ -266,33 +442,35 @@ export default function App() {
       void loadWorkspace();
       return;
     }
+    const run = typeof data.run === "string" ? data.run : null;
     if (event.kind === "neha.message.added" && chat) {
       const text = typeof data.text === "string" ? data.text : "";
       const file = typeof data.file === "string";
       setPreview(chat, { text, file });
+      // A Bot reply names its Run, which is how the page learns which Chat a
+      // Run belongs to: the events that end a Run name no Chat.
+      if (run) noteRun(run, chat);
+      if (event.author.kind === "bot" && chat !== state.activeChat?.id) markUnread(chat);
     }
-    const run = typeof data.run === "string" ? data.run : null;
-    if (event.kind === "neha.run.finished") {
-      // RunFinished carries no Chat. Only the followed Run may settle the Chat.
-      if (!run) return;
-      if (isFollowing(run)) {
-        finishFollowing(run);
-        queueRefresh();
-        return;
-      }
-      settledRuns.add(run);
-      // A Run of this Bot ahead of ours may have ended and left a better place.
-      if (followed?.step === "queued") void refreshRunPlace(followed.run);
-      else if (run === newestRequestRun(state.messages)) queueRefresh();
-      return;
+    if (event.kind === "neha.file.added") {
+      // A File the followed Run produced belongs to its activity card.
+      const id = typeof data.file === "string" ? data.file : null;
+      if (chat && id && followed && state.activeChat?.id === chat) noteFile(followed.run, id);
     }
     if (event.kind === "neha.run.queued") {
-      // The command result may hold an older place than the record does.
-      if (run && chat && state.activeChat?.id === chat && isFollowing(run)) void refreshRunPlace(run);
+      if (run && chat) {
+        noteRun(run, chat);
+        setChatStatus(chat, "working");
+        // The command result may hold an older place than the record does.
+        if (state.activeChat?.id === chat && isFollowing(run)) void refreshRunPlace(run);
+      }
       return;
     }
     if (event.kind === "neha.run.started") {
-      if (!run || !chat || state.activeChat?.id !== chat) return;
+      if (!run || !chat) return;
+      noteRun(run, chat);
+      setChatStatus(chat, "working");
+      if (state.activeChat?.id !== chat) return;
       if (isFollowing(run)) {
         advanceRun(run, "running");
       } else if (followed) {
@@ -304,9 +482,43 @@ export default function App() {
       }
       return;
     }
+    if (event.kind === "neha.run.step" && run && isFollowing(run)) {
+      noteStep(run, typeof data.step === "number" ? data.step : 0);
+    }
+    if (event.kind === "neha.action.started" && run && isFollowing(run)) {
+      startAction(run, stepOf(data), actionOf(data), toolOf(data));
+    }
+    if (event.kind === "neha.action.finished" && run && isFollowing(run)) {
+      const error = typeof data.error === "string" ? data.error : null;
+      finishAction(run, stepOf(data), actionOf(data), actionStatusOf(data.status), error);
+    }
+    if (event.kind === "neha.run.finished") {
+      // RunFinished carries no Chat, so the page looks up the Chat it remembered
+      // for the Run. Only the followed Run may settle the Chat on screen.
+      if (!run) return;
+      const outcome = outcomeFrom(data);
+      if (isFollowing(run)) {
+        finishFollowing(run, outcome);
+        queueRefresh();
+        return;
+      }
+      settledRuns.add(run);
+      settleChat(runChats.get(run), run, outcome);
+      // A Run of this Bot ahead of ours may have ended and left a better place.
+      if (followed?.step === "queued") void refreshRunPlace(followed.run);
+      else if (run === newestRequestRun(state.messages)) queueRefresh();
+      return;
+    }
     if (event.kind === "neha.approval.requested") {
       const approval = approvalRequested(event);
-      if (!approval || state.activeChat?.id !== approval.chat) return;
+      if (!approval) return;
+      noteRun(approval.run, approval.chat);
+      setChatStatus(approval.chat, "waiting");
+      if (approval.chat !== state.activeChat?.id) {
+        // Another Chat waits for the User; the attention section names it.
+        rememberAttention(approval.chat, approval);
+        return;
+      }
       showApproval(approval);
       // The Run stops here until the User answers, and no longer holds a place.
       if (isFollowing(approval.run)) advanceRun(approval.run, "waiting");
@@ -316,10 +528,55 @@ export default function App() {
     if (event.kind === "neha.approval.decided") {
       const approval = typeof data.approval === "string" ? data.approval : null;
       if (approval && run) applyDecision(approval, run, data.allow === true);
+      // A granted approval lets its Run work again, wherever it runs.
+      if (data.allow === true && run) {
+        const owner = runChats.get(run);
+        if (owner) setChatStatus(owner, "working");
+      }
+      forgetAttention(approval);
       return;
     }
     if (chat && state.activeChat?.id === chat) {
       queueRefresh();
+    }
+  }
+
+  // A Bot Message that arrived while another Chat was on screen is new activity
+  // for that Chat. Opening it answers the mark.
+  function markUnread(chat: string) {
+    setState((draft) => {
+      draft.unread[chat] = true;
+    });
+  }
+
+  // An approval another Chat waits for, so the attention section can name it.
+  function rememberAttention(chat: string, approval: Approval) {
+    setState((draft) => {
+      draft.attention[chat] = approval;
+    });
+  }
+
+  // An approval that was answered no longer needs attention.
+  function forgetAttention(approval: string | null) {
+    if (!approval) return;
+    setState((draft) => {
+      for (const [chat, waiting] of Object.entries(draft.attention)) {
+        if (waiting.approval === approval) delete draft.attention[chat];
+      }
+    });
+  }
+
+  // A Run the page heard about ended: its Chat leaves the busy or waiting state.
+  function settleChat(chat: string | undefined, run: string, outcome: RunOutcome) {
+    if (!chat) return;
+    setChatStatus(chat, outcome.failed ? "failed" : "idle");
+    const waiting = state.attention[chat];
+    if (waiting && waiting.run === run) forgetAttention(waiting.approval);
+    // A Chat on screen that follows no Run of its own keeps the failure in its
+    // header and one line in its stream.
+    if (outcome.failed && state.activeChat?.id === chat && !followed) {
+      update({ failed: true });
+      setActivity((current) => failActivity(current, run, outcome.error));
     }
   }
 
@@ -437,6 +694,13 @@ export default function App() {
         bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
         chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
       });
+      setState((draft) => {
+        for (const chat of chats) {
+          // The Space projects what each Chat is doing; a live event that has
+          // already answered is the newer word.
+          if (draft.chatStatus[chat.id] === undefined) draft.chatStatus[chat.id] = chat.status ?? "idle";
+        }
+      });
       await loadPreviews(chats);
       const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
       const target = active ?? (!isMobile() ? chats[0] : undefined);
@@ -480,7 +744,12 @@ export default function App() {
   async function selectChat(chat: Chat) {
     const generation = ++runGeneration;
     followed = null;
-    update({ activeChat: chat, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, deciding: null, error: null });
+    setActivity(null);
+    update({ activeChat: chat, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, failed: false, deciding: null, error: null });
+    // Opening a Chat answers its new activity.
+    setState((draft) => {
+      draft.unread[chat.id] = false;
+    });
     try {
       const [messages, files, approvals, bot] = await Promise.all([
         commands.command<Message[]>("chat_read", { chat: chat.id }),
@@ -512,7 +781,7 @@ export default function App() {
         // A waiting Run is unfinished too: show its place and follow it.
         advanceRun(run, view.status, view.position);
       } else {
-        finishFollowing(run);
+        finishFollowing(run, outcomeOf(view.status, view.error));
         await refreshActive(chat, generation);
       }
     } catch {
@@ -597,8 +866,8 @@ export default function App() {
         "message_send",
         uploaded ? { chat: chat.id, text, file: uploaded.id } : { chat: chat.id, text },
       );
-      // The Space accepted the Message into its Bot's queue. The Chat stays
-      // available: the reader may put another request behind this Run.
+      // The Space accepted the Message into its Bot's queue. The Chat now works
+      // on it and takes no second Message until the Run is done.
       if (!isCurrentChat(chat, generation)) return true;
       if (settledRuns.has(result.run)) {
         // The record already reported this Run finished before the answer came.
@@ -701,12 +970,48 @@ export default function App() {
   function backToList() {
     runGeneration += 1;
     followed = null;
-    update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, deciding: null, error: null });
+    setActivity(null);
+    update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, failed: false, deciding: null, error: null });
   }
 
   const errorText = () => (state.error ? messageFor(state.error) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
+
+  // What each Chat is doing, for the list and the attention section.
+  const chatStates = createMemo<Record<string, ChatStatus>>(() => {
+    const states: Record<string, ChatStatus> = {};
+    for (const chat of state.chats) states[chat.id] = statusOf(chat);
+    return states;
+  });
+
+  // The Chats that wait for the User. The Chat on screen answers its own
+  // approvals, so only the others count as needing attention.
+  const attentionEntries = createMemo<AttentionEntry[]>(() =>
+    state.chats
+      .filter((chat) => statusOf(chat) === "waiting" && chat.id !== state.activeChat?.id)
+      .map((chat) => {
+        const waiting = state.attention[chat.id];
+        return {
+          chat,
+          botName: state.bots.find((bot) => bot.id === chat.bot)?.name ?? "Bot",
+          detail: waiting ? `${waiting.tool} · ${waiting.summary}` : null,
+        };
+      }),
+  );
+
+  // What the activity card shows: the followed Run's activity while it works,
+  // and one line with the reason once it failed. A Run waiting in the queue has
+  // done nothing yet, and a Run waiting for an approval shows its card instead.
+  const shownActivity = () => (state.working || state.failed ? activity() : null);
+
+  // The Chat on screen works or waits for an approval, so its composer takes no
+  // second Message until the Run is done.
+  const busyChat = () => {
+    if (state.working || state.waiting || state.queue !== null) return true;
+    const active = state.activeChat;
+    return active ? statusOf(active) === "working" || statusOf(active) === "waiting" : false;
+  };
 
   return (
     <Show when={ready()} fallback={<Boot />}>
@@ -725,6 +1030,9 @@ export default function App() {
               bots={state.bots}
               activeChat={state.activeChat}
               previews={state.previews}
+              statuses={chatStates()}
+              unread={state.unread}
+              attention={attentionEntries()}
               onSelect={(chat) => void selectChat(chat)}
             />
             <main class="main">
@@ -764,6 +1072,9 @@ export default function App() {
                   working={state.working}
                   waiting={state.waiting}
                   queue={state.queue}
+                  busy={busyChat()}
+                  failed={state.failed}
+                  activity={shownActivity()}
                   deciding={state.deciding}
                   error={errorText()}
                   onSend={sendMessage}

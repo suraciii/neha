@@ -151,11 +151,15 @@ describe("App with Files", () => {
 
     submit(view);
     await waitFor(() => expect(view.container.querySelector(".file-card")).toBeTruthy());
-    // The Message is accepted at once: its Run waits, and the composer is free.
+    // The Message is accepted at once: its Run waits, and the composer takes no
+    // second Message until the Run is done.
     await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
-    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(true);
     finishRun("r1");
     await waitFor(() => expect(queueText(view)).toBeUndefined());
+    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
 
     expect(upload).toHaveBeenCalledWith("h1", file, "notes.txt", "text/plain");
     expect(space.sent).toEqual([{ chat: "h1", text: "", file: "f1" }]);
@@ -299,13 +303,18 @@ describe("App with Files", () => {
     space.messages.push({ ...request("m1", "h1", "r1", "please work"), run: null });
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
 
     record("neha.run.finished", { run: "another-run", status: "failed", error: "nope" });
-    expect(element(view, ".msg--working")).toBeTruthy();
+    expect(element(view, ".activity")).toBeTruthy();
 
+    // A failed Run leaves one line behind, with the reason behind the fold, and
+    // the Chat header marks the failure.
     record("neha.run.finished", { run: "r1", status: "failed", error: "nope" });
-    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
+    await waitFor(() => expect(element(view, ".activity").textContent).toContain("Failed"));
+    expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
+    flush(() => fireEvent.click(element(view, ".activity__head")));
+    expect(element(view, ".activity__reason").textContent).toContain("nope");
   });
 
   it("refreshes the Chat from a live record event", async () => {
@@ -360,14 +369,18 @@ describe("App with Files", () => {
     space.runs["r9"] = { status: "queued", position: 3 };
     const view = await openChat();
 
-    // A waiting Run is unfinished: its place shows and the composer stays usable.
+    // A waiting Run is unfinished: its place shows, and the composer takes no
+    // second Message while it waits.
     await waitFor(() => expect(queueText(view)).toBe("Waiting behind 2 requests"));
-    expect(view.container.querySelector(".msg--working")).toBeNull();
-    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
-    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
+    expect(view.container.querySelector(".activity")).toBeNull();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(true);
+    // The queue place says why, so the composer adds nothing else.
+    expect(view.container.querySelector(".composer__closed")).toBeNull();
 
     finishRun("r9");
     await waitFor(() => expect(queueText(view)).toBeUndefined());
+    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
     expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
   });
 
@@ -388,16 +401,20 @@ describe("App with Files", () => {
     type(view, "hello");
     submit(view);
     await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
-    expect(view.container.querySelector(".msg--working")).toBeNull();
+    // A Run waiting in the queue has done nothing yet, so no activity shows.
+    expect(view.container.querySelector(".activity")).toBeNull();
 
     startRun("r1");
-    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
+    await waitFor(() => expect(element(view, ".activity").textContent).toContain("Working"));
     expect(queueText(view)).toBeUndefined();
-    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    // The Chat works, so the composer takes no second Message.
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
 
     finishRun("r1", reply("m2", "h1", "r1", "Here is the answer."));
-    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
+    await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
     await waitFor(() => expect(view.container.textContent).toContain("Here is the answer."));
+    // The Run answered, so the composer opens again.
+    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
   });
 
   it("keeps the new Chat's place while an old Message is still being accepted", async () => {
@@ -430,74 +447,79 @@ describe("App with Files", () => {
     expect(alertText(view)).toBeUndefined();
   });
 
-  it("keeps following the latest Run when an earlier Run's reply lands", async () => {
+  it("keeps following its own Run when another Run works in the same Chat", async () => {
     const view = await openChat();
     type(view, "first");
     submit(view);
     await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
     startRun("r1");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
 
-    // A second request waits behind the first, and becomes the followed Run.
-    type(view, "second");
-    submit(view);
-    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    // Another client put a Run behind ours in this Chat. The page keeps
+    // following its own, and the composer stays closed either way.
+    space.runs["r9"] = { status: "queued", position: 1 };
+    record("neha.run.queued", { chat: "h1", run: "r9", bot: "b1", command: "c9", message: "m9" });
+    await drain();
+    expect(element(view, ".activity")).toBeTruthy();
 
-    // The first Run ends; its reply is a Message that names the first Run.
+    // Our Run ends; its reply names it, and the page reads the record about the
+    // Run it followed.
     const showsBefore = space.runShows.length;
     space.runs["r1"] = { status: "succeeded" };
     const firstReply = reply("m3", "h1", "r1", "first done");
     space.messages.push(firstReply);
     record("neha.message.added", { chat: "h1", message: firstReply.id, text: firstReply.text, file: null, run: "r1" });
     await waitFor(() => expect(view.container.textContent).toContain("first done"));
-    // The reply's read asks the record about the followed Run, not the reply's.
-    await waitFor(() => expect(space.runShows.length).toBeGreaterThan(showsBefore));
-    await drain();
-    expect(space.runShows.slice(showsBefore)).not.toContain("r1");
-    expect(queueText(view)).toBe("Waiting behind 1 request");
+    // The reply's read asks the record about the Run the page follows.
+    await waitFor(() => expect(space.runShows.slice(showsBefore)).toContain("r1"));
 
-    // The first Run's finish moves the second Run's place, not its tracking.
-    space.runs["r2"] = { status: "queued", position: 1 };
-    record("neha.run.finished", { run: "r1", status: "succeeded", reply: "m3", usage: null, error: null });
-    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
-    expect(view.container.querySelector(".msg--working")).toBeNull();
-
-    startRun("r2");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
-    finishRun("r2", reply("m4", "h1", "r2", "second done"));
-    await waitFor(() => expect(queueText(view)).toBeUndefined());
-    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
-    await waitFor(() => expect(view.container.textContent).toContain("second done"));
+    // The other Run ends too, and the page follows neither of them.
+    record("neha.run.finished", { run: "r9", status: "succeeded", reply: null, usage: null, error: null });
+    await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
+    expect(queueText(view)).toBeUndefined();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
   });
 
-  it("accepts a later request while a Run is still unfinished", async () => {
+  it("takes no second Message while a Run is unfinished", async () => {
     const view = await openChat();
     type(view, "first");
     submit(view);
     await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
     startRun("r1");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
 
-    // The composer stays open: the reader puts a second request in the queue.
-    type(view, "second");
-    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
-    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
+    // The Chat works, so the composer takes no second Message.
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(true);
     submit(view);
-    await waitFor(() => expect(space.asked.filter((name) => name === "message_send")).toHaveLength(2));
-    expect(space.sent).toHaveLength(2);
-    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    await drain();
+    expect(space.asked.filter((name) => name === "message_send")).toHaveLength(1);
+    expect(space.sent).toHaveLength(1);
 
-    // The first Run's end moves the second Run's place; the second is still followed.
-    space.runs["r1"] = { status: "succeeded" };
-    space.runs["r2"] = { status: "queued", position: 1 };
-    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
-    await waitFor(() => expect(queueText(view)).toBe("Waiting in the queue"));
+    finishRun("r1", reply("m2", "h1", "r1", "the answer"));
+    await waitFor(() => expect(view.container.textContent).toContain("the answer"));
+    // The Run answered, so the composer opens again.
+    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
+  });
 
-    startRun("r2");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
-    finishRun("r2");
-    await waitFor(() => expect(queueText(view)).toBeUndefined());
-    await waitFor(() => expect(view.container.querySelector(".msg--working")).toBeNull());
+  it("keeps what the reader wrote while the composer is closed", async () => {
+    // The Chat holds a Message, so its Run's activity shows beside it.
+    space.messages.push({ ...request("m1", "h1", "r7", "please work"), run: null });
+    const view = await openChat();
+    type(view, "a draft");
+
+    // Another client's Run works in this Chat, so the composer closes.
+    record("neha.run.started", { chat: "h1", run: "r7", bot: "b1", command: "c7", message: "m7" });
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+    expect(element<HTMLTextAreaElement>(view, "textarea").value).toBe("a draft");
+
+    record("neha.run.finished", { run: "r7", status: "succeeded", reply: null, usage: null, error: null });
+    await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    // The draft waited in the composer.
+    expect(element<HTMLTextAreaElement>(view, "textarea").value).toBe("a draft");
   });
 
   it("does not move back to queued when the Run started before the answer", async () => {
@@ -509,12 +531,12 @@ describe("App with Files", () => {
 
     // The record starts the Run before the command's answer reaches the page.
     startRun("r1");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
 
     space.releaseSends();
     await waitFor(() => expect(space.sendsDone).toBe(1));
     await drain();
-    expect(element(view, ".msg--working")).toBeTruthy();
+    expect(element(view, ".activity")).toBeTruthy();
     expect(queueText(view)).toBeUndefined();
   });
 
@@ -533,32 +555,30 @@ describe("App with Files", () => {
     await drain();
 
     expect(queueText(view)).toBeUndefined();
-    expect(view.container.querySelector(".msg--working")).toBeNull();
+    expect(view.container.querySelector(".activity")).toBeNull();
     await waitFor(() => expect(view.container.textContent).toContain("done already"));
   });
 
-  it("keeps following a newer Run when an earlier Run's answer lands late", async () => {
+  it("does not revive a Run that finished while its answer was in flight", async () => {
     const view = await openChat();
     space.holdRunShow("r1");
-    type(view, "first");
+    type(view, "hello");
     submit(view);
     await waitFor(() => expect(space.runShows).toContain("r1"));
     startRun("r1");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
+    await waitFor(() => expect(element(view, ".activity")).toBeTruthy());
 
-    // The second request becomes the followed Run while r1's answer is in flight.
-    type(view, "second");
-    submit(view);
-    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
-    startRun("r2");
-    await waitFor(() => expect(element(view, ".msg--working")).toBeTruthy());
-
-    // r1's delayed answer says it ended; r2 is still the Run the page follows.
+    // The Run ends while the record's answer about it is still in flight.
     space.runs["r1"] = { status: "succeeded" };
+    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
+
     space.runHolds["r1"]?.release();
     await drain();
-    expect(element(view, ".msg--working")).toBeTruthy();
+    // The late answer names a Run that already ended, so it revives nothing.
+    expect(view.container.querySelector(".activity")).toBeNull();
     expect(queueText(view)).toBeUndefined();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
   });
 
   it("does not let an old Chat's lost run_show answer clear the new Chat", async () => {

@@ -24,7 +24,7 @@ A Bot's progress never starts a Notification.
 
 ## Needs attention
 
-A User sees a Needs attention view: the Questions and Approvals waiting on them, the runs that failed, the Group Messages that mention them, and the work an offline Computer blocks.
+A User sees a Needs attention view: the Questions and Approvals waiting on them. A failed run and an offline Computer wait for no answer, so the view holds neither.
 
 The view lists only what the User can read.
 

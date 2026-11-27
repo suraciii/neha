@@ -241,5 +241,5 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
 - One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
-- The browser client covers joining, first-run setup, and one-to-one Chat. It does not show Groups, Tasks, search, or notifications.
-- The browser client does not stream a reply. It shows a working state until the Run finishes.
+- The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait. It does not show Groups, Tasks, search, or notifications.
+- The browser client does not stream a reply. It shows a working state while the Run works, and each action the Bot takes appears when it completes.

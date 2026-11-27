@@ -29,7 +29,7 @@ pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage
 pub use secrets::{Secrets, SecretsError};
 pub use server::{Running, ServerError, SpaceServer, start, start_with_ui};
 pub use state::{
-    BotView, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView, RunStatus,
-    RunView, State, UserView,
+    BotView, ChatStatus, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView,
+    RunStatus, RunView, State, UserView,
 };
 pub use store::{AppendRequest, AppendResult, EventPage, Projection, Store, StoreError};

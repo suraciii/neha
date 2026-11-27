@@ -140,6 +140,24 @@ pub struct ComputerView {
     pub workspace: String,
 }
 
+/// The live state of a Chat, projected from its runs.
+///
+/// The state is not recorded. A replay of the same events projects the same
+/// state again, so a snapshot and a client that followed the events agree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatStatus {
+    /// The Chat has no run to follow.
+    #[default]
+    Idle,
+    /// A run is queued or running.
+    Working,
+    /// A run waits for its acting User to allow or deny an action.
+    Waiting,
+    /// The Chat's latest run failed.
+    Failed,
+}
+
 /// A Chat.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ChatView {
@@ -149,6 +167,18 @@ pub struct ChatView {
     pub owner: Id,
     /// The Bot the Chat is with.
     pub bot: Id,
+    /// The Chat's live state, projected from its runs.
+    ///
+    /// A record written before the state existed reads as [`ChatStatus::Idle`]
+    /// until a run event projects it.
+    #[serde(default)]
+    pub status: ChatStatus,
+    /// The run the state follows: the oldest waiting run while the Chat waits,
+    /// or the oldest queued or running run while it works.
+    ///
+    /// An idle or failed Chat follows no run.
+    #[serde(default)]
+    pub active_run: Option<Id>,
 }
 
 /// A Message.
@@ -643,6 +673,44 @@ impl State {
         runs
     }
 
+    /// Projects a Chat's live state from its runs.
+    ///
+    /// The record's order decides: the oldest run waiting for an approval wins,
+    /// then the oldest run queued or working, then its latest run's failure.
+    /// Every other Chat is idle.
+    fn project_chat_status(&mut self, chat: Id) {
+        let mut waiting: Option<&RunView> = None;
+        let mut working: Option<&RunView> = None;
+        let mut latest: Option<&RunView> = None;
+        for run in self.runs.values().filter(|run| run.chat == chat) {
+            if run.status == RunStatus::Waiting && waiting.is_none_or(|older| run.seq < older.seq) {
+                waiting = Some(run);
+            }
+            if matches!(run.status, RunStatus::Queued | RunStatus::Running)
+                && working.is_none_or(|older| run.seq < older.seq)
+            {
+                working = Some(run);
+            }
+            if latest.is_none_or(|older| older.seq < run.seq) {
+                latest = Some(run);
+            }
+        }
+        let (status, active_run) = if let Some(run) = waiting {
+            (ChatStatus::Waiting, Some(run.id))
+        } else if let Some(run) = working {
+            (ChatStatus::Working, Some(run.id))
+        } else if latest.is_some_and(|run| run.status == RunStatus::Failed) {
+            (ChatStatus::Failed, None)
+        } else {
+            (ChatStatus::Idle, None)
+        };
+        let Some(view) = self.chats.get_mut(&chat) else {
+            return;
+        };
+        view.status = status;
+        view.active_run = active_run;
+    }
+
     /// Builds the Model history for a Chat up to a cursor.
     ///
     /// A resumed run rebuilds the history it saw when it started, not the
@@ -867,6 +935,8 @@ impl Projection for State {
                         id: data.chat,
                         owner: data.owner,
                         bot: data.bot,
+                        status: ChatStatus::Idle,
+                        active_run: None,
                     },
                 );
             }
@@ -939,6 +1009,7 @@ impl Projection for State {
                         actions: Vec::new(),
                     },
                 );
+                self.project_chat_status(data.chat);
             }
             EventData::RunStarted(data) => {
                 let acting = event.acting.ok_or("a run names the User it acts for")?;
@@ -976,6 +1047,7 @@ impl Projection for State {
                         });
                     }
                 }
+                self.project_chat_status(data.chat);
             }
             EventData::RunContext(data) => {
                 let run = self
@@ -1010,15 +1082,19 @@ impl Projection for State {
                 self.final_recovered_runs.remove(&data.run);
                 // A token lives only while its run does.
                 self.bot_tokens.retain(|_, token| token.run != data.run);
-                let run = self
-                    .runs
-                    .get_mut(&data.run)
-                    .ok_or("a finished run must have started")?;
-                run.status = data.status;
-                run.reply = data.reply;
-                run.usage = data.usage;
-                run.error = data.error;
-                run.approval = None;
+                let chat = {
+                    let run = self
+                        .runs
+                        .get_mut(&data.run)
+                        .ok_or("a finished run must have started")?;
+                    run.status = data.status;
+                    run.reply = data.reply;
+                    run.usage = data.usage;
+                    run.error = data.error;
+                    run.approval = None;
+                    run.chat
+                };
+                self.project_chat_status(chat);
             }
             EventData::RunStep(data) => {
                 let run = self
@@ -1133,6 +1209,7 @@ impl Projection for State {
                     decided: None,
                     seq: event.seq,
                 });
+                self.project_chat_status(data.chat);
             }
             EventData::ApprovalDecided(data) => {
                 let position = self
@@ -1165,30 +1242,34 @@ impl Projection for State {
                         approval.grant_folder.clone(),
                     )
                 };
-                let run = self
-                    .runs
-                    .get_mut(&data.run)
-                    .ok_or("a decided approval must belong to a started run")?;
-                if run.approval == Some(data.approval) {
-                    run.approval = None;
-                }
-                if allow {
-                    run.status = RunStatus::Running;
-                    if reason == ApprovalReason::FirstUseLocal {
-                        self.first_use_allowed.insert((bot, acting, computer));
+                let chat = {
+                    let run = self
+                        .runs
+                        .get_mut(&data.run)
+                        .ok_or("a decided approval must belong to a started run")?;
+                    if run.approval == Some(data.approval) {
+                        run.approval = None;
                     }
-                    if reason == ApprovalReason::Grant {
-                        // The owner answered a grant card, which names the
-                        // Bot, the folder, and the machine: that also answers
-                        // the first use of this machine.
-                        self.first_use_allowed.insert((bot, acting, computer));
-                        // The folder is allowed for the action this answer
-                        // resumed, whether or not the answer also lasts for
-                        // later runs. A lasting answer updates the Bot, which
-                        // the run's pinned access deliberately ignores.
-                        run.once_grant = scope;
+                    if allow {
+                        run.status = RunStatus::Running;
+                        if reason == ApprovalReason::FirstUseLocal {
+                            self.first_use_allowed.insert((bot, acting, computer));
+                        }
+                        if reason == ApprovalReason::Grant {
+                            // The owner answered a grant card, which names the
+                            // Bot, the folder, and the machine: that also answers
+                            // the first use of this machine.
+                            self.first_use_allowed.insert((bot, acting, computer));
+                            // The folder is allowed for the action this answer
+                            // resumed, whether or not the answer also lasts for
+                            // later runs. A lasting answer updates the Bot, which
+                            // the run's pinned access deliberately ignores.
+                            run.once_grant = scope;
+                        }
                     }
-                }
+                    run.chat
+                };
+                self.project_chat_status(chat);
             }
             EventData::RuleAdded(data) => {
                 if !self.bots.contains_key(&data.bot) {
@@ -1244,7 +1325,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::{AccessView, FULL_ACCESS_CONSENT_VERSION, RunStatus, State};
+    use super::{AccessView, ChatStatus, ChatView, FULL_ACCESS_CONSENT_VERSION, RunStatus, State};
     use crate::store::Projection as _;
 
     fn event(kind: EventKind, author: Author, data: serde_json::Value, seq: i64) -> Event {
@@ -1944,6 +2025,97 @@ mod tests {
             .unwrap();
     }
 
+    /// The live state the projection shows for one Chat.
+    fn chat_projection(state: &State, chat: Id) -> (ChatStatus, Option<Id>) {
+        let view = state.chats.get(&chat).expect("a known Chat");
+
+        (view.status, view.active_run)
+    }
+
+    /// Applies a run event one Bot records.
+    fn apply_run(
+        state: &mut State,
+        kind: EventKind,
+        bot: Id,
+        acting: Id,
+        data: serde_json::Value,
+        seq: i64,
+    ) {
+        state
+            .apply(&acted_event(kind, Author::Bot(bot), acting, data, seq))
+            .unwrap();
+    }
+
+    /// Applies the answer its acting User gives an approval.
+    fn apply_decision(state: &mut State, owner: Id, data: serde_json::Value, seq: i64) {
+        state
+            .apply(&acted_event(
+                EventKind::ApprovalDecided,
+                Author::User(owner),
+                owner,
+                data,
+                seq,
+            ))
+            .unwrap();
+    }
+
+    /// The data a run names itself with when it is queued or started.
+    fn run_data(chat: Id, bot: Id, run: Id) -> serde_json::Value {
+        serde_json::json!({
+            "run": run,
+            "chat": chat,
+            "bot": bot,
+            "command": Id::new(),
+            "message": Id::new(),
+        })
+    }
+
+    /// The data of an approval one run asks for.
+    fn approval_requested(
+        chat: Id,
+        bot: Id,
+        computer: Id,
+        acting: Id,
+        run: Id,
+        approval: Id,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "approval": approval,
+            "run": run,
+            "bot": bot,
+            "computer": computer,
+            "chat": chat,
+            "acting": acting,
+            "action": Id::new(),
+            "index": 0,
+            "step": 1,
+            "call": "call-1",
+            "tool": "shell",
+            "arguments": {"command": "true"},
+            "summary": "shell: true",
+            "reason": "rule",
+            "rule": null,
+            "lasting_scope": null,
+            "undoable": "no",
+        })
+    }
+
+    /// The data of an answer to an approval.
+    fn approval_decided(run: Id, approval: Id, allow: bool, user: Id) -> serde_json::Value {
+        serde_json::json!({
+            "approval": approval,
+            "run": run,
+            "allow": allow,
+            "lasting": false,
+            "user": user,
+        })
+    }
+
+    /// The data of a run's end.
+    fn run_finished(run: Id, status: &str) -> serde_json::Value {
+        serde_json::json!({"run": run, "status": status})
+    }
+
     #[test]
     fn a_queued_run_waits_its_turn() {
         let owner = Id::new();
@@ -2056,6 +2228,367 @@ mod tests {
         assert_eq!(view.status, RunStatus::Running);
         assert_eq!(view.seq, Seq::from_i64(5).unwrap());
         assert_eq!(state.active_runs(bot_id), vec![view]);
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(run)),
+            "an old record's started run makes its Chat work"
+        );
+
+        state
+            .apply(&event(
+                EventKind::RunFinished,
+                Author::Bot(bot_id),
+                serde_json::json!({"run": run, "status": "failed"}),
+                6,
+            ))
+            .unwrap();
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Failed, None),
+            "an old record's failed run leaves its Chat failed"
+        );
+    }
+
+    #[test]
+    fn a_chat_projects_the_state_of_its_runs() {
+        let owner = Id::new();
+        let bot_id = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let (first, second, third) = (Id::new(), Id::new(), Id::new());
+        let first_ask = Id::new();
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Idle, None),
+            "a new Chat follows no run"
+        );
+
+        // Queueing makes the Chat work, and the oldest queued run is the one
+        // it follows.
+        apply_run(
+            &mut state,
+            EventKind::RunQueued,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, first),
+            4,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(first))
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunQueued,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, second),
+            5,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(first)),
+            "a second queued run waits behind the first"
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunStarted,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, first),
+            6,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(first))
+        );
+
+        // An approval makes the Chat wait; allowing it resumes the work.
+        apply_run(
+            &mut state,
+            EventKind::ApprovalRequested,
+            bot_id,
+            owner,
+            approval_requested(chat, bot_id, computer, owner, first, first_ask),
+            7,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Waiting, Some(first))
+        );
+        apply_decision(
+            &mut state,
+            owner,
+            approval_decided(first, first_ask, true, owner),
+            8,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(first))
+        );
+
+        // The next queued run is followed once the first ends.
+        apply_run(
+            &mut state,
+            EventKind::RunFinished,
+            bot_id,
+            owner,
+            run_finished(first, "succeeded"),
+            9,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(second))
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunStarted,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, second),
+            10,
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunFinished,
+            bot_id,
+            owner,
+            run_finished(second, "failed"),
+            11,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Failed, None),
+            "a failed latest run leaves the Chat failed"
+        );
+
+        // A new run clears the failure as soon as it queues.
+        apply_run(
+            &mut state,
+            EventKind::RunQueued,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, third),
+            12,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(third))
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunStarted,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, third),
+            13,
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunFinished,
+            bot_id,
+            owner,
+            run_finished(third, "succeeded"),
+            14,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Idle, None),
+            "a succeeded latest run leaves the Chat idle"
+        );
+    }
+
+    #[test]
+    fn a_waiting_chat_follows_its_oldest_approval() {
+        let owner = Id::new();
+        let bot_id = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let (first, second) = (Id::new(), Id::new());
+        let (first_ask, second_ask) = (Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        for (seq, run) in [(4, first), (5, second)] {
+            apply_run(
+                &mut state,
+                EventKind::RunQueued,
+                bot_id,
+                owner,
+                run_data(chat, bot_id, run),
+                seq,
+            );
+        }
+
+        // A waiting run does not hold the Bot's queue, so a later run starts
+        // and asks for its own approval too.
+        apply_run(
+            &mut state,
+            EventKind::RunStarted,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, first),
+            6,
+        );
+        apply_run(
+            &mut state,
+            EventKind::ApprovalRequested,
+            bot_id,
+            owner,
+            approval_requested(chat, bot_id, computer, owner, first, first_ask),
+            7,
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunStarted,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, second),
+            8,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Waiting, Some(first)),
+            "a waiting run wins over a working one"
+        );
+        apply_run(
+            &mut state,
+            EventKind::ApprovalRequested,
+            bot_id,
+            owner,
+            approval_requested(chat, bot_id, computer, owner, second, second_ask),
+            9,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Waiting, Some(first)),
+            "the oldest approval is the one the Chat waits on"
+        );
+
+        // Answering the first leaves the Chat waiting on the second.
+        apply_decision(
+            &mut state,
+            owner,
+            approval_decided(first, first_ask, true, owner),
+            10,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Waiting, Some(second))
+        );
+
+        // Denying the second ends it, and the allowed first run works on.
+        apply_decision(
+            &mut state,
+            owner,
+            approval_decided(second, second_ask, false, owner),
+            11,
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunFinished,
+            bot_id,
+            owner,
+            run_finished(second, "failed"),
+            12,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Working, Some(first))
+        );
+    }
+
+    #[test]
+    fn a_denied_run_leaves_a_failed_chat() {
+        let owner = Id::new();
+        let bot_id = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let (run, approval) = (Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        apply_run(
+            &mut state,
+            EventKind::RunQueued,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, run),
+            4,
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunStarted,
+            bot_id,
+            owner,
+            run_data(chat, bot_id, run),
+            5,
+        );
+        apply_run(
+            &mut state,
+            EventKind::ApprovalRequested,
+            bot_id,
+            owner,
+            approval_requested(chat, bot_id, computer, owner, run, approval),
+            6,
+        );
+        assert_eq!(
+            chat_projection(&state, chat),
+            (ChatStatus::Waiting, Some(run))
+        );
+
+        // The answer and the run's failure are recorded together, so a reader
+        // never sees a wait the User already answered.
+        apply_decision(
+            &mut state,
+            owner,
+            approval_decided(run, approval, false, owner),
+            7,
+        );
+        apply_run(
+            &mut state,
+            EventKind::RunFinished,
+            bot_id,
+            owner,
+            run_finished(run, "failed"),
+            8,
+        );
+        assert_eq!(chat_projection(&state, chat), (ChatStatus::Failed, None));
+    }
+
+    #[test]
+    fn a_chat_view_crosses_the_wire_with_its_state() {
+        for (status, slug) in [
+            (ChatStatus::Idle, "idle"),
+            (ChatStatus::Working, "working"),
+            (ChatStatus::Waiting, "waiting"),
+            (ChatStatus::Failed, "failed"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                serde_json::json!(slug)
+            );
+        }
+
+        // A client written before the state existed reads a Chat as idle, and
+        // an unknown state is an error rather than an idle Chat.
+        let id = Id::new();
+        let old = serde_json::json!({"id": id, "owner": Id::new(), "bot": Id::new()});
+        let view: ChatView = serde_json::from_value(old).unwrap();
+        assert_eq!(view.status, ChatStatus::Idle);
+        assert_eq!(view.active_run, None);
+        assert!(serde_json::from_str::<ChatStatus>("\"done\"").is_err());
+
+        // The state a client receives is explicit, next to the old fields.
+        let run = Id::new();
+        let view = ChatView {
+            id,
+            owner: Id::new(),
+            bot: Id::new(),
+            status: ChatStatus::Working,
+            active_run: Some(run),
+        };
+        let value = serde_json::to_value(&view).unwrap();
+        assert_eq!(value["id"], serde_json::json!(id));
+        assert_eq!(value["status"], "working");
+        assert_eq!(value["active_run"], serde_json::json!(run));
     }
 
     #[test]

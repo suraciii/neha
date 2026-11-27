@@ -370,7 +370,7 @@ describe("App with approvals", () => {
 
     // A granted approval lets the Run work again, and the header says so.
     press(view, "允许一次");
-    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("正在处理"));
+    await waitFor(() => expect(element(view, ".activity").textContent).toContain("正在处理"));
     expect(header(view)).not.toContain("等待你的审批");
     expect(card(view)).toContain("已允许");
   });
@@ -402,11 +402,11 @@ describe("App with approvals", () => {
     await waitFor(() => expect(space.runShows.length).toBeGreaterThan(shows));
     await flush();
     expect(header(view)).toContain("Waiting for your approval");
-    expect(view.container.querySelector(".msg--working")).toBeNull();
+    expect(view.container.querySelector(".activity")).toBeNull();
 
     // Only the decision lets the Run work again.
     press(view, "Allow once");
-    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
+    await waitFor(() => expect(element(view, ".activity").textContent).toContain("Working"));
     expect(header(view)).not.toContain("Waiting for your approval");
   });
 

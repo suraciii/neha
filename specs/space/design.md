@@ -63,6 +63,14 @@ Realtime events and snapshots go only to the User whose account is the event's a
 
 A projection is built from the record and can be built again from it. Building a projection runs no tool and sends no message.
 
+## Chat state
+
+The Space projects one state for each Chat: working, waiting, failed, or idle. The projection reads the Chat's run and approval events and nothing else, and a restart replays it to the same state.
+
+A queued, running, or resumed run projects working, and a run that waits for an Approval or an answer projects waiting. A run that ended in failure projects failed, and that state stays until the next run for the Chat starts. A Chat whose record holds no such run projects idle, including a record written before the projection existed.
+
+Snapshots and realtime events carry the same projected state.
+
 ## Secrets
 
 The Vault and the keys of Providers are encrypted on disk. The key that decrypts them lives in the operating system's key store, or in a file that only the Space's account can read where no key store exists.

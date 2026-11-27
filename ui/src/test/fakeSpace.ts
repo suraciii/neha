@@ -2,13 +2,23 @@
 // Tests import `space` to set up and read what happened, and hand
 // `FakeCommands` to the client in place of its WebSocket.
 import type { SubscriptionHandlers } from "../lib/ws";
-import type { Approval, Chat, FileSummary, Message, RunView } from "../types";
+import type { Approval, Chat, ChatStatus, FileSummary, Message, RunView } from "../types";
 
 const account = { id: "u1", display_name: "Ada", is_admin: true };
 const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
+const otherBot = { id: "b2", owner: "u1", name: "Quill", computer: "p1", chat: "h2" };
+const thirdBot = { id: "b3", owner: "u1", name: "Sage", computer: "p1", chat: "h3" };
 const computer = { id: "p1", owner: "u1", kind: "local", online: true, workspace: "/w" };
 const chat = { id: "h1", owner: "u1", bot: "b1" };
-const otherChat = { id: "h2", owner: "u1", bot: "b1" };
+const otherChat = { id: "h2", owner: "u1", bot: "b2" };
+const thirdChat = { id: "h3", owner: "u1", bot: "b3" };
+
+// The Bot that owns a Chat, like the Space answers bot_show.
+function botFor(id: string) {
+  if (id === otherBot.id) return otherBot;
+  if (id === thirdBot.id) return thirdBot;
+  return bot;
+}
 // A send or a decision can be held open, so a test can act while the Space
 // has not answered yet.
 let sendGate: Promise<void> | null = null;
@@ -19,15 +29,20 @@ let openDecide: (() => void) | null = null;
 export const space = {
   account,
   bot,
+  otherBot,
+  thirdBot,
   computer,
   chat,
   otherChat,
+  thirdChat,
   asked: [] as string[],
   sent: [] as unknown[],
   files: [] as FileSummary[],
   messages: [] as Message[],
   otherMessages: [] as Message[],
   chats: [chat] as Chat[],
+  // What the Space projects each Chat to be doing. A Chat it omits is idle.
+  statuses: {} as Record<string, ChatStatus>,
   chatDelay: null as null | ((chatId: string) => Promise<void>),
   handlers: null as SubscriptionHandlers | null,
   // What the record says about each Run. A Run this map omits has succeeded.
@@ -58,6 +73,7 @@ export const space = {
     space.messages = [];
     space.otherMessages = [];
     space.chats = [chat];
+    space.statuses = {};
     space.chatDelay = null;
     space.handlers = null;
     space.runs = {};
@@ -118,9 +134,14 @@ export class FakeCommands {
       case "model_list":
         return [] as T;
       case "bot_list":
-        return [space.bot] as T;
+        // Each Chat's Bot answers, like the Space lists them.
+        return space.chats.map((known) => botFor(known.bot)) as T;
       case "chat_list":
-        return [...space.chats] as T;
+        // Like the Space's JSON, each answer carries its own copies, with what
+        // the Space projects the Chat to be doing.
+        return space.chats.map((known) =>
+          space.statuses[known.id] ? { ...known, status: space.statuses[known.id] } : { ...known },
+        ) as T;
       case "chat_read": {
         const asked = args as { chat: string };
         await space.chatDelay?.(asked.chat);
@@ -128,11 +149,20 @@ export class FakeCommands {
       }
       case "file_list":
         return [...space.files] as T;
-      case "approval_list":
-        // Like the Space's JSON, each answer carries its own copies.
-        return space.approvals.map((approval) => ({ ...approval })) as T;
-      case "bot_show":
-        return { bot: space.bot, computer: space.computer, chat: space.chat } as T;
+      case "approval_list": {
+        // Like the Space's JSON, each answer carries its own copies, and names
+        // only the approvals the asked Chat waits for.
+        const asked = args as { chat: string };
+        return space.approvals
+          .filter((approval) => approval.chat === asked.chat)
+          .map((approval) => ({ ...approval })) as T;
+      }
+      case "bot_show": {
+        const asked = args as { bot: string };
+        const known = botFor(asked.bot);
+        const own = space.chats.find((entry) => entry.bot === known.id) ?? space.chat;
+        return { bot: known, computer: space.computer, chat: own } as T;
+      }
       case "message_send": {
         if (sendGate) await sendGate;
         try {

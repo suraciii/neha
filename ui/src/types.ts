@@ -36,10 +36,26 @@ export interface Computer {
   workspace: string;
 }
 
+// What a Chat's active Run is doing, as the Space projects it.
+export type ChatStatus = "idle" | "working" | "waiting" | "failed";
+
 export interface Chat {
   id: string;
   owner: string;
   bot: string;
+  // The Space projects the Chat's state. A Space that says nothing leaves the
+  // Chat idle.
+  status?: ChatStatus;
+  // The Run the Chat works on, when it has one.
+  active_run?: string | null;
+}
+
+// One Chat that waits for the User, as the attention section names it.
+export interface AttentionEntry {
+  chat: Chat;
+  botName: string;
+  // What the Chat waits for, when the record named it.
+  detail: string | null;
 }
 
 export interface Author {
@@ -169,6 +185,38 @@ export interface Decision {
 export interface RunProgress {
   status: "queued" | "running";
   position?: number;
+}
+
+// How one tool action of a Run is doing.
+export type ToolStatus = "running" | "succeeded" | "failed" | "unknown";
+
+// One tool action the record reported for the Run the page follows.
+export interface ToolAction {
+  // The action's identifier.
+  action: string;
+  // The step that asked for it.
+  step: number;
+  // The tool's name.
+  tool: string;
+  // How it ended so far.
+  status: ToolStatus;
+  // Why it failed, when it did.
+  error: string | null;
+}
+
+// The Run the page follows: its steps, its tool actions, and the Files it
+// produced, while it has any.
+export interface RunActivity {
+  // The Run this belongs to.
+  run: string;
+  // The newest step the record reported.
+  step: number;
+  // The actions the Run took, oldest first.
+  actions: ToolAction[];
+  // The Files the Run produced, oldest first.
+  files: string[];
+  // Why the Run failed, when it did.
+  error: string | null;
 }
 
 export type Preview = { text: string; file: boolean } | { error: true } | null;

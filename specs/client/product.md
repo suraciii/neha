@@ -28,9 +28,16 @@ A client without a valid session shows the sign-in page. A client with a valid s
 
 The client has one primary navigation rail, one sidebar, and one main area.
 
-The rail selects what the sidebar contains. It has Chats, and the sidebar lists the User's Chats in record order.
+The rail selects what the client shows.
 
-The main area shows the selected Chat. On a viewport 900 CSS pixels or narrower, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
+| Entry | What it opens |
+| --- | --- |
+| Chats | The sidebar lists the User's Chats in record order |
+| Needs attention | The sidebar lists the items that wait for the User's answer |
+| Bots | The Bot pages |
+| Settings | The Space's Providers, Models, and catalog |
+
+With Chats selected, the main area shows the selected Chat. On a viewport 900 CSS pixels or narrower, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
 
 When the User has no Chats, the sidebar shows the Chat-list empty state. When the User has Chats and none is selected, the main area asks the User to select one.
 
@@ -47,17 +54,35 @@ A User who is not the Admin sees that an Admin MUST connect the Provider. The cl
 
 After the Bot is created, the client opens its Chat.
 
+## The Chat list
+
+Each row in the Chat list shows the Chat's state: Working, Waiting, or Unread. [Chat](../messaging/chat/product.md#state) defines the states and their precedence.
+
+Unread is the client's own memory of a Message that landed while the User was not looking at the Chat. The record holds no such state, and the badge clears when the User opens the Chat.
+
 ## A Chat
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
 
-The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online. While the Run the client follows waits for an Approval, the header marks the wait; the Approval Card remains in the stream. A Chat with no Messages shows the Bot's name and starting prompts.
+The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online.
+
+The header shows the Chat's [state](../space/design.md#chat-state): working, waiting for an Approval, or failed. The Approval Card remains in the stream while the Run waits.
+
+A Chat with no Messages shows the Bot's name and starting prompts.
 
 The composer sends one Message. Enter sends; Shift and Enter insert a new line. The composer does not accept an empty Message.
 
 While a Run is active, the Chat shows that the Bot is working and does not accept another Message from the same User.
 
 A failed Run leaves a Bot Message that states the failure. The Chat keeps the Message in its place.
+
+## Tool activity
+
+While a Run works, each action the Bot takes appears in the Chat as a card when the action completes. A collapsed card names the tool and says what it did, and it never shows the action's raw arguments.
+
+## Needs attention
+
+The Needs attention entry opens the [Needs attention view](../messaging/notification/product.md#needs-attention). Each item names its Bot, and selecting one opens the Chat where the item waits.
 
 ## Language
 

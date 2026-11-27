@@ -30,6 +30,36 @@ describe("i18n", () => {
     expect(t("chat.aria", { name: "Nova" })).toBe("与 Nova 的 Chat");
   });
 
+  it("names what a Chat waits for, in the reader's language", () => {
+    expect(t("attention.title")).toBe("Needs attention");
+    expect(t("attention.count.one")).toBe("1 Chat waiting");
+    expect(t("attention.count.many", { count: 2 })).toBe("2 Chats waiting");
+    expect(t("chat.newActivity")).toBe("New activity");
+    expect(t("chat.failed")).toBe("Failed");
+    expect(t("chat.activity.step", { count: 2 })).toBe("Step 2");
+    expect(t("chat.activity.succeeded")).toBe("Succeeded");
+    expect(t("chat.activity.unknown")).toBe("Unknown");
+    flush(() => setLocale("zh-CN"));
+    expect(t("attention.title")).toBe("在等你");
+    expect(t("attention.count.one")).toBe("1 个 Chat 在等你");
+    expect(t("attention.count.many", { count: 2 })).toBe("2 个 Chat 在等你");
+    expect(t("chat.newActivity")).toBe("有新活动");
+    expect(t("chat.failed")).toBe("已失败");
+    expect(t("chat.activity.step", { count: 2 })).toBe("第 2 步");
+    expect(t("chat.activity.succeeded")).toBe("成功");
+    expect(t("chat.activity.failed")).toBe("失败");
+    expect(t("chat.activity.unknown")).toBe("未知");
+  });
+
+  it("explains a closed composer with the Bot's name", () => {
+    expect(t("chat.composer.busy", { name: "Scout" })).toContain("Scout");
+    expect(t("chat.composer.busy", { name: "Scout" })).toContain("working");
+    expect(t("chat.composer.waiting", { name: "Scout" })).toContain("approval");
+    flush(() => setLocale("zh-CN"));
+    expect(t("chat.composer.busy", { name: "Scout" })).toContain("Scout");
+    expect(t("chat.composer.waiting", { name: "Scout" })).toContain("审批");
+  });
+
   it("keeps implementation copy out of the client", () => {
     expect(t("auth.fine")).not.toContain("HttpOnly");
     expect(t("auth.password.hint")).not.toContain("byte");
