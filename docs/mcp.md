@@ -23,8 +23,11 @@ existing Space server with their own credential. The credential comes from
 machine that runs the Space and never puts it in the record or a Computer.
 
 A User-scope server is offered to a Bot only while the Bot acts for that User.
-`neha mcp list` prints each server, its scope, its address, and whether a
-credential is connected. `neha mcp remove <server>` disconnects one.
+`neha mcp list` prints each server, its scope, who connected it, its address,
+and whether the Space reaches it: a server with a credential that is refused,
+or that cannot be reached, is not connected. The address is `https`, or `http`
+on a loopback address, and carries no credential of its own.
+`neha mcp remove <server>` disconnects one.
 
 ## Give the tools to a Bot
 

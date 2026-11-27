@@ -30,6 +30,15 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The largest answer this client reads for one request.
 const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 
+/// The most pages one tool listing may follow.
+///
+/// A server that keeps naming fresh cursors would otherwise spend the run's
+/// whole budget before the Model sees a single tool.
+const MAX_TOOL_PAGES: usize = 16;
+
+/// The most tools this client accepts from one server.
+const MAX_TOOLS: usize = 256;
+
 /// A tool one server offers.
 #[derive(Clone, Debug, PartialEq)]
 pub struct McpTool {
@@ -85,6 +94,8 @@ pub struct McpClient {
     negotiated: bool,
     /// Whether the handshake completed.
     opened: bool,
+    /// How long one request may wait for its answer.
+    timeout: Duration,
 }
 
 impl McpClient {
@@ -106,13 +117,20 @@ impl McpClient {
             "http" => is_loopback(&url),
             _ => false,
         };
-        if !allowed {
+        if !allowed
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
             return Err(protocol_error(
-                "the MCP server URL must be https://, or http:// on a loopback address",
+                "the MCP server URL must be https://, or http:// on a loopback address, and carry no credentials or fragment",
             ));
         }
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
+            // A redirect could leave the address rule behind; a server answers
+            // where it was connected.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|_| unreachable_error("the HTTP client could not be built"))?;
 
@@ -126,7 +144,16 @@ impl McpClient {
             session_id: None,
             negotiated: false,
             opened: false,
+            timeout: REQUEST_TIMEOUT,
         })
+    }
+
+    /// Uses another request timeout, for a caller that shows a status rather
+    /// than waiting for an answer.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// Performs the `initialize` handshake and the `notifications/initialized`
@@ -152,6 +179,18 @@ impl McpClient {
             },
         });
         let answer = self.rpc("initialize", Some(params)).await?;
+        let negotiated = answer
+            .result
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                protocol_error("the MCP server's handshake named no protocol version")
+            })?;
+        if negotiated != PROTOCOL_VERSION {
+            return Err(protocol_error(
+                "the MCP server speaks a protocol version this Space does not",
+            ));
+        }
         self.session_id = answer.session_id;
         self.negotiated = true;
         self.notify("notifications/initialized").await?;
@@ -171,7 +210,9 @@ impl McpClient {
         let mut tools = Vec::new();
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::HashSet::new();
+        let mut pages = 0_usize;
         loop {
+            pages = pages.saturating_add(1);
             let params = match &cursor {
                 Some(cursor) => json!({ "cursor": cursor }),
                 None => json!({}),
@@ -183,7 +224,13 @@ impl McpClient {
                 .and_then(Value::as_array)
                 .ok_or_else(malformed)?;
             for tool in listed {
+                if tools.len() >= MAX_TOOLS {
+                    return Err(protocol_error("the MCP server lists too many tools"));
+                }
                 tools.push(tool_from_json(tool)?);
+            }
+            if pages >= MAX_TOOL_PAGES {
+                return Err(protocol_error("the MCP server lists too many pages"));
             }
             let next = page
                 .get("nextCursor")
@@ -250,7 +297,7 @@ impl McpClient {
             message["params"] = params;
         }
 
-        match tokio::time::timeout(REQUEST_TIMEOUT, self.exchange(&message, id)).await {
+        match tokio::time::timeout(self.timeout, self.exchange(&message, id)).await {
             Ok(answer) => answer,
             Err(_) => Err(unreachable_error("the server did not answer in time")),
         }
@@ -259,7 +306,7 @@ impl McpClient {
     /// Sends one JSON-RPC notification and accepts any success status.
     async fn notify(&self, method: &str) -> Result<(), McpError> {
         let message = json!({"jsonrpc": "2.0", "method": method});
-        match tokio::time::timeout(REQUEST_TIMEOUT, self.send(&message)).await {
+        match tokio::time::timeout(self.timeout, self.send(&message)).await {
             Ok(response) => ensure_success(response?.status().as_u16()),
             Err(_) => Err(unreachable_error("the server did not answer in time")),
         }
@@ -502,13 +549,14 @@ async fn read_answer_body(response: reqwest::Response) -> Result<Vec<u8>, McpErr
 fn event_end(buffer: &[u8], from: usize) -> Option<(usize, usize)> {
     (from..buffer.len()).find_map(|start| {
         let rest = &buffer[start..];
-        if rest.starts_with(b"\r\n\r\n") {
-            Some((start, 4))
-        } else if rest.starts_with(b"\n\n") {
-            Some((start, 2))
+        let length = if rest.starts_with(b"\r\n\r\n") {
+            4
+        } else if rest.starts_with(b"\n\n") || rest.starts_with(b"\r\r") {
+            2
         } else {
-            None
-        }
+            return None;
+        };
+        Some((start, length))
     })
 }
 
@@ -535,11 +583,15 @@ fn matching_event(event: &[u8], id: u64) -> Option<Value> {
 /// The JSON-RPC message in an answer that carries the request's id.
 fn matching_message(answer: Value, id: u64) -> Option<Value> {
     let expected = Value::from(id);
+    // A server-initiated request may carry any id, so only an answer with a
+    // result or an error answers this client.
+    let is_answer = |message: &Value| {
+        message.get("id") == Some(&expected)
+            && (message.get("result").is_some() || message.get("error").is_some())
+    };
     match answer {
-        Value::Array(messages) => messages
-            .into_iter()
-            .find(|message| message.get("id") == Some(&expected)),
-        message if message.get("id") == Some(&expected) => Some(message),
+        Value::Array(messages) => messages.into_iter().find(|message| is_answer(message)),
+        message if is_answer(&message) => Some(message),
         _ => None,
     }
 }
@@ -1260,5 +1312,69 @@ mod tests {
             "{error}"
         );
         task.abort();
+    }
+    #[tokio::test]
+    async fn a_handshake_version_this_client_does_not_speak_is_refused() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                match message.get("method").and_then(Value::as_str) {
+                    Some("initialize") => json_response(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": message["id"],
+                            "result": {
+                                "protocolVersion": "2024-11-05",
+                                "capabilities": {},
+                                "serverInfo": {"name": "fake", "version": "1.0.0"},
+                            },
+                        })
+                        .to_string(),
+                    ),
+                    _ => empty(StatusCode::ACCEPTED),
+                }
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+
+        let error = client.open().await.unwrap_err();
+        assert!(matches!(error, McpError::Protocol(_)), "{error}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_event_stream_may_end_events_with_carriage_returns() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                assert_eq!(message["method"], "tools/list");
+                let answer = json!({
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": {"tools": [{ "name": "search", "inputSchema": {} }]},
+                });
+                event_stream(format!("data: {answer}\r\r"))
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let tools = client.tools().await.unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "search");
+        task.abort();
+    }
+
+    #[test]
+    fn a_server_request_does_not_answer_the_client() {
+        let request = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "ping"});
+        assert!(super::matching_message(request, 1).is_none());
+        let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}});
+        assert!(super::matching_message(answer, 1).is_some());
     }
 }

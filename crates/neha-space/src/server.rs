@@ -19149,4 +19149,211 @@ mod tests {
         server_task.abort();
         running.shutdown().await;
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_always_allowed_mcp_call_writes_a_rule_for_that_server() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, log, server_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+        let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+        let run = run_of(&submit(&mut socket, chat, "search", None).await);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, true).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|message| message["method"] == "tools/call")
+        );
+        // The lasting rule names the same server and tool the card named.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let added: Vec<&Value> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::RuleAdded)
+            .map(|event| &event.data)
+            .collect();
+        assert_eq!(added.len(), 1, "Always allow writes one rule");
+        assert_eq!(added[0]["server"], json!(server));
+        assert_eq!(added[0]["tool"], json!("search"));
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_server_disabled_before_the_answer_runs_nothing() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, log, server_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+        let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+        let run = run_of(&submit(&mut socket, chat, "search", None).await);
+        wait_status(&mut socket, run, "waiting").await;
+        // The owner disables the server while the card waits.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpDisable { bot, server },
+        )
+        .await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded");
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .all(|message| message["method"] != "tools/call"),
+            "a disabled server is sent no call"
+        );
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let finished: Vec<&Value> = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::ActionFinished && event.data["run"] == json!(run)
+            })
+            .map(|event| &event.data)
+            .collect();
+        assert_eq!(finished.len(), 1);
+        let error = finished[0]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("not offered to this run") || error.contains("no longer enabled"),
+            "{error}"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_mcp_call_asks_even_when_an_ask_rule_names_it() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, _log, server_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+        let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+        // An Allow-shaped rule may not answer for the first call.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::RuleAdd {
+                bot,
+                effect: neha::record::RuleEffect::Allow,
+                tool: "search".to_owned(),
+                command_prefix: None,
+                path_prefix: None,
+                skill: None,
+                script: None,
+                server: Some("docs".to_owned()),
+            },
+        )
+        .await;
+        let run = run_of(&submit(&mut socket, chat, "search", None).await);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "first_mcp_call");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mcp_list_reports_whether_the_space_reaches_each_server() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, _log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+        let reachable = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+        let unreachable = add_mcp_server(
+            &mut socket,
+            "broken",
+            "http://127.0.0.1:9/mcp",
+            Some("token-2"),
+        )
+        .await;
+        let list = command(&mut socket, Id::new(), CommandCall::McpList).await;
+        let rows = list.as_array().unwrap();
+        let by_server = |server: Id| {
+            rows.iter()
+                .find(|row| row["server"] == json!(server))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by_server(reachable)["connected"], json!(true));
+        assert_eq!(
+            by_server(unreachable)["connected"],
+            json!(false),
+            "a server the Space cannot reach is not connected"
+        );
+        socket.close(None).await.unwrap();
+        server_task.abort();
+        running.shutdown().await;
+    }
 }

@@ -386,18 +386,36 @@ pub async fn execute(
         CommandCall::McpAdd(arguments) => {
             mcp_add(context, account, command_id, fingerprint, arguments).await
         }
-        CommandCall::McpList => read(context.state, |state| {
-            let servers: Vec<Value> = state
-                .mcps
-                .iter()
-                .filter(|server| match server.scope {
-                    neha::record::McpScope::Space => true,
-                    neha::record::McpScope::User => server.user == Some(account.id),
-                })
-                .map(|server| mcp_view(context, server, account.id))
-                .collect::<Result<_, ApiError>>()?;
-            Ok(Value::Array(servers))
-        }),
+        CommandCall::McpList => {
+            let servers: Vec<crate::state::McpServerView> = {
+                let state = context
+                    .state
+                    .lock()
+                    .map_err(|_| ApiError::internal("state lock"))?;
+                state
+                    .mcps
+                    .iter()
+                    .filter(|server| match server.scope {
+                        neha::record::McpScope::Space => true,
+                        neha::record::McpScope::User => server.user == Some(account.id),
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let views = futures_util::future::join_all(
+                servers
+                    .into_iter()
+                    .map(|server| mcp_view(context, server, account.id)),
+            )
+            .await;
+            let servers = views.into_iter().collect::<Result<Vec<_>, ApiError>>()?;
+            Ok(Outcome {
+                committed: None,
+                result: Value::Array(servers),
+                queued: None,
+                events: Vec::new(),
+            })
+        }
         CommandCall::McpRemove { server } => {
             mcp_remove(context, account, command_id, fingerprint, server).await
         }
@@ -979,6 +997,18 @@ async fn rule_add(
     })
 }
 
+/// Whether the Space reaches one server with one credential.
+async fn mcp_reachable(url: &str, credential: &str) -> bool {
+    let Ok(client) = crate::mcp::McpClient::new(url, Some(credential)) else {
+        return false;
+    };
+    client
+        .with_timeout(std::time::Duration::from_secs(3))
+        .open()
+        .await
+        .is_ok()
+}
+
 /// Connects an MCP server for the Space or one User.
 async fn mcp_add(
     context: &CommandContext<'_>,
@@ -1109,7 +1139,10 @@ async fn mcp_add(
         neha::record::McpScope::Space => None,
         neha::record::McpScope::User => Some(account.id),
     };
-    let connected = arguments.credential.is_some();
+    let connected = match &arguments.credential {
+        Some(credential) => mcp_reachable(&url, credential).await,
+        None => false,
+    };
     if let Some(credential) = &arguments.credential {
         context
             .secrets
@@ -1171,9 +1204,9 @@ async fn mcp_add(
 }
 
 /// One MCP server as a reader sees it.
-fn mcp_view(
+async fn mcp_view(
     context: &CommandContext<'_>,
-    server: &crate::state::McpServerView,
+    server: crate::state::McpServerView,
     reader: Id,
 ) -> Result<Value, ApiError> {
     let who = match server.scope {
@@ -1182,25 +1215,30 @@ fn mcp_view(
     };
     // A Space server may carry the reader's own credential; a User's own
     // server carries theirs.
-    let connected = match who {
-        Some(user) if user == reader => context
-            .secrets
-            .mcp_credential(server.server, Some(user))
-            .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
-            .is_some(),
-        Some(_) => false,
-        None => {
-            context
+    let credential =
+        match who {
+            Some(user) if user == reader => context
+                .secrets
+                .mcp_credential(server.server, Some(user))
+                .map_err(|_| ApiError::internal("cannot read the MCP credential"))?,
+            Some(_) => None,
+            None => match context
                 .secrets
                 .mcp_credential(server.server, Some(reader))
                 .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
-                .is_some()
-                || context
+            {
+                Some(credential) => Some(credential),
+                None => context
                     .secrets
                     .mcp_credential(server.server, None)
-                    .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
-                    .is_some()
-        }
+                    .map_err(|_| ApiError::internal("cannot read the MCP credential"))?,
+            },
+        };
+    // A credential that is present but refused, and a server that cannot be
+    // reached, are not connected: the list says what a call would find.
+    let connected = match &credential {
+        Some(credential) => mcp_reachable(&server.url, credential).await,
+        None => false,
     };
 
     Ok(json!({
@@ -5256,6 +5294,13 @@ impl RedactingRuntime<'_> {
             let Some(server) = state.mcp(server) else {
                 return ActionResult::failed("the MCP server is no longer connected");
             };
+            if !state
+                .mcps_of(self.bot, self.acting)
+                .iter()
+                .any(|enabled| enabled.server == server.server)
+            {
+                return ActionResult::failed("the MCP server is no longer enabled for this Bot");
+            }
             // A card names the server and the tool it was made for; a call
             // answered for another one would run code the User never saw.
             let answered = state
@@ -5274,11 +5319,15 @@ impl RedactingRuntime<'_> {
         let Some(secrets) = self.secrets else {
             return ActionResult::failed("this runtime cannot read an MCP credential");
         };
-        let credential = secrets
-            .mcp_credential(server.server, Some(self.acting))
-            .ok()
-            .flatten()
-            .or_else(|| secrets.mcp_credential(server.server, None).ok().flatten());
+        let credential = match secrets.mcp_credential(server.server, Some(self.acting)) {
+            Ok(Some(credential)) => Some(credential),
+            Ok(None) => secrets.mcp_credential(server.server, None).ok().flatten(),
+            Err(_) => {
+                return ActionResult::failed(
+                    "the MCP server's credential cannot be read, so nothing was sent",
+                );
+            }
+        };
         let Some(credential) = credential else {
             return ActionResult::failed(format!(
                 "the MCP server {:?} is not connected",
@@ -5584,7 +5633,17 @@ const MAX_TOOL_NAME_BYTES: usize = 64;
 impl McpCatalog {
     /// Forms every tool's model-facing name, then attaches a hash to any name
     /// more than one tool would receive.
-    fn build(mut tools: Vec<ExposedMcpTool>) -> Self {
+    fn build(tools: Vec<ExposedMcpTool>) -> Self {
+        // A server that lists one tool twice is asked once; the first
+        // declaration is the one the Model sees.
+        let mut unique: HashMap<(Id, String), ExposedMcpTool> = HashMap::new();
+        for tool in tools {
+            unique
+                .entry((tool.server, tool.tool.clone()))
+                .or_insert(tool);
+        }
+        let mut tools: Vec<ExposedMcpTool> = unique.into_values().collect();
+        tools.sort_by(|left, right| (left.server, &left.tool).cmp(&(right.server, &right.tool)));
         for tool in &mut tools {
             tool.model_name = mcp_tool_name(tool);
         }
@@ -5601,7 +5660,7 @@ impl McpCatalog {
         let mut by_identity = HashMap::with_capacity(tools.len());
         for tool in tools {
             by_identity.insert((tool.server, tool.tool.clone()), tool.model_name.clone());
-            by_name.insert(tool.model_name.clone(), tool);
+            by_name.entry(tool.model_name.clone()).or_insert(tool);
         }
         Self {
             by_name,
@@ -5716,6 +5775,23 @@ fn mcp_hashed_name(tool: &ExposedMcpTool) -> String {
     name
 }
 
+/// The largest description and schema the Space accepts from one tool.
+const MAX_MCP_DESCRIPTION_BYTES: usize = 16 * 1024;
+const MAX_MCP_SCHEMA_BYTES: usize = 64 * 1024;
+
+/// Whether a server's tool declaration fits what a Model call can carry.
+///
+/// One server's malformed declaration must not make every model request
+/// invalid: the tool is left out, and the rest keeps working.
+fn mcp_declaration_fits(tool: &crate::mcp::McpTool) -> bool {
+    !tool.name.is_empty()
+        && tool.name.len() <= 256
+        && tool.description.len() <= MAX_MCP_DESCRIPTION_BYTES
+        && tool.input_schema.is_object()
+        && serde_json::to_vec(&tool.input_schema)
+            .is_ok_and(|schema| schema.len() <= MAX_MCP_SCHEMA_BYTES)
+}
+
 /// The tools a run offers: the built-in ones, a skill's, and a server's.
 struct OfferedTools {
     tools: Vec<neha_loop::ToolSpec>,
@@ -5739,24 +5815,36 @@ async fn offered_tools(
         Ok(state) => state.mcps_of(bot, acting).into_iter().cloned().collect(),
         Err(_) => Vec::new(),
     };
-    let mut found = Vec::new();
-    for server in servers {
+    // Servers are discovered together, and each discovery gets one budget:
+    // a server that pages or stalls cannot keep the Model waiting behind it.
+    const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    let discovered = futures_util::future::join_all(servers.into_iter().map(|server| async move {
         // The acting User's credential wins; the Space's answers otherwise.
-        let credential = secrets
-            .mcp_credential(server.server, Some(acting))
-            .ok()
-            .flatten()
-            .or_else(|| secrets.mcp_credential(server.server, None).ok().flatten());
+        let credential = match secrets.mcp_credential(server.server, Some(acting)) {
+            Ok(Some(credential)) => Some(credential),
+            Ok(None) => secrets.mcp_credential(server.server, None).ok().flatten(),
+            Err(_) => return (server, Vec::new(), None),
+        };
         let Ok(mut client) = crate::mcp::McpClient::new(&server.url, credential.as_deref()) else {
-            continue;
+            return (server, Vec::new(), credential);
         };
-        if client.open().await.is_err() {
-            continue;
+        let listed = tokio::time::timeout(DISCOVERY_TIMEOUT, async {
+            client.open().await?;
+            client.tools().await
+        })
+        .await;
+        match listed {
+            Ok(Ok(list)) => (server, list, credential),
+            Ok(Err(_)) | Err(_) => (server, Vec::new(), credential),
         }
-        let Ok(list) = client.tools().await else {
-            continue;
-        };
+    }))
+    .await;
+    let mut found = Vec::new();
+    for (server, list, credential) in discovered {
         for tool in list {
+            if !mcp_declaration_fits(&tool) {
+                continue;
+            }
             let description = match &credential {
                 Some(credential) => tool.description.replace(credential.as_str(), "[redacted]"),
                 None => tool.description,
@@ -6053,7 +6141,7 @@ async fn approve_mcp(
         script: None,
         mcp: Some(identity),
     };
-    let (bot, chat, server_name, matching, first) = {
+    let (bot, chat, server_name, matching, first, enabled) = {
         let state = recorder
             .log
             .state
@@ -6066,6 +6154,10 @@ async fn approve_mcp(
         let server = state
             .mcp(tool.server)
             .ok_or_else(|| LoopError::Record("the MCP server is no longer connected".to_owned()))?;
+        let enabled = state
+            .mcps_of(run.bot, recorder.log.acting)
+            .iter()
+            .any(|enabled| enabled.server == tool.server);
         // A rule about a server's tool names the server and the tool; a
         // tool-only rule about the same name asks for every server's tool
         // of that name.
@@ -6073,7 +6165,7 @@ async fn approve_mcp(
             .rules_of(run.bot)
             .into_iter()
             .filter(|rule| rule.user == recorder.log.acting && rule.tool == tool.tool)
-            .filter(|rule| rule.server.is_none() || rule.server == Some(tool.server))
+            .filter(|rule| rule.server == Some(tool.server))
             .filter(|rule| {
                 rule.command_prefix.is_none()
                     && rule.path_prefix.is_none()
@@ -6083,21 +6175,35 @@ async fn approve_mcp(
             .cloned()
             .collect();
         let first = !state.mcp_call_allowed(run.bot, recorder.log.acting, tool.server, &tool.tool);
-        (run.bot, run.chat, server.name.clone(), matching, first)
+        (
+            run.bot,
+            run.chat,
+            server.name.clone(),
+            matching,
+            first,
+            enabled,
+        )
     };
-    let ask = matching.iter().any(|rule| rule.effect == RuleEffect::Ask);
-    let (reason, rule) = if first && !ask {
-        (neha::record::ApprovalReason::FirstMcpCall, None)
+    if !enabled {
+        return Ok(neha_loop::Authorization::Refuse(
+            "the MCP server is no longer enabled for this Bot".to_owned(),
+        ));
+    }
+    let ask_rule = matching
+        .iter()
+        .filter(|rule| rule.effect == RuleEffect::Ask)
+        .max_by_key(|rule| rule_specificity(rule))
+        .map(|rule| rule.rule);
+    let (reason, rule) = if first {
+        // The first call asks whatever rules exist: an Allow rule for the tool
+        // stands in for it only after that consent is recorded.
+        match ask_rule {
+            Some(rule) => (neha::record::ApprovalReason::Rule, Some(rule)),
+            None => (neha::record::ApprovalReason::FirstMcpCall, None),
+        }
     } else {
         match decisive_rule(&matching) {
-            Some(Decision::Wait) => {
-                let rule = matching
-                    .iter()
-                    .filter(|rule| rule.effect == RuleEffect::Ask)
-                    .max_by_key(|rule| rule_specificity(rule))
-                    .map(|rule| rule.rule);
-                (neha::record::ApprovalReason::Rule, rule)
-            }
+            Some(Decision::Wait) => (neha::record::ApprovalReason::Rule, ask_rule),
             Some(Decision::Allow) | None => {
                 return Ok(neha_loop::Authorization::Allow(dispatched));
             }
@@ -6178,14 +6284,16 @@ impl Recorder for RunRecorder<'_> {
         let calls: Vec<Value> = calls
             .iter()
             .map(|call| match self.mcp.get(&call.tool) {
-                Some(tool) => json!({
+                // A call that never runs keeps the name the Model used: its
+                // started and finished actions carry no server identity either.
+                Some(tool) if call.refused.is_none() => json!({
                     "call": call.call,
                     "tool": tool.tool,
                     "server": tool.server,
                     "arguments": call.arguments,
                     "refused": call.refused,
                 }),
-                None => json!({
+                _ => json!({
                     "call": call.call,
                     "tool": call.tool,
                     "arguments": call.arguments,
@@ -6499,10 +6607,16 @@ impl Recorder for RunRecorder<'_> {
             ActionStatus::Unknown => RecordedActionStatus::Unknown,
         };
         // The Model sees a server's tool under its model-facing name; the
-        // record keeps the server and the tool's original name.
+        // record keeps the server and the tool's original name. A call that
+        // never ran keeps the name the Model used, like its started action.
+        let refused = self
+            .calls
+            .get(&step)
+            .and_then(|calls| calls.iter().find(|call| call.tool == tool))
+            .is_some_and(|call| call.refused.is_some());
         let (tool, server) = match self.mcp.get(&tool) {
-            Some(tool) => (tool.tool.clone(), Some(tool.server)),
-            None => (tool, None),
+            Some(found) if !refused => (found.tool.clone(), Some(found.server)),
+            _ => (tool, None),
         };
         self.log
             .append(vec![self.log.bot_draft(
@@ -8216,6 +8330,37 @@ mod tests {
         assert_ne!(name, "shell", "a built-in must not take the server's call");
         assert!(name.starts_with("mcp__"), "{name}");
         assert!(name.contains('/'), "no offered name holds a slash: {name}");
+    }
+
+    #[test]
+    fn a_malformed_server_declaration_is_left_out_of_the_run() {
+        let tool = |name: &str, description: &str, schema: serde_json::Value| crate::mcp::McpTool {
+            name: name.to_owned(),
+            description: description.to_owned(),
+            input_schema: schema,
+        };
+        assert!(super::mcp_declaration_fits(&tool(
+            "search",
+            "Find things.",
+            json!({"type": "object"})
+        )));
+        // A declaration the Model cannot carry would invalidate every request.
+        assert!(!super::mcp_declaration_fits(&tool("", "", json!({}))));
+        assert!(!super::mcp_declaration_fits(&tool(
+            "search",
+            "",
+            json!("not a schema")
+        )));
+        assert!(!super::mcp_declaration_fits(&tool(
+            "search",
+            &"x".repeat(super::MAX_MCP_DESCRIPTION_BYTES + 1),
+            json!({"type": "object"})
+        )));
+        assert!(!super::mcp_declaration_fits(&tool(
+            "search",
+            "",
+            json!({"description": "x".repeat(super::MAX_MCP_SCHEMA_BYTES)})
+        )));
     }
 
     #[test]

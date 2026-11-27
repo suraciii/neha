@@ -318,11 +318,44 @@ pub struct Event {
 mod tests {
     use super::{
         Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
-        FileAdded, FileError, RunAccess, RunQueued, SkillAdded, SkillLibrary, SkillScript,
+        FileAdded, FileError, McpServerAdded, RunAccess, RunQueued, SkillAdded, SkillLibrary,
+        SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
     use crate::id::Id;
+
+    #[test]
+    fn a_server_url_names_an_address_this_space_may_call() {
+        for url in [
+            "https://example.com/mcp",
+            "https://example.com/mcp?key=1",
+            "https://mcp.example.com:8443",
+            "https://[2001:db8::1]/mcp",
+            "http://localhost:8080/mcp",
+            "http://127.0.0.1/mcp",
+            "http://[::1]:9000/mcp",
+            "https://single",
+        ] {
+            assert!(McpServerAdded::valid_url(url), "{url}");
+        }
+        for url in [
+            "",
+            "ftp://example.com/mcp",
+            "https://",
+            "https://user:token@example.com/mcp",
+            "https://example.com/mcp#fragment",
+            "https://example.com/mcp\\path",
+            "http://example.com/mcp",
+            "http://localhost:0/mcp",
+            "http://localhost:port/mcp",
+            "https://exa mple.com/mcp",
+            "https://-example.com/mcp",
+            "https://example..com/mcp",
+        ] {
+            assert!(!McpServerAdded::valid_url(url), "{url}");
+        }
+    }
 
     #[test]
     fn wire_names_round_trip() {
@@ -352,6 +385,11 @@ mod tests {
             EventKind::SkillRemoved,
             EventKind::BotSkillEnabled,
             EventKind::BotSkillDisabled,
+            EventKind::McpServerAdded,
+            EventKind::McpServerUpdated,
+            EventKind::McpServerRemoved,
+            EventKind::BotMcpEnabled,
+            EventKind::BotMcpDisabled,
         ];
 
         for kind in kinds {
@@ -2105,23 +2143,79 @@ impl McpServerAdded {
     /// when the caller is the Space's own loopback.
     #[must_use]
     pub fn valid_url(url: &str) -> bool {
-        if url.len() > 2048 || url.chars().any(char::is_whitespace) {
+        if url.len() > 2048
+            || url
+                .chars()
+                .any(|character| character.is_whitespace() || character.is_control())
+            || url.contains('\\')
+            || url.contains('#')
+        {
             return false;
         }
-        if url.starts_with("https://") {
-            return true;
+        let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
+            ("https", rest)
+        } else if let Some(rest) = url.strip_prefix("http://") {
+            ("http", rest)
+        } else {
+            return false;
+        };
+        // The authority ends where the path or the query begins.
+        let authority = rest.split(['/', '?']).next().unwrap_or_default();
+        // Userinfo would put a credential in the record.
+        if authority.is_empty() || authority.contains('@') {
+            return false;
         }
-        url.strip_prefix("http://").is_some_and(|rest| {
-            let host = rest
-                .split(['/', '?', '#'])
-                .next()
-                .unwrap_or_default()
-                .rsplit_once(':')
-                .map_or(
-                    rest.split(['/', '?', '#']).next().unwrap_or(""),
-                    |(host, _)| host,
-                );
-            matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            // A bracketed IPv6 host names its port after the closing bracket.
+            let Some((host, rest)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let port = if rest.is_empty() {
+                None
+            } else if let Some(port) = rest.strip_prefix(':') {
+                Some(port)
+            } else {
+                return false;
+            };
+            (format!("[{host}]"), port)
+        } else if let Some((host, port)) = authority.rsplit_once(':') {
+            (host.to_owned(), Some(port))
+        } else {
+            (authority.to_owned(), None)
+        };
+        if let Some(port) = port
+            && (port.is_empty()
+                || port.len() > 5
+                || !port.bytes().all(|byte| byte.is_ascii_digit())
+                || port.parse::<u16>().is_err()
+                || port.parse::<u16>() == Ok(0))
+        {
+            return false;
+        }
+        let host = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_owned();
+        let host = host.as_str();
+        if host.is_empty() {
+            return false;
+        }
+        let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+        if scheme == "http" && !loopback {
+            return false;
+        }
+        if host.contains(':') {
+            return host.parse::<std::net::Ipv6Addr>().is_ok();
+        }
+        let labels: Vec<&str> = host.split('.').collect();
+        labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
         })
     }
 

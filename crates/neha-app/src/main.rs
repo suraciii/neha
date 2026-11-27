@@ -2354,7 +2354,8 @@ fn skill_row(skill: &Value) -> Result<String> {
     ))
 }
 
-/// One row per MCP server: server, name, scope, url, and connection state.
+/// One row per MCP server: server, name, scope, who connected it, url, and
+/// connection state.
 fn mcp_rows(list: &Value) -> Result<Vec<String>> {
     list.as_array()
         .context("no MCP servers in the answer")?
@@ -2366,13 +2367,14 @@ fn mcp_rows(list: &Value) -> Result<Vec<String>> {
 /// Formats one MCP server as a single line.
 fn mcp_row(server: &Value) -> Result<String> {
     Ok(format!(
-        "{}  {}  {}  {}  {}",
+        "{}  {}  {}  by {}  {}  {}",
         id_of(server, "server")?,
         server
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or_default(),
         mcp_scope_label(server),
+        server.get("by").and_then(Value::as_str).unwrap_or("-"),
         server
             .get("url")
             .and_then(Value::as_str)
@@ -4864,16 +4866,18 @@ mod tests {
         assert_eq!(
             mcp_rows(&list).unwrap(),
             vec![
-                format!("{server}  weather  space  https://mcp.example.com/mcp  connected"),
                 format!(
-                    "{user_server}  notes  user {user}  http://127.0.0.1:9000/mcp  not connected"
+                    "{server}  weather  space  by {by}  https://mcp.example.com/mcp  connected"
+                ),
+                format!(
+                    "{user_server}  notes  user {user}  by {user}  http://127.0.0.1:9000/mcp  not connected"
                 ),
             ]
         );
         // Absent fields read as a Space server that has not connected.
         assert_eq!(
             mcp_row(&json!({"server": server, "name": "bare", "url": "https://x/"})).unwrap(),
-            format!("{server}  bare  space  https://x/  not connected")
+            format!("{server}  bare  space  by -  https://x/  not connected")
         );
         assert_eq!(mcp_rows(&json!([])).unwrap(), Vec::<String>::new());
     }
