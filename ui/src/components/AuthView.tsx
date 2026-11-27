@@ -1,7 +1,7 @@
-import { Show, createSignal } from "solid-js";
+import { createSignal, Show } from "solid-js";
 
 import { t } from "../i18n";
-import { api, ApiError } from "../lib/api";
+import { ApiError, api } from "../lib/api";
 import type { Account } from "../types";
 import Brand from "./Brand";
 import LocaleSwitch from "./LocaleSwitch";
@@ -72,7 +72,8 @@ export default function AuthView(props: AuthViewProps) {
           <Show when={props.mode === "missing-invite"}>
             <h2>{t("auth.missing.title")}</h2>
             <p class="muted">
-              {t("auth.missing.lead")} <code>neha serve</code> {t("auth.missing.mid")} <code>#</code>
+              {t("auth.missing.lead")} <code>neha serve</code> {t("auth.missing.mid")}{" "}
+              <code>#</code>
               {t("auth.missing.tail")}
             </p>
           </Show>
@@ -117,7 +118,11 @@ export default function AuthView(props: AuthViewProps) {
               </Show>
 
               <button class="btn btn--primary btn--wide" type="submit" disabled={pending()}>
-                {pending() ? t("auth.working") : isJoin() ? t("auth.join.action") : t("auth.login.action")}
+                {pending()
+                  ? t("auth.working")
+                  : isJoin()
+                    ? t("auth.join.action")
+                    : t("auth.login.action")}
               </button>
             </form>
           </Show>

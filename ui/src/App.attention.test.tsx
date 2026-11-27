@@ -20,7 +20,13 @@ function botOf(chatId: string) {
 }
 
 // An approval the Space holds for a Chat, which it answers when asked.
-function waitingIn(chatId: string, run: string, tool: string, summary: string, approval = `a-${run}`) {
+function waitingIn(
+  chatId: string,
+  run: string,
+  tool: string,
+  summary: string,
+  approval = `a-${run}`,
+) {
   space.statuses[chatId] = "waiting";
   space.activeRuns[chatId] = run;
   // The Space holds the Run waiting for this approval, as it really would.
@@ -39,7 +45,13 @@ function waitingIn(chatId: string, run: string, tool: string, summary: string, a
 }
 
 // An approval the record asks for, in any Chat.
-function asksApproval(chatId: string, run: string, tool: string, summary: string, approval = `a-${run}`) {
+function asksApproval(
+  chatId: string,
+  run: string,
+  tool: string,
+  summary: string,
+  approval = `a-${run}`,
+) {
   record("neha.approval.requested", {
     approval,
     run,
@@ -59,12 +71,16 @@ function asksApproval(chatId: string, run: string, tool: string, summary: string
 
 // What each row of the attention list says.
 function attentionRows(view: View): string[] {
-  return Array.from(view.container.querySelectorAll(".attention__row")).map((row) => row.textContent ?? "");
+  return Array.from(view.container.querySelectorAll(".attention__row")).map(
+    (row) => row.textContent ?? "",
+  );
 }
 
 // What each Chat in the list says about its state.
 function badges(view: View): string[] {
-  return Array.from(view.container.querySelectorAll(".conv__badge")).map((badge) => badge.textContent ?? "");
+  return Array.from(view.container.querySelectorAll(".conv__badge")).map(
+    (badge) => badge.textContent ?? "",
+  );
 }
 
 describe("App attention", () => {
@@ -96,7 +112,14 @@ describe("App attention", () => {
     if (!allow) throw new Error("no Allow once button in the view");
     fireEvent.click(allow);
     await waitFor(() => expect(space.decisions).toHaveLength(1));
-    record("neha.approval.decided", { approval: "a-r2", run: "r2", allow: true, lasting: false, user: "u1", rule: null });
+    record("neha.approval.decided", {
+      approval: "a-r2",
+      run: "r2",
+      allow: true,
+      lasting: false,
+      user: "u1",
+      rule: null,
+    });
     await waitFor(() => expect(view.container.querySelectorAll(".attention__row")).toHaveLength(0));
     expect(view.container.querySelector(".attention")).toBeNull();
   });
@@ -113,7 +136,9 @@ describe("App attention", () => {
     fireEvent.keyDown(row, { key: "Enter" });
     fireEvent.click(row);
     await waitFor(() => expect(element(view, ".chat__titles h1").textContent).toBe("Quill"));
-    await waitFor(() => expect(view.container.querySelector('[data-approval="a-r2"]')).toBeTruthy());
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-approval="a-r2"]')).toBeTruthy(),
+    );
   });
 
   it("lists one row per approval in the same Chat", async () => {
@@ -182,8 +207,20 @@ describe("App attention", () => {
 
     // Its Run ends and answers, which the reader has not opened yet.
     space.runs["r9"] = { status: "succeeded" };
-    record("neha.message.added", { chat: "h2", message: "m9", text: "an answer", file: null, run: "r9" });
-    record("neha.run.finished", { run: "r9", status: "succeeded", reply: "m9", usage: null, error: null });
+    record("neha.message.added", {
+      chat: "h2",
+      message: "m9",
+      text: "an answer",
+      file: null,
+      run: "r9",
+    });
+    record("neha.run.finished", {
+      run: "r9",
+      status: "succeeded",
+      reply: "m9",
+      usage: null,
+      error: null,
+    });
     await waitFor(() => expect(badges(view)).toEqual(["New activity"]));
     await drain();
 
@@ -208,7 +245,13 @@ describe("App attention", () => {
     expect(view.container.querySelectorAll(".attention__row")).toHaveLength(1);
 
     // r2 ends. That is a sibling Run ending, so the Chat stays waiting.
-    record("neha.run.finished", { run: "r2", status: "succeeded", reply: "m2", usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r2",
+      status: "succeeded",
+      reply: "m2",
+      usage: null,
+      error: null,
+    });
     await waitFor(() => expect(view.container.querySelectorAll(".attention__row")).toHaveLength(1));
     expect(badges(view)).toEqual(["Waiting"]);
     expect(element(view, ".attention__count").textContent).toBe("1");
@@ -278,7 +321,13 @@ describe("App attention", () => {
       file: null,
     });
     const view = await openChat();
-    record("neha.message.added", { chat: "h2", message: "m9", text: "an answer", file: null, run: null });
+    record("neha.message.added", {
+      chat: "h2",
+      message: "m9",
+      text: "an answer",
+      file: null,
+      run: null,
+    });
     await waitFor(() => expect(badges(view)).toContain("New activity"));
 
     // Opening the Chat answers its new activity, wherever the reader came from.
@@ -344,7 +393,9 @@ describe("App attention", () => {
       const rows = view.container.querySelectorAll(".attention__row");
       expect(rows).toHaveLength(2);
       flush(() => fireEvent.click(rows[1] as HTMLElement));
-      await waitFor(() => expect(view.container.querySelector('[data-approval="a-r3"]')).toBeTruthy());
+      await waitFor(() =>
+        expect(view.container.querySelector('[data-approval="a-r3"]')).toBeTruthy(),
+      );
       await waitFor(() => expect(scrolled).toEqual(["a-r3"]));
     } finally {
       Element.prototype.scrollIntoView = hadScroll;

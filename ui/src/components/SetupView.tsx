@@ -1,4 +1,4 @@
-import { Show, createSignal } from "solid-js";
+import { createSignal, Show } from "solid-js";
 
 import { t } from "../i18n";
 import type { Account, Bot, Model, Provider } from "../types";
@@ -114,7 +114,9 @@ export default function SetupView(props: SetupViewProps) {
                   </div>
                   <div class="fact">
                     <span class="fact__label">{t("setup.models")}</span>
-                    <span class="fact__value">{props.models.map((item) => item.name).join(", ") || t("setup.none")}</span>
+                    <span class="fact__value">
+                      {props.models.map((item) => item.name).join(", ") || t("setup.none")}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -151,7 +153,11 @@ export default function SetupView(props: SetupViewProps) {
                 </div>
               </div>
               <div class="panel__foot">
-                <button class="btn btn--primary" type="submit" disabled={props.busy || botName().trim() === ""}>
+                <button
+                  class="btn btn--primary"
+                  type="submit"
+                  disabled={props.busy || botName().trim() === ""}
+                >
                   {props.busy ? t("setup.bot.creating") : t("setup.bot.create")}
                   <Icon name="arrow-right" size="sm" />
                 </button>
@@ -160,12 +166,7 @@ export default function SetupView(props: SetupViewProps) {
           </>
         }
       >
-        <Show
-          when={props.account.is_admin}
-          fallback={
-            <p class="banner">{t("setup.noAdmin")}</p>
-          }
-        >
+        <Show when={props.account.is_admin} fallback={<p class="banner">{t("setup.noAdmin")}</p>}>
           <form class="panel" onSubmit={connectProvider}>
             <div class="panel__head">
               <div>

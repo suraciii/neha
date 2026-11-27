@@ -1,4 +1,4 @@
-import { t, type Locale } from "../i18n";
+import { type Locale, t } from "../i18n";
 
 export function timeOfDay(value: string): string {
   const date = new Date(value);

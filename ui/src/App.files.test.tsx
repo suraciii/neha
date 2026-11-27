@@ -1,9 +1,8 @@
-import { fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { fireEvent, type render, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
-import App from "./App";
-import { api, ApiError } from "./lib/api";
+import { ApiError, api } from "./lib/api";
 import { MAX_FILE_BYTES } from "./lib/files";
 import { space } from "./test/fakeSpace";
 import { drain, element, openChat, record, renderApp, useView } from "./test/view";
@@ -42,7 +41,9 @@ function queueText(view: ReturnType<typeof render>): string | undefined {
 }
 
 function type(view: ReturnType<typeof render>, text: string) {
-  flush(() => fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: text } }));
+  flush(() =>
+    fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: text } }),
+  );
 }
 
 function submit(view: ReturnType<typeof render>) {
@@ -57,7 +58,13 @@ function openCard(view: ReturnType<typeof render>) {
 // The record starts a queued Run.
 function startRun(run: string) {
   space.runs[run] = { status: "running" };
-  record("neha.run.started", { chat: space.chat.id, run, bot: space.bot.id, command: "c1", message: "m1" });
+  record("neha.run.started", {
+    chat: space.chat.id,
+    run,
+    bot: space.bot.id,
+    command: "c1",
+    message: "m1",
+  });
 }
 
 // The record ends a Run, with the reply Message when it has one.
@@ -65,9 +72,21 @@ function finishRun(run: string, reply: Message | null = null) {
   space.runs[run] = { status: "succeeded" };
   if (reply) {
     space.messages.push(reply);
-    record("neha.message.added", { chat: reply.chat, message: reply.id, text: reply.text, file: null, run });
+    record("neha.message.added", {
+      chat: reply.chat,
+      message: reply.id,
+      text: reply.text,
+      file: null,
+      run,
+    });
   }
-  record("neha.run.finished", { run, status: "succeeded", reply: reply?.id ?? null, usage: null, error: null });
+  record("neha.run.finished", {
+    run,
+    status: "succeeded",
+    reply: reply?.id ?? null,
+    usage: null,
+    error: null,
+  });
 }
 
 function request(id: string, chat: string, run: string, text = "earlier"): Message {
@@ -152,7 +171,9 @@ describe("App with Files", () => {
     });
     const file = new File(["hello"], "notes.txt", { type: "text/plain" });
     attach(view, file);
-    await waitFor(() => expect(view.container.querySelector(".attachment")?.textContent).toContain("5 B"));
+    await waitFor(() =>
+      expect(view.container.querySelector(".attachment")?.textContent).toContain("5 B"),
+    );
 
     submit(view);
     await waitFor(() => expect(view.container.querySelector(".file-card")).toBeTruthy());
@@ -163,7 +184,9 @@ describe("App with Files", () => {
     expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(true);
     finishRun("r1");
     await waitFor(() => expect(queueText(view)).toBeUndefined());
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
     expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
 
     expect(upload).toHaveBeenCalledWith("h1", file, "notes.txt", "text/plain");
@@ -190,7 +213,9 @@ describe("App with Files", () => {
 
     await waitFor(() => expect(alertText(view)).toBe("notes.txt is larger than 32 MiB."));
     // Nothing left the composer, so it still holds the Message.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").value).toBe("please summarize"));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").value).toBe("please summarize"),
+    );
     expect(view.container.querySelector(".attachment")?.textContent).toContain("notes.txt");
     expect(space.sent).toEqual([]);
   });
@@ -216,7 +241,9 @@ describe("App with Files", () => {
 
     await waitFor(() => expect(alertText(view)).toBe("The file could not be uploaded. Try again."));
     expect(space.sent).toEqual([]);
-    await waitFor(() => expect(view.container.querySelector(".attachment")?.textContent).toContain("notes.txt"));
+    await waitFor(() =>
+      expect(view.container.querySelector(".attachment")?.textContent).toContain("notes.txt"),
+    );
 
     flush(() => fireEvent.click(element(view, ".locale-switch")));
     expect(alertText(view)).toBe("文件上传失败，请重试。");
@@ -278,7 +305,9 @@ describe("App with Files", () => {
     space.chatDelay = (chatId) => {
       if (chatId !== "h2") return Promise.resolve();
       h2Reads += 1;
-      return h2Reads === 1 ? new Promise<void>((resolve) => (release = resolve)) : Promise.resolve();
+      return h2Reads === 1
+        ? new Promise<void>((resolve) => (release = resolve))
+        : Promise.resolve();
     };
     space.handlers?.onEvent?.({
       seq: "3",
@@ -384,12 +413,18 @@ describe("App with Files", () => {
 
     finishRun("r9");
     await waitFor(() => expect(queueText(view)).toBeUndefined());
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
     expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
   });
 
   it("restores the newest request, not a later Bot reply", async () => {
-    space.messages.push(request("m1", "h1", "r1"), request("m2", "h1", "r2"), reply("m3", "h1", "r1", "first done"));
+    space.messages.push(
+      request("m1", "h1", "r1"),
+      request("m2", "h1", "r2"),
+      reply("m3", "h1", "r1", "first done"),
+    );
     space.runs["r1"] = { status: "succeeded" };
     space.runs["r2"] = { status: "queued", position: 2 };
     const view = await openChat();
@@ -418,7 +453,9 @@ describe("App with Files", () => {
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
     await waitFor(() => expect(view.container.textContent).toContain("Here is the answer."));
     // The Run answered, so the composer opens again.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
   });
 
   it("keeps the new Chat's place while an old Message is still being accepted", async () => {
@@ -436,7 +473,8 @@ describe("App with Files", () => {
 
     // A record read can no longer repair the view, so only the record events
     // that belong to this Chat may change it from here on.
-    space.chatDelay = (chatId) => (chatId === "h2" ? new Promise<void>(() => undefined) : Promise.resolve());
+    space.chatDelay = (chatId) =>
+      chatId === "h2" ? new Promise<void>(() => undefined) : Promise.resolve();
     space.releaseSends();
     await waitFor(() => expect(space.sendsDone).toBe(1));
 
@@ -472,13 +510,25 @@ describe("App with Files", () => {
     space.runs["r1"] = { status: "succeeded" };
     const firstReply = reply("m3", "h1", "r1", "first done");
     space.messages.push(firstReply);
-    record("neha.message.added", { chat: "h1", message: firstReply.id, text: firstReply.text, file: null, run: "r1" });
+    record("neha.message.added", {
+      chat: "h1",
+      message: firstReply.id,
+      text: firstReply.text,
+      file: null,
+      run: "r1",
+    });
     await waitFor(() => expect(view.container.textContent).toContain("first done"));
     // The reply's read asks the record about the Run the page follows.
     await waitFor(() => expect(space.runShows.slice(showsBefore)).toContain("r1"));
 
     // The other Run ends too, and the page follows neither of them.
-    record("neha.run.finished", { run: "r9", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r9",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
     expect(queueText(view)).toBeUndefined();
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
@@ -527,15 +577,29 @@ describe("App with Files", () => {
 
     // The other Run's reply carries its File and names that Run, so the page
     // keeps the File out of the work of the Run it follows.
-    record("neha.message.added", { chat: "h1", message: "m9", text: "here is theirs", file: "f9", run: "r9" });
+    record("neha.message.added", {
+      chat: "h1",
+      message: "m9",
+      text: "here is theirs",
+      file: "f9",
+      run: "r9",
+    });
     await drain();
     openCard(view);
     expect(view.container.querySelector(".activity .file-card")).toBeNull();
-    expect(view.container.querySelector(".activity")?.textContent ?? "").not.toContain("theirs.txt");
+    expect(view.container.querySelector(".activity")?.textContent ?? "").not.toContain(
+      "theirs.txt",
+    );
 
     // Our own Run's reply carries its File and names our Run, and the card
     // names that one.
-    record("neha.message.added", { chat: "h1", message: "m3", text: "here is mine", file: "f1", run: "r1" });
+    record("neha.message.added", {
+      chat: "h1",
+      message: "m3",
+      text: "here is mine",
+      file: "f1",
+      run: "r1",
+    });
     await waitFor(() => expect(view.container.querySelector(".activity .file-card")).toBeTruthy());
     const card = view.container.querySelector(".activity")?.textContent ?? "";
     expect(card).toContain("mine.txt");
@@ -561,7 +625,9 @@ describe("App with Files", () => {
     finishRun("r1", reply("m2", "h1", "r1", "the answer"));
     await waitFor(() => expect(view.container.textContent).toContain("the answer"));
     // The Run answered, so the composer opens again.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
     expect(element<HTMLButtonElement>(view, ".composer__attach").disabled).toBe(false);
   });
 
@@ -577,7 +643,13 @@ describe("App with Files", () => {
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
     expect(element<HTMLTextAreaElement>(view, "textarea").value).toBe("a draft");
 
-    record("neha.run.finished", { run: "r7", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r7",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
     // The draft waited in the composer.
@@ -632,7 +704,13 @@ describe("App with Files", () => {
 
     // The Run ends while the record's answer about it is still in flight.
     space.runs["r1"] = { status: "succeeded" };
-    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r1",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeNull());
 
     space.runHolds["r1"]?.release();
@@ -653,8 +731,16 @@ describe("App with Files", () => {
     // A refresh of the old Chat asks the record about its Run and the answer hangs.
     space.holdRunShow("r9");
     const showsBefore = space.runShows.filter((run) => run === "r9").length;
-    record("neha.message.added", { chat: "h1", message: "m2", text: "hello", file: null, run: null });
-    await waitFor(() => expect(space.runShows.filter((run) => run === "r9").length).toBeGreaterThan(showsBefore));
+    record("neha.message.added", {
+      chat: "h1",
+      message: "m2",
+      text: "hello",
+      file: null,
+      run: null,
+    });
+    await waitFor(() =>
+      expect(space.runShows.filter((run) => run === "r9").length).toBeGreaterThan(showsBefore),
+    );
 
     // The reader moves to the waiting Chat before the old answer is lost.
     await openWaitingChat(view);

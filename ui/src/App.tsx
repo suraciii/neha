@@ -1,4 +1,4 @@
-import { Show, createMemo, createSignal, createStore, onCleanup, onSettled } from "solid-js";
+import { createMemo, createSignal, createStore, onCleanup, onSettled, Show } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import BotPage from "./components/BotPage";
@@ -7,10 +7,9 @@ import Rail, { type RailView } from "./components/Rail";
 import SettingsPage from "./components/SettingsPage";
 import SetupView from "./components/SetupView";
 import Sidebar, { type SettingsSection } from "./components/Sidebar";
-import { t, type MessageKey } from "./i18n";
-import { api, ApiError } from "./lib/api";
-import { MAX_FILE_BYTES,
-  MAX_FILE_LABEL, formatBytes, indexFiles, mediaTypeFor } from "./lib/files";
+import { type MessageKey, t } from "./i18n";
+import { ApiError, api } from "./lib/api";
+import { indexFiles, MAX_FILE_BYTES, MAX_FILE_LABEL, mediaTypeFor } from "./lib/files";
 import { watchViewportHeight } from "./lib/viewport";
 import { Commands, ProtocolError } from "./lib/ws";
 import type {
@@ -348,11 +347,21 @@ export default function App() {
 
   // The tool's action ended, one way or another. An action the page only heard
   // the end of still belongs to the card.
-  function finishAction(run: string, step: number, action: string, status: ToolAction["status"], error: string | null) {
+  function finishAction(
+    run: string,
+    step: number,
+    action: string,
+    status: ToolAction["status"],
+    error: string | null,
+  ) {
     setActivity((current) => {
       if (!current || current.run !== run) return current;
       const known = current.actions.find((entry) => entry.action === action);
-      const done = { ...(known ?? { action, step, tool: "", status: "running", error: null }), status, error: status === "failed" ? error : null };
+      const done = {
+        ...(known ?? { action, step, tool: "", status: "running", error: null }),
+        status,
+        error: status === "failed" ? error : null,
+      };
       const actions = known
         ? current.actions.map((entry) => (entry.action === action ? done : entry))
         : [...current.actions, done];
@@ -371,7 +380,8 @@ export default function App() {
   // A Run the page heard about holds its Chat from now on.
   function holdRun(chat: string, run: string, step: RunStep) {
     setState((draft) => {
-      const runs = (draft.runs[chat] ??= { active: {}, last: null });
+      const runs = draft.runs[chat] ?? { active: {}, last: null };
+      draft.runs[chat] = runs;
       runs.active[run] = step;
     });
   }
@@ -381,7 +391,8 @@ export default function App() {
   // answer can be older than the events that landed since it was sent.
   function seedRun(chat: string, run: string, step: RunStep) {
     setState((draft) => {
-      const runs = (draft.runs[chat] ??= { active: {}, last: null });
+      const runs = draft.runs[chat] ?? { active: {}, last: null };
+      draft.runs[chat] = runs;
       if (runs.active[run] === undefined) runs.active[run] = step;
     });
   }
@@ -391,7 +402,8 @@ export default function App() {
   function endRun(chat: string | undefined, run: string, outcome: RunOutcome) {
     if (!chat) return;
     setState((draft) => {
-      const runs = (draft.runs[chat] ??= { active: {}, last: null });
+      const runs = draft.runs[chat] ?? { active: {}, last: null };
+      draft.runs[chat] = runs;
       delete runs.active[run];
       runs.last = outcome.failed ? "failed" : "succeeded";
     });
@@ -434,7 +446,10 @@ export default function App() {
   // The newest User request in a Chat. A Bot reply names its Run too, so only a
   // User Message may start following a Run.
   function newestRequestRun(messages: Message[]): string | null {
-    return [...messages].reverse().find((message) => message.author.kind === "user" && message.run)?.run ?? null;
+    return (
+      [...messages].reverse().find((message) => message.author.kind === "user" && message.run)
+        ?.run ?? null
+    );
   }
 
   // The Run a Chat's record points at when the Space names none. A Chat that
@@ -446,15 +461,21 @@ export default function App() {
   // answered has only the newest one to show.
   function historyRun(messages: Message[], failed: boolean): string | null {
     if (failed) {
-      const ended = [...messages].reverse().find((message) => message.author.kind === "bot" && message.run);
+      const ended = [...messages]
+        .reverse()
+        .find((message) => message.author.kind === "bot" && message.run);
       if (ended?.run) return ended.run;
     }
     const answered = new Set(
-      messages.filter((message) => message.author.kind === "bot" && message.run).map((message) => message.run),
+      messages
+        .filter((message) => message.author.kind === "bot" && message.run)
+        .map((message) => message.run),
     );
     const waiting = [...messages]
       .reverse()
-      .find((message) => message.author.kind === "user" && message.run && !answered.has(message.run));
+      .find(
+        (message) => message.author.kind === "user" && message.run && !answered.has(message.run),
+      );
     return waiting?.run ?? newestRequestRun(messages);
   }
 
@@ -473,7 +494,9 @@ export default function App() {
     // The Chat works on this Run now, whatever else it holds.
     const chat = state.activeChat;
     if (chat) holdRun(chat.id, run, step);
-    setActivity((current) => (current?.run === run ? current : { run, step: 0, actions: [], files: [], error: null }));
+    setActivity((current) =>
+      current?.run === run ? current : { run, step: 0, actions: [], files: [], error: null },
+    );
   }
 
   // Moves the followed Run forward: queued, then running, then waiting. An
@@ -587,7 +610,8 @@ export default function App() {
     // A reopened Chat shows what the Run already did: its recorded steps and
     // actions, which the events of a Run the page never saw cannot tell. A Run
     // that answered leaves its reply in the stream instead.
-    if (view.status !== "succeeded") restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
+    if (view.status !== "succeeded")
+      restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
   }
 
   // Puts the recorded steps and actions of one Run into its activity card.
@@ -1006,7 +1030,12 @@ export default function App() {
     // A Chat on screen that follows no Run of its own keeps the failure in its
     // header and one line in its stream, but only once nothing else holds the
     // Chat: a sibling Run that still works outranks the one that ended.
-    if (outcome.failed && state.activeChat?.id === chat && !followed && projectRuns(chat) === "failed") {
+    if (
+      outcome.failed &&
+      state.activeChat?.id === chat &&
+      !followed &&
+      projectRuns(chat) === "failed"
+    ) {
       setActivity((current) => failActivity(current, run, outcome.error));
     }
   }
@@ -1156,7 +1185,9 @@ export default function App() {
       if (requested || requestedApproval || requestedMessage) {
         history.replaceState(history.state, "", `${location.pathname}${location.hash}`);
       }
-      const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
+      const active = state.activeChat
+        ? chats.find((chat) => chat.id === state.activeChat?.id)
+        : undefined;
       // A refresh reads the Chat that is open again, and a wide window opens the
       // newest Chat. What a phone reloads into is its history entry's screen,
       // which enter() restores once the workspace is read, and a link that names
@@ -1265,7 +1296,11 @@ export default function App() {
     // Chat stays failed. The Run the page reads there is history, and it only
     // fills that Chat's card. A Space that names no Run at all, an older one,
     // leaves the page to the newest request in the record.
-    const run = named ?? (named === null ? historyRun(messages, chat.status === "failed") : newestRequestRun(messages));
+    const run =
+      named ??
+      (named === null
+        ? historyRun(messages, chat.status === "failed")
+        : newestRequestRun(messages));
     if (!run || !isCurrentChat(chat, generation)) return;
     // Only a Run the Space named may write the Chat's state back.
     const holds = named !== null;
@@ -1328,7 +1363,11 @@ export default function App() {
         commands.command<Approval[]>("approval_list", { chat: chat.id }),
       ]);
       if (!isCurrentChat(chat, generation)) return;
-      update({ messages, files: indexFiles(files), approvals: mergeApprovals(approvals, state.approvals) });
+      update({
+        messages,
+        files: indexFiles(files),
+        approvals: mergeApprovals(approvals, state.approvals),
+      });
       const last = messages.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
       await reconcileRun(chat, messages, generation);
@@ -1356,7 +1395,9 @@ export default function App() {
         return false;
       }
       const saved = uploaded;
-      setState((draft) => { draft.files[saved.id] = saved; });
+      setState((draft) => {
+        draft.files[saved.id] = saved;
+      });
     }
 
     const optimistic: Message = {
@@ -1417,7 +1458,10 @@ export default function App() {
       return await api.uploadFile(chat.id, file, file.name, mediaTypeFor(file));
     } catch (reason) {
       if (!isCurrentChat(chat, generation)) return null;
-      update({ error: reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason) });
+      update({
+        error:
+          reason instanceof ApiError && reason.status === 413 ? tooLarge() : uploadFailure(reason),
+      });
       return null;
     }
   }
@@ -1511,7 +1555,18 @@ export default function App() {
     runGeneration += 1;
     followed = null;
     setActivity(null);
-    update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, queue: null, deciding: null, error: null });
+    update({
+      activeChat: null,
+      messages: [],
+      files: {},
+      approvals: [],
+      activeBot: null,
+      activeComputer: null,
+      submitting: false,
+      queue: null,
+      deciding: null,
+      error: null,
+    });
   }
 
   // The screen the User is on, as one history entry.
@@ -1554,9 +1609,7 @@ export default function App() {
   // surface opened leaves no step for it, and the trail does the work instead.
   function onPhoneStep(): boolean {
     const entry = screenOf(history.state);
-    return (
-      (entry.view === "bots" || entry.view === "settings") && sameScreen(entry, screen())
-    );
+    return (entry.view === "bots" || entry.view === "settings") && sameScreen(entry, screen());
   }
 
   // Gives the phone's history one entry for the screen. A step the User takes
@@ -1727,7 +1780,9 @@ export default function App() {
   // Widening a Bot's access carries the owner's answer at the current consent
   // version; an older client cannot turn full access on without it.
   async function setFullAccess(on: boolean) {
-    const consent = on ? { full_access: true, full_access_consent: FULL_ACCESS_CONSENT } : { full_access: false };
+    const consent = on
+      ? { full_access: true, full_access_consent: FULL_ACCESS_CONSENT }
+      : { full_access: false };
     await updateBot(consent);
   }
 
@@ -2100,178 +2155,187 @@ export default function App() {
         <Show
           when={state.account}
           fallback={
-            <AuthView mode={authMode()} secret={authSecret()} onAuthed={(account) => void enter(account)} />
+            <AuthView
+              mode={authMode()}
+              secret={authSecret()}
+              onAuthed={(account) => void enter(account)}
+            />
           }
         >
-        {(account) => (
-          <div
-            class={`app${showDetail() ? " app--detail" : ""}${showSetup() ? " app--setup" : ""}`}
-          >
-            <Rail
-              account={account()}
-              view={view()}
-              attentionCount={attentionEntries().length}
-              onSelect={(next) => {
-                if (next === "bots" || next === "settings") openManage(next);
-                else setView(next);
-              }}
-            />
-            <Sidebar
-              account={account()}
-              chats={state.chats}
-              bots={state.bots}
-              activeChat={state.activeChat}
-              previews={state.previews}
-              statuses={chatStates()}
-              unread={state.unread}
-              attention={attentionEntries()}
-              attentionOpen={view() === "attention"}
-              view={view()}
-              activeBot={pageBotId()}
-              section={section()}
-              onSelect={(chat) => {
-                setView("chats");
-                // Choosing a Chat is a step of its own: the phone's history gets
-                // an entry, so its system Back closes the Chat the way the
-                // page's own Back does.
-                remember({ chat: chat.id, view: "chats", section: null, bot: null });
-                void selectChat(chat);
-              }}
-              onAttention={(entry) => openAttention(entry)}
-              onBot={(bot) => {
-                // A Bot's page is a step deeper than the list it was opened from,
-                // so the phone's history gets an entry for it.
-                remember({ chat: state.activeChat?.id ?? null, view: "bots", section: null, bot: bot.id });
-                void selectPageBot(bot);
-              }}
-              onSection={(next) => {
-                setSection(next);
-                setSectionOpen(true);
-                // A section is a step inside its surface, so the phone's history
-                // gets one for it: its system Back leaves the section for the
-                // list of sections, the way the page's own Back does.
-                remember({
-                  chat: state.activeChat?.id ?? null,
-                  view: "settings",
-                  section: next,
-                  bot: null,
-                });
-              }}
-              onCreateBot={(name, computer) => createBot(name, computer)}
-              computers={state.computers}
-              canCreateBot={canCreateBot()}
-            />
-            <main class="main">
-              <Show when={showManage()}>
-                <Show when={view() === "bots"}>
-                  <Show
-                    when={state.pageBot}
-                    fallback={
-                      <div class="select-chat">
-                        <h2>{t("bots.select.title")}</h2>
-                      </div>
-                    }
-                  >
-                    {(bot) => (
-                      <BotPage
-                        bot={bot()}
-                        computer={state.pageComputer}
-                        computers={state.computers}
-                        models={state.models}
-                        rules={state.rules}
-                        busy={state.managing}
-                        error={manageErrorText()}
-                        onBack={closeManage}
-                        onRename={(name) => renameBot(name)}
-                        onModel={(model, thinking) => saveBotModel(model, thinking)}
-                        onGrantAdd={(path) => grantFolder(path)}
-                        onGrantRemove={(path) => dropGrant(path)}
-                        onFullAccess={(on) => setFullAccess(on)}
-                        onMove={(computer) => moveBotTo(computer)}
-                        onReset={() => resetWorkspace()}
-                        onRuleAdd={(rule) => addRule(rule)}
-                        onRuleRemove={(rule) => removeRule(rule)}
-                      />
-                    )}
-                  </Show>
-                </Show>
-                <Show when={view() === "settings"}>
-                  <SettingsPage
-                    account={account()}
-                    providers={state.providers}
-                    models={state.models}
-                    computers={state.computers}
-                    bots={state.bots}
-                    vendors={state.vendors}
-                    catalog={state.catalog}
-                    section={section()}
-                    busy={state.managing}
-                    error={manageErrorText()}
-                    onBack={closeManage}
-                    onReset={(computer) => resetComputer(computer)}
-                    onOpenBot={(bot) => openBotPage(bot)}
-                    onConnect={(input) => connectVendor(input)}
-                    onRefresh={(provider) => refreshProviderModels(provider)}
-                    onDefault={(model) => makeDefaultModel(model)}
-                    onCatalog={() => refreshCatalog()}
-                  />
-                </Show>
-              </Show>
-              <Show when={!showManage()}>
-                <Show
-                  when={showChat() ? state.activeChat?.id : null}
-                  keyed
-                  fallback={
+          {(account) => (
+            <div
+              class={`app${showDetail() ? " app--detail" : ""}${showSetup() ? " app--setup" : ""}`}
+            >
+              <Rail
+                account={account()}
+                view={view()}
+                attentionCount={attentionEntries().length}
+                onSelect={(next) => {
+                  if (next === "bots" || next === "settings") openManage(next);
+                  else setView(next);
+                }}
+              />
+              <Sidebar
+                account={account()}
+                chats={state.chats}
+                bots={state.bots}
+                activeChat={state.activeChat}
+                previews={state.previews}
+                statuses={chatStates()}
+                unread={state.unread}
+                attention={attentionEntries()}
+                attentionOpen={view() === "attention"}
+                view={view()}
+                activeBot={pageBotId()}
+                section={section()}
+                onSelect={(chat) => {
+                  setView("chats");
+                  // Choosing a Chat is a step of its own: the phone's history gets
+                  // an entry, so its system Back closes the Chat the way the
+                  // page's own Back does.
+                  remember({ chat: chat.id, view: "chats", section: null, bot: null });
+                  void selectChat(chat);
+                }}
+                onAttention={(entry) => openAttention(entry)}
+                onBot={(bot) => {
+                  // A Bot's page is a step deeper than the list it was opened from,
+                  // so the phone's history gets an entry for it.
+                  remember({
+                    chat: state.activeChat?.id ?? null,
+                    view: "bots",
+                    section: null,
+                    bot: bot.id,
+                  });
+                  void selectPageBot(bot);
+                }}
+                onSection={(next) => {
+                  setSection(next);
+                  setSectionOpen(true);
+                  // A section is a step inside its surface, so the phone's history
+                  // gets one for it: its system Back leaves the section for the
+                  // list of sections, the way the page's own Back does.
+                  remember({
+                    chat: state.activeChat?.id ?? null,
+                    view: "settings",
+                    section: next,
+                    bot: null,
+                  });
+                }}
+                onCreateBot={(name, computer) => createBot(name, computer)}
+                computers={state.computers}
+                canCreateBot={canCreateBot()}
+              />
+              <main class="main">
+                <Show when={showManage()}>
+                  <Show when={view() === "bots"}>
                     <Show
-                      when={needsSetup()}
+                      when={state.pageBot}
                       fallback={
                         <div class="select-chat">
-                          <h2>{t("select.title")}</h2>
+                          <h2>{t("bots.select.title")}</h2>
                         </div>
                       }
                     >
-                      <SetupView
-                        account={account()}
-                        providers={state.providers}
-                        models={state.models}
-                        bots={state.bots}
-                        busy={state.busy}
-                        error={errorText()}
-                        onProvider={(input) => void connectProvider(input)}
-                        onBot={(name) => void createBot(name)}
-                      />
+                      {(bot) => (
+                        <BotPage
+                          bot={bot()}
+                          computer={state.pageComputer}
+                          computers={state.computers}
+                          models={state.models}
+                          rules={state.rules}
+                          busy={state.managing}
+                          error={manageErrorText()}
+                          onBack={closeManage}
+                          onRename={(name) => renameBot(name)}
+                          onModel={(model, thinking) => saveBotModel(model, thinking)}
+                          onGrantAdd={(path) => grantFolder(path)}
+                          onGrantRemove={(path) => dropGrant(path)}
+                          onFullAccess={(on) => setFullAccess(on)}
+                          onMove={(computer) => moveBotTo(computer)}
+                          onReset={() => resetWorkspace()}
+                          onRuleAdd={(rule) => addRule(rule)}
+                          onRuleRemove={(rule) => removeRule(rule)}
+                        />
+                      )}
                     </Show>
-                  }
-                >
-                  <ChatView
-                    account={account()}
-                    bot={state.activeBot}
-                    computer={state.activeComputer}
-                    messages={state.messages}
-                    files={state.files}
-                    approvals={state.approvals}
-                    submitting={state.submitting}
-                    status={chatStatus()}
-                    queue={state.queue}
-                    busy={busyChat()}
-                    activity={shownActivity()}
-                    focus={focus()}
-                    focusMessage={focusMessage()}
-                    onFocused={() => {
-                      setFocus(null);
-                      setFocusMessage(null);
-                    }}
-                    deciding={state.deciding}
-                    error={errorText()}
-                    onSend={sendMessage}
-                    onDecide={decideApproval}
-                    onBack={closeChat}
-                  />
+                  </Show>
+                  <Show when={view() === "settings"}>
+                    <SettingsPage
+                      account={account()}
+                      providers={state.providers}
+                      models={state.models}
+                      computers={state.computers}
+                      bots={state.bots}
+                      vendors={state.vendors}
+                      catalog={state.catalog}
+                      section={section()}
+                      busy={state.managing}
+                      error={manageErrorText()}
+                      onBack={closeManage}
+                      onReset={(computer) => resetComputer(computer)}
+                      onOpenBot={(bot) => openBotPage(bot)}
+                      onConnect={(input) => connectVendor(input)}
+                      onRefresh={(provider) => refreshProviderModels(provider)}
+                      onDefault={(model) => makeDefaultModel(model)}
+                      onCatalog={() => refreshCatalog()}
+                    />
+                  </Show>
                 </Show>
-              </Show>
-            </main>
-          </div>
-        )}
+                <Show when={!showManage()}>
+                  <Show
+                    when={showChat() ? state.activeChat?.id : null}
+                    keyed
+                    fallback={
+                      <Show
+                        when={needsSetup()}
+                        fallback={
+                          <div class="select-chat">
+                            <h2>{t("select.title")}</h2>
+                          </div>
+                        }
+                      >
+                        <SetupView
+                          account={account()}
+                          providers={state.providers}
+                          models={state.models}
+                          bots={state.bots}
+                          busy={state.busy}
+                          error={errorText()}
+                          onProvider={(input) => void connectProvider(input)}
+                          onBot={(name) => void createBot(name)}
+                        />
+                      </Show>
+                    }
+                  >
+                    <ChatView
+                      account={account()}
+                      bot={state.activeBot}
+                      computer={state.activeComputer}
+                      messages={state.messages}
+                      files={state.files}
+                      approvals={state.approvals}
+                      submitting={state.submitting}
+                      status={chatStatus()}
+                      queue={state.queue}
+                      busy={busyChat()}
+                      activity={shownActivity()}
+                      focus={focus()}
+                      focusMessage={focusMessage()}
+                      onFocused={() => {
+                        setFocus(null);
+                        setFocusMessage(null);
+                      }}
+                      deciding={state.deciding}
+                      error={errorText()}
+                      onSend={sendMessage}
+                      onDecide={decideApproval}
+                      onBack={closeChat}
+                    />
+                  </Show>
+                </Show>
+              </main>
+            </div>
+          )}
         </Show>
       </Show>
     </Show>
@@ -2441,7 +2505,9 @@ const MAX_CURSOR = "9223372036854775807";
 
 function isCursor(value: string | null): value is string {
   if (!value || !/^(0|[1-9][0-9]*)$/.test(value)) return false;
-  return value.length < MAX_CURSOR.length || (value.length === MAX_CURSOR.length && value <= MAX_CURSOR);
+  return (
+    value.length < MAX_CURSOR.length || (value.length === MAX_CURSOR.length && value <= MAX_CURSOR)
+  );
 }
 
 function readCursor(): string | null {

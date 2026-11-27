@@ -5,10 +5,18 @@ import { fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
-import App from "./App";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
-import { button, drain, element, openChat, panelText, record, renderApp, useView } from "./test/view";
+import {
+  button,
+  drain,
+  element,
+  openChat,
+  panelText,
+  record,
+  renderApp,
+  useView,
+} from "./test/view";
 import type { Model, Rule } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
@@ -229,7 +237,9 @@ describe("App management", () => {
     // The second Model thinks less: it accepts no "high", so the Bot keeps the
     // nearest level it does accept.
     choose(view, "bot_model", "m2");
-    await waitFor(() => expect(field<HTMLSelectElement>(view, "bot_thinking").value).toBe("medium"));
+    await waitFor(() =>
+      expect(field<HTMLSelectElement>(view, "bot_thinking").value).toBe("medium"),
+    );
     press(view, "Save Model");
     await waitFor(() => expect(space.updates).toHaveLength(2));
     expect(space.updates[1]).toMatchObject({ model: "m2", thinking: "medium" });
@@ -245,7 +255,9 @@ describe("App management", () => {
     flush(() => fireEvent.click(element<HTMLButtonElement>(view, ".row__remove")));
     await waitFor(() => expect(space.updates).toHaveLength(1));
     expect(space.updates[0]).toMatchObject({ bot: "b1", grant_remove: "/data" });
-    await waitFor(() => expect(panelText(view, "Granted folders")).toContain("No folder is granted."));
+    await waitFor(() =>
+      expect(panelText(view, "Granted folders")).toContain("No folder is granted."),
+    );
 
     // A folder comes back through the form.
     type(view, "grant_path", "/data/project");
@@ -264,7 +276,9 @@ describe("App management", () => {
     // the Bot can read before the confirm button is pressed, not after.
     flush(() => fireEvent.click(fullAccess));
     expect(space.updates).toHaveLength(0);
-    await waitFor(() => expect(element(view, ".risk__text").textContent).toContain("read and change any file"));
+    await waitFor(() =>
+      expect(element(view, ".risk__text").textContent).toContain("read and change any file"),
+    );
     const risk = () => element(view, ".risk__text").textContent ?? "";
     // With the sandbox off the Bot can also read Neha's configuration
     // directory: the saved pairing, the machine's token, and CLI sessions.
@@ -304,13 +318,17 @@ describe("App management", () => {
     await waitFor(() => expect(button(view, "Reset Workspace")).toBeTruthy());
 
     // A Hosted Computer takes no granted folder and no full access.
-    expect(panelText(view, "Granted folders")).toContain("A Hosted Computer takes no granted folder.");
+    expect(panelText(view, "Granted folders")).toContain(
+      "A Hosted Computer takes no granted folder.",
+    );
     expect(panelText(view, "Full access")).toContain("full access does not apply");
     expect(view.container.querySelector('[name="full_access"]')).toBeNull();
 
     press(view, "Reset Workspace");
     expect(space.resets).toHaveLength(0);
-    await waitFor(() => expect(button(view, "Press again to reset").className).toContain("btn--danger"));
+    await waitFor(() =>
+      expect(button(view, "Press again to reset").className).toContain("btn--danger"),
+    );
 
     press(view, "Press again to reset");
     await waitFor(() => expect(space.resets).toEqual(["p1"]));
@@ -351,7 +369,9 @@ describe("App management", () => {
 
     flush(() => fireEvent.click(element<HTMLButtonElement>(view, ".row__remove")));
     await waitFor(() => expect(space.ruleRemoves).toEqual(["rule1"]));
-    await waitFor(() => expect(panelText(view, "Ask and Allow rules")).toContain("No rule is set."));
+    await waitFor(() =>
+      expect(panelText(view, "Ask and Allow rules")).toContain("No rule is set."),
+    );
 
     // A new rule names its effect, its tool, and what it covers. The tool comes
     // from the set every Bot has, so the page cannot name one the Space would
@@ -384,9 +404,11 @@ describe("App management", () => {
     // The page names the refusal where the change was asked for, and keeps the
     // Bot's own name.
     await waitFor(() => expect(space.asked).toContain("bot_update"));
-    await waitFor(() => expect(element(view, '[role="alert"]').textContent).toBe(
-      "This Space does not allow that change.",
-    ));
+    await waitFor(() =>
+      expect(element(view, '[role="alert"]').textContent).toBe(
+        "This Space does not allow that change.",
+      ),
+    );
     await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Scout"));
   });
 
@@ -449,7 +471,9 @@ describe("App management", () => {
 
     press(view, "Make default");
     await waitFor(() => expect(space.defaults).toEqual(["m2"]));
-    await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Default Model saved"));
+    await waitFor(() =>
+      expect(element(view, ".page__note").textContent).toBe("Default Model saved"),
+    );
     // The default moved to the Model that was chosen.
     await waitFor(() => {
       const after = view.container.querySelectorAll(".row");
@@ -528,15 +552,21 @@ describe("App management", () => {
 
     // The Providers are empty until one is connected.
     flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-    await waitFor(() => expect(element(view, ".side-empty__title").textContent).toBe("No Provider yet"));
+    await waitFor(() =>
+      expect(element(view, ".side-empty__title").textContent).toBe("No Provider yet"),
+    );
 
     // So are the Models, which come with them.
     flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
-    await waitFor(() => expect(element(view, ".side-empty__title").textContent).toBe("No Model yet"));
+    await waitFor(() =>
+      expect(element(view, ".side-empty__title").textContent).toBe("No Model yet"),
+    );
 
     // A Space with no Bot has no Bot page to open.
     flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
-    await waitFor(() => expect(element(view, ".side-empty__title").textContent).toBe("No Bots yet"));
+    await waitFor(() =>
+      expect(element(view, ".side-empty__title").textContent).toBe("No Bots yet"),
+    );
     expect(view.container.querySelector(".page__body")).toBeNull();
   });
 
@@ -999,7 +1029,9 @@ describe("App management", () => {
     space.computer.sandboxed = null;
     const view = await openSettings("Computers");
 
-    expect(panelText(view, "Computers")).toContain("Waiting for this Computer to say what it allows");
+    expect(panelText(view, "Computers")).toContain(
+      "Waiting for this Computer to say what it allows",
+    );
     expect(panelText(view, "Computers")).not.toContain("Shell runs as the machine user");
     expect(panelText(view, "Computers")).not.toContain("Only its Workspace");
     await drain();
@@ -1165,7 +1197,9 @@ describe("App management", () => {
     // rule, so the rule is what the page holds.
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
-    expect(narrow).toMatch(/\.page__head\s*\{[^}]*padding-top:\s*calc\([^;]*env\(safe-area-inset-top/);
+    expect(narrow).toMatch(
+      /\.page__head\s*\{[^}]*padding-top:\s*calc\([^;]*env\(safe-area-inset-top/,
+    );
   });
 
   it("takes a grant away from a Computer that takes no new one", async () => {

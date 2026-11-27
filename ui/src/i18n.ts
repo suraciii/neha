@@ -95,7 +95,8 @@ const en = {
   "notify.loading": "Checking notifications…",
   "notify.error": "The notification setting could not be changed.",
   "notify.close": "Close",
-  "notify.hint": "A Bot finished a run or waits for your approval. The notification opens its Chat.",
+  "notify.hint":
+    "A Bot finished a run or waits for your approval. The notification opens its Chat.",
 
   "attention.title": "Needs attention",
   "attention.count.one": "1 approval waiting",
@@ -192,8 +193,8 @@ const en = {
   "chat.approval.undo.unknown": "It is not known whether this action can be undone.",
   "chat.approval.lastingScope": "Always allow covers: {scope}",
   "chat.approval.cwd": "in {path}",
-  "chat.approval.scope.shell": "shell commands starting with \"{command}\"",
-  "chat.approval.scope.files": "files under \"{path}\"",
+  "chat.approval.scope.shell": 'shell commands starting with "{command}"',
+  "chat.approval.scope.files": 'files under "{path}"',
   "chat.approval.scope.root": "files in the Workspace root",
   "chat.approval.showFull": "Show full action",
   "chat.approval.showLess": "Show less",
@@ -225,7 +226,8 @@ const en = {
   "bots.new": "New Bot",
   "bots.new.computer": "Computer",
   "bots.new.computer.offline": "An offline Computer cannot take a new Bot yet.",
-  "bots.new.noProvider": "This Space has no Provider yet, so it has no Model for a Bot to work with.",
+  "bots.new.noProvider":
+    "This Space has no Provider yet, so it has no Model for a Bot to work with.",
   "bots.select.title": "Select a Bot to open its page.",
 
   "common.cancel": "Cancel",
@@ -301,10 +303,10 @@ const en = {
     "With full access on, the Bot may read and change any file this Computer's user can reach, including files outside its Workspace. It can also read Neha's configuration directory, ~/.config/neha by default, which holds the saved pairing, the machine's token, and CLI sessions. Turn it on only for a Computer you trust.",
   "bot.fullAccess.confirm": "Turn on full access",
   "bot.fullAccess.on": "Full access is on.",
-  "bot.fullAccess.hosted": "A Hosted Computer works only in its Workspace, so full access does not apply.",
+  "bot.fullAccess.hosted":
+    "A Hosted Computer works only in its Workspace, so full access does not apply.",
   "bot.rules.empty": "No rule is set.",
-  "bot.rules.hosted":
-    "A Hosted Computer applies no Ask or Allow rule, so none can be set here.",
+  "bot.rules.hosted": "A Hosted Computer applies no Ask or Allow rule, so none can be set here.",
   "bot.rules.hint":
     "A rule names a kind of action. Ask makes the Bot ask first; Allow lets it run.",
   "bot.rules.effect": "Effect",
@@ -338,7 +340,8 @@ const en = {
   "settings.models.empty.text": "Connect a Provider and its Models appear here.",
   "settings.models.default": "Space default",
   "settings.models.empty.provider": "This Provider offers no Models yet.",
-  "settings.models.setDefault.noTools": "This Model cannot call tools, so it cannot be the default.",
+  "settings.models.setDefault.noTools":
+    "This Model cannot call tools, so it cannot be the default.",
   "settings.models.setDefault": "Make default",
   "settings.models.setDefault.done": "Default Model saved",
   "settings.catalog.hint":
@@ -355,7 +358,8 @@ const en = {
 
   "settings.computers.hint": "Every Computer this Space can use.",
   "settings.computers.empty.title": "No Computer yet",
-  "settings.computers.empty.text": "Pair this machine, or let the Space make a Hosted one for a Bot.",
+  "settings.computers.empty.text":
+    "Pair this machine, or let the Space make a Hosted one for a Bot.",
   "settings.computers.bots.none": "No Bot works here",
   "settings.computers.reset.done": "Workspace cleared",
   "settings.computers.access.none": "Only its Workspace",
@@ -399,7 +403,8 @@ const zh: Record<MessageKey, string> = {
   "auth.fine": "你的会话保存在这个客户端里。",
 
   "desktop.title": "选择 Space 所在的位置。",
-  "desktop.lede": "在这台电脑上运行 Neha，或打开一个已有的 Space。两者使用同一个客户端和同一次登录。",
+  "desktop.lede":
+    "在这台电脑上运行 Neha，或打开一个已有的 Space。两者使用同一个客户端和同一次登录。",
   "desktop.point.local": "Space 在这台电脑上",
   "desktop.point.remote": "Space 已经在你手里",
   "desktop.point.login": "正常登录一次",
@@ -560,8 +565,8 @@ const zh: Record<MessageKey, string> = {
   "chat.approval.undo.unknown": "这个操作能否撤销尚不清楚。",
   "chat.approval.lastingScope": "始终允许的范围：{scope}",
   "chat.approval.cwd": "在 {path}",
-  "chat.approval.scope.shell": "以 \"{command}\" 开头的 shell 命令",
-  "chat.approval.scope.files": "\"{path}\" 下的文件",
+  "chat.approval.scope.shell": '以 "{command}" 开头的 shell 命令',
+  "chat.approval.scope.files": '"{path}" 下的文件',
   "chat.approval.scope.root": "Workspace 根目录下的文件",
   "chat.approval.showFull": "显示完整动作",
   "chat.approval.showLess": "收起",

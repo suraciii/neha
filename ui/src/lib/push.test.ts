@@ -40,12 +40,12 @@ describe("push capability", () => {
   });
 
   it("recognizes an iPad that reports a Mac platform", () => {
-    expect(isIos({ userAgent: "Mozilla/5.0 (Macintosh)", platform: "MacIntel", maxTouchPoints: 5 })).toBe(
-      true,
-    );
-    expect(isIos({ userAgent: "Mozilla/5.0 (Macintosh)", platform: "MacIntel", maxTouchPoints: 0 })).toBe(
-      false,
-    );
+    expect(
+      isIos({ userAgent: "Mozilla/5.0 (Macintosh)", platform: "MacIntel", maxTouchPoints: 5 }),
+    ).toBe(true);
+    expect(
+      isIos({ userAgent: "Mozilla/5.0 (Macintosh)", platform: "MacIntel", maxTouchPoints: 0 }),
+    ).toBe(false);
   });
 
   it("is unsupported without a worker or push APIs", () => {
