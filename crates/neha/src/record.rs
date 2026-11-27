@@ -326,6 +326,24 @@ mod tests {
     use crate::id::Id;
 
     #[test]
+    fn a_credential_holds_only_what_a_bearer_token_takes() {
+        for token in ["abc", "token-1", "a.b_c~d+e/f==", "A1"] {
+            assert!(McpServerAdded::valid_credential(token), "{token}");
+        }
+        for token in [
+            "",
+            "two words",
+            "quote\"inside",
+            "back\\slash",
+            "line\nbreak",
+            "###",
+            "===",
+        ] {
+            assert!(!McpServerAdded::valid_credential(token), "{token}");
+        }
+    }
+
+    #[test]
     fn a_server_url_names_an_address_this_space_may_call() {
         for url in [
             "https://example.com/mcp",
@@ -2136,6 +2154,22 @@ pub struct McpServerAdded {
 }
 
 impl McpServerAdded {
+    /// Whether a token is one this Space stores as an MCP credential.
+    ///
+    /// The alphabet is the one a bearer token takes (RFC 6750 `b64token`), so
+    /// a token cannot hide from a text search through JSON string escaping.
+    #[must_use]
+    pub fn valid_credential(token: &str) -> bool {
+        let bytes = token.as_bytes();
+        !bytes.is_empty()
+            && bytes.len() <= 8192
+            && bytes.iter().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+            })
+            && bytes.iter().rev().take_while(|byte| **byte == b'=').count() <= 2
+    }
+
     /// Whether the name follows the Plugin naming rule.
     #[must_use]
     pub fn valid_name(name: &str) -> bool {

@@ -1070,6 +1070,11 @@ async fn mcp_add(
                 "connecting a server with your own credential needs one",
             ));
         };
+        if !neha::record::McpServerAdded::valid_credential(&credential) {
+            return Err(ApiError::invalid_argument(
+                "an MCP credential holds only the characters a bearer token takes",
+            ));
+        }
         context
             .secrets
             .store_mcp_credential(existing.server, Some(account.id), &credential)
@@ -4777,7 +4782,10 @@ fn prepare_resume(
         ));
     }
     let approved = &reply.calls[done];
-    if approved.tool != approval.tool || approved.arguments != approval.arguments {
+    if approved.tool != approval.tool
+        || approved.server != approval.server
+        || approved.arguments != approval.arguments
+    {
         return Err(ApiError::internal(
             "the approval does not name its position's call",
         ));
@@ -4791,6 +4799,8 @@ fn prepare_resume(
             .map(|call| LoopCall {
                 call: call.call.clone(),
                 tool: recorded_model_name(mcp, call),
+                server: call.server,
+                tool_name: call.server.map(|_| call.tool.clone()),
                 arguments: call.arguments.clone(),
                 refused: call.refused.clone(),
             })
@@ -4956,7 +4966,7 @@ pub(crate) fn prepare_recovery(
         return Err(format!("step {next_step} has more actions than calls"));
     }
     for (call, action) in reply.calls.iter().zip(&actions) {
-        if action.tool != call.tool || action.arguments != call.arguments {
+        if !call_matches_action(action, call, mcp) {
             return Err(format!(
                 "step {next_step}'s actions do not line up with its calls"
             ));
@@ -5010,7 +5020,7 @@ pub(crate) fn prepare_recovery(
         })));
     }
     for (call, action) in reply.calls.iter().zip(&actions) {
-        if action.tool != call.tool || action.arguments != call.arguments {
+        if !call_matches_action(action, call, mcp) {
             return Err(format!(
                 "step {next_step}'s actions do not line up with its calls"
             ));
@@ -5027,6 +5037,8 @@ pub(crate) fn prepare_recovery(
         .map(|call| LoopCall {
             call: call.call.clone(),
             tool: recorded_model_name(mcp, call),
+            server: call.server,
+            tool_name: call.server.map(|_| call.tool.clone()),
             arguments: call.arguments.clone(),
             refused: call.refused.clone(),
         })
@@ -5765,11 +5777,11 @@ impl McpCatalog {
 /// no name gets a syntactic name no run offers, and the run refuses it.
 fn recorded_model_name(mcp: &McpCatalog, call: &neha::record::RecordedCall) -> String {
     if let Some(server) = call.server {
-        if let Some(name) = mcp.model_name(server, &call.tool) {
-            return name.to_owned();
-        }
         if let Some(name) = &call.model_name {
             return name.clone();
+        }
+        if let Some(name) = mcp.model_name(server, &call.tool) {
+            return name.to_owned();
         }
         let digest = crate::blobs::digest(format!("{server}/{}", call.tool).as_bytes());
         return format!("mcp__unavailable__{}", &digest[..16]);
@@ -5790,7 +5802,7 @@ fn call_matches_action(
         return false;
     }
     if action.server.is_some() {
-        return action.tool == call.tool;
+        return action.server == call.server && action.tool == call.tool;
     }
     action.tool == call.tool || action.tool == recorded_model_name(mcp, call)
 }
@@ -5877,11 +5889,23 @@ fn mcp_declaration_fits(tool: &crate::mcp::McpTool) -> bool {
 }
 
 /// Whether a tool declaration would carry a credential into a model request.
+///
+/// The schema is searched as decoded JSON: a token that JSON would escape
+/// must not pass a check that reads the serialized text.
 fn declaration_carries(tool: &crate::mcp::McpTool, credential: &str) -> bool {
-    let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+    fn holds(value: &Value, credential: &str) -> bool {
+        match value {
+            Value::String(text) => text.contains(credential),
+            Value::Array(items) => items.iter().any(|item| holds(item, credential)),
+            Value::Object(entries) => entries
+                .iter()
+                .any(|(key, entry)| key.contains(credential) || holds(entry, credential)),
+            _ => false,
+        }
+    }
     tool.name.contains(credential)
         || tool.description.contains(credential)
-        || schema.contains(credential)
+        || holds(&tool.input_schema, credential)
 }
 
 /// The tools a run offers: the built-in ones, a skill's, and a server's.
@@ -6219,6 +6243,22 @@ struct RunRecorder<'a> {
     identities: HashMap<Id, (String, Option<Id>)>,
 }
 
+/// Whether the tool now offering a name is the one the call was made for.
+///
+/// A call that names no server (a fresh call) matches any; a call a reply
+/// kept an identity for matches only that server and that original tool.
+fn mcp_call_identity_matches(call: &LoopCall, tool: &ExposedMcpTool) -> bool {
+    let Some(server) = call.server else {
+        return true;
+    };
+
+    tool.server == server
+        && call
+            .tool_name
+            .as_deref()
+            .is_none_or(|name| name == tool.tool)
+}
+
 /// Decides one call of a tool an MCP server gives the Bot.
 ///
 /// The first call for the Bot and the acting User always asks; a lasting
@@ -6431,8 +6471,16 @@ impl Recorder for RunRecorder<'_> {
             ));
         }
         // A tool an MCP server gives the Bot has its own first-call consent and
-        // its own rules, whatever Computer runs the Bot.
+        // its own rules, whatever Computer runs the Bot. A call a reply was
+        // made for one server may not run on a replacement under the same
+        // name: the identity the reply kept must still be the one offering it.
         if let Some(tool) = self.mcp.get(&call.tool).cloned() {
+            if !mcp_call_identity_matches(call, &tool) {
+                return Ok(neha_loop::Authorization::Refuse(format!(
+                    "the MCP server the call was made for no longer offers {:?}",
+                    call.tool_name.as_deref().unwrap_or(&call.tool)
+                )));
+            }
             return approve_mcp(self, step, call, action, &tool).await;
         }
         let plan = {
@@ -6612,7 +6660,7 @@ impl Recorder for RunRecorder<'_> {
     async fn authorized_action(
         &mut self,
         action: Id,
-        _call: &LoopCall,
+        call: &LoopCall,
     ) -> Result<neha_loop::Dispatched, LoopError> {
         let state = self
             .log
@@ -6627,6 +6675,18 @@ impl Recorder for RunRecorder<'_> {
             return Ok(neha_loop::Dispatched::default());
         };
         if let Some(server) = approval.server {
+            // The answer names one server's tool. A replay whose call now
+            // resolves to another server must not borrow that answer.
+            if call.server.is_some_and(|known| known != server)
+                || call
+                    .tool_name
+                    .as_deref()
+                    .is_some_and(|name| name != approval.tool)
+            {
+                return Err(LoopError::Record(
+                    "the answer names a server's tool the call no longer names".to_owned(),
+                ));
+            }
             return Ok(neha_loop::Dispatched {
                 script: None,
                 mcp: Some(neha_loop::McpIdentity {
@@ -7983,7 +8043,7 @@ mod tests {
             call: "call-1".to_owned(),
             tool: tool.to_owned(),
             arguments,
-            refused: None,
+            ..LoopCall::default()
         }
     }
 
@@ -8439,6 +8499,38 @@ mod tests {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-'),
             "a provider takes this name: {name}"
         );
+    }
+
+    #[test]
+    fn a_pending_call_matches_only_the_server_it_was_made_for() {
+        let server = Id::new();
+        let other = Id::new();
+        let tool = super::ExposedMcpTool {
+            model_name: "mcp__docs__search".to_owned(),
+            server,
+            server_name: "docs".to_owned(),
+            tool: "search".to_owned(),
+            description: String::new(),
+            input_schema: json!({"type": "object"}),
+        };
+        let mut call = super::LoopCall {
+            tool: "mcp__docs__search".to_owned(),
+            server: Some(server),
+            tool_name: Some("search".to_owned()),
+            ..super::LoopCall::default()
+        };
+        assert!(super::mcp_call_identity_matches(&call, &tool));
+        // A replacement registered under the same name is another server.
+        call.server = Some(other);
+        assert!(!super::mcp_call_identity_matches(&call, &tool));
+        // The same server offering another tool under that name is another tool.
+        call.server = Some(server);
+        call.tool_name = Some("other".to_owned());
+        assert!(!super::mcp_call_identity_matches(&call, &tool));
+        // A fresh call names no server and takes the only tool offering its name.
+        call.server = None;
+        call.tool_name = None;
+        assert!(super::mcp_call_identity_matches(&call, &tool));
     }
 
     #[test]

@@ -133,12 +133,19 @@ pub struct Resume {
 }
 
 /// A tool call as the record keeps it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordedCall {
     /// The identifier the call's tool result answers under; see [`call_id`].
     pub call: String,
     /// The tool's name.
     pub tool: String,
+    /// The MCP server the call names, when the record kept one.
+    ///
+    /// A replay pins the server: a replacement registered under the same name
+    /// must never run a call the answer was made for another server.
+    pub server: Option<Id>,
+    /// The tool's original name in that server.
+    pub tool_name: Option<String>,
     /// The Model's arguments as JSON; a refused call too large to keep is
     /// summarized instead.
     pub arguments: Value,
@@ -590,6 +597,8 @@ fn step_calls(
                 recorded: RecordedCall {
                     call: call_id(&call.id, step, index),
                     tool: call.name.clone(),
+                    server: None,
+                    tool_name: None,
                     arguments: recorded_arguments(&parsed, &call.arguments),
                     refused: parsed.as_ref().err().cloned(),
                 },
@@ -1042,7 +1051,7 @@ mod tests {
             call: id.to_owned(),
             tool: tool.to_owned(),
             arguments,
-            refused: None,
+            ..RecordedCall::default()
         }
     }
 

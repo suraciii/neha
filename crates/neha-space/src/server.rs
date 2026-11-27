@@ -19489,4 +19489,63 @@ mod tests {
         other_task.abort();
         running.shutdown().await;
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replacement_server_never_runs_a_pending_call() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (old_url, _old_log, old_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "old"}]})).await;
+        let old = add_mcp_server(&mut socket, "docs", &old_url, Some("token-1")).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server: old },
+        )
+        .await;
+        let run = run_of(&submit(&mut socket, chat, "search", None).await);
+        wait_status(&mut socket, run, "waiting").await;
+        // The server the card was made for leaves, and a new one takes its name.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpRemove { server: old },
+        )
+        .await;
+        let (new_url, new_log, new_task) =
+            fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "new"}]})).await;
+        let new = add_mcp_server(&mut socket, "docs", &new_url, Some("token-2")).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server: new },
+        )
+        .await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["server"], json!(old));
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        assert!(
+            new_log
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|message| message["method"] != "tools/call"),
+            "a replacement server is sent no call the answer was not made for"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        old_task.abort();
+        new_task.abort();
+        running.shutdown().await;
+    }
 }
