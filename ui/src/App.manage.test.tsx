@@ -707,6 +707,28 @@ describe("App management", () => {
     await waitFor(() => expect(panelText(view, "Computers")).toContain("/w"));
   });
 
+  it("names every Computer it lists, even one with no workspace", async () => {
+    // A Computer the User paired does not always name a workspace, and the
+    // leading part of a time-ordered identifier is the time it was made: two
+    // machines paired within one window begin it alike. The row is named by the
+    // whole identifier, so neither of them is a blank the other matches.
+    space.computer.id = "019a3f2c-1111-7aaa-8bbb-000000000001";
+    space.otherComputer.id = "019a3f2c-2222-7aaa-8bbb-000000000002";
+    space.computer.workspace = "";
+    space.otherComputer.workspace = "";
+    const view = await openSettings("Computers");
+
+    const names = Array.from(view.container.querySelectorAll(".rows .row__name")).map(
+      (row) => row.textContent,
+    );
+    expect(names).toEqual([
+      "Local Computer 019a3f2c-1111-7aaa-8bbb-000000000001",
+      // The label also says this one is offline, which is the row's own line too.
+      "Local Computer 019a3f2c-2222-7aaa-8bbb-000000000002 · Offline",
+      "Hosted Computer p5 · /hosted",
+    ]);
+  });
+
   it("resets a Hosted Computer from the Computers list", async () => {
     space.bot.computer = "p1";
     const view = await openSettings("Computers");

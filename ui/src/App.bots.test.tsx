@@ -195,8 +195,7 @@ describe("App bots", () => {
     await openNewBot(view, "");
 
     const option = element<HTMLOptionElement>(view, `[name="bot_computer"] option[value="${space.computer.id}"]`);
-    expect(option.textContent).toContain(space.computer.id.slice(0, 8));
-    expect(option.textContent).toContain("Local Computer");
+    expect(option.textContent).toBe(`Local Computer ${space.computer.id}`);
     expect(option.disabled).toBe(false);
   });
 
@@ -208,7 +207,7 @@ describe("App bots", () => {
     await openNewBot(view, "");
 
     const option = element<HTMLOptionElement>(view, `[name="bot_computer"] option[value="${space.computer.id}"]`);
-    expect(option.textContent).toContain("Offline");
+    expect(option.textContent).toBe("Local Computer p1 · /w · Offline");
     expect(option.disabled).toBe(true);
     // The list says why it cannot be chosen.
     expect(element(view, ".field__hint").textContent).toContain("offline Computer");
@@ -219,6 +218,46 @@ describe("App bots", () => {
     flush(() => fireEvent.click(pressed(view, "Create Bot")));
     await waitFor(() =>
       expect(frames("bot_create")).toEqual([{ name: "bot_create", args: { name: "Nova" } }]),
+    );
+  });
+
+  it("tells two Computers apart when their identifiers begin alike", async () => {
+    // The leading part of a time-ordered identifier is the time it was made, so
+    // two machines paired within one window begin it alike, and a paired record
+    // may name no workspace: the label says which is which the whole way, so
+    // neither can be mistaken for the other.
+    space.computer.id = "019a3f2c-1111-7aaa-8bbb-000000000001";
+    space.otherComputer.id = "019a3f2c-2222-7aaa-8bbb-000000000002";
+    space.computer.workspace = "";
+    space.otherComputer.workspace = "";
+    space.otherComputer.online = true;
+    const view = await openBotsList();
+    await openNewBot(view, "");
+
+    // Each Computer is named by its own identifier, so no two read the same.
+    const offered = () =>
+      Array.from(
+        view.container.querySelectorAll<HTMLOptionElement>('[name="bot_computer"] option'),
+      ).filter((option) => option.value !== "");
+    expect(offered().map((option) => option.textContent)).toEqual([
+      `Local Computer ${space.computer.id}`,
+      `Local Computer ${space.otherComputer.id}`,
+    ]);
+
+    // Either one can be chosen, and the one chosen is the one that travels.
+    flush(() =>
+      fireEvent.change(element<HTMLSelectElement>(view, '[name="bot_computer"]'), {
+        target: { value: space.otherComputer.id },
+      }),
+    );
+    flush();
+    type(view, "bot_name", "Nova");
+    await readyToCreate(view);
+    flush(() => fireEvent.click(pressed(view, "Create Bot")));
+    await waitFor(() =>
+      expect(frames("bot_create")).toEqual([
+        { name: "bot_create", args: { name: "Nova", computer: space.otherComputer.id } },
+      ]),
     );
   });
 
@@ -393,7 +432,7 @@ describe("App bots", () => {
       reloaded,
       `[name="bot_computer"] option[value="${space.computer.id}"]`,
     );
-    expect(option.textContent).toContain(space.computer.id.slice(0, 8));
+    expect(option.textContent).toBe("Local Computer p1 · /w");
     await drain();
   });
 });
