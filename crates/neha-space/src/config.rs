@@ -24,6 +24,16 @@ pub struct Config {
     pub storage: Storage,
     /// Where the model catalog comes from and how long it stays fresh.
     pub catalog: CatalogConfig,
+    /// What the Space does with the scripts a skill carries.
+    pub skills: SkillsConfig,
+}
+
+/// What the Space does with the scripts a skill carries.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SkillsConfig {
+    /// Whether the Space treats skills as instructions only, so the scripts of
+    /// a skill never reach a Computer.
+    pub instructions_only: bool,
 }
 
 /// The models.dev catalog.
@@ -64,6 +74,9 @@ impl Config {
         Ok(Self {
             storage: document.storage.into_storage()?,
             catalog: document.catalog.into_catalog()?,
+            skills: SkillsConfig {
+                instructions_only: document.skills.instructions_only.unwrap_or(false),
+            },
         })
     }
 }
@@ -120,6 +133,16 @@ struct Document {
     storage: StorageSettings,
     #[serde(default)]
     catalog: CatalogSettings,
+    #[serde(default)]
+    skills: SkillsSettings,
+}
+
+/// The `[skills]` section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillsSettings {
+    /// Whether skills are instructions only, so their scripts never run.
+    instructions_only: Option<bool>,
 }
 
 /// The `[catalog]` section, before its values are checked against each other.

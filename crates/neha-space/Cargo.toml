@@ -23,6 +23,7 @@ reqwest = { workspace = true, default-features = false, features = ["json", "rus
 serde = { workspace = true, features = ["derive"] }
 sha2 = "0.10"
 serde_json.workspace = true
+serde_norway = "0.9.42"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
 subtle = "2"
 thiserror.workspace = true

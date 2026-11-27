@@ -50,12 +50,9 @@ const MAX_SCRIPT_ARGUMENT_BYTES: usize = 4 * 1024;
 /// The file mode a real-machine write keeps: private to the machine user.
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
-/// The file mode a skill script is written with, so the shell can execute it.
-/// Windows has no execute bit, so a script there keeps the mode its write has.
+/// Staged scripts are readable and executable only by their owner.
 #[cfg(unix)]
-const SCRIPT_MODE: Option<u32> = Some(0o755);
-#[cfg(not(unix))]
-const SCRIPT_MODE: Option<u32> = None;
+const SCRIPT_MODE: Option<u32> = Some(0o500);
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// The system directories a shell searches for its commands.
 const SHELL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -1191,12 +1188,48 @@ impl LocalRuntime {
         }
         // Every check passes before a byte is written, so a refused script
         // leaves the Workspace as it was.
-        if let Err(error) = self.write_to_root(&script_path(name), content.as_bytes(), SCRIPT_MODE)
+        #[cfg(windows)]
         {
-            return ActionResult::failed(error.to_string());
+            ActionResult::failed("a skill script cannot run on a Windows Computer yet")
         }
-
-        self.shell(&script_command(name, arguments)).await
+        #[cfg(all(not(unix), not(windows)))]
+        {
+            ActionResult::failed("a skill script cannot run on this platform yet")
+        }
+        #[cfg(unix)]
+        {
+            let filename = staged_script_name(name);
+            let relative = Path::new(".neha/skills").join(&filename);
+            let path = self.root.join(&relative);
+            let Some(host_path) = path.to_str() else {
+                return ActionResult::failed("the script path is not valid UTF-8");
+            };
+            if let Err(error) = self.write_to_root(host_path, content.as_bytes(), SCRIPT_MODE) {
+                return ActionResult::failed(error.to_string());
+            }
+            // Keep the parent descriptor for cleanup. The script itself (or a
+            // concurrent writer) may rename the directory while the shell runs.
+            let staged = match StagedScript::open(self, &filename) {
+                Ok(staged) => staged,
+                Err(error) => {
+                    return ActionResult::failed(format!(
+                        "cannot open the staged script directory: {error}"
+                    ));
+                }
+            };
+            // Hosted mounts this same directory at /workspace in its rootfs.
+            let command = if self.hosted.is_some() {
+                script_command(
+                    &Path::new(HOSTED_WORKSPACE).join(relative).to_string_lossy(),
+                    arguments,
+                )
+            } else {
+                script_command(host_path, arguments)
+            };
+            let result = self.shell(&command).await;
+            drop(staged);
+            result
+        }
     }
 
     /// Lists one directory of a real machine through the descriptor it opened.
@@ -2270,41 +2303,65 @@ fn check_script_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The path one skill script is written under, inside the Workspace.
-fn script_path(name: &str) -> String {
-    format!(".neha/skills/{name}")
+/// Keep the staging component within the same byte limit as a script name.
+#[cfg(unix)]
+fn staged_script_name(name: &str) -> String {
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let counter = NEXT.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let suffix = format!(".{counter}-{pid}-{nanos}");
+    let prefix = &name[..name.floor_char_boundary(MAX_SCRIPT_NAME_BYTES - suffix.len())];
+    format!("{prefix}{suffix}")
 }
 
-/// Builds the shell line that runs one skill script with its arguments.
-///
-/// The shell starts in the Workspace, so the script is named by its path
-/// inside it. Every word of a POSIX line is single-quoted; a Windows line
-/// keeps the path form `cmd.exe` accepts and double-quotes each argument.
-#[cfg(not(windows))]
-fn script_command(name: &str, arguments: &[String]) -> String {
-    let mut command = single_quoted(&script_path(name));
+/// Unlink only in the directory opened before the command started, even if
+/// the command renames it. Dropping a cancelled action also cleans up.
+#[cfg(unix)]
+struct StagedScript {
+    directory: std::fs::File,
+    filename: std::ffi::CString,
+}
+
+#[cfg(unix)]
+impl StagedScript {
+    fn open(runtime: &LocalRuntime, filename: &str) -> std::io::Result<Self> {
+        let root = match &runtime.mode {
+            Mode::Machine { folder, .. } if !runtime.full_access => folder.try_clone()?,
+            _ => open_directory_path(&runtime.root)?,
+        };
+        let neha = open_directory_at(&root, OsStr::new(".neha"))?;
+        let directory = open_directory_at(&neha, OsStr::new("skills"))?;
+        Ok(Self {
+            directory,
+            filename: std::ffi::CString::new(filename)?,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StagedScript {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd as _;
+        // SAFETY: the descriptor is live and filename is one NUL-terminated component.
+        unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.filename.as_ptr(), 0) };
+    }
+}
+
+/// Quotes the absolute path and each argument for the runtime's POSIX shell.
+#[cfg(unix)]
+fn script_command(path: &str, arguments: &[String]) -> String {
+    let mut command = single_quoted(path);
     for argument in arguments {
         command.push(' ');
         command.push_str(&single_quoted(argument));
     }
-
-    command
-}
-
-#[cfg(windows)]
-fn script_command(name: &str, arguments: &[String]) -> String {
-    let path = format!(".neha\\skills\\{name}");
-    // A path that needs no quotes stays bare: PowerShell would only echo a
-    // lone quoted string instead of running it.
-    let mut command = if path.contains([' ', '"']) {
-        format!("\"{}\"", path.replace('"', "\"\""))
-    } else {
-        path
-    };
-    for argument in arguments {
-        command.push_str(&format!(" \"{}\"", argument.replace('"', "\"\"")));
-    }
-
     command
 }
 
@@ -3814,35 +3871,99 @@ mod tests {
             "{}",
             result.output.text
         );
-        assert!(
-            runtime
-                .workspace()
-                .join(".neha/skills/echo-args.sh")
-                .is_file()
-        );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_skill_script_is_written_executable_inside_the_workspace() {
+    async fn managed_skill_scripts_stage_in_the_workspace_and_clean_up_after_each_run() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let (_dir, runtime) = runtime();
+        let project = tempfile::tempdir().unwrap();
+        let runtime = runtime
+            .with_working_dir(project.path().to_str().unwrap())
+            .unwrap();
+        let content = "#!/bin/sh\ncp -p \"$0\" \"$1/copy\" && printf '%s' \"$0\" > \"$1/path\" || exit 2\nexit \"$2\"\n# trailing bytes: é  ";
+        let mut previous = None;
+        for (exit, expected) in [("0", ActionStatus::Succeeded), ("1", ActionStatus::Failed)] {
+            let observation = tempfile::tempdir().unwrap();
+            let result = runtime
+                .execute(Action::RunScript {
+                    name: "é".repeat(MAX_SCRIPT_NAME_BYTES / 2),
+                    content: content.to_owned(),
+                    arguments: vec![
+                        observation.path().to_str().unwrap().to_owned(),
+                        exit.to_owned(),
+                    ],
+                })
+                .await;
+            assert_eq!(result.status, expected, "{result:?}");
+            let copy = observation.path().join("copy");
+            assert_eq!(std::fs::read(&copy).unwrap(), content.as_bytes());
+            assert_eq!(
+                std::fs::metadata(copy).unwrap().permissions().mode() & 0o777,
+                0o500
+            );
+            let path = std::path::PathBuf::from(
+                std::fs::read_to_string(observation.path().join("path")).unwrap(),
+            );
+            assert_eq!(
+                path.parent().unwrap(),
+                runtime.workspace().join(".neha/skills")
+            );
+            assert!(!path.exists());
+            assert_ne!(previous.as_ref(), Some(&path));
+            previous = Some(path);
+        }
+        assert!(!project.path().join(".neha").exists());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_refuses_skill_scripts_before_staging() {
+        let (_dir, runtime) = runtime();
         let result = runtime
             .execute(Action::RunScript {
-                name: "mode.sh".to_owned(),
-                content: "#!/bin/sh\ntrue\n".to_owned(),
+                name: "test.cmd".to_owned(),
+                content: "echo yes".to_owned(),
                 arguments: Vec::new(),
             })
             .await;
+        assert_eq!(result.status, ActionStatus::Failed);
+        assert_eq!(
+            result.output.text,
+            "a skill script cannot run on a Windows Computer yet"
+        );
+        assert!(!runtime.workspace().join(".neha").exists());
+    }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_skill_scripts_use_the_mounted_workspace() {
+        let Some((_dir, runtime)) = hosted_runtime() else {
+            return;
+        };
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "where.sh".to_owned(),
+                content: "#!/bin/sh\nprintf '%s' \"$0\"".to_owned(),
+                arguments: Vec::new(),
+            })
+            .await;
         assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
-        let script = runtime.workspace().join(".neha/skills/mode.sh");
-        let mode = std::fs::metadata(&script)
-            .expect("the script is written inside the Workspace")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755, "{script:?}");
+        assert!(
+            result
+                .output
+                .text
+                .contains("/workspace/.neha/skills/where.sh."),
+            "{result:?}"
+        );
+        assert_eq!(
+            std::fs::read_dir(runtime.workspace().join(".neha/skills"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -4643,23 +4764,26 @@ mod tests {
         let Some((_dir, runtime)) = machine_runtime() else {
             return;
         };
+        let project = outside_tempdir();
+        let runtime = runtime
+            .with_machine_access(false, &[], project.path().to_str())
+            .unwrap();
         let result = runtime
             .execute(Action::RunScript {
                 name: "where.sh".to_owned(),
-                content: "#!/bin/sh\npwd\n".to_owned(),
+                content: "#!/bin/sh\npwd\nprintf '%s' \"$0\"\n".to_owned(),
                 arguments: Vec::new(),
             })
             .await;
 
         assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
-        assert!(
-            result
-                .output
-                .text
-                .contains(&runtime.workspace().to_string_lossy().into_owned()),
-            "{}",
-            result.output.text
+        let expected = format!(
+            "{}\n{}/.neha/skills/where.sh.",
+            project.path().display(),
+            runtime.workspace().display()
         );
+        assert!(result.output.text.contains(&expected), "{result:?}");
+        assert!(!project.path().join(".neha").exists());
     }
 
     #[tokio::test]

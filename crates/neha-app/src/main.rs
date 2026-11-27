@@ -1894,35 +1894,129 @@ async fn skill_command(command: SkillCommand) -> Result<()> {
     Ok(())
 }
 
+/// The largest `SKILL.md` a skill directory carries: its frontmatter and its
+/// body. The Space holds the body to its own limit; this bound refuses a stray
+/// file before its bytes are read.
+const MAX_SKILL_DOCUMENT_BYTES: u64 = 256 * 1024;
+/// The largest script a skill directory carries. The Space refuses the same
+/// size, so the CLI reports it before it uploads.
+const MAX_SKILL_SCRIPT_BYTES: u64 = 64 * 1024;
+/// The most scripts a skill directory carries. The Space refuses the same
+/// count, so the CLI reports it before it uploads.
+const MAX_SKILL_SCRIPTS: usize = 16;
+
 /// Reads a skill's directory: its `SKILL.md`, and every file directly in its
 /// `scripts/` folder.
+///
+/// Nothing here follows a symlink. A link at any level — the directory itself,
+/// `SKILL.md`, `scripts/`, or an entry in it — could carry a file the user
+/// never picked, so every level must be the real thing. Each read is bounded by
+/// the entry's own size, taken before the read, so an oversized file is refused
+/// before its bytes arrive.
 fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
-    if !path.is_dir() {
+    let Some(metadata) = own_metadata(path)? else {
+        bail!("{} is not a directory", path.display());
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("{} is a symlink, which is not followed", path.display());
+    }
+    if !metadata.file_type().is_dir() {
         bail!("{} is not a directory", path.display());
     }
-    let document = std::fs::read_to_string(path.join("SKILL.md"))
-        .with_context(|| format!("{} has no SKILL.md", path.display()))?;
+    Ok((read_skill_document(path)?, read_skill_scripts(path)?))
+}
+
+/// The metadata of `path` itself, never of what a final symlink points at.
+/// `None` means nothing is there.
+fn own_metadata(path: &std::path::Path) -> Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("{} cannot be read", path.display())),
+    }
+}
+
+/// Reads the skill's `SKILL.md`: one regular file, bounded before it is read.
+fn read_skill_document(path: &std::path::Path) -> Result<String> {
+    let document = path.join("SKILL.md");
+    let Some(metadata) = own_metadata(&document)? else {
+        bail!("{} has no SKILL.md", path.display());
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("{} is a symlink, which is not followed", document.display());
+    }
+    if !metadata.file_type().is_file() {
+        bail!("{} is not a regular file", document.display());
+    }
+    if metadata.len() > MAX_SKILL_DOCUMENT_BYTES {
+        bail!(
+            "{} is {} bytes; a skill document is at most {MAX_SKILL_DOCUMENT_BYTES} bytes",
+            document.display(),
+            metadata.len()
+        );
+    }
+    std::fs::read_to_string(&document)
+        .with_context(|| format!("{} has no SKILL.md", path.display()))
+}
+
+/// Reads every file directly in the skill's `scripts/` folder, bounded the way
+/// the Space bounds them. A `scripts/` that is absent, or is not a directory,
+/// carries no scripts.
+fn read_skill_scripts(path: &std::path::Path) -> Result<Vec<SkillAddScript>> {
     let mut scripts = Vec::new();
     let scripts_dir = path.join("scripts");
-    if scripts_dir.is_dir() {
-        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&scripts_dir)?
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.path())
-            .filter(|entry| entry.is_file())
-            .collect();
-        entries.sort();
-        for entry in entries {
-            let name = entry
-                .file_name()
-                .and_then(|name| name.to_str())
-                .context("a script name is not text")?
-                .to_owned();
-            let content = std::fs::read_to_string(&entry)
-                .with_context(|| format!("{} is not readable text", entry.display()))?;
-            scripts.push(SkillAddScript { name, content });
-        }
+    let Some(metadata) = own_metadata(&scripts_dir)? else {
+        return Ok(scripts);
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "{} is a symlink, which is not followed",
+            scripts_dir.display()
+        );
     }
-    Ok((document, scripts))
+    if !metadata.file_type().is_dir() {
+        return Ok(scripts);
+    }
+    let mut found: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    for entry in std::fs::read_dir(&scripts_dir)? {
+        let entry = entry?;
+        let script = entry.path();
+        let Some(metadata) = own_metadata(&script)? else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("{} is a symlink, which is not followed", script.display());
+        }
+        // A folder in `scripts/` is not a script, as it has never been one.
+        if metadata.file_type().is_dir() {
+            continue;
+        }
+        if !metadata.file_type().is_file() {
+            bail!("{} is not a regular file", script.display());
+        }
+        found.push((script, metadata.len()));
+    }
+    if found.len() > MAX_SKILL_SCRIPTS {
+        bail!("a skill carries at most {MAX_SKILL_SCRIPTS} scripts");
+    }
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    for (script, size) in found {
+        if size > MAX_SKILL_SCRIPT_BYTES {
+            bail!(
+                "{} is {size} bytes; a script is at most {MAX_SKILL_SCRIPT_BYTES} bytes",
+                script.display()
+            );
+        }
+        let name = script
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("a script name is not text")?
+            .to_owned();
+        let content = std::fs::read_to_string(&script)
+            .with_context(|| format!("{} is not readable text", script.display()))?;
+        scripts.push(SkillAddScript { name, content });
+    }
+    Ok(scripts)
 }
 
 /// One row per skill: skill, library, name, and what it does.
@@ -2012,7 +2106,11 @@ fn rule_row(rule: &Value) -> Result<String> {
     if let Some(prefix) = rule["path_prefix"].as_str() {
         row.push_str(&format!("  path-prefix {prefix}"));
     }
-    if let (Some(skill), Some(script)) = (rule["skill"].as_str(), rule["script"].as_str()) {
+    if let Some(script) = rule["script"].as_str() {
+        let skill = rule["skill_name"]
+            .as_str()
+            .or_else(|| rule["skill"].as_str())
+            .unwrap_or_default();
         row.push_str(&format!("  skill {skill}  script {script}"));
     }
 
@@ -3177,6 +3275,209 @@ mod tests {
         assert!(read_skill_directory(&directory.path().join("missing")).is_err());
     }
 
+    /// A skill directory with a `SKILL.md` and one script in `scripts/`.
+    fn skill_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+        )
+        .unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        std::fs::write(
+            directory.path().join("scripts").join("hello.sh"),
+            "printf hi",
+        )
+        .unwrap();
+        directory
+    }
+
+    /// A skill directory that is itself a symlink is refused: the link could
+    /// name a folder the user never picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_skill_directory_is_refused() {
+        let real = skill_directory();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("skill");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let error = read_skill_directory(&link).unwrap_err().to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A `SKILL.md` that is a symlink is refused, so a skill cannot carry a
+    /// document that lives outside the directory the user picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_skill_document_is_refused() {
+        let directory = skill_directory();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("elsewhere.md"),
+            "---\nname: away\ndescription: Not picked.\n---\n",
+        )
+        .unwrap();
+        std::fs::remove_file(directory.path().join("SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("elsewhere.md"),
+            directory.path().join("SKILL.md"),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A `scripts/` that is a symlink is refused, so a skill cannot carry
+    /// scripts that live outside the directory the user picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_scripts_folder_is_refused() {
+        let directory = skill_directory();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("away.sh"), "printf away").unwrap();
+        std::fs::remove_dir_all(directory.path().join("scripts")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("scripts")).unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A script that is a symlink is refused, whatever it points at.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_script_is_refused() {
+        let directory = skill_directory();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("away.sh"), "printf away").unwrap();
+        std::fs::remove_file(directory.path().join("scripts").join("hello.sh")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("away.sh"),
+            directory.path().join("scripts").join("hello.sh"),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A script that is not a regular file is refused: reading a FIFO can block
+    /// forever, and a socket or a device is not a file the user picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_script_that_is_not_a_regular_file_is_refused() {
+        let directory = skill_directory();
+        let fifo = directory.path().join("scripts").join("pipe.sh");
+        let Ok(made) = std::process::Command::new("mkfifo").arg(&fifo).status() else {
+            return; // No mkfifo here, so the check is not exercised.
+        };
+        assert!(made.success(), "mkfifo did not make a FIFO");
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a regular file"), "{error}");
+    }
+
+    /// A `SKILL.md` past the bound is refused before it is read, and the
+    /// message names the limit.
+    #[test]
+    fn an_oversized_skill_document_is_refused() {
+        let directory = skill_directory();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "x".repeat(super::MAX_SKILL_DOCUMENT_BYTES as usize + 1),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "at most {} bytes",
+                super::MAX_SKILL_DOCUMENT_BYTES
+            )),
+            "{error}"
+        );
+    }
+
+    /// A script past the bound is refused before it is read, and the message
+    /// names the limit.
+    #[test]
+    fn an_oversized_script_is_refused() {
+        let directory = skill_directory();
+        std::fs::write(
+            directory.path().join("scripts").join("hello.sh"),
+            "x".repeat(super::MAX_SKILL_SCRIPT_BYTES as usize + 1),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("at most {} bytes", super::MAX_SKILL_SCRIPT_BYTES)),
+            "{error}"
+        );
+    }
+
+    /// More scripts than a skill carries is refused before any of them is read.
+    #[test]
+    fn too_many_scripts_are_refused() {
+        let directory = skill_directory();
+        for index in 0..=super::MAX_SKILL_SCRIPTS {
+            std::fs::write(
+                directory
+                    .path()
+                    .join("scripts")
+                    .join(format!("script-{index:02}.sh")),
+                "printf hi",
+            )
+            .unwrap();
+        }
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("at most {} scripts", super::MAX_SKILL_SCRIPTS)),
+            "{error}"
+        );
+    }
+
+    /// A skill with no `scripts/` folder, or one holding only folders, carries
+    /// no scripts.
+    #[test]
+    fn a_skill_without_scripts_carries_none() {
+        let bare = skill_directory();
+        std::fs::remove_dir_all(bare.path().join("scripts")).unwrap();
+        let (_, scripts) = read_skill_directory(bare.path()).unwrap();
+        assert!(scripts.is_empty(), "{scripts:?}");
+
+        let folders = skill_directory();
+        std::fs::create_dir(folders.path().join("scripts").join("helpers")).unwrap();
+        std::fs::write(
+            folders
+                .path()
+                .join("scripts")
+                .join("helpers")
+                .join("helper.sh"),
+            "printf help",
+        )
+        .unwrap();
+        let (_, scripts) = read_skill_directory(folders.path()).unwrap();
+        assert_eq!(scripts.len(), 1, "only scripts/ holds scripts: {scripts:?}");
+        assert_eq!(scripts[0].name, "hello.sh");
+    }
+
     #[test]
     fn the_rule_commands_parse() {
         let bot = Id::new();
@@ -3863,6 +4164,7 @@ mod tests {
         assert!(details.contains(&format!("  chat {chat}")), "{details}");
 
         let rule = Id::new();
+        let skill = Id::new();
         let list = json!([{
             "rule": rule,
             "bot": bot,
@@ -3880,7 +4182,8 @@ mod tests {
             "bot": bot,
             "effect": "allow",
             "tool": "run_skill_script",
-            "skill": "weekly-report",
+            "skill": skill,
+            "skill_name": "weekly-report",
             "script": "collect.sh",
         }]);
         assert_eq!(

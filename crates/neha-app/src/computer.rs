@@ -3381,9 +3381,11 @@ mod tests {
         };
         assert_eq!(status, ActionStatus::Succeeded, "{output:?}");
         assert!(output.text.contains("hello space"), "{output:?}");
-        assert_eq!(
-            std::fs::read_to_string(folder.join(".neha/skills/greet.sh")).unwrap(),
-            content
+        // A staged script is unique per action and gone once it ran.
+        let staging = folder.join(".neha/skills");
+        assert!(
+            !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
+            "the delivered script leaves nothing behind"
         );
     }
 

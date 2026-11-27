@@ -389,12 +389,12 @@ mod tests {
             unreachable!("the data is a rule");
         };
         assert_eq!((rule.skill, rule.script), (None, None));
-        old_rule["skill"] = serde_json::json!("weekly-report");
+        old_rule["skill"] = serde_json::json!(Id::new());
         old_rule["script"] = serde_json::json!("collect.sh");
         let EventData::RuleAdded(rule) = EventKind::RuleAdded.decode(&old_rule).unwrap() else {
             unreachable!("the data is a rule");
         };
-        assert_eq!(rule.skill.as_deref(), Some("weekly-report"));
+        assert!(rule.skill.is_some());
         assert_eq!(rule.script.as_deref(), Some("collect.sh"));
     }
 
@@ -1757,6 +1757,15 @@ pub struct ApprovalRequested {
     /// What an "Always allow" would allow, in words the User reads.
     #[serde(default)]
     pub lasting_scope: Option<String>,
+    /// The skill the action runs when its tool is `run_skill_script`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// The digest of the skill's script the card was made for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
     /// The folder a grant answer covers, when the reason is a grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_folder: Option<String>,
@@ -1803,9 +1812,9 @@ pub struct RuleAdded {
     /// The path prefix a matching file action's path starts with.
     #[serde(default)]
     pub path_prefix: Option<String>,
-    /// The skill, by name, whose script a matching `run_skill_script` action runs.
+    /// The skill whose script a matching `run_skill_script` action runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill: Option<String>,
+    pub skill: Option<Id>,
     /// The script a matching `run_skill_script` action runs, within that skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,

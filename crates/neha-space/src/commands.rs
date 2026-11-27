@@ -172,6 +172,8 @@ pub struct CommandContext<'a> {
     /// Serializes answers and rule changes, so two clients cannot decide one
     /// approval or add one rule twice.
     pub approvals: &'a tokio::sync::Mutex<()>,
+    /// Serializes changes to the skills of both libraries.
+    pub library: &'a tokio::sync::Mutex<()>,
     /// The run queue. A command that changes a Bot's authority takes the Bot's
     /// admit lock, so its read and its event cannot interleave with a run
     /// start's read and event: the record's order then decides which access a
@@ -337,7 +339,17 @@ pub async fn execute(
                 })
                 .filter(|rule| bot.is_none_or(|bot| rule.bot == bot))
                 .collect();
-            serde_json::to_value(rules).map_err(json_error)
+            let mut shown = Vec::with_capacity(rules.len());
+            for rule in rules {
+                let mut value = serde_json::to_value(rule).map_err(json_error)?;
+                // A script rule names its skill by identifier in the record;
+                // a reader shows the name it can check against the library.
+                if let Some(skill) = rule.skill {
+                    value["skill_name"] = json!(state.skill(skill).map(|view| view.name.clone()));
+                }
+                shown.push(value);
+            }
+            Ok(Value::Array(shown))
         }),
         CommandCall::RuleAdd {
             bot,
@@ -740,37 +752,43 @@ async fn rule_add(
             "a run_skill_script rule names its skill and its script, and no other tool does",
         ));
     }
-    let (skill, script) = if script_rule {
-        if command_prefix.is_some() || path_prefix.is_some() {
-            return Err(ApiError::invalid_argument(
-                "a run_skill_script rule takes no command or path prefix",
-            ));
-        }
-        let (Some(skill), Some(script)) = (skill, script) else {
-            return Err(ApiError::invalid_argument(
-                "a run_skill_script rule names its skill and its script",
-            ));
-        };
-        if !neha::record::SkillAdded::valid_name(&skill) {
-            return Err(ApiError::invalid_argument(
-                "a skill name is 1 to 64 lowercase letters, digits, or hyphens",
-            ));
-        }
-        if !neha::record::valid_script_name(&script) {
-            return Err(ApiError::invalid_argument(
-                "a script name is one path component of letters, digits, dots, or hyphens",
-            ));
-        }
-        (Some(skill), Some(script))
-    } else {
-        (None, None)
-    };
 
-    let (existing_rule, owned) = {
+    let (existing_rule, owned, skill, script) = {
         let state = context
             .state
             .lock()
             .map_err(|_| ApiError::internal("state lock"))?;
+        // A script rule names the installed skill by its identifier, so a
+        // replacement under the same name never inherits the rule.
+        let (skill, script) = if script_rule {
+            if command_prefix.is_some() || path_prefix.is_some() {
+                return Err(ApiError::invalid_argument(
+                    "a run_skill_script rule takes no command or path prefix",
+                ));
+            }
+            let (Some(name), Some(script)) = (skill, script) else {
+                return Err(ApiError::invalid_argument(
+                    "a run_skill_script rule names its skill and its script",
+                ));
+            };
+            let Some(view) = state.skills.iter().find(|view| {
+                view.name == name && (view.library == SkillLibrary::Space || view.bot == Some(bot))
+            }) else {
+                return Err(ApiError::not_found("no such skill"));
+            };
+            if !view
+                .scripts
+                .iter()
+                .any(|candidate| candidate.name == script)
+            {
+                return Err(ApiError::invalid_argument(
+                    "the skill carries no such script",
+                ));
+            }
+            (Some(view.id), Some(script))
+        } else {
+            (None, None)
+        };
         let existing = state
             .rules
             .iter()
@@ -785,7 +803,12 @@ async fn rule_add(
                     && rule.script == script
             })
             .cloned();
-        (existing, state.owned_bot(bot, account.id).is_some())
+        (
+            existing,
+            state.owned_bot(bot, account.id).is_some(),
+            skill,
+            script,
+        )
     };
     if !owned {
         return Err(ApiError::not_found("no such Bot"));
@@ -946,6 +969,9 @@ async fn skill_add(
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
+    // One change to a library at a time: the checks below and the append must
+    // not interleave with another client's.
+    let _library = context.library.lock().await;
     if arguments.library == SkillLibrary::Space && arguments.bot.is_some() {
         return Err(ApiError::invalid_argument(
             "a skill in the Space's library belongs to no Bot",
@@ -963,7 +989,10 @@ async fn skill_add(
             "a skill carries at most {MAX_SKILL_SCRIPTS} scripts"
         )));
     }
-    let mut scripts = Vec::with_capacity(arguments.scripts.len());
+    // Every check that can refuse the skill comes before the first byte is
+    // stored, so a refused add leaves no orphan in the File store.
+    let mut named = Vec::with_capacity(arguments.scripts.len());
+    let mut seen = std::collections::HashSet::new();
     for script in arguments.scripts {
         if !valid_script_name(&script.name) {
             return Err(ApiError::invalid_argument(
@@ -975,11 +1004,12 @@ async fn skill_add(
                 "a script is at most {MAX_SKILL_SCRIPT_BYTES} bytes"
             )));
         }
-        let sha256 = context.blobs.put(script.content.as_bytes()).await?;
-        scripts.push(SkillScript {
-            name: script.name,
-            sha256,
-        });
+        if !seen.insert(script.name.clone()) {
+            return Err(ApiError::invalid_argument(
+                "a skill carries one script under each name",
+            ));
+        }
+        named.push(script);
     }
     let (allowed, taken) = {
         let state = context
@@ -1004,6 +1034,14 @@ async fn skill_add(
         return Err(ApiError::invalid_argument(
             "the library already holds a skill under this name; remove it first",
         ));
+    }
+    let mut scripts = Vec::with_capacity(named.len());
+    for script in named {
+        let sha256 = context.blobs.put(script.content.as_bytes()).await?;
+        scripts.push(SkillScript {
+            name: script.name,
+            sha256,
+        });
     }
     let skill = Id::new();
     let result = json!({
@@ -1081,6 +1119,7 @@ async fn skill_remove(
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
+    let _library = context.library.lock().await;
     let view = {
         let state = context
             .state
@@ -1143,6 +1182,7 @@ async fn bot_skill(
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
+    let _library = context.library.lock().await;
     let (skill_view, unchanged) = {
         let state = context
             .state
@@ -3225,6 +3265,7 @@ pub async fn finish_run(
     state: &Mutex<State>,
     home: &Home,
     blobs: &Blobs,
+    instructions_only: bool,
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
@@ -3237,6 +3278,7 @@ pub async fn finish_run(
         state,
         home,
         blobs,
+        instructions_only,
         model,
         events,
         tool_timeout,
@@ -3344,6 +3386,7 @@ pub async fn resume_run(
     state: &Mutex<State>,
     home: &Home,
     blobs: &Blobs,
+    instructions_only: bool,
     model: &ModelClient,
     secrets: &Secrets,
     events: &tokio::sync::broadcast::Sender<Event>,
@@ -3389,6 +3432,7 @@ pub async fn resume_run(
             state,
             home,
             blobs,
+            instructions_only,
             model,
             events,
             tool_timeout,
@@ -3490,6 +3534,7 @@ pub async fn resume_run(
                 state,
                 home,
                 blobs,
+                instructions_only,
                 model,
                 events,
                 tool_timeout,
@@ -3612,6 +3657,7 @@ async fn finish_run_with(
     state: &Mutex<State>,
     home: &Home,
     blobs: &Blobs,
+    instructions_only: bool,
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
@@ -3702,6 +3748,8 @@ async fn finish_run_with(
         state,
         blobs,
         bot: pending.bot.id,
+        run: pending.run,
+        instructions_only,
     };
     if let Some((next_step, unknown)) = recovery {
         start_step = Some(next_step);
@@ -3843,7 +3891,7 @@ async fn finish_run_with(
         log: log.clone(),
         calls: HashMap::new(),
     };
-    let (tools, skills) = run_tools_and_skills(state, pending.bot.id);
+    let (tools, skills) = run_tools_and_skills(state, pending.bot.id, instructions_only);
     let mut request = RunRequest::new(
         format!(
             "You are {}, a Bot working in Neha. Work on your Computer with the tools \
@@ -4628,6 +4676,9 @@ struct RedactingRuntime<'a> {
     state: &'a Mutex<State>,
     blobs: &'a Blobs,
     bot: Id,
+    run: Id,
+    /// Whether this Space treats skills as instructions only.
+    instructions_only: bool,
 }
 
 impl RedactingRuntime<'_> {
@@ -4657,8 +4708,13 @@ impl RedactingRuntime<'_> {
         ))
     }
 
-    /// Returns the digest and script name a `run_skill_script` call names.
-    fn script_digest(&self, skill: &str, script: &str) -> Result<String, String> {
+    /// Returns the digest the action's approval covered.
+    ///
+    /// A card names the skill and the script's digest it was made for. A
+    /// replacement under the same names has another digest, so the answer can
+    /// never run code the User did not see. An action a rule allowed has no
+    /// card and runs what the skill holds now.
+    fn approved_digest(&self, action: Id, skill: &str, script: &str) -> Result<String, String> {
         let state = self
             .state
             .lock()
@@ -4666,11 +4722,30 @@ impl RedactingRuntime<'_> {
         let view = state
             .skill_named(self.bot, skill)
             .ok_or_else(|| format!("the Bot has no skill named {skill:?}"))?;
-        view.scripts
+        let digest = view
+            .scripts
             .iter()
             .find(|candidate| candidate.name == script)
             .map(|candidate| candidate.sha256.clone())
-            .ok_or_else(|| format!("the skill {skill:?} carries no script named {script:?}"))
+            .ok_or_else(|| format!("the skill {skill:?} carries no script named {script:?}"))?;
+        let answered = state.approvals.iter().find(|approval| {
+            approval.run == self.run
+                && approval.action == action
+                && approval.tool == neha_loop::tools::RUN_SKILL_SCRIPT
+        });
+        if let Some(answered) = answered {
+            let covered = answered.skill == Some(view.id)
+                && answered.script.as_deref() == Some(script)
+                && answered.script_sha256.as_deref() == Some(digest.as_str());
+            if !covered {
+                return Err(
+                    "the skill changed before the script ran, so the answer does not cover it"
+                        .to_owned(),
+                );
+            }
+        }
+
+        Ok(digest)
     }
 }
 
@@ -4711,6 +4786,7 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
     #[allow(clippy::manual_async_fn)]
     fn serve(
         &self,
+        action: Id,
         call: SpaceCall,
     ) -> impl std::future::Future<Output = Result<ActionResult, LoopError>> + Send {
         async move {
@@ -4724,7 +4800,12 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
                     script,
                     arguments,
                 } => {
-                    let digest = match self.script_digest(&skill, &script) {
+                    if self.instructions_only {
+                        return Ok(ActionResult::failed(
+                            "this Space treats skills as instructions only, so a skill's script never runs",
+                        ));
+                    }
+                    let digest = match self.approved_digest(action, &skill, &script) {
                         Ok(digest) => digest,
                         Err(error) => return Ok(ActionResult::failed(error)),
                     };
@@ -4736,6 +4817,11 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
                             )));
                         }
                     };
+                    if crate::blobs::digest(content.as_bytes()) != digest {
+                        return Ok(ActionResult::failed(
+                            "the script's bytes are not the ones the Space recorded",
+                        ));
+                    }
                     let result = self
                         .inner
                         .execute(Action::RunScript {
@@ -4756,7 +4842,11 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
 /// A skill's name and description enter the Bot's context; its body enters
 /// only when the Bot loads the skill. A Bot without skills is offered neither
 /// skill tool.
-fn run_tools_and_skills(state: &Mutex<State>, bot: Id) -> (Vec<neha_loop::ToolSpec>, String) {
+fn run_tools_and_skills(
+    state: &Mutex<State>,
+    bot: Id,
+    instructions_only: bool,
+) -> (Vec<neha_loop::ToolSpec>, String) {
     let skills = state
         .lock()
         .map(|state| {
@@ -4777,7 +4867,7 @@ fn run_tools_and_skills(state: &Mutex<State>, bot: Id) -> (Vec<neha_loop::ToolSp
     let has_scripts = skills.iter().any(|(_, _, scripts)| *scripts);
     tools.retain(|tool| match tool.name.as_str() {
         neha_loop::tools::SKILL => !skills.is_empty(),
-        neha_loop::tools::RUN_SKILL_SCRIPT => has_scripts,
+        neha_loop::tools::RUN_SKILL_SCRIPT => has_scripts && !instructions_only,
         _ => true,
     });
     if skills.is_empty() {
@@ -5097,31 +5187,21 @@ impl Recorder for RunRecorder<'_> {
             // A skill's script asks before its first run for the Bot and the
             // acting User, whatever Computer runs it. A script the Bot does
             // not have never runs, so it asks nobody.
-            let (skill_name, script_name) = script_fields(call);
-            let script_first = skill_name.is_some()
-                && state
-                    .skill_named(bot.id, skill_name.unwrap_or_default())
-                    .is_some()
-                && !state.script_run_allowed(
-                    bot.id,
-                    self.log.acting,
-                    skill_name.unwrap_or_default(),
-                    script_name.unwrap_or_default(),
-                );
+            let script = script_call(&state, bot.id, call);
+            let script_first = script.as_ref().is_some_and(|script| {
+                !state.script_run_allowed(bot.id, self.log.acting, script.skill, &script.name)
+            });
             let tool_rules: Vec<RuleView> = state
                 .rules_of(bot.id)
                 .into_iter()
                 .filter(|rule| rule.user == self.log.acting && rule.tool == call.tool)
-                .filter(|rule| {
-                    rule.skill
-                        .as_deref()
-                        .is_none_or(|skill| Some(skill) == skill_name)
-                })
                 .cloned()
                 .collect();
             let matching: Vec<RuleView> = tool_rules
                 .iter()
-                .filter(|rule| rule_matches_at(rule, call, self.log.cwd.as_deref()))
+                .filter(|rule| {
+                    rule_matches_at(rule, call, self.log.cwd.as_deref(), script.as_ref())
+                })
                 .cloned()
                 .collect();
             (
@@ -5133,12 +5213,15 @@ impl Recorder for RunRecorder<'_> {
                 tool_rules,
                 run,
                 bot,
+                script,
             )
         };
-        let (local, first_use, script_first, computer, matching, tool_rules, run, bot) = plan;
-        if !local && !script_first {
-            // A Hosted Computer has no fence yet (M2-B); it never asks, and a
-            // script on one asks only before its first run.
+        let (local, first_use, script_first, computer, matching, tool_rules, run, bot, script) =
+            plan;
+        if !local && call.tool != neha_loop::tools::RUN_SKILL_SCRIPT {
+            // A Hosted Computer has no fence yet (M2-B), so the actions it runs
+            // never ask. A call the Space answers itself has its own approvals
+            // whatever Computer the Bot works on.
             return Ok(Decision::Allow);
         }
         let grant = grant_folder(&self.log.access, self.log.cwd.as_deref(), call);
@@ -5192,6 +5275,14 @@ impl Recorder for RunRecorder<'_> {
             ApprovalReason::FirstUseLocal => None,
             ApprovalReason::FirstScriptRun => lasting_scope_at(call, self.log.cwd.as_deref()),
         };
+        let (skill_id, script_name, script_sha256) =
+            script.as_ref().map_or((None, None, None), |script| {
+                (
+                    Some(script.skill),
+                    Some(script.name.clone()),
+                    Some(script.sha256.clone()),
+                )
+            });
         let approval = Id::new();
         self.log
             .append(vec![self.log.bot_draft(
@@ -5212,6 +5303,9 @@ impl Recorder for RunRecorder<'_> {
                     "summary": approval_summary(call, self.log.cwd.as_deref()),
                     "reason": reason,
                     "ambiguous": ambiguous,
+                    "skill": skill_id,
+                    "script": script_name,
+                    "script_sha256": script_sha256,
                     "rule": rule,
                     "lasting_scope": lasting_scope,
                     "grant_folder": grant.as_ref().map(|(folder, _)| folder.clone()),
@@ -5301,9 +5395,7 @@ impl RunRecorder<'_> {
 /// narrower still, and a skill's script the narrowest of all.
 fn rule_specificity(rule: &RuleView) -> (u8, usize) {
     if rule.skill.is_some() || rule.script.is_some() {
-        let length =
-            rule.skill.as_deref().map_or(0, str::len) + rule.script.as_deref().map_or(0, str::len);
-        return (2, length);
+        return (2, rule.script.as_deref().map_or(0, str::len));
     }
     match (&rule.command_prefix, &rule.path_prefix) {
         (Some(prefix), _) | (_, Some(prefix)) => (1, prefix.chars().count()),
@@ -5473,22 +5565,61 @@ fn script_fields_call(arguments: &Value) -> (Option<&str>, Option<&str>) {
     )
 }
 
+/// One script call, resolved against the skills the Bot may use.
+struct ScriptCall {
+    /// The skill's identifier, which the run and its rules name.
+    skill: Id,
+    /// The script's file name within the skill.
+    name: String,
+    /// The digest of the script's bytes, which the Computer receives.
+    sha256: String,
+}
+
+/// Resolves a `run_skill_script` call to the skill and script it names.
+///
+/// A call whose skill or script the Bot does not have resolves to nothing:
+/// it never runs, so it asks nobody and matches no rule.
+fn script_call(state: &State, bot: Id, call: &LoopCall) -> Option<ScriptCall> {
+    if call.tool != neha_loop::tools::RUN_SKILL_SCRIPT {
+        return None;
+    }
+    let (skill_name, script_name) = script_fields(call);
+    let skill_name = skill_name?;
+    let script_name = script_name?;
+    let skill = state.skill_named(bot, skill_name)?;
+    let script = skill
+        .scripts
+        .iter()
+        .find(|candidate| candidate.name == script_name)?;
+    Some(ScriptCall {
+        skill: skill.id,
+        name: script_name.to_owned(),
+        sha256: script.sha256.clone(),
+    })
+}
+
 /// Returns whether a lasting rule covers one action.
 #[cfg(test)]
 fn rule_matches(rule: &RuleView, call: &LoopCall) -> bool {
-    rule_matches_at(rule, call, None)
+    rule_matches_at(rule, call, None, None)
 }
 
-fn rule_matches_at(rule: &RuleView, call: &LoopCall, cwd: Option<&str>) -> bool {
+fn rule_matches_at(
+    rule: &RuleView,
+    call: &LoopCall,
+    cwd: Option<&str>,
+    script: Option<&ScriptCall>,
+) -> bool {
     if rule.tool != call.tool {
         return false;
     }
-    // A script rule matches the one skill and script it names.
-    if let Some(skill) = &rule.skill {
-        let (Some(call_skill), Some(call_script)) = script_fields(call) else {
+    // A script rule matches one installed skill and one of its scripts. A rule
+    // written by another version may name no skill: it matches no script call.
+    if rule.skill.is_some() || rule.script.is_some() {
+        let (Some(rule_skill), Some(script)) = (rule.skill, script) else {
             return false;
         };
-        return call_skill == skill && rule.script.as_deref() == Some(call_script);
+        return rule_skill == script.skill && rule.script.as_deref() == Some(script.name.as_str());
     }
     if let Some(prefix) = &rule.command_prefix {
         let Some(command) = call.arguments.get("command").and_then(Value::as_str) else {
@@ -5702,7 +5833,7 @@ struct DerivedRule {
     tool: String,
     command_prefix: Option<String>,
     path_prefix: Option<String>,
-    skill: Option<String>,
+    skill: Option<Id>,
     script: Option<String>,
 }
 
@@ -5718,7 +5849,7 @@ fn derived_rule(view: &ApprovalView, cwd: Option<&str>) -> Result<DerivedRule, A
     };
     match view.tool.as_str() {
         neha_loop::tools::RUN_SKILL_SCRIPT => {
-            let (Some(skill), Some(script)) = script_fields_call(&view.arguments) else {
+            let (Some(skill), Some(script)) = (view.skill, view.script.as_deref()) else {
                 return Err(ApiError::invalid_argument(
                     "the action names no skill and script to make a rule from",
                 ));
@@ -5727,7 +5858,7 @@ fn derived_rule(view: &ApprovalView, cwd: Option<&str>) -> Result<DerivedRule, A
                 tool,
                 command_prefix: None,
                 path_prefix: None,
-                skill: Some(skill.to_owned()),
+                skill: Some(skill),
                 script: Some(script.to_owned()),
             })
         }
@@ -5859,6 +5990,13 @@ const MAX_SUMMARY_BYTES: usize = 4096;
 /// arguments are in the event and in `RunShow`.
 fn approval_summary(call: &LoopCall, cwd: Option<&str>) -> String {
     let detail = match call.tool.as_str() {
+        neha_loop::tools::RUN_SKILL_SCRIPT => {
+            let (skill, script) = script_fields(call);
+            match (skill, script) {
+                (Some(skill), Some(script)) => Some(format!("{skill} {script}")),
+                _ => None,
+            }
+        }
         neha_loop::tools::SHELL => call
             .arguments
             .get("command")
@@ -6377,17 +6515,17 @@ mod tests {
         }
     }
 
-    fn script_rule(skill: &str, script: &str) -> super::DerivedRule {
+    fn script_rule(skill: Id, script: &str) -> super::DerivedRule {
         super::DerivedRule {
             tool: neha_loop::tools::RUN_SKILL_SCRIPT.to_owned(),
             command_prefix: None,
             path_prefix: None,
-            skill: Some(skill.to_owned()),
+            skill: Some(skill),
             script: Some(script.to_owned()),
         }
     }
 
-    fn ask_script(skill: &str, script: &str) -> RuleView {
+    fn ask_script(skill: Id, script: &str) -> RuleView {
         RuleView {
             rule: Id::new(),
             bot: Id::new(),
@@ -6396,7 +6534,7 @@ mod tests {
             tool: neha_loop::tools::RUN_SKILL_SCRIPT.to_owned(),
             command_prefix: None,
             path_prefix: None,
-            skill: Some(skill.to_owned()),
+            skill: Some(skill),
             script: Some(script.to_owned()),
             seq: Seq::from_i64(1).unwrap(),
         }
@@ -6797,17 +6935,18 @@ mod tests {
         ));
 
         // A script's allow covers the Ask for that skill's script alone.
+        let skill = Id::new();
         assert!(rule_covers(
-            &script_rule("weekly-report", "collect.sh"),
-            &ask_script("weekly-report", "collect.sh")
+            &script_rule(skill, "collect.sh"),
+            &ask_script(skill, "collect.sh")
         ));
         assert!(!rule_covers(
-            &script_rule("weekly-report", "collect.sh"),
-            &ask_script("weekly-report", "other.sh")
+            &script_rule(skill, "collect.sh"),
+            &ask_script(skill, "other.sh")
         ));
         assert!(!rule_covers(
-            &script_rule("weekly-report", "collect.sh"),
-            &ask("run_skill_script", None, None)
+            &script_rule(skill, "collect.sh"),
+            &ask(neha_loop::tools::RUN_SKILL_SCRIPT, None, None)
         ));
     }
 
@@ -7299,6 +7438,8 @@ mod tests {
             state: &Mutex::new(State::default()),
             blobs: &blobs,
             bot: Id::new(),
+            run: Id::new(),
+            instructions_only: false,
         };
         let result = runtime
             .execute(neha_computer::Action::Shell {

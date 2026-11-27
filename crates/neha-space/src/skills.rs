@@ -23,12 +23,18 @@ pub enum SkillError {
     /// The document does not open with a frontmatter block.
     #[error("a skill document starts with a line `---` and ends its frontmatter with another")]
     NoFrontmatter,
+    /// The frontmatter is not valid YAML.
+    #[error("the frontmatter is not valid YAML: {0}")]
+    Yaml(String),
+    /// The frontmatter is not a mapping of fields.
+    #[error("the frontmatter is a mapping of fields")]
+    NotMapping,
     /// A required field is absent.
     #[error("the frontmatter names no `{0}`")]
     Missing(&'static str),
-    /// A frontmatter line is not `key: value`.
-    #[error("the frontmatter line {0:?} is not `key: value`")]
-    BadLine(String),
+    /// A field is not text.
+    #[error("the frontmatter `{0}` is not text")]
+    NotText(&'static str),
     /// The name is not one the specification allows.
     #[error(
         "a skill name is 1 to 64 lowercase letters, digits, or hyphens, and does not begin or end with a hyphen"
@@ -65,49 +71,20 @@ pub fn parse(document: &str) -> Result<SkillDocument, SkillError> {
 
 /// Reads the fields of a frontmatter block.
 fn read(frontmatter: &str, body: &str) -> Result<SkillDocument, SkillError> {
-    let lines: Vec<&str> = frontmatter.split('\n').collect();
-    let mut fields: Vec<(&str, String)> = Vec::new();
-    let mut index = 0;
-    while index < lines.len() {
-        let line = lines[index].trim();
-        index += 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            return Err(SkillError::BadLine(line.to_owned()));
-        };
-        let key = key.trim();
-        if key.is_empty()
-            || !key
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
-        {
-            return Err(SkillError::BadLine(line.to_owned()));
-        }
-        let value = value.trim();
-        let text = if value.starts_with(['|', '>']) {
-            let consumed = block(lines.get(index..).unwrap_or_default(), value);
-            index += consumed.1;
-            consumed.0
-        } else if value.is_empty() {
-            // A nested list or map Neha does not read: skip the lines that
-            // belong to it.
-            index += nested(lines.get(index..).unwrap_or_default());
-            String::new()
-        } else {
-            unquote(value)
-        };
-        fields.push((key, text));
-    }
-    let field = |wanted: &str| {
-        fields
-            .iter()
-            .find(|(key, _)| *key == wanted)
-            .map(|(_, value)| value.clone())
+    let value: serde_norway::Value =
+        serde_norway::from_str(frontmatter).map_err(|error| SkillError::Yaml(error.to_string()))?;
+    let serde_norway::Value::Mapping(fields) = value else {
+        return Err(SkillError::NotMapping);
     };
-    let name = field("name").ok_or(SkillError::Missing("name"))?;
-    let description = field("description").ok_or(SkillError::Missing("description"))?;
+    let field = |wanted: &'static str| -> Result<Option<String>, SkillError> {
+        match fields.get(serde_norway::Value::String(wanted.to_owned())) {
+            None | Some(serde_norway::Value::Null) => Ok(None),
+            Some(serde_norway::Value::String(text)) => Ok(Some(text.clone())),
+            Some(_) => Err(SkillError::NotText(wanted)),
+        }
+    };
+    let name = field("name")?.ok_or(SkillError::Missing("name"))?;
+    let description = field("description")?.ok_or(SkillError::Missing("description"))?;
     if !SkillAdded::valid_name(&name) {
         return Err(SkillError::BadName);
     }
@@ -123,69 +100,6 @@ fn read(frontmatter: &str, body: &str) -> Result<SkillDocument, SkillError> {
         description,
         body: body.to_owned(),
     })
-}
-
-/// Reads a block scalar: the indented lines that follow its key. Returns the
-/// text and how many lines it took.
-fn block(lines: &[&str], marker: &str) -> (String, usize) {
-    let fold = marker.starts_with('>');
-    let chomp = marker.ends_with('-');
-    let mut parts: Vec<String> = Vec::new();
-    let mut blanks = 0;
-    let mut taken = 0;
-    for line in lines {
-        if line.trim().is_empty() {
-            blanks += 1;
-            taken += 1;
-            continue;
-        }
-        if line.starts_with([' ', '\t']) {
-            parts.extend((0..blanks).map(|_| String::new()));
-            blanks = 0;
-            parts.push(line.trim_start().to_owned());
-            taken += 1;
-            continue;
-        }
-        break;
-    }
-    let mut text = if fold {
-        let mut folded = String::new();
-        for (position, part) in parts.iter().enumerate() {
-            if position > 0 {
-                folded.push(if part.is_empty() { '\n' } else { ' ' });
-            }
-            folded.push_str(part);
-        }
-        folded
-    } else {
-        parts.join("\n")
-    };
-    if !chomp {
-        text.push('\n');
-    }
-    (text.trim().to_owned(), taken)
-}
-
-/// Counts the lines of a nested list or map: indented lines, or list items.
-fn nested(lines: &[&str]) -> usize {
-    lines
-        .iter()
-        .take_while(|line| line.starts_with([' ', '\t']) || line.trim_start().starts_with('-'))
-        .count()
-}
-
-/// Removes the quotes around a scalar, when it has them.
-fn unquote(value: &str) -> String {
-    for quote in ['\'', '"'] {
-        if let Some(inner) = value
-            .strip_prefix(quote)
-            .and_then(|rest| rest.strip_suffix(quote))
-        {
-            let escaped = format!("{quote}{quote}");
-            return inner.replace(&escaped, &quote.to_string());
-        }
-    }
-    value.to_owned()
 }
 
 #[cfg(test)]
@@ -228,9 +142,17 @@ mod tests {
             parse("---\nname: x\n---\n"),
             Err(SkillError::Missing("description"))
         );
+        assert!(
+            matches!(
+                parse("---\nname: [unclosed\n---\n"),
+                Err(SkillError::Yaml(_))
+            ),
+            "broken YAML is reported"
+        );
+        assert_eq!(parse("---\n- a list\n---\n"), Err(SkillError::NotMapping));
         assert_eq!(
-            parse("---\nname x\n---\n"),
-            Err(SkillError::BadLine("name x".to_owned()))
+            parse("---\nname: 3\ndescription: d\n---\n"),
+            Err(SkillError::NotText("name"))
         );
         assert_eq!(
             parse("---\nname: Bad Name\ndescription: d\n---\n"),
@@ -249,6 +171,23 @@ mod tests {
         assert_eq!(
             parse(&format!("---\nname: x\ndescription: d\n---\n{big}")),
             Err(SkillError::BodyTooLarge)
+        );
+    }
+
+    #[test]
+    fn reads_a_yaml_comment_and_escapes() {
+        // A comment ends a plain scalar; it is not part of the name.
+        let document = "---\nname: weekly-report # the report skill\ndescription: \"Write: the weekly report\"\n---\nbody";
+        let parsed = parse(document).unwrap();
+        assert_eq!(parsed.name, "weekly-report");
+        assert_eq!(parsed.description, "Write: the weekly report");
+
+        // A plain multi-line scalar folds into one line.
+        let document =
+            "---\nname: folded\ndescription: Write the report\n  from the docs.\n---\nbody";
+        assert_eq!(
+            parse(document).unwrap().description,
+            "Write the report from the docs."
         );
     }
 

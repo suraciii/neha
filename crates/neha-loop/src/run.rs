@@ -245,10 +245,12 @@ pub trait Recorder {
 /// What a run works with: its Computer, and the tools the Space serves itself.
 pub trait Runtime: ComputerRuntime {
     /// Serves one tool call the Space runs itself: a skill's body, or a
-    /// script it delivers to the Computer. A refusal is a failed action, never
-    /// a lost one.
+    /// script it delivers to the Computer. The action is the identity the
+    /// record gave it, so the Space can check what the answer covered. A
+    /// refusal is a failed action, never a lost one.
     fn serve(
         &self,
+        action: Id,
         call: SpaceCall,
     ) -> impl Future<Output = Result<ActionResult, LoopError>> + Send;
 }
@@ -351,7 +353,7 @@ where
                     recorder.step(step, reply.usage, 0).await?;
                     return Ok(final_reply(reply.content, usage));
                 }
-                let calls = step_calls(step, &reply.tool_calls)?;
+                let calls = step_calls(step, &reply.tool_calls, &tools)?;
                 recorder
                     .reply(
                         step,
@@ -419,7 +421,7 @@ where
                     Ok(tools::Call::Computer(computer_action)) => {
                         runtime.execute(computer_action).await
                     }
-                    Ok(tools::Call::Space(space_call)) => runtime.serve(space_call).await?,
+                    Ok(tools::Call::Space(space_call)) => runtime.serve(action, space_call).await?,
                     Err(error) => ActionResult::failed(error),
                 };
                 recorder
@@ -467,12 +469,25 @@ struct StepCall {
 }
 
 /// The calls of a Model reply as the step runs them.
-fn step_calls(step: u32, calls: &[ToolCall]) -> Result<Vec<StepCall>, LoopError> {
+fn step_calls(
+    step: u32,
+    calls: &[ToolCall],
+    offered: &[ToolSpec],
+) -> Result<Vec<StepCall>, LoopError> {
     let calls: Vec<StepCall> = calls
         .iter()
         .enumerate()
         .map(|(index, call)| {
-            let parsed = tools::parse(&call.name, &call.arguments);
+            // A Model cannot call a tool the run did not offer it, whatever
+            // its reply names: the offer is the Space's decision. An unknown
+            // name keeps the parser's own refusal.
+            let parsed = match tools::parse(&call.name, &call.arguments) {
+                Ok(_) if !offered.iter().any(|tool| tool.name == call.name) => Err(format!(
+                    "the tool {:?} is not offered to this run",
+                    call.name
+                )),
+                parsed => parsed,
+            };
             StepCall {
                 recorded: RecordedCall {
                     call: call_id(&call.id, step, index),
@@ -748,6 +763,7 @@ mod tests {
         #[allow(clippy::manual_async_fn)]
         fn serve(
             &self,
+            _action: Id,
             call: SpaceCall,
         ) -> impl Future<Output = Result<ActionResult, LoopError>> + Send {
             self.served.lock().unwrap().push(call);

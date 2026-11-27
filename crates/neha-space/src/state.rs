@@ -427,6 +427,12 @@ pub struct ApprovalView {
     pub rule: Option<Id>,
     /// What an "Always allow" would allow, in words the User reads.
     pub lasting_scope: Option<String>,
+    /// The skill the action runs when its tool is `run_skill_script`.
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    pub script: Option<String>,
+    /// The digest of the skill's script the card was made for.
+    pub script_sha256: Option<String>,
     /// The folder a grant answer covers, when the reason is a grant.
     pub grant_folder: Option<String>,
     /// The directory the run works in, when it named one.
@@ -456,9 +462,9 @@ pub struct RuleView {
     pub command_prefix: Option<String>,
     /// The path prefix a matching file action's path starts with.
     pub path_prefix: Option<String>,
-    /// The skill, by name, whose script a matching `run_skill_script` action runs.
+    /// The skill whose script a matching `run_skill_script` action runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skill: Option<String>,
+    pub skill: Option<Id>,
     /// The script a matching `run_skill_script` action runs, within that skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script: Option<String>,
@@ -542,9 +548,9 @@ pub struct State {
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
-    /// The (Bot, acting User, skill name, script name) that already ran a
-    /// skill's script; the first run of each asks.
-    pub script_runs: HashSet<(Id, Id, String, String)>,
+    /// The (Bot, acting User, skill, script name) that already ran a skill's
+    /// script; the first run of each asks.
+    pub script_runs: HashSet<(Id, Id, Id, String)>,
     /// The Model's replies per run, in the order the record holds them.
     pub replies: HashMap<Id, Vec<RunReply>>,
     /// Runs a Space start found interrupted and may recover. It is not part of
@@ -648,9 +654,9 @@ impl State {
 
     /// Whether the Bot and the acting User already ran one skill's script.
     #[must_use]
-    pub fn script_run_allowed(&self, bot: Id, acting: Id, skill: &str, script: &str) -> bool {
+    pub fn script_run_allowed(&self, bot: Id, acting: Id, skill: Id, script: &str) -> bool {
         self.script_runs
-            .contains(&(bot, acting, skill.to_owned(), script.to_owned()))
+            .contains(&(bot, acting, skill, script.to_owned()))
     }
 
     /// Returns the replies the record holds for one run.
@@ -1255,29 +1261,45 @@ impl Projection for State {
                 });
             }
             EventData::ActionStarted(data) => {
+                // A script that starts has run: later runs ask only when a rule
+                // says so. A call the Model got wrong never runs, so its
+                // recorded arguments do not parse and it marks nothing; it is
+                // still recorded as an action.
+                let bot = self
+                    .runs
+                    .get(&data.run)
+                    .ok_or("an action must belong to a started run")?
+                    .bot;
+                let script = (data.tool == neha_loop::tools::RUN_SKILL_SCRIPT
+                    && neha_loop::tools::parse(&data.tool, &data.arguments.to_string()).is_ok())
+                .then(|| {
+                    let (skill, script) = (
+                        data.arguments
+                            .get("skill")
+                            .and_then(serde_json::Value::as_str)?,
+                        data.arguments
+                            .get("script")
+                            .and_then(serde_json::Value::as_str)?,
+                    );
+                    let id = self
+                        .skills
+                        .iter()
+                        .find(|view| {
+                            view.name == skill
+                                && (view.library == SkillLibrary::Space || view.bot == Some(bot))
+                        })
+                        .map(|view| view.id)?;
+                    Some((id, script.to_owned()))
+                })
+                .flatten();
+                let acting = event.acting;
                 let run = self
                     .runs
                     .get_mut(&data.run)
                     .ok_or("an action must belong to a started run")?;
                 run.once_grant = None;
-                // A script that starts has run: later runs ask only when a
-                // rule says so.
-                if data.tool == neha_loop::tools::RUN_SKILL_SCRIPT {
-                    let (Some(skill), Some(script)) = (
-                        data.arguments
-                            .get("skill")
-                            .and_then(serde_json::Value::as_str),
-                        data.arguments
-                            .get("script")
-                            .and_then(serde_json::Value::as_str),
-                    ) else {
-                        return Err("a script action names its skill and its script".to_owned());
-                    };
-                    let acting = event
-                        .acting
-                        .ok_or("an action is recorded for the User the Bot acts for")?;
-                    self.script_runs
-                        .insert((run.bot, acting, skill.to_owned(), script.to_owned()));
+                if let (Some((skill, script)), Some(acting)) = (script, acting) {
+                    self.script_runs.insert((run.bot, acting, skill, script));
                 }
                 run.actions.push(ActionView {
                     id: data.action,
@@ -1369,6 +1391,9 @@ impl Projection for State {
                     ambiguous: data.ambiguous,
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
+                    skill: data.skill,
+                    script: data.script,
+                    script_sha256: data.script_sha256,
                     grant_folder: data.grant_folder,
                     cwd,
                     undoable: data.undoable,
@@ -1445,27 +1470,6 @@ impl Projection for State {
                 }
                 if self.rules.iter().any(|rule| rule.rule == data.rule) {
                     return Err("a rule is recorded once".to_owned());
-                }
-                let script_rule = data.skill.is_some() || data.script.is_some();
-                let script_tool = data.tool == neha_loop::tools::RUN_SKILL_SCRIPT;
-                if script_tool != script_rule {
-                    return Err(
-                        "a run_skill_script rule names its skill and its script, and no other rule does"
-                            .to_owned(),
-                    );
-                }
-                if script_rule {
-                    let (Some(skill), Some(script)) = (&data.skill, &data.script) else {
-                        return Err("a script rule names its skill and its script".to_owned());
-                    };
-                    if data.tool != neha_loop::tools::RUN_SKILL_SCRIPT
-                        || data.command_prefix.is_some()
-                        || data.path_prefix.is_some()
-                        || !neha::record::SkillAdded::valid_name(skill)
-                        || !neha::record::valid_script_name(script)
-                    {
-                        return Err("a script rule is about run_skill_script alone".to_owned());
-                    }
                 }
                 self.rules.push(RuleView {
                     rule: data.rule,
@@ -1641,6 +1645,131 @@ mod tests {
 
     fn message_added(chat: Id, text: &str, file: Option<Id>) -> serde_json::Value {
         serde_json::json!({"message": Id::new(), "chat": chat, "text": text, "file": file})
+    }
+
+    #[test]
+    fn an_older_rule_shape_projects_and_grants_no_script_authority() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let mut state = State::default();
+        let created = |kind, data, seq| event(kind, Author::User(owner), data, seq);
+        state
+            .apply(&created(
+                EventKind::ComputerCreated,
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::BotCreated,
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::ChatCreated,
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+
+        // A record written before skill rules named a script may hold a rule
+        // for the whole tool. It must still project, and it must match no
+        // script call: an upgrade never makes a Space unreadable.
+        let legacy = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::RuleAdded,
+                Author::User(owner),
+                owner,
+                serde_json::json!({
+                    "rule": legacy,
+                    "bot": bot,
+                    "user": owner,
+                    "effect": "allow",
+                    "tool": "run_skill_script",
+                    "command_prefix": null,
+                    "path_prefix": null,
+                }),
+                4,
+            ))
+            .unwrap();
+        assert_eq!(state.rules.len(), 1);
+        assert!(state.rules[0].skill.is_none());
+
+        // A call the Model got wrong, and a call to a skill the Bot does not
+        // have, are recorded as actions without failing the projection and
+        // without counting as a run.
+        let run = Id::new();
+        let run_data = serde_json::json!({
+            "run": run,
+            "chat": chat,
+            "bot": bot,
+            "command": Id::new(),
+            "message": Id::new(),
+        });
+        state
+            .apply(&acted_event(
+                EventKind::RunQueued,
+                Author::Bot(bot),
+                owner,
+                run_data.clone(),
+                5,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                owner,
+                run_data,
+                6,
+            ))
+            .unwrap();
+        let start = |action, arguments, seq| {
+            acted_event(
+                EventKind::ActionStarted,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": "run_skill_script",
+                    "arguments": arguments,
+                }),
+                seq,
+            )
+        };
+        state
+            .apply(&start(Id::new(), serde_json::json!({"surprise": true}), 7))
+            .unwrap();
+        state
+            .apply(&start(
+                Id::new(),
+                serde_json::json!({"skill": "missing", "script": "s.sh"}),
+                8,
+            ))
+            .unwrap();
+        assert!(
+            state.script_runs.is_empty(),
+            "a call that never runs marks no first run"
+        );
     }
 
     #[test]

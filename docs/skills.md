@@ -66,15 +66,17 @@ The first run of one skill's script asks for approval, once for each Bot, acting
 
 An Ask rule for that skill and script makes every run ask. Always allow on that card answers it and removes the Ask rule it covers. [Approvals](approvals.md#lasting-rules) covers the rule commands.
 
-A script runs under the same fence, time limit, and output limit as a shell command, and `write_file` rules do not cover it. A script that the Bot does not have never runs: the action fails without asking.
+A script runs under the same fence, time limit, and output limit as a shell command, and `write_file` rules do not cover it. A script that the Bot does not have never runs: the action fails without asking. A script never runs on a Windows Computer yet: the action fails and the card offers no way to run it.
 
 The body says which script to run and what to pass. The Bot names the script by its file name inside `scripts/`.
 
 ## Limits
 
-- `neha skill add` reads `SKILL.md` and every regular file directly in `scripts/`: at most 16 scripts, each at most 64 KiB.
-- A script name is one path component of letters, digits, dots, hyphens, or underscores, so a name cannot leave `.neha/skills/`.
-- The Space parses `SKILL.md` before it records anything, and it reports the frontmatter rule a rejected document broke.
+- `neha skill add` reads `SKILL.md` and every regular file directly in `scripts/`: at most 16 scripts, each at most 64 KiB, and a document of at most 256 KiB.
+- `neha skill add` refuses a symlink and a file that is not a regular file, at every level, so a skill's files come from the directory the User named.
+- A script name is one path component of letters, digits, dots, hyphens, or underscores, so a name cannot leave the staging directory.
+- The Space parses `SKILL.md` as YAML before it records anything, and it reports the frontmatter rule a rejected document broke.
+- The Admin can set the Space to treat skills as instructions only. Add `[skills] instructions_only = true` to `config.toml` in the Space home and restart the Space; then no skill's script is offered to a Bot or reaches a Computer, and a call to one fails.
 
 ## What this milestone does not do
 

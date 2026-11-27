@@ -107,6 +107,10 @@ pub struct SpaceServer {
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
     /// Serializes approval answers and rule changes.
     pub(crate) approvals: tokio::sync::Mutex<()>,
+    /// Serializes changes to the skills of both libraries.
+    pub(crate) library: tokio::sync::Mutex<()>,
+    /// Whether this Space treats skills as instructions only.
+    pub(crate) instructions_only: bool,
     /// Local-ticket pair attempts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
     /// The ticket file this start wrote for its Admin, with its digest.
@@ -147,6 +151,7 @@ impl SpaceServer {
             .unwrap_or_else(|| browser_host(home.root()));
         let config = Config::load(&home)?;
         let storage = config.storage.clone();
+        let instructions_only = config.skills.instructions_only;
         let catalog = std::sync::Arc::new(CatalogStore::open(&home, &config.catalog));
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
@@ -191,6 +196,8 @@ impl SpaceServer {
             links: ComputerLinks::new(),
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
             approvals: tokio::sync::Mutex::new(()),
+            library: tokio::sync::Mutex::new(()),
+            instructions_only,
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -1910,6 +1917,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             links: &server.links,
                             pairings: &server.pairings,
                             approvals: &server.approvals,
+                            library: &server.library,
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
@@ -12751,6 +12759,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            library: &server.library,
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
@@ -13298,6 +13307,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            library: &server.library,
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
@@ -17697,6 +17707,11 @@ mod tests {
         assert_eq!(approvals[0]["tool"], "run_skill_script");
         assert_eq!(approvals[0]["arguments"]["skill"], "hello");
         assert_eq!(approvals[0]["arguments"]["script"], "hello.sh");
+        let summary = approvals[0]["summary"].as_str().unwrap_or_default();
+        assert!(
+            summary.contains("hello") && summary.contains("hello.sh"),
+            "the card names the skill and the script it will run: {summary}"
+        );
         let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
         let decided = decide_approval(&mut socket, approval, true, true).await;
         assert_eq!(decided["status"], "allowed");
@@ -17730,7 +17745,7 @@ mod tests {
             .find(|rule| rule["rule"] == decided["rule"])
             .unwrap_or_else(|| panic!("the derived rule is listed: {rules:?}"));
         assert_eq!(rule["tool"], "run_skill_script");
-        assert_eq!(rule["skill"], "hello");
+        assert_eq!(rule["skill_name"], "hello");
         assert_eq!(rule["script"], "hello.sh");
         assert_eq!(rule["effect"], "allow");
 
@@ -17744,6 +17759,151 @@ mod tests {
             "a lasting rule answers the second run"
         );
         assert_eq!(last_message(&mut socket, chat).await["text"], "second done");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_script_call_marks_no_run_and_breaks_no_replay() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            // The Model names the pair but adds a field the tool refuses.
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "surprise": true}),
+            ),
+            text("first done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["one"]}),
+            ),
+            text("second done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+                &[("hello.sh", "printf 'hello'")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+
+        // The refused call is recorded as an action and stops nothing: the
+        // record still projects, so the run finishes.
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert_eq!(last_message(&mut socket, chat).await["text"], "first done");
+
+        // It also marks no run: the pair's first real run still asks.
+        let queued = submit(&mut socket, chat, "run it properly", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(
+            approvals[0]["reason"], "first_script_run",
+            "a refused call is not a first run: {approvals:?}"
+        );
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_ask_rule_for_a_script_asks_every_run() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["one"]}),
+            ),
+            text("first done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["two"]}),
+            ),
+            text("second done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["three"]}),
+            ),
+            text("third done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+                &[("hello.sh", "printf 'hello'")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        let ask = command(
+            &mut socket,
+            Id::new(),
+            add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
+        )
+        .await;
+        let ask: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+        // A Space-served call has its own approvals on every Computer kind.
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "rule", "{approvals:?}");
+        assert_eq!(approvals[0]["rule"], json!(ask));
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+        // Allow once leaves the Ask rule: the next run asks again.
+        let queued = submit(&mut socket, chat, "again", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "rule", "{approvals:?}");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut socket, approval, true, true).await;
+        assert_eq!(decided["overridden"], json!(ask));
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+        // The covered Ask rule is gone, so the next run starts without a card.
+        let queued = submit(&mut socket, chat, "one more", None).await;
+        let run = run_of(&queued);
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        assert!(
+            approvals_in(&mut socket, Some(chat)).await.is_empty(),
+            "no rule asks after Always allow covers the Ask rule"
+        );
         socket.close(None).await.unwrap();
         provider_task.abort();
         running.shutdown().await;
@@ -17984,33 +18144,49 @@ mod tests {
         .unwrap_err();
         assert_eq!(code, ErrorCode::InvalidArgument);
         assert!(message.contains("names its skill"), "{message}");
-        // A pair with another tool names no script.
-        let (code, message) = try_command(
+        // A pair names an installed skill and one of its scripts.
+        let (code, _message) = try_command(
             &mut socket,
             Id::new(),
             add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
         )
         .await
-        .unwrap();
-        let _ = (code, message);
-        let rule: Id = serde_json::from_value(
-            try_command(
-                &mut socket,
-                Id::new(),
-                add_script_rule(bot, neha::record::RuleEffect::Allow, "hello", "hello.sh"),
-            )
-            .await
-            .unwrap()
-            .1["rule"]
-                .clone(),
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::NotFound);
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'hello'")],
+            ),
         )
-        .unwrap();
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "other.sh"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("carries no such script"), "{message}");
+        let added_rule = command(
+            &mut socket,
+            Id::new(),
+            add_script_rule(bot, neha::record::RuleEffect::Allow, "hello", "hello.sh"),
+        )
+        .await;
+        let rule: Id = serde_json::from_value(added_rule["rule"].clone()).unwrap();
         let rules = approvals_of(&mut socket, bot).await;
         assert!(
-            rules
-                .iter()
-                .any(|view| view["rule"] == json!(rule) && view["skill"] == "hello"),
-            "the rule names the pair: {rules:?}"
+            rules.iter().any(|view| view["rule"] == json!(rule)
+                && view["skill"] == json!(skill)
+                && view["skill_name"] == "hello"
+                && view["script"] == "hello.sh"),
+            "the rule names the installed skill and its script: {rules:?}"
         );
         // A pair on a tool that is not run_skill_script is refused.
         let (code, message) = try_command(
@@ -18072,6 +18248,400 @@ mod tests {
                 .unwrap_err();
         assert_eq!(code, ErrorCode::NotFound);
         socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+    /// Reads one command's answer without assuming the order two commands
+    /// answered in.
+    async fn settled(socket: &mut Socket, wanted: Id) -> Result<Value, (ErrorCode, String)> {
+        loop {
+            match next_frame(socket).await {
+                ServerFrame::Confirmed { id, result } if id == wanted => return Ok(result),
+                ServerFrame::Error {
+                    id: Some(id),
+                    code,
+                    message,
+                } if id == wanted => return Err((code, message)),
+                ServerFrame::Heartbeat { .. }
+                | ServerFrame::Event { .. }
+                | ServerFrame::Snapshot { .. }
+                | ServerFrame::Accepted { .. }
+                | ServerFrame::Committed { .. }
+                | ServerFrame::Confirmed { .. }
+                | ServerFrame::Error { .. } => {}
+                other => panic!("unexpected frame {other:?}"),
+            }
+        }
+    }
+
+    /// The bytes the Space holds under one access rule, as a count.
+    fn staged_blob_count(running: &Running) -> usize {
+        std::fs::read_dir(running.server.home.blobs_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(std::result::Result::ok)
+                    .filter(|entry| entry.path().is_dir())
+                    .map(|entry| std::fs::read_dir(entry.path()).map_or(0, |files| files.count()))
+                    .sum()
+            })
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_the_skill_lacks_never_asks() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "missing.sh", "arguments": []}),
+            ),
+            text("done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'hello'")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert!(
+            approvals_in(&mut socket, Some(chat)).await.is_empty(),
+            "a script the skill does not carry asks nobody"
+        );
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answered_card_never_runs_a_replacement_script() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+            ),
+            text("done"),
+        ])
+        .await;
+        let (bot, chat, computer) = tool_bot(&mut socket, base.clone()).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'old' > result.txt")],
+            ),
+        )
+        .await;
+        let first_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable {
+                bot,
+                skill: first_skill,
+            },
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "first_script_run");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+
+        // The card waits while the skill it named is replaced under the same
+        // names by another script.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::SkillRemove { skill: first_skill },
+        )
+        .await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'new' > result.txt")],
+            ),
+        )
+        .await;
+        let second_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable {
+                bot,
+                skill: second_skill,
+            },
+        )
+        .await;
+        // The run keeps the Computer it began on, and that workspace is where
+        // either script would write.
+        let workspace = running
+            .server
+            .state
+            .lock()
+            .unwrap()
+            .computers
+            .get(&computer)
+            .map(|view| view.workspace.clone())
+            .unwrap();
+
+        decide_approval(&mut socket, approval, true, false).await;
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert!(
+            !std::path::Path::new(&workspace).join("result.txt").exists(),
+            "no replacement script ran under the old card"
+        );
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let text = messages.as_array().unwrap().last().unwrap()["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(text, "done");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_script_call_survives_a_restart() {
+        let (directory, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "surprise": true}),
+            ),
+            text("first done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+            ),
+            text("second done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'hello'")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+
+        // The record replays: the refused call it holds projects as before.
+        let root = running.server_home();
+        running.shutdown().await;
+        let (second_base, second_provider) = scripted_provider(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+            ),
+            text("replayed done"),
+        ])
+        .await;
+        let second = start(test_home(&root), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        command(&mut socket, Id::new(), provider_add(second_base)).await;
+        let _ = directory;
+        let skills = command(&mut socket, Id::new(), CommandCall::SkillList { bot: None }).await;
+        assert_eq!(skills.as_array().map(Vec::len), Some(1), "{skills}");
+        let queued = submit(&mut socket, chat, "run it again", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(
+            approvals[0]["reason"], "first_script_run",
+            "the replay still knows the refused call never ran: {approvals:?}"
+        );
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        socket.close(None).await.unwrap();
+        second_provider.abort();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_clients_cannot_add_the_same_skill_name() {
+        let (_dir, running, invite) = running().await;
+        let (mut first, token) = admin(&running, &invite).await;
+        let mut second = open_socket(&running, &token).await;
+        let call = add_skill(
+            None,
+            "---\nname: shared\ndescription: One skill.\n---\nBody.",
+            &[],
+        );
+        let (first_id, second_id) = (Id::new(), Id::new());
+        send_command(&mut first, first_id, call.clone()).await;
+        send_command(&mut second, second_id, call).await;
+        let answered = tokio::join!(async { settled(&mut first, first_id).await }, async {
+            settled(&mut second, second_id).await
+        },);
+        let ok = [&answered.0, &answered.1]
+            .iter()
+            .filter(|answer| answer.is_ok())
+            .count();
+        assert_eq!(ok, 1, "only one add wins: {answered:?}");
+        let skills = command(&mut first, Id::new(), CommandCall::SkillList { bot: None }).await;
+        assert_eq!(
+            skills.as_array().map(Vec::len),
+            Some(1),
+            "the library holds one skill: {skills}"
+        );
+        first.close(None).await.unwrap();
+        second.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_instructions_only_space_offers_no_scripts() {
+        let (_dir, running, invite) =
+            running_with_config("[skills]\ninstructions_only = true\n").await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task, recorded) = scripted_provider_recording(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+            ),
+            text("done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'hello'")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        {
+            let requests = recorded.lock().unwrap();
+            let names = tool_names(&requests[0]);
+            assert!(
+                names.iter().any(|name| name == "skill")
+                    && !names.iter().any(|name| name == "run_skill_script"),
+                "an instructions-only Space offers the body but no script: {names:?}"
+            );
+        }
+        assert!(
+            approvals_in(&mut socket, Some(chat)).await.is_empty(),
+            "no card is made for a script the Space will never run"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_account_cannot_add_a_skill_to_another_library() {
+        let (_dir, running, invite) = running().await;
+        let (mut admin_socket, _token) = admin(&running, &invite).await;
+        let created = command(&mut admin_socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let mut grace = open_socket(&running, &grace_token).await;
+
+        let before = staged_blob_count(&running);
+        let (code, message) = try_command(
+            &mut grace,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: shared\ndescription: One skill.\n---\nBody.",
+                &[("run.sh", "printf 'x'")],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::Forbidden, "{message}");
+        let (code, message) = try_command(
+            &mut grace,
+            Id::new(),
+            add_skill(
+                Some(bot),
+                "---\nname: shared\ndescription: One skill.\n---\nBody.",
+                &[("run.sh", "printf 'x'")],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::Forbidden, "{message}");
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "a refused add stores no bytes"
+        );
+        let skills = command(&mut grace, Id::new(), CommandCall::SkillList { bot: None }).await;
+        assert_eq!(skills, json!([]), "the refused adds recorded nothing");
+        admin_socket.close(None).await.unwrap();
+        grace.close(None).await.unwrap();
         running.shutdown().await;
     }
 }
