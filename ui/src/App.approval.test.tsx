@@ -41,7 +41,7 @@ function card(view: View): string {
 }
 
 function header(view: View): string {
-  return element(view, ".chat__sub").textContent ?? "";
+  return element(view, ".chat__head").textContent ?? "";
 }
 
 function buttons(view: View) {
@@ -103,7 +103,7 @@ describe("App with approvals", () => {
     expect(card(view)).toContain("printf hi > a.txt");
     expect(card(view)).toContain("This is the first time Scout uses your Computer.");
     expect(element(view, ".approval__undo").textContent).toBe("This action cannot be undone.");
-    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow once", "Deny"]);
     // Nothing lasting is offered, so no scope is promised.
     expect(view.container.querySelector(".approval__scope")).toBeNull();
   });
@@ -198,7 +198,7 @@ describe("App with approvals", () => {
     const view = await openChat();
 
     expect(card(view)).toContain("A rule you set asks before this action.");
-    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Always allow", "Deny"]);
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow once", "Always allow", "Deny"]);
     // The Space said nothing about the scope, so the page names what it can see.
     expect(element(view, ".approval__scope").textContent).toBe(
       "Always allow covers: files in the Workspace root",
@@ -211,7 +211,7 @@ describe("App with approvals", () => {
     const view = await openChat();
 
     expect(card(view)).toContain("A rule you set asks before this action.");
-    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow once", "Deny"]);
     expect(view.container.querySelector(".approval__scope")).toBeNull();
   });
 
@@ -228,7 +228,7 @@ describe("App with approvals", () => {
     expect(view.container.querySelectorAll(".approval__scope")).toHaveLength(0);
     for (const approval of view.container.querySelectorAll(".approval")) {
       expect([...approval.querySelectorAll("button")].map((button) => button.textContent)).toEqual([
-        "Allow",
+        "Allow once",
         "Deny",
       ]);
     }
@@ -239,12 +239,12 @@ describe("App with approvals", () => {
     const view = await openChat();
     space.holdDecide();
 
-    press(view, "Allow");
+    press(view, "Allow once");
     await flush();
     expect(space.decisions).toEqual([{ approval: "a1", allow: true, lasting: false }]);
     expect(buttons(view).every((button) => button.disabled)).toBe(true);
     // A second click while the answer is out changes nothing.
-    press(view, "Allow");
+    press(view, "Allow once");
     expect(space.decisions).toHaveLength(1);
 
     space.releaseDecide();
@@ -286,7 +286,7 @@ describe("App with approvals", () => {
     space.approvals.push(firstUse);
     const view = await openChat();
 
-    press(view, "Allow");
+    press(view, "Allow once");
     await waitFor(() => expect(card(view)).toContain("Allowed"));
     // Any later read of the Chat finds no approval for it any more.
     const lists = asked("approval_list");
@@ -319,16 +319,16 @@ describe("App with approvals", () => {
 
     await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(1));
     expect(card(view)).toContain("printf hi > a.txt");
-    expect(element(view, ".state-text--waiting").textContent).toBe("Waiting for approval");
+    expect(element(view, ".chat__attention-long").textContent).toBe("Waiting for your approval");
 
     flush(() => fireEvent.click(element(view, ".locale-switch")));
-    expect(header(view)).toContain("等待审批");
-    expect(buttons(view).map((button) => button.textContent)).toEqual(["允许", "拒绝"]);
+    expect(header(view)).toContain("等待你的审批");
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["允许一次", "拒绝"]);
 
     // A granted approval lets the Run work again, and the header says so.
-    press(view, "允许");
+    press(view, "允许一次");
     await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("正在处理"));
-    expect(header(view)).not.toContain("等待审批");
+    expect(header(view)).not.toContain("等待你的审批");
     expect(card(view)).toContain("已允许");
   });
 
@@ -336,7 +336,7 @@ describe("App with approvals", () => {
     waitingRun();
     const view = await openChat();
 
-    expect(header(view)).toContain("Waiting for approval");
+    expect(header(view)).toContain("Waiting for your approval");
     expect(card(view)).toContain("printf hi > a.txt");
     // A waiting Run holds no place, so the composer names none.
     expect(view.container.querySelector(".composer__queue")).toBeNull();
@@ -344,13 +344,13 @@ describe("App with approvals", () => {
     // A denied approval ends the wait on this page; the record finishes the Run.
     press(view, "Deny");
     await waitFor(() => expect(card(view)).toContain("Denied"));
-    expect(header(view)).not.toContain("Waiting for approval");
+    expect(header(view)).not.toContain("Waiting for your approval");
   });
 
   it("keeps waiting when a late answer about the record says the Run works", async () => {
     waitingRun();
     const view = await openChat();
-    expect(header(view)).toContain("Waiting for approval");
+    expect(header(view)).toContain("Waiting for your approval");
 
     // An answer read before the approval still says the Run is running.
     space.runs["r1"] = { status: "running" };
@@ -358,13 +358,13 @@ describe("App with approvals", () => {
     record("neha.message.added", { chat: "h1", message: "m8", text: "tick", file: null, run: "r1" });
     await waitFor(() => expect(space.runShows.length).toBeGreaterThan(shows));
     await flush();
-    expect(header(view)).toContain("Waiting for approval");
+    expect(header(view)).toContain("Waiting for your approval");
     expect(view.container.querySelector(".msg--working")).toBeNull();
 
     // Only the decision lets the Run work again.
-    press(view, "Allow");
+    press(view, "Allow once");
     await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
-    expect(header(view)).not.toContain("Waiting for approval");
+    expect(header(view)).not.toContain("Waiting for your approval");
   });
 
   it("keeps what a live request says about a lasting rule", async () => {
@@ -381,7 +381,7 @@ describe("App with approvals", () => {
     requested(noLasting);
     await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(1));
     expect(view.container.querySelector(".approval__scope")).toBeNull();
-    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow", "Deny"]);
+    expect(buttons(view).map((button) => button.textContent)).toEqual(["Allow once", "Deny"]);
 
     // A request that carries the Space's words shows them, and the lasting button.
     const said: Approval = {
@@ -396,9 +396,9 @@ describe("App with approvals", () => {
     await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(2));
     expect(lines(view, ".approval__scope")).toEqual(['Always allow covers: shell commands starting with "git"']);
     expect(buttons(view).map((button) => button.textContent)).toEqual([
-      "Allow",
+      "Allow once",
       "Deny",
-      "Allow",
+      "Allow once",
       "Always allow",
       "Deny",
     ]);

@@ -45,7 +45,6 @@ export default function AuthView(props: AuthViewProps) {
       <section class="auth__intro">
         <Brand />
         <div class="auth__copy">
-          <p class="eyebrow">{t("brand.eyebrow")}</p>
           <h1>{t("auth.headline")}</h1>
           <p class="auth__lede">{t("auth.lede")}</p>
         </div>
@@ -71,7 +70,6 @@ export default function AuthView(props: AuthViewProps) {
             <LocaleSwitch />
           </div>
           <Show when={props.mode === "missing-invite"}>
-            <p class="eyebrow">{t("auth.missing.eyebrow")}</p>
             <h2>{t("auth.missing.title")}</h2>
             <p class="muted">
               {t("auth.missing.lead")} <code>neha serve</code> {t("auth.missing.mid")} <code>#</code>
@@ -80,7 +78,6 @@ export default function AuthView(props: AuthViewProps) {
           </Show>
 
           <Show when={props.mode !== "missing-invite"}>
-            <p class="eyebrow">{isJoin() ? t("auth.join.eyebrow") : t("auth.login.eyebrow")}</p>
             <h2>{isJoin() ? t("auth.join.title") : t("auth.login.title")}</h2>
             <p class="auth__hint">{isJoin() ? t("auth.join.hint") : t("auth.login.hint")}</p>
 
