@@ -124,6 +124,8 @@ pub struct SpaceServer {
     browser_authority: Mutex<Option<String>>,
     /// The public https origin a trusted TLS proxy forwards to this Space.
     public_url: Option<String>,
+    /// The installed browser clients' push subscriptions.
+    pub(crate) push: std::sync::Arc<crate::push::Push>,
 }
 
 impl SpaceServer {
@@ -175,6 +177,10 @@ impl SpaceServer {
         let mut state = SpaceState::default();
         store.replay(&mut state).await?;
         let secrets = Secrets::load(&home)?;
+        let push_contact = public_url
+            .clone()
+            .unwrap_or_else(|| "mailto:neha@localhost".to_owned());
+        let push = crate::push::Push::open(&home, &secrets, push_contact);
         let model = ModelClient::new()?;
         let (events, _) = broadcast::channel(256);
 
@@ -205,6 +211,7 @@ impl SpaceServer {
             browser_host,
             browser_authority: Mutex::new(None),
             public_url,
+            push,
         })
     }
 
@@ -244,6 +251,13 @@ impl SpaceServer {
             .route("/api/join", post(join))
             .route("/api/login", post(login))
             .route("/api/me", get(me))
+            .route("/api/push", get(push_status))
+            .route(
+                "/api/push/subscriptions",
+                post(push_subscribe).delete(push_unsubscribe),
+            )
+            .route("/api/push/mute", post(push_mute))
+            .route("/api/push/unmute", post(push_unmute))
             .route("/api/socket", get(socket))
             .route("/api/computer/socket", get(computer_socket))
             .route("/api/computer/ticket", post(computer_ticket))
@@ -302,7 +316,8 @@ pub struct Running {
     home: Home,
     storage: Storage,
     server: Arc<SpaceServer>,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    push_task: Option<JoinHandle<()>>,
 }
 
 impl Running {
@@ -359,11 +374,31 @@ impl Running {
     /// It refuses new work first, then stops the queues, so a command that
     /// arrives during the stop cannot start a run. A run still working is
     /// abandoned the way it was before a stop.
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         self.server.close();
         self.server.runs.shutdown().await;
-        self.task.abort();
-        let _ = self.task.await;
+        if let Some(push) = self.push_task.take() {
+            push.abort();
+            let _ = push.await;
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        // A dropped Running stops its work even when the caller did not wait
+        // for `shutdown`. The push task holds the server, so leaving it alive
+        // would also keep the record's event sender open.
+        if let Some(task) = &self.task {
+            task.abort();
+        }
+        if let Some(push) = &self.push_task {
+            push.abort();
+        }
     }
 }
 
@@ -487,6 +522,7 @@ async fn start_with(
         }
         (Some(_), None) | (None, _) => None,
     };
+    let push_task = crate::push::spawn(Arc::clone(&server));
     server.runs.wake_all(&server);
     let invite_base = server
         .public_url
@@ -512,7 +548,8 @@ async fn start_with(
         home: server.home().clone(),
         storage: server.storage.clone(),
         server,
-        task,
+        task: Some(task),
+        push_task: Some(push_task),
     })
 }
 
@@ -1197,6 +1234,107 @@ fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
 
 async fn me(Authed { account }: Authed) -> Json<AccountBody> {
     Json(account.into())
+}
+
+#[derive(Serialize)]
+struct PushStatusBody {
+    key: String,
+    muted_until: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct PushSubscribeBody {
+    endpoint: String,
+    keys: PushSubscribeKeys,
+}
+
+#[derive(Deserialize)]
+struct PushSubscribeKeys {
+    p256dh: String,
+    auth: String,
+}
+
+#[derive(Deserialize)]
+struct PushUnsubscribeBody {
+    endpoint: String,
+}
+
+#[derive(Deserialize)]
+struct PushMuteBody {
+    minutes: u64,
+}
+
+/// Returns the VAPID public key and the Space's mute, when push is configured.
+async fn push_status(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account: _ }: Authed,
+) -> Result<Json<PushStatusBody>, ApiError> {
+    let status = server
+        .push
+        .status()
+        .ok_or_else(|| ApiError::unavailable("notifications are not configured"))?;
+
+    Ok(Json(PushStatusBody {
+        key: status.key,
+        muted_until: status.muted_until,
+    }))
+}
+
+/// Stores one browser's subscription for the signed-in account.
+async fn push_subscribe(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account }: Authed,
+    Json(body): Json<PushSubscribeBody>,
+) -> Result<Json<Value>, ApiError> {
+    server
+        .push
+        .subscribe(account.id, body.endpoint, body.keys.p256dh, body.keys.auth)
+        .map_err(push_error)?;
+
+    Ok(Json(serde_json::json!({"subscribed": true})))
+}
+
+/// Forgets one browser's subscription for the signed-in account.
+async fn push_unsubscribe(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account }: Authed,
+    Json(body): Json<PushUnsubscribeBody>,
+) -> Result<Json<Value>, ApiError> {
+    server
+        .push
+        .unsubscribe(account.id, &body.endpoint)
+        .map_err(push_error)?;
+
+    Ok(Json(serde_json::json!({"subscribed": false})))
+}
+
+/// Mutes the whole Space for a number of minutes.
+async fn push_mute(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account: _ }: Authed,
+    Json(body): Json<PushMuteBody>,
+) -> Result<Json<Value>, ApiError> {
+    let until = server.push.mute(body.minutes).map_err(push_error)?;
+
+    Ok(Json(serde_json::json!({"muted_until": until})))
+}
+
+/// Ends a mute.
+async fn push_unmute(
+    State(server): State<Arc<SpaceServer>>,
+    Authed { account: _ }: Authed,
+) -> Result<Json<Value>, ApiError> {
+    server.push.unmute().map_err(push_error)?;
+
+    Ok(Json(serde_json::json!({"muted_until": null})))
+}
+
+fn push_error(error: crate::push::SubscribeError) -> ApiError {
+    match error {
+        crate::push::SubscribeError::Invalid(message) => ApiError::invalid_argument(message),
+        crate::push::SubscribeError::TooMany => ApiError::conflict(error.message()),
+        crate::push::SubscribeError::Store => ApiError::internal(error.message()),
+    }
 }
 
 #[derive(Deserialize)]
@@ -3300,6 +3438,211 @@ mod tests {
             HeaderValue::from_bytes(&[0xFF]).expect("obs-text is a header value"),
         );
         assert_eq!(super::client_ip(proxy, &invalid), proxy);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn push_subscriptions_and_mute_are_stored() {
+        const P256DH: &str = "BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY";
+        const AUTH: &str = "_ordMnz7uTCmrpBTeUV4Bw";
+
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let client = reqwest::Client::new();
+        let status = client
+            .get(format!("{}/api/push", running.url()))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(status.status(), reqwest::StatusCode::OK);
+        let status: serde_json::Value = status.json().await.unwrap();
+        assert!(status["key"].as_str().unwrap().len() > 80);
+
+        let unauthorized = client
+            .get(format!("{}/api/push", running.url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let subscribe = |endpoint: &str, key: &str| {
+            client
+                .post(format!("{}/api/push/subscriptions", running.url()))
+                .bearer_auth(token)
+                .json(&serde_json::json!({
+                    "endpoint": endpoint,
+                    "keys": {"p256dh": key, "auth": AUTH},
+                }))
+                .send()
+        };
+        let stored = subscribe("https://push.example.com/a", P256DH)
+            .await
+            .unwrap();
+        assert_eq!(stored.status(), reqwest::StatusCode::OK);
+        let invalid = subscribe("https://push.example.com/b", "not-a-key")
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        let muted: serde_json::Value = client
+            .post(format!("{}/api/push/mute", running.url()))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"minutes": 60}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(muted["muted_until"].as_u64().unwrap() > 0);
+        let unmuted: serde_json::Value = client
+            .post(format!("{}/api/push/unmute", running.url()))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(unmuted["muted_until"].is_null());
+
+        let removed = client
+            .delete(format!("{}/api/push/subscriptions", running.url()))
+            .bearer_auth(token)
+            .json(&serde_json::json!({"endpoint": "https://push.example.com/a"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(removed.status(), reqwest::StatusCode::OK);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_finished_run_reaches_its_subscribed_device() {
+        const P256DH: &str = "BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY";
+        const AUTH: &str = "_ordMnz7uTCmrpBTeUV4Bw";
+
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let account: Id = session["account"]["id"].as_str().unwrap().parse().unwrap();
+        let bot = Id::new();
+        let chat = Id::new();
+        let run = Id::new();
+        let reply = Id::new();
+        let computer = Id::new();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let device = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk)
+                    .await
+                    .unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            String::from_utf8_lossy(&request).to_lowercase()
+        });
+
+        running
+            .server
+            .push
+            .subscribe(
+                account,
+                format!("http://{address}/push"),
+                P256DH.to_owned(),
+                AUTH.to_owned(),
+            )
+            .unwrap();
+        {
+            let mut state = running.server.state.lock().unwrap();
+            state.bots.insert(
+                bot,
+                crate::state::BotView {
+                    id: bot,
+                    owner: account,
+                    name: "Scout".to_owned(),
+                    computer,
+                    chat,
+                    full_access: false,
+                    grants: Vec::new(),
+                    thinking: None,
+                    model: None,
+                },
+            );
+            state.chats.insert(
+                chat,
+                crate::state::ChatView {
+                    id: chat,
+                    owner: account,
+                    bot,
+                    status: crate::state::ChatStatus::Idle,
+                    active_run: None,
+                },
+            );
+            state.runs.insert(
+                run,
+                crate::state::RunView {
+                    id: run,
+                    chat,
+                    bot,
+                    acting: account,
+                    command: Id::new(),
+                    message: Id::new(),
+                    seq: neha::seq::Seq::ZERO,
+                    started: None,
+                    status: neha::record::RunStatus::Succeeded,
+                    reply: Some(reply),
+                    usage: None,
+                    error: None,
+                    approval: None,
+                    cwd: None,
+                    cwd_writable: false,
+                    once_grant: None,
+                    computer: None,
+                    access: None,
+                    steps: Vec::new(),
+                    actions: Vec::new(),
+                },
+            );
+        }
+
+        let event = neha::record::Event {
+            seq: neha::seq::Seq::from_i64(1_000_000).unwrap(),
+            kind: neha::record::EventKind::RunFinished,
+            version: 1,
+            at: neha::time::Timestamp::from_microseconds(0).unwrap(),
+            author: neha::record::Author::Bot(bot),
+            acting: Some(account),
+            command: None,
+            data: serde_json::json!({"run": run, "status": "succeeded"}),
+        };
+        for _ in 0..100 {
+            if running.server.events.send(event.clone()).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), device)
+            .await
+            .expect("the push request arrived")
+            .unwrap();
+        assert!(request.contains("authorization: vapid t="), "{request}");
+        assert!(request.contains("content-encoding: aes128gcm"), "{request}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

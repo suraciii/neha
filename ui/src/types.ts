@@ -258,3 +258,19 @@ export interface RecordEvent {
   command?: string;
   data: Record<string, unknown>;
 }
+
+// The public VAPID key and the Space's current mute.
+export interface PushStatus {
+  key: string;
+  muted_until: number | null;
+}
+
+// One browser subscription's address and encryption keys.
+export interface PushSubscriptionBody {
+  endpoint: string;
+  keys: { p256dh: string; auth: string };
+}
+
+export interface PushMute {
+  muted_until: number | null;
+}

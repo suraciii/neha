@@ -6,6 +6,7 @@ import Avatar from "./Avatar";
 import Brand from "./Brand";
 import Icon from "./Icon";
 import LocaleSwitch from "./LocaleSwitch";
+import NotificationSetting from "./NotificationSetting";
 
 interface SidebarProps {
   account: Account;
@@ -178,6 +179,7 @@ export default function Sidebar(props: SidebarProps) {
         </span>
         <div class="foot__row">
           <LocaleSwitch class="locale-switch--foot" />
+          <NotificationSetting />
           <span class="foot__meta">{props.account.display_name}</span>
         </div>
       </footer>

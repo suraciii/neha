@@ -59,6 +59,33 @@ describe("the mobile client", () => {
     expect(history.length).toBe(before);
   });
 
+  it("opens the Chat and Message a notification names", async () => {
+    space.messages = [
+      {
+        id: "m1",
+        chat: space.chat.id,
+        author: { kind: "bot", id: space.bot.id },
+        acting: space.account.id,
+        text: "Done.",
+        at: "2026-01-01T00:00:00.000Z",
+        seq: "1",
+        run: null,
+        file: null,
+      },
+    ];
+    history.replaceState(null, "", `/?chat=${space.chat.id}&message=m1`);
+    mobile();
+    const view = renderApp();
+
+    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+    expect(history.state?.nehaChat).toBe(space.chat.id);
+    expect(location.search).toBe("");
+    await waitFor(() =>
+      expect(view.container.querySelector('[data-message="m1"]')).toBeTruthy(),
+    );
+    history.replaceState(null, "", "/");
+  });
+
   it("gives a wide-window Chat an entry when the window becomes narrow", async () => {
     history.replaceState(null, "");
     let narrow = false;

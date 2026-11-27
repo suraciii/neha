@@ -16,11 +16,16 @@ type Handler = (event: {
     mode: string;
     headers: Headers;
   };
+  data?: { json: () => unknown };
+  notification?: { close: () => void; data?: { url?: string } };
   respondWith?: (promise: Promise<Response>) => void;
   waitUntil?: (promise: Promise<unknown>) => void;
 }) => void;
 
-function fakeWorker(fetchImpl: (input: unknown, init?: RequestInit) => Promise<Response>) {
+function fakeWorker(
+  fetchImpl: (input: unknown, init?: RequestInit) => Promise<Response>,
+  language = "en-US",
+) {
   const handlers = new Map<string, Handler>();
   const stores = new Map<string, Map<string, Response>>();
   const keyOf = (key: unknown) =>
@@ -60,10 +65,21 @@ function fakeWorker(fetchImpl: (input: unknown, init?: RequestInit) => Promise<R
     delete: async (name: string) => stores.delete(name),
   };
   const fetchMock = vi.fn(fetchImpl);
+  const showNotification = vi.fn(async () => undefined);
+  const focus = vi.fn(async () => undefined);
+  const navigate = vi.fn(async () => null);
+  const openWindow = vi.fn(async () => null);
+  const clients = {
+    claim: async () => undefined,
+    matchAll: vi.fn(async () => [] as { focus: typeof focus; navigate: typeof navigate }[]),
+    openWindow,
+  };
   const self = {
     addEventListener: (type: string, handler: Handler) => handlers.set(type, handler),
     skipWaiting: async () => undefined,
-    clients: { claim: async () => undefined },
+    registration: { showNotification },
+    clients,
+    location: { origin: "https://space.example.com" },
   };
 
   runInNewContext(readFileSync(resolve(process.cwd(), "public", "sw.js"), "utf8"), {
@@ -73,10 +89,43 @@ function fakeWorker(fetchImpl: (input: unknown, init?: RequestInit) => Promise<R
     Response,
     URL,
     location: { origin: "https://space.example.com" },
+    navigator: { language },
     console,
   });
 
-  return { handlers, cacheFor, cacheApi, fetchMock };
+  return { handlers, cacheFor, cacheApi, fetchMock, clients, showNotification, focus, navigate, openWindow };
+}
+
+async function pushed(
+  handlers: Map<string, Handler>,
+  payload: unknown,
+): Promise<void> {
+  let answered: Promise<unknown> | undefined;
+  handlers.get("push")?.({
+    data: { json: () => payload },
+    waitUntil: (promise) => {
+      answered = promise;
+    },
+  });
+  if (!answered) throw new Error("the worker did not answer the push");
+  await answered;
+}
+
+async function clicked(
+  handlers: Map<string, Handler>,
+  url: string,
+): Promise<{ close: ReturnType<typeof vi.fn> }> {
+  const close = vi.fn();
+  let answered: Promise<unknown> | undefined;
+  handlers.get("notificationclick")?.({
+    notification: { close, data: { url } },
+    waitUntil: (promise) => {
+      answered = promise;
+    },
+  });
+  if (!answered) throw new Error("the worker did not answer the click");
+  await answered;
+  return { close };
 }
 
 async function seed(worker: ReturnType<typeof fakeWorker>) {
@@ -345,6 +394,57 @@ describe("the installed shell worker", () => {
     const response = await navigate(worker.handlers);
     expect(await response.text()).toBe(LAST_GOOD);
     expect(await (await worker.cacheFor(SHELL).match("/"))!.text()).toBe(LAST_GOOD);
+  });
+
+  it("shows a finished run in the device's language", async () => {
+    const worker = fakeWorker(async () => new Response("ok"));
+    await pushed(worker.handlers, {
+      kind: "finished",
+      title: "Scout",
+      url: "/?chat=h1&message=m1",
+      tag: "chat-h1",
+    });
+
+    expect(worker.showNotification).toHaveBeenCalledWith(
+      "Scout",
+      expect.objectContaining({
+        body: "Finished a run.",
+        data: { url: "/?chat=h1&message=m1" },
+        tag: "chat-h1",
+      }),
+    );
+  });
+
+  it("shows an approval in Chinese and closes the notification on click", async () => {
+    const worker = fakeWorker(async () => new Response("ok"), "zh-CN");
+    await pushed(worker.handlers, {
+      kind: "approval",
+      title: "Scout",
+      url: "/?chat=h1&approval=a1",
+      tag: "chat-h1",
+    });
+    expect(worker.showNotification).toHaveBeenCalledWith(
+      "Scout",
+      expect.objectContaining({ body: "等待你的审批。" }),
+    );
+
+    worker.clients.matchAll.mockResolvedValue([
+      { focus: worker.focus, navigate: worker.navigate },
+    ]);
+    const click = await clicked(worker.handlers, "/?chat=h1&approval=a1");
+    expect(click.close).toHaveBeenCalled();
+    expect(worker.focus).toHaveBeenCalled();
+    expect(worker.navigate).toHaveBeenCalledWith(
+      "https://space.example.com/?chat=h1&approval=a1",
+    );
+    expect(worker.openWindow).not.toHaveBeenCalled();
+  });
+
+  it("opens a window when the click has none", async () => {
+    const worker = fakeWorker(async () => new Response("ok"));
+    await clicked(worker.handlers, "/?chat=h2");
+
+    expect(worker.openWindow).toHaveBeenCalledWith("https://space.example.com/?chat=h2");
   });
 
   it("drops an older shell cache on activation", async () => {

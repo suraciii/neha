@@ -43,6 +43,8 @@ interface ChatViewProps {
   activity: RunActivity | null;
   // The approval the User asked to see, so the Chat scrolls to its card.
   focus: string | null;
+  // The Message a notification named, so the Chat scrolls to it.
+  focusMessage: string | null;
   onFocused: () => void;
   // The approval whose answer is on its way to the Space.
   deciding: string | null;
@@ -83,6 +85,21 @@ export default function ChatView(props: ChatViewProps) {
       queueMicrotask(() => {
         if (typeof card.scrollIntoView !== "function") return;
         card.scrollIntoView({ block: "center" });
+        props.onFocused();
+      });
+    },
+  );
+
+  // A notification that named a Message opens the Chat at that Message.
+  createEffect(
+    () => ({ message: props.focusMessage, count: props.messages.length }),
+    ({ message }) => {
+      if (!message) return;
+      const row = stream?.querySelector<HTMLElement>(`[data-message="${message}"]`);
+      if (!row) return;
+      queueMicrotask(() => {
+        if (typeof row.scrollIntoView !== "function") return;
+        row.scrollIntoView({ block: "center" });
         props.onFocused();
       });
     },
@@ -252,7 +269,7 @@ export default function ChatView(props: ChatViewProps) {
                       <span>{dayLabel(message.at, locale())}</span>
                     </div>
                   </Show>
-                  <article class={`msg ${isBot() ? "msg--bot" : "msg--user"}`}>
+                  <article class={`msg ${isBot() ? "msg--bot" : "msg--user"}`} data-message={message.id}>
                     <Show when={isBot()}>
                       <Avatar name={props.bot?.name ?? "Bot"} small />
                     </Show>

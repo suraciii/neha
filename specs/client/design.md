@@ -32,6 +32,22 @@ A path that does not name a file returns `index.html`, the browser entry point. 
 
 The Space does not serve its home directory or any file outside the client directory, except a File's bytes from the File store. A client directory that contains the Space home, or sits inside it, is a start error.
 
+## Notifications
+
+The installed browser client subscribes each device to Web Push only after the User enables notifications there.
+
+It asks the Space for the VAPID public key, subscribes with `userVisibleOnly`, and posts the endpoint and keys to the Space. On a later open it posts an existing subscription again, so the device and the Space agree after either one lost the other.
+
+On iOS and iPadOS, the client MUST NOT request notification permission outside an installed Home Screen app. It shows the Add to Home Screen prerequisite instead.
+
+The Space stores a subscription with its account and the endpoint's encryption keys, in a private state file. The VAPID private key lives with the Space's sealed secrets and MUST NOT rotate silently: every subscription is bound to it.
+
+A subscription the push service reports as gone is removed. The Space sends a push only for a finished or failed Run and a waiting Approval, and only while the Space is not muted; it never sends one for progress.
+
+The service worker shows the notification, localizing only the body. The payload carries the Bot's name and a same-origin URL with the Chat and the reply Message or Approval, never a token or the content of the work. A notification click focuses an existing client and navigates it to that URL; with no client it opens one.
+
+The Space's mute applies to the whole Space and every device, for the time the client asks for. Turning notifications off removes this device's subscription.
+
 ## Desktop host
 
 The desktop shell serves the same built client. A private `neha://ui` protocol

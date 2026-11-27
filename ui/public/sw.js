@@ -8,6 +8,26 @@
 
 const SHELL = "neha-shell-v4";
 
+// Web Push payloads carry what happened, not a sentence: the device picks the
+// words for its own language. The page's locale is not available here.
+const COPY = {
+  en: {
+    finished: "Finished a run.",
+    failed: "A run failed.",
+    approval: "Needs your approval.",
+  },
+  zh: {
+    finished: "完成了一次运行。",
+    failed: "运行失败。",
+    approval: "等待你的审批。",
+  },
+};
+
+function notificationBody(kind) {
+  const language = (navigator.language || "").toLowerCase().startsWith("zh") ? "zh" : "en";
+  return COPY[language][kind] || "";
+}
+
 // A shell is a successful HTML page that carries the app's entry point. A
 // proxy error or a maintenance page must never replace the last good shell.
 async function isShell(response) {
@@ -171,4 +191,59 @@ self.addEventListener("fetch", (event) => {
 
   // A content-named asset never changes; a stable name revalidates.
   event.respondWith(url.pathname.startsWith("/assets/") ? cacheFirst(request) : networkFirst(request));
+});
+
+self.addEventListener("push", (event) => {
+  let payload = {};
+  try {
+    payload = event.data ? event.data.json() : {};
+  } catch {
+    payload = {};
+  }
+  const state = self.registration;
+  const title = typeof payload.title === "string" && payload.title ? payload.title : "Neha";
+  const kind = typeof payload.kind === "string" ? payload.kind : "";
+  const url = typeof payload.url === "string" && payload.url.startsWith("/") ? payload.url : "/";
+  const options = {
+    body: notificationBody(kind),
+    data: { url },
+    icon: "/icons/icon-192.png",
+    badge: "/icons/icon-192.png",
+  };
+  if (typeof payload.tag === "string" && payload.tag) {
+    options.tag = payload.tag;
+    options.renotify = true;
+  }
+  event.waitUntil(state.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+  const stored =
+    event.notification.data && typeof event.notification.data.url === "string"
+      ? event.notification.data.url
+      : "/";
+  const url = new URL(stored, self.location.origin);
+  if (url.origin !== self.location.origin) return;
+  event.waitUntil(
+    (async () => {
+      const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      for (const window of windows) {
+        if ("focus" in window) {
+          await window.focus();
+          if ("navigate" in window) {
+            try {
+              await window.navigate(url.href);
+              return;
+            } catch {
+              // The window may have gone away; try a new one below.
+            }
+          }
+          if (self.clients.openWindow) await self.clients.openWindow(url.href);
+          return;
+        }
+      }
+      if (self.clients.openWindow) await self.clients.openWindow(url.href);
+    })(),
+  );
 });

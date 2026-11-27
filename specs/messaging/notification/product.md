@@ -53,14 +53,21 @@ A User sets a level on any Chat or Group.
 | Addressed and waiting | Mentions, and a Bot waiting for the User |
 | Off | Nothing |
 
-A User can mute the whole Space for a time.
+A User can mute the whole Space for a time. A mute silences every device.
 
 ## Delivery
 
 A Notification arrives as a system notification on the User's desktop and phone, and as a badge on the Chat's or Group's row.
 
-Opening a Notification opens the Chat or Group at the Message that started it.
+A browser receives Web Push only after the User enables notifications on that device. On iOS and iPadOS, Web Push is available only to an installed Home Screen app; the client shows that prerequisite instead of asking for permission.
+
+A subscription belongs to one device. The Space stores it and sends only to the devices of the User it acts for. The payload names the Bot and what happened, not the content of the work, and carries a same-origin address, never a token.
+
+Opening a Notification opens the Chat or Group at the Message that started it. A result opens the Bot's reply Message; a waiting Approval opens its Card.
 
 ## Gaps
 
 - A Question has no record event yet; the Needs attention view lists Approvals until the record holds one.
+- Groups, `@` mentions, Questions, and per-conversation levels are not implemented. Web Push in this build covers one-to-one Chats.
+- The client's Space mute lasts one hour.
+- The Electron desktop shell does not use Web Push in this build; use the installed browser app.
