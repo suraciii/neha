@@ -195,12 +195,17 @@ jobs:
           if (-not $app) { throw "Neha.exe was not installed" }
           $env:NEHA_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "neha-desktop-home"
           $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop.png"
+          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop.err.log"
+          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop.out.log"
           $process = Start-Process -FilePath $app.FullName `
-            -ArgumentList "--no-sandbox", "--disable-gpu" -PassThru
+            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
+            -RedirectStandardError $stderr -RedirectStandardOutput $stdout
           if (-not $process.WaitForExit(180000)) {
             Stop-Process -Id $process.Id -Force
             throw "the desktop app did not exit"
           }
+          if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
+          if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
           if ($process.ExitCode -ne 0) { throw "the desktop app exited $($process.ExitCode)" }
           if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the desktop app did not write a screenshot" }
           Write-Host "desktop screenshot: $env:NEHA_DESKTOP_CAPTURE"
