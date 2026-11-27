@@ -829,6 +829,12 @@ impl LocalRuntime {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     return Err("the path uses a symlink, which is not followed".to_owned());
                 }
+                Ok(metadata) if is_reparse_point(&metadata) => {
+                    return Err("the path uses a reparse point, which is not followed".to_owned());
+                }
+                Ok(metadata) if is_hard_link(&current, &metadata) => {
+                    return Err("the path uses a hard link, which is not followed".to_owned());
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
                 Err(error) => {
@@ -1989,6 +1995,57 @@ fn full_access_shell_command(command: &str, base: &Path) -> Command {
 
 /// Normalizes `.` and `..` without touching the file system; an absolute path
 /// stops at `/`.
+
+/// Windows reparse points, including junctions, are not followed by the
+/// managed file tools. The attribute check also covers a link without a
+/// recognisable symlink tag.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// A file with more than one hard link may name an object outside the Bot's
+/// folder; the managed tools refuse it rather than write through it.
+#[cfg(windows)]
+fn is_hard_link(path: &std::path::Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        // A file that exists but cannot be inspected is not safe to write.
+        return true;
+    };
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let inspected =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) };
+    inspected == 0 || information.nNumberOfLinks > 1
+}
+
+#[cfg(unix)]
+fn is_hard_link(_path: &std::path::Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.is_file() && metadata.nlink() > 1
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_hard_link(_path: &std::path::Path, _metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {

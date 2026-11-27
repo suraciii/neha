@@ -4,7 +4,7 @@
 // without showing the invitation form, and loads the existing browser client.
 // The Space remains the only server; this process is its supervisor.
 const { app, BrowserWindow, dialog, safeStorage, session, shell } = require("electron");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -61,6 +61,7 @@ function unsandboxedConsentFile() {
 
 async function confirmUnsandboxedMode() {
   if (process.platform !== "win32") return true;
+  if (process.env.NEHA_DESKTOP_DECLINE_UNSANDBOXED === "1") return false;
   try {
     fs.readFileSync(unsandboxedConsentFile(), "utf8");
     return true;
@@ -520,11 +521,10 @@ function killTree(child) {
   if (process.platform === "win32") {
     // child.kill() reaches only the daemon. taskkill /T also ends the
     // PowerShell/cmd command it started, so closing Neha cannot orphan a Bot.
-    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
       stdio: "ignore",
       windowsHide: true,
     });
-    killer.unref();
     return;
   }
   child.kill("SIGTERM");

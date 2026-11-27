@@ -245,3 +245,30 @@ jobs:
             throw "the second launch's Local Computer did not connect"
           }
           Write-Host "second desktop screenshot: $env:NEHA_DESKTOP_CAPTURE"
+
+      - name: Verify declining the Windows Local Computer
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
+            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
+            Select-Object -First 1
+          if (-not $app) { throw "Neha.exe was not installed" }
+          $home = Join-Path $env:RUNNER_TEMP "neha-desktop-declined"
+          Remove-Item -Recurse -Force $home -ErrorAction SilentlyContinue
+          $env:NEHA_DESKTOP_HOME = $home
+          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-declined.png"
+          $env:NEHA_DESKTOP_DECLINE_UNSANDBOXED = "1"
+          $process = Start-Process -FilePath $app.FullName `
+            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru
+          if (-not $process.WaitForExit(180000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "the declined desktop launch did not exit"
+          }
+          if ($process.ExitCode -ne 0) { throw "the declined desktop launch exited $($process.ExitCode)" }
+          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) {
+            throw "the declined desktop launch did not write a screenshot"
+          }
+          if (Test-Path (Join-Path $home "computer\computer.json")) {
+            throw "declining the warning must not pair a Local Computer"
+          }
+          Write-Host "declined screenshot: $env:NEHA_DESKTOP_CAPTURE"
