@@ -61,6 +61,12 @@ The new default takes over every Bot that inherits it. The Space refuses a Model
 
 Connecting or refreshing a Provider can move the default Model too, and the Space refuses the whole write when the Model it would set leaves a Bot unable to run, so the Space keeps the default it has.
 
+A refresh judges every Bot that runs on a Model of the Provider it refreshes, on the Models it would leave behind. A Bot whose own Model retires inherits the refreshed default and keeps its thinking level, even when the default does not move.
+
+A Model that keeps its name but changes what it serves is judged by what it now serves.
+
+When a judged Bot could no longer run, or the refreshed default cannot call tools, the Space refuses the whole refresh and records nothing: the Models and the default the Space had stay as they were.
+
 A Bot's chosen Model MUST be connected and able to call tools. Its thinking level MUST be one the Model accepts.
 
 | Thinking level | What it means |
@@ -80,4 +86,4 @@ When a Provider fails or runs out, the Bot says so as a Message and the work is 
 - Signing in with a subscription plan instead of an API key is not yet specified.
 - Fallback Models, used when the chosen Model fails, are not yet specified.
 - Cost by Model is not yet specified.
-- Disconnecting a Provider is not yet available. When it is, Bots that used its Models fall back to the Space's default.
+- Disconnecting a Provider is not yet available. When it is, Bots that used its Models fall back to the Space's default and keep their own thinking levels.

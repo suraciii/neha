@@ -1402,37 +1402,67 @@ async fn provider_refresh(
                     .find(|model| model.is_default)
                     .map(|model| model.id)
             });
+        // The default Model itself must stay usable, even when no Bot is
+        // affected by this refresh.
+        if let Some(default_id) = default_id
+            && let Some(model) = post.get(&default_id)
+            && !model.tools
+        {
+            return Err(ApiError::invalid_argument(
+                "the new default Model cannot call tools, so a Bot cannot use it",
+            ));
+        }
+        // Every affected Bot's actual Model: its own when it survives (a kept
+        // name may come back with other capabilities), else the default it
+        // falls back to. Errors carry counts, never another account's Bot
+        // name.
+        let mut unusable = 0_usize;
+        let mut cannot_think = 0_usize;
+        let mut unaccepted = 0_usize;
         for bot in state.bots.values() {
-            let retires = bot
-                .model
-                .is_some_and(|selected| !post.contains_key(&selected));
-            let inherits = bot.model.is_none() && was_space_default;
-            if !retires && !inherits {
+            let affected = match bot.model {
+                Some(selected) => {
+                    old_models.values().any(|old| old.id == selected)
+                        || !post.contains_key(&selected)
+                }
+                None => was_space_default,
+            };
+            if !affected {
                 continue;
             }
-            let Some(model) = default_id.and_then(|id| post.get(&id)) else {
+            let Some(model) = bot
+                .model
+                .and_then(|selected| post.get(&selected))
+                .or_else(|| default_id.and_then(|id| post.get(&id)))
+            else {
                 continue;
             };
             if !model.tools {
-                return Err(ApiError::invalid_argument(format!(
-                    "refreshing the Provider would leave Bot {} without a Model that can call tools; choose a Model for it first",
-                    bot.name
-                )));
+                unusable += 1;
+                continue;
             }
             if let Some(level) = bot.thinking {
                 if !model.thinks {
-                    return Err(ApiError::invalid_argument(format!(
-                        "refreshing the Provider would leave Bot {} on a thinking level its inherited Model cannot think; reset the thinking level first",
-                        bot.name
-                    )));
-                }
-                if !model.accepted_thinking().contains(&level) {
-                    return Err(ApiError::invalid_argument(format!(
-                        "refreshing the Provider would leave Bot {} on a thinking level its inherited Model does not accept; reset the thinking level first",
-                        bot.name
-                    )));
+                    cannot_think += 1;
+                } else if !model.accepted_thinking().contains(&level) {
+                    unaccepted += 1;
                 }
             }
+        }
+        if unusable > 0 {
+            return Err(ApiError::invalid_argument(format!(
+                "refreshing the Provider would leave {unusable} Bot(s) with a Model that cannot call tools; choose a Model for them first"
+            )));
+        }
+        if cannot_think > 0 {
+            return Err(ApiError::invalid_argument(format!(
+                "refreshing the Provider would leave {cannot_think} Bot(s) with a thinking level their Model cannot think; reset their thinking levels first"
+            )));
+        }
+        if unaccepted > 0 {
+            return Err(ApiError::invalid_argument(format!(
+                "refreshing the Provider would leave {unaccepted} Bot(s) with a thinking level their Model does not accept; reset their thinking levels first"
+            )));
         }
     }
     let data = json!({

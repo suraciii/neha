@@ -5804,7 +5804,7 @@ fn a_provider_refresh_that_retires_a_bots_model_is_refused() {
     assert!(!refused.status.success());
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("refreshing the Provider would leave Bot Scout")
+        stderr.contains("refreshing the Provider would leave 1 Bot")
             && stderr.contains("thinking level"),
         "{stderr}"
     );

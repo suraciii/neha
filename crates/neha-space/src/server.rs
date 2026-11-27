@@ -7514,6 +7514,309 @@ mod tests {
         running.shutdown().await;
     }
 
+    /// Serves a one-Provider catalog whose Model a test can change between
+    /// refreshes; every response gets a fresh ETag.
+    async fn mutable_catalog(
+        initial: Value,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Value>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::http::{HeaderMap, StatusCode, header};
+        use axum::routing::get;
+
+        let current = std::sync::Arc::new(std::sync::Mutex::new(initial));
+        let etags = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = {
+            let current = std::sync::Arc::clone(&current);
+            let etags = std::sync::Arc::clone(&etags);
+            Router::new().route(
+                "/catalog",
+                get(move || {
+                    let current = std::sync::Arc::clone(&current);
+                    let etags = std::sync::Arc::clone(&etags);
+                    async move {
+                        let body = current.lock().expect("the catalog body").to_string();
+                        let etag = format!(
+                            "\"{}\"",
+                            etags.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        );
+                        let mut headers = HeaderMap::new();
+                        headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                        headers.insert(header::ETAG, etag.parse().unwrap());
+                        (StatusCode::OK, headers, body)
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/catalog"), current, task)
+    }
+
+    /// A catalog whose kept Model, `m1`, changes capabilities while another
+    /// tool-calling Model keeps the catalog usable for the vendor.
+    fn mutable_catalog_body(reasoning: Option<&[&str]>, tool_call: bool) -> Value {
+        let mut model = json!({
+            "id": "m1",
+            "name": "M1",
+            "tool_call": tool_call,
+            "attachment": false,
+            "release_date": "2026-12-01",
+            "limit": {"context": 1000, "output": 100},
+        });
+        if let Some(values) = reasoning {
+            model["reasoning"] = json!(true);
+            model["reasoning_options"] = json!([{"type": "effort", "values": values}]);
+        }
+        let other = json!({
+            "id": "m2",
+            "name": "M2",
+            "tool_call": true,
+            "attachment": false,
+            "release_date": "2025-01-01",
+            "limit": {"context": 1000, "output": 100},
+        });
+        json!({
+            "mut": {
+                "id": "mut",
+                "name": "Mutable",
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "http://127.0.0.1:9/v1",
+                "env": ["MUT_KEY"],
+                "models": {"m1": model, "m2": other},
+            }
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_refresh_checks_a_kept_models_capabilities() {
+        let (url, catalog, catalog_task) =
+            mutable_catalog(mutable_catalog_body(Some(&["low", "high"]), true)).await;
+        let (_dir, running, invite) =
+            running_with_config(&format!("[catalog]\nurl = \"{url}\"\nrefresh_hours = 24\n")).await;
+        let mut socket = admin_socket(&running, &invite).await;
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        let connected = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "mut".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(connected["provider"].clone()).unwrap();
+        let model: Id = connected["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["name"] == json!("m1"))
+            .map(|view| serde_json::from_value(view["id"].clone()).unwrap())
+            .unwrap();
+        let other: Id = connected["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["name"] == json!("m2"))
+            .map(|view| serde_json::from_value(view["id"].clone()).unwrap())
+            .unwrap();
+        // Keep the default on the other Model, so the kept Model's own
+        // capability changes are what any refusal is about.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: other },
+        )
+        .await;
+
+        // Grace owns the Bot that keeps `high`; a refusal must not name it.
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace).await;
+        let created = command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "GraceBot".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: Some(model),
+            }),
+        )
+        .await;
+        let grace_bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // The kept Model comes back with the same name but without `high`.
+        *catalog.lock().unwrap() = mutable_catalog_body(Some(&["low"]), true);
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("refreshing the Provider would leave 1 Bot")
+                    && message.contains("thinking level")
+                    && !message.contains("GraceBot")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused refresh records nothing"
+        );
+
+        // The kept Model comes back unable to call tools.
+        *catalog.lock().unwrap() = mutable_catalog_body(Some(&["low", "high"]), false);
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("refreshing the Provider would leave 1 Bot")
+                    && message.contains("cannot call tools")
+                    && !message.contains("GraceBot")),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+
+        // A compatible list lets the same refresh through.
+        *catalog.lock().unwrap() = mutable_catalog_body(Some(&["low", "high"]), true);
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let kept = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(model))
+            .unwrap();
+        assert_eq!(kept["tools"], json!(true));
+        assert_eq!(kept["thinking_levels"], json!(["low", "high"]));
+        let shown = command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::BotShow { bot: grace_bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["model"], json!(model));
+        assert_eq!(shown["bot"]["thinking"], json!("high"));
+
+        grace_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        catalog_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_refresh_refuses_an_unusable_default_model() {
+        let (url, catalog, catalog_task) =
+            mutable_catalog(mutable_catalog_body(Some(&["low", "high"]), true)).await;
+        let (_dir, running, invite) =
+            running_with_config(&format!("[catalog]\nurl = \"{url}\"\nrefresh_hours = 24\n")).await;
+        let mut socket = admin_socket(&running, &invite).await;
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "mut".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(added["provider"].clone()).unwrap();
+        let model: Id = added["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["name"] == json!("m1"))
+            .map(|view| serde_json::from_value(view["id"].clone()).unwrap())
+            .unwrap();
+
+        // No Bot exists, yet the Space's default Model itself must call tools.
+        *catalog.lock().unwrap() = mutable_catalog_body(Some(&["low", "high"]), false);
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "the new default Model cannot call tools, so a Bot cannot use it"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused refresh records nothing"
+        );
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let kept = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(model))
+            .unwrap();
+        assert_eq!(kept["tools"], json!(true), "the record did not change");
+
+        // A compatible list lets it through.
+        *catalog.lock().unwrap() = mutable_catalog_body(Some(&["low", "high"]), true);
+        command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let kept = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(model))
+            .unwrap();
+        assert_eq!(kept["tools"], json!(true));
+
+        socket.close(None).await.unwrap();
+        catalog_task.abort();
+        running.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_provider_discovers_and_refreshes_its_models() {
         use std::sync::atomic::{AtomicUsize, Ordering};
