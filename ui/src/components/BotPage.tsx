@@ -1,5 +1,6 @@
 import { For, Show, createSignal, createTrackedEffect, untrack } from "solid-js";
 
+import { computerLabel } from "../computer";
 import { t } from "../i18n";
 import type { Bot, Computer, Model, Rule, ThinkingLevel } from "../types";
 import Avatar from "./Avatar";
@@ -385,7 +386,7 @@ export default function BotPage(props: BotPageProps) {
                       >
                         <option value="">{t("bot.computer.move.choose")}</option>
                         <For each={targets()}>
-                          {(target) => <option value={target.id}>{target.workspace}</option>}
+                          {(target) => <option value={target.id}>{computerLabel(target)}</option>}
                         </For>
                       </select>
                       <button

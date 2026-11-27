@@ -3,7 +3,7 @@ import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
 import { space } from "./test/fakeSpace";
-import { button, element, panelText, renderApp, useView } from "./test/view";
+import { button, element, mobile, panelText, renderApp, useView } from "./test/view";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/ws")>()),
@@ -14,18 +14,6 @@ vi.mock("./lib/ws", async (importOriginal) => ({
 // The shell names the layout by what the main area holds rather than by a Chat
 // alone: a management page is a detail of its list the same way, so the merged
 // client carries one class for both.
-function mobile() {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    value: (query: string) => ({
-      matches: query.includes("max-width: 900px"),
-      media: query,
-      addEventListener: () => undefined,
-      removeEventListener: () => undefined,
-    }),
-  });
-}
-
 describe("the mobile client", () => {
   useView();
 

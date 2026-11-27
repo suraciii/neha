@@ -241,7 +241,10 @@ export const space = {
     space.releaseApprovals();
     space.computer.kind = "local";
     space.computer.online = true;
+    space.computer.workspace = "/w";
     space.otherComputer.kind = "local";
+    space.otherComputer.online = false;
+    space.otherComputer.workspace = "/other";
     space.computer.supports_grants = true;
     space.computer.supports_full_access = true;
     space.otherComputer.supports_grants = true;

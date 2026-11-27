@@ -320,10 +320,11 @@ describe("App management", () => {
     const view = await openBots();
     expect(factValue(view, "Computer", "Workspace")).toBe("/w");
 
-    // The other paired Local Computer is where a Bot may move.
+    // The other paired Local Computer is where a Bot may move, named by the
+    // identifier the Space gave it rather than by its workspace alone.
     const target = field<HTMLSelectElement>(view, "move_target");
     expect(target.options).toHaveLength(2);
-    expect(target.options[1]?.textContent).toBe("/other");
+    expect(target.options[1]?.textContent).toBe("Local Computer p9 · /other · Offline");
 
     choose(view, "move_target", "p9");
     press(view, "Move to another Computer");

@@ -72,18 +72,35 @@ export async function drain() {
   for (let turn = 0; turn < 4; turn += 1) await Promise.resolve();
 }
 
+// The viewport the client reads. jsdom answers no media query by what it says,
+// so a test that narrows it names the width itself, and the viewport goes back
+// to the wide one after it so the next test reads the same page.
+function wideViewport(query: string) {
+  return {
+    matches: false,
+    media: query,
+    addEventListener: () => undefined,
+    removeEventListener: () => undefined,
+  };
+}
+
+// The client at a phone width.
+export function mobile() {
+  Object.defineProperty(window, "matchMedia", {
+    writable: true,
+    value: (query: string) => ({
+      matches: query.includes("max-width: 900px"),
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+    }),
+  });
+}
+
 // Starts the fake Space clean before each test and cleans the view after it.
 export function useView() {
   beforeAll(() => {
-    Object.defineProperty(window, "matchMedia", {
-      writable: true,
-      value: (query: string) => ({
-        matches: false,
-        media: query,
-        addEventListener: () => undefined,
-        removeEventListener: () => undefined,
-      }),
-    });
+    Object.defineProperty(window, "matchMedia", { writable: true, value: wideViewport });
   });
 
   beforeEach(() => space.reset());
@@ -92,5 +109,6 @@ export function useView() {
     cleanup();
     vi.restoreAllMocks();
     flush(() => setLocale("en-US"));
+    Object.defineProperty(window, "matchMedia", { writable: true, value: wideViewport });
   });
 }

@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
-import { drain, element, renderApp, useView } from "./test/view";
+import { drain, element, mobile, renderApp, useView } from "./test/view";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/ws")>()),
@@ -60,8 +60,9 @@ async function openBotsList(): Promise<View> {
   await waitFor(() => expect(element(view, ".sidebar__title").textContent).toBe("Bots"));
   // The boot's own reads are still in flight when the list opens, so wait for
   // the Chat it opens to be read: a create that follows is then the newest word
-  // about which Chat is on screen. A Space with no Bot opens no Chat.
-  if (space.chats.length > 0) {
+  // about which Chat is on screen. A Space with no Bot opens no Chat, and a
+  // phone starts on its list rather than in one.
+  if (space.chats.length > 0 && !window.matchMedia("(max-width: 900px)").matches) {
     await waitFor(() => expect(space.asked).toContain("bot_show"));
   }
   return view;
@@ -168,14 +169,51 @@ describe("App bots", () => {
     expect(element(view, ".chat__titles h1").textContent).toBe("Nova");
   });
 
-  it("offers no Computer where no Local one is paired", async () => {
-    // A Local Computer that is not online is not one a Bot can be given, and a
-    // Space with none has nothing to choose: the Bot gets a Hosted Computer.
-    space.computer.online = false;
+  it("offers no Computer where the User owns no Local one", async () => {
+    // A Hosted Computer is not one a Bot can be given, so a Space whose
+    // Computers are all Hosted has nothing to choose between.
+    space.computer.kind = "hosted";
+    space.otherComputer.kind = "hosted";
     const view = await openBotsList();
     await openNewBot(view, "");
 
     expect(view.container.querySelector('[name="bot_computer"]')).toBeNull();
+    type(view, "bot_name", "Nova");
+    await readyToCreate(view);
+    flush(() => fireEvent.click(pressed(view, "Create Bot")));
+    await waitFor(() =>
+      expect(frames("bot_create")).toEqual([{ name: "bot_create", args: { name: "Nova" } }]),
+    );
+  });
+
+  it("names a Local Computer the Space names no workspace for", async () => {
+    // A Computer the User paired does not always name a workspace, and a list
+    // of them cannot be chosen between by a blank: the identifier the Space gave
+    // it is what says which one this is.
+    space.computer.workspace = "";
+    const view = await openBotsList();
+    await openNewBot(view, "");
+
+    const option = element<HTMLOptionElement>(view, `[name="bot_computer"] option[value="${space.computer.id}"]`);
+    expect(option.textContent).toContain(space.computer.id.slice(0, 8));
+    expect(option.textContent).toContain("Local Computer");
+    expect(option.disabled).toBe(false);
+  });
+
+  it("offers a Computer that is offline without letting a Bot go to it", async () => {
+    // A Computer that is offline is still the User's, so it stays in the list
+    // where they can see it, but a Bot cannot work on it yet.
+    space.computer.online = false;
+    const view = await openBotsList();
+    await openNewBot(view, "");
+
+    const option = element<HTMLOptionElement>(view, `[name="bot_computer"] option[value="${space.computer.id}"]`);
+    expect(option.textContent).toContain("Offline");
+    expect(option.disabled).toBe(true);
+    // The list says why it cannot be chosen.
+    expect(element(view, ".field__hint").textContent).toContain("offline Computer");
+    // A name that is typed still makes a Bot, on the Hosted Computer the form
+    // starts with.
     type(view, "bot_name", "Nova");
     await readyToCreate(view);
     flush(() => fireEvent.click(pressed(view, "Create Bot")));
@@ -307,5 +345,55 @@ describe("App bots", () => {
     expect(frames("bot_create")).toHaveLength(0);
     expect(view.container.querySelector('[name="bot_name"]')).toBeNull();
     expect(pressed(view, "New Bot")).toBeTruthy();
+  });
+
+  it("leaves the new Bot's Chat in the history a reload returns to", async () => {
+    // A Bot made from the Bots list leaves the User in its Chat, so the phone's
+    // history records that Chat: a reload lands in it rather than back on the
+    // list it was made from, and Back returns to that list.
+    history.replaceState(null, "");
+    mobile();
+    const view = await openBotsList();
+    await openNewBot(view);
+    flush(() => fireEvent.click(pressed(view, "Create Bot")));
+    await waitFor(() => expect(element(view, ".chat__titles h1").textContent).toBe("Nova"));
+
+    // The screen the User is on is the one history holds.
+    expect(history.state).toEqual({ chat: "h-made-1", view: "chats", section: null, bot: null });
+
+    // A reload lands in the new Bot's Chat.
+    cleanup();
+    const reloaded = renderApp();
+    await waitFor(() => expect(element(reloaded, ".chat__titles h1").textContent).toBe("Nova"));
+    expect(reloaded.container.querySelector(".app--detail")).toBeTruthy();
+
+    // Back leaves that Chat for the list the Bot was made from.
+    history.back();
+    await waitFor(() => expect(reloaded.container.querySelector(".app--detail")).toBeNull());
+    await waitFor(() => expect(element(reloaded, ".sidebar__title").textContent).toBe("Bots"));
+    await drain();
+  });
+
+  it("reads the Computers again when a reload lands on the Bots list", async () => {
+    // A Bot is made on a Computer the User may choose, so a screen that lands on
+    // the Bots list reads the Computers a new Bot can work on, the way opening
+    // the list does: a reload into it can still offer a Local one.
+    history.replaceState(null, "");
+    mobile();
+    // The list is the screen history holds, and a reload returns to it.
+    await openBotsList();
+    expect(history.state?.view).toBe("bots");
+
+    cleanup();
+    const reloaded = renderApp();
+    await waitFor(() => expect(element(reloaded, ".sidebar__title").textContent).toBe("Bots"));
+    flush(() => fireEvent.click(pressed(reloaded, "New Bot")));
+
+    const option = element<HTMLOptionElement>(
+      reloaded,
+      `[name="bot_computer"] option[value="${space.computer.id}"]`,
+    );
+    expect(option.textContent).toContain(space.computer.id.slice(0, 8));
+    await drain();
   });
 });

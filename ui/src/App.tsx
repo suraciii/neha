@@ -1498,6 +1498,11 @@ export default function App() {
     // first run's own create leaves the User in it, from wherever the create was
     // asked for.
     setView("chats");
+    // Opening that Chat is a step of its own the way choosing it is, so the
+    // phone's history records the screen it lands on: a reload after a create
+    // stays in the new Bot's Chat, and Back returns to the list it was made
+    // from rather than to an entry that still names that list.
+    remember({ chat: opened.id, view: "chats", section: null, bot: null });
     await selectChat(opened);
     return null;
   }
@@ -1586,6 +1591,9 @@ export default function App() {
     // The Settings surface reads what it connects from, so a screen that lands on
     // it reads it again, the way opening the surface does.
     if (shown.view === "settings") void loadSettings();
+    // The Bots surface is where a Bot is made, so a screen that lands on it
+    // reads the Computers a new one may work on, the way opening it does.
+    if (shown.view === "bots") void refreshComputers();
     setSectionOpen(shown.section !== null);
     if (shown.section !== null) setSection(shown.section);
     if (shown.chat === null) {

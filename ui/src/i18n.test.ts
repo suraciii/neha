@@ -13,6 +13,7 @@ describe("i18n", () => {
     expect(t("bots.new")).toBe("New Bot");
     // A new Bot works on a Computer of its own unless one is chosen.
     expect(t("bots.new.computer")).toBe("Computer");
+    expect(t("bots.new.computer.offline")).toContain("offline Computer");
     expect(t("bots.new.noProvider")).toContain("Provider");
     flush(() => setLocale("zh-CN"));
     expect(t("auth.headline")).toBe("把工作交给一支你看得见的团队。");
@@ -35,6 +36,7 @@ describe("i18n", () => {
     // The action that makes a Bot, in the User's words.
     expect(t("bots.new")).toBe("新建 Bot");
     expect(t("bots.new.computer")).toBe("Computer");
+    expect(t("bots.new.computer.offline")).toContain("离线");
     expect(t("bots.new.noProvider")).toContain("Provider");
   });
 

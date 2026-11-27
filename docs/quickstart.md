@@ -217,7 +217,7 @@ The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>`
 
 The signed-in client has four entries in its rail: Chats, Needs attention, Bots, and Settings. Open Bots and pick a Bot to open its page.
 
-Bots also offers New Bot. Name the Bot there, and it starts on a Hosted Computer unless you name a Local Computer you own. The client opens the new Bot's Chat when it is made, and a Bots list with no Bot offers the same action. The CLI makes one the same way:
+Bots also offers New Bot. Name the Bot there and pick its Computer: the choice lists the Local Computers you own, and one that is offline cannot be picked. Leave the choice on its default and the Bot starts on a new Hosted Computer. The client opens the new Bot's Chat when it is made, and a Bots list with no Bot offers the same action. The CLI makes one the same way:
 
 ```bash
 target/debug/neha bot create "Scout Two"

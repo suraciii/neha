@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
 
+import { computerLabel } from "../computer";
 import { t } from "../i18n";
 import type { Account, AttentionEntry, Bot, Chat, ChatStatus, Computer, Preview } from "../types";
 import Avatar from "./Avatar";
@@ -102,9 +103,10 @@ function NewBotForm(props: {
   const [computer, setComputer] = createSignal("");
   const [sending, setSending] = createSignal(false);
   const [refused, setRefused] = createSignal<string | null>(null);
-  // The paired Local Computers that are online, which are the ones a new Bot can
-  // be given.
-  const locals = () => props.computers.filter((known) => known.kind === "local" && known.online);
+  // The Local Computers the User owns, which are the ones a new Bot may be
+  // given. One that is offline is still theirs, so it is offered and explained
+  // rather than left out, and it cannot be chosen while it is.
+  const locals = () => props.computers.filter((known) => known.kind === "local");
   const blank = () => name().trim() === "";
 
   async function submit(event: SubmitEvent) {
@@ -152,10 +154,17 @@ function NewBotForm(props: {
           >
             <option value="">{t("chat.hostedComputer")}</option>
             <For each={locals()}>
-              {(known) => <option value={known.id}>{known.workspace}</option>}
+              {(known) => (
+                <option value={known.id} disabled={!known.online}>
+                  {computerLabel(known)}
+                </option>
+              )}
             </For>
           </select>
         </label>
+        <Show when={locals().some((known) => !known.online)}>
+          <span class="field__hint">{t("bots.new.computer.offline")}</span>
+        </Show>
       </Show>
       <div class="side-form__actions">
         <button class="btn btn--primary" type="submit" disabled={sending() || blank()}>
