@@ -1,9 +1,7 @@
 name: CI
 
-# A pull request verifies the change: the Linux gate, plus a Windows compile and
-# native-runtime check, started together. A merge to main re-runs the gate on the
-# merged tree. The installer is checked once a night (nightly.yml), because it is
-# the same artifact on every merge.
+# A pull request gates the change on Linux and Windows in parallel; a merge
+# re-runs the gate on main. Packaging runs in nightly.yml.
 on:
   push:
     branches: [main]
@@ -13,9 +11,8 @@ permissions:
   contents: read
 
 concurrency:
-  # A pull request replaces its own superseded run. A merge to main queues
-  # instead: GitHub keeps one pending run per group and drops it when a newer
-  # merge arrives, so a burst of merges ends with one run of the newest commit.
+  # Pull requests replace their superseded run; merges queue, so a burst of
+  # merges runs the newest commit instead of each one.
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
@@ -25,23 +22,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      # The gate does not need debug symbols in CI.
+      # No debug symbols in CI.
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
-      # Run the fence tests against the bubblewrap installed below; without
-      # NEHA_TEST_BWRAP they would skip.
+      # Run the fence and S3 tests against the package and store below.
       NEHA_TEST_BWRAP: '1'
-      # Run the S3 tests against the SeaweedFS service started below;
-      # without NEHA_TEST_S3 they would skip.
       NEHA_TEST_S3: '1'
       NEHA_TEST_S3_ENDPOINT: 'http://127.0.0.1:8333'
       NEHA_TEST_S3_BUCKET: 'neha'
       NEHA_TEST_S3_REGION: 'us-east-1'
       AWS_ACCESS_KEY_ID: 'neha'
       AWS_SECRET_ACCESS_KEY: 'neha-secret'
-      # SeaweedFS does not check signatures; the S3 client still signs.
-      # The store the configuration names must win: this URL is a trap.
+      # The configured endpoint must win: this URL is a trap.
       AWS_ENDPOINT_URL: 'http://127.0.0.1:1'
     steps:
       - uses: actions/checkout@v4
@@ -71,43 +64,24 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
 
-      - name: Install bubblewrap
+      # Ubuntu 24.04 blocks unprivileged user namespaces, and this bubblewrap is
+      # not setuid.
+      - name: Prepare the fence sandbox
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends bubblewrap
-
-      # Ubuntu 24.04 restricts unprivileged user namespaces by default, and
-      # bubblewrap here is not setuid. The gate runs the fence tests, so it
-      # lifts the restriction for this runner only.
-      - name: Allow the fence sandbox
-        run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true
 
-      - name: Start SeaweedFS
-        run: docker run -d --name neha-s3 -p 8333:8333 chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 server -s3 -dir=/data
-
-      - name: Wait for SeaweedFS
-        run: |
-          for attempt in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8333/ >/dev/null; then
-              echo "SeaweedFS is ready after $attempt attempt(s)"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo 'SeaweedFS did not become ready in time' >&2
-          exit 1
-
-      - name: Create the test bucket
-        run: curl -fsS -X PUT http://127.0.0.1:8333/neha
-
-      - name: Collect SeaweedFS logs
-        if: failure()
-        run: docker logs neha-s3 || true
+      - name: Start the S3 test store
+        run: eng/s3.sh up
 
       - name: Run gate with evidence
         run: just verify "$RUNNER_TEMP/verification"
+
+      - name: Collect the S3 store's logs
+        if: failure()
+        run: eng/s3.sh logs || true
 
       - name: Preserve verification evidence
         if: always()
@@ -117,9 +91,7 @@ jobs:
           path: ${{ runner.temp }}/verification
           if-no-files-found: error
 
-  # Windows-only code compiles nowhere else, so a pull request proves it builds
-  # and that the native runtime behaves. Packaging lives in nightly.yml: it is
-  # the slowest job here, and no single merge changes the installer it proves.
+  # Windows-only code does not compile on Linux.
   windows:
     name: Windows check
     if: github.event_name == 'pull_request'

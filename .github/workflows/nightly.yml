@@ -1,8 +1,7 @@
 name: Nightly installer
 
-# Packaging is the slowest job here and most merges do not change the installer,
-# so it runs once a night and only when main moved since the last successful
-# run. Dispatch it to rebuild on demand.
+# Packaging is the slowest job, so it runs once a night and only when main moved
+# since the last successful run. Dispatch it to rebuild on demand.
 on:
   schedule:
     # 02:00 Asia/Shanghai.
@@ -21,29 +20,22 @@ jobs:
   changes:
     name: Check for changes
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
     outputs:
       changed: ${{ steps.compare.outputs.changed }}
     steps:
-      - uses: actions/checkout@v4
-
-      # The last successful run records the commit it saw, so comparing main
-      # with that commit answers whether anything moved since the last build.
+      # The last successful run records the commit it saw.
       - name: Compare main with the last nightly
         id: compare
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          head=$(git rev-parse HEAD)
-          previous=$(gh run list --workflow=nightly.yml --branch=main --status=success \
+          last=$(gh run list --workflow=nightly.yml --branch=main --status=success \
             --limit=1 --json headSha --jq '.[0].headSha // ""')
-          if [ -n "$previous" ] && [ "$previous" = "$head" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "main has not moved since the last nightly ($head)"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "main moved from ${previous:-no earlier nightly} to $head"
-          fi
+          changed=true
+          if [ -n "$last" ] && [ "$last" = "$GITHUB_SHA" ]; then changed=false; fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          echo "head $GITHUB_SHA, last successful nightly ${last:-none}"
 
   installer:
     name: Windows installer

@@ -37,7 +37,7 @@ just ui-check     # type-check, test, and build the browser client
 
 ## S3 test store
 
-The `neha-space` tests include S3 tests that need a local SeaweedFS container; [Storage](storage.md#run-the-s3-tests-locally) gives the container, the bucket, the variables, and the command.
+The `neha-space` tests include S3 tests that need a local SeaweedFS container; [Storage](storage.md#run-the-s3-tests-locally) gives the store, the variables, and the command.
 
 ## A Computer sandbox
 
