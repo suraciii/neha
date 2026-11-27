@@ -28,9 +28,11 @@ subtle = "2"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "net", "rt", "sync", "time"] }
 toml.workspace = true
-web-push-native = "0.5"
+sad-web-push = { version = "0.12", default-features = false }
+p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 
 [dev-dependencies]
+hkdf = "0.12"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-tungstenite = "0.29"

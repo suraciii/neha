@@ -73,7 +73,14 @@ impl Secrets {
             return plain.try_into().map_err(|_| SecretsError::Corrupt);
         }
         let mut key = [0_u8; VAPID_BYTES];
-        rand::rng().fill_bytes(&mut key);
+        loop {
+            rand::rng().fill_bytes(&mut key);
+            // A VAPID key is a P-256 scalar. Reject the vanishingly rare
+            // random value that is zero or above the curve order.
+            if p256::SecretKey::from_slice(&key).is_ok() {
+                break;
+            }
+        }
         let sealed = self.seal(&key)?;
         write_private(&path, &sealed)?;
 

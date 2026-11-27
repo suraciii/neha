@@ -14,19 +14,19 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use axum::http::Uri;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
 use neha::record::{ApprovalRequested, Event, EventKind, RunFinished, RunStatus};
 use neha::seq::Seq;
+use p256::PublicKey;
+use sad_web_push::request_builder::try_build_request;
+use sad_web_push::{
+    ContentEncoding, SubscriptionInfo, VapidSignatureBuilder, WebPushMessageBuilder,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::task::JoinHandle;
-use web_push_native::jwt_simple::algorithms::ECDSAP256PublicKeyLike as _;
-use web_push_native::jwt_simple::algorithms::ES256KeyPair;
-use web_push_native::p256::PublicKey;
-use web_push_native::{Auth, WebPushBuilder};
 
 use crate::home::Home;
 use crate::secrets::Secrets;
@@ -167,10 +167,7 @@ impl Push {
                 None
             }
         };
-        let public = key
-            .as_ref()
-            .and_then(|bytes| ES256KeyPair::from_bytes(bytes).ok())
-            .and_then(|pair| public_key(&pair));
+        let public = key.as_ref().and_then(vapid_public);
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
@@ -377,39 +374,42 @@ impl Push {
         let Some(key) = self.key else {
             return Delivery::Failed(0);
         };
-        let Ok(pair) = ES256KeyPair::from_bytes(&key) else {
-            return Delivery::Failed(0);
+        let private = URL_SAFE_NO_PAD.encode(key);
+        let info = SubscriptionInfo::new(
+            subscription.endpoint.clone(),
+            subscription.p256dh.clone(),
+            subscription.auth.clone(),
+        );
+        // A unit test's fake device is plain HTTP on loopback; the subscription
+        // route and the production resolver refuse that outside tests.
+        let insecure = cfg!(test) && subscription.endpoint.starts_with("http://");
+        let mut vapid = match VapidSignatureBuilder::from_base64(&private, &info) {
+            Ok(vapid) => vapid,
+            Err(_) => return Delivery::Failed(0),
         };
-        let Ok(endpoint) = subscription.endpoint.parse::<Uri>() else {
-            return Delivery::Failed(0);
+        vapid.add_claim("sub", self.contact.as_str());
+        vapid.allow_insecure_endpoint(insecure);
+        let signature = match vapid.build() {
+            Ok(signature) => signature,
+            Err(_) => return Delivery::Failed(0),
         };
-        let Ok(public) = URL_SAFE_NO_PAD
-            .decode(&subscription.p256dh)
-            .ok()
-            .and_then(|bytes| PublicKey::from_sec1_bytes(&bytes).ok())
-            .ok_or(())
-        else {
-            return Delivery::Failed(0);
+        let mut message = WebPushMessageBuilder::new(&info);
+        message.set_ttl(PUSH_TTL.as_secs() as u32);
+        message.set_payload(ContentEncoding::Aes128Gcm, payload);
+        message.set_vapid_signature(signature);
+        message.allow_insecure_endpoint(insecure);
+        let message = match message.build() {
+            Ok(message) => message,
+            Err(_) => return Delivery::Failed(0),
         };
-        let Ok(auth) = URL_SAFE_NO_PAD.decode(&subscription.auth) else {
-            return Delivery::Failed(0);
-        };
-        if auth.len() != 16 {
-            return Delivery::Failed(0);
-        }
-        let auth = Auth::clone_from_slice(&auth);
-        let request = match WebPushBuilder::new(endpoint, public, auth)
-            .with_valid_duration(PUSH_TTL)
-            .with_vapid(&pair, &self.contact)
-            .build(payload.to_vec())
-        {
+        let request = match try_build_request::<Vec<u8>>(message) {
             Ok(request) => request,
             Err(_) => return Delivery::Failed(0),
         };
         let (parts, body) = request.into_parts();
-        let mut outgoing = self
-            .client
-            .request(reqwest::Method::POST, parts.uri.to_string());
+        let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
+            .unwrap_or(reqwest::Method::POST);
+        let mut outgoing = self.client.request(method, parts.uri.to_string());
         for (name, value) in parts.headers.iter() {
             outgoing = outgoing.header(name.as_str(), value.as_bytes());
         }
@@ -668,15 +668,21 @@ fn public_address(address: std::net::IpAddr) -> bool {
             if let Some(address) = address.to_ipv4_mapped() {
                 return public_ipv4(address);
             }
+            // Start from global unicast (2000::/3), then remove the special
+            // ranges inside it. Site-local fec0::/10 and discard-only 100::/64
+            // are outside global unicast and therefore already refused.
             let segments = address.segments();
-            !(address.is_loopback()
-                || address.is_unspecified()
-                || address.is_multicast()
-                || address.is_unique_local()
-                || address.is_unicast_link_local()
-                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
-                || (segments[0] == 0x0064 && segments[1] == 0xff9b)
-                || segments[0] == 0x2002)
+            if segments[0] & 0xe000 != 0x2000 {
+                return false;
+            }
+            !((segments[0] == 0x2001
+                && (segments[1] == 0x0db8
+                    || segments[1] == 0x0000
+                    || segments[1] == 0x0002
+                    || (segments[1] & 0xfff0) == 0x0010
+                    || (segments[1] & 0xfff0) == 0x0020))
+                || segments[0] == 0x2002
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0))
         }
     }
 }
@@ -705,9 +711,10 @@ fn public_ipv4(address: std::net::Ipv4Addr) -> bool {
         || octets[0] >= 224)
 }
 
-fn public_key(pair: &ES256KeyPair) -> Option<String> {
-    let bytes = pair.public_key().public_key().to_bytes_uncompressed();
-    Some(URL_SAFE_NO_PAD.encode(bytes))
+fn vapid_public(key: &[u8; 32]) -> Option<String> {
+    let private = URL_SAFE_NO_PAD.encode(key);
+    let partial = VapidSignatureBuilder::from_base64_no_sub(&private).ok()?;
+    Some(URL_SAFE_NO_PAD.encode(partial.get_public_key()))
 }
 
 fn endpoint_host(endpoint: &str) -> String {
@@ -872,6 +879,11 @@ mod tests {
             "https://192.0.2.1/push",
             "https://0.0.0.0/push",
             "https://[::1]/push",
+            "https://[fec0::1]/push",
+            "https://[100::1]/push",
+            "https://[2001:db8::1]/push",
+            "https://[3fff::1]/push",
+            "https://[2002::1]/push",
             "https://device.local/push",
         ] {
             assert!(
@@ -905,6 +917,41 @@ mod tests {
             .await
             .is_ok()
         );
+    }
+
+    #[test]
+    fn the_address_policy_is_global_unicast() {
+        for address in [
+            "127.0.0.1",
+            "10.0.0.1",
+            "100.64.0.1",
+            "169.254.1.1",
+            "192.0.2.1",
+            "198.18.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+            "::1",
+            "::",
+            "fec0::1",
+            "100::1",
+            "fe80::1",
+            "fc00::1",
+            "2001:db8::1",
+            "2001::1",
+            "2001:2::1",
+            "2001:10::1",
+            "2001:20::1",
+            "2002::1",
+            "3fff::1",
+            "64:ff9b::1",
+        ] {
+            let address = address.parse().unwrap();
+            assert!(!public_address(address), "{address} must not be public");
+        }
+        for address in ["1.1.1.1", "2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            let address = address.parse().unwrap();
+            assert!(public_address(address), "{address} must be public");
+        }
     }
 
     #[test]
@@ -1203,6 +1250,15 @@ mod tests {
 
     #[test]
     fn a_push_request_has_a_vapid_and_encrypted_body() {
+        use aes_gcm::aead::{Aead as _, KeyInit as _};
+        use aes_gcm::{Aes128Gcm, Nonce};
+        use hkdf::Hkdf;
+        use p256::SecretKey;
+        use p256::ecdh::diffie_hellman;
+        use p256::elliptic_curve::Generate as _;
+        use p256::elliptic_curve::sec1::ToSec1Point as _;
+        use sha2::Sha256;
+
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1213,15 +1269,38 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
+                let mut body = Vec::new();
                 loop {
                     let mut chunk = [0_u8; 4096];
                     let read = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk)
                         .await
                         .unwrap();
                     request.extend_from_slice(&chunk[..read]);
-                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
                         break;
                     }
+                }
+                let split = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .unwrap()
+                    + 4;
+                let headers = String::from_utf8_lossy(&request[..split]).to_string();
+                let length = headers
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                body.extend_from_slice(&request[split..]);
+                while body.len() < length {
+                    let mut chunk = [0_u8; 4096];
+                    let read = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk)
+                        .await
+                        .unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    body.extend_from_slice(&chunk[..read]);
                 }
                 tokio::io::AsyncWriteExt::write_all(
                     &mut socket,
@@ -1229,20 +1308,70 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                String::from_utf8_lossy(&request).to_string()
+                (headers, body)
             });
+
+            let browser = SecretKey::generate();
+            let ua_public = browser
+                .public_key()
+                .to_sec1_point(false)
+                .as_bytes()
+                .to_vec();
+            let auth: [u8; 16] = rand::random();
+            let payload = br#"{"kind":"finished"}"#;
             let (_directory, push) = push();
             let subscription = Subscription {
                 endpoint: format!("http://{address}/push"),
-                p256dh: P256DH.to_owned(),
-                auth: AUTH.to_owned(),
+                p256dh: URL_SAFE_NO_PAD.encode(&ua_public),
+                auth: URL_SAFE_NO_PAD.encode(auth),
                 account: Id::new(),
             };
-            let delivery = push.deliver(&subscription, br#"{"kind":"finished"}"#).await;
+            let delivery = push.deliver(&subscription, payload).await;
             assert!(matches!(delivery, Delivery::Sent));
-            let request = server.await.unwrap();
-            assert!(request.contains("authorization: vapid t="));
-            assert!(request.contains("content-encoding: aes128gcm"));
+            let (headers, body) = server.await.unwrap();
+            assert!(headers.to_lowercase().contains("authorization: vapid t="));
+            assert!(
+                headers
+                    .to_lowercase()
+                    .contains("content-encoding: aes128gcm")
+            );
+            let public = push.public.as_ref().expect("a VAPID public key");
+            assert!(headers.contains(&format!("k={public}")));
+            assert_eq!(push.status().expect("push status").key, *public);
+
+            // Browser-side RFC8291 decryption: prove the body carries the
+            // notification, not just that it has the expected headers.
+            assert_eq!(u32::from_be_bytes(body[16..20].try_into().unwrap()), 4096);
+            let id_length = body[20] as usize;
+            assert_eq!(id_length, 65);
+            let as_public = &body[21..21 + id_length];
+            let ciphertext = &body[21 + id_length..];
+            let ephemeral = p256::PublicKey::from_sec1_bytes(as_public).unwrap();
+            let shared = diffie_hellman(browser.to_nonzero_scalar(), ephemeral.as_affine());
+            let mut key_info = Vec::with_capacity(14 + 130);
+            key_info.extend_from_slice(b"WebPush: info\0");
+            key_info.extend_from_slice(&ua_public);
+            key_info.extend_from_slice(as_public);
+            let prk_key = Hkdf::<Sha256>::new(Some(&auth), shared.raw_secret_bytes().as_slice());
+            let mut ikm = [0_u8; 32];
+            prk_key.expand(&key_info, &mut ikm).unwrap();
+            let prk = Hkdf::<Sha256>::new(Some(&body[..16]), &ikm);
+            let mut cek = [0_u8; 16];
+            prk.expand(b"Content-Encoding: aes128gcm\0", &mut cek)
+                .unwrap();
+            let mut nonce = [0_u8; 12];
+            prk.expand(b"Content-Encoding: nonce\0", &mut nonce)
+                .unwrap();
+            let plaintext = Aes128Gcm::new_from_slice(&cek)
+                .unwrap()
+                .decrypt(Nonce::from_slice(&nonce), ciphertext)
+                .unwrap();
+            let end = plaintext
+                .iter()
+                .rposition(|byte| *byte == 0x02)
+                .expect("the final record delimiter");
+            assert_eq!(&plaintext[..end], payload);
+            assert!(plaintext[end + 1..].iter().all(|byte| *byte == 0));
         });
     }
 }
