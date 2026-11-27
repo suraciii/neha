@@ -11,6 +11,7 @@ pub mod computer_link;
 pub mod config;
 pub mod home;
 pub mod identity;
+pub mod mcp;
 pub mod model;
 pub mod remote;
 pub mod runs;

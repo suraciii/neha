@@ -12798,6 +12798,7 @@ mod tests {
             path_prefix: None,
             skill: Some(skill.to_owned()),
             script: Some(script.to_owned()),
+            server: None,
         }
     }
 
@@ -12817,6 +12818,7 @@ mod tests {
             path_prefix: path_prefix.map(ToOwned::to_owned),
             skill: None,
             script: None,
+            server: None,
         }
     }
 
@@ -18206,6 +18208,7 @@ mod tests {
                 path_prefix: None,
                 skill: Some("hello".to_owned()),
                 script: Some("hello.sh".to_owned()),
+                server: None,
             },
         )
         .await
@@ -18934,6 +18937,216 @@ mod tests {
         assert_eq!(skills, json!([]), "the refused adds recorded nothing");
         admin_socket.close(None).await.unwrap();
         grace.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+    /// One request the fake MCP server received.
+    type McpLog = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+    /// Runs a fake MCP server on a loopback port, answering the handshake and
+    /// listing one tool. Returns its URL and a log of what it was asked.
+    async fn fake_mcp_server(
+        tool_answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+    ) -> (String, McpLog, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::{Body, Bytes};
+        use axum::http::{HeaderMap, header::CONTENT_TYPE};
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let log: McpLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let answer = std::sync::Arc::new(tool_answer);
+        let app = Router::new().route(
+            "/",
+            post(move |_headers: HeaderMap, body: Bytes| {
+                let log = seen.clone();
+                let answer = answer.clone();
+                async move {
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    log.lock().unwrap().push(message.clone());
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let result = match message["method"].as_str() {
+                        Some("initialize") => serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "docs", "version": "1"},
+                        }),
+                        Some("notifications/initialized") => return Response::new(Body::empty()),
+                        Some("tools/list") => serde_json::json!({
+                            "tools": [{
+                                "name": "search",
+                                "description": "Search the docs.",
+                                "inputSchema": {"type": "object"},
+                            }],
+                        }),
+                        Some("tools/call") => answer(&message),
+                        _ => Value::Null,
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("mcp-session-id", "session-1")
+                        .body(Body::from(
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                                .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), log, task)
+    }
+
+    /// Adds an MCP server to the Space under a name and returns its id.
+    async fn add_mcp_server(
+        socket: &mut Socket,
+        name: &str,
+        url: &str,
+        credential: Option<&str>,
+    ) -> Id {
+        let result = command(
+            socket,
+            Id::new(),
+            CommandCall::McpAdd(neha::surface::McpAdd {
+                name: name.to_owned(),
+                url: url.to_owned(),
+                scope: neha::record::McpScope::Space,
+                credential: credential.map(ToOwned::to_owned),
+            }),
+        )
+        .await;
+        assert_eq!(result["name"], json!(name));
+        serde_json::from_value(result["server"].clone()).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_calls_an_mcp_tool_after_one_answer() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, log, server_task) = fake_mcp_server(|call| {
+            assert_eq!(call["params"]["name"], json!("search"));
+            json!({"content": [{"type": "text", "text": "the answer"}]})
+        })
+        .await;
+        let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+            tool("mcp__docs__search", json!({"query": "again"})),
+            text("second done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "search", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "first_mcp_call");
+        assert_eq!(approvals[0]["server"], json!(server));
+        assert_eq!(approvals[0]["computer"], json!(server));
+        let summary = approvals[0]["summary"].as_str().unwrap();
+        assert!(
+            summary.contains("docs") && summary.contains("search"),
+            "{summary}"
+        );
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, true).await;
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+        {
+            let calls = log.lock().unwrap();
+            let calls: Vec<&Value> = calls
+                .iter()
+                .filter(|message| message["method"] == "tools/call")
+                .collect();
+            assert_eq!(calls.len(), 1, "one tool call reached the server");
+            assert_eq!(calls[0]["params"]["name"], json!("search"));
+        }
+        // The record names the server and the tool's original name.
+        let events = started_actions(&running, run).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data["server"], json!(server));
+        assert_eq!(events[0].data["tool"], json!("search"));
+        // The Always allow wrote a rule, so the next call asks nothing.
+        let second = run_of(&submit(&mut socket, chat, "again", None).await);
+        assert_eq!(wait_run(&mut socket, second).await["status"], "succeeded");
+        assert_eq!(
+            show_run(&mut socket, second).await["status"],
+            "succeeded",
+            "the second run ended without a card"
+        );
+        let calls = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|message| message["method"] == "tools/call")
+            .count();
+        assert_eq!(calls, 2, "the rule let the second call through");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_tool_without_a_credential_is_not_connected() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+        let server = add_mcp_server(&mut socket, "docs", &url, None).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "search", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(
+            wait_run(&mut socket, run).await["status"],
+            "succeeded",
+            "the run answers that the server is not connected"
+        );
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .all(|message| message["method"] != "tools/call"),
+            "an unconnected server is sent no call"
+        );
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
         running.shutdown().await;
     }
 }

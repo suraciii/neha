@@ -136,6 +136,14 @@ pub enum SpaceCall {
         script: String,
         arguments: Vec<String>,
     },
+    /// Calls a tool an MCP server gives the Bot, under its approvals.
+    Mcp {
+        /// The name the Model sees; the Space resolves the server and the
+        /// tool's original name before it calls anything.
+        name: String,
+        /// The arguments the server receives.
+        arguments: serde_json::Value,
+    },
 }
 
 /// Parses the arguments of a `skill` call.
@@ -184,6 +192,14 @@ pub fn parse(name: &str, arguments: &str) -> Result<Call, String> {
                 skill: arguments.skill,
                 script: arguments.script,
                 arguments: arguments.arguments,
+            }))
+        }
+        _ if name.starts_with("mcp__") => {
+            let arguments: serde_json::Value =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            Ok(Call::Space(SpaceCall::Mcp {
+                name: name.to_owned(),
+                arguments,
             }))
         }
         _ => action(name, arguments).map(Call::Computer),

@@ -230,9 +230,9 @@ pub trait Recorder {
         &mut self,
         action: Id,
         call: &RecordedCall,
-    ) -> impl Future<Output = Result<Option<ScriptIdentity>, LoopError>> + Send;
+    ) -> impl Future<Output = Result<Dispatched, LoopError>> + Send;
 
-    /// Records an action before it runs, with the script identity the Space
+    /// Records an action before it runs, with the identities the Space
     /// resolved for it.
     fn action_started(
         &mut self,
@@ -240,7 +240,7 @@ pub trait Recorder {
         action: Id,
         tool: String,
         arguments: Value,
-        script: Option<&ScriptIdentity>,
+        dispatched: &Dispatched,
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 
     /// Records an action's result.
@@ -270,19 +270,34 @@ pub struct ScriptIdentity {
     pub sha256: String,
 }
 
+/// The identity a server-given tool call runs under.
+///
+/// A record names such a call by its server's id and the tool's original name,
+/// never by the name the Model sees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpIdentity {
+    /// The server.
+    pub server: Id,
+    /// The tool's original name, as the server spells it.
+    pub tool: String,
+}
+
+/// What the Space resolved for one action before it starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dispatched {
+    /// The skill and script the action runs, when it runs one.
+    pub script: Option<ScriptIdentity>,
+    /// The server and tool the action calls, when it calls one.
+    pub mcp: Option<McpIdentity>,
+}
+
 /// What the Space decided about one action before it starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Authorization {
-    /// The action may start. A script action carries the identity it resolved.
-    Allow {
-        /// The script the Space will deliver, when the action runs one.
-        script: Option<ScriptIdentity>,
-    },
+    /// The action may start, with the identities the Space resolved for it.
+    Allow(Dispatched),
     /// The User must answer first.
-    Wait {
-        /// The script the card was made for, when the action runs one.
-        script: Option<ScriptIdentity>,
-    },
+    Wait(Dispatched),
     /// The action cannot run at all, and its failed result says why.
     Refuse(String),
 }
@@ -436,15 +451,16 @@ where
                 // A refused call runs nothing and asks nobody; every call that
                 // can run asks, a File move included. An action the User
                 // already answered runs under its identifier without a second
-                // card, and the Space resolves the identity it recorded.
-                let mut script = None;
+                // card, and the Space resolves the identity it recorded, but
+                // only while the run still offers its tool.
+                let mut dispatched = Dispatched::default();
                 let mut refused = None;
                 if approved_here {
                     // The answer is a decision about this call; a tool the run
                     // no longer offers cannot run under it, and recording a
                     // refused call credits no first run.
                     if tools.iter().any(|tool| tool.name == call.recorded.tool) {
-                        script = recorder.authorized_action(action, &call.recorded).await?;
+                        dispatched = recorder.authorized_action(action, &call.recorded).await?;
                     } else {
                         refused = Some(format!(
                             "the tool {:?} is not offered to this run",
@@ -453,7 +469,7 @@ where
                     }
                 } else if call.parsed.is_ok() {
                     match recorder.approve(step, &call.recorded, action).await? {
-                        Authorization::Wait { .. } => {
+                        Authorization::Wait(_) => {
                             let recorded = call.recorded;
                             return Ok(RunOutcome::Waiting {
                                 approval: WaitingApproval {
@@ -467,7 +483,7 @@ where
                             });
                         }
                         Authorization::Refuse(reason) => refused = Some(reason),
-                        Authorization::Allow { script: identity } => script = identity,
+                        Authorization::Allow(identity) => dispatched = identity,
                     }
                 }
                 recorder
@@ -476,7 +492,7 @@ where
                         action,
                         call.recorded.tool.clone(),
                         call.recorded.arguments.clone(),
-                        script.as_ref(),
+                        &dispatched,
                     )
                     .await?;
                 let result = match (refused, call.parsed) {
@@ -717,8 +733,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Authorization, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest, Runtime,
-        ScriptIdentity, WaitingApproval, call_id, run,
+        Authorization, Dispatched, LoopError, RecordedCall, Recorder, Resume, RunOutcome,
+        RunRequest, Runtime, WaitingApproval, call_id, run,
     };
     use crate::model::{
         Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
@@ -864,7 +880,7 @@ mod tests {
         /// A record that refuses the first action it is asked about.
         fn that_waits() -> Self {
             Self {
-                decisions: VecDeque::from([Authorization::Wait { script: None }]),
+                decisions: VecDeque::from([Authorization::Wait(Dispatched::default())]),
                 ..Self::default()
             }
         }
@@ -909,15 +925,15 @@ mod tests {
             Ok(self
                 .decisions
                 .pop_front()
-                .unwrap_or(Authorization::Allow { script: None }))
+                .unwrap_or(Authorization::Allow(Dispatched::default())))
         }
 
         async fn authorized_action(
             &mut self,
             _action: Id,
             _call: &RecordedCall,
-        ) -> Result<Option<ScriptIdentity>, LoopError> {
-            Ok(None)
+        ) -> Result<Dispatched, LoopError> {
+            Ok(Dispatched::default())
         }
 
         async fn action_started(
@@ -926,7 +942,7 @@ mod tests {
             action: Id,
             tool: String,
             _arguments: Value,
-            _script: Option<&ScriptIdentity>,
+            _dispatched: &Dispatched,
         ) -> Result<(), LoopError> {
             self.record("action_started")?;
             self.started.push((step, tool, action));

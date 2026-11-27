@@ -1532,6 +1532,7 @@ function approvalRequested(event: RecordEvent): Approval | null {
   if (
     reason !== "first_use_local" &&
     reason !== "first_script_run" &&
+    reason !== "first_mcp_call" &&
     reason !== "rule" &&
     reason !== "grant"
   )

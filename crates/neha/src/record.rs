@@ -109,6 +109,21 @@ pub enum EventKind {
     /// A Bot no longer uses a skill.
     #[serde(rename = "neha.bot.skill.disabled")]
     BotSkillDisabled,
+    /// An MCP server was connected.
+    #[serde(rename = "neha.mcp.server.added")]
+    McpServerAdded,
+    /// An MCP server's address or credential changed.
+    #[serde(rename = "neha.mcp.server.updated")]
+    McpServerUpdated,
+    /// An MCP server was disconnected.
+    #[serde(rename = "neha.mcp.server.removed")]
+    McpServerRemoved,
+    /// A Bot may call an MCP server's tools.
+    #[serde(rename = "neha.bot.mcp.enabled")]
+    BotMcpEnabled,
+    /// A Bot may no longer call an MCP server's tools.
+    #[serde(rename = "neha.bot.mcp.disabled")]
+    BotMcpDisabled,
 }
 
 impl EventKind {
@@ -143,6 +158,11 @@ impl EventKind {
             Self::SkillRemoved => "neha.skill.removed",
             Self::BotSkillEnabled => "neha.bot.skill.enabled",
             Self::BotSkillDisabled => "neha.bot.skill.disabled",
+            Self::McpServerAdded => "neha.mcp.server.added",
+            Self::McpServerUpdated => "neha.mcp.server.updated",
+            Self::McpServerRemoved => "neha.mcp.server.removed",
+            Self::BotMcpEnabled => "neha.bot.mcp.enabled",
+            Self::BotMcpDisabled => "neha.bot.mcp.disabled",
         }
     }
 
@@ -170,7 +190,12 @@ impl EventKind {
             | Self::SkillAdded
             | Self::SkillRemoved
             | Self::BotSkillEnabled
-            | Self::BotSkillDisabled => EventClass::Authority,
+            | Self::BotSkillDisabled
+            | Self::McpServerAdded
+            | Self::McpServerUpdated
+            | Self::McpServerRemoved
+            | Self::BotMcpEnabled
+            | Self::BotMcpDisabled => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::ProviderModelsUpdated
@@ -215,6 +240,11 @@ impl FromStr for EventKind {
             "neha.skill.removed" => Ok(Self::SkillRemoved),
             "neha.bot.skill.enabled" => Ok(Self::BotSkillEnabled),
             "neha.bot.skill.disabled" => Ok(Self::BotSkillDisabled),
+            "neha.mcp.server.added" => Ok(Self::McpServerAdded),
+            "neha.mcp.server.updated" => Ok(Self::McpServerUpdated),
+            "neha.mcp.server.removed" => Ok(Self::McpServerRemoved),
+            "neha.bot.mcp.enabled" => Ok(Self::BotMcpEnabled),
+            "neha.bot.mcp.disabled" => Ok(Self::BotMcpDisabled),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -1008,6 +1038,16 @@ pub enum EventData {
     SkillRemoved(SkillRemoved),
     BotSkillEnabled(BotSkillEnabled),
     BotSkillDisabled(BotSkillDisabled),
+    /// An MCP server was connected.
+    McpServerAdded(McpServerAdded),
+    /// An MCP server changed.
+    McpServerUpdated(McpServerUpdated),
+    /// An MCP server was disconnected.
+    McpServerRemoved(McpServerRemoved),
+    /// A Bot may use an MCP server.
+    BotMcpEnabled(BotMcpEnabled),
+    /// A Bot may no longer use an MCP server.
+    BotMcpDisabled(BotMcpDisabled),
 }
 
 /// The first version of every event kind.
@@ -1077,6 +1117,15 @@ impl EventKind {
             Self::SkillRemoved => EventData::SkillRemoved(decode(data)?),
             Self::BotSkillEnabled => EventData::BotSkillEnabled(decode(data)?),
             Self::BotSkillDisabled => EventData::BotSkillDisabled(decode(data)?),
+            Self::McpServerAdded => {
+                let data: McpServerAdded = decode(data)?;
+                data.validate()?;
+                EventData::McpServerAdded(data)
+            }
+            Self::McpServerUpdated => EventData::McpServerUpdated(decode(data)?),
+            Self::McpServerRemoved => EventData::McpServerRemoved(decode(data)?),
+            Self::BotMcpEnabled => EventData::BotMcpEnabled(decode(data)?),
+            Self::BotMcpDisabled => EventData::BotMcpDisabled(decode(data)?),
         };
 
         Ok(decoded)
@@ -1096,7 +1145,12 @@ impl EventKind {
             | Self::SkillAdded
             | Self::SkillRemoved
             | Self::BotSkillEnabled
-            | Self::BotSkillDisabled => {
+            | Self::BotSkillDisabled
+            | Self::McpServerAdded
+            | Self::McpServerUpdated
+            | Self::McpServerRemoved
+            | Self::BotMcpEnabled
+            | Self::BotMcpDisabled => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
                     return Err(EventDataError::Author);
                 }
@@ -1559,6 +1613,9 @@ pub struct ActionStarted {
     /// The tool's arguments.
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// The MCP server the action called, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// The skill the action runs, when it is a `run_skill_script` action.
     ///
     /// This is the identity the Space dispatched, resolved before the action
@@ -1584,8 +1641,11 @@ pub struct ActionFinished {
     pub step: u32,
     /// The action.
     pub action: Id,
-    /// The tool's name.
+    /// The tool's name: the server's original name when it belongs to one.
     pub tool: String,
+    /// The MCP server the action called, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// How it ended.
     pub status: ActionStatus,
     /// The text the Model reads.
@@ -1667,8 +1727,11 @@ pub struct RunFinished {
 pub struct RecordedCall {
     /// The tool-call identifier the provider expects in the result.
     pub call: String,
-    /// The tool's name.
+    /// The tool's name: the server's original name when it belongs to one.
     pub tool: String,
+    /// The MCP server the call names, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// The arguments the tool runs with.
     pub arguments: serde_json::Value,
     /// Why the loop refused the call before anything ran; `None` when it can run.
@@ -1706,6 +1769,8 @@ pub enum ApprovalReason {
     Grant,
     /// The first run of a skill's script by this Bot for this User.
     FirstScriptRun,
+    /// The first call of an MCP server's tool by this Bot for this User.
+    FirstMcpCall,
 }
 
 /// Whether the User can undo an action after allowing it.
@@ -1770,6 +1835,9 @@ pub struct ApprovalRequested {
     /// What an "Always allow" would allow, in words the User reads.
     #[serde(default)]
     pub lasting_scope: Option<String>,
+    /// The MCP server the action calls, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// The skill the action runs when its tool is `run_skill_script`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<Id>,
@@ -1825,6 +1893,9 @@ pub struct RuleAdded {
     /// The path prefix a matching file action's path starts with.
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// The MCP server whose tool a matching call names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// The skill whose script a matching `run_skill_script` action runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<Id>,
@@ -1980,6 +2051,151 @@ pub fn valid_script_name(name: &str) -> bool {
 pub struct SkillRemoved {
     /// The skill.
     pub skill: Id,
+}
+
+/// Where an MCP server's credential and tools belong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpScope {
+    /// The Admin connected it for the whole Space.
+    Space,
+    /// A User connected it with their own credential.
+    User,
+}
+
+/// The longest name an MCP server may take.
+///
+/// A tool's model-facing name is `mcp__<server>__<tool>`, and the Model's tool
+/// names are at most 64 characters.
+pub const MAX_MCP_NAME_BYTES: usize = 32;
+
+/// The data of `neha.mcp.server.added`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerAdded {
+    /// The server.
+    pub server: Id,
+    /// Its name, unique in the Space.
+    pub name: String,
+    /// The address it speaks Streamable HTTP at.
+    pub url: String,
+    /// Where its credential belongs.
+    pub scope: McpScope,
+    /// The User it belongs to, when its scope is one User's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<Id>,
+    /// The account that connected it.
+    pub by: Id,
+}
+
+impl McpServerAdded {
+    /// Whether the name follows the Plugin naming rule.
+    #[must_use]
+    pub fn valid_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        (1..=MAX_MCP_NAME_BYTES).contains(&bytes.len())
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+    }
+
+    /// Whether the address is one a Space calls.
+    ///
+    /// A server runs elsewhere and is reached over HTTPS, or over HTTP only
+    /// when the caller is the Space's own loopback.
+    #[must_use]
+    pub fn valid_url(url: &str) -> bool {
+        if url.len() > 2048 || url.chars().any(char::is_whitespace) {
+            return false;
+        }
+        if url.starts_with("https://") {
+            return true;
+        }
+        url.strip_prefix("http://").is_some_and(|rest| {
+            let host = rest
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or_default()
+                .rsplit_once(':')
+                .map_or(
+                    rest.split(['/', '?', '#']).next().unwrap_or(""),
+                    |(host, _)| host,
+                );
+            matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+        })
+    }
+
+    /// Checks the data against what a server may hold.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if !Self::valid_name(&self.name) {
+            return Err(EventDataError::Data(format!(
+                "an MCP server name is 1 to {MAX_MCP_NAME_BYTES} letters, digits, or hyphens"
+            )));
+        }
+        if !Self::valid_url(&self.url) {
+            return Err(EventDataError::Data(
+                "an MCP server's address is https, or http on the Space's own loopback".to_owned(),
+            ));
+        }
+        match self.scope {
+            McpScope::Space if self.user.is_some() => {
+                return Err(EventDataError::Data(
+                    "a server the Space connected belongs to no User".to_owned(),
+                ));
+            }
+            McpScope::User if self.user.is_none() => {
+                return Err(EventDataError::Data(
+                    "a server a User connected names its User".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.mcp.server.updated`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerUpdated {
+    /// The server.
+    pub server: Id,
+    /// Its new address, when the address changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Whether the update replaced its credential.
+    pub credential: bool,
+    /// The account that changed it.
+    pub by: Id,
+}
+
+/// The data of `neha.mcp.server.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerRemoved {
+    /// The server.
+    pub server: Id,
+}
+
+/// The data of `neha.bot.mcp.enabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotMcpEnabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The server whose tools it may call.
+    pub server: Id,
+}
+
+/// The data of `neha.bot.mcp.disabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotMcpDisabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The server it may no longer call.
+    pub server: Id,
 }
 
 /// The data of `neha.bot.skill.enabled`.

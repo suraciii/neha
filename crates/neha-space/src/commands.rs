@@ -347,6 +347,9 @@ pub async fn execute(
                 if let Some(skill) = rule.skill {
                     value["skill_name"] = json!(state.skill(skill).map(|view| view.name.clone()));
                 }
+                if let Some(server) = rule.server {
+                    value["server_name"] = json!(state.mcp(server).map(|view| view.name.clone()));
+                }
                 shown.push(value);
             }
             Ok(Value::Array(shown))
@@ -359,6 +362,7 @@ pub async fn execute(
             path_prefix,
             skill,
             script,
+            server,
         } => {
             rule_add(
                 context,
@@ -372,11 +376,43 @@ pub async fn execute(
                 path_prefix,
                 skill,
                 script,
+                server,
             )
             .await
         }
         CommandCall::RuleRemove { rule } => {
             rule_remove(context, account, command_id, fingerprint, rule).await
+        }
+        CommandCall::McpAdd(arguments) => {
+            mcp_add(context, account, command_id, fingerprint, arguments).await
+        }
+        CommandCall::McpList => read(context.state, |state| {
+            let servers: Vec<Value> = state
+                .mcps
+                .iter()
+                .filter(|server| match server.scope {
+                    neha::record::McpScope::Space => true,
+                    neha::record::McpScope::User => server.user == Some(account.id),
+                })
+                .map(|server| mcp_view(context, server, account.id))
+                .collect::<Result<_, ApiError>>()?;
+            Ok(Value::Array(servers))
+        }),
+        CommandCall::McpRemove { server } => {
+            mcp_remove(context, account, command_id, fingerprint, server).await
+        }
+        CommandCall::BotMcpEnable { bot, server } | CommandCall::BotMcpDisable { bot, server } => {
+            let enabled = matches!(command, CommandCall::BotMcpEnable { .. });
+            bot_mcp(
+                context,
+                account,
+                command_id,
+                fingerprint,
+                bot,
+                server,
+                enabled,
+            )
+            .await
         }
         CommandCall::SkillAdd(arguments) => {
             skill_add(context, account, command_id, fingerprint, arguments).await
@@ -692,6 +728,7 @@ async fn rule_add(
     path_prefix: Option<String>,
     skill: Option<String>,
     script: Option<String>,
+    server: Option<String>,
 ) -> Result<Outcome, ApiError> {
     let _decisions = context.approvals.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
@@ -752,8 +789,31 @@ async fn rule_add(
             "a run_skill_script rule names its skill and its script, and no other tool does",
         ));
     }
+    if server.is_some() {
+        if script_rule {
+            return Err(ApiError::invalid_argument(
+                "a server rule names a server's tool, not a skill's script",
+            ));
+        }
+        if command_prefix.is_some() || path_prefix.is_some() {
+            return Err(ApiError::invalid_argument(
+                "a server rule takes no command or path prefix",
+            ));
+        }
+        if tool == neha_loop::tools::SHELL
+            || tool == neha_loop::tools::READ_FILE
+            || tool == neha_loop::tools::WRITE_FILE
+            || tool == neha_loop::tools::LIST_FILES
+            || tool == neha_loop::tools::SKILL
+            || tool == neha_loop::tools::RUN_SKILL_SCRIPT
+        {
+            return Err(ApiError::invalid_argument(
+                "a server rule names a tool the server gives",
+            ));
+        }
+    }
 
-    let (existing_rule, owned, skill, script) = {
+    let (existing_rule, owned, skill, script, server) = {
         let state = context
             .state
             .lock()
@@ -802,6 +862,29 @@ async fn rule_add(
         } else {
             (None, None)
         };
+        // A server rule names the connected server by its identifier, and
+        // only a server this Bot may call is worth a rule.
+        let server = match server {
+            Some(name) => {
+                if state.owned_bot(bot, account.id).is_none() {
+                    return Err(ApiError::not_found("no such Bot"));
+                }
+                let Some(view) = state.mcp_named(name.trim()) else {
+                    return Err(ApiError::not_found("no such MCP server"));
+                };
+                let usable = state
+                    .mcps_of(bot, account.id)
+                    .iter()
+                    .any(|server| server.server == view.server);
+                if !usable {
+                    return Err(ApiError::invalid_argument(
+                        "the Bot cannot call this server, so a rule about it would never match",
+                    ));
+                }
+                Some(view.server)
+            }
+            None => None,
+        };
         let existing = state
             .rules
             .iter()
@@ -814,6 +897,7 @@ async fn rule_add(
                     && rule.path_prefix == path_prefix
                     && rule.skill == skill
                     && rule.script == script
+                    && rule.server == server
             })
             .cloned();
         (
@@ -821,6 +905,7 @@ async fn rule_add(
             state.owned_bot(bot, account.id).is_some(),
             skill,
             script,
+            server,
         )
     };
     if !owned {
@@ -863,6 +948,7 @@ async fn rule_add(
             "path_prefix": path_prefix,
             "skill": skill,
             "script": script,
+            "server": server,
         }),
     )
     .acting(account.id);
@@ -876,6 +962,7 @@ async fn rule_add(
         "path_prefix": path_prefix,
         "skill": skill,
         "script": script,
+        "server": server,
     });
     let appended = append(
         context.store,
@@ -896,6 +983,376 @@ async fn rule_add(
 
     Ok(Outcome {
         committed: Some(event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Connects an MCP server for the Space or one User.
+async fn mcp_add(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    arguments: neha::surface::McpAdd,
+) -> Result<Outcome, ApiError> {
+    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    let name = arguments.name.trim().to_owned();
+    if !neha::record::McpServerAdded::valid_name(&name) {
+        return Err(ApiError::invalid_argument(format!(
+            "an MCP server name is 1 to {} letters, digits, or hyphens",
+            neha::record::MAX_MCP_NAME_BYTES
+        )));
+    }
+    let url = arguments.url.trim().to_owned();
+    if !neha::record::McpServerAdded::valid_url(&url) {
+        return Err(ApiError::invalid_argument(
+            "an MCP server's address is https, or http on the Space's own loopback",
+        ));
+    }
+    let existing = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state.mcp_named(&name).cloned()
+    };
+    // A User who adds an existing Space server with their own credential
+    // connects it for themselves; it is one server, not a second one.
+    if let Some(existing) = existing {
+        if existing.scope != neha::record::McpScope::Space
+            || arguments.scope != neha::record::McpScope::User
+        {
+            return Err(ApiError::invalid_argument(
+                "the Space already holds an MCP server under this name",
+            ));
+        }
+        let Some(credential) = arguments.credential else {
+            return Err(ApiError::invalid_argument(
+                "connecting a server with your own credential needs one",
+            ));
+        };
+        context
+            .secrets
+            .store_mcp_credential(existing.server, Some(account.id), &credential)
+            .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
+        let draft = EventDraft::new(
+            EventKind::McpServerUpdated,
+            Author::User(account.id),
+            json!({
+                "server": existing.server,
+                "url": null,
+                "credential": true,
+                "by": account.id,
+            }),
+        );
+        let result = json!({
+            "server": existing.server,
+            "name": existing.name,
+            "url": existing.url,
+            "scope": "space",
+            "user": null,
+            "by": existing.by,
+            "connected": true,
+        });
+        let appended = match append(
+            context.store,
+            context.state,
+            command_id,
+            fingerprint,
+            vec![draft],
+            Some(result.clone()),
+            None,
+        )
+        .await
+        {
+            Ok(appended) => appended,
+            Err(error) => {
+                context
+                    .secrets
+                    .discard_mcp_credential(existing.server, Some(account.id));
+                return Err(error);
+            }
+        };
+        if appended.existing {
+            context
+                .secrets
+                .discard_mcp_credential(existing.server, Some(account.id));
+            return recorded_outcome(context.store, command_id).await;
+        }
+
+        return Ok(Outcome {
+            committed: appended.events.last().map(|event| event.seq),
+            result,
+            queued: None,
+            events: appended.events,
+        });
+    }
+    if arguments.scope == neha::record::McpScope::Space && !account.is_admin {
+        return Err(ApiError::forbidden(
+            "only the Admin connects an MCP server for the Space",
+        ));
+    }
+    let server = Id::new();
+    let user = match arguments.scope {
+        neha::record::McpScope::Space => None,
+        neha::record::McpScope::User => Some(account.id),
+    };
+    let connected = arguments.credential.is_some();
+    if let Some(credential) = &arguments.credential {
+        context
+            .secrets
+            .store_mcp_credential(server, user, credential)
+            .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
+    }
+    let draft = EventDraft::new(
+        EventKind::McpServerAdded,
+        Author::User(account.id),
+        json!({
+            "server": server,
+            "name": name,
+            "url": url,
+            "scope": arguments.scope,
+            "user": user,
+            "by": account.id,
+        }),
+    );
+    let result = json!({
+        "server": server,
+        "name": name,
+        "url": url,
+        "scope": match arguments.scope {
+            neha::record::McpScope::Space => "space",
+            neha::record::McpScope::User => "user",
+        },
+        "user": user,
+        "by": account.id,
+        "connected": connected,
+    });
+    let appended = match append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            context.secrets.discard_mcp_server(server);
+            return Err(error);
+        }
+    };
+    if appended.existing {
+        context.secrets.discard_mcp_server(server);
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// One MCP server as a reader sees it.
+fn mcp_view(
+    context: &CommandContext<'_>,
+    server: &crate::state::McpServerView,
+    reader: Id,
+) -> Result<Value, ApiError> {
+    let who = match server.scope {
+        neha::record::McpScope::Space => None,
+        neha::record::McpScope::User => server.user,
+    };
+    // A Space server may carry the reader's own credential; a User's own
+    // server carries theirs.
+    let connected = match who {
+        Some(user) if user == reader => context
+            .secrets
+            .mcp_credential(server.server, Some(user))
+            .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
+            .is_some(),
+        Some(_) => false,
+        None => {
+            context
+                .secrets
+                .mcp_credential(server.server, Some(reader))
+                .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
+                .is_some()
+                || context
+                    .secrets
+                    .mcp_credential(server.server, None)
+                    .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
+                    .is_some()
+        }
+    };
+
+    Ok(json!({
+        "server": server.server,
+        "name": server.name,
+        "url": server.url,
+        "scope": match server.scope {
+            neha::record::McpScope::Space => "space",
+            neha::record::McpScope::User => "user",
+        },
+        "user": server.user,
+        "by": server.by,
+        "connected": connected,
+    }))
+}
+
+/// Disconnects an MCP server its account added.
+async fn mcp_remove(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    server: Id,
+) -> Result<Outcome, ApiError> {
+    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    let view = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .mcp(server)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such MCP server"))?
+    };
+    let admin_space = view.scope == neha::record::McpScope::Space && account.is_admin;
+    if view.by != account.id && !admin_space {
+        return Err(ApiError::forbidden(
+            "only the account that connected a server, or the Admin for the Space's, removes it",
+        ));
+    }
+    let draft = EventDraft::new(
+        EventKind::McpServerRemoved,
+        Author::User(account.id),
+        json!({"server": server}),
+    );
+    let result = json!({"server": server, "name": view.name});
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+    context.secrets.discard_mcp_server(server);
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Lets a Bot call an MCP server's tools, or stops it.
+async fn bot_mcp(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    bot: Id,
+    server: Id,
+    enabled: bool,
+) -> Result<Outcome, ApiError> {
+    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    let (server_view, unchanged) = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let bot_view = state
+            .bots
+            .get(&bot)
+            .ok_or_else(|| ApiError::not_found("no such Bot"))?;
+        if bot_view.owner != account.id {
+            return Err(ApiError::not_found("no such Bot"));
+        }
+        let server_view = state
+            .mcp(server)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such MCP server"))?;
+        let visible = match server_view.scope {
+            neha::record::McpScope::Space => true,
+            neha::record::McpScope::User => server_view.user == Some(account.id),
+        };
+        if !visible {
+            return Err(ApiError::not_found("no such MCP server"));
+        }
+        let unchanged = bot_view.mcps.contains(&server) == enabled;
+        (server_view, unchanged)
+    };
+    if unchanged {
+        let result = json!({"bot": bot, "server": server, "name": server_view.name});
+        context
+            .store
+            .record_command_result(command_id, &fingerprint, result.clone())
+            .await
+            .map_err(store_error)?;
+        if let Some(outcome) =
+            replay_owned(context.store, command_id, &fingerprint, account).await?
+        {
+            return Ok(outcome);
+        }
+        return Ok(Outcome {
+            committed: None,
+            result,
+            queued: None,
+            events: Vec::new(),
+        });
+    }
+    let kind = if enabled {
+        EventKind::BotMcpEnabled
+    } else {
+        EventKind::BotMcpDisabled
+    };
+    let draft = EventDraft::new(
+        kind,
+        Author::User(account.id),
+        json!({"bot": bot, "server": server}),
+    );
+    let result = json!({"bot": bot, "server": server, "name": server_view.name});
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
         result,
         queued: None,
         events: appended.events,
@@ -3289,6 +3746,7 @@ pub async fn finish_run(
     home: &Home,
     blobs: &Blobs,
     instructions_only: bool,
+    secrets: &Secrets,
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
@@ -3302,6 +3760,7 @@ pub async fn finish_run(
         home,
         blobs,
         instructions_only,
+        secrets,
         model,
         events,
         tool_timeout,
@@ -3311,6 +3770,7 @@ pub async fn finish_run(
         None,
         None,
         neha::usage::Usage::default(),
+        None,
         None,
     )
     .await
@@ -3422,7 +3882,8 @@ pub async fn resume_run(
         (state.is_resumable(run), state.is_recovering(run))
     };
     if resumable {
-        let (history, resume, base_usage) = match prepare_resume(state, run) {
+        let offered = offered_tools(state, secrets, run.bot, run.acting, instructions_only).await;
+        let (history, resume, base_usage) = match prepare_resume(state, run, &offered.mcp) {
             Ok(plan) => plan,
             Err(error) => {
                 eprintln!("neha: cannot resume run {}: {error}", run.id);
@@ -3456,6 +3917,7 @@ pub async fn resume_run(
             home,
             blobs,
             instructions_only,
+            secrets,
             model,
             events,
             tool_timeout,
@@ -3466,6 +3928,7 @@ pub async fn resume_run(
             Some(resume),
             base_usage,
             None,
+            Some(offered),
         )
         .await;
     }
@@ -3558,6 +4021,7 @@ pub async fn resume_run(
                 home,
                 blobs,
                 instructions_only,
+                secrets,
                 model,
                 events,
                 tool_timeout,
@@ -3568,6 +4032,7 @@ pub async fn resume_run(
                 resume,
                 base_usage,
                 Some((next_step, unknown)),
+                None,
             )
             .await
         }
@@ -3681,6 +4146,7 @@ async fn finish_run_with(
     home: &Home,
     blobs: &Blobs,
     instructions_only: bool,
+    secrets: &Secrets,
     model: &ModelClient,
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
@@ -3691,6 +4157,7 @@ async fn finish_run_with(
     resume: Option<Resume>,
     base_usage: neha::usage::Usage,
     recovery: Option<(u32, Option<crate::state::ActionView>)>,
+    prebuilt: Option<OfferedTools>,
 ) -> Result<Finished, ApiError> {
     let mut history = history;
     let mut resume = resume;
@@ -3765,6 +4232,16 @@ async fn finish_run_with(
             }
         }
     };
+    let log = RunLog {
+        store,
+        state,
+        events,
+        bot: pending.bot.id,
+        acting: pending.acting,
+        run: pending.run,
+        cwd: pending.cwd.clone(),
+        access: pending.access.clone(),
+    };
     let runtime = RedactingRuntime {
         inner: runtime,
         secret,
@@ -3773,6 +4250,9 @@ async fn finish_run_with(
         bot: pending.bot.id,
         run: pending.run,
         instructions_only,
+        acting: pending.acting,
+        secrets: Some(secrets),
+        log: Some(log.clone()),
     };
     if let Some((next_step, unknown)) = recovery {
         start_step = Some(next_step);
@@ -3900,21 +4380,25 @@ async fn finish_run_with(
         &provider_id,
         protocol,
     );
-    let log = RunLog {
-        store,
-        state,
-        events,
-        bot: pending.bot.id,
-        acting: pending.acting,
-        run: pending.run,
-        cwd: pending.cwd.clone(),
-        access: pending.access.clone(),
+    let offered = match prebuilt {
+        Some(offered) => offered,
+        None => {
+            offered_tools(
+                state,
+                secrets,
+                pending.bot.id,
+                pending.acting,
+                instructions_only,
+            )
+            .await
+        }
     };
     let mut recorder = RunRecorder {
         log: log.clone(),
         calls: HashMap::new(),
+        mcp: offered.mcp.clone(),
     };
-    let (tools, skills) = run_tools_and_skills(state, pending.bot.id, instructions_only);
+    let (tools, skills) = (offered.tools, offered.skills);
     let mut request = RunRequest::new(
         format!(
             "You are {}, a Bot working in Neha. Work on your Computer with the tools \
@@ -4116,6 +4600,7 @@ async fn load_resume_continuation(
 fn prepare_resume(
     state: &Mutex<State>,
     run: &crate::state::RunView,
+    mcp: &McpCatalog,
 ) -> Result<(Vec<neha_loop::Message>, Resume, neha::usage::Usage), ApiError> {
     let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
     if run
@@ -4182,7 +4667,7 @@ fn prepare_resume(
                 .iter()
                 .map(|call| neha_loop::ToolCall {
                     id: call.call.clone(),
-                    name: call.tool.clone(),
+                    name: resume_tool_name(mcp, call),
                     arguments: call.arguments.to_string(),
                 })
                 .collect(),
@@ -4237,7 +4722,7 @@ fn prepare_resume(
             .iter()
             .map(|call| LoopCall {
                 call: call.call.clone(),
-                tool: call.tool.clone(),
+                tool: resume_tool_name(mcp, call),
                 arguments: call.arguments.clone(),
                 refused: call.refused.clone(),
             })
@@ -4702,6 +5187,12 @@ struct RedactingRuntime<'a> {
     run: Id,
     /// Whether this Space treats skills as instructions only.
     instructions_only: bool,
+    /// The User the Bot acts for.
+    acting: Id,
+    /// The Vault, where an MCP server's credential lives.
+    secrets: Option<&'a Secrets>,
+    /// Where this run records the Files an MCP answer carries.
+    log: Option<RunLog<'a>>,
 }
 
 impl RedactingRuntime<'_> {
@@ -4729,6 +5220,144 @@ impl RedactingRuntime<'_> {
             "# {}\n\n{}\n\n{}",
             skill.name, skill.description, skill.body
         ))
+    }
+
+    /// Calls one tool an MCP server gives the Bot.
+    ///
+    /// The record already names the server and the tool's original name, so a
+    /// server's tool list changing under the run cannot redirect the call.
+    /// Text enters the answer as text, an image as a File, and anything else
+    /// as JSON text.
+    async fn mcp_call(&self, action: Id, model_name: &str, arguments: &Value) -> ActionResult {
+        let (identity, chat, server) = {
+            let state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return ActionResult::failed("the Space state is locked"),
+            };
+            let Some(run) = state.runs.get(&self.run) else {
+                return ActionResult::failed("the run is gone");
+            };
+            let Some(view) = run.actions.iter().find(|view| view.id == action) else {
+                return ActionResult::failed("the action is gone");
+            };
+            let (Some(server), Some(tool)) = (view.server, Some(view.tool.clone())) else {
+                return ActionResult::failed("the action recorded no server's tool to call");
+            };
+            let Some(server) = state.mcp(server) else {
+                return ActionResult::failed("the MCP server is no longer connected");
+            };
+            // A card names the server and the tool it was made for; a call
+            // answered for another one would run code the User never saw.
+            let answered = state
+                .approvals
+                .iter()
+                .find(|approval| approval.run == self.run && approval.action == action);
+            if let Some(answered) = answered
+                && (answered.server != Some(server.server) || answered.tool != tool)
+            {
+                return ActionResult::failed(
+                    "the server changed before the tool ran, so the answer does not cover it",
+                );
+            }
+            (tool, run.chat, server.clone())
+        };
+        let Some(secrets) = self.secrets else {
+            return ActionResult::failed("this runtime cannot read an MCP credential");
+        };
+        let credential = secrets
+            .mcp_credential(server.server, Some(self.acting))
+            .ok()
+            .flatten()
+            .or_else(|| secrets.mcp_credential(server.server, None).ok().flatten());
+        let Some(credential) = credential else {
+            return ActionResult::failed(format!(
+                "the MCP server {:?} is not connected",
+                server.name
+            ));
+        };
+        let Ok(mut client) = crate::mcp::McpClient::new(&server.url, Some(&credential)) else {
+            return ActionResult::failed("the MCP server's address is not usable");
+        };
+        if let Err(error) = client.open().await {
+            return ActionResult::failed(format!(
+                "the MCP server {:?} did not answer: {error}",
+                server.name
+            ));
+        }
+        let answer = match client.call(&identity, arguments).await {
+            Ok(answer) => answer,
+            Err(crate::mcp::McpError::NotConnected { .. }) => {
+                return ActionResult::failed(format!(
+                    "the MCP server {:?} is not connected",
+                    server.name
+                ));
+            }
+            Err(error) => {
+                return ActionResult::failed(format!(
+                    "the MCP server {:?} did not answer {model_name:?}: {error}",
+                    server.name
+                ));
+            }
+        };
+        let mut parts = Vec::new();
+        let mut files = Vec::new();
+        for (index, content) in answer.content.into_iter().enumerate() {
+            match content {
+                crate::mcp::McpContent::Text(text) => parts.push(text),
+                crate::mcp::McpContent::Image { media_type, data } => {
+                    if data.len() as u64 > neha::file::MAX_FILE_BYTES {
+                        parts.push(format!("[an image of {} bytes was too large]", data.len()));
+                        continue;
+                    }
+                    let name = format!("mcp-image-{}.{}", index + 1, media_extension(&media_type));
+                    let sha256 = match self.blobs.put(&data).await {
+                        Ok(sha256) => sha256,
+                        Err(error) => {
+                            return ActionResult::failed(format!(
+                                "cannot store an image from the MCP server: {error}"
+                            ));
+                        }
+                    };
+                    let file = Id::new();
+                    let Some(log) = &self.log else {
+                        return ActionResult::failed("this runtime cannot record an MCP image");
+                    };
+                    files.push(log.bot_draft(
+                        EventKind::FileAdded,
+                        json!({
+                            "file": file,
+                            "chat": chat,
+                            "name": name,
+                            "media_type": media_type,
+                            "size": data.len(),
+                            "sha256": sha256,
+                        }),
+                    ));
+                    parts.push(format!("[image {name}]"));
+                }
+                crate::mcp::McpContent::Other(value) => {
+                    parts.push(serde_json::to_string(&value).unwrap_or_default());
+                }
+            }
+        }
+        if !files.is_empty() {
+            let Some(log) = &self.log else {
+                return ActionResult::failed("this runtime cannot record the MCP server's answer");
+            };
+            if let Err(error) = log.append(files).await {
+                return ActionResult::failed(format!(
+                    "cannot record the MCP server's answer: {error}"
+                ));
+            }
+        }
+        let text = parts.join("\n");
+        let result = if answer.is_error {
+            ActionResult::failed(text)
+        } else {
+            ActionResult::succeeded(ToolOutput::full(text))
+        };
+
+        self.redact(result)
     }
 
     /// Returns the script identity the action recorded when it started.
@@ -4862,6 +5491,9 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
                     Ok(body) => ActionResult::succeeded(ToolOutput::full(body)),
                     Err(error) => ActionResult::failed(error),
                 }),
+                SpaceCall::Mcp { name, arguments } => {
+                    Ok(self.mcp_call(action, &name, &arguments).await)
+                }
                 SpaceCall::Script {
                     skill,
                     script,
@@ -4907,6 +5539,214 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
             }
         }
     }
+}
+
+/// One MCP tool a run offers its Model.
+#[derive(Clone, Debug)]
+struct ExposedMcpTool {
+    /// The name the Model sees.
+    model_name: String,
+    /// The server that gives it.
+    server: Id,
+    /// The server's name, for a card a User reads.
+    server_name: String,
+    /// The tool's original name, as the server spells it.
+    tool: String,
+    /// What the tool does.
+    description: String,
+    /// The JSON schema the Model reads.
+    input_schema: Value,
+}
+
+/// The MCP tools one run offers, by the name the Model sees.
+#[derive(Clone, Debug, Default)]
+struct McpCatalog {
+    by_name: HashMap<String, ExposedMcpTool>,
+    by_identity: HashMap<(Id, String), String>,
+}
+
+/// The longest name a Model's tool may take.
+const MAX_TOOL_NAME_BYTES: usize = 64;
+
+impl McpCatalog {
+    /// Forms every tool's model-facing name, then attaches a hash to any name
+    /// more than one tool would receive.
+    fn build(mut tools: Vec<ExposedMcpTool>) -> Self {
+        for tool in &mut tools {
+            tool.model_name = mcp_tool_name(tool);
+        }
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for tool in &tools {
+            *counts.entry(tool.model_name.clone()).or_default() += 1;
+        }
+        for tool in &mut tools {
+            if counts.get(&tool.model_name).is_some_and(|count| *count > 1) {
+                tool.model_name = mcp_tool_name_hashed(tool);
+            }
+        }
+        let mut by_name = HashMap::with_capacity(tools.len());
+        let mut by_identity = HashMap::with_capacity(tools.len());
+        for tool in tools {
+            by_identity.insert((tool.server, tool.tool.clone()), tool.model_name.clone());
+            by_name.insert(tool.model_name.clone(), tool);
+        }
+        Self {
+            by_name,
+            by_identity,
+        }
+    }
+
+    /// Returns the tool the Model named.
+    fn get(&self, model_name: &str) -> Option<&ExposedMcpTool> {
+        self.by_name.get(model_name)
+    }
+
+    /// Returns the name the Model sees for one server's tool.
+    fn model_name(&self, server: Id, tool: &str) -> Option<&str> {
+        self.by_identity
+            .get(&(server, tool.to_owned()))
+            .map(String::as_str)
+    }
+
+    /// The tool specifications this catalog adds, by name.
+    fn specs(&self) -> Vec<neha_loop::ToolSpec> {
+        let mut tools: Vec<&ExposedMcpTool> = self.by_name.values().collect();
+        tools.sort_by(|left, right| left.model_name.cmp(&right.model_name));
+        tools
+            .into_iter()
+            .map(|tool| neha_loop::ToolSpec {
+                name: tool.model_name.clone(),
+                description: tool.description.clone(),
+                parameters: tool.input_schema.clone(),
+            })
+            .collect()
+    }
+}
+
+/// The name the Model saw for one recorded call.
+///
+/// A server's tool is in the record by its server and its original name; the
+/// Model knew it under the name the Space formed when it offered it. A tool
+/// the server no longer offers keeps its original name, which no run offers,
+/// so the loop refuses it instead of guessing.
+fn resume_tool_name(mcp: &McpCatalog, call: &neha::record::RecordedCall) -> String {
+    match call.server {
+        Some(server) => mcp
+            .model_name(server, &call.tool)
+            .map_or_else(|| call.tool.clone(), ToOwned::to_owned),
+        None => call.tool.clone(),
+    }
+}
+
+/// The extension a File of one image media type takes.
+fn media_extension(media_type: &str) -> &'static str {
+    match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        _ => "bin",
+    }
+}
+
+/// The name the Model sees for one server's tool before any deduplication.
+fn mcp_tool_name(tool: &ExposedMcpTool) -> String {
+    let normalized: String = tool
+        .tool
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let name = format!("mcp__{}__{normalized}", tool.server_name);
+    if normalized != tool.tool || name.len() > MAX_TOOL_NAME_BYTES {
+        mcp_hashed_name(tool)
+    } else {
+        name
+    }
+}
+
+/// The same name with a hash of the server and the tool appended.
+fn mcp_tool_name_hashed(tool: &ExposedMcpTool) -> String {
+    mcp_hashed_name(tool)
+}
+
+fn mcp_hashed_name(tool: &ExposedMcpTool) -> String {
+    let digest = crate::blobs::digest(format!("{}/{}", tool.server, tool.tool).as_bytes());
+    let suffix = format!("_{}", &digest[..8]);
+    let base = format!("mcp__{}__{}", tool.server_name, tool.tool);
+    let available = MAX_TOOL_NAME_BYTES.saturating_sub(suffix.len());
+    let mut name = String::new();
+    for character in base.chars() {
+        if name.len() + character.len_utf8() > available {
+            break;
+        }
+        name.push(character);
+    }
+    name.push_str(&suffix);
+    name
+}
+
+/// The tools a run offers: the built-in ones, a skill's, and a server's.
+struct OfferedTools {
+    tools: Vec<neha_loop::ToolSpec>,
+    skills: String,
+    mcp: McpCatalog,
+}
+
+/// Builds the tools one run offers, reading each enabled server's tool list.
+///
+/// A server that cannot answer keeps its tools out of the run and leaves every
+/// other server and skill usable: a broken integration never breaks the Bot.
+async fn offered_tools(
+    state: &Mutex<State>,
+    secrets: &Secrets,
+    bot: Id,
+    acting: Id,
+    instructions_only: bool,
+) -> OfferedTools {
+    let (mut tools, skills) = run_tools_and_skills(state, bot, instructions_only);
+    let servers: Vec<crate::state::McpServerView> = match state.lock() {
+        Ok(state) => state.mcps_of(bot, acting).into_iter().cloned().collect(),
+        Err(_) => Vec::new(),
+    };
+    let mut found = Vec::new();
+    for server in servers {
+        // The acting User's credential wins; the Space's answers otherwise.
+        let credential = secrets
+            .mcp_credential(server.server, Some(acting))
+            .ok()
+            .flatten()
+            .or_else(|| secrets.mcp_credential(server.server, None).ok().flatten());
+        let Ok(mut client) = crate::mcp::McpClient::new(&server.url, credential.as_deref()) else {
+            continue;
+        };
+        if client.open().await.is_err() {
+            continue;
+        }
+        let Ok(list) = client.tools().await else {
+            continue;
+        };
+        for tool in list {
+            found.push(ExposedMcpTool {
+                model_name: String::new(),
+                server: server.server,
+                server_name: server.name.clone(),
+                tool: tool.name,
+                description: tool.description,
+                input_schema: tool.input_schema,
+            });
+        }
+    }
+    let mcp = McpCatalog::build(found);
+    tools.extend(mcp.specs());
+
+    OfferedTools { tools, skills, mcp }
 }
 
 /// Returns the tools a Bot may call, and the skills it may load.
@@ -5161,6 +6001,121 @@ struct RunRecorder<'a> {
     /// The calls of each step the loop asked about, so an approval can name
     /// the call's position in its step.
     calls: HashMap<u32, Vec<LoopCall>>,
+    /// The MCP tools this run offers, by the name the Model sees.
+    mcp: McpCatalog,
+}
+
+/// Decides one call of a tool an MCP server gives the Bot.
+///
+/// The first call for the Bot and the acting User always asks; a lasting
+/// rule for that server's tool answers later calls. The card names the
+/// server as the action's target, because no Computer runs it.
+async fn approve_mcp(
+    recorder: &mut RunRecorder<'_>,
+    step: u32,
+    call: &LoopCall,
+    _action: Id,
+    tool: &ExposedMcpTool,
+) -> Result<neha_loop::Authorization, LoopError> {
+    let identity = neha_loop::McpIdentity {
+        server: tool.server,
+        tool: tool.tool.clone(),
+    };
+    let dispatched = neha_loop::Dispatched {
+        script: None,
+        mcp: Some(identity),
+    };
+    let (bot, chat, server_name, matching, first) = {
+        let state = recorder
+            .log
+            .state
+            .lock()
+            .map_err(|_| LoopError::Record("the Space state is locked".to_owned()))?;
+        let run = state
+            .runs
+            .get(&recorder.log.run)
+            .ok_or_else(|| LoopError::Record("the run is gone".to_owned()))?;
+        let server = state
+            .mcp(tool.server)
+            .ok_or_else(|| LoopError::Record("the MCP server is no longer connected".to_owned()))?;
+        // A rule about a server's tool names the server and the tool; a
+        // tool-only rule about the same name asks for every server's tool
+        // of that name.
+        let matching: Vec<RuleView> = state
+            .rules_of(run.bot)
+            .into_iter()
+            .filter(|rule| rule.user == recorder.log.acting && rule.tool == tool.tool)
+            .filter(|rule| rule.server.is_none() || rule.server == Some(tool.server))
+            .filter(|rule| {
+                rule.command_prefix.is_none()
+                    && rule.path_prefix.is_none()
+                    && rule.skill.is_none()
+                    && rule.script.is_none()
+            })
+            .cloned()
+            .collect();
+        let first = !state.mcp_call_allowed(run.bot, recorder.log.acting, tool.server, &tool.tool);
+        (run.bot, run.chat, server.name.clone(), matching, first)
+    };
+    let ask = matching.iter().any(|rule| rule.effect == RuleEffect::Ask);
+    let (reason, rule) = if first && !ask {
+        (neha::record::ApprovalReason::FirstMcpCall, None)
+    } else {
+        match decisive_rule(&matching) {
+            Some(Decision::Wait) => {
+                let rule = matching
+                    .iter()
+                    .filter(|rule| rule.effect == RuleEffect::Ask)
+                    .max_by_key(|rule| rule_specificity(rule))
+                    .map(|rule| rule.rule);
+                (neha::record::ApprovalReason::Rule, rule)
+            }
+            Some(Decision::Allow) | None => {
+                return Ok(neha_loop::Authorization::Allow(dispatched));
+            }
+        }
+    };
+    let index = recorder.call_index(step, call)?;
+    let approval = Id::new();
+    recorder
+        .log
+        .append(vec![recorder.log.bot_draft(
+            EventKind::ApprovalRequested,
+            json!({
+                "approval": approval,
+                "run": recorder.log.run,
+                "bot": bot,
+                "computer": tool.server,
+                "chat": chat,
+                "acting": recorder.log.acting,
+                "action": _action,
+                "index": index,
+                "step": step,
+                "call": call.call,
+                "tool": tool.tool,
+                "arguments": call.arguments,
+                "summary": format!("{server_name}: {}", tool.tool),
+                "reason": reason,
+                "ambiguous": false,
+                "server": tool.server,
+                "skill": null,
+                "script": null,
+                "script_sha256": null,
+                "rule": rule,
+                "lasting_scope": format!("this tool of {server_name}"),
+                "grant_folder": null,
+                "undoable": neha::record::Undoability::No,
+            }),
+        )])
+        .await?;
+
+    Ok(neha_loop::Authorization::Wait(neha_loop::Dispatched {
+        script: None,
+        mcp: Some(neha_loop::McpIdentity {
+            server: tool.server,
+            tool: tool.tool.clone(),
+        }),
+    }))
 }
 
 impl Recorder for RunRecorder<'_> {
@@ -5194,13 +6149,20 @@ impl Recorder for RunRecorder<'_> {
         self.calls.insert(step, calls.clone());
         let calls: Vec<Value> = calls
             .iter()
-            .map(|call| {
-                json!({
+            .map(|call| match self.mcp.get(&call.tool) {
+                Some(tool) => json!({
+                    "call": call.call,
+                    "tool": tool.tool,
+                    "server": tool.server,
+                    "arguments": call.arguments,
+                    "refused": call.refused,
+                }),
+                None => json!({
                     "call": call.call,
                     "tool": call.tool,
                     "arguments": call.arguments,
                     "refused": call.refused,
-                })
+                }),
             })
             .collect();
         self.log
@@ -5230,7 +6192,14 @@ impl Recorder for RunRecorder<'_> {
         // Loading a skill reads what the Space holds; it touches no Computer
         // and asks nobody.
         if call.tool == neha_loop::tools::SKILL {
-            return Ok(neha_loop::Authorization::Allow { script: None });
+            return Ok(neha_loop::Authorization::Allow(
+                neha_loop::Dispatched::default(),
+            ));
+        }
+        // A tool an MCP server gives the Bot has its own first-call consent and
+        // its own rules, whatever Computer runs the Bot.
+        if let Some(tool) = self.mcp.get(&call.tool).cloned() {
+            return approve_mcp(self, step, call, action, &tool).await;
         }
         let plan = {
             let state = self
@@ -5299,7 +6268,10 @@ impl Recorder for RunRecorder<'_> {
             // A Hosted Computer has no fence yet (M2-B), so the actions it runs
             // never ask. A call the Space answers itself has its own approvals
             // whatever Computer the Bot works on.
-            return Ok(neha_loop::Authorization::Allow { script: identity });
+            return Ok(neha_loop::Authorization::Allow(neha_loop::Dispatched {
+                script: identity,
+                mcp: None,
+            }));
         }
         let grant = grant_folder(&self.log.access, self.log.cwd.as_deref(), call);
         // An Ask rule for this skill's script asks for itself, so the answer
@@ -5331,7 +6303,10 @@ impl Recorder for RunRecorder<'_> {
                     (ApprovalReason::Rule, rule, false)
                 }
                 Some(Decision::Allow) | None => {
-                    return Ok(neha_loop::Authorization::Allow { script: identity });
+                    return Ok(neha_loop::Authorization::Allow(neha_loop::Dispatched {
+                        script: identity,
+                        mcp: None,
+                    }));
                 }
             }
         };
@@ -5353,6 +6328,7 @@ impl Recorder for RunRecorder<'_> {
             }
             ApprovalReason::FirstUseLocal => None,
             ApprovalReason::FirstScriptRun => lasting_scope_at(call, self.log.cwd.as_deref()),
+            ApprovalReason::FirstMcpCall => None,
         };
         let (skill_id, script_name, script_sha256) =
             identity.as_ref().map_or((None, None, None), |script| {
@@ -5393,32 +6369,57 @@ impl Recorder for RunRecorder<'_> {
             )])
             .await?;
 
-        Ok(neha_loop::Authorization::Wait { script: identity })
+        Ok(neha_loop::Authorization::Wait(neha_loop::Dispatched {
+            script: identity,
+            mcp: None,
+        }))
     }
 
     async fn authorized_action(
         &mut self,
         action: Id,
         _call: &LoopCall,
-    ) -> Result<Option<neha_loop::ScriptIdentity>, LoopError> {
+    ) -> Result<neha_loop::Dispatched, LoopError> {
         let state = self
             .log
             .state
             .lock()
             .map_err(|_| LoopError::Record("the Space state is locked".to_owned()))?;
-        let approval = state.approvals.iter().find(|approval| {
-            approval.run == self.log.run
-                && approval.action == action
-                && approval.tool == neha_loop::tools::RUN_SKILL_SCRIPT
-        });
+        let Some(approval) = state
+            .approvals
+            .iter()
+            .find(|approval| approval.run == self.log.run && approval.action == action)
+        else {
+            return Ok(neha_loop::Dispatched::default());
+        };
+        if let Some(server) = approval.server {
+            return Ok(neha_loop::Dispatched {
+                script: None,
+                mcp: Some(neha_loop::McpIdentity {
+                    server,
+                    tool: approval.tool.clone(),
+                }),
+            });
+        }
+        let Some(skill) = approval.skill else {
+            // A card for a Computer action carries no identity: the recorded
+            // action runs the call the record already names.
+            return Ok(neha_loop::Dispatched::default());
+        };
+        let trusted = |value: Option<&String>, what: &'static str| {
+            value
+                .cloned()
+                .ok_or_else(|| LoopError::Record(format!("the card names no {what}")))
+        };
 
-        Ok(approval.and_then(|approval| {
-            Some(neha_loop::ScriptIdentity {
-                skill: approval.skill?,
-                name: approval.script.clone()?,
-                sha256: approval.script_sha256.clone()?,
-            })
-        }))
+        Ok(neha_loop::Dispatched {
+            script: Some(neha_loop::ScriptIdentity {
+                skill,
+                name: trusted(approval.script.as_ref(), "script")?,
+                sha256: trusted(approval.script_sha256.as_ref(), "digest")?,
+            }),
+            mcp: None,
+        })
     }
 
     async fn action_started(
@@ -5427,8 +6428,15 @@ impl Recorder for RunRecorder<'_> {
         action: Id,
         tool: String,
         arguments: Value,
-        script: Option<&neha_loop::ScriptIdentity>,
+        dispatched: &neha_loop::Dispatched,
     ) -> Result<(), LoopError> {
+        let script = dispatched.script.as_ref();
+        // A server's tool is recorded by the server's identifier and the
+        // tool's original name, never by the name the Model sees.
+        let (tool, server) = match &dispatched.mcp {
+            Some(mcp) => (mcp.tool.clone(), Some(mcp.server)),
+            None => (tool, None),
+        };
         self.log
             .append(vec![self.log.bot_draft(
                 EventKind::ActionStarted,
@@ -5437,6 +6445,7 @@ impl Recorder for RunRecorder<'_> {
                     "step": step,
                     "action": action,
                     "tool": tool,
+                    "server": server,
                     "arguments": arguments,
                     "skill": script.map(|script| script.skill),
                     "script": script.map(|script| script.name.as_str()),
@@ -5461,6 +6470,12 @@ impl Recorder for RunRecorder<'_> {
             ActionStatus::TimedOut => RecordedActionStatus::TimedOut,
             ActionStatus::Unknown => RecordedActionStatus::Unknown,
         };
+        // The Model sees a server's tool under its model-facing name; the
+        // record keeps the server and the tool's original name.
+        let (tool, server) = match self.mcp.get(&tool) {
+            Some(tool) => (tool.tool.clone(), Some(tool.server)),
+            None => (tool, None),
+        };
         self.log
             .append(vec![self.log.bot_draft(
                 EventKind::ActionFinished,
@@ -5469,6 +6484,7 @@ impl Recorder for RunRecorder<'_> {
                     "step": step,
                     "action": action,
                     "tool": tool,
+                    "server": server,
                     "status": status,
                     "output": output.text,
                     "truncated": output.truncated,
@@ -5502,6 +6518,9 @@ impl RunRecorder<'_> {
 /// How specific a rule is: a prefix makes it narrower, a longer prefix
 /// narrower still, and a skill's script the narrowest of all.
 fn rule_specificity(rule: &RuleView) -> (u8, usize) {
+    if rule.server.is_some() {
+        return (3, 0);
+    }
     if rule.skill.is_some() || rule.script.is_some() {
         return (2, rule.script.as_deref().map_or(0, str::len));
     }
@@ -5750,7 +6769,7 @@ fn rule_matches_at(
     cwd: Option<&str>,
     script: Option<&ScriptCall>,
 ) -> bool {
-    if rule.tool != call.tool {
+    if rule.tool != call.tool || rule.server.is_some() {
         return false;
     }
     // A script rule matches one installed skill and one of its scripts, and a
@@ -5934,6 +6953,18 @@ fn rule_covers(derived: &DerivedRule, ask: &RuleView) -> bool {
     if ask.tool != derived.tool {
         return false;
     }
+    // A server's tool rule covers an Ask rule for the same server and tool,
+    // and the tool-only Ask rule that names no server.
+    if let Some(server) = derived.server {
+        return (ask.server == Some(server) || ask.server.is_none())
+            && ask.command_prefix.is_none()
+            && ask.path_prefix.is_none()
+            && ask.skill.is_none()
+            && ask.script.is_none();
+    }
+    if ask.server.is_some() {
+        return false;
+    }
     // A script rule covers only the Ask for that same skill and script.
     if derived.skill.is_some() || derived.script.is_some() {
         return ask.skill == derived.skill && ask.script == derived.script;
@@ -5973,6 +7004,7 @@ struct DerivedRule {
     tool: String,
     command_prefix: Option<String>,
     path_prefix: Option<String>,
+    server: Option<Id>,
     skill: Option<Id>,
     script: Option<String>,
 }
@@ -5980,10 +7012,23 @@ struct DerivedRule {
 /// Derives the lasting rule an "Always allow" makes from the action.
 fn derived_rule(view: &ApprovalView, cwd: Option<&str>) -> Result<DerivedRule, ApiError> {
     let tool = view.tool.clone();
+    // A card made for a server's tool names that server and the tool's
+    // original name, so the rule that Always allow writes is exact.
+    if let Some(server) = view.server {
+        return Ok(DerivedRule {
+            tool,
+            command_prefix: None,
+            path_prefix: None,
+            server: Some(server),
+            skill: None,
+            script: None,
+        });
+    }
     let plain = |command_prefix, path_prefix| DerivedRule {
         tool: tool.clone(),
         command_prefix,
         path_prefix,
+        server: None,
         skill: None,
         script: None,
     };
@@ -5998,6 +7043,7 @@ fn derived_rule(view: &ApprovalView, cwd: Option<&str>) -> Result<DerivedRule, A
                 tool,
                 command_prefix: None,
                 path_prefix: None,
+                server: None,
                 skill: Some(skill),
                 script: Some(script.to_owned()),
             })
@@ -6611,11 +7657,12 @@ mod tests {
     use neha_computer::ComputerRuntime as _;
 
     use super::{
-        LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
-        grant_folder, grants_with, lasting_rule_path_at, load_resume_continuation,
-        normalized_grants, path_covers, path_matches, path_matches_at, path_parent,
-        persistable_grant, pinned_access, prepare_recovery, prepare_resume, resolve_action_path,
-        resumed_access, rule_covers, rule_matches, run_access, under_root, verify_recovered_action,
+        LoopCall, McpCatalog, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path,
+        ambiguous_path_at, grant_folder, grants_with, lasting_rule_path_at,
+        load_resume_continuation, normalized_grants, path_covers, path_matches, path_matches_at,
+        path_parent, persistable_grant, pinned_access, prepare_recovery, prepare_resume,
+        resolve_action_path, resumed_access, rule_covers, rule_matches, run_access, under_root,
+        verify_recovered_action,
     };
     use crate::blobs::Blobs;
     use crate::home::Home;
@@ -6635,6 +7682,7 @@ mod tests {
             tool: tool.to_owned(),
             command_prefix: command_prefix.map(ToOwned::to_owned),
             path_prefix: path_prefix.map(ToOwned::to_owned),
+            server: None,
             skill: None,
             script: None,
             seq: Seq::from_i64(1).unwrap(),
@@ -6650,6 +7698,7 @@ mod tests {
             tool: tool.to_owned(),
             command_prefix: command_prefix.map(ToOwned::to_owned),
             path_prefix: path_prefix.map(ToOwned::to_owned),
+            server: None,
             skill: None,
             script: None,
         }
@@ -6660,6 +7709,7 @@ mod tests {
             tool: neha_loop::tools::RUN_SKILL_SCRIPT.to_owned(),
             command_prefix: None,
             path_prefix: None,
+            server: None,
             skill: Some(skill),
             script: Some(script.to_owned()),
         }
@@ -6674,6 +7724,7 @@ mod tests {
             tool: neha_loop::tools::RUN_SKILL_SCRIPT.to_owned(),
             command_prefix: None,
             path_prefix: None,
+            server: None,
             skill: Some(skill),
             script: Some(script.to_owned()),
             seq: Seq::from_i64(1).unwrap(),
@@ -6718,6 +7769,7 @@ mod tests {
             thinking: None,
             model: None,
             skills: Vec::new(),
+            mcps: Vec::new(),
         }
     }
 
@@ -7492,7 +8544,8 @@ mod tests {
             &[(Id::new(), "shell", json!({"command": "a"}))],
         );
         let (messages, resume, _usage) =
-            prepare_resume(&std::sync::Mutex::new(state), &run).expect("the record resumes");
+            prepare_resume(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
+                .expect("the record resumes");
 
         assert_eq!(resume.step, 1);
         assert_eq!(resume.done, 1);
@@ -7522,7 +8575,8 @@ mod tests {
         );
         let expected = approved_action;
         let (_, resume, _usage) =
-            prepare_resume(&std::sync::Mutex::new(state), &run).expect("the record resumes");
+            prepare_resume(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
+                .expect("the record resumes");
 
         assert_eq!(resume.done, 1);
         assert_eq!(resume.calls[1].arguments, json!({"command": "second"}));
@@ -7612,6 +8666,9 @@ mod tests {
             bot: Id::new(),
             run: Id::new(),
             instructions_only: false,
+            acting: Id::new(),
+            secrets: None,
+            log: None,
         };
         let result = runtime
             .execute(neha_computer::Action::Shell {
@@ -7638,6 +8695,7 @@ mod tests {
             step: 1,
             tool: "write_file".to_owned(),
             arguments: json!({"path": "note.txt", "content": "asked"}),
+            server: None,
             skill: None,
             script: None,
             script_sha256: None,
@@ -7802,7 +8860,9 @@ mod tests {
             json!({"command": "b"}),
             &[],
         );
-        assert!(prepare_resume(&std::sync::Mutex::new(state), &run).is_err());
+        assert!(
+            prepare_resume(&std::sync::Mutex::new(state), &run, &McpCatalog::default()).is_err()
+        );
 
         // A completed action the approval's index does not expect.
         let (state, run, _approved_action) = waiting_state(
@@ -7815,7 +8875,9 @@ mod tests {
             json!({"command": "b"}),
             &[(Id::new(), "shell", json!({"command": "b"}))],
         );
-        assert!(prepare_resume(&std::sync::Mutex::new(state), &run).is_err());
+        assert!(
+            prepare_resume(&std::sync::Mutex::new(state), &run, &McpCatalog::default()).is_err()
+        );
     }
 
     #[test]

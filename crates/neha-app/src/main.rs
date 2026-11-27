@@ -9,10 +9,10 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
-use neha::record::{RuleEffect, SkillLibrary};
+use neha::record::{McpScope, RuleEffect, SkillLibrary};
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
+    BotComputer, BotCreate, BotUpdate, CommandCall, McpAdd, MessageSend, ModelSpec, ProviderAdd,
     ProviderConnect, ProviderProtocol, SkillAdd, SkillAddScript, ThinkingLevel,
 };
 use neha_space::Home;
@@ -112,6 +112,11 @@ enum Top {
     Skill {
         #[command(subcommand)]
         command: SkillCommand,
+    },
+    /// Connect an MCP server or list the servers you may see.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
 }
 
@@ -272,6 +277,11 @@ enum BotCommand {
         #[command(subcommand)]
         command: BotSkillCommand,
     },
+    /// Give your Bot an MCP server, or take one away.
+    Mcp {
+        #[command(subcommand)]
+        command: BotMcpCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -415,6 +425,9 @@ enum RuleCommand {
         bot: Option<Id>,
     },
     /// Add a rule that asks before, or allows, matching actions.
+    ///
+    /// A rule for a server's tool names the server with --server and the tool
+    /// with --tool, and carries no command or path prefix.
     Add {
         /// The Bot the rule applies to.
         #[arg(long)]
@@ -437,6 +450,9 @@ enum RuleCommand {
         /// Match one script of that skill by its file name; with --skill.
         #[arg(long, requires = "skill")]
         script: Option<String>,
+        /// Match a tool an MCP server gives, by the server's name.
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Remove one rule.
     Remove {
@@ -470,6 +486,28 @@ enum SkillCommand {
 }
 
 #[derive(Subcommand)]
+enum McpCommand {
+    /// Connect an MCP server.
+    Add {
+        /// The server's name, unique in the Space: letters, digits, or hyphens.
+        name: String,
+        /// The address it speaks Streamable HTTP at.
+        url: String,
+        /// Connect it for the signed-in User alone; without it the Space is
+        /// the scope, which only the Admin may add to.
+        #[arg(long, value_parser = parse_mcp_scope)]
+        scope: Option<McpScope>,
+    },
+    /// List the MCP servers you may see.
+    List,
+    /// Disconnect an MCP server.
+    Remove {
+        /// The server identifier.
+        server: Id,
+    },
+}
+
+#[derive(Subcommand)]
 enum BotSkillCommand {
     /// Give a Bot a skill.
     Enable {
@@ -484,6 +522,24 @@ enum BotSkillCommand {
         bot: Id,
         /// The skill identifier.
         skill: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotMcpCommand {
+    /// Give a Bot the tools of an MCP server.
+    Enable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The MCP server identifier.
+        server: Id,
+    },
+    /// Take an MCP server's tools away from a Bot.
+    Disable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The MCP server identifier.
+        server: Id,
     },
 }
 
@@ -533,6 +589,7 @@ async fn main() -> Result<()> {
         Top::Approval { command } => approval(command).await,
         Top::Rule { command } => rule(command).await,
         Top::Skill { command } => skill_command(command).await,
+        Top::Mcp { command } => mcp_command(command).await,
     }
 }
 
@@ -893,6 +950,17 @@ fn parse_protocol(value: &str) -> Result<ProviderProtocol> {
         other => bail!(
             "unknown protocol {other:?}; use chat-completions, openai-responses, or anthropic-messages"
         ),
+    }
+}
+
+/// Parses an MCP server's scope.
+///
+/// A server added without `--scope user` belongs to the Space, so `user` is
+/// the only value the option spells.
+fn parse_mcp_scope(value: &str) -> Result<McpScope> {
+    match value {
+        "user" => Ok(McpScope::User),
+        other => bail!("unknown scope {other:?}; --scope takes user, and the Space is the default"),
     }
 }
 
@@ -1270,6 +1338,7 @@ async fn bot(command: BotCommand) -> Result<()> {
             }
         }
         BotCommand::Skill { command } => bot_skill(command).await?,
+        BotCommand::Mcp { command } => bot_mcp(command).await?,
     }
 
     Ok(())
@@ -1792,6 +1861,7 @@ async fn rule(command: RuleCommand) -> Result<()> {
             path_prefix,
             skill,
             script,
+            server,
         } => {
             validate_rule_arguments(
                 &tool,
@@ -1799,6 +1869,7 @@ async fn rule(command: RuleCommand) -> Result<()> {
                 path_prefix.as_deref(),
                 skill.as_deref(),
                 script.as_deref(),
+                server.as_deref(),
             )?;
             let result = client::command(
                 &credential,
@@ -1810,6 +1881,7 @@ async fn rule(command: RuleCommand) -> Result<()> {
                     path_prefix: path_prefix.clone(),
                     skill: skill.clone(),
                     script: script.clone(),
+                    server,
                 },
             )
             .await?;
@@ -1888,6 +1960,52 @@ async fn skill_command(command: SkillCommand) -> Result<()> {
                 .and_then(Value::as_str)
                 .unwrap_or("the skill");
             println!("Removed skill {shown}.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Connects, lists, and disconnects MCP servers.
+async fn mcp_command(command: McpCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        McpCommand::Add { name, url, scope } => {
+            let result = client::command(
+                &credential,
+                CommandCall::McpAdd(McpAdd {
+                    name,
+                    url,
+                    scope: scope.unwrap_or(McpScope::Space),
+                    credential: mcp_credential(),
+                }),
+            )
+            .await?;
+            println!(
+                "Added MCP server {} ({}) at {}.",
+                id_of(&result, "server")?,
+                result["name"].as_str().unwrap_or_default(),
+                result["url"].as_str().unwrap_or_default()
+            );
+            println!(
+                "  scope: {}; {}",
+                mcp_scope_label(&result),
+                mcp_connection_label(&result)
+            );
+        }
+        McpCommand::List => {
+            let list = client::command(&credential, CommandCall::McpList).await?;
+            for row in mcp_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        McpCommand::Remove { server } => {
+            let result = client::command(&credential, CommandCall::McpRemove { server }).await?;
+            let shown = result
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("the server");
+            println!("Removed MCP server {shown}.");
         }
     }
 
@@ -2236,6 +2354,57 @@ fn skill_row(skill: &Value) -> Result<String> {
     ))
 }
 
+/// One row per MCP server: server, name, scope, url, and connection state.
+fn mcp_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no MCP servers in the answer")?
+        .iter()
+        .map(mcp_row)
+        .collect()
+}
+
+/// Formats one MCP server as a single line.
+fn mcp_row(server: &Value) -> Result<String> {
+    Ok(format!(
+        "{}  {}  {}  {}  {}",
+        id_of(server, "server")?,
+        server
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        mcp_scope_label(server),
+        server
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        mcp_connection_label(server)
+    ))
+}
+
+/// The scope of one MCP server view: the Space, or the User who connected it.
+fn mcp_scope_label(server: &Value) -> String {
+    match server.get("scope").and_then(Value::as_str) {
+        Some("user") => server
+            .get("user")
+            .and_then(Value::as_str)
+            .map_or_else(|| "user".to_owned(), |user| format!("user {user}")),
+        _ => "space".to_owned(),
+    }
+}
+
+/// Whether one MCP server view says the Space reached the server.
+fn mcp_connection_label(server: &Value) -> &'static str {
+    if server
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "connected"
+    } else {
+        "not connected"
+    }
+}
+
 /// Gives a Bot a skill, or takes one away.
 async fn bot_skill(command: BotSkillCommand) -> Result<()> {
     let credential = Credential::load()?;
@@ -2257,6 +2426,32 @@ async fn bot_skill(command: BotSkillCommand) -> Result<()> {
         println!("Bot {bot} may use skill {skill} ({name}).");
     } else {
         println!("Bot {bot} no longer uses skill {skill} ({name}).");
+    }
+
+    Ok(())
+}
+
+/// Gives a Bot an MCP server, or takes one away.
+async fn bot_mcp(command: BotMcpCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    let (bot, server, enabled) = match command {
+        BotMcpCommand::Enable { bot, server } => (bot, server, true),
+        BotMcpCommand::Disable { bot, server } => (bot, server, false),
+    };
+    let call = if enabled {
+        CommandCall::BotMcpEnable { bot, server }
+    } else {
+        CommandCall::BotMcpDisable { bot, server }
+    };
+    let result = client::command(&credential, call).await?;
+    let name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("the server");
+    if enabled {
+        println!("Bot {bot} may use MCP server {server} ({name}).");
+    } else {
+        println!("Bot {bot} no longer uses MCP server {server} ({name}).");
     }
 
     Ok(())
@@ -2285,6 +2480,10 @@ fn rule_row(rule: &Value) -> Result<String> {
     }
     if let Some(prefix) = rule["path_prefix"].as_str() {
         row.push_str(&format!("  path-prefix {prefix}"));
+    }
+    if let Some(server) = rule["server"].as_str() {
+        let shown = rule["server_name"].as_str().unwrap_or(server);
+        row.push_str(&format!("  server {shown}"));
     }
     if let Some(script) = rule["script"].as_str() {
         let skill = rule["skill_name"]
@@ -2371,9 +2570,20 @@ fn validate_rule_arguments(
     path_prefix: Option<&str>,
     skill: Option<&str>,
     script: Option<&str>,
+    server: Option<&str>,
 ) -> Result<()> {
     if command_prefix.is_some() && path_prefix.is_some() {
         bail!("pass at most one of --command-prefix and --path-prefix");
+    }
+    if let Some(server) = server {
+        // A server's tool rule names the server and the tool and carries no
+        // prefix, so a prefix with --server can only ever match nothing.
+        if command_prefix.is_some() || path_prefix.is_some() {
+            bail!("--server names a server's tool and takes no --command-prefix or --path-prefix");
+        }
+        if server.trim().is_empty() {
+            bail!("--server must not be empty");
+        }
     }
     let tool = tool.trim();
     if tool.is_empty() {
@@ -2888,6 +3098,17 @@ fn computer_kind_label(kind: &str) -> &str {
     }
 }
 
+/// The credential an `mcp add` sends, which only the environment carries.
+///
+/// A credential argument would outlive the command in a shell history and a
+/// process listing, so `NEHA_MCP_TOKEN` is its only source. Absent, the server
+/// is connected without a credential.
+fn mcp_credential() -> Option<String> {
+    std::env::var("NEHA_MCP_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
 fn provider_key() -> Result<String> {
     if let Ok(key) = std::env::var("NEHA_PROVIDER_KEY")
         && !key.trim().is_empty()
@@ -2927,6 +3148,7 @@ fn text_of<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
+    use neha::record::McpScope;
     use serde_json::json;
 
     use super::{space_file_name, write_run};
@@ -2940,12 +3162,12 @@ mod tests {
 
     use super::{
         ApprovalCard, ApprovalCommand, Decision, LastingScope, RuleCommand, RuleEffectChoice,
-        approval_row, decision_from_input, decision_line, escape_text, read_decision,
-        rule_add_line, rule_add_report, rule_rows, validate_rule_arguments, waiting_advice,
-        write_approval_details,
+        approval_row, decision_from_input, decision_line, escape_text, mcp_row, mcp_rows,
+        read_decision, rule_add_line, rule_add_report, rule_rows, validate_rule_arguments,
+        waiting_advice, write_approval_details,
     };
 
-    use super::{BotSkillCommand, SkillCommand, read_skill_directory};
+    use super::{BotMcpCommand, BotSkillCommand, McpCommand, SkillCommand, read_skill_directory};
 
     use super::{
         BotCommand, checked_grant, confirm_full_access, normalized_grant, revocable_grant,
@@ -3430,6 +3652,115 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn the_mcp_commands_parse() {
+        match parse(&["mcp", "add", "weather", "https://mcp.example.com/mcp"]) {
+            Top::Mcp {
+                command: McpCommand::Add { name, url, scope },
+            } => {
+                assert_eq!(name, "weather");
+                assert_eq!(url, "https://mcp.example.com/mcp");
+                assert_eq!(scope.unwrap_or(McpScope::Space), McpScope::Space);
+            }
+            _ => panic!("mcp add did not parse"),
+        }
+        match parse(&[
+            "mcp",
+            "add",
+            "weather",
+            "https://mcp.example.com/mcp",
+            "--scope",
+            "user",
+        ]) {
+            Top::Mcp {
+                command: McpCommand::Add { scope, .. },
+            } => assert_eq!(scope, Some(McpScope::User)),
+            _ => panic!("mcp add --scope user did not parse"),
+        }
+        assert!(matches!(
+            parse(&["mcp", "list"]),
+            Top::Mcp {
+                command: McpCommand::List
+            }
+        ));
+        let server = Id::new();
+        let server_text = server.to_string();
+        match parse(&["mcp", "remove", server_text.as_str()]) {
+            Top::Mcp {
+                command: McpCommand::Remove { server: shown },
+            } => assert_eq!(shown, server),
+            _ => panic!("mcp remove did not parse"),
+        }
+        for line in [
+            vec!["mcp", "add", "weather"],
+            vec!["mcp", "remove"],
+            vec![
+                "mcp",
+                "add",
+                "weather",
+                "https://mcp.example.com/mcp",
+                "--scope",
+                "space",
+            ],
+        ] {
+            let refused = Cli::try_parse_from(std::iter::once("neha").chain(line.iter().copied()));
+            assert!(refused.is_err(), "{line:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_bot_mcp_commands_parse() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        let server = Id::new();
+        let server_text = server.to_string();
+        match parse(&[
+            "bot",
+            "mcp",
+            "enable",
+            bot_text.as_str(),
+            server_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Mcp {
+                        command:
+                            BotMcpCommand::Enable {
+                                bot: shown_bot,
+                                server: shown_server,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_server, server);
+            }
+            _ => panic!("bot mcp enable did not parse"),
+        }
+        match parse(&[
+            "bot",
+            "mcp",
+            "disable",
+            bot_text.as_str(),
+            server_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Mcp {
+                        command:
+                            BotMcpCommand::Disable {
+                                bot: shown_bot,
+                                server: shown_server,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_server, server);
+            }
+            _ => panic!("bot mcp disable did not parse"),
+        }
+        assert!(Cli::try_parse_from(["neha", "bot", "mcp", "enable"]).is_err());
+    }
+
+    #[test]
     fn a_skill_directory_reads_its_document_and_scripts() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -3744,6 +4075,7 @@ mod tests {
                         path_prefix,
                         skill,
                         script,
+                        server,
                     },
             } => {
                 assert_eq!(shown, bot);
@@ -3752,8 +4084,29 @@ mod tests {
                 assert_eq!(command_prefix.as_deref(), Some("git"));
                 assert_eq!(path_prefix, None);
                 assert_eq!((skill, script), (None, None));
+                assert_eq!(server, None);
             }
             _ => panic!("rule add did not parse"),
+        }
+        match parse(&[
+            "rule",
+            "add",
+            "--bot",
+            bot_text.as_str(),
+            "--effect",
+            "allow",
+            "--tool",
+            "get_weather",
+            "--server",
+            "weather",
+        ]) {
+            Top::Rule {
+                command: RuleCommand::Add { tool, server, .. },
+            } => {
+                assert_eq!(tool, "get_weather");
+                assert_eq!(server.as_deref(), Some("weather"));
+            }
+            _ => panic!("rule add --server did not parse"),
         }
         let rule = Id::new();
         let rule_text = rule.to_string();
@@ -3782,16 +4135,18 @@ mod tests {
 
     #[test]
     fn a_rule_prefix_is_checked_against_its_tool() {
-        validate_rule_arguments("shell", None, None, None, None).unwrap();
-        validate_rule_arguments("shell", Some("git"), None, None, None).unwrap();
-        validate_rule_arguments("read_file", None, Some("/home/ada"), None, None).unwrap();
-        validate_rule_arguments("write_file", None, Some("."), None, None).unwrap();
+        validate_rule_arguments("shell", None, None, None, None, None).unwrap();
+        validate_rule_arguments("shell", Some("git"), None, None, None, None).unwrap();
+        validate_rule_arguments("read_file", None, Some("/home/ada"), None, None, None).unwrap();
+        validate_rule_arguments("write_file", None, Some("."), None, None, None).unwrap();
+        validate_rule_arguments("get_weather", None, None, None, None, Some("weather")).unwrap();
         validate_rule_arguments(
             "run_skill_script",
             None,
             None,
             Some("weekly-report"),
             Some("collect.sh"),
+            None,
         )
         .unwrap();
 
@@ -3804,9 +4159,10 @@ mod tests {
             ("read_file", None, Some(" "), "must not be empty"),
             ("   ", None, None, "--tool"),
         ] {
-            let error = validate_rule_arguments(tool, command_prefix, path_prefix, None, None)
-                .unwrap_err()
-                .to_string();
+            let error =
+                validate_rule_arguments(tool, command_prefix, path_prefix, None, None, None)
+                    .unwrap_err()
+                    .to_string();
             assert!(error.contains(expected), "{tool:?}: {error}");
         }
         for (tool, command_prefix, path_prefix, skill, script, expected) in [
@@ -3828,10 +4184,30 @@ mod tests {
                 "no command or path prefix",
             ),
         ] {
-            let error = validate_rule_arguments(tool, command_prefix, path_prefix, skill, script)
-                .unwrap_err()
-                .to_string();
+            let error =
+                validate_rule_arguments(tool, command_prefix, path_prefix, skill, script, None)
+                    .unwrap_err()
+                    .to_string();
             assert!(error.contains(expected), "{tool:?}: {error}");
+        }
+        // A server's tool rule names the server and the tool and carries no
+        // prefix; a prefix can only ever match nothing, so it is refused here.
+        for (server, command_prefix, path_prefix, expected) in [
+            (Some("weather"), Some("git"), None, "no --command-prefix"),
+            (Some("weather"), None, Some("/tmp"), "no --command-prefix"),
+            (Some("  "), None, None, "must not be empty"),
+        ] {
+            let error = validate_rule_arguments(
+                "get_weather",
+                command_prefix,
+                path_prefix,
+                None,
+                None,
+                server,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{server:?}: {error}");
         }
     }
 
@@ -4451,6 +4827,82 @@ mod tests {
         assert_eq!(
             decision_line(false, approval, None),
             format!("Denied {approval}.")
+        );
+    }
+
+    #[test]
+    fn mcp_rows_show_the_server_scope_url_and_connection() {
+        let server = Id::new();
+        let user_server = Id::new();
+        let user = Id::new();
+        let by = Id::new();
+        let list = json!([
+            {
+                "server": server,
+                "name": "weather",
+                "url": "https://mcp.example.com/mcp",
+                "scope": "space",
+                "by": by,
+                "connected": true,
+            },
+            {
+                "server": user_server,
+                "name": "notes",
+                "url": "http://127.0.0.1:9000/mcp",
+                "scope": "user",
+                "user": user,
+                "by": user,
+                "connected": false,
+            },
+        ]);
+        assert_eq!(
+            mcp_rows(&list).unwrap(),
+            vec![
+                format!("{server}  weather  space  https://mcp.example.com/mcp  connected"),
+                format!(
+                    "{user_server}  notes  user {user}  http://127.0.0.1:9000/mcp  not connected"
+                ),
+            ]
+        );
+        // Absent fields read as a Space server that has not connected.
+        assert_eq!(
+            mcp_row(&json!({"server": server, "name": "bare", "url": "https://x/"})).unwrap(),
+            format!("{server}  bare  space  https://x/  not connected")
+        );
+        assert_eq!(mcp_rows(&json!([])).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_server_rule_row_names_the_server_or_its_id() {
+        let rule = Id::new();
+        let bot = Id::new();
+        let server = Id::new();
+        let named = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "ask",
+            "tool": "get_weather",
+            "server": server,
+            "server_name": "weather",
+        }]);
+        assert_eq!(
+            rule_rows(&named).unwrap(),
+            vec![format!("{rule}  {bot}  ask  get_weather  server weather")]
+        );
+        // The Space may hold no name for the server; its id is the fallback.
+        let unnamed = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "allow",
+            "tool": "get_weather",
+            "server": server,
+            "server_name": null,
+        }]);
+        assert_eq!(
+            rule_rows(&unnamed).unwrap(),
+            vec![format!(
+                "{rule}  {bot}  allow  get_weather  server {server}"
+            )]
         );
     }
 

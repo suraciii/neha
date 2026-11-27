@@ -162,7 +162,12 @@ export interface RunActionView {
 
 // Why a Bot asked before an action: the first use of the User's own Computer,
 // the first run of a skill's script, or a rule the User set to be asked.
-export type ApprovalReason = "first_use_local" | "first_script_run" | "rule" | "grant";
+export type ApprovalReason =
+  | "first_use_local"
+  | "first_script_run"
+  | "first_mcp_call"
+  | "rule"
+  | "grant";
 
 // Whether an action can be undone, as far as the Space knows.
 export type Undoable = "no" | "unknown";

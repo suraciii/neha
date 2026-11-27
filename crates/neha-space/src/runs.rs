@@ -379,6 +379,7 @@ async fn work(
                         &server.home,
                         &server.blobs,
                         server.instructions_only,
+                        &server.secrets,
                         &server.model,
                         &server.events,
                         server.tool_timeout,

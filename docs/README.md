@@ -12,6 +12,7 @@ Contracts live in [../specs/](../specs/). Domain terms live in [../CONTEXT.md](.
 - [Let a Bot work on its Computer](tools.md) — the shell and file tools, the workspace, and their limits.
 - [Approvals](approvals.md) — when a Bot asks before an action, how to answer, and lasting Ask and Allow rules.
 - [Skills](skills.md) — give a Bot a skill, load its instructions, and run the scripts it carries.
+- [MCP servers](mcp.md) — connect an MCP server, give its tools to a Bot, and answer their first call.
 - [Send and receive Files](files.md) — send a file in a Chat, download a File, and let a Bot take and deliver Files.
 - [Storage](storage.md) — where a Space keeps the bytes of its Files, and how to use an S3-compatible bucket.
 

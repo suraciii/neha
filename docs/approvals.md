@@ -71,7 +71,7 @@ target/debug/neha rule add --bot <bot-id> --effect ask --tool run_skill_script -
 target/debug/neha rule remove <rule-id>
 ```
 
-An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets it proceed without asking. A `run_skill_script` rule names a skill and a script instead of a prefix, so `--skill` and `--script` go with `--tool run_skill_script`.
+An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets it proceed without asking. A `run_skill_script` rule names a skill and a script instead of a prefix, so `--skill` and `--script` go with `--tool run_skill_script`. A rule for an MCP server's tool names the server and the tool's original name, so `--server` goes with `--tool <tool>` and no prefix.
 
 When both match, the more specific rule wins: a rule with a command or path prefix beats one with only the tool, a longer prefix beats a shorter one, and a skill and script beat both. If they are equally specific, the Ask rule wins.
 
@@ -101,7 +101,7 @@ target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-pr
 
 Choose Always allow on that approval: the new Allow rule has the same `printf` prefix. It covers the Ask rule, so Neha removes the Ask rule, and `printf` commands no longer ask.
 
-The same holds for a skill's script: an Ask rule on the pair makes each run ask, and Always allow on that card writes an Allow rule for the pair and removes the Ask rule it covers.
+The same holds for a skill's script: an Ask rule on the pair makes each run ask, and Always allow on that card writes an Allow rule for the pair and removes the Ask rule it covers. A server's tool works the same way: an Ask rule on its server and tool makes each call ask, and Always allow writes the matching Allow rule.
 
 ## While a run waits
 

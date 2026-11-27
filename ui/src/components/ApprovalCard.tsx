@@ -26,7 +26,9 @@ export default function ApprovalCard(props: ApprovalCardProps) {
       ? t("chat.approval.reason.firstUse", { name: props.botName })
       : props.approval.reason === "first_script_run"
         ? t("chat.approval.reason.firstScript")
-        : props.approval.reason === "grant"
+        : props.approval.reason === "first_mcp_call"
+          ? t("chat.approval.reason.firstMcp")
+          : props.approval.reason === "grant"
           ? t("chat.approval.reason.grant")
           : props.approval.ambiguous
             ? t("chat.approval.reason.ambiguous")

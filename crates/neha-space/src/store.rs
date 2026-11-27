@@ -1177,6 +1177,37 @@ mod tests {
                 Author::User(user),
                 serde_json::json!({"bot": Id::new(), "skill": Id::new()}),
             ),
+            EventKind::McpServerAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "server": Id::new(),
+                    "name": "docs",
+                    "url": "https://example.com/mcp",
+                    "scope": "space",
+                    "by": user,
+                }),
+            ),
+            EventKind::McpServerUpdated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "server": Id::new(),
+                    "url": null,
+                    "credential": true,
+                    "by": user,
+                }),
+            ),
+            EventKind::McpServerRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"server": Id::new()}),
+            ),
+            EventKind::BotMcpEnabled | EventKind::BotMcpDisabled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"bot": Id::new(), "server": Id::new()}),
+            ),
         }
     }
 

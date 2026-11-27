@@ -166,6 +166,9 @@ pub enum CommandCall {
         /// The script a `run_skill_script` rule matches, within that skill.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         script: Option<String>,
+        /// The MCP server whose tool the rule matches, by name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
     },
     /// Removes a lasting rule.
     RuleRemove {
@@ -199,6 +202,45 @@ pub enum CommandCall {
         /// The skill.
         skill: Id,
     },
+    /// Connects an MCP server.
+    McpAdd(McpAdd),
+    /// Lists the MCP servers the caller may see.
+    McpList,
+    /// Disconnects an MCP server.
+    McpRemove {
+        /// The server.
+        server: Id,
+    },
+    /// Lets a Bot call an MCP server's tools.
+    BotMcpEnable {
+        /// The Bot.
+        bot: Id,
+        /// The server.
+        server: Id,
+    },
+    /// Stops a Bot calling an MCP server's tools.
+    BotMcpDisable {
+        /// The Bot.
+        bot: Id,
+        /// The server.
+        server: Id,
+    },
+}
+
+/// The parameters of `mcp_add`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpAdd {
+    /// The name the tool names and a User's commands use.
+    pub name: String,
+    /// The address the server speaks Streamable HTTP at.
+    pub url: String,
+    /// Where the credential touches the record.
+    pub scope: crate::record::McpScope,
+    /// The credential, which the Space stores encrypted. Absent connects the
+    /// server without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 /// The parameters of `skill_add`.
@@ -917,6 +959,7 @@ mod tests {
             tool: "shell".to_owned(),
             command_prefix: Some("git".to_owned()),
             path_prefix: None,
+            server: None,
             skill: None,
             script: None,
         };
@@ -935,6 +978,7 @@ mod tests {
             path_prefix: None,
             skill: Some("weekly-report".to_owned()),
             script: Some("collect.sh".to_owned()),
+            server: None,
         };
         let text = serde_json::to_string(&script).unwrap();
         assert!(text.contains("\"skill\":\"weekly-report\""), "{text}");

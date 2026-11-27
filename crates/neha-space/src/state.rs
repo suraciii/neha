@@ -13,7 +13,7 @@ use rand::Rng as _;
 
 use neha::id::Id;
 use neha::record::{
-    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
+    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION, McpScope,
     RuleEffect, RunReply, SkillLibrary, Undoability,
 };
 use neha::seq::Seq;
@@ -126,7 +126,32 @@ pub struct BotView {
     /// The skills its owner enabled for it.
     #[serde(default)]
     pub skills: Vec<Id>,
+    /// The MCP servers its owner enabled for it.
+    #[serde(default)]
+    pub mcps: Vec<Id>,
 }
+
+/// An MCP server a Space or a User connected.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpServerView {
+    /// The server.
+    pub server: Id,
+    /// Its name, unique in the Space.
+    pub name: String,
+    /// The address it speaks Streamable HTTP at.
+    pub url: String,
+    /// Where its credential belongs.
+    pub scope: McpScope,
+    /// The User it belongs to, when its scope is one User's.
+    pub user: Option<Id>,
+    /// The account that connected it.
+    pub by: Id,
+    /// The cursor of `mcp.server.added`.
+    pub seq: Seq,
+}
+
+/// The most MCP servers one Space connects.
+pub const MAX_MCP_SERVERS: usize = 64;
 
 /// A skill in a library.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -296,6 +321,9 @@ pub struct ActionView {
     pub tool: String,
     /// The tool's arguments.
     pub arguments: serde_json::Value,
+    /// The MCP server the action called, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// The skill a `run_skill_script` action ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<Id>,
@@ -436,6 +464,8 @@ pub struct ApprovalView {
     pub rule: Option<Id>,
     /// What an "Always allow" would allow, in words the User reads.
     pub lasting_scope: Option<String>,
+    /// The MCP server the action calls, when its tool belongs to one.
+    pub server: Option<Id>,
     /// The skill the action runs when its tool is `run_skill_script`.
     pub skill: Option<Id>,
     /// The script's file name within that skill.
@@ -471,6 +501,9 @@ pub struct RuleView {
     pub command_prefix: Option<String>,
     /// The path prefix a matching file action's path starts with.
     pub path_prefix: Option<String>,
+    /// The MCP server whose tool a matching call names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
     /// The skill whose script a matching `run_skill_script` action runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill: Option<Id>,
@@ -554,12 +587,17 @@ pub struct State {
     pub rules: Vec<RuleView>,
     /// The skills in both libraries, in the order the record added them.
     pub skills: Vec<SkillView>,
+    /// The MCP servers in the order the record connected them.
+    pub mcps: Vec<McpServerView>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
     /// The (Bot, acting User, skill, script name) that already ran a skill's
     /// script; the first run of each asks.
     pub script_runs: HashSet<(Id, Id, Id, String)>,
+    /// The (Bot, acting User, server, tool) that already called a server's
+    /// tool; the first call of each asks.
+    pub mcp_calls: HashSet<(Id, Id, Id, String)>,
     /// The Model's replies per run, in the order the record holds them.
     pub replies: HashMap<Id, Vec<RunReply>>,
     /// Runs a Space start found interrupted and may recover. It is not part of
@@ -666,6 +704,44 @@ impl State {
     pub fn script_run_allowed(&self, bot: Id, acting: Id, skill: Id, script: &str) -> bool {
         self.script_runs
             .contains(&(bot, acting, skill, script.to_owned()))
+    }
+
+    /// Returns one MCP server.
+    #[must_use]
+    pub fn mcp(&self, server: Id) -> Option<&McpServerView> {
+        self.mcps.iter().find(|view| view.server == server)
+    }
+
+    /// Returns the server with one name.
+    #[must_use]
+    pub fn mcp_named(&self, name: &str) -> Option<&McpServerView> {
+        self.mcps.iter().find(|view| view.name == name)
+    }
+
+    /// Returns the MCP servers a Bot may call for this acting User.
+    ///
+    /// A server the Space connected is every Bot's; a server a User connected
+    /// is offered only while the Bot acts for that User.
+    #[must_use]
+    pub fn mcps_of(&self, bot: Id, acting: Id) -> Vec<&McpServerView> {
+        let Some(view) = self.bots.get(&bot) else {
+            return Vec::new();
+        };
+        view.mcps
+            .iter()
+            .filter_map(|server| self.mcp(*server))
+            .filter(|server| match server.scope {
+                McpScope::Space => true,
+                McpScope::User => server.user == Some(acting),
+            })
+            .collect()
+    }
+
+    /// Whether the Bot and the acting User already called one server's tool.
+    #[must_use]
+    pub fn mcp_call_allowed(&self, bot: Id, acting: Id, server: Id, tool: &str) -> bool {
+        self.mcp_calls
+            .contains(&(bot, acting, server, tool.to_owned()))
     }
 
     /// Returns the replies the record holds for one run.
@@ -988,6 +1064,7 @@ impl Projection for State {
                         thinking: data.thinking,
                         model: data.model,
                         skills: Vec::new(),
+                        mcps: Vec::new(),
                     },
                 );
             }
@@ -1285,11 +1362,16 @@ impl Projection for State {
                 {
                     self.script_runs.insert((run.bot, acting, skill, script));
                 }
+                if let (Some(server), Some(acting)) = (data.server, acting) {
+                    self.mcp_calls
+                        .insert((run.bot, acting, server, data.tool.clone()));
+                }
                 run.actions.push(ActionView {
                     id: data.action,
                     step: data.step,
                     tool: data.tool,
                     arguments: data.arguments.clone(),
+                    server: data.server,
                     skill: data.skill,
                     script: data.script,
                     script_sha256: data.script_sha256,
@@ -1325,6 +1407,14 @@ impl Projection for State {
                 self.replies.entry(data.run).or_default().push(data);
             }
             EventData::ApprovalRequested(data) => {
+                // A server-served call names its server in the Computer field,
+                // because no Computer runs it; every other card names the one
+                // the action runs on.
+                if let Some(server) = data.server
+                    && self.mcp(server).is_none()
+                {
+                    return Err("an approval must name a connected server".to_owned());
+                }
                 let run = self
                     .runs
                     .get_mut(&data.run)
@@ -1332,10 +1422,11 @@ impl Projection for State {
                 if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
                     return Err("an approval must belong to a working run".to_owned());
                 }
+                let target = data.server.is_some() || run.computer == Some(data.computer);
                 if data.bot != run.bot
                     || data.chat != run.chat
                     || data.acting != run.acting
-                    || run.computer != Some(data.computer)
+                    || !target
                 {
                     return Err(
                         "an approval must name its run's Bot, Chat, Computer, and User".to_owned(),
@@ -1378,6 +1469,7 @@ impl Projection for State {
                     ambiguous: data.ambiguous,
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
+                    server: data.server,
                     skill: data.skill,
                     script: data.script,
                     script_sha256: data.script_sha256,
@@ -1466,6 +1558,7 @@ impl Projection for State {
                     tool: data.tool,
                     command_prefix: data.command_prefix,
                     path_prefix: data.path_prefix,
+                    server: data.server,
                     skill: data.skill,
                     script: data.script,
                     seq: event.seq,
@@ -1562,6 +1655,93 @@ impl Projection for State {
                     .position(|skill| *skill == data.skill)
                     .ok_or("a disabled skill must be enabled")?;
                 bot.skills.remove(position);
+            }
+            EventData::McpServerAdded(data) => {
+                let Author::User(by) = event.author else {
+                    return Err("an MCP server is connected by a User".to_owned());
+                };
+                if by != data.by {
+                    return Err("an MCP server is connected by its account".to_owned());
+                }
+                if self.mcps.len() >= MAX_MCP_SERVERS {
+                    return Err(format!(
+                        "a Space connects at most {MAX_MCP_SERVERS} MCP servers"
+                    ));
+                }
+                if self.mcps.iter().any(|view| view.name == data.name) {
+                    return Err("a Space holds one MCP server under each name".to_owned());
+                }
+                match data.scope {
+                    McpScope::User if data.user != Some(data.by) => {
+                        return Err("a User connects a server for themselves".to_owned());
+                    }
+                    // Who may connect a Space's server is the command's rule;
+                    // the projection only keeps what the record says.
+                    _ => {}
+                }
+                self.mcps.push(McpServerView {
+                    server: data.server,
+                    name: data.name,
+                    url: data.url,
+                    scope: data.scope,
+                    user: data.user,
+                    by,
+                    seq: event.seq,
+                });
+            }
+            EventData::McpServerUpdated(data) => {
+                let Author::User(by) = event.author else {
+                    return Err("an MCP server is updated by a User".to_owned());
+                };
+                let position = self
+                    .mcps
+                    .iter()
+                    .position(|view| view.server == data.server)
+                    .ok_or("an updated server must exist")?;
+                if self.mcps[position].by != by {
+                    return Err("only the account that connected a server changes it".to_owned());
+                }
+                if let Some(url) = data.url {
+                    self.mcps[position].url = url;
+                }
+            }
+            EventData::McpServerRemoved(data) => {
+                let position = self
+                    .mcps
+                    .iter()
+                    .position(|view| view.server == data.server)
+                    .ok_or("a removed server must exist")?;
+                self.mcps.remove(position);
+                for bot in self.bots.values_mut() {
+                    bot.mcps.retain(|server| *server != data.server);
+                }
+            }
+            EventData::BotMcpEnabled(data) => {
+                if !self.bots.contains_key(&data.bot) {
+                    return Err("an enabled server belongs to an existing Bot".to_owned());
+                }
+                if self.mcp(data.server).is_none() {
+                    return Err("an enabled server must exist".to_owned());
+                }
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("an enabled server belongs to an existing Bot")?;
+                if !bot.mcps.contains(&data.server) {
+                    bot.mcps.push(data.server);
+                }
+            }
+            EventData::BotMcpDisabled(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("a disabled server belongs to an existing Bot")?;
+                let position = bot
+                    .mcps
+                    .iter()
+                    .position(|server| *server == data.server)
+                    .ok_or("a disabled server must be enabled")?;
+                bot.mcps.remove(position);
             }
         }
 
