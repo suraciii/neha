@@ -313,6 +313,7 @@ code,
   color: var(--ink-4);
   font-size: var(--text-2xs);
   line-height: 1.6;
+  text-wrap: pretty;
 }
 
 /* ------------------------------------------------------------- controls --- */
@@ -573,8 +574,8 @@ code,
 }
 
 .rail__admin {
-  font-size: 9px;
-  letter-spacing: 0.06em;
+  font-size: var(--text-2xs);
+  letter-spacing: 0.05em;
   text-transform: uppercase;
 }
 
@@ -1583,6 +1584,13 @@ code,
     min-height: 40px;
   }
   .composer__attach {
+    width: 40px;
+    height: 40px;
+  }
+  .attachment {
+    min-height: 44px;
+  }
+  .attachment__remove {
     width: 40px;
     height: 40px;
   }
