@@ -144,6 +144,9 @@ jobs:
       - name: Build the Windows sidecar
         run: cargo build --locked --release -p neha-app
 
+      - name: Test the Windows runtime
+        run: cargo test --locked -p neha-computer --test windows_shell
+
       - name: Install the UI
         run: pnpm --dir ui install --frozen-lockfile
 
