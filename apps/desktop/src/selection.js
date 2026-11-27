@@ -25,4 +25,19 @@ function normalizeRemoteUrl(value) {
   return url.origin;
 }
 
-module.exports = { isLoopbackHost, normalizeRemoteUrl };
+/**
+ * The URL a trusted main-process request uses to reach a Space.
+ *
+ * Chromium resolves `*.localhost` for the window, but Node's Windows resolver
+ * does not. A `.localhost` Space is on this machine, so its probe goes to the
+ * same port on 127.0.0.1; the browser still loads the named origin.
+ */
+function probeUrl(origin) {
+  const url = new URL(origin);
+  if (url.hostname.endsWith(".localhost")) {
+    url.hostname = "127.0.0.1";
+  }
+  return url.href;
+}
+
+module.exports = { isLoopbackHost, normalizeRemoteUrl, probeUrl };

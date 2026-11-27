@@ -1,7 +1,7 @@
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
 
-const { normalizeRemoteUrl } = require("../src/selection");
+const { normalizeRemoteUrl, probeUrl } = require("../src/selection");
 
 test("accepts an https Space and keeps its origin", () => {
   assert.equal(normalizeRemoteUrl(" https://space.example.com/chat "), "https://space.example.com");
@@ -22,4 +22,15 @@ test("refuses addresses carrying credentials", () => {
 
 test("refuses values that are not URLs", () => {
   assert.throws(() => normalizeRemoteUrl("space.example.com"), /address/);
+});
+
+test("probes a localhost Space through loopback", () => {
+  assert.equal(
+    probeUrl("http://neha-abc.localhost:7337"),
+    "http://127.0.0.1:7337/",
+  );
+  assert.equal(
+    probeUrl("https://space.example.com"),
+    "https://space.example.com/",
+  );
 });

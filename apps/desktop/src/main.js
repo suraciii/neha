@@ -21,7 +21,7 @@ const path = require("node:path");
 const readline = require("node:readline");
 const { pathToFileURL } = require("node:url");
 
-const { normalizeRemoteUrl } = require("./selection");
+const { normalizeRemoteUrl, probeUrl } = require("./selection");
 const { parseStartupLine } = require("./startup");
 
 const REPO_ROOT = path.resolve(__dirname, "../../..");
@@ -581,7 +581,7 @@ async function openLocalSpace(useLocalComputer) {
 
 async function openRemoteSpace(input, persist = true) {
   const origin = normalizeRemoteUrl(input);
-  const response = await fetch(`${origin}/`, {
+  const response = await fetch(probeUrl(origin), {
     redirect: "follow",
     signal: AbortSignal.timeout(8_000),
   });
