@@ -50,7 +50,7 @@ A loop stops a run when the Bot's Computer goes offline and resumes it when the 
 
 A run stops between two actions when it waits for an Approval or an answer, when its Computer goes offline, or when a User takes control of its screen. It resumes after the last recorded action, and a recorded action never runs again.
 
-A Hosted Computer's recovery, reset, or replacement stops its runs between two actions before its saved Workspace is replaced.
+Resetting a Hosted Computer runs only when its Bot has no queued, running, or waiting run.
 
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 

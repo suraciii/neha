@@ -122,6 +122,16 @@ enum WriteRequest {
         result: serde_json::Value,
         reply: oneshot::Sender<Result<(), StoreError>>,
     },
+    ClaimCommand {
+        command: Id,
+        fingerprint: String,
+        reply: oneshot::Sender<Result<Option<CommandRecord>, StoreError>>,
+    },
+    SettleCommand {
+        command: Id,
+        result: serde_json::Value,
+        reply: oneshot::Sender<Result<(), StoreError>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -270,6 +280,47 @@ impl Store {
         answer.await.map_err(|_| StoreError::WriterGone)?
     }
 
+    /// Claims a command identifier before an idempotent effect runs.
+    ///
+    /// A `None` answer means this call inserted the claim. An answer with a
+    /// record means another call already used the identifier, either still
+    /// pending (`result` is `None`) or settled. Claiming first means two
+    /// effects with one identifier cannot both run.
+    pub async fn claim_command(
+        &self,
+        command: Id,
+        fingerprint: impl Into<String>,
+    ) -> Result<Option<CommandRecord>, StoreError> {
+        let (reply, answer) = oneshot::channel();
+        self.writer
+            .send(WriteRequest::ClaimCommand {
+                command,
+                fingerprint: fingerprint.into(),
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterGone)?;
+        answer.await.map_err(|_| StoreError::WriterGone)?
+    }
+
+    /// Settles a command claimed before its effect ran.
+    pub async fn settle_command(
+        &self,
+        command: Id,
+        result: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let (reply, answer) = oneshot::channel();
+        self.writer
+            .send(WriteRequest::SettleCommand {
+                command,
+                result,
+                reply,
+            })
+            .await
+            .map_err(|_| StoreError::WriterGone)?;
+        answer.await.map_err(|_| StoreError::WriterGone)?
+    }
+
     /// Stops the writer and closes the record.
     pub async fn close(mut self) -> Result<(), StoreError> {
         let (reply, answer) = oneshot::channel();
@@ -303,6 +354,20 @@ fn spawn_writer(
                 } => {
                     let _ = reply
                         .send(record_command(&mut connection, command, fingerprint, result).await);
+                }
+                WriteRequest::ClaimCommand {
+                    command,
+                    fingerprint,
+                    reply,
+                } => {
+                    let _ = reply.send(claim_command(&mut connection, command, fingerprint).await);
+                }
+                WriteRequest::SettleCommand {
+                    command,
+                    result,
+                    reply,
+                } => {
+                    let _ = reply.send(settle_command(&mut connection, command, result).await);
                 }
                 WriteRequest::Shutdown { reply } => {
                     let _ = reply.send(());
@@ -344,6 +409,87 @@ async fn record_command(
     .bind(stored)
     .execute(&mut *transaction)
     .await?;
+    transaction.commit().await?;
+
+    Ok(())
+}
+
+async fn read_command(
+    connection: &mut SqliteConnection,
+    command: Id,
+) -> Result<Option<CommandRecord>, StoreError> {
+    let row =
+        sqlx::query("SELECT fingerprint, last_seq, result FROM commands WHERE command_id = ?")
+            .bind(command.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let fingerprint: String = row.try_get("fingerprint")?;
+    let last: i64 = row.try_get("last_seq")?;
+    let last_seq = Seq::from_i64(last).ok_or_else(|| corrupt("command cursor"))?;
+    let stored: Option<String> = row.try_get("result")?;
+    let result = stored
+        .map(|text| serde_json::from_str(&text).map_err(|_| corrupt("command result is not JSON")))
+        .transpose()?;
+
+    Ok(Some(CommandRecord {
+        fingerprint,
+        last_seq,
+        result,
+    }))
+}
+
+async fn claim_command(
+    connection: &mut SqliteConnection,
+    command: Id,
+    fingerprint: String,
+) -> Result<Option<CommandRecord>, StoreError> {
+    let mut transaction = connection.begin().await?;
+    if let Some(record) = read_command(&mut transaction, command).await? {
+        if record.fingerprint != fingerprint {
+            return Err(StoreError::IdempotencyConflict(command));
+        }
+        transaction.commit().await?;
+        return Ok(Some(record));
+    }
+    sqlx::query(
+        "INSERT INTO commands (command_id, fingerprint, first_seq, last_seq, result) \
+         VALUES (?, ?, 0, 0, NULL)",
+    )
+    .bind(command.to_string())
+    .bind(fingerprint)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    Ok(None)
+}
+
+async fn settle_command(
+    connection: &mut SqliteConnection,
+    command: Id,
+    result: serde_json::Value,
+) -> Result<(), StoreError> {
+    let stored = serde_json::to_string(&result).map_err(|_| corrupt("command result"))?;
+    let mut transaction = connection.begin().await?;
+    let updated =
+        sqlx::query("UPDATE commands SET result = ? WHERE command_id = ? AND result IS NULL")
+            .bind(stored)
+            .bind(command.to_string())
+            .execute(&mut *transaction)
+            .await?;
+    if updated.rows_affected() == 0 {
+        let exists = sqlx::query("SELECT 1 FROM commands WHERE command_id = ?")
+            .bind(command.to_string())
+            .fetch_optional(&mut *transaction)
+            .await?;
+        if exists.is_none() {
+            return Err(StoreError::UnclaimedCommand(command));
+        }
+        // Already settled: a repeated settle is harmless.
+    }
     transaction.commit().await?;
 
     Ok(())
@@ -622,6 +768,9 @@ pub enum StoreError {
     /// A command wrote no events.
     #[error("a command must write at least one event")]
     EmptyCommand,
+    /// A command was not claimed before its result was settled.
+    #[error("command {0} was not claimed")]
+    UnclaimedCommand(Id),
     /// An event does not fit its kind's schema.
     #[error("invalid event: {0}")]
     InvalidEvent(String),
@@ -950,6 +1099,37 @@ mod tests {
 
         assert!(again.existing);
         assert_eq!(again.events, recorded.events);
+        assert!(matches!(conflict, Err(StoreError::IdempotencyConflict(_))));
+    }
+
+    #[tokio::test]
+    async fn a_claim_reserves_an_idempotent_command_until_it_settles() {
+        let (_dir, _home, store) = open().await;
+        let command = Id::new();
+        let fingerprint = "v1:reset";
+        assert!(
+            store
+                .claim_command(command, fingerprint)
+                .await
+                .unwrap()
+                .is_none(),
+            "the first claim reserves the command"
+        );
+        let pending = store
+            .claim_command(command, fingerprint)
+            .await
+            .unwrap()
+            .expect("the second claim sees the reservation");
+        assert!(pending.result.is_none(), "the reservation is unsettled");
+
+        store
+            .settle_command(command, serde_json::json!({"computer": Id::new()}))
+            .await
+            .unwrap();
+        let settled = store.command(command).await.unwrap().unwrap();
+        assert!(settled.result.is_some());
+
+        let conflict = store.claim_command(command, "v1:other").await;
         assert!(matches!(conflict, Err(StoreError::IdempotencyConflict(_))));
     }
 

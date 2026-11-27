@@ -32,7 +32,11 @@ A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on 
 
 It finds the startup ticket the Space wrote under the machine's Neha configuration directory, or asks the Space for one as the signed-in User; either way it pairs the Space the ticket names. `--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
 
-`neha computer list` shows the Computers the User owns, Local and Hosted. `neha bot create --computer` takes one of these:
+`neha computer list` shows the Computers the User owns, Local and Hosted. `neha computer reset <computer>` clears a Hosted Computer's Workspace: every file and folder inside it is deleted, and the Workspace folder stays.
+
+Only the Computer's owner resets it, and only a Hosted Computer is reset. A Computer with a queued, running, or waiting run refuses a reset until that run ends, and a second reset of an empty Workspace succeeds.
+
+`neha bot create --computer` takes one of these:
 
 | Value | What happens |
 | --- | --- |
@@ -40,9 +44,9 @@ It finds the startup ticket the Space wrote under the machine's Neha configurati
 | `hosted` | A new Hosted Computer, one for the Bot |
 | A Local Computer id | The Computer with that id |
 
-Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
+Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot update <bot>` changes a Bot's file access. Only the Bot's owner can change it, and the next run uses the new access.
+`neha bot update <bot>` changes a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses the change because its Workspace is its only write range.
 
 `--full-access on` gives it the daemon's own file rights and removes the shell fence. `--full-access off` restores the Bot's Workspace fence.
 
@@ -50,9 +54,9 @@ Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves
 
 `--clear-grants` removes them all and cannot be combined with `--grant`. `neha bot show` prints what is in effect.
 
-`neha chat send --cwd <path>` starts that run's actions in the named directory. Without it they start in the Bot's Workspace. The directory is recorded with the run and shown on an approval card.
+`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. The directory is recorded with the run and shown on an approval card.
 
-A path that is not absolute is refused.
+A Hosted Computer runs only in the Bot's Workspace, and a run that names another directory fails. A path that is not absolute is refused.
 
 ## Approvals
 

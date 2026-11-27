@@ -2,10 +2,12 @@
 //!
 //! It executes real POSIX shell commands and real file operations. In managed
 //! mode everything stays inside one workspace directory: not isolated, not
-//! transported, and only for a Space on the same machine. In real mode it is
-//! one Bot's view of a real machine: reads reach what the machine user can
-//! read, writes reach one folder, and the shell runs under bubblewrap. Hidden
-//! roots are the exception to both reads and writes: the Computer's own
+//! transported, and only for a Space on the same machine. A hosted runtime
+//! keeps the same file rules but runs its shell in a minimal bubblewrap rootfs,
+//! so a Space can give a Bot an isolated Computer on its own machine. In real
+//! mode it is one Bot's view of a real machine: reads reach what the machine
+//! user can read, writes reach one folder, and the shell runs under bubblewrap.
+//! Hidden roots are the exception to both reads and writes: the Computer's own
 //! directory, which holds its channel credential, is passed that way so a Bot
 //! never reaches it.
 
@@ -34,10 +36,16 @@ const MAX_LIST_ENTRIES: usize = 1000;
 /// The largest shell command a tool accepts.
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
-/// The path a shell searches for its commands, in both modes.
+/// The system directories a shell searches for its commands.
 const SHELL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
-/// The writable root outside a Bot's folder that a real shell also gets.
+/// The sandbox's own `/tmp`, which a fenced shell gets instead of the host's.
 const SANDBOX_TMPDIR: &str = "/tmp";
+/// The directory a Hosted sandbox mounts this build's `neha` binary at. The
+/// skill's commands call `neha` by name, and the Space's installation is not
+/// inside the minimal rootfs.
+const HOSTED_CLI_DIR: &str = "/opt/neha-cli";
+/// The one writable folder in a Hosted sandbox: the runtime's workspace.
+const HOSTED_WORKSPACE: &str = "/workspace";
 
 /// The reach of a Bot on a real machine: it reads the machine and writes one
 /// folder.
@@ -61,6 +69,10 @@ pub struct LocalRuntime {
     /// folder on a real machine.
     root: PathBuf,
     mode: Mode,
+    /// The bubblewrap binary a Hosted runtime starts its shell under, or
+    /// `None` for a managed workspace or a real machine. The file tools keep
+    /// the managed rules either way; this field changes only the shell.
+    hosted: Option<PathBuf>,
     /// The directories a real Bot must not read or write: the Computer's own
     /// configuration directory, which holds its channel credential. Resolved,
     /// so an opened file's real path can be compared against them.
@@ -119,7 +131,78 @@ const MAX_SCAN_DEPTH: usize = 8;
 impl LocalRuntime {
     /// Opens a managed workspace, creating it when absent.
     pub fn new(workspace: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
-        let workspace = workspace.into();
+        Self::managed(workspace.into())
+    }
+
+    /// Opens a Hosted workspace: a managed workspace whose shell runs in a
+    /// minimal bubblewrap rootfs.
+    ///
+    /// The workspace is created and resolved like a managed one, and it is the
+    /// only writable place in the sandbox, where it appears at `/workspace`.
+    /// The sandbox is probed here, so a Space never promises a Hosted Computer
+    /// on a machine where bubblewrap cannot start it.
+    pub fn hosted(workspace: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
+        Self::hosted_with_hidden(workspace, Vec::new())
+    }
+
+    /// Opens a Hosted workspace with the roots its sandbox must not expose.
+    ///
+    /// A Hosted sandbox mounts the Space machine's system directories and the
+    /// CLI's directory read-only. If the Space home lives under one of those
+    /// mounts, the sandbox would expose the record, secrets, or another
+    /// Workspace despite the read-only mount, so this constructor refuses that
+    /// layout instead of starting it. The Space passes its home here.
+    pub fn hosted_with_hidden(
+        workspace: impl Into<PathBuf>,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        let requested = workspace.into();
+        std::fs::create_dir_all(&requested)?;
+        let workspace = std::fs::canonicalize(&requested)?;
+        // The path is built from the Space's resolved home and a Computer id,
+        // so a difference after resolving means a symlink sits on it. A later
+        // bind would follow that link and expose or write another directory.
+        Self::hosted_checked(requested, workspace, hidden)
+    }
+
+    fn hosted_checked(
+        requested: PathBuf,
+        workspace: PathBuf,
+        hidden: Vec<PathBuf>,
+    ) -> Result<Self, RuntimeError> {
+        if requested != workspace {
+            return Err(RuntimeError::UnsafeFolder(format!(
+                "the Hosted Workspace path uses a symlink: {}",
+                requested.display()
+            )));
+        }
+        let hidden: Vec<PathBuf> = hidden
+            .into_iter()
+            .map(|root| std::fs::canonicalize(&root).map_err(RuntimeError::Io))
+            .collect::<Result<_, _>>()?;
+        validate_hosted_mounts(&hidden, default_cli_dir().as_deref())?;
+        // The old managed runtime ran with the Space user's rights, so a
+        // Workspace can already hold a hard link or symlink to a host file.
+        // Refuse it before the writable bind: a reset is the owner's repair.
+        #[cfg(unix)]
+        {
+            let folder = Self::open_workspace(&workspace)?;
+            scan_bot_folder(&folder, &workspace).map_err(|error| {
+                RuntimeError::UnsafeFolder(format!(
+                    "{error}; reset the Hosted Computer to clear its Workspace"
+                ))
+            })?;
+        }
+        let mut runtime = Self::managed(workspace)?;
+        let bwrap = find_bwrap().ok_or_else(no_sandbox)?;
+        probe_hosted(&bwrap, &runtime.root)?;
+        runtime.hosted = Some(bwrap);
+
+        Ok(runtime)
+    }
+
+    /// Creates and resolves a managed workspace and its temporary folder.
+    fn managed(workspace: PathBuf) -> Result<Self, RuntimeError> {
         std::fs::create_dir_all(&workspace)?;
         let workspace = std::fs::canonicalize(&workspace)?;
         let temporary = workspace.join(".tmp");
@@ -128,6 +211,7 @@ impl LocalRuntime {
         Ok(Self {
             root: workspace,
             mode: Mode::Managed,
+            hosted: None,
             hidden: Vec::new(),
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -274,6 +358,7 @@ impl LocalRuntime {
         Ok(Self {
             root: folder_path,
             mode: Mode::Machine { bwrap, folder },
+            hosted: None,
             hidden,
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -439,6 +524,10 @@ impl LocalRuntime {
     /// The directory must exist; it is never created and never becomes a
     /// writable root. Relative file paths resolve against it and the shell
     /// starts there.
+    ///
+    /// A Hosted runtime only accepts a directory inside its workspace: the
+    /// sandbox sees the workspace at `/workspace` and no other host path
+    /// reaches it, so a host working directory would name nothing there.
     pub fn with_working_dir(mut self, directory: &str) -> Result<Self, RuntimeError> {
         let path = std::fs::canonicalize(directory.trim()).map_err(RuntimeError::Io)?;
         let metadata = std::fs::metadata(&path).map_err(RuntimeError::Io)?;
@@ -451,6 +540,12 @@ impl LocalRuntime {
         if self.is_hidden(&path) || self.is_denied(&path) {
             return Err(RuntimeError::Access(format!(
                 "the working directory is hidden from this Computer: {}",
+                path.display()
+            )));
+        }
+        if self.hosted.is_some() && !path.starts_with(&self.root) {
+            return Err(RuntimeError::Access(format!(
+                "a Hosted working directory must stay inside its workspace: {}",
                 path.display()
             )));
         }
@@ -913,111 +1008,142 @@ impl LocalRuntime {
 
     /// Builds the shell process for this mode, without starting it.
     fn shell_command(&self, command: &str) -> Command {
-        let mut process = match &self.mode {
-            Mode::Managed => {
-                let mut process = Command::new("sh");
-                process.arg("-c").arg(command).current_dir(&self.root);
-                process
-            }
-            Mode::Machine { bwrap, folder } => {
-                #[cfg(unix)]
-                let source = folder_mount_source();
-                #[cfg(not(unix))]
-                let source = self.root.as_os_str().to_owned();
-                #[cfg(unix)]
-                let (write_roots, grant_fds): (
-                    Vec<(OsString, PathBuf)>,
-                    Vec<libc::c_int>,
-                ) = self
-                    .grants
-                    .iter()
-                    // A grant the Bot's folder scan would refuse is not mounted
-                    // writable for the shell: a hard link or symlink in it
-                    // could otherwise change a file outside the grant. The
-                    // file tools keep their own per-write checks.
-                    .filter(|(root, file)| scan_bot_folder(file, root).is_ok())
-                    .map(|(root, file)| {
-                        use std::os::fd::AsRawFd as _;
-                        (
-                            (
-                                OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
-                                root.clone(),
-                            ),
-                            file.as_raw_fd(),
-                        )
-                    })
-                    .unzip();
-                #[cfg(not(unix))]
-                let (write_roots, grant_fds): (
-                    Vec<(OsString, PathBuf)>,
-                    Vec<libc::c_int>,
-                ) = (Vec::new(), Vec::new());
-                let mut process = sandbox_command(
+        let mut process = if let Some(bwrap) = &self.hosted {
+            // A Hosted shell runs in a minimal rootfs: bwrap mounts the
+            // workspace at `/workspace` and changes into it, so the host
+            // process's own working directory is never involved.
+            let mut process = Command::new(bwrap);
+            process
+                .args(hosted_sandbox_args(
                     bwrap,
-                    &source,
                     &self.root,
-                    self.base(),
-                    &self.hidden,
-                    &write_roots,
-                    self.full_access,
-                );
-                // The parent keeps this descriptor close-on-exec, so other
-                // runtimes' folders are never inherited. In the child, after
-                // fork and before exec, move this runtime's folder descriptor
-                // to a one-digit number and clear its close-on-exec flag, so
-                // bwrap can bind `/proc/self/fd/<fd>` without trusting a path
-                // a later rename could point somewhere else.
-                #[cfg(unix)]
-                {
-                    use std::os::fd::AsRawFd as _;
+                    self.cli_dir.as_deref(),
+                ))
+                .arg("/usr/bin/sh")
+                .arg("-c")
+                .arg(command);
+            process
+        } else {
+            match &self.mode {
+                Mode::Managed => {
+                    let mut process = Command::new("sh");
+                    process.arg("-c").arg(command).current_dir(&self.root);
+                    process
+                }
+                Mode::Machine { bwrap, folder } => {
+                    #[cfg(unix)]
+                    let source = folder_mount_source();
+                    #[cfg(not(unix))]
+                    let source = self.root.as_os_str().to_owned();
+                    #[cfg(unix)]
+                    let (write_roots, grant_fds): (
+                        Vec<(OsString, PathBuf)>,
+                        Vec<libc::c_int>,
+                    ) = self
+                        .grants
+                        .iter()
+                        // A grant the Bot's folder scan would refuse is not mounted
+                        // writable for the shell: a hard link or symlink in it
+                        // could otherwise change a file outside the grant. The
+                        // file tools keep their own per-write checks.
+                        .filter(|(root, file)| scan_bot_folder(file, root).is_ok())
+                        .map(|(root, file)| {
+                            use std::os::fd::AsRawFd as _;
+                            (
+                                (
+                                    OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+                                    root.clone(),
+                                ),
+                                file.as_raw_fd(),
+                            )
+                        })
+                        .unzip();
+                    #[cfg(not(unix))]
+                    let (write_roots, grant_fds): (
+                        Vec<(OsString, PathBuf)>,
+                        Vec<libc::c_int>,
+                    ) = (Vec::new(), Vec::new());
+                    let mut process = sandbox_command(
+                        bwrap,
+                        &source,
+                        &self.root,
+                        self.base(),
+                        &self.hidden,
+                        &write_roots,
+                        self.full_access,
+                    );
+                    // The parent keeps this descriptor close-on-exec, so other
+                    // runtimes' folders are never inherited. In the child, after
+                    // fork and before exec, move this runtime's folder descriptor
+                    // to a one-digit number and clear its close-on-exec flag, so
+                    // bwrap can bind `/proc/self/fd/<fd>` without trusting a path
+                    // a later rename could point somewhere else.
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::AsRawFd as _;
 
-                    let folder_fd = folder.as_raw_fd();
-                    // SAFETY: the closure runs in the child between `fork` and
-                    // `exec`, where only async-signal-safe calls are allowed;
-                    // `dup2` and `fcntl` are, they touch only this child's
-                    // descriptor table, and they allocate nothing. A failure is
-                    // returned so `spawn` reports it instead of exec'ing
-                    // without the descriptor.
-                    unsafe {
-                        process.pre_exec(move || {
-                            if folder_fd != MOUNT_FD && libc::dup2(folder_fd, MOUNT_FD) < 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            if libc::fcntl(MOUNT_FD, libc::F_SETFD, 0) < 0 {
-                                return Err(std::io::Error::last_os_error());
-                            }
-                            for fd in &grant_fds {
-                                if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                        let folder_fd = folder.as_raw_fd();
+                        // SAFETY: the closure runs in the child between `fork` and
+                        // `exec`, where only async-signal-safe calls are allowed;
+                        // `dup2` and `fcntl` are, they touch only this child's
+                        // descriptor table, and they allocate nothing. A failure is
+                        // returned so `spawn` reports it instead of exec'ing
+                        // without the descriptor.
+                        unsafe {
+                            process.pre_exec(move || {
+                                if folder_fd != MOUNT_FD && libc::dup2(folder_fd, MOUNT_FD) < 0 {
                                     return Err(std::io::Error::last_os_error());
                                 }
-                            }
-                            Ok(())
-                        });
+                                if libc::fcntl(MOUNT_FD, libc::F_SETFD, 0) < 0 {
+                                    return Err(std::io::Error::last_os_error());
+                                }
+                                for fd in &grant_fds {
+                                    if libc::fcntl(*fd, libc::F_SETFD, 0) < 0 {
+                                        return Err(std::io::Error::last_os_error());
+                                    }
+                                }
+                                Ok(())
+                            });
+                        }
+                        // The wrapper is our own shell script: it closes the mount
+                        // descriptor first and only then execs the user's command,
+                        // which arrives as a separate argv element and is never
+                        // interpolated into the script.
+                        process
+                            .arg("/bin/sh")
+                            .arg("-c")
+                            .arg(format!("exec {MOUNT_FD}>&-; exec /bin/sh -c \"$1\""))
+                            .arg("neha")
+                            .arg(command);
                     }
-                    // The wrapper is our own shell script: it closes the mount
-                    // descriptor first and only then execs the user's command,
-                    // which arrives as a separate argv element and is never
-                    // interpolated into the script.
+                    #[cfg(not(unix))]
+                    process.arg("/bin/sh").arg("-c").arg(command);
+                    process.current_dir(self.base());
                     process
-                        .arg("/bin/sh")
-                        .arg("-c")
-                        .arg(format!("exec {MOUNT_FD}>&-; exec /bin/sh -c \"$1\""))
-                        .arg("neha")
-                        .arg(command);
                 }
-                #[cfg(not(unix))]
-                process.arg("/bin/sh").arg("-c").arg(command);
-                process.current_dir(self.base());
-                process
             }
         };
-        let temporary = match &self.mode {
-            Mode::Managed => self.root.join(".tmp"),
-            Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
-        };
-        let path = match &self.cli_dir {
-            Some(directory) => format!("{}:{SHELL_PATH}", directory.display()),
-            None => SHELL_PATH.to_owned(),
+        let (home, temporary, path) = if self.hosted.is_some() {
+            (
+                Path::new(HOSTED_WORKSPACE),
+                PathBuf::from(SANDBOX_TMPDIR),
+                match &self.cli_dir {
+                    // The CLI is mounted at a fixed sandbox path, not where it
+                    // sits on the host.
+                    Some(_) => format!("{HOSTED_CLI_DIR}:{SHELL_PATH}"),
+                    None => SHELL_PATH.to_owned(),
+                },
+            )
+        } else {
+            let temporary = match &self.mode {
+                Mode::Managed => self.root.join(".tmp"),
+                Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
+            };
+            let path = match &self.cli_dir {
+                Some(directory) => format!("{}:{SHELL_PATH}", directory.display()),
+                None => SHELL_PATH.to_owned(),
+            };
+            (self.root.as_path(), temporary, path)
         };
         process
             .stdin(Stdio::null())
@@ -1025,7 +1151,7 @@ impl LocalRuntime {
             .stderr(Stdio::piped())
             .env_clear()
             .env("PATH", path)
-            .env("HOME", &self.root)
+            .env("HOME", home)
             .env("TMPDIR", temporary)
             .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
             .kill_on_drop(true);
@@ -1192,9 +1318,8 @@ fn find_bwrap() -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// Starts one empty sandbox, so a Computer never serves a machine where
-/// bubblewrap is installed but cannot run.
-fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), String> {
+/// Checks that one `bwrap` binary runs at all.
+fn check_bwrap_version(bwrap: &Path) -> Result<(), String> {
     let version = std::process::Command::new(bwrap)
         .arg("--version")
         .stdin(Stdio::null())
@@ -1203,6 +1328,14 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
     if !version.status.success() {
         return Err("bwrap --version failed; install a working bubblewrap".to_owned());
     }
+
+    Ok(())
+}
+
+/// Starts one empty sandbox, so a Computer never serves a machine where
+/// bubblewrap is installed but cannot run.
+fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), String> {
+    check_bwrap_version(bwrap)?;
     let output = std::process::Command::new(bwrap)
         .args(sandbox_args(
             folder.as_os_str(),
@@ -1226,6 +1359,33 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
         "bwrap cannot start a sandbox: {}",
         stderr.lines().next().unwrap_or("no error output")
     ))
+}
+
+/// Starts one empty Hosted sandbox, so a Space never promises a Hosted
+/// Computer on a machine where bubblewrap cannot mount the minimal rootfs.
+///
+/// `workspace` must exist: it is bound into the sandbox as `/workspace`, and
+/// the probe fails the way a real action would if the path cannot be mounted.
+pub fn probe_hosted(bwrap: &Path, workspace: &Path) -> Result<(), RuntimeError> {
+    check_bwrap_version(bwrap).map_err(RuntimeError::NoSandbox)?;
+    let output = std::process::Command::new(bwrap)
+        .args(hosted_sandbox_args(bwrap, workspace, None))
+        .arg("/usr/bin/sh")
+        .arg("-c")
+        .arg("true")
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|error| {
+            RuntimeError::NoSandbox(format!("bwrap cannot run: {error}; install bubblewrap"))
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(RuntimeError::NoSandbox(format!(
+        "bwrap cannot start a Hosted sandbox: {}",
+        stderr.lines().next().unwrap_or("no error output")
+    )))
 }
 
 /// Returns whether one hidden root is a file rather than a directory.
@@ -1311,6 +1471,109 @@ fn sandbox_args(
     }
     arguments.push(OsString::from("--chdir"));
     arguments.push(cwd.as_os_str().to_owned());
+    arguments.push(OsString::from("--"));
+
+    arguments
+}
+
+/// Refuses a Hosted layout whose read-only mounts would expose a protected
+/// root.
+///
+/// The sandbox mounts the system directories and the CLI's directory. The
+/// Space home must not sit inside either mount, and the CLI directory must not
+/// sit inside the Space home: in both cases the read-only mount would still
+/// reveal the record, a secret, or another Workspace.
+fn validate_hosted_mounts(hidden: &[PathBuf], cli_dir: Option<&Path>) -> Result<(), RuntimeError> {
+    let cli_dir = cli_dir
+        .map(std::fs::canonicalize)
+        .transpose()
+        .map_err(RuntimeError::Io)?;
+    for root in hidden {
+        if root == Path::new("/") {
+            return Err(RuntimeError::NoSandbox(
+                "NEHA_HOME cannot be the file-system root".to_owned(),
+            ));
+        }
+        for system in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+            let Ok(system) = std::fs::canonicalize(system) else {
+                continue;
+            };
+            if root.starts_with(&system) {
+                return Err(RuntimeError::NoSandbox(format!(
+                    "NEHA_HOME is inside {}; a Hosted sandbox would mount that directory. Move NEHA_HOME outside the system directories",
+                    system.display()
+                )));
+            }
+        }
+        if let Some(cli_dir) = &cli_dir
+            && (root.starts_with(cli_dir) || cli_dir.starts_with(root))
+        {
+            return Err(RuntimeError::NoSandbox(
+                "NEHA_HOME and the CLI directory overlap; a Hosted sandbox would mount one of them"
+                    .to_owned(),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The bubblewrap arguments that give one Hosted shell a minimal rootfs.
+///
+/// A Hosted Computer is the Space's own environment, so its sandbox starts
+/// from an empty root rather than the machine: only the host's system
+/// directories are mounted, read-only, because that is what the shell and the
+/// programs it starts need to run. Nothing else of the host reaches the
+/// sandbox — not the Space's home, its record, its credentials, or another
+/// Computer's workspace. The workspace is the one writable folder, bound at
+/// `/workspace`, and it is the working directory. `/dev`, `/proc`, and a fresh
+/// `/tmp` are the sandbox's own, the PID namespace is private, and the sandbox
+/// dies with its daemon. The network is not unshared: a Hosted shell reaches
+/// the Space's own loopback for the Bot CLI's token API.
+///
+/// The CLI this build runs is mounted read-only at [`HOSTED_CLI_DIR`], so the
+/// skill's `neha` commands work in the shell; the mount is skipped when the
+/// caller has no CLI directory. `_bwrap` is the binary that will run these
+/// arguments; they are the same for every bwrap path.
+fn hosted_sandbox_args(_bwrap: &Path, workspace: &Path, cli_dir: Option<&Path>) -> Vec<OsString> {
+    let mut arguments = Vec::new();
+    // A system directory that does not exist is skipped, so the same rootfs
+    // works on a distribution where it is missing.
+    for directory in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+        if Path::new(directory).is_dir() {
+            arguments.push(OsString::from("--ro-bind"));
+            arguments.push(OsString::from(directory));
+            arguments.push(OsString::from(directory));
+        }
+    }
+    arguments.extend(
+        [
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "--tmpfs",
+            "/tmp",
+            "--tmpfs",
+            "/dev/shm",
+            "--unshare-pid",
+            "--die-with-parent",
+        ]
+        .into_iter()
+        .map(OsString::from),
+    );
+    if let Some(directory) = cli_dir {
+        arguments.push(OsString::from("--dir"));
+        arguments.push(OsString::from("/opt"));
+        arguments.push(OsString::from("--ro-bind"));
+        arguments.push(directory.as_os_str().to_owned());
+        arguments.push(OsString::from(HOSTED_CLI_DIR));
+    }
+    arguments.push(OsString::from("--bind"));
+    arguments.push(workspace.as_os_str().to_owned());
+    arguments.push(OsString::from(HOSTED_WORKSPACE));
+    arguments.push(OsString::from("--chdir"));
+    arguments.push(OsString::from(HOSTED_WORKSPACE));
     arguments.push(OsString::from("--"));
 
     arguments
@@ -2264,8 +2527,8 @@ mod tests {
     use neha::file::MAX_FILE_BYTES;
 
     use super::{
-        DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, Mode, RuntimeError, open_directory_path,
-        sandbox_args,
+        DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, Mode, RuntimeError, find_bwrap,
+        open_directory_path, probe_hosted, sandbox_args,
     };
     use crate::action::{Action, ActionStatus, ByteError, ComputerRuntime};
 
@@ -2313,6 +2576,22 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let runtime = LocalRuntime::machine(directory.path().join("bot"))
             .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox");
+
+        Some((directory, runtime))
+    }
+
+    /// Returns a Hosted runtime, or `None` when the bwrap tests are off.
+    ///
+    /// The workspace lives under the test's temporary directory, which the
+    /// sandbox does not mount; only the workspace itself appears at
+    /// `/workspace`.
+    fn hosted_runtime() -> Option<(tempfile::TempDir, LocalRuntime)> {
+        if !bwrap_enabled() {
+            return None;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = LocalRuntime::hosted(directory.path().join("workspace"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a Hosted sandbox");
 
         Some((directory, runtime))
     }
@@ -2371,6 +2650,7 @@ mod tests {
                 bwrap: std::path::PathBuf::from("bwrap"),
                 folder: open_directory_path(&std::fs::canonicalize(root).unwrap()).unwrap(),
             },
+            hosted: None,
             hidden: vec![std::fs::canonicalize(hidden).unwrap()],
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -4376,5 +4656,259 @@ mod tests {
             })
             .await;
         assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+    }
+
+    #[tokio::test]
+    async fn hosted_shell_has_a_private_rootfs() {
+        let Some((_dir, runtime)) = hosted_runtime() else {
+            return;
+        };
+        // The CLI is mounted at its fixed sandbox path: this build's own
+        // directory is outside the minimal rootfs.
+        let result = runtime
+            .execute(Action::Shell {
+                command:
+                    "pwd && printf x > note.txt && echo \"$HOME $TMPDIR\" && test -d /opt/neha-cli"
+                        .to_owned(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            result.output.text.contains("stdout:\n/workspace\n"),
+            "the Hosted shell did not start in its workspace: {}",
+            result.output.text
+        );
+        assert!(
+            result.output.text.contains("/workspace /tmp\n"),
+            "the Hosted shell has the wrong HOME or TMPDIR: {}",
+            result.output.text
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime.workspace().join("note.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_shell_cannot_see_outside_the_workspace() {
+        let Some((directory, runtime)) = hosted_runtime() else {
+            return;
+        };
+        // The test's temporary directory is the host path above the workspace;
+        // the sandbox replaces the host's /tmp, so that file is not there.
+        let secret = directory.path().join("secret.txt");
+        std::fs::write(&secret, "host-secret-must-not-leak").unwrap();
+
+        let unseen = runtime
+            .execute(Action::Shell {
+                command: format!("test ! -e {}", secret.display()),
+            })
+            .await;
+        assert_eq!(unseen.status, ActionStatus::Succeeded, "{unseen:?}");
+
+        let read = runtime
+            .execute(Action::Shell {
+                command: format!("cat {}", secret.display()),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Failed, "{read:?}");
+        assert!(
+            !read.output.text.contains("host-secret-must-not-leak"),
+            "the sandbox read a host file: {}",
+            read.output.text
+        );
+
+        // A host directory the sandbox does not mount at all is absent too:
+        // /var/tmp is outside the host /tmp that the sandbox replaces.
+        let outside = outside_tempdir();
+        let host_secret = outside.path().join("host-only.txt");
+        std::fs::write(&host_secret, "host-only-bytes").unwrap();
+        let unreachable = runtime
+            .execute(Action::Shell {
+                command: format!("test ! -e {}", host_secret.display()),
+            })
+            .await;
+        assert_eq!(
+            unreachable.status,
+            ActionStatus::Succeeded,
+            "{unreachable:?}"
+        );
+
+        // The system directories are read-only: /etc cannot take a file.
+        let etc = runtime
+            .execute(Action::Shell {
+                command: "printf x > /etc/neha-hosted-test".to_owned(),
+            })
+            .await;
+        assert_eq!(etc.status, ActionStatus::Failed, "{etc:?}");
+        assert!(
+            !std::path::Path::new("/etc/neha-hosted-test").exists(),
+            "the sandbox wrote the host's /etc"
+        );
+
+        // /tmp is the sandbox's own fresh tmpfs, and it is writable.
+        let marker = format!("neha-hosted-tmp-{}", std::process::id());
+        let tmp = runtime
+            .execute(Action::Shell {
+                command: format!("printf x > /tmp/{marker} && cat /tmp/{marker}"),
+            })
+            .await;
+        assert_eq!(tmp.status, ActionStatus::Succeeded, "{tmp:?}");
+        assert!(
+            tmp.output.text.contains("stdout:\nx\n"),
+            "{}",
+            tmp.output.text
+        );
+        assert!(
+            !std::path::Path::new(&format!("/tmp/{marker}")).exists(),
+            "the sandbox wrote the host's /tmp"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_file_tools_stay_in_the_workspace() {
+        let Some((directory, runtime)) = hosted_runtime() else {
+            return;
+        };
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "notes/hello.txt".to_owned(),
+                content: "hello hosted".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(runtime.workspace().join("notes/hello.txt")).unwrap(),
+            "hello hosted"
+        );
+
+        let read = runtime
+            .execute(Action::ReadFile {
+                path: "notes/hello.txt".to_owned(),
+            })
+            .await;
+        assert_eq!(read.status, ActionStatus::Succeeded, "{read:?}");
+        assert_eq!(read.output.text, "hello hosted");
+
+        // The managed rules still apply: no path escapes the workspace.
+        let outside = directory.path().join("escape.txt");
+        for path in [
+            "../escape.txt".to_owned(),
+            outside.to_string_lossy().into_owned(),
+        ] {
+            let refused = runtime
+                .execute(Action::WriteFile {
+                    path,
+                    content: "pwned".to_owned(),
+                })
+                .await;
+            assert_eq!(refused.status, ActionStatus::Failed, "{refused:?}");
+            assert!(
+                refused.output.text.contains("escapes"),
+                "{}",
+                refused.output.text
+            );
+        }
+        assert!(!outside.exists(), "a refused write leaves no file");
+        let refused = runtime
+            .execute(Action::ReadFile {
+                path: "/etc/passwd".to_owned(),
+            })
+            .await;
+        assert_eq!(refused.status, ActionStatus::Failed, "{refused:?}");
+    }
+
+    #[tokio::test]
+    async fn hosted_working_dir_must_stay_in_the_workspace() {
+        let Some((directory, runtime)) = hosted_runtime() else {
+            return;
+        };
+        let inside = runtime.workspace().join("sub");
+        std::fs::create_dir(&inside).unwrap();
+        let runtime = runtime
+            .with_working_dir(inside.to_str().unwrap())
+            .expect("a folder inside the workspace is accepted");
+
+        let outside = directory.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let error = runtime
+            .with_working_dir(outside.to_str().unwrap())
+            .err()
+            .expect("a Hosted working directory outside the workspace is refused");
+        assert!(matches!(error, RuntimeError::Access(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_sandbox_without_a_workspace_is_refused() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let bwrap = find_bwrap().expect("NEHA_TEST_BWRAP is set but bwrap was not found on PATH");
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing-workspace");
+        let error = probe_hosted(&bwrap, &missing)
+            .expect_err("a missing workspace cannot be mounted into a Hosted sandbox");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_cli_directory_inside_the_home_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let cli = home.join("target").join("debug");
+        std::fs::create_dir_all(&cli).unwrap();
+        let error = super::validate_hosted_mounts(std::slice::from_ref(&home), Some(&cli))
+            .expect_err("a CLI inside the protected home would expose that subtree");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+
+        let error = super::validate_hosted_mounts(std::slice::from_ref(&cli), Some(&home))
+            .expect_err("a home inside the CLI directory would expose the home");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_workspace_inside_a_system_mount_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let error =
+            LocalRuntime::hosted_with_hidden(&workspace, vec![std::path::PathBuf::from("/usr")])
+                .err()
+                .expect("a home under a mounted system directory would leak");
+        assert!(matches!(error, RuntimeError::NoSandbox(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_workspace_symlink_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("workspace");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let error = LocalRuntime::hosted(&link)
+            .err()
+            .expect("a Workspace that is a symlink cannot be bound as the writable root");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
+    }
+
+    #[test]
+    fn a_hosted_workspace_holding_a_link_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "host bytes").unwrap();
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).unwrap();
+        let error = LocalRuntime::hosted(&workspace)
+            .err()
+            .expect("a linked entry could change a host file through the writable bind");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
+
+        std::fs::remove_file(workspace.join("link")).unwrap();
+        std::fs::hard_link(&outside, workspace.join("hard")).unwrap();
+        let error = LocalRuntime::hosted(&workspace)
+            .err()
+            .expect("a hard link would share an inode with a host file");
+        assert!(matches!(error, RuntimeError::UnsafeFolder(_)), "{error}");
     }
 }

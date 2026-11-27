@@ -381,6 +381,11 @@ fn computer_online(
     let Some(computer) = run.computer else {
         return true;
     };
+    // A reset clears the Workspace between two actions: no run may start on it
+    // until the clear finished.
+    if state.is_resetting(computer) {
+        return false;
+    }
     let local = state
         .computers
         .get(&computer)
@@ -406,6 +411,9 @@ fn next_queued(
         .min_by_key(|run| run.seq)?
         .clone();
     let computer = state.bots.get(&bot).map(|bot| bot.computer)?;
+    if state.is_resetting(computer) {
+        return None;
+    }
     let local = state
         .computers
         .get(&computer)
