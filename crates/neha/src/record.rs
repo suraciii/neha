@@ -327,17 +327,30 @@ mod tests {
 
     #[test]
     fn a_credential_holds_only_what_a_bearer_token_takes() {
-        for token in ["abc", "token-1", "a.b_c~d+e/f==", "A1"] {
+        for token in [
+            "a",
+            "abc",
+            "token-1",
+            "a.b_c~d+e/f==",
+            "A1",
+            "x=",
+            "x==",
+            "x===",
+        ] {
             assert!(McpServerAdded::valid_credential(token), "{token}");
         }
+        // The token alphabet comes first; padding only ends a token.
         for token in [
             "",
+            "=",
+            "==",
+            "===",
+            "a=b",
             "two words",
             "quote\"inside",
             "back\\slash",
             "line\nbreak",
             "###",
-            "===",
         ] {
             assert!(!McpServerAdded::valid_credential(token), "{token}");
         }
@@ -2161,13 +2174,18 @@ impl McpServerAdded {
     #[must_use]
     pub fn valid_credential(token: &str) -> bool {
         let bytes = token.as_bytes();
-        !bytes.is_empty()
-            && bytes.len() <= 8192
-            && bytes.iter().all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
-            })
-            && bytes.iter().rev().take_while(|byte| **byte == b'=').count() <= 2
+        if bytes.is_empty() || bytes.len() > 8192 {
+            return false;
+        }
+        // RFC 6750: one or more token-alphabet characters, then zero or more
+        // trailing `=` padding characters.
+        let body: &[u8] = match bytes.iter().rposition(|byte| *byte != b'=') {
+            Some(last) => &bytes[..=last],
+            None => return false,
+        };
+        body.iter().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+        })
     }
 
     /// Whether the name follows the Plugin naming rule.
