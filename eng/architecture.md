@@ -93,7 +93,7 @@ Shared dependency versions are declared once in the root `[workspace.dependencie
 
 ## Dependencies and toolchain
 
-- Rust 1.94 or newer, edition 2024.
+- Rust, pinned by [`rust-toolchain.toml`](../rust-toolchain.toml); the MSRV is 1.94; edition 2024.
 - Every dependency's license must be compatible with GPL-3.0-only.
 - A configuration file or manifest Neha owns is TOML. A file a standard defines keeps that standard's format.
 

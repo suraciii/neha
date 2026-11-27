@@ -1,0 +1,40 @@
+name: Stable canary
+
+# rust-toolchain.toml pins the toolchain. This check runs the linter on the
+# current stable, so a weekly red run is the signal to raise the pin instead of
+# letting a stable release break main.
+on:
+  schedule:
+    # 02:00 Asia/Shanghai on Monday.
+    - cron: '0 18 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clippy:
+    name: Clippy on current stable
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      # Overrides the toolchain in rust-toolchain.toml for this job.
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the current stable
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: canary
+
+      - name: Install just
+        uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - name: Lint the workspace
+        run: just clippy
