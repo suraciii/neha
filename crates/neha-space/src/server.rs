@@ -2325,7 +2325,7 @@ async fn recover_interrupted(store: &Store, state: &Mutex<SpaceState>) -> Result
             .collect()
     };
     for run in interrupted {
-        match commands::prepare_recovery(state, &run) {
+        match commands::prepare_recovery(state, &run, &commands::McpCatalog::default()) {
             Ok(plan) => {
                 let mut state = state
                     .lock()

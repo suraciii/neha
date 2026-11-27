@@ -599,6 +599,7 @@ async fn approval_decide(
                     "tool": derived.tool,
                     "command_prefix": derived.command_prefix,
                     "path_prefix": derived.path_prefix,
+                    "server": derived.server,
                     "skill": derived.skill,
                     "script": derived.script,
                 }),
@@ -798,17 +799,6 @@ async fn rule_add(
         if command_prefix.is_some() || path_prefix.is_some() {
             return Err(ApiError::invalid_argument(
                 "a server rule takes no command or path prefix",
-            ));
-        }
-        if tool == neha_loop::tools::SHELL
-            || tool == neha_loop::tools::READ_FILE
-            || tool == neha_loop::tools::WRITE_FILE
-            || tool == neha_loop::tools::LIST_FILES
-            || tool == neha_loop::tools::SKILL
-            || tool == neha_loop::tools::RUN_SKILL_SCRIPT
-        {
-            return Err(ApiError::invalid_argument(
-                "a server rule names a tool the server gives",
             ));
         }
     }
@@ -1031,6 +1021,11 @@ async fn mcp_add(
                 "the Space already holds an MCP server under this name",
             ));
         }
+        if url != existing.url {
+            return Err(ApiError::invalid_argument(
+                "connecting an existing server keeps the address the Space connected",
+            ));
+        }
         let Some(credential) = arguments.credential else {
             return Err(ApiError::invalid_argument(
                 "connecting a server with your own credential needs one",
@@ -1096,6 +1091,18 @@ async fn mcp_add(
         return Err(ApiError::forbidden(
             "only the Admin connects an MCP server for the Space",
         ));
+    }
+    {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        if state.mcps.len() >= crate::state::MAX_MCP_SERVERS {
+            return Err(ApiError::invalid_argument(format!(
+                "a Space connects at most {} MCP servers",
+                crate::state::MAX_MCP_SERVERS
+            )));
+        }
     }
     let server = Id::new();
     let user = match arguments.scope {
@@ -3937,7 +3944,9 @@ pub async fn resume_run(
         let events = fail_resume(store, state, events, run).await?;
         return Ok(Finished::Completed(events));
     }
-    let recovery = match prepare_recovery(state, run) {
+    let recovered_offered =
+        offered_tools(state, secrets, run.bot, run.acting, instructions_only).await;
+    let recovery = match prepare_recovery(state, run, &recovered_offered.mcp) {
         Ok(plan) => plan,
         Err(error) => {
             eprintln!("neha: cannot recover run {}: {error}", run.id);
@@ -4232,6 +4241,19 @@ async fn finish_run_with(
             }
         }
     };
+    let offered = match prebuilt {
+        Some(offered) => offered,
+        None => {
+            offered_tools(
+                state,
+                secrets,
+                pending.bot.id,
+                pending.acting,
+                instructions_only,
+            )
+            .await
+        }
+    };
     let log = RunLog {
         store,
         state,
@@ -4268,7 +4290,7 @@ async fn finish_run_with(
                         .get(&pending.run)
                         .cloned()
                         .ok_or_else(|| ApiError::internal("the run is gone"))?;
-                    match prepare_recovery(state, &current) {
+                    match prepare_recovery(state, &current, &offered.mcp) {
                         Ok(RecoveryPlan::Continue(plan)) if plan.unknown.is_none() => {
                             let ContinuePlan {
                                 next_step,
@@ -4380,19 +4402,6 @@ async fn finish_run_with(
         &provider_id,
         protocol,
     );
-    let offered = match prebuilt {
-        Some(offered) => offered,
-        None => {
-            offered_tools(
-                state,
-                secrets,
-                pending.bot.id,
-                pending.acting,
-                instructions_only,
-            )
-            .await
-        }
-    };
     let mut recorder = RunRecorder {
         log: log.clone(),
         calls: HashMap::new(),
@@ -4747,6 +4756,7 @@ fn prepare_resume(
 pub(crate) fn prepare_recovery(
     state: &Mutex<State>,
     run: &crate::state::RunView,
+    mcp: &McpCatalog,
 ) -> Result<RecoveryPlan, String> {
     let state = state.lock().map_err(|_| "the state is locked".to_owned())?;
     // A step is recorded only when it completed, one at a time from one.
@@ -4954,7 +4964,7 @@ pub(crate) fn prepare_recovery(
         .iter()
         .map(|call| LoopCall {
             call: call.call.clone(),
-            tool: call.tool.clone(),
+            tool: resume_tool_name(mcp, call),
             arguments: call.arguments.clone(),
             refused: call.refused.clone(),
         })
@@ -5350,7 +5360,10 @@ impl RedactingRuntime<'_> {
                 ));
             }
         }
-        let text = parts.join("\n");
+        let mut text = parts.join("\n");
+        if text.contains(&credential) {
+            text = text.replace(&credential, "[redacted]");
+        }
         let result = if answer.is_error {
             ActionResult::failed(text)
         } else {
@@ -5560,7 +5573,7 @@ struct ExposedMcpTool {
 
 /// The MCP tools one run offers, by the name the Model sees.
 #[derive(Clone, Debug, Default)]
-struct McpCatalog {
+pub(crate) struct McpCatalog {
     by_name: HashMap<String, ExposedMcpTool>,
     by_identity: HashMap<(Id, String), String>,
 }
@@ -5631,9 +5644,13 @@ impl McpCatalog {
 /// so the loop refuses it instead of guessing.
 fn resume_tool_name(mcp: &McpCatalog, call: &neha::record::RecordedCall) -> String {
     match call.server {
-        Some(server) => mcp
-            .model_name(server, &call.tool)
-            .map_or_else(|| call.tool.clone(), ToOwned::to_owned),
+        Some(server) => mcp.model_name(server, &call.tool).map_or_else(
+            // A server that no longer offers the tool must not turn a
+            // recorded call into a built-in one with the same name: this name
+            // holds a `/`, which no offered name can, so the run refuses it.
+            || format!("mcp__unavailable__{server}/{}", call.tool),
+            ToOwned::to_owned,
+        ),
         None => call.tool.clone(),
     }
 }
@@ -5652,9 +5669,18 @@ fn media_extension(media_type: &str) -> &'static str {
 
 /// The name the Model sees for one server's tool before any deduplication.
 fn mcp_tool_name(tool: &ExposedMcpTool) -> String {
-    let normalized: String = tool
-        .tool
-        .chars()
+    let normalized = normalized_tool_name(&tool.tool);
+    let name = format!("mcp__{}__{normalized}", tool.server_name);
+    if normalized != tool.tool || name.len() > MAX_TOOL_NAME_BYTES {
+        mcp_hashed_name(tool)
+    } else {
+        name
+    }
+}
+
+/// Folds a tool's original name into the characters a model tool name takes.
+fn normalized_tool_name(tool: &str) -> String {
+    tool.chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() || character == '_' || character == '-' {
                 character
@@ -5662,13 +5688,7 @@ fn mcp_tool_name(tool: &ExposedMcpTool) -> String {
                 '_'
             }
         })
-        .collect();
-    let name = format!("mcp__{}__{normalized}", tool.server_name);
-    if normalized != tool.tool || name.len() > MAX_TOOL_NAME_BYTES {
-        mcp_hashed_name(tool)
-    } else {
-        name
-    }
+        .collect()
 }
 
 /// The same name with a hash of the server and the tool appended.
@@ -5679,7 +5699,11 @@ fn mcp_tool_name_hashed(tool: &ExposedMcpTool) -> String {
 fn mcp_hashed_name(tool: &ExposedMcpTool) -> String {
     let digest = crate::blobs::digest(format!("{}/{}", tool.server, tool.tool).as_bytes());
     let suffix = format!("_{}", &digest[..8]);
-    let base = format!("mcp__{}__{}", tool.server_name, tool.tool);
+    let base = format!(
+        "mcp__{}__{}",
+        tool.server_name,
+        normalized_tool_name(&tool.tool)
+    );
     let available = MAX_TOOL_NAME_BYTES.saturating_sub(suffix.len());
     let mut name = String::new();
     for character in base.chars() {
@@ -5733,12 +5757,16 @@ async fn offered_tools(
             continue;
         };
         for tool in list {
+            let description = match &credential {
+                Some(credential) => tool.description.replace(credential.as_str(), "[redacted]"),
+                None => tool.description,
+            };
             found.push(ExposedMcpTool {
                 model_name: String::new(),
                 server: server.server,
                 server_name: server.name.clone(),
                 tool: tool.name,
-                description: tool.description,
+                description,
                 input_schema: tool.input_schema,
             });
         }
@@ -6953,10 +6981,10 @@ fn rule_covers(derived: &DerivedRule, ask: &RuleView) -> bool {
     if ask.tool != derived.tool {
         return false;
     }
-    // A server's tool rule covers an Ask rule for the same server and tool,
-    // and the tool-only Ask rule that names no server.
+    // A server's tool rule covers only the Ask rule for that same server and
+    // tool. An Ask rule that names no server is wider, so it stays.
     if let Some(server) = derived.server {
-        return (ask.server == Some(server) || ask.server.is_none())
+        return ask.server == Some(server)
             && ask.command_prefix.is_none()
             && ask.path_prefix.is_none()
             && ask.skill.is_none()
@@ -8152,6 +8180,45 @@ mod tests {
     }
 
     #[test]
+    fn a_server_rule_covers_only_its_own_server_and_tool() {
+        let server = Id::new();
+        let derived = super::DerivedRule {
+            tool: "search".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            server: Some(server),
+            skill: None,
+            script: None,
+        };
+        let mut own = ask("search", None, None);
+        own.server = Some(server);
+        assert!(rule_covers(&derived, &own));
+        // An Ask rule that names no server is wider, so an Allow for one
+        // server does not remove it.
+        assert!(!rule_covers(&derived, &ask("search", None, None)));
+        // Another server's Ask is another rule.
+        let mut other = ask("search", None, None);
+        other.server = Some(Id::new());
+        assert!(!rule_covers(&derived, &other));
+    }
+
+    #[test]
+    fn a_recorded_server_call_keeps_a_name_no_run_offers_when_its_tool_is_gone() {
+        let server = Id::new();
+        let call = neha::record::RecordedCall {
+            call: "call-1".to_owned(),
+            tool: "shell".to_owned(),
+            server: Some(server),
+            arguments: json!({}),
+            refused: None,
+        };
+        let name = super::resume_tool_name(&super::McpCatalog::default(), &call);
+        assert_ne!(name, "shell", "a built-in must not take the server's call");
+        assert!(name.starts_with("mcp__"), "{name}");
+        assert!(name.contains('/'), "no offered name holds a slash: {name}");
+    }
+
+    #[test]
     fn a_rule_written_before_script_rules_names_matches_no_script() {
         // A parent-format record could hold a rule for the whole tool. It
         // still projects, but it grants no script authority: the identity is
@@ -8592,7 +8659,8 @@ mod tests {
             None,
         );
         let RecoveryPlan::Continue(plan) =
-            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
+            prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
+                .expect("the record recovers")
         else {
             panic!("expected a continuation");
         };
@@ -8626,7 +8694,8 @@ mod tests {
             )),
         );
         let RecoveryPlan::Continue(plan) =
-            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
+            prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
+                .expect("the record recovers")
         else {
             panic!("expected a continuation");
         };
@@ -8737,7 +8806,7 @@ mod tests {
             usage,
             record_step,
             ..
-        } = prepare_recovery(&std::sync::Mutex::new(state), &run)
+        } = prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
             .expect("a final step finishes from the record")
         else {
             panic!("expected a final answer");
@@ -8761,7 +8830,7 @@ mod tests {
             record_step,
             succeeded,
             ..
-        } = prepare_recovery(&std::sync::Mutex::new(state), &run)
+        } = prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
             .expect("a final reply finishes from the record")
         else {
             panic!("expected a final answer");
@@ -8788,7 +8857,8 @@ mod tests {
             )),
         );
         let RecoveryPlan::Continue(plan) =
-            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("a write can be verified")
+            prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default())
+                .expect("a write can be verified")
         else {
             panic!("expected an action to verify");
         };
@@ -8822,10 +8892,11 @@ mod tests {
             .unwrap();
         action.finished = true;
         action.status = neha::record::ActionStatus::Unknown;
-        let error = match prepare_recovery(&std::sync::Mutex::new(state), &run) {
-            Err(error) => error,
-            Ok(_) => panic!("a recorded unknown result must not be recovered"),
-        };
+        let error =
+            match prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default()) {
+                Err(error) => error,
+                Ok(_) => panic!("a recorded unknown result must not be recovered"),
+            };
         assert!(error.contains("returned an unknown result"), "{error}");
     }
 
@@ -8840,10 +8911,11 @@ mod tests {
                 vec![(unknown, "shell", json!({"command": "true"}), false)],
             )),
         );
-        let error = match prepare_recovery(&std::sync::Mutex::new(state), &run) {
-            Err(error) => error,
-            Ok(_) => panic!("a shell has no verifiable effect"),
-        };
+        let error =
+            match prepare_recovery(&std::sync::Mutex::new(state), &run, &McpCatalog::default()) {
+                Err(error) => error,
+                Ok(_) => panic!("a shell has no verifiable effect"),
+            };
         assert!(error.contains("cannot be verified"), "{error}");
     }
 

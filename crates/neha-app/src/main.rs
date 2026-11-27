@@ -2734,7 +2734,11 @@ impl ApprovalCard {
     /// possible; the User never grants a lasting rule without seeing its
     /// reach.
     fn always_scope(&self) -> Option<String> {
-        if self.reason != "rule" && self.reason != "grant" && self.reason != "first_script_run" {
+        if self.reason != "rule"
+            && self.reason != "grant"
+            && self.reason != "first_script_run"
+            && self.reason != "first_mcp_call"
+        {
             return None;
         }
 
@@ -2779,6 +2783,8 @@ impl ApprovalCard {
             "a folder you have not granted".to_owned()
         } else if self.reason == "first_script_run" {
             "the first run of a skill's script".to_owned()
+        } else if self.reason == "first_mcp_call" {
+            "the first call of an MCP server's tool".to_owned()
         } else {
             self.reason.clone()
         }

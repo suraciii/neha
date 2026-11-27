@@ -43,7 +43,8 @@ export default function ApprovalCard(props: ApprovalCardProps) {
     if (
       (approval.reason !== "rule" &&
         approval.reason !== "grant" &&
-        approval.reason !== "first_script_run") ||
+        approval.reason !== "first_script_run" &&
+        approval.reason !== "first_mcp_call") ||
       approval.lasting_scope === null
     )
       return null;

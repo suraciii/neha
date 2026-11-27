@@ -1698,10 +1698,17 @@ impl Projection for State {
                     .iter()
                     .position(|view| view.server == data.server)
                     .ok_or("an updated server must exist")?;
-                if self.mcps[position].by != by {
-                    return Err("only the account that connected a server changes it".to_owned());
-                }
                 if let Some(url) = data.url {
+                    // Only the account that connected a server changes where
+                    // it points. Any User may attach their own credential to
+                    // the Space's server, which records this update without a
+                    // URL.
+                    if self.mcps[position].by != by {
+                        return Err(
+                            "only the account that connected a server changes its address"
+                                .to_owned(),
+                        );
+                    }
                     self.mcps[position].url = url;
                 }
             }

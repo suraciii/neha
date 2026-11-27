@@ -495,15 +495,32 @@ where
                         &dispatched,
                     )
                     .await?;
-                let result = match (refused, call.parsed) {
-                    (Some(reason), _) => ActionResult::failed(reason),
-                    (None, Ok(tools::Call::Computer(computer_action))) => {
+                // An answer names one kind of action. If the record's call is
+                // not that kind, nothing runs: a built-in tool must never run
+                // under a server's or a script's answer.
+                let mismatch = match (dispatched.script.is_some(), dispatched.mcp.is_some()) {
+                    (true, _) => !matches!(
+                        call.parsed,
+                        Ok(tools::Call::Space(tools::SpaceCall::Script { .. }))
+                    ),
+                    (_, true) => !matches!(
+                        call.parsed,
+                        Ok(tools::Call::Space(tools::SpaceCall::Mcp { .. }))
+                    ),
+                    (false, false) => false,
+                };
+                let result = match (refused, mismatch, call.parsed) {
+                    (Some(reason), _, _) => ActionResult::failed(reason),
+                    (None, true, _) => ActionResult::failed(
+                        "the recorded action is not the one the answer names, so it did not run",
+                    ),
+                    (None, false, Ok(tools::Call::Computer(computer_action))) => {
                         runtime.execute(computer_action).await
                     }
-                    (None, Ok(tools::Call::Space(space_call))) => {
+                    (None, false, Ok(tools::Call::Space(space_call))) => {
                         runtime.serve(action, space_call).await?
                     }
-                    (None, Err(error)) => ActionResult::failed(error),
+                    (None, false, Err(error)) => ActionResult::failed(error),
                 };
                 recorder
                     .action_finished(
