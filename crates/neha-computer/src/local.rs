@@ -288,22 +288,44 @@ impl LocalRuntime {
         hidden: Vec<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let folder = folder.into();
-        let parent = folder
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let name = folder.file_name().ok_or_else(|| {
-            RuntimeError::UnsafeFolder(format!(
-                "{} does not name one folder; clean it and start again (the default is ~/Neha/<bot-id>)",
-                folder.display()
-            ))
-        })?;
-        // The configured parent may be a new path; its final component is
-        // still opened without following a symlink.
-        std::fs::create_dir_all(parent)?;
-        let parent = open_directory_path(parent).map_err(RuntimeError::Io)?;
 
-        Self::machine_at_with(&parent, name, bwrap, hidden)
+        // Windows has no bubblewrap. A Windows Computer uses a managed folder:
+        // its file tools stay inside the Bot's folder, while its shell runs
+        // with the machine user's rights and is not fenced. The daemon must
+        // not claim the Linux sandbox on this path.
+        #[cfg(windows)]
+        {
+            let _ = bwrap;
+            std::fs::create_dir_all(&folder)?;
+            let root = std::fs::canonicalize(&folder)?;
+            let hidden = hidden
+                .into_iter()
+                .map(|path| std::fs::canonicalize(path).map_err(RuntimeError::Io))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut runtime = Self::managed(root)?;
+            runtime.hidden = hidden;
+            return Ok(runtime);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let parent = folder
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = folder.file_name().ok_or_else(|| {
+                RuntimeError::UnsafeFolder(format!(
+                    "{} does not name one folder; clean it and start again (the default is ~/Neha/<bot-id>)",
+                    folder.display()
+                ))
+            })?;
+            // The configured parent may be a new path; its final component is
+            // still opened without following a symlink.
+            std::fs::create_dir_all(parent)?;
+            let parent = open_directory_path(parent).map_err(RuntimeError::Io)?;
+
+            Self::machine_at_with(&parent, name, bwrap, hidden)
+        }
     }
 
     /// Opens a real-machine runtime under a verified workspace root descriptor.
@@ -829,6 +851,16 @@ impl LocalRuntime {
         Ok((file, metadata))
     }
 
+    /// Windows has no `/proc/self/fd`, and its managed runtime does not use
+    /// this method. Keep the match exhaustive with a clear refusal.
+    #[cfg(not(unix))]
+    fn open_machine_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+        Err(format!(
+            "a real-machine read is not available on this platform: {}",
+            path.display()
+        ))
+    }
+
     /// Refuses an opened file or directory that is hidden or denied.
     ///
     /// The opened descriptor's real path is what counts, not the path the
@@ -1026,11 +1058,20 @@ impl LocalRuntime {
         } else {
             match &self.mode {
                 Mode::Managed => {
-                    let mut process = Command::new("sh");
-                    process.arg("-c").arg(command).current_dir(&self.root);
-                    process
+                    #[cfg(windows)]
+                    {
+                        windows_shell(command, &self.root)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let mut process = Command::new("sh");
+                        process.arg("-c").arg(command).current_dir(&self.root);
+                        process
+                    }
                 }
                 Mode::Machine { bwrap, folder } => {
+                    #[cfg(windows)]
+                    let _ = folder;
                     #[cfg(unix)]
                     let source = folder_mount_source();
                     #[cfg(not(unix))]
@@ -1061,8 +1102,10 @@ impl LocalRuntime {
                     #[cfg(not(unix))]
                     let (write_roots, grant_fds): (
                         Vec<(OsString, PathBuf)>,
-                        Vec<libc::c_int>,
+                        Vec<i32>,
                     ) = (Vec::new(), Vec::new());
+                    #[cfg(windows)]
+                    let _ = &grant_fds;
                     let mut process = sandbox_command(
                         bwrap,
                         &source,
@@ -1123,36 +1166,64 @@ impl LocalRuntime {
                 }
             }
         };
-        let (home, temporary, path) = if self.hosted.is_some() {
-            (
-                Path::new(HOSTED_WORKSPACE),
-                PathBuf::from(SANDBOX_TMPDIR),
-                match &self.cli_dir {
-                    // The CLI is mounted at a fixed sandbox path, not where it
-                    // sits on the host.
-                    Some(_) => format!("{HOSTED_CLI_DIR}:{SHELL_PATH}"),
-                    None => SHELL_PATH.to_owned(),
-                },
-            )
+        let (home, temporary) = if self.hosted.is_some() {
+            (Path::new(HOSTED_WORKSPACE), PathBuf::from(SANDBOX_TMPDIR))
         } else {
             let temporary = match &self.mode {
                 Mode::Managed => self.root.join(".tmp"),
                 Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
             };
-            let path = match &self.cli_dir {
+            (self.root.as_path(), temporary)
+        };
+        #[cfg(windows)]
+        let path = {
+            let inherited = std::env::var_os("PATH").unwrap_or_default();
+            match &self.cli_dir {
+                Some(directory) => {
+                    format!("{};{}", directory.display(), inherited.to_string_lossy())
+                }
+                None => inherited.to_string_lossy().into_owned(),
+            }
+        };
+        #[cfg(not(windows))]
+        let path = if self.hosted.is_some() {
+            match &self.cli_dir {
+                // The CLI is mounted at a fixed sandbox path, not where it
+                // sits on the host.
+                Some(_) => format!("{HOSTED_CLI_DIR}:{SHELL_PATH}"),
+                None => SHELL_PATH.to_owned(),
+            }
+        } else {
+            match &self.cli_dir {
                 Some(directory) => format!("{}:{SHELL_PATH}", directory.display()),
                 None => SHELL_PATH.to_owned(),
-            };
-            (self.root.as_path(), temporary, path)
+            }
         };
         process
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .env("PATH", path)
-            .env("HOME", home)
-            .env("TMPDIR", temporary)
+            .stderr(Stdio::piped());
+        // PowerShell needs the inherited system environment to start. Only the
+        // Unix path clears it; the Windows path overrides the values a Bot
+        // should see while preserving SystemRoot, PATHEXT, and friends.
+        #[cfg(windows)]
+        {
+            process
+                .env("HOME", home)
+                .env("USERPROFILE", home)
+                .env("TMP", &temporary)
+                .env("TEMP", &temporary)
+                .env("PATH", path);
+        }
+        #[cfg(not(windows))]
+        {
+            process
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", home)
+                .env("TMPDIR", temporary);
+        }
+        process
             .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
             .kill_on_drop(true);
         process
@@ -2497,7 +2568,50 @@ fn kill_group(pid: Option<u32>) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn windows_shell(command: &str, root: &Path) -> Command {
+    // Real Windows machines have Windows PowerShell 5.1 beside the system
+    // directory. Use it with an absolute path so a Bot's PATH cannot shadow
+    // the shell; fall back to cmd.exe on a minimal image.
+    let powershell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        });
+    let mut process = if powershell.as_ref().is_some_and(|path| path.is_file()) {
+        let mut process = Command::new(powershell.expect("checked above"));
+        process
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(command);
+        process
+    } else {
+        let mut process = Command::new("cmd.exe");
+        process.args(["/D", "/S", "/C"]).arg(command);
+        process
+    };
+    process.current_dir(root);
+    process
+}
+
+#[cfg(windows)]
+fn kill_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // Windows has no process-group kill in the standard library. taskkill
+        // /T walks the child tree and /F ends it, matching the Unix path's
+        // intent for a timed-out or cancelled command.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn kill_group(_pid: Option<u32>) {}
 
 /// The runtime cannot open its workspace or fence a real machine.

@@ -331,6 +331,20 @@ async fn serve(config: Config) -> Result<()> {
 }
 
 /// Refuses a machine whose commands bubblewrap cannot fence.
+///
+/// A Windows Computer is a managed workspace runtime. It has no bubblewrap;
+/// its shell is limited to the Bot's folder by the runtime's working directory
+/// and file tools, and approvals remain the command authority.
+#[cfg(windows)]
+fn fence() -> Result<()> {
+    eprintln!(
+        "Windows Local Computer: commands run with the machine user's rights in the Bot's folder; this build has no sandbox"
+    );
+    Ok(())
+}
+
+/// Refuses a machine whose commands bubblewrap cannot fence.
+#[cfg(not(windows))]
 fn fence() -> Result<()> {
     LocalRuntime::probe_sandbox().context("this machine cannot fence Bot commands")?;
 
@@ -755,10 +769,25 @@ fn machine(
             // Open the workspace root without following a symlink, then walk
             // the Bot's folder through descriptors: a swapped path component
             // can never redirect the runtime outside its folder.
-            let root = LocalRuntime::open_workspace(&config.workspace)
-                .map_err(|error| error.to_string())?;
-            let mut runtime = LocalRuntime::machine_at(&root, bot, hidden.to_vec())
-                .map_err(|error| error.to_string())?
+            #[cfg(not(windows))]
+            let mut runtime = {
+                let root = LocalRuntime::open_workspace(&config.workspace)
+                    .map_err(|error| error.to_string())?;
+                LocalRuntime::machine_at(&root, bot, hidden.to_vec())
+                    .map_err(|error| error.to_string())?
+            };
+            // Windows has no directory descriptors or bubblewrap. The managed
+            // runtime creates the Bot folder, keeps its shell and file tools
+            // inside that folder, and supports the same actions.
+            #[cfg(windows)]
+            let mut runtime = {
+                let folder = folder_for(&config.workspace, bot)?;
+                std::fs::create_dir_all(&folder)
+                    .map_err(|error| format!("cannot create {}: {error}", folder.display()))?;
+                LocalRuntime::machine_with_hidden(&folder, hidden.to_vec())
+                    .map_err(|error| error.to_string())?
+            };
+            runtime = runtime
                 .with_denied(denied.to_vec())
                 .with_machine_access(access.full_access, &access.write_roots)
                 .map_err(|error| error.to_string())?;
@@ -868,12 +897,36 @@ struct Ticket {
 }
 
 /// Returns the configuration directory that holds this machine's Neha files.
+#[cfg(windows)]
+fn config_directory() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("NEHA_COMPUTER_HOME").map(PathBuf::from) {
+        return Ok(path);
+    }
+    let Some(base) = windows_config_base() else {
+        bail!(
+            "LOCALAPPDATA is not set; set NEHA_COMPUTER_HOME to the directory that holds this machine's Neha files"
+        );
+    };
+
+    Ok(base.join("Neha").join("computer"))
+}
+
+/// Returns the configuration directory that holds this machine's Neha files.
+#[cfg(not(windows))]
 fn config_directory() -> Result<PathBuf> {
     config_directory_from(
         std::env::var_os("NEHA_COMPUTER_HOME").map(PathBuf::from),
         std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         std::env::var_os("HOME").map(PathBuf::from),
     )
+}
+
+/// Returns the per-user base directory Windows uses for Neha state.
+#[cfg(windows)]
+fn windows_config_base() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
 }
 
 /// Returns the configuration directory from the variables that may name it.
@@ -902,6 +955,19 @@ fn config_directory_from(
 ///
 /// `NEHA_COMPUTER_HOME` does not move it: the Space writes its ticket there and
 /// the CLI keeps its session credential there.
+#[cfg(windows)]
+fn standard_config_directory(
+    _xdg_config_home: Option<PathBuf>,
+    _user_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    windows_config_base().map(|base| base.join("Neha"))
+}
+
+/// Returns the per-user configuration directory the CLI and the Space share.
+///
+/// `NEHA_COMPUTER_HOME` does not move it: the Space writes its ticket there and
+/// the CLI keeps its session credential there.
+#[cfg(not(windows))]
 fn standard_config_directory(
     xdg_config_home: Option<PathBuf>,
     user_home: Option<PathBuf>,
@@ -1320,6 +1386,17 @@ fn answer_is_yes(answer: &str) -> bool {
 }
 
 /// Returns the directory that holds one folder per Bot by default.
+#[cfg(windows)]
+fn default_workspace() -> Result<PathBuf> {
+    let Some(home) = std::env::var_os("USERPROFILE").map(PathBuf::from) else {
+        bail!("USERPROFILE is not set; pass --workspace to choose where the Bot Workspaces live");
+    };
+
+    Ok(home.join("Neha").join("workspaces"))
+}
+
+/// Returns the directory that holds one folder per Bot by default.
+#[cfg(not(windows))]
 fn default_workspace() -> Result<PathBuf> {
     default_workspace_from(std::env::var_os("HOME").map(PathBuf::from))
 }
