@@ -255,9 +255,9 @@ jobs:
             Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
             Select-Object -First 1
           if (-not $app) { throw "Neha.exe was not installed" }
-          $home = Join-Path $env:RUNNER_TEMP "neha-desktop-declined"
-          Remove-Item -Recurse -Force $home -ErrorAction SilentlyContinue
-          $env:NEHA_DESKTOP_HOME = $home
+          $declinedHome = Join-Path $env:RUNNER_TEMP "neha-desktop-declined"
+          Remove-Item -Recurse -Force $declinedHome -ErrorAction SilentlyContinue
+          $env:NEHA_DESKTOP_HOME = $declinedHome
           $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-declined.png"
           $env:NEHA_DESKTOP_DECLINE_UNSANDBOXED = "1"
           $process = Start-Process -FilePath $app.FullName `
@@ -270,7 +270,7 @@ jobs:
           if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) {
             throw "the declined desktop launch did not write a screenshot"
           }
-          if (Test-Path (Join-Path $home "computer\computer.json")) {
+          if (Test-Path (Join-Path $declinedHome "computer\computer.json")) {
             throw "declining the warning must not pair a Local Computer"
           }
           Write-Host "declined screenshot: $env:NEHA_DESKTOP_CAPTURE"
