@@ -12,7 +12,7 @@ A Bot is a persistent identity: a name, a picture, a memory, and a Computer it l
 
 A Bot remembers what it learns in its Chats and Groups and carries it forward. The user shapes its behavior by telling it, and it keeps lasting rules in memory.
 
-A Bot lives on a Computer: the Local one where Neha runs, or a Hosted one Neha provides.
+A Bot lives on a Computer: a Local one a User controls, or a Hosted one Neha provides.
 
 The owner sets who else can use the Bot: only the owner, everyone, or specific Users.
 
@@ -26,7 +26,7 @@ Memory belongs to the Bot and not to a Chat, so what it learns with its owner fo
 
 Behavior is shaped in conversation because that is where preferences are discovered; the page holds only what has to be visible and revocable, and the Model a Bot thinks with.
 
-A Bot starts on a Hosted Computer because that works without setup. The owner can create it on the machine where Neha runs when the work is there.
+A Bot starts on a Hosted Computer because that works without setup. The owner can create it on a Local Computer they control when the work is there.
 
 Access is the owner's to give because the Bot is the owner's; what it does for another User, it does under that User's authority.
 
@@ -34,7 +34,7 @@ Access is the owner's to give because the Bot is the owner's; what it does for a
 
 - **A Bot remembers.** Memory belongs to the Bot; what it learns in one conversation it carries to the next.
 - **Behavior is shaped in conversation.** Lasting preferences and rules live in memory; the page holds only name, picture, Computer, access, and Model.
-- **A Hosted Computer by default.** A new Bot starts on a Hosted Computer; its owner can create it on the Local Computer where Neha runs instead.
+- **A Hosted Computer by default.** A new Bot starts on a Hosted Computer; its owner can create it on a Local Computer they control instead.
 - **Access is the owner's to give.** The owner decides who else can use the Bot: only the owner, everyone, or specific Users.
 - **Visible while it works.** A User sees that a Bot is working, can redirect it with a Message, and can stop it.
 

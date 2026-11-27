@@ -63,9 +63,11 @@ Only the Admin refreshes the catalog. The other catalog commands are reads.
 
 ## Computers
 
-A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on the machine where Neha runs.
+A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space. On the Space's own machine it uses the ticket the Space wrote; on another machine it uses a pairing code a signed-in User enters.
 
-It finds the startup ticket the Space wrote under the machine's Neha configuration directory, or asks the Space for one as the signed-in User; either way it pairs the Space the ticket names. `--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
+On the Space's own machine it finds the startup ticket under Neha's configuration directory; on another machine the signed-in User's code names the Space. Either way it pairs the Space the ticket or code names.
+
+`--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
 
 `neha computer list` shows the Computers the User owns, Local and Hosted. `neha computer reset <computer>` clears a Hosted Computer's Workspace: every file and folder inside it is deleted, and the Workspace folder stays.
 

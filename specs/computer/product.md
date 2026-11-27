@@ -15,8 +15,10 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 
 | Kind | Who provides it | What it has |
 | --- | --- | --- |
-| Local | The User, on the machine where Neha runs | The machine's own files, logins, and software |
+| Local | The User, on a machine they control | The machine's own files, logins, and software |
 | Hosted | Neha, on the Space's own machine | An isolated environment Neha sets up, with files of its own, a terminal, and a browser |
+
+A Bot's loop and record live in its Space; its actions run on its Computer.
 
 ## Keeping files
 
@@ -30,7 +32,7 @@ A Local Computer keeps each Bot's Workspace on the machine, and the Space keeps 
 
 ## Assigning a Computer
 
-A Bot's page shows its Computer. The owner picks a Hosted Computer, or creates the Bot on the Local Computer where Neha runs.
+A Bot's page shows its Computer. The owner picks a Hosted Computer, or creates the Bot on a Local Computer they own.
 
 Only a Bot's owner can move it from one of their Local Computers to another Local Computer they own. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
 
@@ -38,11 +40,11 @@ Several Bots can be assigned the same Computer, and then share its files and log
 
 ## Adding a Local Computer
 
-A User adds the Local Computer of the machine where Neha runs. Joining needs no code: the Space issues a local ticket, and the User starts the pairing there and confirms it.
+A User adds a Local Computer they control. A signed-in client makes that machine available, and the Space pairs it with that User; [Identity](../identity/product.md#devices) covers the code.
 
-A Local Computer on the machine where Neha runs is the only Local Computer this contract covers. [Identity](../identity/design.md#codes) covers the ticket, and [CLI](../cli/product.md) covers the commands.
+A Local Computer MAY run on the machine that runs the Space or on another machine that can reach the Space. It connects out to the Space and listens on no network port.
 
-The Computer belongs to the User the ticket names; that owner sees it among their Local Computers and can assign their Bots to it, and other Users do not see it.
+The Computer belongs to the User the pairing names; that owner sees it among their Local Computers and can assign their Bots to it, and other Users do not see it.
 
 The machine serves the Space while it runs; after a stop, the User starts it again.
 
@@ -114,5 +116,4 @@ A credential never appears in a Chat or a Group.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
 - Waking a sleeping Computer is not yet specified and is low in priority.
 - Revoking a Computer's credential is not yet specified.
-- Adding a Computer on another machine is not yet specified.
 - Moving a Bot to or from a Hosted Computer is not yet specified, including how its Workspace is carried.

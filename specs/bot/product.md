@@ -8,7 +8,7 @@ Owned by bot. A Bot depends on [Computer](../computer/product.md) for where it l
 
 1. A Bot has exactly one owner.
 2. A Bot's memory is its own and goes where the Bot goes.
-3. A new Bot starts on a Hosted Computer. Its owner can create it on the Local Computer where Neha runs instead.
+3. A new Bot starts on a Hosted Computer. Its owner can create it on a Local Computer they control instead.
 
 ## Creating a Bot
 

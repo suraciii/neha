@@ -31,7 +31,7 @@ adds only the choice of where the Space lives.
 
 On first launch the shell shows **Choose a Space**:
 
-- **This computer** starts a private bundled Space and opens that Space's
+- **This computer** starts a Local Space and opens that Space's
   invitation or sign-in page. The shell never creates the Admin or signs in for
   the User.
 - **Existing Space** connects to an `https://` address, or a loopback `http://`
@@ -41,7 +41,7 @@ The chosen Space is remembered. Later launches open it directly; a missing
 session shows its sign-in page. **Change Space** forgets the choice, stops the
 local Space, and returns to the chooser.
 
-A remote Space starts no local Space and no Local Computer daemon. **This
+A Hosted Space starts no Local Space and no Local Computer daemon. **This
 computer** MAY start a Local Computer only when the User selects the explicit
 Local Computer checkbox in the launcher.
 

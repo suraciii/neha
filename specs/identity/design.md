@@ -15,11 +15,11 @@ Owned by identity. [CLI](../cli/product.md) and [Computer](../computer/product.m
 5. The Space stores only a hash of a token, never its plaintext.
 6. A client that loads the Space's own pages keeps its token only in an HttpOnly cookie. Any other client sends its token in the Authorization header.
 
-## The same Space, deployed two ways
+## Local Space and Hosted Space
 
 Every Space holds Accounts and signs Users in. Where a Space runs changes only its defaults.
 
-A Space on a user's own machine listens on that machine alone until its Admin opens it to the network. A server listens on the network from its first start.
+A Local Space listens on its own machine until its Admin opens it to the network. A Hosted Space listens on its server from its first start.
 
 ## Signing in without a prompt
 
@@ -36,6 +36,8 @@ A device that receives a link from a signed-in User trusts the certificate the l
 An invitation and a pairing code each admit one caller to one Space, work once, and expire. A pairing code is typed, so a User gets only a limited number of tries at it. The Space keeps a pairing code only as a hash, and a paired machine keeps the token that admits it.
 
 A Local Computer started on the Space's own machine uses no code. The User who pairs the machine confirms the pairing there.
+
+A Local Computer started on another machine uses a pairing code that a signed-in User enters there. The code admits that User and one Space.
 
 The Space issues a short-lived, one-use ticket that binds one User, one Space, and one Space start. Its database keeps only the ticket's digest, and a used or expired ticket admits no one.
 

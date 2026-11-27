@@ -247,7 +247,7 @@ target/debug/neha chat send --file notes.txt --bot "$RUNNER_ID" "Read the attach
 
 [Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.
 
-## Connect a remote client
+## Connect a client over the network
 
 A Space that a desktop or phone client reaches over the network sits behind a
 trusted TLS proxy. The proxy forwards to the Space's loopback listener and

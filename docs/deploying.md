@@ -1,6 +1,8 @@
 # Serve a Space on a domain
 
-A Space listens on loopback on the machine that runs it. To reach it from a phone or another computer, put a TLS proxy in front of it and name the public origin with `--domain` or `NEHA_DOMAIN` (a host with an optional port), or with `NEHA_PUBLIC_URL` (a full `https://` origin).
+A Space runs as a Local Space on the computer where the desktop app starts it, or as a Hosted Space on a server. This guide deploys a Hosted Space.
+
+A Space listens on loopback on the machine that runs it. To reach it from a phone or another computer, put a TLS proxy in front of it and name the public origin with `--domain` or `NEHA_DOMAIN` (a host with an optional port), or with `NEHA_PUBLIC_URL` (a full `https://` origin). The same proxy exposes a Space started with `neha serve`; the desktop app's Local Space does not offer this setup yet.
 
 The proxy is the only public port. The Space never opens one itself.
 
