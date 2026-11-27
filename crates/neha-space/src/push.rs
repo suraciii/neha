@@ -85,6 +85,12 @@ enum Delivery {
     Failed(u16),
 }
 
+enum Readiness {
+    Ready,
+    Muted,
+    Gone,
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 /// Resolves only addresses the Space may reach: public push services, and
@@ -168,6 +174,9 @@ impl Push {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
+            // A proxy would resolve the endpoint itself, outside the resolver
+            // below; the Space talks to the push service directly.
+            .no_proxy()
             .dns_resolver(std::sync::Arc::new(PublicResolver {
                 allow_loopback: cfg!(test),
             }))
@@ -339,6 +348,30 @@ impl Push {
         Some((subscriptions, payload))
     }
 
+    /// Whether this exact device may still receive the notice. A mute stops
+    /// every remaining device; a removed or re-subscribed device is skipped.
+    fn readiness(&self, notice: &Notice, sent: &Subscription) -> Readiness {
+        if self.storage_error.is_some() {
+            return Readiness::Muted;
+        }
+        let Ok(store) = self.store.lock() else {
+            return Readiness::Muted;
+        };
+        if store.muted_until.is_some_and(|until| until > now()) {
+            return Readiness::Muted;
+        }
+        if store.subscriptions.iter().any(|subscription| {
+            subscription.account == notice.account
+                && subscription.endpoint == sent.endpoint
+                && subscription.p256dh == sent.p256dh
+                && subscription.auth == sent.auth
+        }) {
+            Readiness::Ready
+        } else {
+            Readiness::Gone
+        }
+    }
+
     /// Sends one encrypted push request to one browser.
     async fn deliver(&self, subscription: &Subscription, payload: &[u8]) -> Delivery {
         let Some(key) = self.key else {
@@ -485,6 +518,11 @@ async fn process(server: &Arc<SpaceServer>, event: Event, cursor: &mut Seq) {
     // detached send behind. One slow endpoint delays the next device by at
     // most the request timeout.
     for subscription in subscriptions {
+        match server.push.readiness(&notice, &subscription) {
+            Readiness::Muted => break,
+            Readiness::Gone => continue,
+            Readiness::Ready => {}
+        }
         match server.push.deliver(&subscription, &payload).await {
             Delivery::Sent => {}
             Delivery::Gone => server.push.remove(&subscription),
@@ -625,26 +663,46 @@ fn public_destination(host: &str, address: Option<std::net::IpAddr>) -> bool {
 
 fn public_address(address: std::net::IpAddr) -> bool {
     match address {
-        std::net::IpAddr::V4(address) => {
-            !(address.is_loopback()
-                || address.is_private()
-                || address.is_link_local()
-                || address.is_unspecified()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.is_multicast())
-        }
+        std::net::IpAddr::V4(address) => public_ipv4(address),
         std::net::IpAddr::V6(address) => {
             if let Some(address) = address.to_ipv4_mapped() {
-                return public_address(std::net::IpAddr::V4(address));
+                return public_ipv4(address);
             }
+            let segments = address.segments();
             !(address.is_loopback()
                 || address.is_unspecified()
                 || address.is_multicast()
                 || address.is_unique_local()
-                || address.is_unicast_link_local())
+                || address.is_unicast_link_local()
+                || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+                || segments[0] == 0x2002)
         }
     }
+}
+
+/// The IPv4 ranges that are not globally routable. This is deliberately
+/// explicit: a resolver result and a literal take the same path.
+fn public_ipv4(address: std::net::Ipv4Addr) -> bool {
+    let octets = address.octets();
+    let shared = octets[0] == 100 && (64..=127).contains(&octets[1]);
+    let protocol = octets[0] == 192 && octets[1] == 0 && (octets[2] == 0 || octets[2] == 2);
+    let benchmark = octets[0] == 198 && (octets[1] == 18 || octets[1] == 19);
+    let documentation = (octets[0] == 198 && octets[1] == 51 && octets[2] == 100)
+        || (octets[0] == 203 && octets[1] == 0 && octets[2] == 113);
+    let relay = octets[0] == 192 && octets[1] == 88 && octets[2] == 99;
+    !(octets[0] == 0
+        || octets[0] == 10
+        || octets[0] == 127
+        || shared
+        || (octets[0] == 169 && octets[1] == 254)
+        || (octets[0] == 172 && (16..=31).contains(&octets[1]))
+        || (octets[0] == 192 && octets[1] == 168)
+        || protocol
+        || benchmark
+        || documentation
+        || relay
+        || octets[0] >= 224)
 }
 
 fn public_key(pair: &ES256KeyPair) -> Option<String> {
@@ -809,6 +867,10 @@ mod tests {
             "https://localhost/push",
             "https://10.0.0.1/push",
             "https://169.254.169.254/latest",
+            "https://100.64.0.1/push",
+            "https://198.18.0.1/push",
+            "https://192.0.2.1/push",
+            "https://0.0.0.0/push",
             "https://[::1]/push",
             "https://device.local/push",
         ] {
@@ -942,6 +1004,48 @@ mod tests {
     }
 
     #[test]
+    fn the_next_send_rechecks_mute_and_the_subscription() {
+        use Readiness::{Gone, Muted, Ready};
+
+        let (_directory, push) = push();
+        let account = Id::new();
+        push.subscribe(
+            account,
+            "https://push.example.com/first".to_owned(),
+            P256DH.to_owned(),
+            AUTH.to_owned(),
+        )
+        .unwrap();
+        push.subscribe(
+            account,
+            "https://push.example.com/second".to_owned(),
+            P256DH.to_owned(),
+            AUTH.to_owned(),
+        )
+        .unwrap();
+        let (first, second) = {
+            let store = push.store.lock().unwrap();
+            (
+                store.subscriptions[0].clone(),
+                store.subscriptions[1].clone(),
+            )
+        };
+        let notice = Notice {
+            account,
+            title: "Scout".to_owned(),
+            kind: "finished",
+            url: "/?chat=1".to_owned(),
+            tag: "chat-1".to_owned(),
+        };
+        assert!(matches!(push.readiness(&notice, &first), Ready));
+        push.unsubscribe(account, &second.endpoint).unwrap();
+        assert!(matches!(push.readiness(&notice, &second), Gone));
+        assert!(matches!(push.readiness(&notice, &first), Ready));
+        push.mute(60).unwrap();
+        assert!(matches!(push.readiness(&notice, &first), Muted));
+    }
+
+    #[test]
     fn a_muted_space_builds_no_notice() {
         let (state, user, _, _, run) = state();
         let (_directory, push) = push();
@@ -1038,6 +1142,63 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    #[test]
+    fn the_push_client_ignores_proxy_environment() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "push::tests::proxy_probe_child", "--nocapture"])
+            .env("ALL_PROXY", "http://127.0.0.1:9")
+            .env("HTTP_PROXY", "http://127.0.0.1:9")
+            .env("HTTPS_PROXY", "http://127.0.0.1:9")
+            .env("NO_PROXY", "")
+            .status()
+            .unwrap();
+        assert!(status.success(), "a proxy must not intercept push delivery");
+    }
+
+    #[test]
+    fn proxy_probe_child() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk)
+                        .await
+                        .unwrap();
+                    request.extend_from_slice(&chunk[..read]);
+                    if read == 0 || request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut socket,
+                    b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            });
+            let (_directory, push) = push();
+            let subscription = Subscription {
+                endpoint: format!("http://{address}/push"),
+                p256dh: P256DH.to_owned(),
+                auth: AUTH.to_owned(),
+                account: Id::new(),
+            };
+            assert!(matches!(
+                push.deliver(&subscription, br#"{"kind":"finished"}"#).await,
+                Delivery::Sent
+            ));
+            server.await.unwrap();
+        });
     }
 
     #[test]

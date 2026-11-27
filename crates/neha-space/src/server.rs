@@ -3638,15 +3638,15 @@ mod tests {
         // instead of advancing its cursor over it.
         let drafts = vec![
             neha::record::EventDraft::new(
-                neha::record::EventKind::RunStep,
-                neha::record::Author::Bot(bot),
-                serde_json::json!({"run": run, "step": 1, "tool_calls": 0}),
-            )
-            .acting(account),
-            neha::record::EventDraft::new(
                 neha::record::EventKind::RunFinished,
                 neha::record::Author::Bot(bot),
                 serde_json::json!({"run": run, "status": "succeeded", "reply": reply}),
+            )
+            .acting(account),
+            neha::record::EventDraft::new(
+                neha::record::EventKind::RunStep,
+                neha::record::Author::Bot(bot),
+                serde_json::json!({"run": run, "step": 1, "tool_calls": 0}),
             )
             .acting(account),
         ];
@@ -3668,14 +3668,16 @@ mod tests {
             .find(|event| event.kind == neha::record::EventKind::RunStep)
             .unwrap()
             .clone();
+        // Publish the higher, non-notification step first. The finish is lower
+        // and must be recovered from the ordered record, or the device only
+        // sees the step and the cursor skips the finish.
         for _ in 0..100 {
-            if running.server.events.send(finished.clone()).is_ok() {
+            if running.server.events.send(step.clone()).is_ok() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Replaying the lower sequence and the same finish must not deliver
-        // either a second time.
+        // Replaying both must not deliver a second time.
         let _ = running.server.events.send(step);
         let _ = running.server.events.send(finished);
         let (request, duplicate) = tokio::time::timeout(std::time::Duration::from_secs(2), device)
@@ -3685,6 +3687,175 @@ mod tests {
         assert!(request.contains("authorization: vapid t="), "{request}");
         assert!(request.contains("content-encoding: aes128gcm"), "{request}");
         assert!(!duplicate, "the same finish must reach the device once");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mute_stops_the_next_device_in_the_same_event() {
+        const P256DH: &str = "BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY";
+        const AUTH: &str = "_ordMnz7uTCmrpBTeUV4Bw";
+
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let account: Id = session["account"]["id"].as_str().unwrap().parse().unwrap();
+        let bot = Id::new();
+        let chat = Id::new();
+        let run = Id::new();
+        let reply = Id::new();
+        let computer = Id::new();
+
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first.local_addr().unwrap();
+        let (accepted, wait_accepted) = tokio::sync::oneshot::channel();
+        let (release, wait_release) = tokio::sync::oneshot::channel();
+        let first_device = tokio::spawn(async move {
+            let (mut socket, _) = first.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk)
+                    .await
+                    .unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = accepted.send(());
+            let _ = wait_release.await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            String::from_utf8_lossy(&request).to_lowercase()
+        });
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second.local_addr().unwrap();
+
+        running
+            .server
+            .push
+            .subscribe(
+                account,
+                format!("http://{first_address}/push"),
+                P256DH.to_owned(),
+                AUTH.to_owned(),
+            )
+            .unwrap();
+        running
+            .server
+            .push
+            .subscribe(
+                account,
+                format!("http://{second_address}/push"),
+                P256DH.to_owned(),
+                AUTH.to_owned(),
+            )
+            .unwrap();
+        {
+            let mut state = running.server.state.lock().unwrap();
+            state.bots.insert(
+                bot,
+                crate::state::BotView {
+                    id: bot,
+                    owner: account,
+                    name: "Scout".to_owned(),
+                    computer,
+                    chat,
+                    full_access: false,
+                    grants: Vec::new(),
+                    thinking: None,
+                    model: None,
+                },
+            );
+            state.chats.insert(
+                chat,
+                crate::state::ChatView {
+                    id: chat,
+                    owner: account,
+                    bot,
+                    status: crate::state::ChatStatus::Idle,
+                    active_run: None,
+                },
+            );
+            state.runs.insert(
+                run,
+                crate::state::RunView {
+                    id: run,
+                    chat,
+                    bot,
+                    acting: account,
+                    command: Id::new(),
+                    message: Id::new(),
+                    seq: neha::seq::Seq::ZERO,
+                    started: None,
+                    status: neha::record::RunStatus::Succeeded,
+                    reply: Some(reply),
+                    usage: None,
+                    error: None,
+                    approval: None,
+                    cwd: None,
+                    cwd_writable: false,
+                    once_grant: None,
+                    computer: None,
+                    access: None,
+                    steps: Vec::new(),
+                    actions: Vec::new(),
+                },
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                "mute-test",
+                vec![
+                    neha::record::EventDraft::new(
+                        neha::record::EventKind::RunFinished,
+                        neha::record::Author::Bot(bot),
+                        serde_json::json!({"run": run, "status": "succeeded", "reply": reply}),
+                    )
+                    .acting(account),
+                ],
+            ))
+            .await
+            .unwrap();
+        let event = appended.events.first().unwrap().clone();
+        for _ in 0..100 {
+            if running.server.events.send(event.clone()).is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        wait_accepted
+            .await
+            .expect("the first device received the first request");
+        running.server.push.mute(60).unwrap();
+        let _ = release.send(());
+        let first_request = tokio::time::timeout(std::time::Duration::from_secs(2), first_device)
+            .await
+            .expect("the first device finished")
+            .unwrap();
+        assert!(first_request.contains("authorization: vapid t="));
+        // The second accept now covers the window after the first response, so
+        // a send that ignored the mute would be seen here.
+        let second_device = tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_millis(700), second.accept()).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), second_device)
+                .await
+                .expect("the second device check finished")
+                .unwrap()
+                .is_err(),
+            "a muted Space must not start the next device"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

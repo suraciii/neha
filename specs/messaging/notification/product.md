@@ -61,7 +61,7 @@ A Notification arrives as a system notification on the User's desktop and phone,
 
 A browser receives Web Push only after the User enables notifications on that device. On iOS and iPadOS, Web Push is available only to an installed Home Screen app; the client shows that prerequisite instead of asking for permission.
 
-A subscription belongs to one device. The Space stores it and sends only to the devices of the User it acts for, over a public HTTPS push service. Redirects stay disabled and a private destination is refused.
+A subscription belongs to one device. The Space stores it and sends only to the devices of the User it acts for, over a public HTTPS push service. It connects directly and resolves only globally routable addresses; redirects stay disabled and a private destination is refused.
 
 The payload names the Bot and what happened, not the content of the work, and carries a same-origin address, never a token.
 

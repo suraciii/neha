@@ -36,7 +36,7 @@ If you open the Space in Safari instead, Neha shows the Add to Home Screen hint 
 - **Turn off on this device** removes this browser's subscription. Other devices keep theirs.
 - The browser's own site settings can also block notifications; Neha reports when that is the case.
 
-A Space that is not running cannot send a notification.
+A Space that is not running cannot send a notification. The Space connects to the push service directly; a mandatory outbound HTTP proxy would block notifications.
 
 ## Privacy
 
