@@ -3344,6 +3344,49 @@ mod tests {
         );
     }
 
+    /// A skill script the Space delivers runs through the channel: the daemon
+    /// writes it inside the Bot's folder and answers with the shell's output.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_script_runs_through_the_channel() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        let config = channel_config(workspace.path());
+        let content = "#!/bin/sh\nprintf 'hello %s' \"$1\"\n";
+
+        let answer = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Action {
+                id: 1,
+                bot: bot.to_string(),
+                action: WireAction::RunScript {
+                    name: "greet.sh".to_owned(),
+                    content: content.to_owned(),
+                    arguments: vec!["space".to_owned()],
+                },
+                working_dir: None,
+                access: AccessFrame::default(),
+                env: Vec::new(),
+            },
+        )
+        .await;
+
+        let DeviceFrame::Result { status, output, .. } = answer else {
+            panic!("expected a result, got {answer:?}");
+        };
+        assert_eq!(status, ActionStatus::Succeeded, "{output:?}");
+        assert!(output.text.contains("hello space"), "{output:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join(".neha/skills/greet.sh")).unwrap(),
+            content
+        );
+    }
+
     /// The run directory from the frame names the folder it says, trailing
     /// space included: the daemon does not trim a path the Space normalized.
     #[cfg(unix)]

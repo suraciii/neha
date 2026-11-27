@@ -41,6 +41,21 @@ const MAX_READ_BYTES: usize = 8 * 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 1000;
 /// The largest shell command a tool accepts.
 pub const MAX_COMMAND_BYTES: usize = 64 * 1024;
+/// The longest file name a skill script may be written under.
+const MAX_SCRIPT_NAME_BYTES: usize = 255;
+/// How many arguments one skill script may take.
+const MAX_SCRIPT_ARGUMENTS: usize = 64;
+/// How large one skill script argument may be.
+const MAX_SCRIPT_ARGUMENT_BYTES: usize = 4 * 1024;
+/// The file mode a real-machine write keeps: private to the machine user.
+#[cfg(unix)]
+const FILE_MODE: u32 = 0o600;
+/// The file mode a skill script is written with, so the shell can execute it.
+/// Windows has no execute bit, so a script there keeps the mode its write has.
+#[cfg(unix)]
+const SCRIPT_MODE: Option<u32> = Some(0o755);
+#[cfg(not(unix))]
+const SCRIPT_MODE: Option<u32> = None;
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// The system directories a shell searches for its commands.
 const SHELL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -866,8 +881,14 @@ impl LocalRuntime {
     /// Returns the path to show a reader (relative to the write root). A
     /// managed workspace keeps its check-then-write path; a real machine writes
     /// only through directory file descriptors, so no symlink is followed and
-    /// no check-to-open window exists.
-    fn write_to_root(&self, input: &str, bytes: &[u8]) -> Result<String, ByteError> {
+    /// no check-to-open window exists. `mode` is the mode the written file
+    /// keeps, or `None` for the one a plain tool write has.
+    fn write_to_root(
+        &self,
+        input: &str,
+        bytes: &[u8],
+        mode: Option<u32>,
+    ) -> Result<String, ByteError> {
         match &self.mode {
             Mode::Managed => {
                 let path = self.resolve_managed(input).map_err(ByteError::Failed)?;
@@ -882,6 +903,9 @@ impl LocalRuntime {
                 std::fs::write(&path, bytes).map_err(|error| {
                     ByteError::Failed(format!("cannot write {}: {error}", path.display()))
                 })?;
+                if let Some(mode) = mode {
+                    set_file_mode(&path, mode)?;
+                }
 
                 Ok(self.relative(&path))
             }
@@ -917,12 +941,12 @@ impl LocalRuntime {
                     let root = std::fs::File::open("/").map_err(|error| {
                         ByteError::Failed(format!("cannot open the machine root: {error}"))
                     })?;
-                    write_machine_file(&root, &relative.to_string_lossy(), bytes)?;
+                    write_machine_file(&root, &relative.to_string_lossy(), bytes, mode)?;
                     return Ok(shown.to_owned());
                 }
                 let written = if let Ok(relative) = target.strip_prefix(&self.root) {
                     let relative = relative.to_string_lossy();
-                    write_machine_file(folder, &relative, bytes)?;
+                    write_machine_file(folder, &relative, bytes, mode)?;
                     shown.to_owned()
                 } else if let Some((root, write_root)) = self
                     .write_roots
@@ -933,7 +957,7 @@ impl LocalRuntime {
                         .strip_prefix(root)
                         .map_err(|_| ByteError::Failed("the path left its write root".to_owned()))?
                         .to_string_lossy();
-                    write_machine_file(write_root, &relative, bytes)?;
+                    write_machine_file(write_root, &relative, bytes, mode)?;
                     shown.to_owned()
                 } else if path.is_absolute() {
                     return Err(ByteError::Failed(format!(
@@ -1100,7 +1124,7 @@ impl LocalRuntime {
                 "the content is larger than {MAX_WRITE_BYTES} bytes"
             ));
         }
-        match self.write_to_root(path, content.as_bytes()) {
+        match self.write_to_root(path, content.as_bytes(), None) {
             Ok(shown) => ActionResult::succeeded(ToolOutput::full(format!(
                 "wrote {} bytes to {shown}",
                 content.len()
@@ -1131,6 +1155,48 @@ impl LocalRuntime {
         };
 
         ActionResult::succeeded(truncate(lines.join("\n")))
+    }
+
+    /// Writes one skill script inside the Workspace and runs it there.
+    ///
+    /// The script is the Space's own bytes, not the Bot's: it is written
+    /// through the path a tool write uses, given the execute bit, and run
+    /// through this runtime's shell, so the sandbox, the write fence, the
+    /// output limits, and the time limit apply exactly as they do to a
+    /// command. A script that this platform's shell cannot run as written
+    /// ends as its own failed command; nothing else is tried instead.
+    async fn run_script(&self, name: &str, content: &str, arguments: &[String]) -> ActionResult {
+        if let Err(message) = check_script_name(name) {
+            return ActionResult::failed(message);
+        }
+        if content.len() > MAX_WRITE_BYTES {
+            return ActionResult::failed(format!(
+                "the content is larger than {MAX_WRITE_BYTES} bytes"
+            ));
+        }
+        if arguments.len() > MAX_SCRIPT_ARGUMENTS {
+            return ActionResult::failed(format!(
+                "a script takes at most {MAX_SCRIPT_ARGUMENTS} arguments"
+            ));
+        }
+        for argument in arguments {
+            if argument.is_empty() {
+                return ActionResult::failed("a script argument is empty");
+            }
+            if argument.len() > MAX_SCRIPT_ARGUMENT_BYTES {
+                return ActionResult::failed(format!(
+                    "a script argument is larger than {MAX_SCRIPT_ARGUMENT_BYTES} bytes"
+                ));
+            }
+        }
+        // Every check passes before a byte is written, so a refused script
+        // leaves the Workspace as it was.
+        if let Err(error) = self.write_to_root(&script_path(name), content.as_bytes(), SCRIPT_MODE)
+        {
+            return ActionResult::failed(error.to_string());
+        }
+
+        self.shell(&script_command(name, arguments)).await
     }
 
     /// Lists one directory of a real machine through the descriptor it opened.
@@ -1576,6 +1642,11 @@ impl ComputerRuntime for LocalRuntime {
                 Action::ReadFile { path } => self.read_file(&path),
                 Action::WriteFile { path, content } => self.write_file(&path, &content),
                 Action::ListFiles { path } => self.list_files(&path),
+                Action::RunScript {
+                    name,
+                    content,
+                    arguments,
+                } => self.run_script(&name, &content, &arguments).await,
             }
         }
     }
@@ -1631,7 +1702,7 @@ impl ComputerRuntime for LocalRuntime {
                     neha::file::MAX_FILE_BYTES
                 )));
             }
-            self.write_to_root(&path, &bytes).map(|_shown| ())
+            self.write_to_root(&path, &bytes, None).map(|_shown| ())
         }
     }
 }
@@ -2172,6 +2243,77 @@ fn unsafe_folder(folder_path: &Path, problem: impl std::fmt::Display) -> Runtime
     ))
 }
 
+/// Checks that one skill script name is exactly one path component.
+///
+/// The name becomes a file name inside the Workspace, so a name that could
+/// point somewhere else — a separator, a dot, whitespace, or a control
+/// character — is refused before anything is written.
+fn check_script_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("the script name is empty".to_owned());
+    }
+    if name.len() > MAX_SCRIPT_NAME_BYTES {
+        return Err(format!(
+            "the script name is larger than {MAX_SCRIPT_NAME_BYTES} bytes"
+        ));
+    }
+    if name != name.trim() {
+        return Err("the script name has leading or trailing whitespace".to_owned());
+    }
+    if name.chars().any(char::is_control) {
+        return Err("the script name holds a control character".to_owned());
+    }
+    if name.contains('/') || name.contains('\\') || matches!(name, "." | "..") {
+        return Err(format!("{name:?} is not one script file name"));
+    }
+
+    Ok(())
+}
+
+/// The path one skill script is written under, inside the Workspace.
+fn script_path(name: &str) -> String {
+    format!(".neha/skills/{name}")
+}
+
+/// Builds the shell line that runs one skill script with its arguments.
+///
+/// The shell starts in the Workspace, so the script is named by its path
+/// inside it. Every word of a POSIX line is single-quoted; a Windows line
+/// keeps the path form `cmd.exe` accepts and double-quotes each argument.
+#[cfg(not(windows))]
+fn script_command(name: &str, arguments: &[String]) -> String {
+    let mut command = single_quoted(&script_path(name));
+    for argument in arguments {
+        command.push(' ');
+        command.push_str(&single_quoted(argument));
+    }
+
+    command
+}
+
+#[cfg(windows)]
+fn script_command(name: &str, arguments: &[String]) -> String {
+    let path = format!(".neha\\skills\\{name}");
+    // A path that needs no quotes stays bare: PowerShell would only echo a
+    // lone quoted string instead of running it.
+    let mut command = if path.contains([' ', '"']) {
+        format!("\"{}\"", path.replace('"', "\"\""))
+    } else {
+        path
+    };
+    for argument in arguments {
+        command.push_str(&format!(" \"{}\"", argument.replace('"', "\"\"")));
+    }
+
+    command
+}
+
+/// Quotes one word for the POSIX shell a runtime starts.
+#[cfg(not(windows))]
+fn single_quoted(word: &str) -> String {
+    format!("'{}'", word.replace('\'', "'\\''"))
+}
+
 /// Opens the Bot's folder under `workspace`, creating it when absent.
 ///
 /// `open_directory_at` never follows a symlink, so neither a Bot folder that
@@ -2512,8 +2654,15 @@ fn open_write_root(_directory: &str) -> std::io::Result<(PathBuf, std::fs::File)
 /// cannot move the write out of the folder and there is no check-then-open
 /// window. The target is opened without `O_TRUNC`, checked with `fstat` — it
 /// must be a regular file with one link — and only then truncated and written.
+/// `mode` is the mode the written file keeps, or `None` for the private one a
+/// plain tool write has.
 #[cfg(unix)]
-fn write_machine_file(folder: &std::fs::File, input: &str, bytes: &[u8]) -> Result<(), ByteError> {
+fn write_machine_file(
+    folder: &std::fs::File,
+    input: &str,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<(), ByteError> {
     use std::io::Write as _;
     use std::os::unix::fs::MetadataExt as _;
 
@@ -2529,7 +2678,7 @@ fn write_machine_file(folder: &std::fs::File, input: &str, bytes: &[u8]) -> Resu
     for name in components {
         directory = open_or_create_directory(&directory, &name, &shown)?;
     }
-    let mut file = open_target_file(&directory, &last, &shown)?;
+    let mut file = open_target_file(&directory, &last, &shown, mode)?;
     let metadata = file
         .metadata()
         .map_err(|error| ByteError::Failed(format!("cannot write {shown}: {error}")))?;
@@ -2540,6 +2689,9 @@ fn write_machine_file(folder: &std::fs::File, input: &str, bytes: &[u8]) -> Resu
         return Err(ByteError::Failed(format!(
             "the path is a hard link, which is not written through: {shown}"
         )));
+    }
+    if let Some(mode) = mode {
+        set_descriptor_mode(&file, mode, &shown)?;
     }
     file.set_len(0)
         .and_then(|()| file.write_all(bytes))
@@ -2556,10 +2708,51 @@ fn write_machine_file(
     _folder: &std::fs::File,
     _input: &str,
     _bytes: &[u8],
+    _mode: Option<u32>,
 ) -> Result<(), ByteError> {
     Err(ByteError::Failed(
         "a real Computer writes only on Unix".to_owned(),
     ))
+}
+
+/// Makes one opened file the mode its writer asked for.
+///
+/// The mode belongs to the descriptor, not to a path: a name swapped in after
+/// the write must not turn the chmod into one on another file.
+#[cfg(unix)]
+fn set_descriptor_mode(file: &std::fs::File, mode: u32, shown: &str) -> Result<(), ByteError> {
+    use std::os::fd::AsRawFd as _;
+
+    // SAFETY: `file` is an owned descriptor and `fchmod` changes only its
+    // mode.
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+        return Err(ByteError::Failed(format!(
+            "cannot write {shown}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    Ok(())
+}
+
+/// Applies the mode one written file keeps.
+///
+/// Windows has no execute bit, so only a POSIX write asks for a mode; its
+/// shell decides what it can run.
+fn set_file_mode(path: &Path, mode: u32) -> Result<(), ByteError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .map_err(|error| ByteError::Failed(format!("cannot write {}: {error}", path.display())))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+
+        Ok(())
+    }
 }
 
 /// Splits a real machine's write path into safe components.
@@ -2753,11 +2946,15 @@ fn directory_error(
 
 /// Opens the file a write ends at, without following a symlink, without
 /// blocking on a FIFO, and without truncating it yet.
+///
+/// `mode` is the mode a newly created file keeps, or `None` for the private
+/// one a plain tool write has.
 #[cfg(unix)]
 fn open_target_file(
     parent: &std::fs::File,
     name: &std::ffi::OsStr,
     shown: &str,
+    mode: Option<u32>,
 ) -> Result<std::fs::File, ByteError> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _};
 
@@ -2784,11 +2981,12 @@ fn open_target_file(
         Err(_) => {}
     }
     let name = c_name(name).map_err(ByteError::Failed)?;
+    let creation = mode.unwrap_or(FILE_MODE) as libc::mode_t;
     let flags =
         libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // SAFETY: `parent` is a live directory descriptor and `name` is
     // NUL-terminated; a successful return is a fresh descriptor owned here.
-    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags, creation) };
     if fd >= 0 {
         // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
         return Ok(unsafe { std::fs::File::from_raw_fd(fd) });
@@ -3218,8 +3416,9 @@ mod tests {
     use neha::file::MAX_FILE_BYTES;
 
     use super::{
-        DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, Mode, RuntimeError, find_bwrap,
-        open_directory_path, open_write_root, probe_hosted, sandbox_args,
+        DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, MAX_SCRIPT_ARGUMENT_BYTES,
+        MAX_SCRIPT_ARGUMENTS, MAX_SCRIPT_NAME_BYTES, MAX_WRITE_BYTES, Mode, RuntimeError,
+        find_bwrap, open_directory_path, open_write_root, probe_hosted, sandbox_args,
     };
     use crate::action::{Action, ActionStatus, ByteError, ComputerRuntime};
 
@@ -3595,6 +3794,125 @@ mod tests {
 
         assert_eq!(result.status, ActionStatus::Succeeded);
         assert!(result.output.text.contains("42"), "{}", result.output.text);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runs_a_skill_script_with_its_arguments() {
+        let (_dir, runtime) = runtime();
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "echo-args.sh".to_owned(),
+                content: "#!/bin/sh\nprintf '[%s]' \"$@\"\n".to_owned(),
+                arguments: vec!["one".to_owned(), "two words".to_owned()],
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            result.output.text.contains("[one][two words]"),
+            "{}",
+            result.output.text
+        );
+        assert!(
+            runtime
+                .workspace()
+                .join(".neha/skills/echo-args.sh")
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_skill_script_is_written_executable_inside_the_workspace() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, runtime) = runtime();
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "mode.sh".to_owned(),
+                content: "#!/bin/sh\ntrue\n".to_owned(),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        let script = runtime.workspace().join(".neha/skills/mode.sh");
+        let mode = std::fs::metadata(&script)
+            .expect("the script is written inside the Workspace")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "{script:?}");
+    }
+
+    #[tokio::test]
+    async fn a_skill_script_name_that_names_another_place_is_refused() {
+        let (_dir, runtime) = runtime();
+        let long = "n".repeat(MAX_SCRIPT_NAME_BYTES + 1);
+        for name in [
+            "",
+            " ",
+            " x",
+            "x ",
+            ".",
+            "..",
+            "../escape",
+            "a/b",
+            "a\\b",
+            "x\ny",
+            long.as_str(),
+        ] {
+            let result = runtime
+                .execute(Action::RunScript {
+                    name: name.to_owned(),
+                    content: "#!/bin/sh\ntrue\n".to_owned(),
+                    arguments: Vec::new(),
+                })
+                .await;
+
+            assert_eq!(result.status, ActionStatus::Failed, "{name:?}");
+        }
+        assert!(
+            !runtime.workspace().join(".neha").exists(),
+            "a refused script writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skill_script_larger_than_the_write_limit_is_refused() {
+        let (_dir, runtime) = runtime();
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "big.sh".to_owned(),
+                content: "a".repeat(MAX_WRITE_BYTES + 1),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed);
+        assert!(!runtime.workspace().join(".neha").exists());
+    }
+
+    #[tokio::test]
+    async fn a_skill_script_with_an_unusable_argument_is_refused() {
+        let (_dir, runtime) = runtime();
+        let long = "a".repeat(MAX_SCRIPT_ARGUMENT_BYTES + 1);
+        for arguments in [
+            vec![String::new()],
+            vec![long],
+            vec!["ok".to_owned(); MAX_SCRIPT_ARGUMENTS + 1],
+        ] {
+            let result = runtime
+                .execute(Action::RunScript {
+                    name: "args.sh".to_owned(),
+                    content: "#!/bin/sh\ntrue\n".to_owned(),
+                    arguments,
+                })
+                .await;
+
+            assert_eq!(result.status, ActionStatus::Failed);
+        }
+        assert!(!runtime.workspace().join(".neha").exists());
     }
 
     #[tokio::test]
@@ -4318,6 +4636,52 @@ mod tests {
 
         assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
         assert!(!sink.exists(), "the sandbox wrote outside the folder");
+    }
+
+    #[tokio::test]
+    async fn a_real_shell_runs_a_skill_script_from_the_bot_folder() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "where.sh".to_owned(),
+                content: "#!/bin/sh\npwd\n".to_owned(),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert!(
+            result
+                .output
+                .text
+                .contains(&runtime.workspace().to_string_lossy().into_owned()),
+            "{}",
+            result.output.text
+        );
+    }
+
+    #[tokio::test]
+    async fn a_skill_script_runs_under_the_sandbox() {
+        let Some((_dir, runtime)) = machine_runtime() else {
+            return;
+        };
+        let outside = outside_tempdir();
+        let sink = outside.path().join("pwned.txt");
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "escape.sh".to_owned(),
+                content: format!("#!/bin/sh\nprintf hi > {}\n", sink.display()),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(
+            !sink.exists(),
+            "the sandbox let a skill script write outside the folder"
+        );
     }
 
     #[tokio::test]

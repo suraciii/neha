@@ -1904,6 +1904,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             store: &server.store,
                             state: &server.state,
                             home: &server.home,
+                            blobs: &server.blobs,
                             secrets: &server.secrets,
                             identity: &server.identity,
                             links: &server.links,
@@ -2979,11 +2980,12 @@ mod tests {
     use neha::error::ErrorCode;
     use neha::file::MAX_FILE_BYTES;
     use neha::id::Id;
+    use neha::record::SkillLibrary;
     use neha::record::{Author, EventDraft, EventKind};
     use neha::seq::Seq;
     use neha::surface::{
         BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
-        ProviderConnect, ProviderProtocol, ThinkingLevel,
+        ProviderConnect, ProviderProtocol, SkillAdd, SkillAddScript, ThinkingLevel,
     };
     use serde_json::Value;
     use tokio::net::TcpStream;
@@ -3244,6 +3246,20 @@ mod tests {
         let (base, task, _gates, _recorded) = gated_provider(script).await;
 
         (base, task)
+    }
+
+    /// A scripted Provider that keeps the requests it saw, for a test that
+    /// asserts what reached the Model.
+    async fn scripted_provider_recording(
+        script: Vec<ScriptedReply>,
+    ) -> (
+        String,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
+        let (base, task, _gates, recorded) = gated_provider(script).await;
+
+        (base, task, recorded)
     }
 
     fn hold(text: &str) -> ScriptedReply {
@@ -12729,6 +12745,7 @@ mod tests {
             store: &server.store,
             state: &server.state,
             home: &server.home,
+            blobs: &server.blobs,
             secrets: &server.secrets,
             identity: &server.identity,
             links: &server.links,
@@ -12758,6 +12775,24 @@ mod tests {
         .await
     }
 
+    fn add_script_rule(
+        bot: Id,
+        effect: neha::record::RuleEffect,
+        skill: &str,
+        script: &str,
+    ) -> CommandCall {
+        CommandCall::RuleAdd {
+            bot,
+            effect,
+            tool: "run_skill_script".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: Some(skill.to_owned()),
+            script: Some(script.to_owned()),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn add_rule(
         bot: Id,
         effect: neha::record::RuleEffect,
@@ -12771,6 +12806,8 @@ mod tests {
             tool: tool.to_owned(),
             command_prefix: command_prefix.map(ToOwned::to_owned),
             path_prefix: path_prefix.map(ToOwned::to_owned),
+            skill: None,
+            script: None,
         }
     }
 
@@ -13255,6 +13292,7 @@ mod tests {
             store: &server.store,
             state: &server.state,
             home: &server.home,
+            blobs: &server.blobs,
             secrets: &server.secrets,
             identity: &server.identity,
             links: &server.links,
@@ -17410,6 +17448,629 @@ mod tests {
             "the retry must not recreate a deleted rule: {rules:?}"
         );
 
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+    /// The `SkillAdd` that adds one skill with its scripts.
+    fn add_skill(bot: Option<Id>, document: &str, scripts: &[(&str, &str)]) -> CommandCall {
+        CommandCall::SkillAdd(SkillAdd {
+            library: if bot.is_some() {
+                SkillLibrary::Bot
+            } else {
+                SkillLibrary::Space
+            },
+            bot,
+            document: document.to_owned(),
+            scripts: scripts
+                .iter()
+                .map(|(name, content)| SkillAddScript {
+                    name: (*name).to_owned(),
+                    content: (*content).to_owned(),
+                })
+                .collect(),
+        })
+    }
+
+    /// The tool names in one recorded Model request.
+    fn tool_names(request: &Value) -> Vec<String> {
+        request["tools"]
+            .as_array()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The system text in one recorded Model request.
+    fn system_text(request: &Value) -> String {
+        request["messages"]
+            .as_array()
+            .map(|messages| {
+                messages
+                    .iter()
+                    .filter(|message| message["role"] == "system")
+                    .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skill_enters_the_bot_context_only_when_enabled() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task, recorded) =
+            scripted_provider_recording(vec![text("done"), text("done")]).await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: weekly-report\ndescription: Write the weekly status report.\n---\nCollect the docs.",
+                &[],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        // The Space's library holds it; the Bot has not enabled it.
+        let listed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::SkillList { bot: Some(bot) },
+        )
+        .await;
+        assert_eq!(listed, json!([]), "an added skill is not enabled");
+        let queued = submit(&mut socket, chat, "hello", None).await;
+        finish(&mut socket, chat, queued).await;
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            let names = tool_names(&requests[0]);
+            assert!(
+                !names.iter().any(|name| name == "skill"),
+                "a Bot without skills is offered no skill tool: {names:?}"
+            );
+            assert!(!system_text(&requests[0]).contains("weekly-report"));
+        }
+
+        let enabled = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        assert_eq!(enabled["enabled"], json!(true));
+        let queued = submit(&mut socket, chat, "again", None).await;
+        finish(&mut socket, chat, queued).await;
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let names = tool_names(&requests[1]);
+            assert!(
+                names.iter().any(|name| name == "skill"),
+                "an enabled skill offers the skill tool: {names:?}"
+            );
+            assert!(
+                !names.iter().any(|name| name == "run_skill_script"),
+                "a skill without scripts offers no script tool: {names:?}"
+            );
+            let system = system_text(&requests[1]);
+            assert!(
+                system.contains("weekly-report: Write the weekly status report."),
+                "{system}"
+            );
+        }
+
+        // Disabling takes the skill's name and tool away again.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillDisable { bot, skill },
+        )
+        .await;
+        let queued = submit(&mut socket, chat, "third", None).await;
+        finish(&mut socket, chat, queued).await;
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 3);
+            assert!(!tool_names(&requests[2]).iter().any(|name| name == "skill"));
+            assert!(!system_text(&requests[2]).contains("weekly-report"));
+        }
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_loads_a_skill_body_without_an_approval() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let body = "1. Collect the docs.\n2. Summarize under a page.";
+        let (base, provider_task, recorded) = scripted_provider_recording(vec![
+            tool("skill", json!({"name": "weekly-report"})),
+            text("done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                &format!(
+                    "---\nname: weekly-report\ndescription: Write the weekly status report.\n---\n{body}"
+                ),
+                &[],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert!(
+            approvals_in(&mut socket, None).await.is_empty(),
+            "loading a skill touches no Computer and asks nobody"
+        );
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            let tool_messages: Vec<&Value> = requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            let text = tool_messages
+                .last()
+                .and_then(|message| message["content"].as_str())
+                .unwrap_or_default();
+            assert!(
+                text.contains(body),
+                "the skill's body reaches the Model: {text}"
+            );
+            assert!(
+                !text.contains("description:"),
+                "the frontmatter stays out of the body: {text}"
+            );
+        }
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_asks_before_its_first_run_and_always_allow_covers_it() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task, recorded) = scripted_provider_recording(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["world"]}),
+            ),
+            text("done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["again"]}),
+            ),
+            text("second done"),
+        ])
+        .await;
+        let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+                &[("hello.sh", "printf 'hello %s' \"$1\"")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["reason"], "first_script_run");
+        assert_eq!(approvals[0]["tool"], "run_skill_script");
+        assert_eq!(approvals[0]["arguments"]["skill"], "hello");
+        assert_eq!(approvals[0]["arguments"]["script"], "hello.sh");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut socket, approval, true, true).await;
+        assert_eq!(decided["status"], "allowed");
+        assert!(
+            decided["rule"].is_string(),
+            "Always allow writes a rule: {decided}"
+        );
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+        {
+            // The script's own output is the action's result.
+            let requests = recorded.lock().unwrap();
+            let results: Vec<&str> = requests[1]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .filter_map(|message| message["content"].as_str())
+                .collect();
+            assert!(
+                results.iter().any(|text| text.contains("hello world")),
+                "the script ran with its argument: {results:?}"
+            );
+        }
+
+        // The rule names the skill and its script.
+        let rules = approvals_of(&mut socket, bot).await;
+        let rule = rules
+            .iter()
+            .find(|rule| rule["rule"] == decided["rule"])
+            .unwrap_or_else(|| panic!("the derived rule is listed: {rules:?}"));
+        assert_eq!(rule["tool"], "run_skill_script");
+        assert_eq!(rule["skill"], "hello");
+        assert_eq!(rule["script"], "hello.sh");
+        assert_eq!(rule["effect"], "allow");
+
+        // The second run needs no answer.
+        let second = submit(&mut socket, chat, "again", None).await;
+        let second_run = run_of(&second);
+        let finished = wait_run(&mut socket, second_run).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert!(
+            approvals_in(&mut socket, Some(chat)).await.is_empty(),
+            "a lasting rule answers the second run"
+        );
+        assert_eq!(last_message(&mut socket, chat).await["text"], "second done");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_local_script_run_asks_once_and_its_rule_answers_later_runs() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("first done"),
+                tool(
+                    "run_skill_script",
+                    json!({"skill": "hello", "script": "hello.sh", "arguments": ["one"]}),
+                ),
+                text("script done"),
+                tool(
+                    "run_skill_script",
+                    json!({"skill": "hello", "script": "hello.sh", "arguments": ["two"]}),
+                ),
+                text("second script done"),
+                tool(
+                    "run_skill_script",
+                    json!({"skill": "hello", "script": "hello.sh", "arguments": ["three"]}),
+                ),
+                text("third script done"),
+                tool(
+                    "run_skill_script",
+                    json!({"skill": "hello", "script": "hello.sh", "arguments": ["four"]}),
+                ),
+                text("fourth script done"),
+            ],
+        )
+        .await;
+        let added = command(
+            &mut local.socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+                &[("hello.sh", "printf 'hello %s' \"$1\"")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotSkillEnable {
+                bot: local.bot,
+                skill,
+            },
+        )
+        .await;
+
+        // The machine's first use asks first; one Allow answers it.
+        let first = run_of(&submit(&mut local.socket, local.chat, "pwd", None).await);
+        let approval = approval_for_run(&mut local.socket, first).await;
+        assert_eq!(approval["reason"], "first_use_local");
+        let approval: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        let action = answer_next_action(&mut local.device, "/home/ada/.neha/workspace").await;
+        assert!(matches!(action, WireAction::Shell { .. }));
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // The script's own first run asks, and Always allow makes its rule.
+        let second = run_of(&submit(&mut local.socket, local.chat, "run the script", None).await);
+        wait_status(&mut local.socket, second, "waiting").await;
+        let approvals = approvals_in(&mut local.socket, Some(local.chat)).await;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["reason"], "first_script_run");
+        assert_eq!(approvals[0]["arguments"]["skill"], "hello");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval, true, true).await;
+        assert!(decided["rule"].is_string(), "{decided}");
+        // The script the Space delivered is the one the skill carries.
+        let action = answer_next_action(&mut local.device, "hello one").await;
+        match action {
+            WireAction::RunScript {
+                name,
+                content,
+                arguments,
+            } => {
+                assert_eq!(name, "hello.sh");
+                assert_eq!(content, "printf 'hello %s' \"$1\"");
+                assert_eq!(arguments, vec!["one".to_owned()]);
+            }
+            other => panic!("expected a script action, got {other:?}"),
+        }
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // The lasting rule answers the next run: it starts without a card.
+        let third = run_of(&submit(&mut local.socket, local.chat, "run it again", None).await);
+        let action = answer_next_action(&mut local.device, "hello two").await;
+        assert!(matches!(action, WireAction::RunScript { .. }));
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        assert!(
+            approvals_in(&mut local.socket, Some(local.chat))
+                .await
+                .is_empty(),
+            "the rule the first script run made answers later runs"
+        );
+        assert_eq!(
+            last_message(&mut local.socket, local.chat).await["text"],
+            "second script done"
+        );
+
+        // An Ask rule for the same pair asks, and the answer names it: the
+        // Allow rule it makes covers that Ask rule, so Neha removes it.
+        let ask = command(
+            &mut local.socket,
+            Id::new(),
+            add_script_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "hello",
+                "hello.sh",
+            ),
+        )
+        .await;
+        let ask: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+        let fourth = run_of(&submit(&mut local.socket, local.chat, "again", None).await);
+        wait_status(&mut local.socket, fourth, "waiting").await;
+        let approvals = approvals_in(&mut local.socket, Some(local.chat)).await;
+        assert_eq!(approvals.len(), 1);
+        assert_eq!(approvals[0]["reason"], "rule", "{approvals:?}");
+        assert_eq!(approvals[0]["rule"], json!(ask));
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval, true, true).await;
+        assert_eq!(decided["overridden"], json!(ask), "{decided}");
+        let action = answer_next_action(&mut local.device, "hello three").await;
+        assert!(matches!(action, WireAction::RunScript { .. }));
+        assert_eq!(
+            wait_run(&mut local.socket, fourth).await["status"],
+            "succeeded"
+        );
+        let rules = approvals_of(&mut local.socket, local.bot).await;
+        assert!(
+            rules.iter().all(|rule| rule["rule"] != json!(ask)),
+            "the covered Ask rule is removed: {rules:?}"
+        );
+
+        // The next run starts without a card: the Ask rule is gone and the
+        // Allow rule answers for the pair.
+        let fifth = run_of(&submit(&mut local.socket, local.chat, "one more", None).await);
+        let action = answer_next_action(&mut local.device, "hello four").await;
+        assert!(matches!(action, WireAction::RunScript { .. }));
+        assert_eq!(
+            wait_run(&mut local.socket, fifth).await["status"],
+            "succeeded"
+        );
+        assert!(
+            approvals_in(&mut local.socket, Some(local.chat))
+                .await
+                .is_empty(),
+            "no rule asks any more"
+        );
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_skill_cannot_be_added_twice_or_from_another_user() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let call = add_skill(
+            None,
+            "---\nname: weekly-report\ndescription: Write the weekly report.\n---\nBody.",
+            &[],
+        );
+        command(&mut socket, Id::new(), call.clone()).await;
+        let (code, message) = try_command(&mut socket, Id::new(), call).await.unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("already holds"), "{message}");
+
+        // A document that is not a skill is refused before anything is
+        // recorded, and the Space says which rule it broke.
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_skill(None, "---\nname: Bad Name\ndescription: d\n---\n", &[]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("skill name"), "{message}");
+
+        // A script name that is not one path component is refused too.
+        let (code, _message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: escaped\ndescription: d\n---\n",
+                &[("../escape.sh", "true")],
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_rule_add_asks_for_a_scripts_pair() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        // The tool alone names nothing to match.
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_rule(
+                bot,
+                neha::record::RuleEffect::Ask,
+                "run_skill_script",
+                None,
+                None,
+            ),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("names its skill"), "{message}");
+        // A pair with another tool names no script.
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
+        )
+        .await
+        .unwrap();
+        let _ = (code, message);
+        let rule: Id = serde_json::from_value(
+            try_command(
+                &mut socket,
+                Id::new(),
+                add_script_rule(bot, neha::record::RuleEffect::Allow, "hello", "hello.sh"),
+            )
+            .await
+            .unwrap()
+            .1["rule"]
+                .clone(),
+        )
+        .unwrap();
+        let rules = approvals_of(&mut socket, bot).await;
+        assert!(
+            rules
+                .iter()
+                .any(|view| view["rule"] == json!(rule) && view["skill"] == "hello"),
+            "the rule names the pair: {rules:?}"
+        );
+        // A pair on a tool that is not run_skill_script is refused.
+        let (code, message) = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::RuleAdd {
+                bot,
+                effect: neha::record::RuleEffect::Ask,
+                tool: "shell".to_owned(),
+                command_prefix: None,
+                path_prefix: None,
+                skill: Some("hello".to_owned()),
+                script: Some("hello.sh".to_owned()),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(message.contains("no other tool"), "{message}");
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_skill_takes_it_away_from_every_bot() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (bot, _chat, _computer) =
+            tool_bot(&mut socket, "http://127.0.0.1:9/v1".to_owned()).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(None, "---\nname: shared\ndescription: d\n---\nBody.", &[]),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["skills"], json!([skill]));
+
+        command(&mut socket, Id::new(), CommandCall::SkillRemove { skill }).await;
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(
+            shown["bot"]["skills"],
+            json!([]),
+            "the Bot forgets a removed skill"
+        );
+        let listed = command(&mut socket, Id::new(), CommandCall::SkillList { bot: None }).await;
+        assert_eq!(listed, json!([]));
+        // Removing it again names no skill rather than throwing.
+        let (code, _message) =
+            try_command(&mut socket, Id::new(), CommandCall::SkillRemove { skill })
+                .await
+                .unwrap_err();
+        assert_eq!(code, ErrorCode::NotFound);
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }

@@ -6,6 +6,8 @@ This guide shows when a Bot asks before an action, how to answer, and how to mak
 
 A Bot runs a Computer action without asking by default. It asks before the first action it runs on a Local Computer, once for each Bot, acting User, and Local Computer, and before an action that a lasting Ask rule names. A Bot moved to another Local Computer asks again on its first action there.
 
+A Bot also asks before the first run of a skill's script, on a Hosted or a Local Computer, once for each Bot, acting User, skill, and script. [Skills](skills.md#scripts) covers that action.
+
 Files move through the Bot's shell (`neha file get` and `neha chat send --file`), so they wait on the shell action's approval; there is no separate File action.
 
 In granted mode a `write_file` that would write outside the Bot's Workspace, its granted folders, and the run's `--cwd` directory asks as well, when the Space can locate the target path. Allow runs it once, Always allow grants the folder for later runs, and Deny ends the run. A shell that writes outside that range is refused by the fence rather than turned into a request, and a Bot with full access never gets a folder card. [Add a Local Computer](computer.md#file-access-and-a-runs-directory) covers the fence and the commands that widen it.
@@ -47,9 +49,10 @@ An Always allow covers the same tool and one of these:
 
 - every shell command whose text starts with the approved command's first word: `printf` covers `printf 'hello'` and `printfx`;
 - every path at or below the approved action's directory;
+- the same skill and script for a `run_skill_script` action;
 - every action of a tool with no command or path.
 
-An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, and only an action with neither gives a tool-only rule.
+An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, a skill's script gives its skill and script, and only an action with neither gives a tool-only rule.
 
 A rule-triggered approval offers no Always allow, and `--always` is refused, when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path. A folder approval offers no Always allow when the folder no grant can store — a `..` climb, a relative form, or a NUL — and `--always` is refused for it; Allow still runs that one action. An ambiguous form that can still make a lasting rule does offer Always allow, and that answer removes no rule.
 
@@ -64,12 +67,13 @@ target/debug/neha rule list
 target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-prefix rm
 target/debug/neha rule add --bot <bot-id> --effect allow --tool read_file --path-prefix /home/ada/docs
 target/debug/neha rule add --bot <bot-id> --effect ask --tool write_file --path-prefix /home/ada/reports
+target/debug/neha rule add --bot <bot-id> --effect ask --tool run_skill_script --skill weekly-report --script collect.sh
 target/debug/neha rule remove <rule-id>
 ```
 
-An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets it proceed without asking.
+An Ask rule makes the Bot ask before that kind of action, and an Allow rule lets it proceed without asking. A `run_skill_script` rule names a skill and a script instead of a prefix, so `--skill` and `--script` go with `--tool run_skill_script`.
 
-When both match, the more specific rule wins: a rule with a command or path prefix beats one with only the tool, and a longer prefix beats a shorter one. If they are equally specific, the Ask rule wins.
+When both match, the more specific rule wins: a rule with a command or path prefix beats one with only the tool, a longer prefix beats a shorter one, and a skill and script beat both. If they are equally specific, the Ask rule wins.
 
 Some forms a prefix cannot judge. A shell command with `;`, `&`, `|`, `$`, a backtick, a parenthesis, `<`, `>`, or a line break asks whenever the Bot and User have any shell rule: `echo hi; rm x` is never covered by an `rm` rule. A file path with `..`, or an absolute/relative form unlike the rule's prefix, asks whenever the Bot and User have any rule for that tool: a `logs` rule does not cover `../logs/x` or `/var/logs/x`. With no rule for the tool, the action runs. An approval raised by this protection reports `ambiguous` true and names no rule: `neha approval show` shows none, and its Always allow removes no rule.
 
@@ -97,6 +101,8 @@ target/debug/neha rule add --bot <bot-id> --effect ask --tool shell --command-pr
 
 Choose Always allow on that approval: the new Allow rule has the same `printf` prefix. It covers the Ask rule, so Neha removes the Ask rule, and `printf` commands no longer ask.
 
+The same holds for a skill's script: an Ask rule on the pair makes each run ask, and Always allow on that card writes an Allow rule for the pair and removes the Ask rule it covers.
+
 ## While a run waits
 
 A waiting approval does not block the Bot: a later request for the same Bot runs while the first waits. The waiting run resumes after its last recorded action when allowed, and no action runs twice. A Space restart continues a working run from its record: completed steps replay, and an action that started before the stop is checked rather than run again.
@@ -107,6 +113,6 @@ A waiting approval does not block the Bot: a later request for the same Bot runs
 - An approval of a run no User is with does not expire yet.
 - The other actions that always ask, such as paying or filling a saved credential, are not available.
 - A Group approval, cancelling an approval, and undoing a decision are not available.
-- A Hosted Computer does not ask for approvals yet.
+- A Hosted Computer does not ask for approvals yet, except before the first run of a skill's script.
 - The Bot's page does not show approvals yet.
 - An independent reviewer of approvals is not available.

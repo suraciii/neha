@@ -31,6 +31,15 @@ pub enum Action {
         /// The path, relative to the workspace or absolute inside it.
         path: String,
     },
+    /// Runs a script the Space delivered, from inside the Workspace.
+    RunScript {
+        /// The file name the script is written under: one path component.
+        name: String,
+        /// The script's bytes.
+        content: String,
+        /// The arguments passed after the script path.
+        arguments: Vec<String>,
+    },
 }
 
 /// How an action ended.

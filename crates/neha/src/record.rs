@@ -97,6 +97,18 @@ pub enum EventKind {
     /// A lasting rule was removed.
     #[serde(rename = "neha.rule.removed")]
     RuleRemoved,
+    /// A skill entered a library.
+    #[serde(rename = "neha.skill.added")]
+    SkillAdded,
+    /// A skill left its library.
+    #[serde(rename = "neha.skill.removed")]
+    SkillRemoved,
+    /// A Bot may use a skill.
+    #[serde(rename = "neha.bot.skill.enabled")]
+    BotSkillEnabled,
+    /// A Bot no longer uses a skill.
+    #[serde(rename = "neha.bot.skill.disabled")]
+    BotSkillDisabled,
 }
 
 impl EventKind {
@@ -127,6 +139,10 @@ impl EventKind {
             Self::ApprovalDecided => "neha.approval.decided",
             Self::RuleAdded => "neha.rule.added",
             Self::RuleRemoved => "neha.rule.removed",
+            Self::SkillAdded => "neha.skill.added",
+            Self::SkillRemoved => "neha.skill.removed",
+            Self::BotSkillEnabled => "neha.bot.skill.enabled",
+            Self::BotSkillDisabled => "neha.bot.skill.disabled",
         }
     }
 
@@ -150,7 +166,11 @@ impl EventKind {
             | Self::ApprovalRequested
             | Self::ApprovalDecided
             | Self::RuleAdded
-            | Self::RuleRemoved => EventClass::Authority,
+            | Self::RuleRemoved
+            | Self::SkillAdded
+            | Self::SkillRemoved
+            | Self::BotSkillEnabled
+            | Self::BotSkillDisabled => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::ProviderModelsUpdated
@@ -191,6 +211,10 @@ impl FromStr for EventKind {
             "neha.approval.decided" => Ok(Self::ApprovalDecided),
             "neha.rule.added" => Ok(Self::RuleAdded),
             "neha.rule.removed" => Ok(Self::RuleRemoved),
+            "neha.skill.added" => Ok(Self::SkillAdded),
+            "neha.skill.removed" => Ok(Self::SkillRemoved),
+            "neha.bot.skill.enabled" => Ok(Self::BotSkillEnabled),
+            "neha.bot.skill.disabled" => Ok(Self::BotSkillDisabled),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -264,7 +288,7 @@ pub struct Event {
 mod tests {
     use super::{
         Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
-        FileAdded, FileError, RunAccess, RunQueued,
+        FileAdded, FileError, RunAccess, RunQueued, SkillAdded, SkillLibrary, SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -294,6 +318,10 @@ mod tests {
             EventKind::ApprovalDecided,
             EventKind::RuleAdded,
             EventKind::RuleRemoved,
+            EventKind::SkillAdded,
+            EventKind::SkillRemoved,
+            EventKind::BotSkillEnabled,
+            EventKind::BotSkillDisabled,
         ];
 
         for kind in kinds {
@@ -320,6 +348,54 @@ mod tests {
         assert_eq!(EventKind::ApprovalDecided.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleAdded.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleRemoved.class(), EventClass::Authority);
+        assert_eq!(EventKind::SkillAdded.class(), EventClass::Authority);
+        assert_eq!(EventKind::SkillRemoved.class(), EventClass::Authority);
+        assert_eq!(EventKind::BotSkillEnabled.class(), EventClass::Authority);
+        assert_eq!(EventKind::BotSkillDisabled.class(), EventClass::Authority);
+    }
+    #[test]
+    fn a_skill_round_trips_and_rejects_what_it_cannot_hold() {
+        let data = SkillAdded {
+            skill: Id::new(),
+            library: SkillLibrary::Space,
+            bot: None,
+            name: "weekly-report".to_owned(),
+            description: "Write the weekly status report.".to_owned(),
+            body: "1. Collect the docs.\n2. Summarize.".to_owned(),
+            scripts: vec![SkillScript {
+                name: "collect.sh".to_owned(),
+                sha256: "a".repeat(64),
+            }],
+        };
+        let value = serde_json::to_value(&data).unwrap();
+        assert_eq!(
+            EventKind::SkillAdded.decode(&value).unwrap(),
+            EventData::SkillAdded(data.clone())
+        );
+        let mut space_with_bot = value.clone();
+        space_with_bot["bot"] = serde_json::json!(Id::new());
+        assert!(EventKind::SkillAdded.decode(&space_with_bot).is_err());
+        let mut bad_name = value.clone();
+        bad_name["name"] = serde_json::json!("Weekly Report");
+        assert!(EventKind::SkillAdded.decode(&bad_name).is_err());
+        let mut bad_script = value.clone();
+        bad_script["scripts"] = serde_json::json!([{"name": "../x.sh", "sha256": "a".repeat(64)}]);
+        assert!(EventKind::SkillAdded.decode(&bad_script).is_err());
+        let mut old_rule = serde_json::json!({
+            "rule": Id::new(), "bot": Id::new(), "user": Id::new(),
+            "effect": "allow", "tool": "shell", "command_prefix": "ls"
+        });
+        let EventData::RuleAdded(rule) = EventKind::RuleAdded.decode(&old_rule).unwrap() else {
+            unreachable!("the data is a rule");
+        };
+        assert_eq!((rule.skill, rule.script), (None, None));
+        old_rule["skill"] = serde_json::json!("weekly-report");
+        old_rule["script"] = serde_json::json!("collect.sh");
+        let EventData::RuleAdded(rule) = EventKind::RuleAdded.decode(&old_rule).unwrap() else {
+            unreachable!("the data is a rule");
+        };
+        assert_eq!(rule.skill.as_deref(), Some("weekly-report"));
+        assert_eq!(rule.script.as_deref(), Some("collect.sh"));
     }
 
     #[test]
@@ -845,6 +921,22 @@ mod tests {
             assert!(kind.validate_author(bot, Some(owner)).is_err());
         }
     }
+
+    #[test]
+    fn a_skill_takes_a_user_author_who_acts_for_nobody() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        for kind in [
+            EventKind::SkillAdded,
+            EventKind::SkillRemoved,
+            EventKind::BotSkillEnabled,
+            EventKind::BotSkillDisabled,
+        ] {
+            assert!(kind.validate_author(user, None).is_ok());
+            assert!(kind.validate_author(user, Some(Id::new())).is_err());
+            assert!(kind.validate_author(bot, None).is_err());
+        }
+    }
 }
 
 /// Where a run is: waiting, working, or how it ended.
@@ -912,6 +1004,10 @@ pub enum EventData {
     RuleAdded(RuleAdded),
     /// A lasting rule was removed.
     RuleRemoved(RuleRemoved),
+    SkillAdded(SkillAdded),
+    SkillRemoved(SkillRemoved),
+    BotSkillEnabled(BotSkillEnabled),
+    BotSkillDisabled(BotSkillDisabled),
 }
 
 /// The first version of every event kind.
@@ -973,6 +1069,14 @@ impl EventKind {
             Self::ApprovalDecided => EventData::ApprovalDecided(decode(data)?),
             Self::RuleAdded => EventData::RuleAdded(decode(data)?),
             Self::RuleRemoved => EventData::RuleRemoved(decode(data)?),
+            Self::SkillAdded => {
+                let data: SkillAdded = decode(data)?;
+                data.validate()?;
+                EventData::SkillAdded(data)
+            }
+            Self::SkillRemoved => EventData::SkillRemoved(decode(data)?),
+            Self::BotSkillEnabled => EventData::BotSkillEnabled(decode(data)?),
+            Self::BotSkillDisabled => EventData::BotSkillDisabled(decode(data)?),
         };
 
         Ok(decoded)
@@ -988,7 +1092,11 @@ impl EventKind {
             | Self::BotMoved
             | Self::BotUpdated
             | Self::ComputerCreated
-            | Self::ChatCreated => {
+            | Self::ChatCreated
+            | Self::SkillAdded
+            | Self::SkillRemoved
+            | Self::BotSkillEnabled
+            | Self::BotSkillDisabled => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
                     return Err(EventDataError::Author);
                 }
@@ -1583,6 +1691,8 @@ pub enum ApprovalReason {
     Rule,
     /// The action writes outside the folders the owner granted.
     Grant,
+    /// The first run of a skill's script by this Bot for this User.
+    FirstScriptRun,
 }
 
 /// Whether the User can undo an action after allowing it.
@@ -1693,6 +1803,12 @@ pub struct RuleAdded {
     /// The path prefix a matching file action's path starts with.
     #[serde(default)]
     pub path_prefix: Option<String>,
+    /// The skill, by name, whose script a matching `run_skill_script` action runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// The script a matching `run_skill_script` action runs, within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
 }
 
 /// The data of `neha.rule.removed`.
@@ -1706,4 +1822,160 @@ pub struct RuleRemoved {
     /// The User who removed it; the Bot's owner may remove another User's
     /// rule, so this is not necessarily the rule's maker.
     pub user: Id,
+}
+
+/// The largest body a skill's `SKILL.md` carries, without its frontmatter.
+pub const MAX_SKILL_BODY_BYTES: usize = 64 * 1024;
+
+/// The libraries that hold skills.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillLibrary {
+    /// The Space's library, which every Bot's owner may enable for their Bot.
+    Space,
+    /// One Bot's own library.
+    Bot,
+}
+
+/// A script a skill carries, stored in the File store by digest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillScript {
+    /// The script's file name within the skill, one path component.
+    pub name: String,
+    /// The digest of its bytes in the File store.
+    pub sha256: String,
+}
+
+/// The data of `neha.skill.added`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillAdded {
+    /// The skill.
+    pub skill: Id,
+    /// The library that holds it.
+    pub library: SkillLibrary,
+    /// The Bot whose library holds it, when it is a Bot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<Id>,
+    /// Its name, as the Agent Skills frontmatter spells it.
+    pub name: String,
+    /// What it does and when to use it.
+    pub description: String,
+    /// The body of its `SKILL.md`, without the frontmatter.
+    pub body: String,
+    /// The scripts it carries.
+    #[serde(default)]
+    pub scripts: Vec<SkillScript>,
+}
+
+impl SkillAdded {
+    /// Whether the name is one the Agent Skills frontmatter allows.
+    #[must_use]
+    pub fn valid_name(name: &str) -> bool {
+        let bytes = name.as_bytes();
+        (1..=64).contains(&bytes.len())
+            && bytes[0] != b'-'
+            && bytes[bytes.len() - 1] != b'-'
+            && bytes
+                .iter()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    }
+
+    /// Checks the data against what a skill may hold.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        match self.library {
+            SkillLibrary::Space if self.bot.is_some() => {
+                return Err(EventDataError::Data(
+                    "a skill in the Space's library belongs to no Bot".to_owned(),
+                ));
+            }
+            SkillLibrary::Bot if self.bot.is_none() => {
+                return Err(EventDataError::Data(
+                    "a skill in a Bot's library names its Bot".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        if !Self::valid_name(&self.name) {
+            return Err(EventDataError::Data(
+                "a skill name is 1 to 64 lowercase letters, digits, or hyphens, and does not \
+                 begin or end with a hyphen"
+                    .to_owned(),
+            ));
+        }
+        if self.description.trim().is_empty() || self.description.chars().count() > 1024 {
+            return Err(EventDataError::Data(
+                "a skill description has 1 to 1024 characters".to_owned(),
+            ));
+        }
+        if self.body.len() > MAX_SKILL_BODY_BYTES {
+            return Err(EventDataError::Data(format!(
+                "a skill body is at most {MAX_SKILL_BODY_BYTES} bytes"
+            )));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for script in &self.scripts {
+            if !valid_script_name(&script.name) {
+                return Err(EventDataError::Data(
+                    "a script name is one path component of letters, digits, dots, or hyphens"
+                        .to_owned(),
+                ));
+            }
+            if !is_sha256(&script.sha256) {
+                return Err(EventDataError::Data(
+                    "a script is named by the digest of its bytes".to_owned(),
+                ));
+            }
+            if !seen.insert(&script.name) {
+                return Err(EventDataError::Data(
+                    "a skill carries one script under each name".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether a script's file name is one a Computer writes safely.
+#[must_use]
+pub fn valid_script_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains(['/', '\\'])
+        && name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '.' || ch == '-' || ch == '_')
+}
+
+/// The data of `neha.skill.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillRemoved {
+    /// The skill.
+    pub skill: Id,
+}
+
+/// The data of `neha.bot.skill.enabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotSkillEnabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The skill it may use.
+    pub skill: Id,
+}
+
+/// The data of `neha.bot.skill.disabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotSkillDisabled {
+    /// The Bot.
+    pub bot: Id,
+    /// The skill it no longer uses.
+    pub skill: Id,
 }

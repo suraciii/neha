@@ -8,12 +8,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::ErrorCode;
 use crate::id::Id;
-use crate::record::{Author, Event, RuleEffect};
+use crate::record::{Author, Event, RuleEffect, SkillLibrary};
 use crate::seq::Seq;
 use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
 /// The largest frame a client or the Space accepts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -160,12 +160,71 @@ pub enum CommandCall {
         /// The path prefix a matching file action's path starts with.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path_prefix: Option<String>,
+        /// The skill whose script a `run_skill_script` rule matches, by name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill: Option<String>,
+        /// The script a `run_skill_script` rule matches, within that skill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        script: Option<String>,
     },
     /// Removes a lasting rule.
     RuleRemove {
         /// The rule.
         rule: Id,
     },
+    /// Adds a skill to the Space's library or to a Bot's.
+    SkillAdd(SkillAdd),
+    /// Lists skills: the Space's and the caller's Bots', or one Bot's when named.
+    SkillList {
+        /// Only this Bot's enabled skills, when named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bot: Option<Id>,
+    },
+    /// Removes a skill from its library.
+    SkillRemove {
+        /// The skill.
+        skill: Id,
+    },
+    /// Lets a Bot use a skill.
+    BotSkillEnable {
+        /// The Bot.
+        bot: Id,
+        /// The skill.
+        skill: Id,
+    },
+    /// Stops a Bot using a skill.
+    BotSkillDisable {
+        /// The Bot.
+        bot: Id,
+        /// The skill.
+        skill: Id,
+    },
+}
+
+/// The parameters of `skill_add`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillAdd {
+    /// The library that holds the skill.
+    pub library: SkillLibrary,
+    /// The Bot whose library holds it, when it is a Bot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<Id>,
+    /// The text of its `SKILL.md`, frontmatter included.
+    pub document: String,
+    /// The scripts it carries, each under its file name.
+    #[serde(default)]
+    pub scripts: Vec<SkillAddScript>,
+}
+
+/// A script a `skill_add` command carries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SkillAddScript {
+    /// The script's file name within the skill, one path component.
+    pub name: String,
+    /// The script's bytes.
+    pub content: String,
 }
 
 /// The parameters of `provider_add`.
@@ -787,7 +846,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
-            "{\"type\":\"hello\",\"version\":1}"
+            "{\"type\":\"hello\",\"version\":2}"
         );
 
         let error = ServerFrame::Error {
@@ -858,12 +917,29 @@ mod tests {
             tool: "shell".to_owned(),
             command_prefix: Some("git".to_owned()),
             path_prefix: None,
+            skill: None,
+            script: None,
         };
         let text = serde_json::to_string(&add).unwrap();
         assert!(text.contains("\"name\":\"rule_add\""), "{text}");
         assert!(text.contains("\"effect\":\"ask\""), "{text}");
         assert!(!text.contains("path_prefix"), "an absent prefix is omitted");
+        assert!(!text.contains("script"), "an absent script is omitted");
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), add);
+
+        let script = CommandCall::RuleAdd {
+            bot: Id::new(),
+            effect: crate::record::RuleEffect::Allow,
+            tool: "run_skill_script".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: Some("weekly-report".to_owned()),
+            script: Some("collect.sh".to_owned()),
+        };
+        let text = serde_json::to_string(&script).unwrap();
+        assert!(text.contains("\"skill\":\"weekly-report\""), "{text}");
+        assert!(text.contains("\"script\":\"collect.sh\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), script);
 
         let remove = CommandCall::RuleRemove { rule: Id::new() };
         let text = serde_json::to_string(&remove).unwrap();

@@ -24,11 +24,13 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const reason = () =>
     props.approval.reason === "first_use_local"
       ? t("chat.approval.reason.firstUse", { name: props.botName })
-      : props.approval.reason === "grant"
-        ? t("chat.approval.reason.grant")
-        : props.approval.ambiguous
-          ? t("chat.approval.reason.ambiguous")
-          : t("chat.approval.reason.rule");
+      : props.approval.reason === "first_script_run"
+        ? t("chat.approval.reason.firstScript")
+        : props.approval.reason === "grant"
+          ? t("chat.approval.reason.grant")
+          : props.approval.ambiguous
+            ? t("chat.approval.reason.ambiguous")
+            : t("chat.approval.reason.rule");
   const undo = () =>
     t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
   // What an Always allow would cover. null, or an empty string, is the Space
@@ -37,7 +39,9 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const scope = () => {
     const approval = props.approval;
     if (
-      (approval.reason !== "rule" && approval.reason !== "grant") ||
+      (approval.reason !== "rule" &&
+        approval.reason !== "grant" &&
+        approval.reason !== "first_script_run") ||
       approval.lasting_scope === null
     )
       return null;

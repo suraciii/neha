@@ -200,7 +200,7 @@ export class Commands {
           return;
         }
         if (this.following) this.following.frameSent = false;
-        socket.send(JSON.stringify({ type: "hello", version: 1 }));
+        socket.send(JSON.stringify({ type: "hello", version: 2 }));
         this.hello = new Promise<void>((helloResolve, helloReject) => {
           const onHello = (event: MessageEvent) => {
             if (this.socket !== socket) return;

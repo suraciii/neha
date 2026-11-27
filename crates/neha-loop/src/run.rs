@@ -16,8 +16,8 @@ use neha_computer::{ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Continuation, Message, Model, ModelFailure, ModelRequest, ToolCall};
-use crate::tools;
+use crate::model::{Continuation, Message, Model, ModelFailure, ModelRequest, ToolCall, ToolSpec};
+use crate::tools::{self, SpaceCall};
 
 /// The largest raw tool-call arguments string a step event keeps whole.
 const MAX_RECORDED_ARGUMENTS: usize = 128 * 1024;
@@ -42,10 +42,13 @@ pub struct RunRequest {
     /// The step a run without a recorded reply starts at, when the Space
     /// recovers it after an interruption.
     pub start_step: u32,
+    /// The tools the Model may call; the built-in tools unless the Space
+    /// names others.
+    pub tools: Vec<ToolSpec>,
 }
 
 impl RunRequest {
-    /// Builds a request with the default step limit.
+    /// Builds a request with the default step limit and the built-in tools.
     #[must_use]
     pub fn new(system: impl Into<String>, history: Vec<Message>, max_output: u32) -> Self {
         Self {
@@ -57,7 +60,15 @@ impl RunRequest {
             max_steps: 8,
             resume: None,
             start_step: 1,
+            tools: tools::specs(),
         }
+    }
+
+    /// Names the tools the Model may call, in place of the built-in tools.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = tools;
+        self
     }
 
     /// Changes the step limit.
@@ -231,7 +242,18 @@ pub trait Recorder {
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 }
 
-/// Runs one Bot run to its end, or until a Computer action waits for an approval.
+/// What a run works with: its Computer, and the tools the Space serves itself.
+pub trait Runtime: ComputerRuntime {
+    /// Serves one tool call the Space runs itself: a skill's body, or a
+    /// script it delivers to the Computer. A refusal is a failed action, never
+    /// a lost one.
+    fn serve(
+        &self,
+        call: SpaceCall,
+    ) -> impl Future<Output = Result<ActionResult, LoopError>> + Send;
+}
+
+/// Runs one Bot run to its end, or until an action waits for an approval.
 pub async fn run<R, M, Rec>(
     runtime: &R,
     model: &M,
@@ -239,7 +261,7 @@ pub async fn run<R, M, Rec>(
     request: RunRequest,
 ) -> Result<RunOutcome, LoopError>
 where
-    R: ComputerRuntime + Sync,
+    R: Runtime + Sync,
     M: Model + Sync,
     Rec: Recorder + Send,
 {
@@ -252,6 +274,7 @@ where
         max_steps,
         resume,
         start_step,
+        tools,
     } = request;
     let mut messages = Vec::with_capacity(history.len() + 8);
     messages.push(Message::system(system));
@@ -300,7 +323,7 @@ where
                 let reply = match model
                     .complete(ModelRequest {
                         messages: messages.clone(),
-                        tools: tools::specs(),
+                        tools: tools.clone(),
                         max_output,
                         thinking,
                         continuation: continuation.clone(),
@@ -396,6 +419,7 @@ where
                     Ok(tools::Call::Computer(computer_action)) => {
                         runtime.execute(computer_action).await
                     }
+                    Ok(tools::Call::Space(space_call)) => runtime.serve(space_call).await?,
                     Err(error) => ActionResult::failed(error),
                 };
                 recorder
@@ -604,12 +628,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest,
+        Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest, Runtime,
         WaitingApproval, call_id, run,
     };
     use crate::model::{
         Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
+        ToolSpec,
     };
+    use crate::tools::SpaceCall;
 
     #[derive(Default)]
     struct FakeModel {
@@ -642,6 +668,7 @@ mod tests {
     struct FakeRuntime {
         actions: Mutex<Vec<Action>>,
         files: Mutex<Vec<(String, Vec<u8>)>>,
+        served: Mutex<Vec<SpaceCall>>,
         fail_writes: bool,
         lost: bool,
         slow_writes: bool,
@@ -714,6 +741,17 @@ mod tests {
                 Ok(())
             };
             async move { written }
+        }
+    }
+
+    impl Runtime for FakeRuntime {
+        #[allow(clippy::manual_async_fn)]
+        fn serve(
+            &self,
+            call: SpaceCall,
+        ) -> impl Future<Output = Result<ActionResult, LoopError>> + Send {
+            self.served.lock().unwrap().push(call);
+            async move { Ok(ActionResult::succeeded(ToolOutput::full("the skill body"))) }
         }
     }
 
@@ -993,6 +1031,104 @@ mod tests {
         let second = requests[1].messages.last().unwrap();
         assert_eq!(second.role, crate::model::Role::Tool);
         assert_eq!(second.content.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn a_space_call_is_served_by_the_space_and_returns_to_the_model() {
+        let model = FakeModel::with(vec![
+            call_reply("skill", json!({"name": "weekly-report"})),
+            call_reply(
+                "run_skill_script",
+                json!({"skill": "weekly-report", "script": "collect.sh", "arguments": ["q4"]}),
+            ),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(
+            recorder
+                .started
+                .iter()
+                .map(|(_, tool, _)| tool.as_str())
+                .collect::<Vec<_>>(),
+            ["skill", "run_skill_script"]
+        );
+        assert!(
+            recorder
+                .finished
+                .iter()
+                .all(|(_, status)| *status == ActionStatus::Succeeded)
+        );
+        // The Computer ran nothing: both calls went to the Space.
+        assert!(runtime.actions.lock().unwrap().is_empty());
+        let served = runtime.served.lock().unwrap();
+        assert_eq!(
+            served.as_slice(),
+            [
+                SpaceCall::Skill {
+                    name: "weekly-report".to_owned(),
+                },
+                SpaceCall::Script {
+                    skill: "weekly-report".to_owned(),
+                    script: "collect.sh".to_owned(),
+                    arguments: vec!["q4".to_owned()],
+                },
+            ]
+        );
+        let requests = model.requests.lock().unwrap();
+        for request in &requests[..2] {
+            let names: Vec<&str> = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert!(names.contains(&"skill") && names.contains(&"run_skill_script"));
+        }
+        assert_eq!(
+            requests[2].messages.last().unwrap().content.as_deref(),
+            Some("the skill body")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_space_names_the_tools_the_model_sees() {
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+        let extra = ToolSpec {
+            name: "mcp__docs__search".to_owned(),
+            description: "Search the docs.".to_owned(),
+            parameters: json!({"type": "object"}),
+        };
+
+        let _ = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            RunRequest::new("system", Vec::new(), 100).with_tools(vec![extra]),
+        )
+        .await;
+
+        let requests = model.requests.lock().unwrap();
+        let names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, ["mcp__docs__search"]);
     }
 
     #[tokio::test]

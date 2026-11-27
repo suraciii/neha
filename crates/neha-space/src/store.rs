@@ -1155,6 +1155,28 @@ mod tests {
                 serde_json::json!({"rule": Id::new(), "bot": Id::new(), "user": user}),
             )
             .acting(user),
+            EventKind::SkillAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "skill": Id::new(),
+                    "library": "space",
+                    "name": "weekly-report",
+                    "description": "Write the weekly report.",
+                    "body": "1. Collect.",
+                    "scripts": [],
+                }),
+            ),
+            EventKind::SkillRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"skill": Id::new()}),
+            ),
+            EventKind::BotSkillEnabled | EventKind::BotSkillDisabled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"bot": Id::new(), "skill": Id::new()}),
+            ),
         }
     }
 

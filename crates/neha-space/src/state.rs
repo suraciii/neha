@@ -14,7 +14,7 @@ use rand::Rng as _;
 use neha::id::Id;
 use neha::record::{
     ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
-    RuleEffect, RunReply, Undoability,
+    RuleEffect, RunReply, SkillLibrary, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -123,6 +123,33 @@ pub struct BotView {
     /// Its Model; absent uses the Space's default.
     #[serde(default)]
     pub model: Option<Id>,
+    /// The skills its owner enabled for it.
+    #[serde(default)]
+    pub skills: Vec<Id>,
+}
+
+/// A skill in a library.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillView {
+    /// The skill.
+    pub id: Id,
+    /// The library that holds it.
+    pub library: SkillLibrary,
+    /// The Bot whose library holds it, when it is a Bot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<Id>,
+    /// Its name, as the Agent Skills frontmatter spells it.
+    pub name: String,
+    /// What it does and when to use it.
+    pub description: String,
+    /// The body of its `SKILL.md`, without the frontmatter.
+    pub body: String,
+    /// The scripts it carries, each stored in the File store by digest.
+    pub scripts: Vec<neha::record::SkillScript>,
+    /// The User who added it.
+    pub by: Id,
+    /// The cursor of `skill.added`.
+    pub seq: Seq,
 }
 
 /// A Computer.
@@ -429,6 +456,12 @@ pub struct RuleView {
     pub command_prefix: Option<String>,
     /// The path prefix a matching file action's path starts with.
     pub path_prefix: Option<String>,
+    /// The skill, by name, whose script a matching `run_skill_script` action runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<String>,
+    /// The script a matching `run_skill_script` action runs, within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     /// The cursor of `rule.added`.
     pub seq: Seq,
 }
@@ -504,9 +537,14 @@ pub struct State {
     pub approvals: Vec<ApprovalView>,
     /// The lasting rules in the order the record added them.
     pub rules: Vec<RuleView>,
+    /// The skills in both libraries, in the order the record added them.
+    pub skills: Vec<SkillView>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
+    /// The (Bot, acting User, skill name, script name) that already ran a
+    /// skill's script; the first run of each asks.
+    pub script_runs: HashSet<(Id, Id, String, String)>,
     /// The Model's replies per run, in the order the record holds them.
     pub replies: HashMap<Id, Vec<RunReply>>,
     /// Runs a Space start found interrupted and may recover. It is not part of
@@ -566,6 +604,53 @@ impl State {
     #[must_use]
     pub fn rules_of(&self, bot: Id) -> Vec<&RuleView> {
         self.rules.iter().filter(|rule| rule.bot == bot).collect()
+    }
+
+    /// Returns a skill by identifier.
+    #[must_use]
+    pub fn skill(&self, skill: Id) -> Option<&SkillView> {
+        self.skills.iter().find(|view| view.id == skill)
+    }
+
+    /// Returns the skills a Bot may use: the Space's, when enabled for it,
+    /// and those in its own library when enabled for it.
+    #[must_use]
+    pub fn skills_of(&self, bot: Id) -> Vec<&SkillView> {
+        let Some(view) = self.bots.get(&bot) else {
+            return Vec::new();
+        };
+        view.skills
+            .iter()
+            .filter_map(|skill| self.skill(*skill))
+            .filter(|skill| {
+                skill.library == SkillLibrary::Space
+                    || matches!(skill.bot, Some(owner) if owner == bot)
+            })
+            .collect()
+    }
+
+    /// Returns the enabled skill a Bot has under a name.
+    #[must_use]
+    pub fn skill_named(&self, bot: Id, name: &str) -> Option<&SkillView> {
+        self.skills_of(bot)
+            .into_iter()
+            .find(|skill| skill.name == name)
+    }
+
+    /// Whether a skill a User adds to a library is theirs to add.
+    #[must_use]
+    pub fn skill_library_allowed(&self, library: SkillLibrary, bot: Option<Id>, user: Id) -> bool {
+        match library {
+            SkillLibrary::Space => bot.is_none(),
+            SkillLibrary::Bot => bot.is_some_and(|bot| self.owned_bot(bot, user).is_some()),
+        }
+    }
+
+    /// Whether the Bot and the acting User already ran one skill's script.
+    #[must_use]
+    pub fn script_run_allowed(&self, bot: Id, acting: Id, skill: &str, script: &str) -> bool {
+        self.script_runs
+            .contains(&(bot, acting, skill.to_owned(), script.to_owned()))
     }
 
     /// Returns the replies the record holds for one run.
@@ -887,6 +972,7 @@ impl Projection for State {
                         grants: Vec::new(),
                         thinking: data.thinking,
                         model: data.model,
+                        skills: Vec::new(),
                     },
                 );
             }
@@ -1174,6 +1260,25 @@ impl Projection for State {
                     .get_mut(&data.run)
                     .ok_or("an action must belong to a started run")?;
                 run.once_grant = None;
+                // A script that starts has run: later runs ask only when a
+                // rule says so.
+                if data.tool == neha_loop::tools::RUN_SKILL_SCRIPT {
+                    let (Some(skill), Some(script)) = (
+                        data.arguments
+                            .get("skill")
+                            .and_then(serde_json::Value::as_str),
+                        data.arguments
+                            .get("script")
+                            .and_then(serde_json::Value::as_str),
+                    ) else {
+                        return Err("a script action names its skill and its script".to_owned());
+                    };
+                    let acting = event
+                        .acting
+                        .ok_or("an action is recorded for the User the Bot acts for")?;
+                    self.script_runs
+                        .insert((run.bot, acting, skill.to_owned(), script.to_owned()));
+                }
                 run.actions.push(ActionView {
                     id: data.action,
                     step: data.step,
@@ -1341,6 +1446,27 @@ impl Projection for State {
                 if self.rules.iter().any(|rule| rule.rule == data.rule) {
                     return Err("a rule is recorded once".to_owned());
                 }
+                let script_rule = data.skill.is_some() || data.script.is_some();
+                let script_tool = data.tool == neha_loop::tools::RUN_SKILL_SCRIPT;
+                if script_tool != script_rule {
+                    return Err(
+                        "a run_skill_script rule names its skill and its script, and no other rule does"
+                            .to_owned(),
+                    );
+                }
+                if script_rule {
+                    let (Some(skill), Some(script)) = (&data.skill, &data.script) else {
+                        return Err("a script rule names its skill and its script".to_owned());
+                    };
+                    if data.tool != neha_loop::tools::RUN_SKILL_SCRIPT
+                        || data.command_prefix.is_some()
+                        || data.path_prefix.is_some()
+                        || !neha::record::SkillAdded::valid_name(skill)
+                        || !neha::record::valid_script_name(script)
+                    {
+                        return Err("a script rule is about run_skill_script alone".to_owned());
+                    }
+                }
                 self.rules.push(RuleView {
                     rule: data.rule,
                     bot: data.bot,
@@ -1349,6 +1475,8 @@ impl Projection for State {
                     tool: data.tool,
                     command_prefix: data.command_prefix,
                     path_prefix: data.path_prefix,
+                    skill: data.skill,
+                    script: data.script,
                     seq: event.seq,
                 });
             }
@@ -1369,6 +1497,80 @@ impl Projection for State {
                     return Err("a removed rule must name its Bot".to_owned());
                 }
                 self.rules.remove(position);
+            }
+            EventData::SkillAdded(data) => {
+                let Author::User(by) = event.author else {
+                    return Err("a skill is added by a User".to_owned());
+                };
+                match data.library {
+                    SkillLibrary::Bot if !self.bots.contains_key(&data.bot.unwrap_or_default()) => {
+                        return Err("a Bot's skill belongs to an existing Bot".to_owned());
+                    }
+                    SkillLibrary::Space if data.bot.is_some() => {
+                        return Err("the Space's skill belongs to no Bot".to_owned());
+                    }
+                    _ => {}
+                }
+                let library = data.bot.unwrap_or_default();
+                if self.skills.iter().any(|view| {
+                    view.library == data.library
+                        && view.bot.unwrap_or_default() == library
+                        && view.name == data.name
+                }) {
+                    return Err("a library holds one skill under each name".to_owned());
+                }
+                self.skills.push(SkillView {
+                    id: data.skill,
+                    library: data.library,
+                    bot: data.bot,
+                    name: data.name,
+                    description: data.description,
+                    body: data.body,
+                    scripts: data.scripts,
+                    by,
+                    seq: event.seq,
+                });
+            }
+            EventData::SkillRemoved(data) => {
+                let position = self
+                    .skills
+                    .iter()
+                    .position(|view| view.id == data.skill)
+                    .ok_or("a removed skill must exist")?;
+                self.skills.remove(position);
+                for bot in self.bots.values_mut() {
+                    bot.skills.retain(|skill| *skill != data.skill);
+                }
+            }
+            EventData::BotSkillEnabled(data) => {
+                if !self.bots.contains_key(&data.bot) {
+                    return Err("an enabled skill belongs to an existing Bot".to_owned());
+                }
+                let Some(skill) = self.skill(data.skill) else {
+                    return Err("an enabled skill must exist".to_owned());
+                };
+                if skill.library == SkillLibrary::Bot && skill.bot != Some(data.bot) {
+                    return Err("a Bot enables only its own skills and the Space's".to_owned());
+                }
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("an enabled skill belongs to an existing Bot")?;
+                if !bot.skills.contains(&data.skill) {
+                    bot.skills.push(data.skill);
+                }
+            }
+            EventData::BotSkillDisabled(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("a disabled skill belongs to an existing Bot")?;
+                let position = bot
+                    .skills
+                    .iter()
+                    .position(|skill| *skill == data.skill)
+                    .ok_or("a disabled skill must be enabled")?;
+                bot.skills.remove(position);
             }
         }
 

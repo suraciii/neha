@@ -9,11 +9,11 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
-use neha::record::RuleEffect;
+use neha::record::{RuleEffect, SkillLibrary};
 use neha::seq::Seq;
 use neha::surface::{
     BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
-    ProviderConnect, ProviderProtocol, ThinkingLevel,
+    ProviderConnect, ProviderProtocol, SkillAdd, SkillAddScript, ThinkingLevel,
 };
 use neha_space::Home;
 use serde_json::Value;
@@ -107,6 +107,11 @@ enum Top {
     Rule {
         #[command(subcommand)]
         command: RuleCommand,
+    },
+    /// Manage the skills a Bot may load.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
     },
 }
 
@@ -262,6 +267,11 @@ enum BotCommand {
     },
     /// List your Bots.
     List,
+    /// Give your Bot a skill, or take one away.
+    Skill {
+        #[command(subcommand)]
+        command: BotSkillCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -421,11 +431,59 @@ enum RuleCommand {
         /// Match file paths that start with this text.
         #[arg(long)]
         path_prefix: Option<String>,
+        /// Match a skill's script by the skill's name; with --script.
+        #[arg(long, requires = "script")]
+        skill: Option<String>,
+        /// Match one script of that skill by its file name; with --skill.
+        #[arg(long, requires = "skill")]
+        script: Option<String>,
     },
     /// Remove one rule.
     Remove {
         /// The rule identifier.
         rule: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Add a skill from a directory that holds a SKILL.md and its scripts.
+    Add {
+        /// The skill's directory: SKILL.md, and scripts directly in scripts/.
+        path: std::path::PathBuf,
+        /// The Bot whose library holds it; without it the Space's library
+        /// holds it, which only the Admin may add to.
+        #[arg(long)]
+        bot: Option<Id>,
+    },
+    /// List skills: the Space's and your Bots', or one Bot's enabled skills.
+    List {
+        /// Only the skills this Bot may use.
+        #[arg(long)]
+        bot: Option<Id>,
+    },
+    /// Remove a skill from its library.
+    Remove {
+        /// The skill identifier.
+        skill: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotSkillCommand {
+    /// Give a Bot a skill.
+    Enable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The skill identifier.
+        skill: Id,
+    },
+    /// Take a skill away from a Bot.
+    Disable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The skill identifier.
+        skill: Id,
     },
 }
 
@@ -474,6 +532,7 @@ async fn main() -> Result<()> {
         Top::Run { command } => run(command).await,
         Top::Approval { command } => approval(command).await,
         Top::Rule { command } => rule(command).await,
+        Top::Skill { command } => skill_command(command).await,
     }
 }
 
@@ -1210,6 +1269,7 @@ async fn bot(command: BotCommand) -> Result<()> {
                 );
             }
         }
+        BotCommand::Skill { command } => bot_skill(command).await?,
     }
 
     Ok(())
@@ -1730,8 +1790,16 @@ async fn rule(command: RuleCommand) -> Result<()> {
             tool,
             command_prefix,
             path_prefix,
+            skill,
+            script,
         } => {
-            validate_rule_arguments(&tool, command_prefix.as_deref(), path_prefix.as_deref())?;
+            validate_rule_arguments(
+                &tool,
+                command_prefix.as_deref(),
+                path_prefix.as_deref(),
+                skill.as_deref(),
+                script.as_deref(),
+            )?;
             let result = client::command(
                 &credential,
                 CommandCall::RuleAdd {
@@ -1740,6 +1808,8 @@ async fn rule(command: RuleCommand) -> Result<()> {
                     tool: tool.clone(),
                     command_prefix: command_prefix.clone(),
                     path_prefix: path_prefix.clone(),
+                    skill: skill.clone(),
+                    script: script.clone(),
                 },
             )
             .await?;
@@ -1751,7 +1821,9 @@ async fn rule(command: RuleCommand) -> Result<()> {
                     effect.wire(),
                     &tool,
                     command_prefix.as_deref(),
-                    path_prefix.as_deref()
+                    path_prefix.as_deref(),
+                    skill.as_deref(),
+                    script.as_deref()
                 )?
             );
         }
@@ -1763,6 +1835,154 @@ async fn rule(command: RuleCommand) -> Result<()> {
                 .map_or_else(|| rule.to_string(), str::to_owned);
             println!("Removed rule {shown}.");
         }
+    }
+
+    Ok(())
+}
+
+/// Adds, lists, and removes skills.
+async fn skill_command(command: SkillCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        SkillCommand::Add { path, bot } => {
+            let (document, scripts) = read_skill_directory(&path)?;
+            let library = if bot.is_some() {
+                SkillLibrary::Bot
+            } else {
+                SkillLibrary::Space
+            };
+            let result = client::command(
+                &credential,
+                CommandCall::SkillAdd(SkillAdd {
+                    library,
+                    bot,
+                    document,
+                    scripts,
+                }),
+            )
+            .await?;
+            println!(
+                "Added skill {} ({}) with {} script(s).",
+                id_of(&result, "skill")?,
+                result["name"].as_str().unwrap_or_default(),
+                result["scripts"].as_array().map_or(0, std::vec::Vec::len)
+            );
+            if let Some(bot) = bot {
+                println!(
+                    "Give it to the Bot with: neha bot skill enable {} {}",
+                    bot,
+                    id_of(&result, "skill")?
+                );
+            }
+        }
+        SkillCommand::List { bot } => {
+            let list = client::command(&credential, CommandCall::SkillList { bot }).await?;
+            for row in skill_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        SkillCommand::Remove { skill } => {
+            let result = client::command(&credential, CommandCall::SkillRemove { skill }).await?;
+            let shown = result
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("the skill");
+            println!("Removed skill {shown}.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Reads a skill's directory: its `SKILL.md`, and every file directly in its
+/// `scripts/` folder.
+fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
+    if !path.is_dir() {
+        bail!("{} is not a directory", path.display());
+    }
+    let document = std::fs::read_to_string(path.join("SKILL.md"))
+        .with_context(|| format!("{} has no SKILL.md", path.display()))?;
+    let mut scripts = Vec::new();
+    let scripts_dir = path.join("scripts");
+    if scripts_dir.is_dir() {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&scripts_dir)?
+            .filter_map(std::result::Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| entry.is_file())
+            .collect();
+        entries.sort();
+        for entry in entries {
+            let name = entry
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("a script name is not text")?
+                .to_owned();
+            let content = std::fs::read_to_string(&entry)
+                .with_context(|| format!("{} is not readable text", entry.display()))?;
+            scripts.push(SkillAddScript { name, content });
+        }
+    }
+    Ok((document, scripts))
+}
+
+/// One row per skill: skill, library, name, and what it does.
+fn skill_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no skills in the answer")?
+        .iter()
+        .map(skill_row)
+        .collect()
+}
+
+/// Formats one skill as a single line.
+fn skill_row(skill: &Value) -> Result<String> {
+    let library = match skill.get("library").and_then(Value::as_str) {
+        Some("bot") => skill
+            .get("bot")
+            .and_then(Value::as_str)
+            .map_or_else(|| "bot".to_owned(), |bot| format!("bot {bot}")),
+        _ => "space".to_owned(),
+    };
+    let scripts = skill
+        .get("scripts")
+        .and_then(Value::as_array)
+        .map_or(0, std::vec::Vec::len);
+    Ok(format!(
+        "{}  {library}  {}  {} script(s)  {}",
+        entity_id(skill, &["id", "skill"])?,
+        skill
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        scripts,
+        skill
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ))
+}
+
+/// Gives a Bot a skill, or takes one away.
+async fn bot_skill(command: BotSkillCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    let (bot, skill, enabled) = match command {
+        BotSkillCommand::Enable { bot, skill } => (bot, skill, true),
+        BotSkillCommand::Disable { bot, skill } => (bot, skill, false),
+    };
+    let call = if enabled {
+        CommandCall::BotSkillEnable { bot, skill }
+    } else {
+        CommandCall::BotSkillDisable { bot, skill }
+    };
+    let result = client::command(&credential, call).await?;
+    let name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("the skill");
+    if enabled {
+        println!("Bot {bot} may use skill {skill} ({name}).");
+    } else {
+        println!("Bot {bot} no longer uses skill {skill} ({name}).");
     }
 
     Ok(())
@@ -1792,11 +2012,15 @@ fn rule_row(rule: &Value) -> Result<String> {
     if let Some(prefix) = rule["path_prefix"].as_str() {
         row.push_str(&format!("  path-prefix {prefix}"));
     }
+    if let (Some(skill), Some(script)) = (rule["skill"].as_str(), rule["script"].as_str()) {
+        row.push_str(&format!("  skill {skill}  script {script}"));
+    }
 
     Ok(row)
 }
 
 /// The line that reports one added rule.
+#[allow(clippy::too_many_arguments)]
 fn rule_add_line(
     rule: Id,
     bot: Id,
@@ -1804,6 +2028,8 @@ fn rule_add_line(
     tool: &str,
     command_prefix: Option<&str>,
     path_prefix: Option<&str>,
+    skill: Option<&str>,
+    script: Option<&str>,
 ) -> String {
     let mut line = format!("Added rule {rule} for Bot {bot}: {effect} {tool}");
     if let Some(prefix) = command_prefix {
@@ -1811,6 +2037,9 @@ fn rule_add_line(
     }
     if let Some(prefix) = path_prefix {
         line.push_str(&format!(" (path-prefix {prefix:?})"));
+    }
+    if let (Some(skill), Some(script)) = (skill, script) {
+        line.push_str(&format!(" (skill {skill:?}, script {script:?})"));
     }
 
     line
@@ -1820,6 +2049,7 @@ fn rule_add_line(
 ///
 /// The Space normalizes a prefix before it records the rule; printing what the
 /// Space returned shows the rule that actually exists, not the text typed.
+#[allow(clippy::too_many_arguments)]
 fn rule_add_report(
     result: &Value,
     bot: Id,
@@ -1827,6 +2057,8 @@ fn rule_add_report(
     tool: &str,
     command_prefix: Option<&str>,
     path_prefix: Option<&str>,
+    skill: Option<&str>,
+    script: Option<&str>,
 ) -> Result<String> {
     let rule = entity_id(result, &["rule", "id"])?;
     let command_prefix = result.get("command_prefix").map_or_else(
@@ -1845,6 +2077,8 @@ fn rule_add_report(
         tool,
         command_prefix.as_deref(),
         path_prefix.as_deref(),
+        skill,
+        script,
     ))
 }
 
@@ -1857,6 +2091,8 @@ fn validate_rule_arguments(
     tool: &str,
     command_prefix: Option<&str>,
     path_prefix: Option<&str>,
+    skill: Option<&str>,
+    script: Option<&str>,
 ) -> Result<()> {
     if command_prefix.is_some() && path_prefix.is_some() {
         bail!("pass at most one of --command-prefix and --path-prefix");
@@ -1864,6 +2100,16 @@ fn validate_rule_arguments(
     let tool = tool.trim();
     if tool.is_empty() {
         bail!("--tool must not be empty");
+    }
+    let script_rule = skill.is_some() || script.is_some();
+    if script_rule && tool != "run_skill_script" {
+        bail!("--skill and --script match a skill's script; {tool} is not run_skill_script");
+    }
+    if tool == "run_skill_script" && !script_rule {
+        bail!("--tool run_skill_script needs --skill and --script");
+    }
+    if script_rule && (command_prefix.is_some() || path_prefix.is_some()) {
+        bail!("--skill and --script take no command or path prefix");
     }
     if let Some(prefix) = command_prefix {
         if tool != "shell" {
@@ -2000,7 +2246,7 @@ impl ApprovalCard {
     /// possible; the User never grants a lasting rule without seeing its
     /// reach.
     fn always_scope(&self) -> Option<String> {
-        if self.reason != "rule" && self.reason != "grant" {
+        if self.reason != "rule" && self.reason != "grant" && self.reason != "first_script_run" {
             return None;
         }
 
@@ -2043,6 +2289,8 @@ impl ApprovalCard {
             "a rule you set".to_owned()
         } else if self.reason == "grant" {
             "a folder you have not granted".to_owned()
+        } else if self.reason == "first_script_run" {
+            "the first run of a skill's script".to_owned()
         } else {
             self.reason.clone()
         }
@@ -2418,6 +2666,8 @@ mod tests {
         rule_add_line, rule_add_report, rule_rows, validate_rule_arguments, waiting_advice,
         write_approval_details,
     };
+
+    use super::{BotSkillCommand, SkillCommand, read_skill_directory};
 
     use super::{
         BotCommand, checked_grant, confirm_full_access, normalized_grant, revocable_grant,
@@ -2813,6 +3063,121 @@ mod tests {
     }
 
     #[test]
+    fn the_skill_commands_parse() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        let skill = Id::new();
+        let skill_text = skill.to_string();
+
+        match parse(&["skill", "add", "/tmp/skills/weekly"]) {
+            Top::Skill {
+                command: SkillCommand::Add { path, bot: None },
+            } => assert_eq!(path, std::path::Path::new("/tmp/skills/weekly")),
+            _ => panic!("skill add did not parse"),
+        }
+        match parse(&[
+            "skill",
+            "add",
+            "/tmp/skills/weekly",
+            "--bot",
+            bot_text.as_str(),
+        ]) {
+            Top::Skill {
+                command:
+                    SkillCommand::Add {
+                        bot: Some(shown), ..
+                    },
+            } => assert_eq!(shown, bot),
+            _ => panic!("skill add --bot did not parse"),
+        }
+        match parse(&["skill", "list"]) {
+            Top::Skill {
+                command: SkillCommand::List { bot: None },
+            } => {}
+            _ => panic!("skill list did not parse"),
+        }
+        match parse(&["skill", "remove", skill_text.as_str()]) {
+            Top::Skill {
+                command: SkillCommand::Remove { skill: shown },
+            } => assert_eq!(shown, skill),
+            _ => panic!("skill remove did not parse"),
+        }
+        match parse(&[
+            "bot",
+            "skill",
+            "enable",
+            bot_text.as_str(),
+            skill_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Skill {
+                        command:
+                            BotSkillCommand::Enable {
+                                bot: shown_bot,
+                                skill: shown_skill,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_skill, skill);
+            }
+            _ => panic!("bot skill enable did not parse"),
+        }
+        match parse(&[
+            "bot",
+            "skill",
+            "disable",
+            bot_text.as_str(),
+            skill_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Skill {
+                        command:
+                            BotSkillCommand::Disable {
+                                bot: shown_bot,
+                                skill: shown_skill,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_skill, skill);
+            }
+            _ => panic!("bot skill disable did not parse"),
+        }
+        assert!(Cli::try_parse_from(["neha", "skill", "add"]).is_err());
+        assert!(Cli::try_parse_from(["neha", "bot", "skill", "enable"]).is_err());
+    }
+
+    #[test]
+    fn a_skill_directory_reads_its_document_and_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+        )
+        .unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        std::fs::write(
+            directory.path().join("scripts").join("hello.sh"),
+            "printf hi",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "not a script").unwrap();
+        let (document, scripts) = read_skill_directory(directory.path()).unwrap();
+        assert!(document.contains("name: hello"));
+        assert_eq!(scripts.len(), 1, "only scripts/ holds scripts: {scripts:?}");
+        assert_eq!(scripts[0].name, "hello.sh");
+        assert_eq!(scripts[0].content, "printf hi");
+
+        // A directory without SKILL.md is not a skill.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(read_skill_directory(empty.path()).is_err());
+        assert!(read_skill_directory(&directory.path().join("missing")).is_err());
+    }
+
+    #[test]
     fn the_rule_commands_parse() {
         let bot = Id::new();
         let bot_text = bot.to_string();
@@ -2842,6 +3207,8 @@ mod tests {
                         tool,
                         command_prefix,
                         path_prefix,
+                        skill,
+                        script,
                     },
             } => {
                 assert_eq!(shown, bot);
@@ -2849,6 +3216,7 @@ mod tests {
                 assert_eq!(tool, "shell");
                 assert_eq!(command_prefix.as_deref(), Some("git"));
                 assert_eq!(path_prefix, None);
+                assert_eq!((skill, script), (None, None));
             }
             _ => panic!("rule add did not parse"),
         }
@@ -2879,10 +3247,18 @@ mod tests {
 
     #[test]
     fn a_rule_prefix_is_checked_against_its_tool() {
-        validate_rule_arguments("shell", None, None).unwrap();
-        validate_rule_arguments("shell", Some("git"), None).unwrap();
-        validate_rule_arguments("read_file", None, Some("/home/ada")).unwrap();
-        validate_rule_arguments("write_file", None, Some(".")).unwrap();
+        validate_rule_arguments("shell", None, None, None, None).unwrap();
+        validate_rule_arguments("shell", Some("git"), None, None, None).unwrap();
+        validate_rule_arguments("read_file", None, Some("/home/ada"), None, None).unwrap();
+        validate_rule_arguments("write_file", None, Some("."), None, None).unwrap();
+        validate_rule_arguments(
+            "run_skill_script",
+            None,
+            None,
+            Some("weekly-report"),
+            Some("collect.sh"),
+        )
+        .unwrap();
 
         for (tool, command_prefix, path_prefix, expected) in [
             ("shell", Some("git"), Some("/tmp"), "at most one"),
@@ -2893,7 +3269,31 @@ mod tests {
             ("read_file", None, Some(" "), "must not be empty"),
             ("   ", None, None, "--tool"),
         ] {
-            let error = validate_rule_arguments(tool, command_prefix, path_prefix)
+            let error = validate_rule_arguments(tool, command_prefix, path_prefix, None, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{tool:?}: {error}");
+        }
+        for (tool, command_prefix, path_prefix, skill, script, expected) in [
+            (
+                "shell",
+                None,
+                None,
+                Some("weekly-report"),
+                Some("collect.sh"),
+                "not run_skill_script",
+            ),
+            ("run_skill_script", None, None, None, None, "needs --skill"),
+            (
+                "run_skill_script",
+                Some("git"),
+                None,
+                Some("weekly-report"),
+                Some("collect.sh"),
+                "no command or path prefix",
+            ),
+        ] {
+            let error = validate_rule_arguments(tool, command_prefix, path_prefix, skill, script)
                 .unwrap_err()
                 .to_string();
             assert!(error.contains(expected), "{tool:?}: {error}");
@@ -3475,13 +3875,36 @@ mod tests {
             rule_rows(&list).unwrap(),
             vec![format!("{rule}  {bot}  ask  shell  command-prefix git")]
         );
+        let script_rule = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "allow",
+            "tool": "run_skill_script",
+            "skill": "weekly-report",
+            "script": "collect.sh",
+        }]);
+        assert_eq!(
+            rule_rows(&script_rule).unwrap(),
+            vec![format!(
+                "{rule}  {bot}  allow  run_skill_script  skill weekly-report  script collect.sh"
+            )]
+        );
         assert_eq!(rule_rows(&json!([])).unwrap(), Vec::<String>::new());
         assert_eq!(
-            rule_add_line(rule, bot, "ask", "shell", Some("git"), None),
+            rule_add_line(rule, bot, "ask", "shell", Some("git"), None, None, None),
             format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
         );
         assert_eq!(
-            rule_add_line(rule, bot, "allow", "read_file", None, Some("/tmp")),
+            rule_add_line(
+                rule,
+                bot,
+                "allow",
+                "read_file",
+                None,
+                Some("/tmp"),
+                None,
+                None
+            ),
             format!("Added rule {rule} for Bot {bot}: allow read_file (path-prefix \"/tmp\")")
         );
         assert_eq!(
@@ -3505,7 +3928,17 @@ mod tests {
             "path_prefix": "logs",
         });
         assert_eq!(
-            rule_add_report(&result, bot, "ask", "write_file", None, Some("./logs/")).unwrap(),
+            rule_add_report(
+                &result,
+                bot,
+                "ask",
+                "write_file",
+                None,
+                Some("./logs/"),
+                None,
+                None
+            )
+            .unwrap(),
             format!("Added rule {rule} for Bot {bot}: ask write_file (path-prefix \"logs\")")
         );
 
@@ -3516,14 +3949,24 @@ mod tests {
             "path_prefix": null,
         });
         assert_eq!(
-            rule_add_report(&result, bot, "allow", "shell", Some("  git  "), None).unwrap(),
+            rule_add_report(
+                &result,
+                bot,
+                "allow",
+                "shell",
+                Some("  git  "),
+                None,
+                None,
+                None
+            )
+            .unwrap(),
             format!("Added rule {rule} for Bot {bot}: allow shell (command-prefix \"git\")")
         );
 
         // A Space answer without the fields falls back to what was typed.
         let result = json!({"rule": rule});
         assert_eq!(
-            rule_add_report(&result, bot, "ask", "shell", Some("git"), None).unwrap(),
+            rule_add_report(&result, bot, "ask", "shell", Some("git"), None, None, None).unwrap(),
             format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
         );
     }

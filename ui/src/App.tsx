@@ -1529,7 +1529,13 @@ function approvalRequested(event: RecordEvent): Approval | null {
   const summary = text("summary");
   const reason = data.reason;
   if (!approval || !run || !bot || !chat || !action || !tool || !summary) return null;
-  if (reason !== "first_use_local" && reason !== "rule" && reason !== "grant") return null;
+  if (
+    reason !== "first_use_local" &&
+    reason !== "first_script_run" &&
+    reason !== "rule" &&
+    reason !== "grant"
+  )
+    return null;
   const card: Approval = {
     approval,
     run,

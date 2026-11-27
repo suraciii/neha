@@ -15,6 +15,7 @@ pub use model::{
     Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall, ToolSpec,
 };
 pub use run::{
-    Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest, WaitingApproval,
-    call_id, run,
+    Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest, Runtime,
+    WaitingApproval, call_id, run,
 };
+pub use tools::SpaceCall;
