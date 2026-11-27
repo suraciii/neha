@@ -340,6 +340,7 @@ const en = {
   "settings.computers.access.folders": "{count} granted folders",
   "settings.computers.access.full": "Full access",
   "settings.computers.access.machine": "Shell runs as the machine user",
+  "settings.computers.access.unknown": "Waiting for this Computer to say what it allows",
 
   "error.permission": "This Space does not allow that change.",
 
@@ -680,6 +681,7 @@ const zh: Record<MessageKey, string> = {
   "settings.computers.access.folders": "{count} 个授权文件夹",
   "settings.computers.access.full": "完全访问",
   "settings.computers.access.machine": "Shell 以机器用户权限运行",
+  "settings.computers.access.unknown": "等待 Computer 连接以确认权限",
 
   "error.permission": "这个 Space 不允许这个修改。",
 

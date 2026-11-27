@@ -148,6 +148,13 @@ pub struct ComputerView {
     /// Whether its owner may turn a Bot's full access on.
     #[serde(default = "true_capability")]
     pub supports_full_access: bool,
+    /// Whether its machine sandboxes runs; absent until it greets the Space.
+    ///
+    /// `Some(false)` marks a runtime with no OS fence (an opted-in Windows
+    /// Local Computer); `None` means this Space process has not seen the
+    /// machine's handshake yet, so a client must not assume either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandboxed: Option<bool>,
 }
 
 /// The live state of a Chat, projected from its runs.
@@ -1012,6 +1019,7 @@ impl Projection for State {
                         workspace: data.workspace,
                         supports_grants: true,
                         supports_full_access: true,
+                        sandboxed: None,
                     },
                 );
                 self.computer_order.push(data.computer);

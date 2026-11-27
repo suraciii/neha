@@ -51,6 +51,9 @@ pub struct AccessCapabilities {
     pub grants: bool,
     /// Whether the owner may turn a Bot's full access on.
     pub full_access: bool,
+    /// Whether the machine sandboxes runs; a client shows a view of unknown
+    /// access until the machine greets, so this is only read when known.
+    pub sandboxed: bool,
 }
 
 impl AccessCapabilities {
@@ -58,6 +61,7 @@ impl AccessCapabilities {
     pub const SUPPORTED: Self = Self {
         grants: true,
         full_access: true,
+        sandboxed: true,
     };
 
     /// What a Local Computer can serve until its handshake says otherwise.
@@ -68,6 +72,8 @@ impl AccessCapabilities {
     pub const UNSUPPORTED: Self = Self {
         grants: false,
         full_access: false,
+        // Unknown access is shown as `None`, not as this placeholder.
+        sandboxed: true,
     };
 }
 
@@ -643,6 +649,7 @@ mod tests {
             super::AccessCapabilities {
                 grants: false,
                 full_access: false,
+                sandboxed: true,
             },
         );
 
@@ -666,6 +673,7 @@ mod tests {
             Some(super::AccessCapabilities {
                 grants: false,
                 full_access: false,
+                sandboxed: true,
             }),
             "the reconnect replaced what the Computer declared"
         );

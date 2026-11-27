@@ -208,10 +208,15 @@ export default function SettingsPage(props: SettingsPageProps) {
   // A Computer whose daemon serves no fence runs the Bot's shell with the
   // machine user's own rights: the folders the Bot names are ones the daemon
   // would have to honor, and this one honors none of them. So the summary says
-  // what the shell really runs as instead of a fence that is not there.
+  // what the shell really runs as instead of a fence that is not there. A
+  // Computer that has not answered says nothing about its machine yet, so the
+  // summary asks for its word rather than guessing either way.
   const accessOf = (bot: Bot, computer: Computer | undefined): string => {
-    if (computer && !(computer.supports_grants ?? false)) {
+    if (computer && computer.sandboxed === false) {
       return t("settings.computers.access.machine");
+    }
+    if (computer && computer.sandboxed == null) {
+      return t("settings.computers.access.unknown");
     }
     return bot.full_access
       ? t("settings.computers.access.full")

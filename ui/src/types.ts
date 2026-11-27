@@ -59,6 +59,10 @@ export interface Computer {
   supports_grants?: boolean;
   // Whether the daemon on this Computer may run without its sandbox.
   supports_full_access?: boolean;
+  // Whether the daemon on this Computer fences a Bot's commands. A Computer that
+  // has not answered yet leaves it unset: nothing is known about its machine, so
+  // nothing is claimed about what a Bot's shell runs as.
+  sandboxed?: boolean | null;
 }
 
 // What a Chat's active Run is doing, as the Space projects it.

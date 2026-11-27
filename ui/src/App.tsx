@@ -1820,6 +1820,9 @@ export default function App() {
       setSectionOpen(false);
       return;
     }
+    // The page is closing, so a read it asked for belongs to a page that is gone:
+    // the count moves on, and the answer is dropped when it lands.
+    pageGen += 1;
     const trail = manageTrail();
     setManageTrail(trail.slice(0, -1));
     const back = trail[trail.length - 1] ?? "chats";
@@ -1842,6 +1845,15 @@ export default function App() {
   const showManage = () => view() === "bots" || view() === "settings";
   const showPage = () =>
     (view() === "settings" && sectionOpen()) || (view() === "bots" && state.pageBot !== null);
+  // The main area holds a detail rather than a list: on a narrow viewport that is
+  // the one surface on screen and the sidebar is the one hidden. Which of the two
+  // is on screen follows the rail view, not what is open behind it: a Chat left
+  // open must not hide the list of the surface the User just opened.
+  const showDetail = () => (showManage() ? showPage() : showChat());
+  // The setup view fills the main area too, so the sidebar is the one hidden —
+  // unless a management surface is open, where its list is how a Space with no
+  // Provider yet gets one.
+  const showSetup = () => needsSetup() && !showManage();
 
   // What each Chat is doing, for the list and the attention section.
   const chatStates = createMemo<Record<string, ChatStatus>>(() => {
@@ -1925,9 +1937,7 @@ export default function App() {
         >
         {(account) => (
           <div
-            class={`app${showChat() || showPage() ? " app--detail" : ""}${
-              needsSetup() ? " app--setup" : ""
-            }`}
+            class={`app${showDetail() ? " app--detail" : ""}${showSetup() ? " app--setup" : ""}`}
           >
             <Rail
               account={account()}

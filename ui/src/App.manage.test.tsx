@@ -963,10 +963,24 @@ describe("App management", () => {
     }
   });
 
+  it("asks for a Computer's word before it says what the shell runs as", async () => {
+    // A Space that restarted has not heard from this Computer yet: nothing is
+    // known about its machine, so the summary asks rather than claiming either
+    // a fence or the machine user's own rights.
+    space.computer.sandboxed = null;
+    const view = await openSettings("Computers");
+
+    expect(panelText(view, "Computers")).toContain("Waiting for this Computer to say what it allows");
+    expect(panelText(view, "Computers")).not.toContain("Shell runs as the machine user");
+    expect(panelText(view, "Computers")).not.toContain("Only its Workspace");
+    await drain();
+  });
+
   it("says what a Windows Computer's shell really runs as", async () => {
     // An online Windows Local daemon serves no fence: it runs the Bot's shell
     // with the machine user's own rights, so a summary that named the Bot's
     // folders would describe a fence that is not there.
+    space.computer.sandboxed = false;
     space.computer.supports_grants = false;
     space.computer.supports_full_access = false;
     const view = await openSettings("Computers");
@@ -1019,6 +1033,76 @@ describe("App management", () => {
       const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
       const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
       expect(narrow).toContain(".app--detail .sidebar");
+    } finally {
+      window.matchMedia = wide;
+    }
+  });
+
+  it("reaches the Settings sections while the Space still needs setup", async () => {
+    // A Space with no Provider yet shows its setup view, which fills the main
+    // area. A narrow viewport must still reach the list of sections, because a
+    // Provider is connected from the Providers section.
+    space.providers = [];
+    const wide = window.matchMedia;
+    try {
+      Object.defineProperty(window, "matchMedia", {
+        writable: true,
+        value: (query: string) => ({
+          matches: true,
+          media: query,
+          addEventListener: () => undefined,
+          removeEventListener: () => undefined,
+        }),
+      });
+      const view = renderApp();
+      await waitFor(() => expect(element(view, ".rail__item:nth-of-type(4)")).toBeTruthy());
+      // The setup view is what fills the main area while there is no Provider.
+      expect(element(view, ".app").className).toContain("app--setup");
+
+      // The rail opens the Settings surface, and its list of sections is the
+      // surface on screen.
+      flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+      expect(element(view, ".app").className).not.toContain("app--setup");
+      expect(element(view, ".app").className).not.toContain("app--detail");
+    } finally {
+      window.matchMedia = wide;
+    }
+  });
+
+  it("reaches the Settings sections from a Chat that is already open", async () => {
+    // A narrow viewport shows one surface at a time, and the Chat left open
+    // behind the Settings surface must not be the one that decides: the rail
+    // view does. Otherwise the list of sections is the hidden surface and three
+    // of the four sections cannot be reached.
+    const wide = window.matchMedia;
+    try {
+      Object.defineProperty(window, "matchMedia", {
+        writable: true,
+        value: (query: string) => ({
+          matches: true,
+          media: query,
+          addEventListener: () => undefined,
+          removeEventListener: () => undefined,
+        }),
+      });
+      const view = renderApp();
+      // A Chat is open, which is what put the shell in its detail layout.
+      await waitFor(() => expect(element(view, ".conv")).toBeTruthy());
+      flush(() => fireEvent.click(element(view, ".conv")));
+      await waitFor(() => expect(element(view, ".chat")).toBeTruthy());
+      expect(element(view, ".app").className).toContain("app--detail");
+
+      // The rail opens the Settings surface, and its list of sections is the
+      // surface on screen.
+      flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+      expect(element(view, ".app").className).not.toContain("app--detail");
+
+      // The Bots surface is reachable the same way.
+      flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
+      await waitFor(() => expect(element(view, ".conv")).toBeTruthy());
+      expect(element(view, ".app").className).not.toContain("app--detail");
     } finally {
       window.matchMedia = wide;
     }
@@ -1131,6 +1215,29 @@ describe("App management", () => {
     expect(element(view, ".page__titles h1").textContent).toBe("Quill");
     expect(element(view, ".rows .row__name").textContent).toBe("write_file");
     expect(panelText(view, "Ask and Allow rules")).not.toContain("No rule is set.");
+    await drain();
+  });
+
+  it("drops a Bot page read that answers after Back closed it", async () => {
+    space.bot.grants = ["/data"];
+    const view = await openBots();
+    expect(panelText(view, "Granted folders")).toContain("/data");
+
+    // The write goes out, and the read that would fill the page back in is held.
+    space.holdRules("b1");
+    flush(() => fireEvent.click(element(view, ".row__remove")));
+    await waitFor(() => expect(space.updates).toHaveLength(1));
+    expect(space.updates[0]).toMatchObject({ bot: "b1", grant_remove: "/data" });
+
+    // Back closes the page while the answer is still in flight.
+    flush(() => fireEvent.click(element(view, ".page__back")));
+    await waitFor(() => expect(view.container.querySelector(".page__body")).toBeNull());
+
+    // The held read answers now. It belongs to the page Back closed, so the
+    // detail does not come back to fill the list.
+    space.releaseRules();
+    await drain();
+    expect(view.container.querySelector(".page__body")).toBeNull();
     await drain();
   });
 

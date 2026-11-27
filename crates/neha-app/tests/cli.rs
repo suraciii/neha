@@ -5596,3 +5596,100 @@ fn a_bot_owner_resets_its_model_and_thinking_from_the_cli() {
         "the level reset replays:\n{shown}"
     );
 }
+
+#[test]
+fn a_provider_whose_default_would_strand_a_bot_is_refused_by_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, _url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "thinker",
+            "--thinks",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let thinker = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("thinker"))
+        .map(first_word)
+        .expect("thinker is listed");
+    let defaults = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .filter(|line| line.contains("default"))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let before = defaults(&listed);
+    assert_eq!(before.len(), 1, "{listed}");
+    assert!(before[0].starts_with(&thinker), "{listed}");
+
+    let created = run(
+        &home,
+        &credential,
+        &["bot", "create", "Scout", "--thinking", "high"],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+
+    // The second Provider's only Model cannot think; it would become the
+    // Space's default and strand the Bot's level.
+    let refused = cli(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:2/v1",
+            "--model",
+            "plain",
+        ],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("cannot think") && stderr.contains("reset their thinking levels"),
+        "{stderr}"
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    assert_eq!(defaults(&listed), before, "the old default stays");
+
+    // After the Bot gives up its level the same connection succeeds.
+    run(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--reset-thinking"],
+    );
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:2/v1",
+            "--model",
+            "plain",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let plain = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("plain"))
+        .map(first_word)
+        .expect("plain is listed");
+    let after = defaults(&listed);
+    assert_eq!(after.len(), 1, "{listed}");
+    assert!(after[0].starts_with(&plain), "{listed}");
+
+    drop(server);
+}

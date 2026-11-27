@@ -64,6 +64,9 @@ const computer = {
   workspace: "/w",
   supports_grants: true,
   supports_full_access: true,
+  // The daemon fences this machine's commands, and it has said so. A test may
+  // take the word away, or leave the Computer yet to give it.
+  sandboxed: true as boolean | null,
 };
 // Another paired Local Computer, which is where a Bot may move.
 const otherComputer = {
@@ -74,6 +77,7 @@ const otherComputer = {
   workspace: "/other",
   supports_grants: true,
   supports_full_access: true,
+  sandboxed: true as boolean | null,
 };
 // A Computer the Space runs itself, which only a reset can clear.
 const hostedComputer = {
@@ -82,6 +86,7 @@ const hostedComputer = {
   kind: "hosted",
   online: true,
   workspace: "/hosted",
+  sandboxed: true,
 };
 const chat = { id: "h1", owner: "u1", bot: "b1" };
 const otherChat = { id: "h2", owner: "u1", bot: "b2" };
@@ -218,6 +223,9 @@ export const space = {
     space.computer.supports_full_access = true;
     space.otherComputer.supports_grants = true;
     space.otherComputer.supports_full_access = true;
+    space.computer.sandboxed = true;
+    space.otherComputer.sandboxed = true;
+    space.hostedComputer.sandboxed = true;
     space.hostedComputer.kind = "hosted";
     space.bot.name = "Scout";
     space.bot.computer = "p1";

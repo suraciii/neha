@@ -1757,6 +1757,7 @@ fn hello_access(
     AccessCapabilities {
         grants: supports_grants.unwrap_or(sandbox),
         full_access: supports_full_access.unwrap_or(sandbox),
+        sandboxed: sandbox,
     }
 }
 
@@ -2921,7 +2922,11 @@ mod tests {
     fn a_greeting_written_before_access_fields_derives_them_from_sandbox() {
         assert_eq!(
             super::hello_access(false, None, None),
-            AccessCapabilities::UNSUPPORTED
+            AccessCapabilities {
+                grants: false,
+                full_access: false,
+                sandboxed: false,
+            }
         );
         assert_eq!(
             super::hello_access(true, None, None),
@@ -2933,6 +2938,16 @@ mod tests {
             AccessCapabilities {
                 grants: false,
                 full_access: true,
+                sandboxed: true,
+            }
+        );
+        // An unsandboxed greeting says so, whatever its capabilities claim.
+        assert_eq!(
+            super::hello_access(false, Some(false), Some(false)),
+            AccessCapabilities {
+                grants: false,
+                full_access: false,
+                sandboxed: false,
             }
         );
     }
@@ -7246,6 +7261,114 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_add_that_would_strand_a_bot_is_refused() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let first = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::ChatCompletions,
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                api_key: "sk-test".to_owned(),
+                models: vec![model_spec(
+                    "thinker",
+                    true,
+                    true,
+                    vec![ThinkingLevel::Low, ThinkingLevel::High],
+                )],
+                default_model: Some("thinker".to_owned()),
+                thinking: None,
+                vendor: None,
+                discover: false,
+            }),
+        )
+        .await;
+        let thinker: Id = serde_json::from_value(first["models"][0]["id"].clone()).unwrap();
+        // Scout inherits the default and keeps `high`.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: None,
+            }),
+        )
+        .await;
+
+        // A second Provider's Model would become the default and could not
+        // think, stranding Scout: the connection is refused.
+        let before = running.server.store.last_seq().await.unwrap();
+        let plain = CommandCall::ProviderAdd(ProviderAdd {
+            protocol: ProviderProtocol::ChatCompletions,
+            base_url: "http://127.0.0.1:2/v1".to_owned(),
+            api_key: "sk-test".to_owned(),
+            models: vec![model_spec("plain", false, true, Vec::new())],
+            default_model: Some("plain".to_owned()),
+            thinking: None,
+            vendor: None,
+            discover: false,
+        });
+        let refused = try_command(&mut socket, Id::new(), plain.clone()).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("cannot think")
+                    && message.contains("reset their thinking levels")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused connection records nothing"
+        );
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let default = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["is_default"] == json!(true))
+            .unwrap();
+        assert_eq!(default["id"], json!(thinker), "the old default stays");
+
+        // After the Bot gives up its level, the same connection succeeds.
+        let bots = command(&mut socket, Id::new(), CommandCall::BotList).await;
+        let scout: Id = serde_json::from_value(bots[0]["id"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot: scout,
+                name: None,
+                reset_model: false,
+                reset_thinking: true,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        command(&mut socket, Id::new(), plain).await;
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let defaults: Vec<&Value> = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|model| model["is_default"] == json!(true))
+            .collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0]["name"], "plain");
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_provider_discovers_and_refreshes_its_models() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10617,6 +10740,47 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_computer_declares_no_access_until_it_greets() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (_device, code) = pair_machine(&running).await;
+        let added = command(&mut socket, Id::new(), add_computer(&code)).await;
+        let computer: Id = serde_json::from_value(added["id"].clone()).unwrap();
+
+        // The pairing answer matches the listing: before the handshake the
+        // machine serves no access and its sandbox is unknown.
+        assert_eq!(added["online"], json!(false));
+        assert_eq!(added["supports_grants"], json!(false));
+        assert_eq!(added["supports_full_access"], json!(false));
+        assert_eq!(added["sandboxed"], Value::Null);
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed, &added, "the answer is the listing view");
+
+        // After the handshake the view names what the machine declared.
+        let mut device = connect_computer(&running, &machine_token(), computer).await;
+        wait_online(&mut socket, computer).await;
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed["sandboxed"], json!(true));
+        assert_eq!(listed["supports_grants"], json!(true));
+
+        device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn pairing_a_machine_over_http_adds_a_real_computer() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -11800,6 +11964,7 @@ mod tests {
         let unsupported = AccessCapabilities {
             grants: false,
             full_access: false,
+            sandboxed: true,
         };
         let mut device = connect_computer_with(&running, &machine, computer, unsupported).await;
         wait_online(&mut socket, computer).await;
@@ -11916,6 +12081,11 @@ mod tests {
         assert_eq!(listed["online"], json!(false));
         assert_eq!(listed["supports_grants"], json!(false));
         assert_eq!(listed["supports_full_access"], json!(false));
+        assert_eq!(
+            listed["sandboxed"],
+            Value::Null,
+            "unknown sandbox is not refused access"
+        );
 
         // Dropping a path introduces nothing, so it passes...
         let narrowed = command(
@@ -11989,6 +12159,7 @@ mod tests {
             .find(|view| view["id"] == json!(computer))
             .unwrap();
         assert_eq!(listed["supports_grants"], json!(false));
+        assert_eq!(listed["sandboxed"], json!(true));
         let refused = try_command(
             &mut socket,
             Id::new(),
@@ -17328,6 +17499,127 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_lasting_grant_checks_the_computers_access() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "inside.txt", "content": "one"}),
+                ),
+                text("first"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "two"}),
+                ),
+                text("second"),
+            ],
+        )
+        .await;
+        // The first use of the machine asks; allowing it once is enough for
+        // the next outside write to offer a lasting grant.
+        let first = run_of(&submit(&mut local.socket, local.chat, "inside", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        decide_approval(&mut local.socket, approval, true, false).await;
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+        let second = run_of(&submit(&mut local.socket, local.chat, "outside", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "grant");
+        assert!(approval["lasting_scope"].is_string());
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+
+        // The Bot moves to a machine that has not declared access yet.
+        let (unsupported, _machine) =
+            paired_computer_with_token(&mut local.socket, &running, &machine_token_n(90)).await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot: local.bot,
+                computer: unsupported,
+            },
+        )
+        .await;
+
+        // A lasting answer writes a permanent grant, so it needs the access a
+        // grant needs: refused, with the approval still pending.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support granted folders")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused lasting answer writes nothing"
+        );
+        let approvals = approvals_in(&mut local.socket, Some(local.chat)).await;
+        assert!(
+            approvals
+                .iter()
+                .any(|view| view["approval"] == json!(approval_id)),
+            "the approval stays pending"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!([]), "no grant was written");
+
+        // Back on the machine that serves granted folders, the answer works.
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot: local.bot,
+                computer: local.computer,
+            },
+        )
+        .await;
+        let decided = decide_approval(&mut local.socket, approval_id, true, true).await;
+        assert_eq!(decided["grant"], "/tmp");
+        answer_next_action(&mut local.device, "o").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!(["/tmp"]));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_first_grant_cannot_become_lasting() {
         let (_dir, running, invite) = running().await;
         let mut local = local_bot(
@@ -19241,6 +19533,115 @@ mod tests {
         );
         socket.close(None).await.unwrap();
         restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_reset_checks_the_inherited_model_can_call_tools() {
+        let (dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Pawn", None)).await;
+        let owner: Id = serde_json::from_value(created["bot"]["owner"].clone()).unwrap();
+
+        // A Provider recorded before `provider add` checked its default can
+        // name a Model that cannot call tools as the Space default.
+        let (provider, good, bad) = (Id::new(), Id::new(), Id::new());
+        let model = |id: Id, name: &str, tools: bool| {
+            json!({
+                "id": id,
+                "name": name,
+                "context_limit": 128_000,
+                "max_output": 8_192,
+                "reads_images": false,
+                "thinks": false,
+                "tools": tools,
+                "thinking_levels": [],
+            })
+        };
+        running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                "legacy provider",
+                vec![EventDraft::new(
+                    EventKind::ProviderAdded,
+                    Author::User(owner),
+                    json!({
+                        "provider": provider,
+                        "protocol": "chat_completions",
+                        "base_url": "http://127.0.0.1:1/v1",
+                        "models": [model(good, "good", true), model(bad, "bad", false)],
+                        "default_model": bad,
+                        "thinking": "medium",
+                    }),
+                )],
+            ))
+            .await
+            .unwrap();
+        // The running server applies commands' events itself, so restart to
+        // replay the seeded record into the projection.
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let running = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&running, "Ada").await;
+        let mut socket = open_socket(&running, &token).await;
+
+        // A Bot with its own runnable Model can reset to the broken default.
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: None,
+                model: Some(good),
+            }),
+        )
+        .await;
+        let scout: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let reset = CommandCall::BotUpdate(BotUpdate {
+            bot: scout,
+            name: None,
+            reset_model: true,
+            reset_thinking: false,
+            full_access: None,
+            full_access_consent: None,
+            grants: None,
+            grant_add: None,
+            grant_remove: None,
+            model: None,
+            thinking: None,
+        });
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(&mut socket, Id::new(), reset.clone()).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "the Model cannot call tools, so a Bot cannot use it"),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused reset records nothing"
+        );
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot: scout }).await;
+        assert_eq!(
+            shown["bot"]["model"],
+            json!(good),
+            "the Bot keeps its Model"
+        );
+
+        // Once the default Model can call tools, the same reset succeeds.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: good },
+        )
+        .await;
+        let done = command(&mut socket, Id::new(), reset).await;
+        assert_eq!(done["model"], json!(null));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

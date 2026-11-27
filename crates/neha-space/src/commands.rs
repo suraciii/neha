@@ -463,6 +463,37 @@ async fn approval_decide(
             "this grant cannot become lasting",
         ));
     }
+    if lasting_grant.is_some() {
+        // A lasting answer writes a permanent grant, so it needs what a Bot
+        // update grant needs: the Bot's final Computer must serve granted
+        // folders. Before the machine greets this Space process, unknown is
+        // treated as unsupported. A refused answer writes no decision, so the
+        // approval stays pending and the owner can narrow access and answer
+        // again.
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let bot = state
+            .bots
+            .get(&view.bot)
+            .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
+        let computer = state
+            .computers
+            .get(&bot.computer)
+            .ok_or_else(|| ApiError::internal("the Bot has no Computer"))?;
+        if computer.kind == "local" {
+            let access = context
+                .links
+                .access_capabilities(computer.id)
+                .unwrap_or(AccessCapabilities::UNSUPPORTED);
+            if !access.grants {
+                return Err(ApiError::invalid_argument(
+                    "this Local Computer does not support granted folders, so the approval cannot become a lasting grant",
+                ));
+            }
+        }
+    }
     let lasting_rule = if lasting && view.reason != ApprovalReason::Grant {
         Some(Id::new())
     } else {
@@ -1094,12 +1125,26 @@ async fn record_provider(
     api_key: String,
     thinking: Option<ThinkingLevel>,
 ) -> Result<Outcome, ApiError> {
+    let mut model_views: Vec<ModelView> = Vec::with_capacity(plan.models.len());
     let models: Vec<Value> = plan
         .models
         .iter()
         .map(|model| {
+            let id = Id::new();
+            model_views.push(ModelView {
+                id,
+                provider: plan.provider,
+                name: model.name.clone(),
+                context_limit: model.context_limit,
+                max_output: model.max_output,
+                reads_images: model.reads_images,
+                thinks: model.thinks,
+                tools: model.tools,
+                thinking_levels: recorded_thinking_levels(model),
+                is_default: false,
+            });
             json!({
-                "id": Id::new(),
+                "id": id,
                 "name": model.name,
                 "context_limit": model.context_limit,
                 "max_output": model.max_output,
@@ -1110,18 +1155,29 @@ async fn record_provider(
             })
         })
         .collect();
-    let default_model = plan
+    // A Provider add or connect makes one of its Models the Space's default.
+    // That may strand a Bot that inherits the default and keeps a thinking
+    // level: refuse the write before anything is recorded.
+    let default_index = plan
         .default_model
         .as_ref()
-        .and_then(|name| {
-            plan.models
-                .iter()
-                .zip(&models)
-                .find(|(model, _)| &model.name == name)
-                .map(|(_, data)| data["id"].clone())
-        })
-        .or_else(|| models.first().map(|model| model["id"].clone()))
+        .and_then(|name| plan.models.iter().position(|model| &model.name == name))
+        .unwrap_or(0);
+    let default_view = model_views
+        .get(default_index)
+        .ok_or_else(|| ApiError::invalid_argument("the default Model is not declared"))?
+        .clone();
+    let default_model = models
+        .get(default_index)
+        .map(|data| data["id"].clone())
         .ok_or_else(|| ApiError::invalid_argument("the default Model is not declared"))?;
+    {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        check_default_model(&state, &default_view)?;
+    }
     let protocol = serde_json::to_value(plan.protocol).map_err(json_error)?;
     let thinking = thinking.or(Some(ThinkingLevel::Medium));
     let data = json!({
@@ -1293,6 +1349,33 @@ async fn provider_refresh(
             .find(|model| model["name"].as_str() == Some(name))
             .map(|model| model["id"].clone())
     });
+    // A refresh can move the Space's default when the old one is retired.
+    // Refuse the write if an inheriting Bot could no longer run.
+    if let Some(name) = default_name.as_deref()
+        && let Some(spec) = specs.iter().find(|model| model.name == name)
+    {
+        let default_view = ModelView {
+            id: default_model
+                .as_ref()
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse().ok())
+                .unwrap_or_else(Id::new),
+            provider,
+            name: spec.name.clone(),
+            context_limit: spec.context_limit,
+            max_output: spec.max_output,
+            reads_images: spec.reads_images,
+            thinks: spec.thinks,
+            tools: spec.tools,
+            thinking_levels: recorded_thinking_levels(spec),
+            is_default: true,
+        };
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        check_default_model(&state, &default_view)?;
+    }
     let data = json!({
         "provider": provider,
         "models": models,
@@ -1373,43 +1456,7 @@ async fn model_default(
         if !state.providers.contains_key(&provider) {
             return Err(ApiError::invalid_argument("the Model has no Provider"));
         }
-        // Every Bot that inherits the Space's default needs the Model to call
-        // tools; a default that cannot would strand every Bot without a Model
-        // of its own.
-        if !selected.tools {
-            return Err(ApiError::invalid_argument(
-                "the Model cannot call tools, so a Bot cannot use it",
-            ));
-        }
-        // The new default takes over every Bot that inherits it. A Bot that
-        // keeps its own thinking level must still start a run with this Model,
-        // so a Model that cannot serve a level is refused before anything is
-        // recorded. Bots with their own Model are untouched.
-        let mut cannot_think = 0_usize;
-        let mut unaccepted = 0_usize;
-        for bot in state.bots.values() {
-            let Some(level) = bot.thinking else {
-                continue;
-            };
-            if bot.model.is_some() {
-                continue;
-            }
-            if !selected.thinks {
-                cannot_think += 1;
-            } else if !selected.accepted_thinking().contains(&level) {
-                unaccepted += 1;
-            }
-        }
-        if cannot_think > 0 {
-            return Err(ApiError::invalid_argument(format!(
-                "the new default Model cannot think, but {cannot_think} Bot(s) using the Space's default keep a thinking level; reset their thinking levels first"
-            )));
-        }
-        if unaccepted > 0 {
-            return Err(ApiError::invalid_argument(format!(
-                "the new default Model does not accept the thinking level of {unaccepted} Bot(s) using the Space's default; reset their thinking levels first"
-            )));
-        }
+        check_default_model(&state, selected)?;
         let mut provider_models: Vec<&ModelView> = state
             .models
             .values()
@@ -1872,8 +1919,10 @@ async fn bot_update(
             renamed = Some(name);
         }
         // A Bot must leave this command in a combination its next run can
-        // start with: a reset can hand it the Space's default Model, which may
-        // not fit the level the Bot keeps.
+        // start with. A reset hands it the Space's default Model, which may not
+        // exist, may lose its Provider, or may not call tools; either way the
+        // final Model is checked as a run would use it, then the level the Bot
+        // keeps is checked against that Model.
         if selection_change {
             let effective = bot.model.or_else(|| {
                 state
@@ -1882,18 +1931,21 @@ async fn bot_update(
                     .find(|model| model.is_default)
                     .map(|model| model.id)
             });
-            if let (Some(selected), Some(level)) = (effective, bot.thinking)
-                && let Some(view) = state.models.get(&selected)
-            {
-                if !view.thinks {
-                    return Err(ApiError::invalid_argument(
-                        "the Model the Bot would use cannot think, but the Bot keeps its thinking level; reset the thinking level too (--reset-thinking)",
-                    ));
-                }
-                if !view.accepted_thinking().contains(&level) {
-                    return Err(ApiError::invalid_argument(
-                        "the Model the Bot would use does not accept its thinking level; reset the thinking level too (--reset-thinking)",
-                    ));
+            if let Some(selected) = effective {
+                check_model_capability(&state, selected, "the Bot's Model does not exist")?;
+                if let Some(level) = bot.thinking
+                    && let Some(view) = state.models.get(&selected)
+                {
+                    if !view.thinks {
+                        return Err(ApiError::invalid_argument(
+                            "the Model the Bot would use cannot think, but the Bot keeps its thinking level; reset the thinking level too (--reset-thinking)",
+                        ));
+                    }
+                    if !view.accepted_thinking().contains(&level) {
+                        return Err(ApiError::invalid_argument(
+                            "the Model the Bot would use does not accept its thinking level; reset the thinking level too (--reset-thinking)",
+                        ));
+                    }
                 }
             }
         }
@@ -2432,7 +2484,10 @@ async fn computer_add(
             "workspace": workspace,
         }),
     );
-    let result = json!(ComputerView {
+    // The pairing answer is the same view a listing shows: a machine that has
+    // not greeted this Space process yet serves no access, so it must not
+    // promise capabilities its first handshake may refuse.
+    let added = ComputerView {
         id: computer,
         owner: account.id,
         kind: "local".to_owned(),
@@ -2440,7 +2495,9 @@ async fn computer_add(
         workspace,
         supports_grants: true,
         supports_full_access: true,
-    });
+        sandboxed: None,
+    };
+    let result = json!(viewed_computer(&added, context.links));
     let appended = match append(
         context.store,
         context.state,
@@ -2574,6 +2631,7 @@ fn fresh_hosted(
         workspace: workspace.to_string_lossy().into_owned(),
         supports_grants: true,
         supports_full_access: true,
+        sandboxed: None,
     };
 
     Ok((computer, view, Some(workspace)))
@@ -2797,11 +2855,13 @@ fn viewed_computer(computer: &ComputerView, links: &ComputerLinks) -> ComputerVi
     // of this Space process nothing is known, and unknown is shown as no
     // access: a control must not be offered until the machine says it works.
     if computer.kind == "local" {
-        let access = links
-            .access_capabilities(computer.id)
-            .unwrap_or(AccessCapabilities::UNSUPPORTED);
+        let known = links.access_capabilities(computer.id);
+        let access = known.unwrap_or(AccessCapabilities::UNSUPPORTED);
         computer.supports_grants = access.grants;
         computer.supports_full_access = access.full_access;
+        // Unknown is not the same as an unsandboxed machine: a client shows
+        // that it waits for the Computer instead of explaining user rights.
+        computer.sandboxed = known.map(|access| access.sandboxed);
     }
 
     computer
@@ -5751,6 +5811,47 @@ fn check_model_capability(state: &State, model: Id, missing: &str) -> Result<(),
         return Err(ApiError::invalid_argument(
             "the Model cannot call tools, so a Bot cannot use it",
         ));
+    }
+
+    Ok(())
+}
+
+/// Checks that a Model can be the Space's default.
+///
+/// Every Bot that inherits the default and keeps its own thinking level must
+/// be able to run with the Model, and the Model must call tools. A Provider
+/// write may move the default, so it checks this before recording anything,
+/// exactly as an Admin's `model default` does.
+fn check_default_model(state: &State, model: &ModelView) -> Result<(), ApiError> {
+    if !model.tools {
+        return Err(ApiError::invalid_argument(
+            "the Model cannot call tools, so a Bot cannot use it",
+        ));
+    }
+    let mut cannot_think = 0_usize;
+    let mut unaccepted = 0_usize;
+    for bot in state.bots.values() {
+        let Some(level) = bot.thinking else {
+            continue;
+        };
+        if bot.model.is_some() {
+            continue;
+        }
+        if !model.thinks {
+            cannot_think += 1;
+        } else if !model.accepted_thinking().contains(&level) {
+            unaccepted += 1;
+        }
+    }
+    if cannot_think > 0 {
+        return Err(ApiError::invalid_argument(format!(
+            "the new default Model cannot think, but {cannot_think} Bot(s) using the Space's default keep a thinking level; reset their thinking levels first"
+        )));
+    }
+    if unaccepted > 0 {
+        return Err(ApiError::invalid_argument(format!(
+            "the new default Model does not accept the thinking level of {unaccepted} Bot(s) using the Space's default; reset their thinking levels first"
+        )));
     }
 
     Ok(())
