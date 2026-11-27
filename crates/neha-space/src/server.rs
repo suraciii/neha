@@ -8937,6 +8937,143 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_file_message_names_the_run_that_sent_it() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (bot, chat, _computer) = create_bot(&mut socket).await;
+        let run = Id::new();
+        let acting = {
+            let state = running.server.state.lock().unwrap();
+            state.bots[&bot].owner
+        };
+        let bot_token = {
+            let mut state = running.server.state.lock().unwrap();
+            state.issue_bot_token(crate::state::BotToken {
+                bot,
+                chat,
+                run,
+                acting,
+                expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            })
+        };
+        let client = reqwest::Client::new();
+        let uploaded: Value = client
+            .post(format!("{}/api/bot/files", running.url()))
+            .query(&[("name", "out.txt"), ("media_type", "text/plain")])
+            .bearer_auth(&bot_token)
+            .body("from the bot".to_owned())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+
+        // The Bot's run token posts the File Message, which names its run.
+        let posted: Value = client
+            .post(format!("{}/api/bot/messages", running.url()))
+            .bearer_auth(&bot_token)
+            .json(&serde_json::json!({"chat": chat, "file": file}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let message: Id = serde_json::from_value(posted["message"].clone()).unwrap();
+        {
+            let state = running.server.state.lock().unwrap();
+            let view = state
+                .messages
+                .iter()
+                .find(|view| view.id == message)
+                .expect("the File Message is recorded");
+            assert_eq!(view.author, Author::Bot(bot));
+            assert_eq!(view.file, Some(file));
+            assert_eq!(
+                view.run,
+                Some(run),
+                "a Bot's File Message names the run that sent it"
+            );
+        }
+
+        // The Chat read the Web client follows carries the same binding.
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let wire = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(message))
+            .expect("the File Message is readable");
+        assert_eq!(wire["author"]["kind"], "bot");
+        assert_eq!(wire["file"], json!(file));
+        assert_eq!(wire["run"], json!(run));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_from_before_runs_were_named_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_home(dir.path());
+        let first = start(root.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let (mut socket, _token) = admin(&first, &invite).await;
+        let (bot, chat, _computer) = create_bot(&mut socket).await;
+        let owner = {
+            let state = first.server.state.lock().unwrap();
+            state.bots[&bot].owner
+        };
+        socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        // A record written before a Message named its Run holds no run.
+        let message = Id::new();
+        let store = Store::open(&root).await.unwrap();
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "legacy-message",
+                vec![EventDraft::new(
+                    EventKind::MessageAdded,
+                    Author::User(owner),
+                    json!({"message": message, "chat": chat, "text": "old words"}),
+                )],
+            ))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let second = start(root.clone(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let read = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(message))
+            .expect("the old Message is readable");
+        assert_eq!(read["text"], "old words");
+        assert_eq!(read["run"], Value::Null);
+
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_file_survives_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let first = start(test_home(dir.path()), 0).await.unwrap();

@@ -157,6 +157,11 @@ export const space = {
     });
     space.runHolds[run] = { gate, release, fail };
   },
+  // Lets every read held about one Run answer, after the page moved on.
+  releaseRunShow(run: string) {
+    space.runHolds[run]?.release();
+    space.runHolds[run] = undefined;
+  },
   // A page that reconnects reads a snapshot of the events it missed, and the
   // Space says the cursor it now holds. This is what a real reconnect delivers.
   resume(events: RecordEvent[]) {

@@ -304,8 +304,11 @@ export default function App() {
       runs.last = outcome.failed ? "failed" : "succeeded";
     });
     // A snapshot names one Run for a Chat. Now that it ended, the Space's word
-    // is read once more before the page decides the Chat has nothing left.
-    if (seeded.has(chat) && projectRuns(chat) !== "working" && projectRuns(chat) !== "waiting") {
+    // is read once more before the page decides the Chat has nothing left. The
+    // write above is staged, not committed, so the page reads the projection
+    // with this Run already taken out of it.
+    const held = Object.keys(state.runs[chat]?.active ?? {}).some((id) => id !== run);
+    if (seeded.has(chat) && !held) {
       seeded.delete(chat);
       queueCalibrate();
     }
@@ -340,6 +343,20 @@ export default function App() {
   // User Message may start following a Run.
   function newestRequestRun(messages: Message[]): string | null {
     return [...messages].reverse().find((message) => message.author.kind === "user" && message.run)?.run ?? null;
+  }
+
+  // The Run a Chat's record points at when the Space names none: the request
+  // the record shows no answer for, which is the one a Chat that follows no Run
+  // failed on. A run that answered leaves its reply in the stream instead. A
+  // Chat whose every request was answered has only the newest one to show.
+  function historyRun(messages: Message[]): string | null {
+    const answered = new Set(
+      messages.filter((message) => message.author.kind === "bot" && message.run).map((message) => message.run),
+    );
+    const waiting = [...messages]
+      .reverse()
+      .find((message) => message.author.kind === "user" && message.run && !answered.has(message.run));
+    return waiting?.run ?? newestRequestRun(messages);
   }
 
   function isFollowing(run: string): boolean {
@@ -563,16 +580,18 @@ export default function App() {
       // The Space's word about each Chat becomes part of the page's own
       // projection of Runs, so a Run the page never saw an event for still
       // counts: its Chat waits while it waits, and its end lands on the Chat it
-      // belongs to.
+      // belongs to. A Run the page already heard end is not put back to work:
+      // an answer about the record as it was does not unmake the User's news.
       for (const chat of chats) {
         const run = chat.active_run;
-        if (!run) continue;
+        if (!run || settledRuns.has(run)) continue;
         if (chat.status !== "working" && chat.status !== "waiting") continue;
         noteRun(run, chat.id);
         seedRun(chat.id, run, chat.status === "waiting" ? "waiting" : "running");
         seeded.add(chat.id);
       }
       for (const approval of approvals) {
+        if (settledRuns.has(approval.run)) continue;
         noteRun(approval.run, approval.chat);
         seedRun(approval.chat, approval.run, "waiting");
         seeded.add(approval.chat);
@@ -585,7 +604,18 @@ export default function App() {
         }
         for (const approval of approvals) draft.pending[approval.approval] = approval;
       });
-      if (state.activeChat) await refreshActive(state.activeChat, runGeneration);
+      // The Chat on screen takes the Space's word about itself over the copy it
+      // holds: the header, the badge and the composer read the same projection,
+      // and the page follows the Run the Space names for it — the one that
+      // works, not the one that queued behind it. The write is staged while the
+      // answer is read back, so the answer itself is what answers.
+      const answered = state.activeChat
+        ? { ...state.activeChat, ...chats.find((chat) => chat.id === state.activeChat?.id) }
+        : null;
+      if (answered) {
+        update({ activeChat: answered });
+        await refreshActive(answered, runGeneration);
+      }
     } finally {
       const landed = [...during];
       if (calibrateEvents === during) calibrateEvents = null;
@@ -636,9 +666,12 @@ export default function App() {
       // Run belongs to: the events that end a Run name no Chat.
       if (run) noteRun(run, chat);
       // A reply that carries a File names the Run that made it, so the File
-      // belongs to that Run's work: a File the User uploaded is theirs, and a
-      // File another Run of the same Bot made is that Run's.
-      if (carried && run && chat === state.activeChat?.id && isFollowing(run)) noteFile(run, carried);
+      // belongs to that Run's work: only a Bot reply does. A File the User
+      // uploaded is theirs, and a File another Run of the same Bot made is
+      // that Run's.
+      if (event.author.kind === "bot" && carried && run && chat === state.activeChat?.id && isFollowing(run)) {
+        noteFile(run, carried);
+      }
       if (event.author.kind === "bot" && chat !== state.activeChat?.id) markUnread(chat);
     }
     if (event.kind === "neha.run.queued") {
@@ -979,12 +1012,22 @@ export default function App() {
     // The Run the Chat works on, in the Space's words. The page never guesses
     // which Run is the newest: a Chat that waits follows the Run that waits,
     // even when a later Run already works.
-    const run = chat.active_run ?? newestRequestRun(messages);
+    const named = chat.active_run;
+    // A Chat the Space names no Run for keeps the state it was given: a failed
+    // Chat stays failed. The Run the page reads there is history, and it only
+    // fills that Chat's card. A Space that names no Run at all, an older one,
+    // leaves the page to the newest request in the record.
+    const run = named ?? (named === null ? historyRun(messages) : newestRequestRun(messages));
     if (!run || !isCurrentChat(chat, generation)) return;
+    // Only a Run the Space named may write the Chat's state back.
+    const holds = named !== null;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
-      applyRunView(view);
+      // The page moved on to another Run while the answer was on its way.
+      if (followed && followed.run !== run) return;
+      if (holds) applyRunView(view);
+      else restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
       // A Run that answered is over: the Chat reads the record again for the
       // reply and the Files it produced.
       if (!isUnfinished(view.status)) await refreshActive(chat, generation);
@@ -995,13 +1038,18 @@ export default function App() {
 
   async function reconcileRun(chat: Chat, messages: Message[], generation: number) {
     if (!isCurrentChat(chat, generation)) return;
-    // The followed Run owns the Chat; only a Chat that follows none discovers
-    // the newest request in the record.
-    const run = followed?.run ?? newestRequestRun(messages);
+    // The followed Run owns the Chat. A Chat that follows none takes the Run
+    // the Space names for it, and a Chat the Space names no Run for keeps the
+    // state it was given, so the page discovers nothing new in it: an older
+    // Run's answer only fills its card.
+    const named = chat.active_run;
+    const run = followed?.run ?? (named === null ? null : (named ?? newestRequestRun(messages)));
     if (!run || settledRuns.has(run)) return;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
+      // The page moved on to another Run while the answer was on its way.
+      if (followed && followed.run !== run) return;
       applyRunView(view);
     } catch {
       // A late answer for a Chat the reader left must not touch the new one.

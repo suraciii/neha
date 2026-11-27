@@ -344,11 +344,14 @@ describe("App run activity", () => {
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
     await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
 
-    // Another client's User uploaded the File: it is theirs, not the Run's work.
-    record("neha.file.added", { chat: "h1", file: "f9", name: "notes.txt", media_type: "text/plain", size: 12, sha256: "cd".repeat(32) }, {
-      kind: "user",
-      id: "u2",
-    });
+    // Another client's User uploaded the File and sent it with their request:
+    // the Message names the Run it started, but the File is theirs, not the
+    // Run's work. Only a Bot reply carries a File into a Run's card.
+    record(
+      "neha.message.added",
+      { chat: "h1", message: "m9", text: "have a look at this", file: "f9", run: "r1" },
+      { kind: "user", id: "u2" },
+    );
     openCard(view);
     expect(view.container.querySelector(".activity .file-card")).toBeNull();
     expect(cardText(view)).not.toContain("notes.txt");
