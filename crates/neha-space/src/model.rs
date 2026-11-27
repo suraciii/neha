@@ -505,6 +505,8 @@ struct ResponsesUsage {
 struct ResponsesInputDetails {
     #[serde(default)]
     cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
 }
 
 /// The reasoning portion of the output OpenAI Responses reports.
@@ -521,7 +523,7 @@ impl ResponsesUsage {
         Usage {
             uncached_input: self.input_tokens.saturating_sub(input.cached_tokens),
             cache_read: input.cached_tokens,
-            cache_write: 0,
+            cache_write: input.cache_write_tokens,
             output: self.output_tokens,
             reasoning: output.reasoning_tokens,
         }
@@ -705,7 +707,10 @@ async fn read_responses_stream(
                 }
             }
             "response.failed" | "error" => {
-                return Err(ModelError::Provider(provider_error(&value, data)));
+                return Err(ModelError::ProviderStream {
+                    message: provider_error(&value, data),
+                    usage,
+                });
             }
             _ => {}
         }
@@ -826,6 +831,35 @@ struct AnthropicUsage {
     cache_read_input_tokens: Option<u64>,
     #[serde(default)]
     cache_creation_input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens_details: Option<AnthropicOutputDetails>,
+}
+
+/// The thinking portion of the output Anthropic Messages reports.
+#[derive(Deserialize, Default)]
+struct AnthropicOutputDetails {
+    #[serde(default)]
+    thinking_tokens: u64,
+}
+
+impl AnthropicUsage {
+    fn apply(self, usage: &mut Usage) {
+        if let Some(tokens) = self.input_tokens {
+            usage.uncached_input = tokens;
+        }
+        if let Some(tokens) = self.output_tokens {
+            usage.output = tokens;
+        }
+        if let Some(tokens) = self.cache_read_input_tokens {
+            usage.cache_read = tokens;
+        }
+        if let Some(tokens) = self.cache_creation_input_tokens {
+            usage.cache_write = tokens;
+        }
+        if let Some(details) = self.output_tokens_details {
+            usage.reasoning = details.thinking_tokens;
+        }
+    }
 }
 
 /// One content block of an Anthropic Messages reply, as it streams.
@@ -835,6 +869,7 @@ struct AnthropicBlock {
     text: String,
     thinking: String,
     signature: String,
+    data: String,
     id: String,
     name: String,
     input: Value,
@@ -874,6 +909,11 @@ impl AnthropicBlock {
                 .cloned()
                 .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
             signature: String::new(),
+            data: block
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
             partial_json: String::new(),
         }
     }
@@ -915,6 +955,16 @@ impl AnthropicBlock {
             .unwrap_or_else(|| self.input.clone())
     }
 
+    /// The raw arguments, even when they are not valid JSON: the loop, not
+    /// the adapter, decides whether a call can run.
+    fn tool_arguments(&self) -> String {
+        if self.partial_json.is_empty() {
+            self.input.to_string()
+        } else {
+            self.partial_json.clone()
+        }
+    }
+
     fn finish(&self) -> Option<Value> {
         match self.kind.as_str() {
             "text" => Some(serde_json::json!({"type": "text", "text": self.text})),
@@ -931,6 +981,10 @@ impl AnthropicBlock {
                 "name": self.name,
                 "input": self.tool_input(),
             })),
+            "redacted_thinking" => Some(serde_json::json!({
+                "type": "redacted_thinking",
+                "data": self.data,
+            })),
             _ => None,
         }
     }
@@ -942,6 +996,12 @@ fn anthropic_body<'a>(request: &'a ChatRequest<'_>) -> AnthropicBody<'a> {
         .messages
         .iter()
         .rposition(|message| message.role == ChatRole::Assistant);
+    let needs_native_turn = native_assistant.is_some_and(|index| {
+        index + 1 < request.messages.len()
+            && request.messages[index + 1..]
+                .iter()
+                .all(|message| message.role == ChatRole::Tool)
+    });
     let native_blocks = native_assistant
         .filter(|index| {
             *index + 1 < request.messages.len()
@@ -1018,9 +1078,17 @@ fn anthropic_body<'a>(request: &'a ChatRequest<'_>) -> AnthropicBody<'a> {
         messages,
         tools,
         stream: true,
-        thinking: request
-            .thinking
-            .and_then(|level| anthropic_thinking(level, request.max_output)),
+        // A tool round needs its signed native turn. If this run lost it
+        // (an old record, or a mismatched Provider/Model), sending thinking
+        // without that turn would make Anthropic reject the request; continue
+        // without extended thinking instead.
+        thinking: if needs_native_turn && native_blocks.is_none() {
+            None
+        } else {
+            request
+                .thinking
+                .and_then(|level| anthropic_thinking(level, request.max_output))
+        },
     }
 }
 
@@ -1126,15 +1194,7 @@ async fn read_anthropic_stream(
                 if let Some(reported) = message.get("usage") {
                     let reported: AnthropicUsage = serde_json::from_value(reported.clone())
                         .map_err(|_| ModelError::Protocol)?;
-                    if let Some(tokens) = reported.input_tokens {
-                        usage.uncached_input = tokens;
-                    }
-                    if let Some(tokens) = reported.cache_read_input_tokens {
-                        usage.cache_read = tokens;
-                    }
-                    if let Some(tokens) = reported.cache_creation_input_tokens {
-                        usage.cache_write = tokens;
-                    }
+                    reported.apply(&mut usage);
                 }
             }
             "content_block_start" => {
@@ -1175,19 +1235,16 @@ async fn read_anthropic_stream(
                 if let Some(reported) = value.get("usage") {
                     let reported: AnthropicUsage = serde_json::from_value(reported.clone())
                         .map_err(|_| ModelError::Protocol)?;
-                    if let Some(tokens) = reported.output_tokens {
-                        usage.output = tokens;
-                    }
-                    if let Some(tokens) = reported.cache_read_input_tokens {
-                        usage.cache_read = tokens;
-                    }
-                    if let Some(tokens) = reported.cache_creation_input_tokens {
-                        usage.cache_write = tokens;
-                    }
+                    reported.apply(&mut usage);
                 }
             }
             "message_stop" => finished = true,
-            "error" => return Err(ModelError::Provider(provider_error(&value, data))),
+            "error" => {
+                return Err(ModelError::ProviderStream {
+                    message: provider_error(&value, data),
+                    usage,
+                });
+            }
             _ => {}
         }
     }
@@ -1214,7 +1271,7 @@ async fn read_anthropic_stream(
         .map(|block| ChatToolCall {
             id: block.id.clone(),
             name: block.name.clone(),
-            arguments: block.tool_input().to_string(),
+            arguments: block.tool_arguments(),
         })
         .collect();
     if text.is_empty() && tool_calls.is_empty() {
@@ -1570,6 +1627,14 @@ pub enum ModelError {
         /// The usage it reported.
         usage: Usage,
     },
+    /// The Provider reported a failure inside the stream.
+    #[error("the Provider reported an error: {message}")]
+    ProviderStream {
+        /// What the Provider said.
+        message: String,
+        /// The usage it reported before the failure.
+        usage: Usage,
+    },
     /// The call failed after earlier attempts reported usage.
     #[error("{source}")]
     Retried {
@@ -1600,6 +1665,7 @@ impl ModelError {
                 | Self::Transport
                 | Self::Empty
                 | Self::StreamEnded { .. }
+                | Self::ProviderStream { .. }
         )
     }
 
@@ -1620,6 +1686,7 @@ impl ModelError {
             Self::StreamEnded { usage }
             | Self::Truncated { usage }
             | Self::Filtered { usage }
+            | Self::ProviderStream { usage, .. }
             | Self::Retried { usage, .. } => Some(*usage),
             _ => None,
         }
@@ -1631,9 +1698,10 @@ impl ModelError {
         match self {
             Self::Unauthorized => ErrorCode::Unauthorized,
             Self::RateLimited { .. } => ErrorCode::RateLimited,
-            Self::Server { .. } | Self::Transport | Self::StreamEnded { .. } => {
-                ErrorCode::Unavailable
-            }
+            Self::Server { .. }
+            | Self::Transport
+            | Self::StreamEnded { .. }
+            | Self::ProviderStream { .. } => ErrorCode::Unavailable,
             Self::Retried { source, .. } => source.code(),
             Self::ContextTooLarge
             | Self::Empty
@@ -2269,7 +2337,7 @@ mod tests {
                     ],
                     "usage": {
                         "input_tokens": 10,
-                        "input_tokens_details": {"cached_tokens": 4},
+                        "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 2},
                         "output_tokens": 2,
                         "output_tokens_details": {"reasoning_tokens": 1},
                     },
@@ -2307,7 +2375,7 @@ mod tests {
             Usage {
                 uncached_input: 6,
                 cache_read: 4,
-                cache_write: 0,
+                cache_write: 2,
                 output: 2,
                 reasoning: 1,
             }
@@ -2567,7 +2635,10 @@ mod tests {
                 json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": "tool_use"},
-                    "usage": {"output_tokens": 15},
+                    "usage": {
+                        "output_tokens": 15,
+                        "output_tokens_details": {"thinking_tokens": 5},
+                    },
                 }),
             ),
             ("message_stop", json!({"type": "message_stop"})),
@@ -2612,7 +2683,7 @@ mod tests {
                 cache_read: 4,
                 cache_write: 2,
                 output: 15,
-                reasoning: 0,
+                reasoning: 5,
             }
         );
 
@@ -2730,7 +2801,10 @@ mod tests {
                 json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": "tool_use"},
-                    "usage": {"output_tokens": 15},
+                    "usage": {
+                        "output_tokens": 15,
+                        "output_tokens_details": {"thinking_tokens": 5},
+                    },
                 }),
             ),
             ("message_stop", json!({"type": "message_stop"})),
@@ -2860,6 +2934,146 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn anthropic_keeps_redacted_thinking_blocks() {
+        use axum::body::Bytes;
+
+        let native = named_sse(&[
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "usage": {"input_tokens": 10},
+                }}),
+            ),
+            (
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "redacted_thinking", "data": "opaque"},
+                }),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "read_file",
+                        "input": {"path": "a.txt"},
+                    },
+                }),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 1}),
+            ),
+            (
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "tool_use"},
+                    "usage": {"output_tokens": 2},
+                }),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let native = native.clone();
+                async move { event_stream(native) }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+        let request = anthropic_request(&base);
+        let reply = client.chat(request).await.unwrap();
+        let continuation = reply.continuation.expect("a tool call keeps native state");
+        assert_eq!(continuation.state["blocks"][0]["type"], "redacted_thinking");
+        assert_eq!(continuation.state["blocks"][0]["data"], "opaque");
+        task.abort();
+
+        // The same request without its native turn must not ask Anthropic for
+        // thinking, which would be rejected without the signed block.
+        let recorded = recorder();
+        let seen = Arc::clone(&recorded);
+        let text = named_sse(&[
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {
+                    "id": "msg_2", "type": "message", "role": "assistant",
+                    "content": [], "usage": {"input_tokens": 1},
+                }}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "done"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 1}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |body: Bytes| {
+                let seen = Arc::clone(&seen);
+                let text = text.clone();
+                async move {
+                    record(&seen, &body);
+                    event_stream(text)
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let mut request = anthropic_request(&base);
+        request.messages = vec![
+            ChatMessage::new(ChatRole::System, "be brief"),
+            ChatMessage::new(ChatRole::User, "hello"),
+            ChatMessage::assistant_calls(
+                None,
+                vec![ChatToolCall {
+                    id: "toolu_1".to_owned(),
+                    name: "read_file".to_owned(),
+                    arguments: "{\"path\":\"a.txt\"}".to_owned(),
+                }],
+            ),
+            ChatMessage::tool_result("toolu_1", "file contents"),
+        ];
+        request.thinking = Some(ThinkingLevel::Low);
+        request.continuation = None;
+        client.chat(request).await.unwrap();
+        let body = bodies(&recorded).pop().unwrap();
+        assert!(
+            body.get("thinking").is_none(),
+            "a tool round without its native turn must not ask for thinking: {body}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn a_failed_responses_call_is_retried_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2890,6 +3104,68 @@ mod tests {
 
         let reply = client.chat(responses_request(&base)).await.unwrap();
 
+        assert_eq!(reply.text, "retried");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_stream_error_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let error = named_sse(&[(
+            "error",
+            json!({"type": "error", "error": {"type": "overloaded_error", "message": "busy"}}),
+        )]);
+        let ok = named_sse(&[
+            (
+                "message_start",
+                json!({"type": "message_start", "message": {
+                    "id": "msg_2", "type": "message", "role": "assistant",
+                    "content": [], "usage": {"input_tokens": 1},
+                }}),
+            ),
+            (
+                "content_block_start",
+                json!({"type": "content_block_start", "index": 0,
+                    "content_block": {"type": "text", "text": ""}}),
+            ),
+            (
+                "content_block_delta",
+                json!({"type": "content_block_delta", "index": 0,
+                    "delta": {"type": "text_delta", "text": "retried"}}),
+            ),
+            (
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": 0}),
+            ),
+            (
+                "message_delta",
+                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"},
+                    "usage": {"output_tokens": 1}}),
+            ),
+            ("message_stop", json!({"type": "message_stop"})),
+        ]);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                let error = error.clone();
+                let ok = ok.clone();
+                async move {
+                    if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        event_stream(error)
+                    } else {
+                        event_stream(ok)
+                    }
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+        let reply = client.chat(anthropic_request(&base)).await.unwrap();
         assert_eq!(reply.text, "retried");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         task.abort();

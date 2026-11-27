@@ -2453,7 +2453,7 @@ pub async fn resume_run(
         (state.is_resumable(run), state.is_recovering(run))
     };
     if resumable {
-        let (history, mut resume, base_usage) = match prepare_resume(state, run) {
+        let (history, resume, base_usage) = match prepare_resume(state, run) {
             Ok(plan) => plan,
             Err(error) => {
                 eprintln!("neha: cannot resume run {}: {error}", run.id);
@@ -2461,13 +2461,11 @@ pub async fn resume_run(
                 return Ok(Finished::Completed(events));
             }
         };
-        if let Some(state) = store
-            .continuation(run.id, resume.step)
-            .await
-            .map_err(store_error)?
-        {
-            resume.continuation = Some(state);
-        }
+        let mut resume = Some(resume);
+        load_resume_continuation(store, run.id, &mut resume).await?;
+        let Some(resume) = resume else {
+            return Err(ApiError::internal("the resumed step is missing"));
+        };
         let pending = match resume_pending(state, secrets, run).await {
             Ok(pending) => pending,
             Err(error) => {
@@ -2814,10 +2812,12 @@ async fn finish_run_with(
                             let ContinuePlan {
                                 next_step,
                                 history: replay,
-                                resume: replay_resume,
+                                resume: mut replay_resume,
                                 base_usage: replay_usage,
                                 ..
                             } = *plan;
+                            load_resume_continuation(store, pending.run, &mut replay_resume)
+                                .await?;
                             start_step = Some(next_step);
                             history = replay;
                             resume = replay_resume;
@@ -3110,6 +3110,26 @@ async fn record_recovered_action(
 /// and the waiting step becomes a `Resume` whose `done` calls already have
 /// their results. A step whose actions do not line up with its calls, or an
 /// action that started and never finished, cannot be resumed.
+/// Loads the provider-native state a resumed step needs.
+async fn load_resume_continuation(
+    store: &Store,
+    run: Id,
+    resume: &mut Option<Resume>,
+) -> Result<(), ApiError> {
+    let Some(waiting) = resume.as_mut() else {
+        return Ok(());
+    };
+    if let Some(state) = store
+        .continuation(run, waiting.step)
+        .await
+        .map_err(store_error)?
+    {
+        waiting.continuation = Some(state);
+    }
+
+    Ok(())
+}
+
 fn prepare_resume(
     state: &Mutex<State>,
     run: &crate::state::RunView,
@@ -5105,15 +5125,17 @@ mod tests {
 
     use super::{
         LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
-        grant_folder, grants_with, lasting_rule_path_at, normalized_grants, path_covers,
-        path_matches, path_matches_at, path_parent, persistable_grant, pinned_access,
-        prepare_recovery, prepare_resume, resolve_action_path, resumed_access, rule_covers,
-        rule_matches, run_access, under_root, verify_recovered_action,
+        grant_folder, grants_with, lasting_rule_path_at, load_resume_continuation,
+        normalized_grants, path_covers, path_matches, path_matches_at, path_parent,
+        persistable_grant, pinned_access, prepare_recovery, prepare_resume, resolve_action_path,
+        resumed_access, rule_covers, rule_matches, run_access, under_root, verify_recovered_action,
     };
+    use crate::home::Home;
     use crate::state::{AccessView, BotView, RuleView};
+    use crate::store::{AppendRequest, ContinuationWrite, Store};
     use neha::error::ErrorCode;
     use neha::id::Id;
-    use neha::record::RuleEffect;
+    use neha::record::{EventDraft, RuleEffect};
     use neha::seq::Seq;
 
     fn ask(tool: &str, command_prefix: Option<&str>, path_prefix: Option<&str>) -> RuleView {
@@ -5317,6 +5339,71 @@ mod tests {
             vec!["/data/one".to_owned()],
             "a folder already granted is not recorded twice"
         );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_step_loads_only_its_own_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let run = Id::new();
+        let bot = Id::new();
+        let user = Id::new();
+        let first = neha_loop::Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_first"}]}),
+        };
+        let second = neha_loop::Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_second"}]}),
+        };
+        for (step, continuation) in [(1, first), (2, second.clone())] {
+            let reply = EventDraft::new(
+                EventKind::RunReply,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": step,
+                    "content": null,
+                    "calls": [{"call": format!("call-{step}"), "tool": "shell",
+                        "arguments": {"command": "true"}}],
+                    "usage": null,
+                }),
+            )
+            .acting(user);
+            store
+                .append(
+                    AppendRequest::new(Id::new(), format!("reply-{step}"), vec![reply])
+                        .with_continuation(ContinuationWrite {
+                            run,
+                            step,
+                            continuation: Some(continuation),
+                        }),
+                )
+                .await
+                .unwrap();
+        }
+        let mut resume = Some(neha_loop::Resume {
+            step: 2,
+            content: None,
+            calls: Vec::new(),
+            done: 0,
+            approved_action: None,
+            usage: neha::usage::Usage::default(),
+            recovered: false,
+            continuation: None,
+        });
+
+        load_resume_continuation(&store, run, &mut resume)
+            .await
+            .unwrap();
+
+        assert_eq!(resume.unwrap().continuation, Some(second));
+        store.close().await.unwrap();
     }
 
     #[test]

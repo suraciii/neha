@@ -5048,7 +5048,10 @@ mod tests {
                         "usage": {
                             "input_tokens": 120,
                             "output_tokens": 30,
-                            "input_tokens_details": {"cached_tokens": 20},
+                            "input_tokens_details": {
+                                "cached_tokens": 20,
+                                "cache_write_tokens": 5,
+                            },
                             "output_tokens_details": {"reasoning_tokens": 10},
                         },
                     },
@@ -5282,6 +5285,7 @@ mod tests {
         );
         assert_eq!(shown["usage"]["uncached_input"], 250);
         assert_eq!(shown["usage"]["cache_read"], 20);
+        assert_eq!(shown["usage"]["cache_write"], 5);
         assert_eq!(shown["usage"]["output"], 42);
         assert_eq!(shown["usage"]["reasoning"], 10);
 
@@ -5341,6 +5345,7 @@ mod tests {
                         "usage": {
                             "input_tokens": 100,
                             "cache_read_input_tokens": 10,
+                            "cache_creation_input_tokens": 5,
                             "output_tokens": 1,
                         },
                     },
@@ -5404,7 +5409,10 @@ mod tests {
                 json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": "tool_use"},
-                    "usage": {"output_tokens": 20},
+                    "usage": {
+                        "output_tokens": 20,
+                        "output_tokens_details": {"thinking_tokens": 6},
+                    },
                 }),
             ),
             sse("message_stop", json!({"type": "message_stop"})),
@@ -5428,6 +5436,7 @@ mod tests {
                         "usage": {
                             "input_tokens": 140,
                             "cache_read_input_tokens": 30,
+                            "cache_creation_input_tokens": 3,
                             "output_tokens": 1,
                         },
                     },
@@ -5458,7 +5467,10 @@ mod tests {
                 json!({
                     "type": "message_delta",
                     "delta": {"stop_reason": "end_turn"},
-                    "usage": {"output_tokens": 12},
+                    "usage": {
+                        "output_tokens": 12,
+                        "output_tokens_details": {"thinking_tokens": 2},
+                    },
                 }),
             ),
             sse("message_stop", json!({"type": "message_stop"})),
@@ -5507,7 +5519,9 @@ mod tests {
         );
         assert_eq!(shown["usage"]["uncached_input"], 240);
         assert_eq!(shown["usage"]["cache_read"], 40);
+        assert_eq!(shown["usage"]["cache_write"], 8);
         assert_eq!(shown["usage"]["output"], 32);
+        assert_eq!(shown["usage"]["reasoning"], 8);
 
         // The protocol the Admin named is the one the Space records.
         let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;

@@ -104,7 +104,7 @@ A new Bot gets its own Chat and its own Computer: a Hosted Computer unless you n
 target/debug/neha bot create Scout
 ```
 
-A Bot uses the Space's default thinking level. Choose its own with `--thinking minimal|low|medium|high|max`; `neha bot show` prints it.
+A Bot uses the Space's default thinking level. Choose its own with `--thinking minimal|low|medium|high|max`; `neha bot show` prints its own level when set.
 
 The output names the Bot, its Chat, and its Computer. Show them again, including the Computer's workspace:
 
