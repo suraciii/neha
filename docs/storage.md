@@ -163,16 +163,10 @@ The last two variables feed the default credential chain that signs each request
 
 On a real bucket, these are the real access keys. The tests read the two variables, and a Space can also take its credentials from a `profile` or the machine's role.
 
-Start the container, wait for it, create the bucket, set the variables, and run the tests:
+Start the store, set the variables, and run the tests:
 
 ```bash
-docker run -d --name neha-s3 -p 8333:8333 chrislusf/seaweedfs@sha256:7ca46aeae2f223b37e5d91593c17ab37738eec6df6ab69b48a0487f7643342b9 server -s3 -dir=/data
-for attempt in $(seq 1 30); do
-  if curl -fsS --max-time 2 http://127.0.0.1:8333/ >/dev/null 2>&1; then break; fi
-  if [ "$attempt" = 30 ]; then echo "SeaweedFS did not start" >&2; exit 1; fi
-  sleep 1
-done
-curl -fsS --max-time 5 -X PUT http://127.0.0.1:8333/neha
+eng/s3.sh up
 export NEHA_TEST_S3=1
 export NEHA_TEST_S3_ENDPOINT=http://127.0.0.1:8333
 export NEHA_TEST_S3_BUCKET=neha
@@ -182,4 +176,4 @@ export AWS_SECRET_ACCESS_KEY=neha-secret
 just test-s3
 ```
 
-`just test-s3` runs the `neha-space` tests with these variables set, so the S3 tests run too. Remove the container with `docker rm -f neha-s3`.
+`just test-s3` runs the `neha-space` tests with these variables set, so the S3 tests run too. `eng/s3.sh down` removes the store, and `eng/s3.sh logs` prints its output.
