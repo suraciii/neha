@@ -1,0 +1,50 @@
+version: 2
+
+# Keep the pinned workflow actions, the Rust crates, and the two client
+# lockfiles current. Minor and patch updates arrive as one pull request per
+# configured ecosystem and directory; a major update stays separate because it
+# needs a decision.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build(deps)"
+    groups:
+      cargo:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: /ui
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build(ui)"
+    groups:
+      ui:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: /apps/desktop
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "build(desktop)"
+    groups:
+      desktop:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
