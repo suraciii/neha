@@ -26,4 +26,16 @@ The provider-native output a later tool step needs, such as a reasoning item or 
 
 ## Models
 
-A Model's capabilities and limits come from a bundled snapshot of public Model data unless the Provider's configuration states them. A Model outside the snapshot states its context limit and capabilities in configuration.
+A Model's capabilities and limits come from the catalog unless the Provider's configuration states them. The Provider record stores the resolved values, so a run reads one source: its Model's record. Manual values win over the catalog.
+
+The catalog's `attachment` flag says a file can be attached, not that the Model reads images. Image input comes only from an `image` entry in the catalog's input modalities; a Model with no modalities reads no images.
+
+A Model that cannot call tools never enters the loop. The loop's tool schemas are its only way to act, so a text-only Model is refused before a step starts.
+
+## Catalog
+
+The catalog is a versioned data file, not a record event. A build embeds a full models.dev snapshot, and a Space reads the cached copy under its home when one is usable. A failed fetch leaves the last known good catalog in place.
+
+The catalog maps a vendor's `npm` package to one protocol: OpenAI to Responses, Anthropic to Messages, and OpenAI-compatible to Chat Completions. A vendor with another package is visible but not connectable.
+
+A fetched catalog is written atomically beside its ETag and timestamps. A cache that is corrupt, has another version, or lacks Providers or Models is ignored in favor of the snapshot. Background refresh runs only for an existing cache older than the configured interval.

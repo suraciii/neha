@@ -1,10 +1,10 @@
 //! The Space's configuration file.
 //!
-//! One file, `<home>/config.toml`, names where the bytes of Files are stored.
-//! An absent file means the local default, so a Space that never needed S3
-//! keeps working unchanged. The file is strict: an unknown key, an S3 field
-//! beside the local backend, or a malformed value refuses the start instead
-//! of being ignored.
+//! One file, `<home>/config.toml`, names where the bytes of Files are stored
+//! and where the model catalog comes from. An absent file means the defaults,
+//! so a Space that never needed S3 or a catalog override keeps working
+//! unchanged. The file is strict: an unknown key, an S3 field beside the local
+//! backend, or a malformed value refuses the start instead of being ignored.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -22,6 +22,29 @@ const CONFIG_FILE: &str = "config.toml";
 pub struct Config {
     /// Where the bytes of Files are stored.
     pub storage: Storage,
+    /// Where the model catalog comes from and how long it stays fresh.
+    pub catalog: CatalogConfig,
+}
+
+/// The models.dev catalog.
+#[derive(Clone, Debug)]
+pub struct CatalogConfig {
+    /// The address the catalog is fetched from.
+    pub url: String,
+    /// How many hours a cached catalog stays fresh; 0 disables background refresh.
+    pub refresh_hours: u64,
+}
+
+/// The default refresh interval of a cached catalog.
+const DEFAULT_REFRESH_HOURS: u64 = 24;
+
+impl Default for CatalogConfig {
+    fn default() -> Self {
+        Self {
+            url: crate::catalog::DEFAULT_URL.to_owned(),
+            refresh_hours: DEFAULT_REFRESH_HOURS,
+        }
+    }
 }
 
 impl Config {
@@ -40,6 +63,7 @@ impl Config {
 
         Ok(Self {
             storage: document.storage.into_storage()?,
+            catalog: document.catalog.into_catalog()?,
         })
     }
 }
@@ -88,12 +112,49 @@ impl fmt::Display for Storage {
     }
 }
 
-/// The parsed `config.toml`; an absent `[storage]` section is the default.
+/// The parsed `config.toml`; an absent section is that section's default.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Document {
     #[serde(default)]
     storage: StorageSettings,
+    #[serde(default)]
+    catalog: CatalogSettings,
+}
+
+/// The `[catalog]` section, before its values are checked against each other.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogSettings {
+    url: Option<String>,
+    refresh_hours: Option<u64>,
+}
+
+impl CatalogSettings {
+    fn into_catalog(self) -> Result<CatalogConfig, ConfigError> {
+        let default = CatalogConfig::default();
+        let url = match self.url {
+            Some(url) => {
+                if url.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "catalog.url must not be empty".to_owned(),
+                    ));
+                }
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(ConfigError::Invalid(
+                        "catalog.url must start with \"http://\" or \"https://\"".to_owned(),
+                    ));
+                }
+                url
+            }
+            None => default.url,
+        };
+
+        Ok(CatalogConfig {
+            url,
+            refresh_hours: self.refresh_hours.unwrap_or(default.refresh_hours),
+        })
+    }
 }
 
 /// The `[storage]` section, before its values are checked against each other.
@@ -454,5 +515,68 @@ mod tests {
             Config::load(&home).unwrap().storage.to_string(),
             "s3://neha at https://s3.eu-central-1.amazonaws.com"
         );
+    }
+
+    #[test]
+    fn an_absent_catalog_section_is_the_public_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+
+        let config = Config::load(&home).unwrap();
+
+        assert_eq!(config.catalog.url, crate::catalog::DEFAULT_URL);
+        assert_eq!(config.catalog.refresh_hours, 24);
+        assert_eq!(Config::default().catalog.url, crate::catalog::DEFAULT_URL);
+    }
+
+    #[test]
+    fn the_catalog_section_names_its_source_and_interval() {
+        let (_dir, home) = home_with(
+            "[catalog]\nurl = \"https://catalog.example.com/api.json\"\nrefresh_hours = 0\n",
+        );
+
+        let config = Config::load(&home).unwrap();
+
+        assert_eq!(config.catalog.url, "https://catalog.example.com/api.json");
+        assert_eq!(config.catalog.refresh_hours, 0);
+    }
+
+    #[test]
+    fn a_catalog_url_must_be_a_web_address() {
+        for url in ["", "models.dev/api.json", "ftp://models.dev/api.json"] {
+            let (_dir, home) = home_with(&format!("[catalog]\nurl = \"{url}\"\n"));
+
+            let error = Config::load(&home).unwrap_err();
+
+            assert!(matches!(error, ConfigError::Invalid(_)), "{url:?}: {error}");
+            assert!(
+                error.to_string().contains("catalog.url"),
+                "{url:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_catalog_key_is_refused() {
+        let (_dir, home) = home_with("[catalog]\nrefresh_minutes = 5\n");
+
+        let error = Config::load(&home).unwrap_err();
+
+        assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
+        assert!(error.to_string().contains("refresh_minutes"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_catalog_refresh_interval_is_refused() {
+        for value in ["\"daily\"", "-1", "1.5"] {
+            let (_dir, home) = home_with(&format!("[catalog]\nrefresh_hours = {value}\n"));
+
+            let error = Config::load(&home).unwrap_err();
+
+            assert!(
+                matches!(error, ConfigError::Parse { .. }),
+                "{value}: {error}"
+            );
+        }
     }
 }

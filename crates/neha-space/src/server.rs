@@ -47,6 +47,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::blobs::{Blobs, BlobsError};
+use crate::catalog::CatalogStore;
 use crate::commands;
 use crate::computer_link::{self, ComputerLinks};
 use crate::config::{Config, ConfigError, Storage};
@@ -95,6 +96,8 @@ pub struct SpaceServer {
     login: Mutex<LoginLimiter>,
     pub(crate) state: Mutex<SpaceState>,
     pub(crate) secrets: Secrets,
+    /// The models.dev catalog and its cache.
+    pub(crate) catalog: std::sync::Arc<CatalogStore>,
     pub(crate) model: ModelClient,
     pub(crate) events: broadcast::Sender<neha::record::Event>,
     pub(crate) tool_timeout: Duration,
@@ -135,7 +138,9 @@ impl SpaceServer {
     ) -> Result<Self, ServerError> {
         let session_cookie = session_cookie_name(home.root());
         let browser_host = browser_host(home.root());
-        let storage = Config::load(&home)?.storage;
+        let config = Config::load(&home)?;
+        let storage = config.storage.clone();
+        let catalog = std::sync::Arc::new(CatalogStore::open(&home, &config.catalog));
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
         let blobs = Blobs::open(&home, &storage)?;
@@ -172,6 +177,7 @@ impl SpaceServer {
             login: Mutex::new(LoginLimiter::default()),
             state: Mutex::new(state),
             secrets,
+            catalog,
             model,
             events,
             tool_timeout,
@@ -383,6 +389,7 @@ async fn start_with(
         state.url = Some(format!("http://{addr}"));
     }
     recover_interrupted(&server.store, &server.state).await?;
+    server.catalog.clone().spawn_background();
     reconcile_pairings(&server).await?;
     // The record is the truth about Computers: a token whose Computer the
     // replay does not hold is an orphan from a crash between a pairing's token
@@ -1797,6 +1804,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             approvals: &server.approvals,
                             runs: &server.runs,
                             events: &server.events,
+                            catalog: &server.catalog,
                         };
                         let reset = matches!(command, CommandCall::ComputerReset { .. });
                         let outcome = commands::execute(&context, &account, id, command).await;
@@ -2335,6 +2343,14 @@ impl ApiError {
         Self::new(StatusCode::CONFLICT, ErrorCode::UnsupportedVersion, message)
     }
 
+    pub(crate) fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Unavailable,
+            message,
+        )
+    }
+
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         eprintln!("neha: internal error: {}", message.into());
         Self::new(
@@ -2779,8 +2795,8 @@ mod tests {
     use neha::record::{Author, EventDraft, EventKind};
     use neha::seq::Seq;
     use neha::surface::{
-        BotComputer, BotCreate, CommandCall, MessageSend, ModelSpec, ProviderAdd, ProviderProtocol,
-        ThinkingLevel,
+        BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
+        ProviderConnect, ProviderProtocol, ThinkingLevel,
     };
     use serde_json::Value;
     use tokio::net::TcpStream;
@@ -3284,9 +3300,15 @@ mod tests {
                 max_output: 8_192,
                 reads_images: false,
                 thinks: false,
+
+                tools: true,
+                thinking_levels: Vec::new(),
             }],
             default_model: Some("test-model".to_owned()),
             thinking: None,
+
+            vendor: None,
+            discover: false,
         })
     }
 
@@ -3307,9 +3329,15 @@ mod tests {
                 max_output: 8_192,
                 reads_images: false,
                 thinks,
+
+                tools: true,
+                thinking_levels: Vec::new(),
             }],
             default_model: Some("test-model".to_owned()),
             thinking,
+
+            vendor: None,
+            discover: false,
         })
     }
 
@@ -3351,6 +3379,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3392,6 +3422,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3425,6 +3457,8 @@ mod tests {
             name: "Scout".to_owned(),
             computer: None,
             thinking: None,
+
+            model: None,
         });
 
         let (first_seq, first) = try_command(&mut socket, command_id, create.clone())
@@ -3454,6 +3488,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3613,6 +3649,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3819,6 +3857,8 @@ mod tests {
                         name: "Scout".to_owned(),
                         computer: None,
                         thinking: None,
+
+                        model: None,
                     }),
                 })
                 .unwrap()
@@ -3861,6 +3901,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3871,6 +3913,8 @@ mod tests {
                 name: "Other".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3937,6 +3981,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -3986,6 +4032,8 @@ mod tests {
             name: "Scout".to_owned(),
             computer: None,
             thinking: None,
+
+            model: None,
         });
         let first = command(&mut socket, create, bot_command.clone()).await;
         let second = command(&mut socket, create, bot_command).await;
@@ -4020,6 +4068,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4073,6 +4123,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4169,6 +4221,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4211,6 +4265,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4318,6 +4374,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4470,6 +4528,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4495,6 +4555,8 @@ mod tests {
                         name: "Live".to_owned(),
                         computer: None,
                         thinking: None,
+
+                        model: None,
                     }),
                 })
                 .unwrap()
@@ -4657,6 +4719,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -4743,6 +4807,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -5131,6 +5197,8 @@ mod tests {
                 name: "Low".to_owned(),
                 computer: None,
                 thinking: Some(ThinkingLevel::Low),
+
+                model: None,
             }),
         )
         .await;
@@ -5820,6 +5888,694 @@ mod tests {
         running.shutdown().await;
     }
 
+    /// A Chat Completions reply with one text part.
+    fn chat_text_reply(text: &str) -> String {
+        format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}\n\ndata: [DONE]\n\n"
+        )
+    }
+
+    /// A provider with two Models: one plain and one that thinks.
+    fn provider_add_models(base_url: String, models: Vec<ModelSpec>) -> CommandCall {
+        CommandCall::ProviderAdd(ProviderAdd {
+            protocol: ProviderProtocol::ChatCompletions,
+            base_url,
+            api_key: "sk-test".to_owned(),
+            models,
+            default_model: Some("fast".to_owned()),
+            thinking: None,
+            vendor: None,
+            discover: false,
+        })
+    }
+
+    fn model_spec(name: &str, thinks: bool, tools: bool, levels: Vec<ThinkingLevel>) -> ModelSpec {
+        ModelSpec {
+            name: name.to_owned(),
+            context_limit: 128_000,
+            max_output: 8_192,
+            reads_images: false,
+            thinks,
+            tools,
+            thinking_levels: levels,
+        }
+    }
+
+    /// Serves one small models.dev catalog with an ETag.
+    async fn fake_catalog() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::get;
+
+        let body = json!({
+            "fake": {
+                "id": "fake",
+                "name": "Fake",
+                "npm": "@ai-sdk/openai-compatible",
+                "api": "http://127.0.0.1:9/v1",
+                "env": ["FAKE_KEY"],
+                "models": {
+                    "fake-tool": {
+                        "id": "fake-tool",
+                        "name": "Fake Tool",
+                        "reasoning": true,
+                        "reasoning_options": [{"type": "effort", "values": ["low", "high"]}],
+                        "tool_call": true,
+                        "attachment": false,
+                        "limit": {"context": 1000, "output": 100},
+                        "release_date": "2026-01-01",
+                    },
+                    "fake-plain": {
+                        "id": "fake-plain",
+                        "name": "Fake Plain",
+                        "tool_call": false,
+                        "attachment": false,
+                        "limit": {"context": 1000, "output": 100},
+                    },
+                },
+            },
+            "unsupported": {
+                "id": "unsupported",
+                "name": "Unsupported",
+                "npm": "@ai-sdk/google",
+                "models": {
+                    "other": {
+                        "id": "other",
+                        "name": "Other",
+                        "tool_call": true,
+                        "limit": {"context": 1000, "output": 100},
+                    },
+                },
+            },
+        })
+        .to_string();
+        let app = Router::new().route(
+            "/api.json",
+            get(move |headers: axum::http::HeaderMap| {
+                let body = body.clone();
+                async move {
+                    let if_none_match = headers
+                        .get(IF_NONE_MATCH)
+                        .and_then(|value| value.to_str().ok());
+                    if if_none_match == Some("\"v1\"") {
+                        return StatusCode::NOT_MODIFIED.into_response();
+                    }
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .header(ETAG, "\"v1\"")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                        .into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{addr}/api.json"), task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalog_gates_and_connects_a_known_vendor() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+
+        let providers = command(&mut socket, Id::new(), CommandCall::CatalogList).await;
+        let providers = providers.as_array().unwrap();
+        assert!(providers.len() > 300, "the seed is the whole catalog");
+        let openai = providers
+            .iter()
+            .find(|provider| provider["id"] == "openai")
+            .unwrap();
+        assert_eq!(openai["selectable"], true);
+        assert_eq!(openai["protocol"], "openai_responses");
+        let google = providers
+            .iter()
+            .find(|provider| provider["id"] == "google")
+            .unwrap();
+        assert_eq!(google["selectable"], false);
+        assert!(google["protocol"].is_null());
+        let templated = providers
+            .iter()
+            .find(|provider| provider["id"] == "databricks")
+            .unwrap();
+        assert_eq!(
+            templated["selectable"], false,
+            "a templated base URL needs an explicit override"
+        );
+        assert!(templated["api"].is_null());
+
+        let no_tools = providers
+            .iter()
+            .find(|provider| provider["id"] == "meragpt")
+            .unwrap();
+        assert_eq!(no_tools["selectable"], false);
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "meragpt".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert!(matches!(error, Err((ErrorCode::InvalidArgument, _))));
+
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "databricks".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(error, Err((ErrorCode::InvalidArgument, _))),
+            "a templated vendor asks for --base-url"
+        );
+
+        let connected = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "openai".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert_eq!(connected["protocol"], "openai_responses");
+        assert_eq!(connected["base_url"], "https://api.openai.com/v1");
+        let models = connected["models"].as_array().unwrap();
+        assert!(!models.is_empty());
+        assert!(models.iter().all(|model| model["tools"].is_boolean()));
+
+        let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
+        assert_eq!(providers[0]["vendor"], "openai");
+
+        let overridden = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "databricks".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: Some("https://example.test/v1".to_owned()),
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert_eq!(overridden["base_url"], "https://example.test/v1");
+
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "google".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(error, Err((ErrorCode::InvalidArgument, _))),
+            "an unsupported vendor is visible but not selectable"
+        );
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_catalog_refreshes_and_uses_its_cache() {
+        let (base, catalog_task) = fake_catalog().await;
+        let (_dir, running, invite) = running_with_config(&format!(
+            "[catalog]\nurl = \"{base}\"\nrefresh_hours = 24\n"
+        ))
+        .await;
+        let mut socket = admin_socket(&running, &invite).await;
+
+        let status = command(&mut socket, Id::new(), CommandCall::CatalogStatus).await;
+        assert_eq!(status["builtin"], true);
+
+        let refreshed = command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        assert_eq!(refreshed["changed"], true);
+        assert_eq!(refreshed["status"]["builtin"], false);
+        assert_eq!(refreshed["status"]["source"], base);
+        assert_eq!(refreshed["status"]["provider_count"], 2);
+        assert_eq!(refreshed["status"]["model_count"], 3);
+        assert!(refreshed["status"]["etag"].is_string());
+        let cache = running.server_home().join("catalog").join("catalog.json");
+        assert!(cache.is_file(), "the fetched catalog is cached");
+
+        let second = command(&mut socket, Id::new(), CommandCall::CatalogRefresh).await;
+        assert_eq!(second["changed"], false, "the ETag answers 304");
+
+        let providers = command(&mut socket, Id::new(), CommandCall::CatalogList).await;
+        let providers = providers.as_array().unwrap();
+        let fake = providers.iter().find(|p| p["id"] == "fake").unwrap();
+        assert_eq!(fake["selectable"], true);
+        assert_eq!(fake["model_count"], 2);
+        let unsupported = providers.iter().find(|p| p["id"] == "unsupported").unwrap();
+        assert_eq!(unsupported["selectable"], false);
+
+        let connected = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "fake".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert_eq!(connected["protocol"], "chat_completions");
+        let models = connected["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        let thinking = models
+            .iter()
+            .find(|model| model["name"] == "fake-tool")
+            .unwrap();
+        assert_eq!(thinking["thinks"], true);
+        assert_eq!(thinking["tools"], true);
+        assert_eq!(
+            thinking["thinking_levels"],
+            json!(["low", "high"]),
+            "the catalog caps the accepted levels"
+        );
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let default = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["is_default"] == true)
+            .unwrap();
+        assert_eq!(
+            default["name"], "fake-tool",
+            "a vendor defaults to a tool-calling Model"
+        );
+
+        socket.close(None).await.unwrap();
+        catalog_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_discovers_and_refreshes_its_models() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use axum::Router;
+        use axum::routing::get;
+
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let seen = std::sync::Arc::clone(&calls);
+        let app = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    let names = if seen.fetch_add(1, Ordering::SeqCst) == 0 {
+                        vec!["m1", "m2"]
+                    } else {
+                        vec!["m1", "m2", "m3"]
+                    };
+                    axum::Json(json!({
+                        "data": names
+                            .into_iter()
+                            .map(|name| json!({"id": name}))
+                            .collect::<Vec<_>>(),
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let models_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::ChatCompletions,
+                base_url: format!("http://{addr}/v1"),
+                api_key: "sk-test".to_owned(),
+                models: Vec::new(),
+                default_model: None,
+                thinking: None,
+                vendor: None,
+                discover: true,
+            }),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(added["provider"].clone()).unwrap();
+        let names: Vec<&str> = added["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["m1", "m2"]);
+
+        let refreshed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        let models = refreshed["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[2]["name"], "m3");
+        assert_eq!(models[0]["name"], "m1");
+        assert_eq!(
+            models[0]["id"], added["models"][0]["id"],
+            "a still-present Model keeps its identifier"
+        );
+
+        // Refreshing a Provider that is not the Space default must not take
+        // the default away from the Provider that holds it.
+        command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                format!("http://{addr}/v1"),
+                vec![model_spec("other", false, true, Vec::new())],
+            ),
+        )
+        .await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let default = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["is_default"] == true)
+            .unwrap();
+        assert_eq!(default["name"], "other");
+
+        socket.close(None).await.unwrap();
+        models_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_without_discovery_is_declared_manually() {
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "no list") }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::ChatCompletions,
+                base_url: format!("http://{addr}/v1"),
+                api_key: "sk-test".to_owned(),
+                models: Vec::new(),
+                default_model: None,
+                thinking: None,
+                vendor: None,
+                discover: true,
+            }),
+        )
+        .await;
+        let Err((code, message)) = error else {
+            panic!("a failed discovery must fail");
+        };
+        assert_eq!(code, ErrorCode::InvalidArgument);
+        assert!(
+            message.contains("--model"),
+            "a failed discovery asks for manual Models: {message}"
+        );
+        let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
+        assert!(providers.as_array().unwrap().is_empty());
+
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                format!("http://{addr}/v1"),
+                vec![model_spec("manual", false, true, Vec::new())],
+            ),
+        )
+        .await;
+        assert_eq!(added["models"][0]["name"], "manual");
+
+        socket.close(None).await.unwrap();
+        task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_responses_provider_refreshes_its_discovered_models() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async {
+                axum::Json(json!({
+                    "data": [{"id": "one"}, {"id": "two"}],
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+
+        let added = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::OpenAiResponses,
+                base_url: format!("http://{addr}/v1"),
+                api_key: "sk-test".to_owned(),
+                models: Vec::new(),
+                default_model: None,
+                thinking: None,
+                vendor: None,
+                discover: true,
+            }),
+        )
+        .await;
+        let provider: Id = serde_json::from_value(added["provider"].clone()).unwrap();
+        let refreshed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderRefresh { provider },
+        )
+        .await;
+        let names: Vec<&str> = refreshed["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["one", "two"]);
+
+        socket.close(None).await.unwrap();
+        task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_uses_the_model_and_thinking_its_owner_chose() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, recorded) = protocol_provider(
+            ProviderProtocol::ChatCompletions,
+            vec![chat_text_reply("done"), chat_text_reply("done again")],
+        )
+        .await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                base,
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec(
+                        "thinker",
+                        true,
+                        true,
+                        vec![ThinkingLevel::Low, ThinkingLevel::High],
+                    ),
+                    model_spec("plain", false, false, Vec::new()),
+                ],
+            ),
+        )
+        .await;
+        let models = added["models"].as_array().unwrap();
+        let thinker: Id = serde_json::from_value(
+            models
+                .iter()
+                .find(|model| model["name"] == "thinker")
+                .unwrap()["id"]
+                .clone(),
+        )
+        .unwrap();
+        let plain: Id = serde_json::from_value(
+            models
+                .iter()
+                .find(|model| model["name"] == "plain")
+                .unwrap()["id"]
+                .clone(),
+        )
+        .unwrap();
+
+        let bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: Some(thinker),
+            }),
+        )
+        .await;
+        let bot_id: Id = serde_json::from_value(bot["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(bot["chat"]["id"].clone()).unwrap();
+        assert_eq!(bot["bot"]["model"], json!(thinker));
+        send(&mut socket, chat, "hello").await;
+        for _ in 0..500 {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let body = recorded.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "thinker");
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot: bot_id }).await;
+        assert_eq!(shown["bot"]["model"], json!(thinker));
+        assert_eq!(shown["bot"]["thinking"], "high");
+
+        let updated = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot: bot_id,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: Some(ThinkingLevel::Low),
+            }),
+        )
+        .await;
+        assert_eq!(updated["thinking"], "low");
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot: bot_id,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: Some(ThinkingLevel::Minimal),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(error, Err((ErrorCode::InvalidArgument, _))),
+            "a level the Model does not offer is refused"
+        );
+
+        let default_bot = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Default".to_owned(),
+                computer: None,
+                thinking: None,
+                model: None,
+            }),
+        )
+        .await;
+        let default_chat: Id = serde_json::from_value(default_bot["chat"]["id"].clone()).unwrap();
+        send(&mut socket, default_chat, "hello").await;
+        for _ in 0..500 {
+            if !recorded.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let body = recorded.lock().unwrap().pop().unwrap();
+        assert_eq!(body["model"], "fast");
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "the default Model cannot think"
+        );
+
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Plain".to_owned(),
+                computer: None,
+                thinking: None,
+                model: Some(plain),
+            }),
+        )
+        .await;
+        assert!(
+            matches!(error, Err((ErrorCode::InvalidArgument, _))),
+            "a Model without tools is never chosen for a Bot"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bot_runs_a_shell_command() {
         let (_dir, running, invite) = running().await;
@@ -5953,6 +6709,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -6175,6 +6933,8 @@ mod tests {
                     name: name.to_owned(),
                     computer: None,
                     thinking: None,
+
+                    model: None,
                 }),
             )
             .await;
@@ -6310,6 +7070,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -6416,6 +7178,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -6614,6 +7378,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -7296,6 +8062,8 @@ mod tests {
                 name: "Scout".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -7659,6 +8427,8 @@ mod tests {
                 name: "Helper".to_owned(),
                 computer: None,
                 thinking: None,
+
+                model: None,
             }),
         )
         .await;
@@ -8336,6 +9106,8 @@ mod tests {
             name: name.to_owned(),
             computer,
             thinking: None,
+
+            model: None,
         })
     }
 
@@ -11462,6 +12234,7 @@ mod tests {
             approvals: &server.approvals,
             runs: &server.runs,
             events: &server.events,
+            catalog: &server.catalog,
         }
     }
 
@@ -11514,6 +12287,9 @@ mod tests {
             grants,
             grant_add: grant_add.map(ToOwned::to_owned),
             grant_remove: grant_remove.map(ToOwned::to_owned),
+
+            model: None,
+            thinking: None,
         })
     }
 
@@ -11984,6 +12760,7 @@ mod tests {
             approvals: &server.approvals,
             runs: &server.runs,
             events: &server.events,
+            catalog: &server.catalog,
         };
         let stranger = crate::identity::Account {
             id: Id::new(),
@@ -12515,6 +13292,9 @@ mod tests {
                 grants: Some(vec!["/tmp".to_owned(), "/etc".to_owned()]),
                 grant_add: None,
                 grant_remove: None,
+
+                model: None,
+                thinking: None,
             }),
         )
         .await;
@@ -13237,6 +14017,9 @@ mod tests {
                 grants: Some(vec!["/tmp".to_owned()]),
                 grant_add: None,
                 grant_remove: None,
+
+                model: None,
+                thinking: None,
             }),
         )
         .await;
@@ -15854,6 +16637,9 @@ mod tests {
             grants: Some(vec!["/data/shared".to_owned(), "/data/team".to_owned()]),
             grant_add: None,
             grant_remove: None,
+
+            model: None,
+            thinking: None,
         });
         let first = command(&mut socket, command_id, update.clone()).await;
         assert_eq!(first["full_access"], json!(true));
@@ -15895,6 +16681,9 @@ mod tests {
                 grants: Some(vec!["relative/folder".to_owned()]),
                 grant_add: None,
                 grant_remove: None,
+
+                model: None,
+                thinking: None,
             }),
         )
         .await;
@@ -15947,6 +16736,9 @@ mod tests {
                 grants: None,
                 grant_add: None,
                 grant_remove: None,
+
+                model: None,
+                thinking: None,
             })
         };
 

@@ -932,6 +932,15 @@ mod tests {
                     }),
                 )
             }
+            EventKind::ProviderModelsUpdated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "provider": Id::new(),
+                    "models": [],
+                    "default_model": null,
+                }),
+            ),
             EventKind::RunContext => EventDraft::new(
                 kind,
                 Author::Bot(Id::new()),
