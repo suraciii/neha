@@ -3588,6 +3588,7 @@ mod tests {
     /// A `SKILL.md` past the bound is refused before it is read, and the
     /// message names the limit.
     #[test]
+    #[cfg(unix)]
     fn an_oversized_skill_document_is_refused() {
         let directory = skill_directory();
         std::fs::write(
@@ -3611,6 +3612,7 @@ mod tests {
     /// A script past the bound is refused before it is read, and the message
     /// names the limit.
     #[test]
+    #[cfg(unix)]
     fn an_oversized_script_is_refused() {
         let directory = skill_directory();
         std::fs::write(
@@ -3661,6 +3663,7 @@ mod tests {
 
     /// More scripts than a skill carries is refused before any of them is read.
     #[test]
+    #[cfg(unix)]
     fn too_many_scripts_are_refused() {
         let directory = skill_directory();
         for index in 0..=super::MAX_SKILL_SCRIPTS {
@@ -3686,6 +3689,7 @@ mod tests {
     /// A skill with no `scripts/` folder, or one holding only folders, carries
     /// no scripts.
     #[test]
+    #[cfg(unix)]
     fn a_skill_without_scripts_carries_none() {
         let bare = skill_directory();
         std::fs::remove_dir_all(bare.path().join("scripts")).unwrap();

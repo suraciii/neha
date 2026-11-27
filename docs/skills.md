@@ -36,7 +36,7 @@ target/debug/neha skill add ./weekly-report --bot <bot-id>
 
 Without `--bot` the skill joins the Space's library, which only the Admin may add to. With `--bot` it joins that Bot's library, and only the Bot's owner may add it there. A library holds one skill under each name; remove the old one before adding another under the same name.
 
-Adding a skill from a directory needs the CLI on a Unix machine; that machine may run the CLI against any Space. A Windows build refuses the command instead of reading a path a racing writer could change, and adding a skill from an installed package (`neha plugin install`) does not need it.
+Adding a skill from a directory needs the CLI on a Unix machine; that machine may run the CLI against any Space. A Windows build refuses the command instead of reading a path a racing writer could change.
 
 ```bash
 target/debug/neha skill list
