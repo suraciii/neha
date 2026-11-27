@@ -2,36 +2,79 @@
 // Tests import `space` to set up and read what happened, and hand
 // `FakeCommands` to the client in place of its WebSocket.
 import type { SubscriptionHandlers } from "../lib/ws";
-import type { Approval, Chat, FileSummary, Message, RunView } from "../types";
+import type { Approval, Chat, ChatStatus, FileSummary, Message, RecordEvent, RunView } from "../types";
 
 const account = { id: "u1", display_name: "Ada", is_admin: true };
 const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
+const otherBot = { id: "b2", owner: "u1", name: "Quill", computer: "p1", chat: "h2" };
+const thirdBot = { id: "b3", owner: "u1", name: "Sage", computer: "p1", chat: "h3" };
 const computer = { id: "p1", owner: "u1", kind: "local", online: true, workspace: "/w" };
 const chat = { id: "h1", owner: "u1", bot: "b1" };
-const otherChat = { id: "h2", owner: "u1", bot: "b1" };
+const otherChat = { id: "h2", owner: "u1", bot: "b2" };
+const thirdChat = { id: "h3", owner: "u1", bot: "b3" };
+
+// The Bot that owns a Chat, like the Space answers bot_show.
+function botFor(id: string) {
+  if (id === otherBot.id) return otherBot;
+  if (id === thirdBot.id) return thirdBot;
+  return bot;
+}
+// One Chat as the Space projects it: its own state, and the Run it follows.
+function project(known: Chat): Chat {
+  const status = space.statuses[known.id];
+  const active = space.activeRuns[known.id];
+  return {
+    ...known,
+    ...(status === undefined ? {} : { status }),
+    ...(active === undefined ? {} : { active_run: active }),
+  };
+}
 // A send or a decision can be held open, so a test can act while the Space
 // has not answered yet.
 let sendGate: Promise<void> | null = null;
 let openSend: (() => void) | null = null;
 let decideGate: Promise<void> | null = null;
 let openDecide: (() => void) | null = null;
+let approvalGate: Promise<void> | null = null;
+let openApproval: (() => void) | null = null;
 
 export const space = {
   account,
   bot,
+  otherBot,
+  thirdBot,
   computer,
   chat,
   otherChat,
+  thirdChat,
   asked: [] as string[],
   sent: [] as unknown[],
   files: [] as FileSummary[],
   messages: [] as Message[],
   otherMessages: [] as Message[],
   chats: [chat] as Chat[],
+  // What the Space projects each Chat to be doing. A Chat it omits is idle.
+  statuses: {} as Record<string, ChatStatus>,
+  // The Run each Chat works on, as the Space projects it: the waiting Run while
+  // it waits, else the oldest queued or running Run, else none.
+  activeRuns: {} as Record<string, string | null>,
   chatDelay: null as null | ((chatId: string) => Promise<void>),
   handlers: null as SubscriptionHandlers | null,
   // What the record says about each Run. A Run this map omits has succeeded.
-  runs: {} as Record<string, { status: RunView["status"]; position?: number; approval?: string }>,
+  // A Run can also carry the steps and actions the record holds for it, which
+  // is how a reopened Chat shows what the Run already did.
+  runs: {} as Record<
+    string,
+    {
+      status: RunView["status"];
+      position?: number;
+      approval?: string;
+      steps?: { index: number; tool_calls: number }[];
+      actions?: { id: string; step: number; tool: string; status: string; error?: string | null }[];
+      // Why the Run failed, when it did before any step or action.
+      error?: string | null;
+    }
+  >,
   runShows: [] as string[],
   // A run_show answer can be held open, so a test can act while it is in flight.
   runHolds: {} as Record<string, { gate: Promise<void>; release: () => void; fail: () => void } | undefined>,
@@ -51,6 +94,7 @@ export const space = {
   reset() {
     space.releaseSends();
     space.releaseDecide();
+    space.releaseApprovals();
     space.computer.kind = "local";
     space.asked = [];
     space.sent = [];
@@ -58,6 +102,8 @@ export const space = {
     space.messages = [];
     space.otherMessages = [];
     space.chats = [chat];
+    space.statuses = {};
+    space.activeRuns = {};
     space.chatDelay = null;
     space.handlers = null;
     space.runs = {};
@@ -80,6 +126,18 @@ export const space = {
     openSend = null;
     sendGate = null;
   },
+  // An approval read can be held open, so a test can answer while the Space's
+  // word about the record is still in flight.
+  holdApprovals() {
+    approvalGate = new Promise<void>((resolve) => {
+      openApproval = resolve;
+    });
+  },
+  releaseApprovals() {
+    openApproval?.();
+    openApproval = null;
+    approvalGate = null;
+  },
   holdDecide() {
     decideGate = new Promise<void>((resolve) => {
       openDecide = resolve;
@@ -99,11 +157,42 @@ export const space = {
     });
     space.runHolds[run] = { gate, release, fail };
   },
+  // Lets every read held about one Run answer, after the page moved on.
+  releaseRunShow(run: string) {
+    space.runHolds[run]?.release();
+    space.runHolds[run] = undefined;
+  },
+  // A page that reconnects reads a snapshot of the events it missed, and the
+  // Space says the cursor it now holds. This is what a real reconnect delivers.
+  resume(events: RecordEvent[]) {
+    space.seq += 1;
+    space.handlers?.onSnapshot?.(events, `s${space.seq}`, true);
+  },
 };
+
+// One event the Space writes to the record, delivered live to the page that
+// follows it. The commands that change the record write their event, so a page
+// hears about its own answer the same way it hears about everyone else's.
+function emit(kind: string, data: Record<string, unknown>) {
+  space.seq += 1;
+  space.handlers?.onEvent?.({
+    seq: String(space.seq),
+    kind,
+    version: 1,
+    at: "2026-01-01T00:00:00.000Z",
+    author: { kind: "user", id: "u1" },
+    acting: "u1",
+    data,
+  });
+}
 
 export class FakeCommands {
   async subscribe(handlers: SubscriptionHandlers): Promise<void> {
     space.handlers = handlers;
+    // A real Space answers a subscribe with one snapshot frame, which a page
+    // that asked for no cursor reads as its first page of the record.
+    await Promise.resolve();
+    handlers.onSnapshot?.([], "", false);
   }
 
   async close(): Promise<void> {
@@ -118,9 +207,12 @@ export class FakeCommands {
       case "model_list":
         return [] as T;
       case "bot_list":
-        return [space.bot] as T;
+        // Each Chat's Bot answers, like the Space lists them.
+        return space.chats.map((known) => botFor(known.bot)) as T;
       case "chat_list":
-        return [...space.chats] as T;
+        // Like the Space's JSON, each answer carries its own copies, with what
+        // the Space projects the Chat to be doing and the Run it follows.
+        return space.chats.map((known) => project(known)) as T;
       case "chat_read": {
         const asked = args as { chat: string };
         await space.chatDelay?.(asked.chat);
@@ -128,11 +220,22 @@ export class FakeCommands {
       }
       case "file_list":
         return [...space.files] as T;
-      case "approval_list":
-        // Like the Space's JSON, each answer carries its own copies.
-        return space.approvals.map((approval) => ({ ...approval })) as T;
-      case "bot_show":
-        return { bot: space.bot, computer: space.computer, chat: space.chat } as T;
+      case "approval_list": {
+        // Like the Space's JSON, each answer carries its own copies, and names
+        // only the approvals the User may still answer: the asked Chat's, or
+        // every Chat's when the call names none.
+        const asked = args as { chat?: string };
+        if (approvalGate) await approvalGate;
+        return space.approvals
+          .filter((approval) => asked.chat === undefined || approval.chat === asked.chat)
+          .map((approval) => ({ ...approval })) as T;
+      }
+      case "bot_show": {
+        const asked = args as { bot: string };
+        const known = botFor(asked.bot);
+        const own = space.chats.find((entry) => entry.bot === known.id) ?? space.chat;
+        return { bot: known, computer: space.computer, chat: project(own) } as T;
+      }
       case "message_send": {
         if (sendGate) await sendGate;
         try {
@@ -169,6 +272,16 @@ export class FakeCommands {
           if (decideGate) await decideGate;
           const waiting = space.approvals.find((known) => known.approval === decided.approval);
           if (waiting) space.approvals = space.approvals.filter((known) => known !== waiting);
+          // The Space writes the decision to the record, so the page hears
+          // about its own answer the same way it hears about any other.
+          emit("neha.approval.decided", {
+            approval: decided.approval,
+            run: waiting?.run ?? "r0",
+            allow: decided.allow,
+            lasting: decided.lasting,
+            user: "u1",
+            rule: null,
+          });
           return {
             approval: decided.approval,
             run: waiting?.run ?? "r0",
@@ -196,8 +309,10 @@ export class FakeCommands {
           position: known.position,
           approval: known.status === "waiting" ? (known.approval ?? null) : null,
           reply: null,
-          error: null,
+          error: known.error ?? null,
           usage: null,
+          steps: known.steps ?? [],
+          actions: known.actions ?? [],
         } as T;
       }
       default:

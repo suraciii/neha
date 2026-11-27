@@ -19,6 +19,12 @@ Owned by cli. Every topic's behavior is reachable through the command surface, s
 
 The command surface is the set of commands a Space accepts and the events it sends. One definition of it produces the Space's types and the clients' types.
 
+The browser client reads and writes through the command surface, as the CLI does.
+
+## Management
+
+Management is what a signed-in User changes on the Space: its Providers and Models, a Bot, the access and Workspace of that Bot's Computer, and the rules. An authenticated browser session and the CLI reach the same management commands.
+
 ## A Bot's shell
 
 A run's shell gets `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`. The token is bound to that run's Bot and Chat. It lives only in the Space's memory and expires; a restart drops it and a later run issues a new one.

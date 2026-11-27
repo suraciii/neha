@@ -550,6 +550,7 @@ code,
   height: 38px;
   display: grid;
   place-items: center;
+  position: relative;
   border-radius: 10px;
   color: var(--ink-3);
 }
@@ -561,6 +562,22 @@ code,
 .rail__item.is-active {
   background: var(--ink);
   color: var(--bg);
+}
+
+/* How many approvals wait, on the rail's own attention entry. */
+.rail__count {
+  position: absolute;
+  top: 1px;
+  right: 0;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--attention);
+  color: var(--attention-ink);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
 }
 
 .rail__spacer {
@@ -614,6 +631,107 @@ code,
   font-variant-numeric: tabular-nums;
 }
 
+/* What waits for the User, above the Chat list. The attention color owns this
+   one place, so the list itself stays quiet. */
+.attention {
+  flex: none;
+  margin: 0 10px 6px;
+  padding: 8px 8px 6px;
+  border: 1px solid var(--attention-line);
+  border-radius: var(--r-md);
+  background: var(--attention-soft);
+  /* A long wait must not push the Chats out of reach, so the block scrolls
+     inside a bounded height instead of growing with the record. */
+  max-height: 42vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.attention__head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 4px 4px;
+  color: var(--attention);
+}
+
+.attention__head .icon {
+  width: 15px;
+  height: 15px;
+  flex: none;
+}
+
+.attention__title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: -0.005em;
+}
+
+.attention__count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--attention);
+  color: var(--raised);
+  font-size: var(--text-2xs);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.attention__row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  min-height: 40px;
+  padding: 5px 6px;
+  border-radius: var(--r-sm);
+  text-align: left;
+  transition: background 140ms var(--ease-soft);
+}
+
+.attention__row:hover {
+  background: var(--ink-hover-soft);
+}
+
+.attention__row .avatar {
+  flex: none;
+}
+
+.attention__text {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+}
+
+.attention__text b {
+  color: var(--ink);
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+
+.attention__text span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-3);
+  font-size: var(--text-2xs);
+}
+
+.attention__go {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: var(--ink-4);
+}
+
 .sidebar__list {
   flex: 1;
   overflow-y: auto;
@@ -662,6 +780,53 @@ code,
 .conv__meta {
   color: var(--ink-4);
   font-size: var(--text-2xs);
+}
+
+/* One mark per Chat: what it waits for, that it works, or that something
+   happened in it while another Chat was on screen. */
+.conv__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: none;
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--sunken);
+  color: var(--ink-3);
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.conv__badge .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.conv__badge .dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  background: currentColor;
+}
+
+.conv__badge--waiting {
+  background: var(--attention-soft);
+  color: var(--attention);
+}
+
+.conv__badge--working,
+.conv__badge--new {
+  background: var(--accent-soft);
+  color: var(--accent-2);
+}
+
+.conv__name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .conv__preview {
@@ -807,6 +972,35 @@ code,
   display: none;
 }
 
+/* A pill beside the header: the Bot works, or its Run failed. It never carries
+   the whole state alone; the activity card and the Approval Card say more. */
+.chat__state {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-2);
+  font-size: var(--text-2xs);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.chat__state .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.chat__state--failed {
+  border-color: var(--danger-line);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .locale-switch {
   display: inline-flex;
   align-items: center;
@@ -920,8 +1114,153 @@ code,
   max-width: min(82%, 680px);
   padding-top: 2px;
 }
-.msg--working .msg__body {
+/* What the followed Run is doing: one quiet line the User can open, with the
+   steps, the tools, how each action ended, and the Files it produced. A tool's
+   arguments never reach this card. */
+.activity {
+  max-width: min(82%, 680px);
+  margin: 12px auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 14px 14px 14px 4px;
+  background: var(--raised);
+}
+
+.activity--failed {
+  border-color: var(--danger-line);
+}
+
+.activity__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 12px;
+  border-radius: inherit;
+  text-align: left;
+  color: var(--ink-2);
+}
+
+.activity__head:hover {
+  background: var(--ink-hover-soft);
+}
+
+.activity__head .avatar,
+.activity__head .icon,
+.activity__head .work-bars {
+  flex: none;
+}
+
+.activity__head .work-bars {
+  margin-top: 0;
+}
+
+.activity__title {
+  font-size: var(--text-md);
+  font-weight: 500;
+  color: var(--ink-2);
+  white-space: nowrap;
+}
+
+.activity--failed .activity__title {
+  color: var(--danger);
+}
+
+/* The tools the Run used, named once each. */
+.activity__tools {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--ink-4);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.activity__chev {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  color: var(--ink-4);
+  transition: transform 160ms var(--ease-soft);
+}
+
+.activity__head[aria-expanded="false"] .activity__chev {
+  transform: rotate(-90deg);
+}
+
+.activity__steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 2px 12px 8px;
+  list-style: none;
+}
+
+.activity__step {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+}
+
+.activity__mark {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--ink-4);
+}
+
+.activity__mark--running {
+  background: var(--accent-2);
+}
+
+.activity__mark--succeeded {
+  background: var(--success);
+}
+
+.activity__mark--failed {
+  background: var(--danger);
+}
+
+.activity__step-no {
+  flex: none;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+
+.activity__tool {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+}
+
+.activity__status {
+  flex: none;
+  margin-left: auto;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+
+.activity__files {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 8px;
+}
+
+.activity__reason {
+  margin: 0;
+  padding: 0 12px 12px;
+  color: var(--danger);
+  font-size: var(--text-sm);
 }
 
 .msg__meta {
@@ -1055,6 +1394,17 @@ code,
   margin: 0 2px 6px;
   color: var(--ink-3);
   font-size: var(--text-sm);
+}
+
+/* The composer takes no second Message while the Chat works, so it says why. */
+.composer__closed {
+  margin: 0 2px 6px;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+}
+
+.composer__input:disabled {
+  opacity: 0.55;
 }
 
 /* An action the Bot waits to run until the User answers. */

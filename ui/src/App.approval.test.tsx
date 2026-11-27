@@ -3,7 +3,7 @@ import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
 import { space } from "./test/fakeSpace";
-import { element, openChat, record, useView, type View } from "./test/view";
+import { drain, element, openChat, record, useView, type View } from "./test/view";
 import type { Approval } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
@@ -370,9 +370,100 @@ describe("App with approvals", () => {
 
     // A granted approval lets the Run work again, and the header says so.
     press(view, "允许一次");
-    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("正在处理"));
+    await waitFor(() => expect(element(view, ".activity").textContent).toContain("正在处理"));
     expect(header(view)).not.toContain("等待你的审批");
     expect(card(view)).toContain("已允许");
+  });
+
+  it("does not bring an answered approval back when its read answers late", async () => {
+    const view = await openChat();
+    // The Space's read of the approvals is still in flight when the answer is
+    // given, so its answer describes the record as it was before it.
+    space.holdApprovals();
+    space.resume([]);
+    space.approvals.push(firstUse);
+    record("neha.approval.requested", {
+      approval: "a1",
+      run: "r1",
+      bot: "b1",
+      chat: "h1",
+      acting: "u1",
+      action: "act1",
+      step: 1,
+      call: "c1",
+      tool: "shell",
+      arguments: { command: "printf hi > a.txt" },
+      summary: "printf hi > a.txt",
+      reason: "first_use_local",
+      rule: null,
+    });
+    await waitFor(() => expect(view.container.querySelectorAll(".approval")).toHaveLength(1));
+    expect(header(view)).toContain("Waiting for your approval");
+
+    press(view, "Allow once");
+    await waitFor(() => expect(card(view)).toContain("Allowed"));
+    expect(header(view)).not.toContain("Waiting for your approval");
+
+    // The held read answers, and says nothing waits any more.
+    space.releaseApprovals();
+    await drain();
+    expect(space.approvals).toHaveLength(0);
+    // The answered approval stays answered: no row comes back for it.
+    await waitFor(() => expect(view.container.querySelectorAll(".attention__row")).toHaveLength(0));
+    expect(view.container.querySelector('[data-approval="a1"]')).toBeTruthy();
+    expect(card(view)).toContain("Allowed");
+    expect(header(view)).not.toContain("Waiting for your approval");
+  });
+
+  it("keeps the Chat waiting while another of its approvals still waits", async () => {
+    // Two Runs of the same Bot both wait, each with its own approval.
+    space.messages.push({
+      id: "m1",
+      chat: "h1",
+      author: { kind: "user", id: "u1" },
+      acting: null,
+      text: "two things",
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "1",
+      run: "r1",
+      file: null,
+    });
+    space.messages.push({
+      id: "m2",
+      chat: "h1",
+      author: { kind: "user", id: "u1" },
+      acting: null,
+      text: "and another",
+      at: "2026-01-01T00:00:00.000Z",
+      seq: "2",
+      run: "r2",
+      file: null,
+    });
+    space.statuses["h1"] = "waiting";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = { status: "waiting", approval: "a1" };
+    space.runs["r2"] = { status: "waiting", approval: "a2" };
+    space.approvals.push(firstUse, { ...firstUse, approval: "a2", run: "r2", action: "act2", summary: "write_file: notes.txt" });
+    const view = await openChat();
+
+    expect(header(view)).toContain("Waiting for your approval");
+    expect(view.container.querySelectorAll(".approval")).toHaveLength(2);
+    expect(element(view, ".attention__count").textContent).toBe("2");
+
+    // The first approval is allowed: its Run works again, and the Chat still
+    // waits for the second one.
+    press(view, "Allow once");
+    await waitFor(() => expect(card(view)).toContain("Allowed"));
+    expect(header(view)).toContain("Waiting for your approval");
+    expect(view.container.querySelectorAll(".approval")).toHaveLength(2);
+    // The answered approval leaves the attention list, and the Chat keeps its
+    // Waiting mark for the one that still waits.
+    expect(view.container.querySelectorAll(".attention__row")).toHaveLength(1);
+    expect(element(view, ".attention__count").textContent).toBe("1");
+    expect(view.container.querySelector(".conv__badge")?.textContent).toContain("Waiting");
+    // The Run that was allowed works, so the composer takes no Message.
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+    expect(view.container.querySelector(".composer__queue")).toBeNull();
   });
 
   it("follows a Run that already waits when the Chat opens", async () => {
@@ -402,11 +493,11 @@ describe("App with approvals", () => {
     await waitFor(() => expect(space.runShows.length).toBeGreaterThan(shows));
     await flush();
     expect(header(view)).toContain("Waiting for your approval");
-    expect(view.container.querySelector(".msg--working")).toBeNull();
+    expect(view.container.querySelector(".activity")).toBeNull();
 
     // Only the decision lets the Run work again.
     press(view, "Allow once");
-    await waitFor(() => expect(element(view, ".msg--working").textContent).toContain("Working"));
+    await waitFor(() => expect(element(view, ".activity").textContent).toContain("Working"));
     expect(header(view)).not.toContain("Waiting for your approval");
   });
 

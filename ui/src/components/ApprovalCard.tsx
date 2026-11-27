@@ -60,7 +60,7 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const cwd = () => props.approval.cwd || null;
 
   return (
-    <article class="msg msg--bot approval" aria-live="polite">
+    <article class="msg msg--bot approval" aria-live="polite" data-approval={props.approval.approval}>
       <Avatar name={props.botName} small />
       <div class="msg__body">
         <div class="approval__head">

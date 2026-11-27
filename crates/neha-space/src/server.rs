@@ -3711,6 +3711,174 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn chat_list_projects_a_working_chat_and_an_idle_one() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates, _recorded) = gated_provider(vec![hold("done")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: None,
+
+                model: None,
+            }),
+        )
+        .await;
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // A Chat with no run is idle, in the list and under its Bot.
+        let view = chat_view(&mut socket, chat).await;
+        assert_eq!(view["status"], "idle");
+        assert!(
+            view["active_run"].is_null(),
+            "an idle Chat follows no run: {view}"
+        );
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["chat"]["status"], "idle");
+        assert!(shown["chat"]["active_run"].is_null());
+
+        // A queued run makes the Chat work before the Model answers.
+        let queued = submit(&mut socket, chat, "hello", None).await;
+        let run = run_of(&queued);
+        let view = chat_view(&mut socket, chat).await;
+        assert_eq!(view["status"], "working", "a queued run works: {view}");
+        assert_eq!(view["active_run"], json!(run));
+        wait_status(&mut socket, run, "running").await;
+        assert_eq!(chat_view(&mut socket, chat).await["status"], "working");
+
+        // The reply ends the run, and the Chat settles back to idle.
+        gates[0].open();
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded");
+        let view = chat_view(&mut socket, chat).await;
+        assert_eq!(view["status"], "idle");
+        assert!(
+            view["active_run"].is_null(),
+            "an ended Chat follows no run: {view}"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_replays_the_chat_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_home(dir.path());
+        let first = start(root.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![tool("shell", json!({"command": "pwd"})), text("done")],
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+        let view = chat_view(&mut local.socket, local.chat).await;
+        assert_eq!(view["status"], "waiting");
+        assert_eq!(view["active_run"], json!(run));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        // A fresh start projects the same state from the record again.
+        let second = start(root.clone(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        let view = chat_view(&mut socket, local.chat).await;
+        assert_eq!(
+            view["status"], "waiting",
+            "a restart projects the waiting run: {view}"
+        );
+        assert_eq!(view["active_run"], json!(run));
+
+        // Answering the approval fails the run, and the projection follows.
+        decide_approval(&mut socket, approval, false, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "failed");
+        let view = chat_view(&mut socket, local.chat).await;
+        assert_eq!(view["status"], "failed");
+        assert!(
+            view["active_run"].is_null(),
+            "a failed Chat follows no run: {view}"
+        );
+
+        // A new run in the Chat works again as soon as it queues.
+        let next = run_of(&submit(&mut socket, local.chat, "run pwd again", None).await);
+        let view = chat_view(&mut socket, local.chat).await;
+        assert_eq!(view["status"], "working");
+        assert_eq!(view["active_run"], json!(next));
+
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chat_list_keeps_the_later_failure_after_an_earlier_success() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("second done"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            chat_view(&mut local.socket, local.chat).await["status"],
+            "waiting"
+        );
+
+        // A waiting run does not hold the Bot's queue, so the next Message's
+        // run starts and succeeds while the first one waits.
+        let second = run_of(&submit(&mut local.socket, local.chat, "second", None).await);
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let view = chat_view(&mut local.socket, local.chat).await;
+        assert_eq!(
+            view["status"], "waiting",
+            "the wait outranks the newer run: {view}"
+        );
+        assert_eq!(view["active_run"], json!(first));
+
+        // Denying the first run fails it. Its end is the latest event that
+        // ended a run, so the Chat stays failed; the newer success must not
+        // hide it.
+        decide_approval(&mut local.socket, approval, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, first).await["status"], "failed");
+        let view = chat_view(&mut local.socket, local.chat).await;
+        assert_eq!(
+            view["status"], "failed",
+            "the later failure outlives the earlier success: {view}"
+        );
+        assert!(view["active_run"].is_null());
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn repeated_wrong_passwords_are_rate_limited() {
         let (_dir, running, invite) = running().await;
         let _session = join(&running, &invite, "Ada", "correct horse battery").await;
@@ -5144,6 +5312,16 @@ mod tests {
 
     async fn show_run(socket: &mut Socket, run: Id) -> Value {
         command(socket, Id::new(), CommandCall::RunShow { run }).await
+    }
+
+    /// Returns the ChatList snapshot of one Chat.
+    async fn chat_view(socket: &mut Socket, chat: Id) -> Value {
+        let chats = command(socket, Id::new(), CommandCall::ChatList).await;
+        chats
+            .as_array()
+            .and_then(|views| views.iter().find(|view| view["id"] == json!(chat)))
+            .cloned()
+            .unwrap_or_else(|| panic!("ChatList has no Chat {chat}"))
     }
 
     /// Reads the record of a stopped Space.
@@ -8913,6 +9091,143 @@ mod tests {
         }
         socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_file_message_names_the_run_that_sent_it() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (bot, chat, _computer) = create_bot(&mut socket).await;
+        let run = Id::new();
+        let acting = {
+            let state = running.server.state.lock().unwrap();
+            state.bots[&bot].owner
+        };
+        let bot_token = {
+            let mut state = running.server.state.lock().unwrap();
+            state.issue_bot_token(crate::state::BotToken {
+                bot,
+                chat,
+                run,
+                acting,
+                expires: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            })
+        };
+        let client = reqwest::Client::new();
+        let uploaded: Value = client
+            .post(format!("{}/api/bot/files", running.url()))
+            .query(&[("name", "out.txt"), ("media_type", "text/plain")])
+            .bearer_auth(&bot_token)
+            .body("from the bot".to_owned())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let file: Id = serde_json::from_value(uploaded["id"].clone()).unwrap();
+
+        // The Bot's run token posts the File Message, which names its run.
+        let posted: Value = client
+            .post(format!("{}/api/bot/messages", running.url()))
+            .bearer_auth(&bot_token)
+            .json(&serde_json::json!({"chat": chat, "file": file}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let message: Id = serde_json::from_value(posted["message"].clone()).unwrap();
+        {
+            let state = running.server.state.lock().unwrap();
+            let view = state
+                .messages
+                .iter()
+                .find(|view| view.id == message)
+                .expect("the File Message is recorded");
+            assert_eq!(view.author, Author::Bot(bot));
+            assert_eq!(view.file, Some(file));
+            assert_eq!(
+                view.run,
+                Some(run),
+                "a Bot's File Message names the run that sent it"
+            );
+        }
+
+        // The Chat read the Web client follows carries the same binding.
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let wire = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(message))
+            .expect("the File Message is readable");
+        assert_eq!(wire["author"]["kind"], "bot");
+        assert_eq!(wire["file"], json!(file));
+        assert_eq!(wire["run"], json!(run));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_message_from_before_runs_were_named_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = test_home(dir.path());
+        let first = start(root.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().unwrap();
+        let (mut socket, _token) = admin(&first, &invite).await;
+        let (bot, chat, _computer) = create_bot(&mut socket).await;
+        let owner = {
+            let state = first.server.state.lock().unwrap();
+            state.bots[&bot].owner
+        };
+        socket.close(None).await.unwrap();
+        first.shutdown().await;
+
+        // A record written before a Message named its Run holds no run.
+        let message = Id::new();
+        let store = Store::open(&root).await.unwrap();
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "legacy-message",
+                vec![EventDraft::new(
+                    EventKind::MessageAdded,
+                    Author::User(owner),
+                    json!({"message": message, "chat": chat, "text": "old words"}),
+                )],
+            ))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let second = start(root.clone(), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let read = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(message))
+            .expect("the old Message is readable");
+        assert_eq!(read["text"], "old words");
+        assert_eq!(read["run"], Value::Null);
+
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
