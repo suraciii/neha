@@ -34,6 +34,9 @@ pub enum EventKind {
     /// The Admin connected a Provider.
     #[serde(rename = "neha.provider.added")]
     ProviderAdded,
+    /// The Admin refreshed a Provider's Models.
+    #[serde(rename = "neha.provider.models_updated")]
+    ProviderModelsUpdated,
     /// A Bot was created.
     #[serde(rename = "neha.bot.created")]
     BotCreated,
@@ -103,6 +106,7 @@ impl EventKind {
         match self {
             Self::UserJoined => "neha.user.joined",
             Self::ProviderAdded => "neha.provider.added",
+            Self::ProviderModelsUpdated => "neha.provider.models_updated",
             Self::BotCreated => "neha.bot.created",
             Self::BotMoved => "neha.bot.moved",
             Self::BotUpdated => "neha.bot.updated",
@@ -149,6 +153,7 @@ impl EventKind {
             | Self::RuleRemoved => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
+            | Self::ProviderModelsUpdated
             | Self::BotCreated
             | Self::BotMoved
             | Self::BotUpdated
@@ -165,6 +170,7 @@ impl FromStr for EventKind {
         match text {
             "neha.user.joined" => Ok(Self::UserJoined),
             "neha.provider.added" => Ok(Self::ProviderAdded),
+            "neha.provider.models_updated" => Ok(Self::ProviderModelsUpdated),
             "neha.bot.created" => Ok(Self::BotCreated),
             "neha.bot.moved" => Ok(Self::BotMoved),
             "neha.bot.updated" => Ok(Self::BotUpdated),
@@ -269,6 +275,7 @@ mod tests {
         let kinds = [
             EventKind::UserJoined,
             EventKind::ProviderAdded,
+            EventKind::ProviderModelsUpdated,
             EventKind::BotCreated,
             EventKind::BotMoved,
             EventKind::ComputerCreated,
@@ -450,6 +457,55 @@ mod tests {
                 "{status} is a status a finished run may carry"
             );
         }
+    }
+
+    #[test]
+    fn an_old_model_data_is_still_tool_capable() {
+        let provider = Id::new();
+        let model = Id::new();
+        let value = serde_json::json!({
+            "provider": provider,
+            "protocol": "chat_completions",
+            "base_url": "http://127.0.0.1:9000/v1",
+            "models": [{
+                "id": model,
+                "name": "old-model",
+                "context_limit": 8192,
+                "max_output": 1024,
+                "reads_images": false,
+            }],
+        });
+        let EventData::ProviderAdded(data) = EventKind::ProviderAdded.decode(&value).unwrap()
+        else {
+            panic!("expected a Provider");
+        };
+        assert_eq!(data.vendor, None);
+        assert!(data.models[0].tools, "old Models could call tools");
+        assert!(data.models[0].thinking_levels.is_empty());
+
+        let updated = serde_json::json!({
+            "provider": provider,
+            "models": [{
+                "id": model,
+                "name": "new-model",
+                "context_limit": 128000,
+                "max_output": 8192,
+                "reads_images": true,
+                "thinks": true,
+                "tools": false,
+                "thinking_levels": ["low", "high"],
+            }],
+            "default_model": model,
+        });
+        let EventData::ProviderModelsUpdated(data) =
+            EventKind::ProviderModelsUpdated.decode(&updated).unwrap()
+        else {
+            panic!("expected refreshed Models");
+        };
+        assert_eq!(data.provider, provider);
+        assert_eq!(data.default_model, Some(model));
+        assert!(!data.models[0].tools);
+        assert_eq!(data.models[0].thinking_levels.len(), 2);
     }
 
     #[test]
@@ -814,6 +870,8 @@ pub enum EventData {
     UserJoined(UserJoined),
     /// A Provider was connected.
     ProviderAdded(ProviderAdded),
+    /// A Provider's Models were refreshed.
+    ProviderModelsUpdated(ProviderModelsUpdated),
     /// A Bot was created.
     BotCreated(BotCreated),
     /// A Bot moved to another Computer.
@@ -878,6 +936,7 @@ impl EventKind {
         let decoded = match self {
             Self::UserJoined => EventData::UserJoined(decode(data)?),
             Self::ProviderAdded => EventData::ProviderAdded(decode(data)?),
+            Self::ProviderModelsUpdated => EventData::ProviderModelsUpdated(decode(data)?),
             Self::BotCreated => EventData::BotCreated(decode(data)?),
             Self::BotMoved => EventData::BotMoved(decode(data)?),
             Self::BotUpdated => EventData::BotUpdated(decode(data)?),
@@ -924,6 +983,7 @@ impl EventKind {
         match self {
             Self::UserJoined
             | Self::ProviderAdded
+            | Self::ProviderModelsUpdated
             | Self::BotCreated
             | Self::BotMoved
             | Self::BotUpdated
@@ -1009,6 +1069,9 @@ pub struct UserJoined {
 pub struct ProviderAdded {
     /// The Provider identifier.
     pub provider: Id,
+    /// The catalog vendor this Provider came from.
+    #[serde(default)]
+    pub vendor: Option<String>,
     /// The protocol it speaks.
     pub protocol: String,
     /// Its base address.
@@ -1040,6 +1103,30 @@ pub struct ModelData {
     /// Whether it can think before it answers.
     #[serde(default)]
     pub thinks: bool,
+    /// Whether it can call tools.
+    #[serde(default = "model_tools_default")]
+    pub tools: bool,
+    /// The thinking levels it supports; empty means every level.
+    #[serde(default)]
+    pub thinking_levels: Vec<crate::surface::ThinkingLevel>,
+}
+
+/// Models recorded before tools were a capability could call them.
+const fn model_tools_default() -> bool {
+    true
+}
+
+/// The data of `neha.provider.models_updated`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderModelsUpdated {
+    /// The Provider.
+    pub provider: Id,
+    /// The Models it now offers.
+    pub models: Vec<ModelData>,
+    /// The Model the Space uses by default now.
+    #[serde(default)]
+    pub default_model: Option<Id>,
 }
 
 /// The data of `neha.bot.created`.
@@ -1059,6 +1146,9 @@ pub struct BotCreated {
     /// Its thinking level; absent uses the Space's default.
     #[serde(default)]
     pub thinking: Option<crate::surface::ThinkingLevel>,
+    /// Its Model; absent uses the Space's default.
+    #[serde(default)]
+    pub model: Option<Id>,
 }
 
 /// The data of `neha.bot.moved`.
@@ -1094,6 +1184,12 @@ pub struct BotUpdated {
     /// `Some(empty)` removes every grant; `None` leaves them unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<String>>,
+    /// The Model it uses; absent leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Id>,
+    /// Its thinking level; absent leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<crate::surface::ThinkingLevel>,
 }
 
 /// What a Computer is: the machine Neha runs on, or the Space itself.

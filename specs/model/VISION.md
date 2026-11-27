@@ -12,7 +12,7 @@ A Provider is a source of Models: a known vendor reached with an API key, or an 
 
 The Admin of a Space connects its Providers. Every Bot on the Space can use their Models.
 
-A Model has capabilities: whether it reads images, whether it thinks, and its context limit.
+A Model has capabilities: its context and output limits, whether it reads images, whether it calls tools, and whether and how it thinks.
 
 The Space has a default Model. A Bot can choose its own Model and thinking level.
 
@@ -24,7 +24,7 @@ An OpenAI-compatible address is the one universal case: whatever a user runs, it
 
 Per-Provider protocol and headers live under Advanced because most users never need them and the few who do cannot work without them.
 
-Capabilities are recorded per Model because a Bot that works a screen needs a model that reads images, and the picker has to say so before the work fails.
+Capabilities are recorded per Model because a Bot that works a screen needs a model that reads images, and a Model that cannot call tools cannot act. The picker has to say so before the work fails.
 
 A Space default with a per-Bot choice keeps the floor flat and the ceiling high: most Bots never think about it, and the ones that need to can.
 

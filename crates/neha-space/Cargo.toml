@@ -12,6 +12,7 @@ argon2 = { version = "0.5", features = ["std"] }
 axum = { version = "0.8", features = ["http1", "json", "tokio", "ws"] }
 base64 = "0.22"
 eventsource-stream = "0.2"
+flate2 = "1"
 futures-util.workspace = true
 neha = { path = "../neha" }
 neha-computer = { path = "../neha-computer" }

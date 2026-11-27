@@ -13,7 +13,7 @@ use neha::record::RuleEffect;
 use neha::seq::Seq;
 use neha::surface::{
     BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
-    ProviderProtocol, ThinkingLevel,
+    ProviderConnect, ProviderProtocol, ThinkingLevel,
 };
 use neha_space::Home;
 use serde_json::Value;
@@ -62,6 +62,11 @@ enum Top {
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
+    },
+    /// Browse and refresh the models.dev catalog.
+    Catalog {
+        #[command(subcommand)]
+        command: CatalogCommand,
     },
     /// List the Models the Space offers.
     Model {
@@ -115,8 +120,12 @@ enum ProviderCommand {
         /// The protocol: chat-completions, openai-responses, or anthropic-messages.
         #[arg(long, default_value = "chat-completions", value_parser = parse_protocol)]
         protocol: ProviderProtocol,
-        /// A Model name at the Provider; repeat for more.
-        #[arg(long = "model", value_name = "NAME", required = true)]
+        /// A Model name at the Provider; repeat for more, or use --discover.
+        #[arg(
+            long = "model",
+            value_name = "NAME",
+            required_unless_present = "discover"
+        )]
         models: Vec<String>,
         /// The Model's context window in tokens.
         #[arg(long, default_value_t = 128_000)]
@@ -127,15 +136,50 @@ enum ProviderCommand {
         /// The Model does not read images.
         #[arg(long)]
         no_images: bool,
+        /// The Model cannot call tools.
+        #[arg(long)]
+        no_tools: bool,
         /// The Model can think before it answers.
         #[arg(long)]
         thinks: bool,
         /// The Space's default thinking level: minimal, low, medium, high, max.
         #[arg(long, value_parser = parse_thinking)]
         thinking: Option<ThinkingLevel>,
+        /// Ask the endpoint for its Models instead of naming them.
+        #[arg(long, conflicts_with = "models")]
+        discover: bool,
+    },
+    /// Connect a vendor the catalog knows.
+    Connect {
+        /// The catalog vendor id, such as openai or deepseek.
+        vendor: String,
+        /// Override the preset base URL.
+        #[arg(long)]
+        base_url: Option<String>,
+        /// Override the preset protocol.
+        #[arg(long, value_parser = parse_protocol)]
+        protocol: Option<ProviderProtocol>,
+        /// The Space's default thinking level.
+        #[arg(long, value_parser = parse_thinking)]
+        thinking: Option<ThinkingLevel>,
+    },
+    /// Refresh a Provider's Models from its endpoint or the catalog.
+    Refresh {
+        /// The Provider identifier.
+        provider: Id,
     },
     /// List connected Providers.
     List,
+}
+
+#[derive(Subcommand)]
+enum CatalogCommand {
+    /// List the Providers the catalog knows.
+    List,
+    /// Show the catalog cache state.
+    Status,
+    /// Fetch the catalog from models.dev.
+    Refresh,
 }
 
 #[derive(Subcommand)]
@@ -155,6 +199,20 @@ enum BotCommand {
         /// A fresh Hosted Computer when omitted.
         #[arg(long, value_name = "LOCAL|HOSTED|ID")]
         computer: Option<String>,
+        /// The Bot's thinking level: minimal, low, medium, high, max.
+        #[arg(long, value_parser = parse_thinking)]
+        thinking: Option<ThinkingLevel>,
+        /// The Model the Bot uses; defaults to the Space's default Model.
+        #[arg(long)]
+        model: Option<Id>,
+    },
+    /// Change your Bot's Model or thinking level.
+    Set {
+        /// The Bot identifier.
+        bot: Id,
+        /// The Model the Bot uses.
+        #[arg(long)]
+        model: Option<Id>,
         /// The Bot's thinking level: minimal, low, medium, high, max.
         #[arg(long, value_parser = parse_thinking)]
         thinking: Option<ThinkingLevel>,
@@ -407,6 +465,7 @@ async fn main() -> Result<()> {
         Top::Login { name, server } => login(&name, server).await,
         Top::Whoami => whoami(),
         Top::Provider { command } => provider(command).await,
+        Top::Catalog { command } => catalog(command).await,
         Top::Model { command } => model(command).await,
         Top::Bot { command } => bot(command).await,
         Top::Computer { command } => computer_command(command).await,
@@ -539,8 +598,10 @@ async fn provider(command: ProviderCommand) -> Result<()> {
             context_limit,
             max_output,
             no_images,
+            no_tools,
             thinks,
             thinking,
+            discover,
         } => {
             let api_key = provider_key()?;
             let default = models.first().cloned();
@@ -558,10 +619,14 @@ async fn provider(command: ProviderCommand) -> Result<()> {
                             max_output,
                             reads_images: !no_images,
                             thinks,
+                            tools: !no_tools,
+                            thinking_levels: Vec::new(),
                         })
                         .collect(),
                     default_model: default,
                     thinking,
+                    vendor: None,
+                    discover,
                 }),
             )
             .await?;
@@ -580,16 +645,123 @@ async fn provider(command: ProviderCommand) -> Result<()> {
                 );
             }
         }
+        ProviderCommand::Connect {
+            vendor,
+            base_url,
+            protocol,
+            thinking,
+        } => {
+            let api_key = provider_key()?;
+            let result = client::command(
+                &credential,
+                CommandCall::ProviderConnect(ProviderConnect {
+                    vendor: vendor.clone(),
+                    api_key,
+                    base_url,
+                    protocol,
+                    thinking,
+                }),
+            )
+            .await?;
+            println!(
+                "Connected Provider {} from {vendor}.",
+                id_of(&result, "provider")?
+            );
+            for model in result["models"]
+                .as_array()
+                .context("no Models in the answer")?
+            {
+                println!(
+                    "  Model {} ({})",
+                    id_of(model, "id")?,
+                    text_of(model, "name")?
+                );
+            }
+        }
+        ProviderCommand::Refresh { provider } => {
+            let result =
+                client::command(&credential, CommandCall::ProviderRefresh { provider }).await?;
+            for model in result["models"]
+                .as_array()
+                .context("no Models in the answer")?
+            {
+                println!(
+                    "  Model {} ({})",
+                    id_of(model, "id")?,
+                    text_of(model, "name")?
+                );
+            }
+        }
         ProviderCommand::List => {
             let result = client::command(&credential, CommandCall::ProviderList).await?;
             for provider in result.as_array().context("no Providers in the answer")? {
                 println!(
-                    "{}  {}  {}",
+                    "{}  {}  {}  {}",
                     id_of(provider, "id")?,
+                    provider["vendor"].as_str().unwrap_or("-"),
                     text_of(provider, "protocol")?,
                     text_of(provider, "base_url")?
                 );
             }
+        }
+    }
+
+    Ok(())
+}
+
+async fn catalog(command: CatalogCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        CatalogCommand::List => {
+            let result = client::command(&credential, CommandCall::CatalogList).await?;
+            for provider in result.as_array().context("no Providers in the answer")? {
+                let protocol = provider["protocol"].as_str().unwrap_or("unsupported");
+                let selectable = provider["selectable"].as_bool().unwrap_or(false);
+                println!(
+                    "{}  {}  {}  {} models{}",
+                    text_of(provider, "id")?,
+                    text_of(provider, "name")?,
+                    protocol,
+                    provider["model_count"].as_u64().unwrap_or_default(),
+                    if selectable { "" } else { "  (unsupported)" }
+                );
+            }
+        }
+        CatalogCommand::Status => {
+            let status = client::command(&credential, CommandCall::CatalogStatus).await?;
+            println!(
+                "Catalog: {} ({} Providers, {} Models)",
+                text_of(&status, "source")?,
+                status["provider_count"].as_u64().unwrap_or_default(),
+                status["model_count"].as_u64().unwrap_or_default()
+            );
+            if status["builtin"].as_bool().unwrap_or(false) {
+                println!("  Built-in snapshot; run `neha catalog refresh` to cache a fresh one.");
+            } else {
+                println!(
+                    "  Cache: {}",
+                    status["cache_path"].as_str().unwrap_or_default()
+                );
+                if let Some(age) = status["age_seconds"].as_u64() {
+                    println!(
+                        "  Age: {age}s; stale: {}",
+                        status["stale"].as_bool().unwrap_or(false)
+                    );
+                }
+                if let Some(etag) = status["etag"].as_str() {
+                    println!("  ETag: {etag}");
+                }
+            }
+        }
+        CatalogCommand::Refresh => {
+            let result = client::command(&credential, CommandCall::CatalogRefresh).await?;
+            let status = &result["status"];
+            println!(
+                "Catalog refreshed: {} Providers, {} Models (changed: {}).",
+                status["provider_count"].as_u64().unwrap_or_default(),
+                status["model_count"].as_u64().unwrap_or_default(),
+                result["changed"].as_bool().unwrap_or(false)
+            );
         }
     }
 
@@ -613,12 +785,30 @@ async fn model(command: ModelCommand) -> Result<()> {
                     "no images"
                 };
                 let thinks = if model["thinks"].as_bool().unwrap_or(false) {
-                    "thinks"
+                    if let Some(levels) = model["thinking_levels"].as_array()
+                        && !levels.is_empty()
+                    {
+                        format!(
+                            "thinks ({})",
+                            levels
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        )
+                    } else {
+                        "thinks".to_owned()
+                    }
                 } else {
-                    "no thinking"
+                    "no thinking".to_owned()
+                };
+                let tools = if model["tools"].as_bool().unwrap_or(true) {
+                    "tools"
+                } else {
+                    "no tools"
                 };
                 println!(
-                    "{}  {}  context {}  max output {}  {images}  {thinks}{default}",
+                    "{}  {}  context {}  max output {}  {images}  {thinks}  {tools}{default}",
                     id_of(model, "id")?,
                     text_of(model, "name")?,
                     model["context_limit"].as_u64().unwrap_or_default(),
@@ -755,6 +945,8 @@ fn access_update(bot: Id) -> BotUpdate {
         grants: None,
         grant_add: None,
         grant_remove: None,
+        model: None,
+        thinking: None,
     }
 }
 
@@ -847,6 +1039,7 @@ async fn bot(command: BotCommand) -> Result<()> {
             name,
             computer,
             thinking,
+            model,
         } => {
             let computer = computer.as_deref().map(parse_bot_computer).transpose()?;
             let result = client::command(
@@ -855,6 +1048,7 @@ async fn bot(command: BotCommand) -> Result<()> {
                     name: name.clone(),
                     computer,
                     thinking,
+                    model,
                 }),
             )
             .await?;
@@ -865,6 +1059,31 @@ async fn bot(command: BotCommand) -> Result<()> {
                 "Say hello with: neha chat send --bot {} \"hello\"",
                 id_of(&result["bot"], "id")?
             );
+        }
+        BotCommand::Set {
+            bot,
+            model,
+            thinking,
+        } => {
+            if model.is_none() && thinking.is_none() {
+                bail!("a Bot update names --model, --thinking, or both");
+            }
+            let result = client::command(
+                &credential,
+                CommandCall::BotUpdate(BotUpdate {
+                    model,
+                    thinking,
+                    ..access_update(bot)
+                }),
+            )
+            .await?;
+            println!("Updated Bot {}.", id_of(&result, "id")?);
+            if let Some(model) = result["model"].as_str() {
+                println!("  model: {model}");
+            }
+            if let Some(thinking) = result["thinking"].as_str() {
+                println!("  thinking: {thinking}");
+            }
         }
         BotCommand::Move { bot, computer } => {
             let result =
@@ -969,6 +1188,9 @@ async fn bot(command: BotCommand) -> Result<()> {
             }
             // `bot access` prints the same lines.
             write_access(&mut std::io::stdout().lock(), &result["bot"])?;
+            if let Some(model) = result["bot"]["model"].as_str() {
+                println!("  model: {model}");
+            }
             if let Some(thinking) = result["bot"]["thinking"].as_str() {
                 println!("  thinking: {thinking}");
             }
@@ -2218,6 +2440,95 @@ mod tests {
             cwd: None,
             arguments: json!({"command": "printf approved > proof.txt"}),
         }
+    }
+
+    #[test]
+    fn provider_connect_catalog_and_bot_model_parse() {
+        let connect = Cli::try_parse_from([
+            "neha",
+            "provider",
+            "connect",
+            "openai",
+            "--protocol",
+            "openai-responses",
+            "--thinking",
+            "high",
+        ])
+        .unwrap();
+        let Top::Provider {
+            command:
+                super::ProviderCommand::Connect {
+                    vendor,
+                    protocol,
+                    thinking,
+                    ..
+                },
+        } = connect.command
+        else {
+            panic!("expected provider connect");
+        };
+        assert_eq!(vendor, "openai");
+        assert_eq!(
+            protocol,
+            Some(neha::surface::ProviderProtocol::OpenAiResponses)
+        );
+        assert_eq!(thinking, Some(neha::surface::ThinkingLevel::High));
+
+        let status = Cli::try_parse_from(["neha", "catalog", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Top::Catalog {
+                command: super::CatalogCommand::Status
+            }
+        ));
+
+        let discover = Cli::try_parse_from([
+            "neha",
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:9000/v1",
+            "--discover",
+        ])
+        .unwrap();
+        let Top::Provider {
+            command:
+                super::ProviderCommand::Add {
+                    discover, models, ..
+                },
+        } = discover.command
+        else {
+            panic!("expected provider add");
+        };
+        assert!(discover);
+        assert!(models.is_empty());
+
+        let model = Id::new();
+        let update = Cli::try_parse_from([
+            "neha",
+            "bot",
+            "set",
+            &model.to_string(),
+            "--model",
+            &model.to_string(),
+            "--thinking",
+            "low",
+        ])
+        .unwrap();
+        let Top::Bot {
+            command:
+                super::BotCommand::Set {
+                    bot,
+                    model: selected,
+                    thinking,
+                },
+        } = update.command
+        else {
+            panic!("expected bot set");
+        };
+        assert_eq!(bot, model);
+        assert_eq!(selected, Some(model));
+        assert_eq!(thinking, Some(neha::surface::ThinkingLevel::Low));
     }
 
     #[test]
