@@ -7,7 +7,7 @@ Owned by identity. [Space](../space/product.md) holds the accounts; [CLI](../cli
 ## Laws
 
 1. Every User of a Space has an account on it.
-2. The built-in Space signs its first User in without a prompt.
+2. The built-in Space's first User creates the Admin account through the invitation page; no client creates or signs in an account silently.
 3. A device joins a Space through a code that a signed-in User enters, except a Local Computer started on the Space's own machine.
 
 ## Accounts

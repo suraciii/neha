@@ -115,6 +115,9 @@ jobs:
           if (-not (Test-Path (Join-Path $app.Directory "resources\ui\index.html"))) {
             throw "the installed UI is missing"
           }
+          if (-not (Test-Path (Join-Path $app.Directory "resources\ui\desktop.html"))) {
+            throw "the installed Space chooser is missing"
+          }
           Write-Host "installed $($app.FullName)"
           & (Join-Path $app.Directory "resources\neha.exe") --version | Write-Host
 
@@ -126,10 +129,8 @@ jobs:
             Select-Object -First 1
           if (-not $app) { throw "Neha.exe was not installed" }
           $env:NEHA_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "neha-desktop-home"
-          $consent = Join-Path $env:NEHA_DESKTOP_HOME "computer\unsandboxed-consent.json"
-          New-Item -ItemType Directory -Force -Path (Split-Path $consent) | Out-Null
-          Set-Content -Path $consent -Value '{"version":1,"accepted":true}' -Encoding ascii
-          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop.png"
+          Remove-Item -Recurse -Force $env:NEHA_DESKTOP_HOME -ErrorAction SilentlyContinue
+          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-chooser.png"
           $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop.err.log"
           $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop.out.log"
           $process = Start-Process -FilePath $app.FullName `
@@ -142,64 +143,124 @@ jobs:
           if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
           if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
           if ($process.ExitCode -ne 0) { throw "the desktop app exited $($process.ExitCode)" }
-          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the desktop app did not write a screenshot" }
-          Write-Host "desktop screenshot: $env:NEHA_DESKTOP_CAPTURE"
+          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the desktop app did not write a chooser screenshot" }
+          if (-not (Select-String -Path $stderr -Pattern "loaded the Space chooser" -Quiet)) {
+            throw "the first launch did not open the Space chooser"
+          }
+          if (Select-String -Path $stderr -Pattern "starting the local Space" -Quiet) {
+            throw "the chooser must not start a Space before the User chooses"
+          }
+          Write-Host "chooser screenshot: $env:NEHA_DESKTOP_CAPTURE"
 
-      - name: Relaunch the installed desktop app
+      - name: Open the local Space sign-in page
         shell: pwsh
         run: |
           $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
             Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
             Select-Object -First 1
           if (-not $app) { throw "Neha.exe was not installed" }
-          $env:NEHA_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "neha-desktop-home"
-          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-second.png"
-          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop-second.err.log"
-          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop-second.out.log"
+          $localHome = Join-Path $env:RUNNER_TEMP "neha-desktop-local"
+          Remove-Item -Recurse -Force $localHome -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $localHome | Out-Null
+          Set-Content -Path (Join-Path $localHome "desktop-space.json") `
+            -Value '{"version":1,"mode":"local","localComputer":false}' -Encoding ascii
+          $env:NEHA_DESKTOP_HOME = $localHome
+          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-local-login.png"
+          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop-local.err.log"
+          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop-local.out.log"
           $process = Start-Process -FilePath $app.FullName `
             -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
             -RedirectStandardError $stderr -RedirectStandardOutput $stdout
           if (-not $process.WaitForExit(180000)) {
             Stop-Process -Id $process.Id -Force
-            throw "the second desktop launch did not exit"
+            throw "the local desktop launch did not exit"
           }
           if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
           if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
-          if ($process.ExitCode -ne 0) { throw "the second desktop launch exited $($process.ExitCode)" }
-          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) {
-            throw "the second desktop launch did not write a screenshot"
+          if ($process.ExitCode -ne 0) { throw "the local desktop launch exited $($process.ExitCode)" }
+          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the local launch did not write a screenshot" }
+          if (-not (Select-String -Path $stdout -Pattern "Invite:" -Quiet)) {
+            throw "the local Space did not open its invitation page"
           }
-          if (-not (Select-String -Path $stderr -Pattern "moved the saved Local Computer pairing" -Quiet)) {
-            throw "the second launch did not resume the saved Local Computer pairing"
+          if (Select-String -Path $stderr -Pattern "started the Local Computer" -Quiet) {
+            throw "the local Computer must wait for the in-launcher checkbox and a signed-in session"
           }
-          if (-not (Select-String -Path $stdout -Pattern "Connected to" -Quiet)) {
-            throw "the second launch's Local Computer did not connect"
-          }
-          Write-Host "second desktop screenshot: $env:NEHA_DESKTOP_CAPTURE"
+          Write-Host "local login screenshot: $env:NEHA_DESKTOP_CAPTURE"
 
-      - name: Verify declining the Windows Local Computer
+      - name: Open a remote Space invitation page
         shell: pwsh
         run: |
           $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
             Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
             Select-Object -First 1
           if (-not $app) { throw "Neha.exe was not installed" }
-          $declinedHome = Join-Path $env:RUNNER_TEMP "neha-desktop-declined"
-          Remove-Item -Recurse -Force $declinedHome -ErrorAction SilentlyContinue
-          $env:NEHA_DESKTOP_HOME = $declinedHome
-          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-declined.png"
-          $env:NEHA_DESKTOP_DECLINE_UNSANDBOXED = "1"
-          $process = Start-Process -FilePath $app.FullName `
-            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru
-          if (-not $process.WaitForExit(180000)) {
-            Stop-Process -Id $process.Id -Force
-            throw "the declined desktop launch did not exit"
+          $remoteHome = Join-Path $env:RUNNER_TEMP "neha-remote-space"
+          Remove-Item -Recurse -Force $remoteHome -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $remoteHome | Out-Null
+          $remoteOut = Join-Path $env:RUNNER_TEMP "neha-remote-space.out.log"
+          $remoteErr = Join-Path $env:RUNNER_TEMP "neha-remote-space.err.log"
+          $env:NEHA_HOME = $remoteHome
+          $sidecar = Join-Path $app.Directory "resources\neha.exe"
+          $ui = Join-Path $app.Directory "resources\ui"
+          $space = Start-Process -FilePath $sidecar `
+            -ArgumentList @("serve", "--port", "0", "--ui", $ui) -PassThru `
+            -RedirectStandardOutput $remoteOut -RedirectStandardError $remoteErr
+          try {
+            $url = $null
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 500
+              if (Test-Path $remoteOut) {
+                $match = Select-String -Path $remoteOut -Pattern "Open in a browser: (\S+)" | Select-Object -First 1
+                if ($match) { $url = $match.Matches[0].Groups[1].Value; break }
+              }
+            }
+            if (-not $url) { throw "the remote Space did not print a browser URL" }
+            Write-Host "remote Space URL: $url"
+            if ($space.HasExited) {
+              Get-Content $remoteOut -ErrorAction SilentlyContinue | Write-Host
+              Get-Content $remoteErr -ErrorAction SilentlyContinue | Write-Host
+              throw "the remote Space exited before the desktop could open it"
+            }
+            $remotePort = ([Uri]$url).Port
+            Start-Sleep -Milliseconds 800
+            $probe = New-Object System.Net.Sockets.TcpClient
+            try {
+              $probe.Connect("127.0.0.1", $remotePort)
+              Write-Host "remote Space accepted a connection on 127.0.0.1:$remotePort"
+            } catch {
+              Get-Content $remoteOut -ErrorAction SilentlyContinue | Write-Host
+              Get-Content $remoteErr -ErrorAction SilentlyContinue | Write-Host
+              throw "the remote Space did not accept a connection on 127.0.0.1:${remotePort}: $($_.Exception.Message)"
+            } finally {
+              $probe.Close()
+            }
+            $desktopHome = Join-Path $env:RUNNER_TEMP "neha-desktop-remote"
+            Remove-Item -Recurse -Force $desktopHome -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Force -Path $desktopHome | Out-Null
+            $selection = @{ version = 1; mode = "remote"; spaceUrl = $url } | ConvertTo-Json -Compress
+            Set-Content -Path (Join-Path $desktopHome "desktop-space.json") -Value $selection -Encoding ascii
+            $env:NEHA_DESKTOP_HOME = $desktopHome
+            $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-remote.png"
+            $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop-remote.err.log"
+            $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop-remote.out.log"
+            $process = Start-Process -FilePath $app.FullName `
+              -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
+              -RedirectStandardError $stderr -RedirectStandardOutput $stdout
+            if (-not $process.WaitForExit(180000)) {
+              Stop-Process -Id $process.Id -Force
+              throw "the remote desktop launch did not exit"
+            }
+            if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
+            if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
+            if ($process.ExitCode -ne 0) { throw "the remote desktop launch exited $($process.ExitCode)" }
+            if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the remote launch did not write a screenshot" }
+            if (-not (Select-String -Path $stderr -Pattern "opened the remote Space at" -Quiet)) {
+              throw "the remote Space page did not load"
+            }
+            if (Select-String -Path $stderr -Pattern "starting the local Space" -Quiet) {
+              throw "the remote choice must not start a local Space"
+            }
+            Write-Host "remote screenshot: $env:NEHA_DESKTOP_CAPTURE"
+          } finally {
+            if ($space -and -not $space.HasExited) { Stop-Process -Id $space.Id -Force }
           }
-          if ($process.ExitCode -ne 0) { throw "the declined desktop launch exited $($process.ExitCode)" }
-          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) {
-            throw "the declined desktop launch did not write a screenshot"
-          }
-          if (Test-Path (Join-Path $declinedHome "computer\computer.json")) {
-            throw "declining the warning must not pair a Local Computer"
-          }
-          Write-Host "declined screenshot: $env:NEHA_DESKTOP_CAPTURE"

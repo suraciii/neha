@@ -24,6 +24,35 @@ When the Space already has an account, the client asks for the display name and 
 
 A client without a valid session shows the sign-in page. A client with a valid session opens the Chats view.
 
+## The desktop entry
+
+The desktop shell uses the same browser client and the same Space sign-in. It
+adds only the choice of where the Space lives.
+
+On first launch the shell shows **Choose a Space**:
+
+- **This computer** starts a private bundled Space and opens that Space's
+  invitation or sign-in page. The shell never creates the Admin or signs in for
+  the User.
+- **Existing Space** connects to an `https://` address, or a loopback `http://`
+  address for development, and opens that Space's sign-in page.
+
+The chosen Space is remembered. Later launches open it directly; a missing
+session shows its sign-in page. **Change Space** forgets the choice, stops the
+local Space, and returns to the chooser.
+
+A remote Space starts no local Space and no Local Computer daemon. **This
+computer** MAY start a Local Computer only when the User selects the explicit
+Local Computer checkbox in the launcher.
+
+On Windows that checkbox is the warning and consent for a daemon whose shell has
+no OS sandbox. The daemon starts only after the local Space has a signed-in
+session. Chat remains usable when it cannot start.
+
+The shell archives data from an older desktop alpha whose Admin was created
+automatically with an unknown generated password; it never silently signs that
+account in.
+
 ## The shell
 
 The client has one primary navigation rail, one sidebar, and one main area.

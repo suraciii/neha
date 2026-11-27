@@ -118,6 +118,8 @@ pub struct SpaceServer {
     ui: Option<PathBuf>,
     session_cookie: String,
     browser_host: String,
+    /// The public https origin a trusted TLS proxy forwards to this Space.
+    public_url: Option<String>,
 }
 
 impl SpaceServer {
@@ -127,7 +129,7 @@ impl SpaceServer {
     }
 
     async fn open_with(home: Home, tool_timeout: Duration) -> Result<Self, ServerError> {
-        Self::open_with_ui(home, None, tool_timeout).await
+        Self::open_with_ui(home, None, tool_timeout, None).await
     }
 
     /// Opens a home and serves the browser client from `ui`.
@@ -135,9 +137,14 @@ impl SpaceServer {
         home: Home,
         ui: Option<PathBuf>,
         tool_timeout: Duration,
+        public_url: Option<String>,
     ) -> Result<Self, ServerError> {
         let session_cookie = session_cookie_name(home.root());
-        let browser_host = browser_host(home.root());
+        let browser_host = public_url
+            .as_deref()
+            .and_then(|value| reqwest::Url::parse(value).ok())
+            .and_then(|url| url.host_str().map(str::to_owned))
+            .unwrap_or_else(|| browser_host(home.root()));
         let config = Config::load(&home)?;
         let storage = config.storage.clone();
         let catalog = std::sync::Arc::new(CatalogStore::open(&home, &config.catalog));
@@ -192,6 +199,7 @@ impl SpaceServer {
             ui,
             session_cookie,
             browser_host,
+            public_url,
         })
     }
 
@@ -302,7 +310,10 @@ impl Running {
     /// Returns the URL the browser client uses.
     #[must_use]
     pub fn browser_url(&self) -> String {
-        format!("http://{}:{}", self.browser_host, self.addr.port())
+        self.server
+            .public_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}:{}", self.browser_host, self.addr.port()))
     }
 
     /// Returns the browser invitation, when the Space has no Admin yet.
@@ -347,7 +358,14 @@ impl Running {
 
 /// Binds a home on loopback and starts serving it.
 pub async fn start(home: Home, port: u16) -> Result<Running, ServerError> {
-    start_with_tool_timeout(home, port, neha_computer::local::DEFAULT_TIMEOUT).await
+    start_with(
+        home,
+        port,
+        None,
+        neha_computer::local::DEFAULT_TIMEOUT,
+        public_url_from_env()?,
+    )
+    .await
 }
 
 /// Binds a home on loopback and starts serving it with a browser client.
@@ -356,7 +374,25 @@ pub async fn start_with_ui(
     port: u16,
     ui: Option<PathBuf>,
 ) -> Result<Running, ServerError> {
-    start_with(home, port, ui, neha_computer::local::DEFAULT_TIMEOUT).await
+    start_with_ui_public(home, port, ui, public_url_from_env()?).await
+}
+
+/// Starts a UI-serving Space with an explicit public origin. Tests use this;
+/// `start_with_ui` reads `NEHA_PUBLIC_URL`.
+pub(crate) async fn start_with_ui_public(
+    home: Home,
+    port: u16,
+    ui: Option<PathBuf>,
+    public_url: Option<String>,
+) -> Result<Running, ServerError> {
+    start_with(
+        home,
+        port,
+        ui,
+        neha_computer::local::DEFAULT_TIMEOUT,
+        public_url,
+    )
+    .await
 }
 
 /// Binds a home on loopback and starts serving it with a tool time limit.
@@ -365,7 +401,7 @@ pub async fn start_with_tool_timeout(
     port: u16,
     tool_timeout: Duration,
 ) -> Result<Running, ServerError> {
-    start_with(home, port, None, tool_timeout).await
+    start_with(home, port, None, tool_timeout, public_url_from_env()?).await
 }
 
 async fn start_with(
@@ -373,13 +409,14 @@ async fn start_with(
     port: u16,
     ui: Option<PathBuf>,
     tool_timeout: Duration,
+    public_url: Option<String>,
 ) -> Result<Running, ServerError> {
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
     {
         return Err(ServerError::Ui(dir.clone()));
     }
-    let server = Arc::new(SpaceServer::open_with_ui(home, ui, tool_timeout).await?);
+    let server = Arc::new(SpaceServer::open_with_ui(home, ui, tool_timeout, public_url).await?);
     validate_client_directory(&server).await?;
     // The port is bound before anything is written or woken: a start that
     // cannot listen must not make a run, reach a Provider, or record a failure.
@@ -430,9 +467,13 @@ async fn start_with(
         (Some(_), None) | (None, _) => None,
     };
     server.runs.wake_all(&server);
+    let invite_base = server
+        .public_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{addr}"));
     let invite = server
         .invite_secret()
-        .map(|secret| format!("http://{addr}/invite#{secret}"));
+        .map(|secret| format!("{invite_base}/invite#{secret}"));
     let router = server.router();
     let task = tokio::spawn(async move {
         let _ = axum::serve(
@@ -475,7 +516,8 @@ async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: N
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.starts_with("Bearer "));
     if let Some(origin) = origin {
-        let same_site = host.is_some_and(|host| same_authority(origin, host));
+        let same_site =
+            host.is_some_and(|host| same_authority(origin, host, server.browser_scheme()));
         if (!same_site || !browser_host) && !bearer {
             return ApiError::forbidden("a browser Origin must name this Space").into_response();
         }
@@ -484,18 +526,45 @@ async fn guard(State(server): State<Arc<SpaceServer>>, request: Request, next: N
     next.run(request).await
 }
 
-fn same_authority(origin: &str, host: &str) -> bool {
-    let Some((scheme, rest)) = origin.split_once("://") else {
+fn same_authority(origin: &str, host: &str, scheme: &str) -> bool {
+    let Some((origin_scheme, rest)) = origin.split_once("://") else {
         return false;
     };
-    // This Space listens on plain HTTP on loopback. A page served by it has
-    // an http Origin; accepting another scheme would claim transport security
-    // the listener does not provide.
-    if scheme != "http" {
+    // A local Space serves plain HTTP; a trusted TLS proxy presents https.
+    // Accepting the other scheme would either claim transport security the
+    // listener does not provide or break a real https page.
+    if origin_scheme != scheme {
         return false;
     }
     let authority = rest.split('/').next().unwrap_or(rest);
     authority.eq_ignore_ascii_case(host)
+}
+
+fn public_url_from_env() -> Result<Option<String>, ServerError> {
+    let Some(value) = std::env::var_os("NEHA_PUBLIC_URL") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .ok_or_else(|| ServerError::PublicUrl("the public URL is not UTF-8".to_owned()))?;
+    let url = reqwest::Url::parse(value)
+        .map_err(|error| ServerError::PublicUrl(format!("{value}: {error}")))?;
+    if url.scheme() != "https" {
+        return Err(ServerError::PublicUrl(
+            "the public URL must use https".to_owned(),
+        ));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ServerError::PublicUrl(
+            "the public URL must not carry credentials".to_owned(),
+        ));
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err(ServerError::PublicUrl(
+            "the public URL must be an origin with no path, query, or fragment".to_owned(),
+        ));
+    }
+    Ok(Some(url.origin().ascii_serialization()))
 }
 
 fn loopback_host(value: &str) -> bool {
@@ -692,7 +761,11 @@ async fn client_file(
             .and_then(|(_, port)| port)
             .map(|port| format!(":{port}"))
             .unwrap_or_default();
-        let location = format!("http://{}{}{}", server.browser_host, port, uri.path());
+        let base = server
+            .public_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}{}", server.browser_host, port));
+        let location = format!("{}{}", base.trim_end_matches('/'), uri.path());
         return (StatusCode::TEMPORARY_REDIRECT, [("location", location)]).into_response();
     }
     let Some(configured) = &server.ui else {
@@ -908,10 +981,23 @@ async fn login(
 }
 
 impl SpaceServer {
+    fn browser_scheme(&self) -> &'static str {
+        if self.public_url.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
     fn session_headers(&self, token: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
+        let secure = if self.public_url.is_some() {
+            "; Secure"
+        } else {
+            ""
+        };
         let cookie = format!(
-            "{}={token}; Path=/; HttpOnly; SameSite=Strict",
+            "{}={token}; Path=/; HttpOnly; SameSite=Strict{secure}",
             self.session_cookie
         );
         if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
@@ -943,7 +1029,7 @@ fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
             && headers
                 .get(HOST)
                 .and_then(|value| value.to_str().ok())
-                .is_some_and(|host| same_authority(origin, host))
+                .is_some_and(|host| same_authority(origin, host, server.browser_scheme()))
     })
 }
 
@@ -2629,6 +2715,9 @@ pub enum ServerError {
     /// The local pairing ticket cannot be issued or cleared.
     #[error("local ticket error: {0}")]
     Ticket(#[from] TicketError),
+    /// The public URL for a Space behind a trusted TLS proxy is invalid.
+    #[error("public URL error: {0}")]
+    PublicUrl(String),
 }
 
 #[cfg(test)]
@@ -2647,7 +2736,10 @@ mod tests {
     use serde_json::json;
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-    use super::{Running, ServerError, SpaceServer, StreamError, catch_up, start, start_with_ui};
+    use super::{
+        Running, ServerError, SpaceServer, StreamError, catch_up, start, start_with_ui,
+        start_with_ui_public,
+    };
     use crate::blobs::test_s3;
     use crate::config::S3Storage;
     use crate::home::Home;
@@ -2698,6 +2790,71 @@ mod tests {
             .json()
             .await
             .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_public_tls_proxy_uses_its_https_origin_and_secure_cookie() {
+        let dir = tempfile::tempdir().unwrap();
+        let ui = tempfile::tempdir().unwrap();
+        std::fs::write(ui.path().join("index.html"), "<!doctype html>").unwrap();
+        let running = start_with_ui_public(
+            test_home(dir.path()),
+            0,
+            Some(ui.path().to_path_buf()),
+            Some("https://space.example.com".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(running.browser_url(), "https://space.example.com");
+        let invite = running.invite.clone().expect("a fresh Space invites");
+        assert!(invite.starts_with("https://space.example.com/invite#"));
+        join(&running, &invite, "Ada", "correct horse battery").await;
+
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // A loopback request must move to the public TLS origin, not to the
+        // Space's private browser hostname.
+        let loopback = client
+            .get(running.url())
+            .header("host", "127.0.0.1")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(loopback.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            loopback.headers().get("location").unwrap(),
+            "https://space.example.com/"
+        );
+
+        // A browser request through the proxy carries the public Host and the
+        // matching https Origin; it receives the Secure session cookie.
+        let login = client
+            .post(format!("{}/api/login", running.url()))
+            .header("host", "space.example.com")
+            .header("origin", "https://space.example.com")
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), reqwest::StatusCode::OK);
+        let cookie = login.headers().get("set-cookie").unwrap().to_str().unwrap();
+        assert!(cookie.contains("; Secure"), "{cookie}");
+
+        // A page on another scheme is not this Space.
+        let wrong_scheme = client
+            .post(format!("{}/api/login", running.url()))
+            .header("host", "space.example.com")
+            .header("origin", "http://space.example.com")
+            .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong_scheme.status(), reqwest::StatusCode::FORBIDDEN);
+
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

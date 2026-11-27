@@ -143,7 +143,7 @@ The same split reaches Files: in the shell, `neha file get` writes a File of the
 
 In granted mode on Linux a shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace, its granted folders, and the run's `--cwd` directory are writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; a write outside the writable roots, such as one in that `/tmp`, is gone when the command ends and never reaches the machine's own `/tmp`.
 
-On Windows the sandbox is not available. This is an explicit opt-in mode, not a silent fallback: the Space operator sets `NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`, and the desktop asks the owner to accept a warning before it starts the Local Computer. The file tools stay inside the Bot's folder, but a shell command runs with the machine user's rights and can reach the rest of the machine. Grants, full access, and `--cwd` are refused on Windows rather than silently narrowed. Only use trusted Bots; approvals are the command boundary, not an OS fence.
+On Windows the sandbox is not available. This is an explicit opt-in mode, not a silent fallback: the Space operator sets `NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`, and the desktop asks the owner to accept an in-launcher warning before it starts the Local Computer. The file tools stay inside the Bot's folder, but a shell command runs with the machine user's rights and can reach the rest of the machine. Grants, full access, and `--cwd` are refused on Windows rather than silently narrowed. Only use trusted Bots; approvals are the command boundary, not an OS fence.
 
 In granted mode on Linux the daemon checks a Bot's folder before it serves it. A hard link, a symlink, or a special file in the folder makes the daemon refuse that folder until it is cleaned; keep links and special files out of the Workspace. A Bot with full access is served without that check.
 
@@ -221,7 +221,8 @@ The machine ends the command it was running when the channel drops, so no action
   managed Bot folder: file tools stay inside that folder, but commands run with
   the machine user's rights and are not OS-sandboxed; approvals are the command
   boundary. macOS is not supported. The desktop app starts the Local Computer
-  automatically on Linux and Windows.
+  on Linux and Windows only when **This computer** is chosen with the Local
+  Computer checkbox, and only after the local Space has a signed-in session.
 
 ## File access and a run's directory
 

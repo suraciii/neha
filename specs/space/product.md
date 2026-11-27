@@ -27,7 +27,7 @@ A client connects to one Space at a time.
 
 The desktop app opens with a choice: use the Space built into this computer, or connect to a remote one.
 
-The built-in Space is created on first use, and its first user is its Admin.
+The built-in Space is created on first use; its first User creates the Admin account through the invitation page.
 
 A new Space has no Provider. Connecting one is the first thing its Admin does, before any Bot can work; see [Model](../model/product.md).
 

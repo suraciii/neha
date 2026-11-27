@@ -1,31 +1,50 @@
 // Local-first Neha desktop shell.
 //
-// The shell owns a bundled Space process, signs the first local Admin in
-// without showing the invitation form, and loads the existing browser client.
-// The Space remains the only server; this process is its supervisor.
-const { app, BrowserWindow, dialog, safeStorage, session, shell } = require("electron");
+// The shell asks where the Space lives, starts a bundled Space only for the
+// local choice, and then lets the Space's own web client handle sign-in. The
+// launcher is a small page from the same UI build, served by a private
+// protocol; it is the only page with a desktop bridge.
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  Menu,
+  net,
+  protocol,
+  session,
+  shell,
+} = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const { pathToFileURL } = require("node:url");
 
-const {
-  cookiePair,
-  defaultDisplayName,
-  generatePassword,
-  parseStartupLine,
-} = require("./startup");
+const { normalizeRemoteUrl, probeUrl, settledRemoteUrl } = require("./selection");
+const { parseStartupLine } = require("./startup");
 
 const REPO_ROOT = path.resolve(__dirname, "../../..");
 const START_TIMEOUT_MS = 20_000;
 const READY_GRACE_MS = 300;
+const UI_SCHEME = "neha";
+const LAUNCHER_URL = `${UI_SCHEME}://ui/desktop.html`;
+
+protocol.registerSchemesAsPrivileged([
+  {
+    scheme: UI_SCHEME,
+    privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true },
+  },
+]);
 
 let server;
 let localComputer;
+let pairing;
+let loginWatcher;
 let mainWindow;
-let stopping = false;
-let allowUnsandboxedWindowsComputer = false;
+let currentOrigin;
+let quitting = false;
+let cleanupDone = false;
 
 function log(...args) {
   console.error("[neha-desktop]", ...args);
@@ -35,7 +54,11 @@ function userDataDir() {
   return app.getPath("userData");
 }
 
-function accountFile() {
+function selectionFile() {
+  return path.join(userDataDir(), "desktop-space.json");
+}
+
+function legacyAccountFile() {
   return path.join(userDataDir(), "account.json");
 }
 
@@ -53,46 +76,6 @@ function computerWorkspace() {
 
 function computerConfigFile() {
   return path.join(computerHome(), "computer.json");
-}
-
-function unsandboxedConsentFile() {
-  return path.join(computerHome(), "unsandboxed-consent.json");
-}
-
-function hasUnsandboxedConsent() {
-  try {
-    const consent = JSON.parse(fs.readFileSync(unsandboxedConsentFile(), "utf8"));
-    return consent?.version === 1 && consent?.accepted === true;
-  } catch {
-    return false;
-  }
-}
-
-async function confirmUnsandboxedMode() {
-  if (process.platform !== "win32") return true;
-  if (process.env.NEHA_DESKTOP_DECLINE_UNSANDBOXED === "1") return false;
-  if (hasUnsandboxedConsent()) return true;
-  const answer = await dialog.showMessageBox({
-    type: "warning",
-    title: "Windows Local Computer",
-    message: "Windows Local Computer runs without an operating-system sandbox.",
-    detail: "Commands run with your Windows account's rights and can read or change anything that account can, including Neha's saved credentials. Only use Bots you trust. Chat still works if you choose Not Now.",
-    buttons: ["Use Local Computer", "Not Now"],
-    defaultId: 1,
-    cancelId: 1,
-    noLink: true,
-  });
-  if (answer.response !== 0) {
-    log("the Windows Local Computer was not enabled");
-    return false;
-  }
-  fs.mkdirSync(computerHome(), { recursive: true });
-  fs.writeFileSync(
-    unsandboxedConsentFile(),
-    JSON.stringify({ version: 1, accepted: true, at: new Date().toISOString() }, null, 2),
-    { mode: 0o600 },
-  );
-  return true;
 }
 
 function standardConfigDirectory() {
@@ -113,21 +96,6 @@ function ticketFileFor(origin) {
   return path.join(config, "spaces", match[1], "local-computer.ticket");
 }
 
-function spaceEnv() {
-  const env = { ...process.env, NEHA_HOME: spaceHome() };
-  if (process.platform === "win32" && allowUnsandboxedWindowsComputer) {
-    // The bundled Windows Local Computer has no OS sandbox. Enable the opt-in
-    // only after the owner accepted the warning; otherwise the Space starts
-    // without it and refuses the daemon.
-    env.NEHA_ALLOW_UNSANDBOXED_COMPUTERS = "1";
-  }
-  return env;
-}
-
-function computerEnv() {
-  return { ...process.env, NEHA_COMPUTER_HOME: computerHome() };
-}
-
 function binaryPath() {
   if (process.env.NEHA_BIN) return path.resolve(process.env.NEHA_BIN);
   const name = process.platform === "win32" ? "neha.exe" : "neha";
@@ -141,149 +109,242 @@ function uiDir() {
     : path.join(REPO_ROOT, "ui", "dist"));
 }
 
-async function saveAccount(displayName, password) {
-  const directory = userDataDir();
-  fs.mkdirSync(directory, { recursive: true });
-  let scheme = "safeStorage";
-  let value;
-  if (await safeStorage.isAsyncEncryptionAvailable()) {
-    value = (await safeStorage.encryptStringAsync(password)).toString("base64");
-  } else {
-    // Windows uses DPAPI through Electron safeStorage. Keep a clearly marked
-    // fallback for development hosts without a secret service; the packaged
-    // release must not rely on this path.
-    scheme = "plain";
-    value = Buffer.from(password, "utf8").toString("base64");
-    log("secure storage is unavailable; the development account password is stored locally in plain text");
-  }
-  fs.writeFileSync(
-    accountFile(),
-    JSON.stringify({ displayName, scheme, value }, null, 2),
-    { mode: 0o600 },
-  );
-  try { fs.chmodSync(accountFile(), 0o600); } catch {}
+function computerEnv() {
+  const env = { ...process.env, NEHA_COMPUTER_HOME: computerHome() };
+  delete env.NEHA_PUBLIC_URL;
+  return env;
 }
 
-async function loadAccount() {
+function spaceEnv(useLocalComputer) {
+  const env = { ...process.env, NEHA_HOME: spaceHome() };
+  // The bundled Space is private. A shell configured for a public proxy must
+  // not change its origin or cookie host.
+  delete env.NEHA_PUBLIC_URL;
+  if (process.platform === "win32" && useLocalComputer) {
+    // The explicit Windows Local Computer has no OS sandbox. The launcher
+    // records the owner's choice and this is the only place that turns the
+    // Space's opt-in on.
+    env.NEHA_ALLOW_UNSANDBOXED_COMPUTERS = "1";
+  }
+  return env;
+}
+
+// ---------------------------------------------------------------- selection ---
+
+function readSelection() {
   try {
-    const body = JSON.parse(fs.readFileSync(accountFile(), "utf8"));
-    if (!body || typeof body.displayName !== "string" || typeof body.value !== "string") return null;
-    const bytes = Buffer.from(body.value, "base64");
-    let password;
-    if (body.scheme === "safeStorage") {
-      password = (await safeStorage.decryptStringAsync(bytes)).result;
-    } else {
-      password = bytes.toString("utf8");
+    const body = JSON.parse(fs.readFileSync(selectionFile(), "utf8"));
+    if (body?.version !== 1) return null;
+    if (body.mode === "local") {
+      return { mode: "local", localComputer: body.localComputer === true };
     }
-    return { displayName: body.displayName, password };
-  } catch (error) {
-    if (error?.code !== "ENOENT") log("cannot read the saved account:", error.message);
+    if (body.mode === "remote") {
+      return { mode: "remote", spaceUrl: normalizeRemoteUrl(body.spaceUrl) };
+    }
+    return null;
+  } catch {
     return null;
   }
 }
 
-async function postJson(url, body) {
-  // This is a trusted main-process request, not a browser page, so it sends no
-  // Origin. Keeping the URL on loopback avoids the system resolver for
-  // arbitrary *.localhost names on Windows; the cookie is installed for the
-  // browser Space separately.
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const text = await response.text().catch(() => "");
-    throw new Error(`${url} failed (${response.status})${text ? `: ${text}` : ""}`);
-  }
-  return response;
+function writeSelection(selection) {
+  fs.mkdirSync(userDataDir(), { recursive: true });
+  fs.writeFileSync(
+    selectionFile(),
+    JSON.stringify({ version: 1, ...selection }, null, 2),
+    { mode: 0o600 },
+  );
+  try { fs.chmodSync(selectionFile(), 0o600); } catch {}
 }
 
-function sessionCookieName(origin) {
-  const match = /^neha-([^.]+)\.localhost$/.exec(new URL(origin).hostname);
-  if (!match) throw new Error(`${origin} is not a browser Space origin`);
-  return `neha_session_${match[1]}`;
+function clearSelection() {
+  try { fs.rmSync(selectionFile(), { force: true }); } catch {}
 }
 
-async function installCookie(response, origin) {
-  const values = typeof response.headers.getSetCookie === "function"
-    ? response.headers.getSetCookie()
-    : [response.headers.get("set-cookie")];
-  const pair = values.map(cookiePair).find(Boolean);
-  let name = pair?.name;
-  let value = pair?.value;
-  if (!value) {
-    // A request with no Origin is the CLI shape: the Space returns the same
-    // session token in the body instead of a Set-Cookie header.
-    const body = await response.clone().json().catch(() => null);
-    if (typeof body?.token !== "string") {
-      throw new Error("the Space did not return a session token");
+// Old alpha builds created an Admin with a generated password and signed in
+// automatically. The new flow uses the Space's normal account flow, so that
+// account has no password its owner knows. Keep the old data in named backups
+// and start clean rather than locking the owner out.
+function archiveLegacyAutoAdmin() {
+  if (!fs.existsSync(legacyAccountFile())) return;
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const name of ["space", "computer", "workspace"]) {
+    const source = path.join(userDataDir(), name);
+    if (!fs.existsSync(source)) continue;
+    let target = path.join(userDataDir(), `${name}.pre-login-${stamp}`);
+    for (let suffix = 1; fs.existsSync(target); suffix += 1) {
+      target = path.join(userDataDir(), `${name}.pre-login-${stamp}-${suffix}`);
     }
-    name = sessionCookieName(origin);
-    value = body.token;
+    fs.renameSync(source, target);
+    log(`archived the old ${name} folder at ${target}`);
   }
-  await session.defaultSession.cookies.set({
-    url: origin,
-    name,
-    value,
-    path: "/",
-    httpOnly: true,
-    sameSite: "strict",
+  fs.rmSync(legacyAccountFile(), { force: true });
+  log("removed the old automatic account; the next local Space starts with a normal sign-in");
+}
+
+// ------------------------------------------------------------------- protocol ---
+
+function installUiProtocol() {
+  const root = path.resolve(uiDir());
+  protocol.handle(UI_SCHEME, async (request) => {
+    const url = new URL(request.url);
+    if (url.hostname !== "ui") {
+      return new Response("Not found", { status: 404 });
+    }
+    const relative = decodeURIComponent(url.pathname).replace(/^\/+/, "") || "index.html";
+    const file = path.resolve(root, relative);
+    if (file !== root && !file.startsWith(root + path.sep)) {
+      return new Response("Not found", { status: 404 });
+    }
+    return net.fetch(pathToFileURL(file).toString());
   });
 }
 
-async function discoverOrigin(loopback) {
-  const response = await fetch(`${loopback}/`, { redirect: "manual" });
-  const location = response.headers.get("location");
-  return location ? new URL(location).origin : new URL(loopback).origin;
-}
+// --------------------------------------------------------------------- window ---
 
-async function joinFirstAdmin(invite, browserUrl) {
-  const inviteUrl = new URL(invite);
-  const loopback = inviteUrl.origin;
-  const origin = browserUrl ? new URL(browserUrl).origin : loopback;
-  const secret = inviteUrl.hash.replace(/^#/, "");
-  if (!secret) throw new Error("the Space did not print a usable invitation");
-  const displayName = defaultDisplayName(os.userInfo().username);
-  const password = generatePassword();
-  // Save before joining: a crash between the Space creating the account and
-  // the shell writing its credentials would leave an account no later launch
-  // can sign in to.
-  await saveAccount(displayName, password);
-  // Windows does not resolve arbitrary *.localhost names through the system
-  // resolver. Send the request to loopback as a CLI-style request (no Origin),
-  // then store its returned token as the browser Space's session cookie.
-  const response = await postJson(
-    `${loopback}/api/join`,
-    { secret, display_name: displayName, password },
-  );
-  await installCookie(response, origin);
-  log(`created the first local Admin as ${displayName}`);
-  return origin;
-}
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    minWidth: 720,
+    minHeight: 520,
+    backgroundColor: "#f2f3ee",
+    show: false,
+    title: "Neha",
+    icon: app.isPackaged
+      ? path.join(process.resourcesPath, "icon.png")
+      : path.join(REPO_ROOT, "apps", "desktop", "build", "icon.png"),
+    autoHideMenuBar: true,
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "preload.js"),
+    },
+  });
+  installMenu();
 
-async function loginSavedAccount(origin, loopback) {
-  const account = await loadAccount();
-  if (!account) {
-    throw new Error("this Space already has an account, but no local desktop account was found");
+  for (const eventName of ["will-navigate", "will-redirect"]) {
+    mainWindow.webContents.on(eventName, (event, url) => {
+      if (!navigationAllowed(url)) {
+        event.preventDefault();
+        log(`blocked ${eventName} to ${url}`);
+      } else if (eventName === "will-redirect") {
+        // A canonical loopback -> *.localhost redirect is now this window's
+        // origin; keep later same-origin navigation allowed.
+        currentOrigin = new URL(url).origin;
+      }
+    });
   }
-  const response = await postJson(
-    `${loopback}/api/login`,
-    { display_name: account.displayName, password: account.password },
-  );
-  await installCookie(response, origin);
-  log(`signed in as ${account.displayName}`);
-  return origin;
+  for (const eventName of ["did-navigate", "did-navigate-in-page"]) {
+    mainWindow.webContents.on(eventName, (_event, url) => {
+      rememberSettledRemoteUrl(url);
+    });
+  }
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (new URL(url).protocol === "https:") void shell.openExternal(url);
+    return { action: "deny" };
+  });
+  mainWindow.webContents.on("did-fail-load", (_event, code, description) => {
+    log(`the client failed to load (${code} ${description})`);
+  });
+  mainWindow.once("ready-to-show", () => mainWindow?.show());
+  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => {
+    callback(false);
+  });
 }
 
-/**
- * Launches `neha serve` and resolves once it prints its loopback URL.
- *
- * The invitation and browser URL are captured while the process starts. A
- * Space with an existing account prints neither, so its browser origin is
- * discovered from the loopback redirect.
- */
-function startSpace() {
+function installMenu() {
+  const template = [
+    ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
+    {
+      label: "Neha",
+      submenu: [
+        {
+          label: "Change Space…",
+          accelerator: "CommandOrControl+Shift+K",
+          click: () => void resetToLauncher(),
+        },
+        { type: "separator" },
+        { role: "quit" },
+      ],
+    },
+    { role: "editMenu" },
+  ];
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
+
+function isLoopbackName(hostname) {
+  return (
+    hostname === "127.0.0.1" ||
+    hostname === "localhost" ||
+    hostname === "[::1]" ||
+    hostname === "::1"
+  );
+}
+
+function canonicalSpaceRedirect(next) {
+  if (!currentOrigin) return false;
+  const current = new URL(currentOrigin);
+  if (!isLoopbackName(current.hostname)) return false;
+  if (current.port !== next.port) return false;
+  return /^neha-[a-f0-9]+\.localhost$/.test(next.hostname);
+}
+
+function navigationAllowed(url) {
+  try {
+    const next = new URL(url);
+    if (next.protocol === UI_SCHEME && next.hostname === "ui") return true;
+    if (canonicalSpaceRedirect(next)) return true;
+    return currentOrigin !== null && next.origin === currentOrigin;
+  } catch {
+    return false;
+  }
+}
+
+function rememberSettledRemoteUrl(url) {
+  const selection = readSelection();
+  const settled = settledRemoteUrl(selection, currentOrigin, url);
+  if (settled) writeSelection({ mode: "remote", spaceUrl: settled });
+}
+
+async function showUrl(url) {
+  if (!mainWindow) throw new Error("the desktop window is not open");
+  currentOrigin = new URL(url).origin;
+  log(`loading ${url}`);
+  await mainWindow.loadURL(url);
+  log(`loaded ${url}`);
+  maybeCapture();
+}
+
+async function showLauncher() {
+  if (!mainWindow) throw new Error("the desktop window is not open");
+  currentOrigin = null;
+  log("loading the Space chooser");
+  await mainWindow.loadURL(LAUNCHER_URL);
+  log("loaded the Space chooser");
+  maybeCapture();
+}
+
+function maybeCapture() {
+  const target = process.env.NEHA_DESKTOP_CAPTURE;
+  if (!target || !mainWindow) return;
+  setTimeout(async () => {
+    try {
+      const image = await mainWindow.webContents.capturePage();
+      fs.writeFileSync(target, image.toPNG());
+      log(`wrote ${target}`);
+    } catch (error) {
+      log("cannot capture the client:", error.message);
+    } finally {
+      app.quit();
+    }
+  }, 1_500);
+}
+
+// ---------------------------------------------------------------------- space ---
+
+function startSpace(useLocalComputer) {
   return new Promise((resolve, reject) => {
     const binary = binaryPath();
     if (!fs.existsSync(binary)) {
@@ -291,9 +352,11 @@ function startSpace() {
       return;
     }
     const ui = uiDir();
-    if (!fs.existsSync(path.join(ui, "index.html"))) {
-      reject(new Error(`the browser client was not found at ${ui}`));
-      return;
+    for (const file of ["index.html", "desktop.html"]) {
+      if (!fs.existsSync(path.join(ui, file))) {
+        reject(new Error(`the client build is missing ${file} at ${ui}`));
+        return;
+      }
     }
 
     let listening;
@@ -301,7 +364,7 @@ function startSpace() {
     let browser;
     let settled = false;
     const child = spawn(binary, ["serve", "--port", "0", "--ui", ui], {
-      env: spaceEnv(),
+      env: spaceEnv(useLocalComputer),
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -317,13 +380,14 @@ function startSpace() {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      child.kill("SIGTERM");
+      if (server === child) server = undefined;
+      killTree(child);
       reject(error);
     };
     const timer = setTimeout(() => fail(new Error("the Space did not start in time")), START_TIMEOUT_MS);
 
     readline.createInterface({ input: child.stdout }).on("line", (line) => {
-      log(line);
+      process.stdout.write(`[space] ${line}\n`);
       const parsed = parseStartupLine(line);
       if (!parsed) return;
       if (parsed.listening) {
@@ -342,39 +406,130 @@ function startSpace() {
   });
 }
 
-function waitForExit(child, timeoutMs = 2_000) {
-  return new Promise((resolve) => {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      resolve();
+async function discoverOrigin(loopback) {
+  const response = await fetch(`${loopback}/`, { redirect: "manual" });
+  if (!response.ok && !(response.status >= 300 && response.status < 400)) {
+    throw new Error(`the Space did not answer at ${loopback} (${response.status})`);
+  }
+  const location = response.headers.get("location");
+  if (location) return new URL(location, loopback).origin;
+  return new URL(loopback).origin;
+}
+
+function killTree(child) {
+  if (!child || child.killed) return;
+  if (process.platform === "win32" && child.pid) {
+    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    return;
+  }
+  child.kill("SIGTERM");
+}
+
+async function stopSpace() {
+  const child = server;
+  server = undefined;
+  if (child) killTree(child);
+}
+
+// --------------------------------------------------------------- local computer ---
+
+function stopLocalComputer() {
+  if (loginWatcher) {
+    loginWatcher.abort();
+    loginWatcher = undefined;
+  }
+  if (pairing) {
+    const child = pairing;
+    pairing = undefined;
+    killTree(child);
+  }
+  if (localComputer) {
+    const child = localComputer;
+    localComputer = undefined;
+    killTree(child);
+  }
+}
+
+function sessionCookieName(origin) {
+  const match = /^neha-([^.]+)\.localhost$/.exec(new URL(origin).hostname);
+  if (!match) throw new Error(`${origin} is not a local Space origin`);
+  return `neha_session_${match[1]}`;
+}
+
+function wait(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new Error("aborted"));
       return;
     }
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
+    const onAbort = () => {
       clearTimeout(timer);
-      resolve();
+      reject(new Error("aborted"));
     };
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      finish();
-    }, timeoutMs);
-    child.once("exit", finish);
-    child.once("error", finish);
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-async function restartSpace() {
-  const old = server;
-  server = undefined;
-  if (old) {
-    killTree(old);
-    await waitForExit(old);
-  }
-  return startSpace();
+function watchForLocalLogin(origin, spaceUrl) {
+  const cookieName = sessionCookieName(origin);
+  const controller = new AbortController();
+  loginWatcher = controller;
+  void (async () => {
+    try {
+      while (!controller.signal.aborted) {
+        const cookies = await session.defaultSession.cookies.get({ url: origin });
+        const cookie = cookies.find((item) => item.name === cookieName && item.value);
+        if (cookie) {
+          if (controller.signal.aborted) return;
+          await startLocalComputer(spaceUrl, origin, cookie, controller.signal);
+          return;
+        }
+        await wait(500, controller.signal);
+      }
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        log("the Local Computer could not start; Chat is still available:", error.message);
+      }
+    }
+  })();
 }
 
-async function runPairing(spaceUrl, ticketFile) {
+async function requestTicket(spaceUrl, cookie, signal) {
+  // The session cookie is scoped to the Space's browser host, while this
+  // trusted main-process request goes to loopback. Send its token the way the
+  // CLI does, so the ticket endpoint authenticates without a browser Host.
+  const response = await fetch(`${spaceUrl}/api/computer/ticket`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${cookie.value}` },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`the Space did not issue a Local Computer ticket (${response.status})`);
+  }
+  const body = await response.json();
+  if (typeof body?.ticket !== "string" || body.ticket.length === 0) {
+    throw new Error("the Space returned no Local Computer ticket");
+  }
+  return body.ticket;
+}
+
+async function writeTicketFile(origin, spaceUrl, ticket) {
+  const file = ticketFileFor(origin) || path.join(computerHome(), "local-computer.ticket");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ ticket, url: spaceUrl }), { mode: 0o600 });
+  try { fs.chmodSync(file, 0o600); } catch {}
+  return file;
+}
+
+async function runPairing(spaceUrl, ticketFile, signal) {
+  if (signal.aborted) return false;
   fs.mkdirSync(computerHome(), { recursive: true });
   fs.mkdirSync(computerWorkspace(), { recursive: true });
   const args = [
@@ -383,24 +538,34 @@ async function runPairing(spaceUrl, ticketFile) {
     "--yes",
     "--space",
     spaceUrl,
+    "--ticket-file",
+    ticketFile,
     "--workspace",
     computerWorkspace(),
   ];
-  if (ticketFile && fs.existsSync(ticketFile)) {
-    args.push("--ticket-file", ticketFile);
-  }
   const child = spawn(binaryPath(), args, {
     env: computerEnv(),
     stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
   });
+  pairing = child;
+  const abort = () => killTree(child);
+  signal.addEventListener("abort", abort, { once: true });
   child.stdout.on("data", (chunk) => process.stdout.write(`[pair] ${chunk}`));
   child.stderr.on("data", (chunk) => process.stderr.write(`[pair:err] ${chunk}`));
-  await waitForExit(child, 15_000);
-  return child.exitCode === 0;
+  try {
+    const code = await new Promise((resolve) => {
+      child.once("error", () => resolve(1));
+      child.once("exit", (value) => resolve(value ?? 1));
+    });
+    return !signal.aborted && code === 0;
+  } finally {
+    signal.removeEventListener("abort", abort);
+    if (pairing === child) pairing = undefined;
+  }
 }
 
-function waitForComputerConnected(child, timeoutMs = 10_000) {
+async function waitForComputerConnected(child, timeoutMs = 10_000) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = () => {
@@ -418,19 +583,14 @@ function waitForComputerConnected(child, timeoutMs = 10_000) {
   });
 }
 
-async function startLocalComputer(spaceUrl, origin) {
+async function startLocalComputer(spaceUrl, origin, cookie, signal) {
+  if (signal.aborted) return;
   if (process.platform === "darwin") {
     log("the Local Computer is not available on macOS yet");
     return;
   }
-  if (process.platform === "win32" && !allowUnsandboxedWindowsComputer) {
-    log("the Windows Local Computer is disabled until its warning is accepted");
-    return;
-  }
   let paired = fs.existsSync(computerConfigFile());
   if (paired) {
-    // The Space picks a fresh loopback port on every launch. The saved token
-    // and Computer id stay valid; only the address has to move with it.
     try {
       const config = JSON.parse(fs.readFileSync(computerConfigFile(), "utf8"));
       if (config.space_url !== spaceUrl) {
@@ -444,12 +604,15 @@ async function startLocalComputer(spaceUrl, origin) {
     }
   }
   if (!paired) {
-    paired = await runPairing(spaceUrl, ticketFileFor(origin));
-    if (!paired) {
-      log("the Local Computer could not pair; Chat is still available");
+    const ticket = await requestTicket(spaceUrl, cookie, signal);
+    if (signal.aborted) return;
+    const file = await writeTicketFile(origin, spaceUrl, ticket);
+    if (!(await runPairing(spaceUrl, file, signal))) {
+      if (!signal.aborted) log("the Local Computer could not pair; Chat is still available");
       return;
     }
   }
+  if (signal.aborted) return;
   localComputer = spawn(binaryPath(), [
     "computer",
     "run",
@@ -469,115 +632,105 @@ async function startLocalComputer(spaceUrl, origin) {
   await waitForComputerConnected(localComputer);
 }
 
-async function openLocalSpace() {
-  if (process.platform === "win32") {
-    allowUnsandboxedWindowsComputer = await confirmUnsandboxedMode();
-    log(`Windows Local Computer opt-in: ${allowUnsandboxedWindowsComputer ? "accepted" : "declined"}`);
-  }
-  const started = await startSpace();
-  let origin;
-  let spaceUrl;
-  if (started.invite) {
-    origin = await joinFirstAdmin(started.invite, started.browser);
-    // The Space writes its local-computer ticket when it starts with an
-    // existing Admin, not at the moment the invitation is accepted. Restart
-    // once, then sign in to the new port.
-    const restarted = await restartSpace();
-    spaceUrl = restarted.listening;
-    origin = await discoverOrigin(spaceUrl);
-    await loginSavedAccount(origin, spaceUrl);
-  } else {
-    spaceUrl = started.listening;
-    origin = await discoverOrigin(spaceUrl);
-    await loginSavedAccount(origin, spaceUrl);
-  }
-  await startLocalComputer(spaceUrl, origin);
+// -------------------------------------------------------------------- choices ---
 
-  mainWindow = new BrowserWindow({
-    width: 1200,
-    height: 800,
-    minWidth: 720,
-    minHeight: 520,
-    backgroundColor: "#f4f3ee",
-    show: false,
-    title: "Neha",
-    webPreferences: {
-      contextIsolation: true,
-      sandbox: true,
-      nodeIntegration: false,
-    },
-  });
-
-  session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => {
-    callback(false);
-  });
-
-  const allowedOrigin = new URL(origin).origin;
-  mainWindow.webContents.on("will-navigate", (event, url) => {
-    if (new URL(url).origin !== allowedOrigin) event.preventDefault();
-  });
-  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (new URL(url).protocol === "https:") void shell.openExternal(url);
-    return { action: "deny" };
-  });
-  mainWindow.webContents.on("did-fail-load", (_event, code, description) => {
-    log(`the client failed to load (${code} ${description})`);
-  });
-  mainWindow.once("ready-to-show", () => mainWindow?.show());
-  await mainWindow.loadURL(`${allowedOrigin}/`);
-
-  const capture = process.env.NEHA_DESKTOP_CAPTURE;
-  if (capture) {
-    setTimeout(async () => {
-      try {
-        const image = await mainWindow.webContents.capturePage();
-        fs.writeFileSync(capture, image.toPNG());
-        log(`wrote ${capture}`);
-      } catch (error) {
-        log("cannot capture the client:", error.message);
-      } finally {
-        app.quit();
-      }
-    }, 1_500);
-  }
+async function openLocalSpace(useLocalComputer) {
+  stopLocalComputer();
+  await stopSpace();
+  log("starting the local Space");
+  const started = await startSpace(useLocalComputer);
+  log(`the Space is ready at ${started.listening}`);
+  const origin = await discoverOrigin(started.listening);
+  log(`the browser origin is ${origin}`);
+  await showUrl(started.invite ? (started.browser || started.invite) : `${origin}/`);
+  if (useLocalComputer) watchForLocalLogin(origin, started.listening);
+  log(`opened the local Space at ${origin}`);
 }
 
-function killTree(child) {
-  if (!child || child.killed || !child.pid) return;
-  if (process.platform === "win32") {
-    // child.kill() reaches only the daemon. taskkill /T also ends the
-    // PowerShell/cmd command it started, so closing Neha cannot orphan a Bot.
-    spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
+async function openRemoteSpace(input, persist = true) {
+  const location = normalizeRemoteUrl(input);
+  const origin = new URL(location).origin;
+  // Do not follow a redirect here: the Space may redirect to its browser host
+  // (`*.localhost`), which Node cannot resolve on Windows. Chromium resolves it
+  // when the window loads the address.
+  const response = await fetch(probeUrl(origin), {
+    redirect: "manual",
+    signal: AbortSignal.timeout(8_000),
+  });
+  if (!response.ok && !(response.status >= 300 && response.status < 400)) {
+    throw new Error(`the Space did not answer (${response.status})`);
+  }
+  stopLocalComputer();
+  await stopSpace();
+  if (persist) writeSelection({ mode: "remote", spaceUrl: location });
+  await showUrl(location);
+  log(`opened the remote Space at ${origin}`);
+}
+
+async function resetToLauncher() {
+  stopLocalComputer();
+  await stopSpace();
+  clearSelection();
+  await showLauncher();
+}
+
+// ----------------------------------------------------------------------- ipc ---
+
+function registerIpc() {
+  ipcMain.handle("desktop:choose-local", async (_event, useLocalComputer) => {
+    const enabled = useLocalComputer === true;
+    try {
+      writeSelection({ mode: "local", localComputer: enabled });
+      await openLocalSpace(enabled);
+      return { ok: true };
+    } catch (error) {
+      log(error?.stack || String(error));
+      clearSelection();
+      await stopLocalComputer();
+      await stopSpace();
+      await showLauncher();
+      return { ok: false, message: error?.message || String(error) };
+    }
+  });
+
+  ipcMain.handle("desktop:connect-remote", async (_event, url) => {
+    try {
+      await openRemoteSpace(String(url));
+      return { ok: true };
+    } catch (error) {
+      log(error?.stack || String(error));
+      return { ok: false, message: error?.message || String(error) };
+    }
+  });
+}
+
+// ------------------------------------------------------------------ lifecycle ---
+
+async function openSavedSpace() {
+  const selection = readSelection();
+  if (selection?.mode === "remote") {
+    await openRemoteSpace(selection.spaceUrl, false);
     return;
   }
-  child.kill("SIGTERM");
-  setTimeout(() => child.kill("SIGKILL"), 500).unref();
-}
-
-function stopServer() {
-  if (stopping) return;
-  stopping = true;
-  if (localComputer) {
-    const child = localComputer;
-    localComputer = undefined;
-    killTree(child);
+  if (selection?.mode === "local") {
+    await openLocalSpace(selection.localComputer === true);
+    return;
   }
-  if (server) {
-    const child = server;
-    server = undefined;
-    killTree(child);
-  }
+  await showLauncher();
 }
 
 function fail(error) {
   log(error?.stack || String(error));
-  stopServer();
-  // A failed startup has no window to attach a native dialog to, and blocking
-  // on one under a headless launch can prevent the process from exiting.
+  stopLocalComputer();
+  void stopSpace();
   app.exit(1);
+}
+
+async function cleanup() {
+  if (cleanupDone) return;
+  cleanupDone = true;
+  stopLocalComputer();
+  await stopSpace();
 }
 
 if (!app.requestSingleInstanceLock()) {
@@ -591,11 +744,33 @@ if (!app.requestSingleInstanceLock()) {
     }
   });
   app.on("window-all-closed", () => app.quit());
-  app.on("before-quit", stopServer);
+  app.on("before-quit", (event) => {
+    if (quitting) return;
+    quitting = true;
+    event.preventDefault();
+    void cleanup().finally(() => app.quit());
+  });
 
   if (process.env.NEHA_DESKTOP_HOME) {
     fs.mkdirSync(process.env.NEHA_DESKTOP_HOME, { recursive: true });
     app.setPath("userData", path.resolve(process.env.NEHA_DESKTOP_HOME));
   }
-  app.whenReady().then(openLocalSpace).catch(fail);
+
+  app.whenReady().then(async () => {
+    installUiProtocol();
+    createWindow();
+    archiveLegacyAutoAdmin();
+    registerIpc();
+    try {
+      await openSavedSpace();
+    } catch (error) {
+      log(error?.stack || String(error));
+      if (error?.cause) log("cause:", error.cause);
+      // A saved Space may be temporarily offline. Keep the choice so the next
+      // launch retries it; only Change Space forgets it.
+      await stopLocalComputer();
+      await stopSpace();
+      await showLauncher();
+    }
+  }).catch(fail);
 }
