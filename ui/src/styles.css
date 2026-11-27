@@ -2156,6 +2156,17 @@ code,
   .chat__head {
     padding-top: calc(10px + env(safe-area-inset-top, 0px));
   }
+  /* The rail holds the brand and the surfaces, so the notch and the home
+     indicator move its first and last item instead of covering them. */
+  .rail {
+    padding-top: calc(14px + env(safe-area-inset-top, 0px));
+    padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  }
+  /* A management page's head carries the Back action, and a viewport that shows
+     one surface at a time has nothing else to reach it by. */
+  .page__head {
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  }
   /* iOS zooms a focused field under 16px, then leaves the page scrolled. */
   .input,
   .composer__input {

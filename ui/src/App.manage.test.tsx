@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
-import { drain, element, openChat, record, renderApp, useView } from "./test/view";
+import { button, drain, element, openChat, panelText, record, renderApp, useView } from "./test/view";
 import type { Model, Rule } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
@@ -59,27 +59,9 @@ const quiet: Model = {
   thinking_levels: [],
 };
 
-// The button the test names, found by what it says.
-function button(view: View, text: string): HTMLButtonElement {
-  const found = Array.from(view.container.querySelectorAll<HTMLButtonElement>("button")).find(
-    (known) => known.textContent?.trim() === text,
-  );
-  if (!found) throw new Error(`no ${text} button in the view`);
-  return found;
-}
-
 // The field the test names, by its name.
 function field<T extends HTMLElement>(view: View, name: string): T {
   return element<T>(view, `[name="${name}"]`);
-}
-
-// What one panel says, found by its own heading.
-function panelText(view: View, heading: string): string {
-  const panel = Array.from(view.container.querySelectorAll(".panel")).find(
-    (known) => known.querySelector("h2")?.textContent === heading,
-  );
-  if (!panel) throw new Error(`no ${heading} panel in the view`);
-  return panel.textContent ?? "";
 }
 
 // The value of one fact in a panel: the label says what the value is, so the
@@ -1116,6 +1098,27 @@ describe("App management", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
     expect(narrow).not.toMatch(/\.rail\s*\{[^}]*display:\s*none/);
+  });
+
+  it("keeps the rail's items out of the notch and the home indicator", () => {
+    // The rail stays on a narrow viewport, so it is the rail's first and last
+    // item that an installed window's notch and home indicator would cover. The
+    // layout itself is a stylesheet rule, so the rule is what the page holds.
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
+    const rail = narrow.match(/\.rail\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(rail).toMatch(/padding-top:\s*calc\([^;]*env\(safe-area-inset-top/);
+    expect(rail).toMatch(/padding-bottom:\s*calc\([^;]*env\(safe-area-inset-bottom/);
+  });
+
+  it("keeps a management page's Back out of the notch", () => {
+    // A narrow viewport shows one surface at a time, so a management page's head
+    // is the only thing over its Back action: an installed window's notch covers
+    // it unless the head reserves the inset. The layout itself is a stylesheet
+    // rule, so the rule is what the page holds.
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
+    expect(narrow).toMatch(/\.page__head\s*\{[^}]*padding-top:\s*calc\([^;]*env\(safe-area-inset-top/);
   });
 
   it("takes a grant away from a Computer that takes no new one", async () => {
