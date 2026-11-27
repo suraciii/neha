@@ -71,8 +71,22 @@ impl Secrets {
     }
 
     /// Removes every credential of one MCP server.
-    pub fn discard_mcp_server(&self, server: Id) {
-        let _ = fs::remove_dir_all(self.directory.join(mcp_directory(server)));
+    ///
+    /// A server that holds no credential is already clean, so a missing
+    /// directory is success. Any other failure is reported: the caller's
+    /// record may already say the server is gone, and hiding a credential it
+    /// could not delete would leave a secret behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretsError::Io`] when the server's directory exists but
+    /// cannot be removed.
+    pub fn discard_mcp_server(&self, server: Id) -> Result<(), SecretsError> {
+        match fs::remove_dir_all(self.directory.join(mcp_directory(server))) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(SecretsError::Io(error)),
+        }
     }
 
     /// Removes one MCP server's credential for the Space or one User.
@@ -302,5 +316,38 @@ mod tests {
         let error = Secrets::load(&second_home).unwrap().provider_key(provider);
 
         assert!(matches!(error, Err(SecretsError::Decrypt)));
+    }
+
+    #[test]
+    fn a_missing_credential_directory_is_already_clean() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let secrets = Secrets::load(&home).unwrap();
+        let server = Id::new();
+
+        secrets.discard_mcp_server(server).unwrap();
+
+        secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        secrets.discard_mcp_server(server).unwrap();
+        assert_eq!(secrets.mcp_credential(server, None).unwrap(), None);
+    }
+
+    #[test]
+    fn a_credential_directory_that_cannot_be_removed_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::open(dir.path()).unwrap();
+        let secrets = Secrets::load(&home).unwrap();
+        let server = Id::new();
+        // A plain file where the server's directory belongs: the removal fails,
+        // and a failure must not pass as a finished cleanup.
+        fs::write(
+            home.root().join("secrets").join(format!("mcp-{server}")),
+            "blocked",
+        )
+        .unwrap();
+
+        assert!(secrets.discard_mcp_server(server).is_err());
     }
 }

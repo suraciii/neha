@@ -1,6 +1,12 @@
 import type { RecordEvent } from "../types";
 import { uuidv7 } from "./uuid";
 
+/**
+ * The protocol version this client speaks. It states the version in its hello
+ * frame, and the Space refuses a session that greets with another version.
+ */
+export const PROTOCOL_VERSION = 3;
+
 export class ProtocolError extends Error {
   readonly code: string;
 
@@ -200,7 +206,7 @@ export class Commands {
           return;
         }
         if (this.following) this.following.frameSent = false;
-        socket.send(JSON.stringify({ type: "hello", version: 2 }));
+        socket.send(JSON.stringify({ type: "hello", version: PROTOCOL_VERSION }));
         this.hello = new Promise<void>((helloResolve, helloReject) => {
           const onHello = (event: MessageEvent) => {
             if (this.socket !== socket) return;

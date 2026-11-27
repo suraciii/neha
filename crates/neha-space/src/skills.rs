@@ -2,7 +2,10 @@
 //!
 //! A skill is one `SKILL.md`: a YAML frontmatter between `---` lines, then
 //! the body the Bot reads when it loads the skill. Neha reads the two fields
-//! the Agent Skills specification requires and ignores every other field.
+//! the Agent Skills specification requires, validates the type and bounds of
+//! the optional fields it defines, and ignores every other field. Only a field
+//! the frontmatter does not name is absent: a field written with a null value
+//! is present and is refused like any other wrong type.
 
 use neha::record::{MAX_SKILL_BODY_BYTES, SkillAdded};
 
@@ -37,12 +40,18 @@ pub enum SkillError {
     NotText(&'static str),
     /// The name is not one the specification allows.
     #[error(
-        "a skill name is 1 to 64 lowercase letters, digits, or hyphens, and does not begin or end with a hyphen"
+        "a skill name is 1 to 64 lowercase letters, digits, or hyphens, with no leading, trailing, or doubled hyphen"
     )]
     BadName,
     /// The description is empty or too long.
     #[error("a skill description has 1 to 1024 characters")]
     BadDescription,
+    /// The compatibility field is outside its length.
+    #[error("a skill compatibility has 1 to 500 characters")]
+    BadCompatibility,
+    /// The metadata field is not a mapping of text to text.
+    #[error("the frontmatter `metadata` is a mapping of text keys to text values")]
+    BadMetadata,
     /// The body is too large to carry in the record.
     #[error("a skill body is at most {MAX_SKILL_BODY_BYTES} bytes")]
     BodyTooLarge,
@@ -80,19 +89,47 @@ fn read(frontmatter: &str, body: &str) -> Result<SkillDocument, SkillError> {
     };
     let field = |wanted: &'static str| -> Result<Option<String>, SkillError> {
         match fields.get(serde_norway::Value::String(wanted.to_owned())) {
-            None | Some(serde_norway::Value::Null) => Ok(None),
+            // Only an absent key is absent: `license:` with no value is a
+            // present field of the wrong type, not a missing one.
+            None => Ok(None),
             Some(serde_norway::Value::String(text)) => Ok(Some(text.clone())),
             Some(_) => Err(SkillError::NotText(wanted)),
         }
     };
     let name = field("name")?.ok_or(SkillError::Missing("name"))?;
     let description = field("description")?.ok_or(SkillError::Missing("description"))?;
-    if !SkillAdded::valid_name(&name) {
+    // The name is a directory name: lowercase, digits, single hyphens between,
+    // and never a doubled hyphen.
+    if !SkillAdded::valid_name(&name) || name.contains("--") {
         return Err(SkillError::BadName);
     }
     let description = description.trim().to_owned();
     if description.is_empty() || description.chars().count() > 1024 {
         return Err(SkillError::BadDescription);
+    }
+    // The optional fields the specification defines are read for their type
+    // and bounds: a wrong type is not a skill, rather than a field the client
+    // reads differently from the package's author.
+    let _license = field("license")?;
+    if let Some(compatibility) = field("compatibility")?
+        && !(1..=500).contains(&compatibility.chars().count())
+    {
+        return Err(SkillError::BadCompatibility);
+    }
+    let _allowed_tools = field("allowed-tools")?;
+    match fields.get(serde_norway::Value::String("metadata".to_owned())) {
+        // Only an absent key is absent: an explicit null is not a mapping.
+        None => {}
+        Some(serde_norway::Value::Mapping(metadata)) => {
+            let text = metadata.iter().all(|(key, value)| {
+                matches!(key, serde_norway::Value::String(_))
+                    && matches!(value, serde_norway::Value::String(_))
+            });
+            if !text {
+                return Err(SkillError::BadMetadata);
+            }
+        }
+        Some(_) => return Err(SkillError::BadMetadata),
     }
     if body.len() > MAX_SKILL_BODY_BYTES {
         return Err(SkillError::BodyTooLarge);
@@ -118,7 +155,7 @@ mod tests {
 
     #[test]
     fn reads_the_two_required_fields_and_ignores_the_rest() {
-        let document = "---\nname: weekly-report\ndescription: >-\n  Write the weekly status report\n  from the docs the User names.\nlicense: MIT\nallowed-tools: [read_file, shell]\nmetadata:\n  author: ada\n  reviewed: yes\n---\n1. Collect the docs.\n2. Summarize under a page.\n";
+        let document = "---\nname: weekly-report\ndescription: >-\n  Write the weekly status report\n  from the docs the User names.\nlicense: MIT\nallowed-tools: read_file shell\nmetadata:\n  author: ada\n  reviewed: \"yes\"\n---\n1. Collect the docs.\n2. Summarize under a page.\n";
         let parsed = parse(document).unwrap();
         assert_eq!(parsed.name, "weekly-report");
         assert_eq!(
@@ -129,6 +166,101 @@ mod tests {
             parsed.body,
             "1. Collect the docs.\n2. Summarize under a page.\n"
         );
+    }
+
+    #[test]
+    fn accepts_the_optional_fields_the_specification_defines() {
+        let document = "---\nname: pdf-processing\ndescription: Extract PDF text.\nlicense: Apache-2.0\ncompatibility: Requires git and access to the internet.\nmetadata:\n  author: example-org\n  version: \"1.0\"\nallowed-tools: Bash(git:*) Bash(jq:*) Read\n---\nBody.";
+        let parsed = parse(document).unwrap();
+
+        assert_eq!(parsed.name, "pdf-processing");
+        assert_eq!(parsed.body, "Body.");
+        // The longest allowed compatibility is still a skill.
+        let longest = "x".repeat(500);
+        let document = format!("---\nname: x\ndescription: d\ncompatibility: {longest}\n---\nbody");
+        assert!(parse(&document).is_ok());
+    }
+
+    #[test]
+    fn rejects_optional_fields_of_the_wrong_type() {
+        // The optional fields are validated by type; a list where the
+        // specification names a string is not a skill.
+        for field in [
+            "license: [MIT]",
+            "license: 3",
+            "compatibility: [linux]",
+            "compatibility: 3",
+            "allowed-tools: [read_file]",
+            "allowed-tools: 3",
+            "metadata: [author]",
+            "metadata: 3",
+            "metadata:\n  author: 3",
+            "metadata:\n  3: ada",
+        ] {
+            let document = format!("---\nname: x\ndescription: d\n{field}\n---\nbody");
+            assert!(parse(&document).is_err(), "{field:?} must not be a skill");
+        }
+        assert_eq!(
+            parse("---\nname: x\ndescription: d\nlicense: 3\n---\n"),
+            Err(SkillError::NotText("license"))
+        );
+        assert_eq!(
+            parse("---\nname: x\ndescription: d\ncompatibility: [linux]\n---\n"),
+            Err(SkillError::NotText("compatibility"))
+        );
+        assert_eq!(
+            parse("---\nname: x\ndescription: d\nallowed-tools: [read_file]\n---\n"),
+            Err(SkillError::NotText("allowed-tools"))
+        );
+        assert_eq!(
+            parse("---\nname: x\ndescription: d\nmetadata:\n  author: 3\n---\n"),
+            Err(SkillError::BadMetadata)
+        );
+    }
+
+    #[test]
+    fn rejects_an_explicit_null_optional_field() {
+        // A field is optional only when the frontmatter does not name it: an
+        // explicit YAML null is a present field of the wrong type.
+        for (field, error) in [
+            ("license:", SkillError::NotText("license")),
+            ("license: null", SkillError::NotText("license")),
+            ("license: ~", SkillError::NotText("license")),
+            ("compatibility:", SkillError::NotText("compatibility")),
+            ("compatibility: null", SkillError::NotText("compatibility")),
+            ("compatibility: ~", SkillError::NotText("compatibility")),
+            ("allowed-tools:", SkillError::NotText("allowed-tools")),
+            ("allowed-tools: null", SkillError::NotText("allowed-tools")),
+            ("allowed-tools: ~", SkillError::NotText("allowed-tools")),
+            ("metadata:", SkillError::BadMetadata),
+            ("metadata: null", SkillError::BadMetadata),
+            ("metadata: ~", SkillError::BadMetadata),
+        ] {
+            let document = format!("---\nname: x\ndescription: d\n{field}\n---\nbody");
+            assert_eq!(
+                parse(&document),
+                Err(error),
+                "{field:?} is an explicit null, not an absent field"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_optional_field_is_absent() {
+        let parsed = parse("---\nname: x\ndescription: d\n---\nbody").unwrap();
+
+        assert_eq!(parsed.name, "x");
+        assert_eq!(parsed.description, "d");
+    }
+
+    #[test]
+    fn rejects_a_compatibility_outside_its_length() {
+        let empty = parse("---\nname: x\ndescription: d\ncompatibility: ''\n---\n");
+        assert_eq!(empty, Err(SkillError::BadCompatibility));
+
+        let long = "x".repeat(501);
+        let document = format!("---\nname: x\ndescription: d\ncompatibility: {long}\n---\n");
+        assert_eq!(parse(&document), Err(SkillError::BadCompatibility));
     }
 
     #[test]
@@ -152,6 +284,15 @@ mod tests {
             parse("---\nname: x\n---\n"),
             Err(SkillError::Missing("description"))
         );
+        // A required field is not optional and a null value is not text.
+        assert_eq!(
+            parse("---\nname:\ndescription: d\n---\n"),
+            Err(SkillError::NotText("name"))
+        );
+        assert_eq!(
+            parse("---\nname: x\ndescription: ~\n---\n"),
+            Err(SkillError::NotText("description"))
+        );
         assert!(
             matches!(
                 parse("---\nname: [unclosed\n---\n"),
@@ -168,6 +309,13 @@ mod tests {
             parse("---\nname: Bad Name\ndescription: d\n---\n"),
             Err(SkillError::BadName)
         );
+        for name in ["-pdf", "pdf-", "pdf--processing", "PDF-processing"] {
+            assert_eq!(
+                parse(&format!("---\nname: {name}\ndescription: d\n---\n")),
+                Err(SkillError::BadName),
+                "{name:?} is not a skill name"
+            );
+        }
         assert_eq!(
             parse("---\nname: x\ndescription: ''\n---\n"),
             Err(SkillError::BadDescription)

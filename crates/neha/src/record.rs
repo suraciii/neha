@@ -124,6 +124,18 @@ pub enum EventKind {
     /// A Bot may no longer call an MCP server's tools.
     #[serde(rename = "neha.bot.mcp.disabled")]
     BotMcpDisabled,
+    /// A package was installed.
+    #[serde(rename = "neha.plugin.installed")]
+    PluginInstalled,
+    /// A package was removed.
+    #[serde(rename = "neha.plugin.removed")]
+    PluginRemoved,
+    /// The Space offers a package.
+    #[serde(rename = "neha.plugin.enabled")]
+    PluginEnabled,
+    /// The Space no longer offers a package.
+    #[serde(rename = "neha.plugin.disabled")]
+    PluginDisabled,
 }
 
 impl EventKind {
@@ -163,6 +175,10 @@ impl EventKind {
             Self::McpServerRemoved => "neha.mcp.server.removed",
             Self::BotMcpEnabled => "neha.bot.mcp.enabled",
             Self::BotMcpDisabled => "neha.bot.mcp.disabled",
+            Self::PluginInstalled => "neha.plugin.installed",
+            Self::PluginRemoved => "neha.plugin.removed",
+            Self::PluginEnabled => "neha.plugin.enabled",
+            Self::PluginDisabled => "neha.plugin.disabled",
         }
     }
 
@@ -195,7 +211,11 @@ impl EventKind {
             | Self::McpServerUpdated
             | Self::McpServerRemoved
             | Self::BotMcpEnabled
-            | Self::BotMcpDisabled => EventClass::Authority,
+            | Self::BotMcpDisabled
+            | Self::PluginInstalled
+            | Self::PluginRemoved
+            | Self::PluginEnabled
+            | Self::PluginDisabled => EventClass::Authority,
             Self::UserJoined
             | Self::ProviderAdded
             | Self::ProviderModelsUpdated
@@ -245,6 +265,10 @@ impl FromStr for EventKind {
             "neha.mcp.server.removed" => Ok(Self::McpServerRemoved),
             "neha.bot.mcp.enabled" => Ok(Self::BotMcpEnabled),
             "neha.bot.mcp.disabled" => Ok(Self::BotMcpDisabled),
+            "neha.plugin.installed" => Ok(Self::PluginInstalled),
+            "neha.plugin.removed" => Ok(Self::PluginRemoved),
+            "neha.plugin.enabled" => Ok(Self::PluginEnabled),
+            "neha.plugin.disabled" => Ok(Self::PluginDisabled),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -421,6 +445,10 @@ mod tests {
             EventKind::McpServerRemoved,
             EventKind::BotMcpEnabled,
             EventKind::BotMcpDisabled,
+            EventKind::PluginInstalled,
+            EventKind::PluginRemoved,
+            EventKind::PluginEnabled,
+            EventKind::PluginDisabled,
         ];
 
         for kind in kinds {
@@ -465,6 +493,7 @@ mod tests {
                 name: "collect.sh".to_owned(),
                 sha256: "a".repeat(64),
             }],
+            plugin: None,
         };
         let value = serde_json::to_value(&data).unwrap();
         assert_eq!(
@@ -1117,6 +1146,14 @@ pub enum EventData {
     BotMcpEnabled(BotMcpEnabled),
     /// A Bot may no longer use an MCP server.
     BotMcpDisabled(BotMcpDisabled),
+    /// A package was installed, with what it brought.
+    PluginInstalled(PluginInstalled),
+    /// A package was removed.
+    PluginRemoved(PluginRemoved),
+    /// The Space offers a package.
+    PluginEnabled(PluginEnabled),
+    /// The Space no longer offers a package.
+    PluginDisabled(PluginDisabled),
 }
 
 /// The first version of every event kind.
@@ -1195,6 +1232,14 @@ impl EventKind {
             Self::McpServerRemoved => EventData::McpServerRemoved(decode(data)?),
             Self::BotMcpEnabled => EventData::BotMcpEnabled(decode(data)?),
             Self::BotMcpDisabled => EventData::BotMcpDisabled(decode(data)?),
+            Self::PluginInstalled => {
+                let data: PluginInstalled = decode(data)?;
+                data.validate()?;
+                EventData::PluginInstalled(data)
+            }
+            Self::PluginRemoved => EventData::PluginRemoved(decode(data)?),
+            Self::PluginEnabled => EventData::PluginEnabled(decode(data)?),
+            Self::PluginDisabled => EventData::PluginDisabled(decode(data)?),
         };
 
         Ok(decoded)
@@ -1219,7 +1264,11 @@ impl EventKind {
             | Self::McpServerUpdated
             | Self::McpServerRemoved
             | Self::BotMcpEnabled
-            | Self::BotMcpDisabled => {
+            | Self::BotMcpDisabled
+            | Self::PluginInstalled
+            | Self::PluginRemoved
+            | Self::PluginEnabled
+            | Self::PluginDisabled => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
                     return Err(EventDataError::Author);
                 }
@@ -2038,6 +2087,9 @@ pub struct SkillAdded {
     /// The scripts it carries.
     #[serde(default)]
     pub scripts: Vec<SkillScript>,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
 }
 
 impl SkillAdded {
@@ -2164,6 +2216,12 @@ pub struct McpServerAdded {
     pub user: Option<Id>,
     /// The account that connected it.
     pub by: Id,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
+    /// The fixed headers the package configures, which are visible data.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 impl McpServerAdded {
@@ -2371,4 +2429,92 @@ pub struct BotSkillDisabled {
     pub bot: Id,
     /// The skill it no longer uses.
     pub skill: Id,
+}
+
+/// The most bytes a package's name, version, and source may carry.
+pub const MAX_PLUGIN_SOURCE_BYTES: usize = 4096;
+
+/// The data of `neha.plugin.installed`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginInstalled {
+    /// The package.
+    pub plugin: Id,
+    /// Its name from `plugin.json`.
+    pub name: String,
+    /// Its version from `plugin.json`, when it names one.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// The digest of the package's bytes.
+    pub digest: String,
+    /// The commit the package was fetched at, when it came from a repository.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// The source it came from.
+    pub source: String,
+    /// The MCP servers it brought.
+    #[serde(default)]
+    pub servers: Vec<Id>,
+    /// The skills it brought into the Space's library.
+    #[serde(default)]
+    pub skills: Vec<Id>,
+}
+
+impl PluginInstalled {
+    /// Checks the fields a record reader relies on.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        let valid = |text: &str, limit: usize| {
+            !text.is_empty() && text.len() <= limit && !text.chars().any(char::is_control)
+        };
+
+        if !valid(&self.name, 64) {
+            return Err(EventDataError::Data("a package names a name".to_owned()));
+        }
+        if self.digest.len() != 64 || !self.digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(EventDataError::Data(
+                "a package digest is a sha256 hex string".to_owned(),
+            ));
+        }
+        if self.version.as_ref().is_some_and(|text| !valid(text, 128)) {
+            return Err(EventDataError::Data(
+                "a package version is short text".to_owned(),
+            ));
+        }
+        if self.commit.as_ref().is_some_and(|text| !valid(text, 128)) {
+            return Err(EventDataError::Data(
+                "a package commit is short text".to_owned(),
+            ));
+        }
+        if !valid(&self.source, MAX_PLUGIN_SOURCE_BYTES) {
+            return Err(EventDataError::Data(
+                "a package names its source".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.plugin.removed`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginRemoved {
+    /// The package.
+    pub plugin: Id,
+}
+
+/// The data of `neha.plugin.enabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginEnabled {
+    /// The package.
+    pub plugin: Id,
+}
+
+/// The data of `neha.plugin.disabled`.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginDisabled {
+    /// The package.
+    pub plugin: Id,
 }

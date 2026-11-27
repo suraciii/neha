@@ -18,7 +18,9 @@ address is `https`, or `http` on the Space's own loopback.
 
 Only the Admin connects a server for the Space. `--scope user` connects it for
 the signed-in User alone: a Bot owner may add one for themselves, or connect an
-existing Space server with their own credential. The credential comes from
+existing Space server with their own credential. The Admin adds a Space-wide
+credential to a server a package brought by naming that server again with
+`--scope space` (the default) and its address. The credential comes from
 `NEHA_MCP_TOKEN` only, never from the command line; the Space seals it on the
 machine that runs the Space and never puts it in the record or a Computer.
 

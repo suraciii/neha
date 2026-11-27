@@ -8,8 +8,8 @@
 //! A command that is already recorded never writes or creates anything
 //! again: its recorded result is the answer.
 
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -19,8 +19,8 @@ use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{
     ActionStatus as RecordedActionStatus, ApprovalReason, Author, Event, EventDraft, EventKind,
-    FULL_ACCESS_CONSENT_VERSION, FileAdded, RuleEffect, SkillLibrary, SkillScript, Undoability,
-    valid_script_name,
+    FULL_ACCESS_CONSENT_VERSION, FileAdded, MAX_PLUGIN_SOURCE_BYTES, RuleEffect, SkillLibrary,
+    SkillScript, Undoability, valid_script_name,
 };
 use neha::seq::Seq;
 use neha::surface::{
@@ -35,13 +35,17 @@ use crate::catalog::CatalogStore;
 use crate::computer_link::ComputerLinks;
 use crate::home::Home;
 use crate::identity::{Account, Identity, PairingRequest};
+use crate::mcp::{HeaderClass, header_class};
 use crate::model::{ModelClient, SpaceModel};
+use crate::plugins::{
+    Source, extract_archive, fetch_archive, parse_source, read_authorized_directory, validate,
+};
 use crate::remote::{RemoteRuntime, TIMEOUT_GRACE};
 use crate::secrets::Secrets;
 use crate::server::{ApiError, PairingAttempts, identity_error};
 use crate::state::{
-    ApprovalView, BotView, ChatView, ComputerView, ModelView, ProviderView, RuleView, RunStatus,
-    State,
+    ApprovalView, BotView, ChatView, ComputerView, ModelView, ProviderView, RemovedMcpView,
+    RuleView, RunStatus, State,
 };
 use crate::store::{
     AppendRequest, AppendResult, CommandRecord, ContinuationWrite, Projection, Store,
@@ -172,7 +176,10 @@ pub struct CommandContext<'a> {
     /// Serializes answers and rule changes, so two clients cannot decide one
     /// approval or add one rule twice.
     pub approvals: &'a tokio::sync::Mutex<()>,
-    /// Serializes changes to the skills of both libraries.
+    /// Serializes changes to the Space's libraries: skills, MCP servers, and
+    /// packages. One mutex covers every one of them, so a decision that reads
+    /// what the Space offers and appends the change cannot interleave with
+    /// another such decision.
     pub library: &'a tokio::sync::Mutex<()>,
     /// The run queue. A command that changes a Bot's authority takes the Bot's
     /// admit lock, so its read and its event cannot interleave with a run
@@ -183,6 +190,8 @@ pub struct CommandContext<'a> {
     pub events: &'a tokio::sync::broadcast::Sender<Event>,
     /// The models.dev catalog and its cache.
     pub catalog: &'a CatalogStore,
+    /// Where this Space may install a package from.
+    pub plugins: &'a crate::config::PluginsConfig,
 }
 
 /// Runs one command for an account.
@@ -454,6 +463,19 @@ pub async fn execute(
                 enabled,
             )
             .await
+        }
+        CommandCall::PluginInstall { source } => {
+            plugin_install(context, account, command_id, fingerprint, source).await
+        }
+        CommandCall::PluginList => plugin_list(context, account),
+        CommandCall::PluginRemove { plugin } => {
+            plugin_remove(context, account, command_id, fingerprint, plugin).await
+        }
+        CommandCall::PluginEnable { plugin } => {
+            plugin_set_enabled(context, account, command_id, fingerprint, plugin, true).await
+        }
+        CommandCall::PluginDisable { plugin } => {
+            plugin_set_enabled(context, account, command_id, fingerprint, plugin, false).await
         }
     }
 }
@@ -999,10 +1021,15 @@ async fn rule_add(
 }
 
 /// Whether the Space reaches one server with one credential.
-async fn mcp_reachable(url: &str, credential: &str) -> bool {
+async fn mcp_reachable(
+    url: &str,
+    credential: &str,
+    headers: &std::collections::BTreeMap<String, String>,
+) -> bool {
     let Ok(client) = crate::mcp::McpClient::new(url, Some(credential)) else {
         return false;
     };
+    let client = client.with_headers(headers);
     client
         .with_timeout(std::time::Duration::from_secs(3))
         .open()
@@ -1018,7 +1045,14 @@ async fn mcp_add(
     fingerprint: String,
     arguments: neha::surface::McpAdd,
 ) -> Result<Outcome, ApiError> {
-    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    // A registration changes what the Space holds, so it takes the same lock a
+    // library change takes: the checks below and the append are one decision.
+    // A retry of this same command may have finished while this one waited, so
+    // ask again under the lock.
+    let _library = context.library.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
@@ -1033,6 +1067,16 @@ async fn mcp_add(
     if !neha::record::McpServerAdded::valid_url(&url) {
         return Err(ApiError::invalid_argument(
             "an MCP server's address is https, or http on the Space's own loopback",
+        ));
+    }
+    // The record's address rule admits a query string, but the address is where
+    // the server answers, and a query a caller wrote may carry a credential.
+    // The package loader's endpoint rule refuses one, and this direct path
+    // matches it. The answer never repeats the address: it may hold the very
+    // token a query was misused to carry.
+    if url.contains('?') {
+        return Err(ApiError::invalid_argument(
+            "an MCP server's address carries no user information, query string, or fragment",
         ));
     }
     // An empty token connects nothing: a call must send a bearer or no request.
@@ -1060,11 +1104,10 @@ async fn mcp_add(
         state.mcp_named(&name).cloned()
     };
     // A User who adds an existing Space server with their own credential
-    // connects it for themselves; it is one server, not a second one.
+    // connects it for themselves; the Admin adding it for the Space attaches
+    // the Space's. It is one server, not a second one, either way.
     if let Some(existing) = existing {
-        if existing.scope != neha::record::McpScope::Space
-            || arguments.scope != neha::record::McpScope::User
-        {
+        if existing.scope != neha::record::McpScope::Space {
             return Err(ApiError::invalid_argument(
                 "the Space already holds an MCP server under this name",
             ));
@@ -1074,21 +1117,41 @@ async fn mcp_add(
                 "connecting an existing server keeps the address the Space connected",
             ));
         }
+        // Where the credential touches the record: the Admin adds the Space's,
+        // every account adds its own.
+        let user = match arguments.scope {
+            neha::record::McpScope::User => Some(account.id),
+            neha::record::McpScope::Space if account.is_admin => None,
+            neha::record::McpScope::Space => {
+                return Err(ApiError::forbidden(
+                    "only the Admin connects an MCP server for the Space",
+                ));
+            }
+        };
         let Some(credential) = arguments.credential else {
-            return Err(ApiError::invalid_argument(
-                "connecting a server with your own credential needs one",
-            ));
+            return Err(ApiError::invalid_argument(match user {
+                Some(_) => "connecting a server with your own credential needs one",
+                None => "connecting a server for the Space needs its credential",
+            }));
         };
         if !neha::record::McpServerAdded::valid_credential(&credential) {
             return Err(ApiError::invalid_argument(
                 "an MCP credential holds only the characters a bearer token takes",
             ));
         }
+        // A rotation replaces the credential that worked. What the record's
+        // append decides, so is the credential this command leaves behind: keep
+        // the old one until the append commits, and put it back when it does
+        // not.
+        let previous = context
+            .secrets
+            .mcp_credential(existing.server, user)
+            .map_err(|_| ApiError::internal("cannot read the MCP credential"))?;
         context
             .secrets
-            .store_mcp_credential(existing.server, Some(account.id), &credential)
+            .store_mcp_credential(existing.server, user, &credential)
             .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
-        let connected = mcp_reachable(&existing.url, &credential).await;
+        let connected = mcp_reachable(&existing.url, &credential, &existing.headers).await;
         let draft = EventDraft::new(
             EventKind::McpServerUpdated,
             Author::User(account.id),
@@ -1103,8 +1166,11 @@ async fn mcp_add(
             "server": existing.server,
             "name": existing.name,
             "url": existing.url,
+            // The server stays the Space's, whatever credential this attached.
             "scope": "space",
-            "user": null,
+            // The command's owner, not the server's: a recorded answer is
+            // replayed only to the account whose command it was.
+            "user": account.id,
             "by": existing.by,
             "connected": connected,
         });
@@ -1121,16 +1187,26 @@ async fn mcp_add(
         {
             Ok(appended) => appended,
             Err(error) => {
-                context
-                    .secrets
-                    .discard_mcp_credential(existing.server, Some(account.id));
+                // The record did not change, so the credential that worked
+                // before this command must not stay replaced by one it wrote.
+                match previous {
+                    Some(previous) => {
+                        let _ =
+                            context
+                                .secrets
+                                .store_mcp_credential(existing.server, user, &previous);
+                    }
+                    None => context
+                        .secrets
+                        .discard_mcp_credential(existing.server, user),
+                }
                 return Err(error);
             }
         };
         if appended.existing {
             context
                 .secrets
-                .discard_mcp_credential(existing.server, Some(account.id));
+                .discard_mcp_credential(existing.server, user);
             return recorded_outcome(context.store, command_id).await;
         }
 
@@ -1164,7 +1240,9 @@ async fn mcp_add(
         neha::record::McpScope::User => Some(account.id),
     };
     let connected = match &arguments.credential {
-        Some(credential) => mcp_reachable(&url, credential).await,
+        Some(credential) => {
+            mcp_reachable(&url, credential, &std::collections::BTreeMap::new()).await
+        }
         None => false,
     };
     if let Some(credential) = &arguments.credential {
@@ -1189,11 +1267,15 @@ async fn mcp_add(
         "server": server,
         "name": name,
         "url": url,
+        // Whose server it is, by scope: a Space server belongs to no User.
         "scope": match arguments.scope {
             neha::record::McpScope::Space => "space",
             neha::record::McpScope::User => "user",
         },
-        "user": user,
+        // The command's owner, not the server's: a recorded answer is replayed
+        // only to the account whose command it was. For a User's own server
+        // the two are the same account, and `scope` names the owner.
+        "user": account.id,
         "by": account.id,
         "connected": connected,
     });
@@ -1210,12 +1292,14 @@ async fn mcp_add(
     {
         Ok(appended) => appended,
         Err(error) => {
-            context.secrets.discard_mcp_server(server);
+            // The record did not change, so a credential this command stored
+            // before the append is not the Space's to keep.
+            let _ = context.secrets.discard_mcp_server(server);
             return Err(error);
         }
     };
     if appended.existing {
-        context.secrets.discard_mcp_server(server);
+        let _ = context.secrets.discard_mcp_server(server);
         return recorded_outcome(context.store, command_id).await;
     }
 
@@ -1261,7 +1345,7 @@ async fn mcp_view(
     // A credential that is present but refused, and a server that cannot be
     // reached, are not connected: the list says what a call would find.
     let connected = match &credential {
-        Some(credential) => mcp_reachable(&server.url, credential).await,
+        Some(credential) => mcp_reachable(&server.url, credential, &server.headers).await,
         None => false,
     };
 
@@ -1280,6 +1364,17 @@ async fn mcp_view(
 }
 
 /// Disconnects an MCP server its account added.
+///
+/// The record keeps the event that removed it; what leaves the Space is the
+/// Vault credentials outside the record. They are not the record's, so a replay
+/// of this command re-attempts their discard before it answers: a Space that
+/// stopped between the append and the cleanup leaves no orphan behind.
+///
+/// A cleanup that does not finish is not an error: the record already changed,
+/// so the answer is the command's and carries the cleanup it still owes. The
+/// shipped CLI sends a new command id for a retry, so a removal the record
+/// already holds is also finished by a new command that names the server; that
+/// path writes no event.
 async fn mcp_remove(
     context: &CommandContext<'_>,
     account: &Account,
@@ -1287,19 +1382,36 @@ async fn mcp_remove(
     fingerprint: String,
     server: Id,
 ) -> Result<Outcome, ApiError> {
-    let _decisions = context.approvals.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
-        return Ok(outcome);
+        // The credential is not the record's, so a replay still discards it: a
+        // Space that stopped between its append and its cleanup leaves no
+        // orphan behind. A cleanup that cannot finish is reported, not hidden.
+        let failures = cleanup_removed_mcp_server(context, server);
+        return Ok(warned_replay(outcome, &failures));
     }
-    let view = {
+    // A removal changes what the Space holds, so it takes the same lock a
+    // library change takes: its read and its append are one decision.
+    let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        let failures = cleanup_removed_mcp_server(context, server);
+        return Ok(warned_replay(outcome, &failures));
+    }
+    let (view, removed) = {
         let state = context
             .state
             .lock()
             .map_err(|_| ApiError::internal("state lock"))?;
-        state
-            .mcp(server)
-            .cloned()
-            .ok_or_else(|| ApiError::not_found("no such MCP server"))?
+        (
+            state.mcp(server).cloned(),
+            state.removed_mcp(server).cloned(),
+        )
+    };
+    let Some(view) = view else {
+        // The server is not in the projection, but the projection may still
+        // hold what the removal that took it away was. A CLI retry carries a
+        // new command id, so it cannot replay that command; what it can name is
+        // the server, and finishing the removal needs no new event.
+        return finish_removed_mcp_server_cleanup(context, account, server, removed);
     };
     let admin_space = view.scope == neha::record::McpScope::Space && account.is_admin;
     if view.by != account.id && !admin_space {
@@ -1312,7 +1424,12 @@ async fn mcp_remove(
         Author::User(account.id),
         json!({"server": server}),
     );
-    let result = json!({"server": server, "name": view.name});
+    let result = json!({
+        "server": server,
+        "name": view.name,
+        // The command's owner: a recorded answer is replayed only to them.
+        "user": account.id,
+    });
     let appended = append(
         context.store,
         context.state,
@@ -1323,14 +1440,20 @@ async fn mcp_remove(
         None,
     )
     .await?;
+    // The record says the server is gone; its credentials are the Space's. A
+    // cleanup that cannot finish is not an error: the record already changed,
+    // and the answer carries what is left for a retry.
+    let failures = cleanup_removed_mcp_server(context, server);
     if appended.existing {
-        return recorded_outcome(context.store, command_id).await;
+        return Ok(warned_replay(
+            recorded_outcome(context.store, command_id).await?,
+            &failures,
+        ));
     }
-    context.secrets.discard_mcp_server(server);
 
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
-        result,
+        result: with_cleanup(result, &failures),
         queued: None,
         events: appended.events,
     })
@@ -1346,7 +1469,12 @@ async fn bot_mcp(
     server: Id,
     enabled: bool,
 ) -> Result<Outcome, ApiError> {
-    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    // Changing which servers a Bot may call is a registry change: its read and
+    // its append are one decision under the same lock a library change takes.
+    let _library = context.library.lock().await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
@@ -1825,6 +1953,1076 @@ async fn bot_skill(
         queued: None,
         events: appended.events,
     })
+}
+
+/// Maps a package reader failure to the answer its caller sees.
+///
+/// A source the Admin does not allow is forbidden; every other failure is the
+/// package's own, so it is an invalid argument.
+fn plugin_error(error: crate::plugins::PluginError) -> ApiError {
+    match error {
+        crate::plugins::PluginError::NotAllowed(_) => ApiError::forbidden(error.to_string()),
+        error => ApiError::invalid_argument(error.to_string()),
+    }
+}
+
+/// Installs a package from a source the Admin allowed.
+///
+/// Reading a package is the whole install: no code from it runs. Every check
+/// that can refuse the install happens before anything is written, so a
+/// refusal leaves the record as it was.
+///
+/// The source is parsed and authorized, and its bytes are read or fetched,
+/// outside the library lock: a stalled archive body must not hold every skill
+/// and package command for the request's whole timeout. The lock is taken once
+/// the package is here, for the checks against what the Space holds, the
+/// staged write, the publish, and the append.
+///
+/// The package is written under a staging directory unique to this command,
+/// `<home>/plugins/.staging-<command>`, and published as
+/// `<home>/plugins/<name>@<digest>` before its events enter the record: a
+/// command that answers success names bytes that are on disk. Publishing never
+/// writes into a directory the Space already serves, so a concurrent install of
+/// the same digest keeps the one that is there. A directory a failed append
+/// published is removed again only when it was not there before and no record
+/// names it; an orphan directory is harmless, and a retry is idempotent. The
+/// staging directory is removed on every failure and before a recorded answer
+/// is replayed.
+///
+/// Installing a package under a name the Space holds replaces it: its
+/// `neha.plugin.removed` event is the first of this command's events, so the
+/// servers and skills it brought are free for the new package to take. A
+/// server or skill the new package would collide with otherwise is reported in
+/// `skipped`, not refused.
+async fn plugin_install(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    source: String,
+) -> Result<Outcome, ApiError> {
+    if !account.is_admin {
+        return Err(ApiError::forbidden("only the Admin installs a package"));
+    }
+    let plugins = context.home.plugins_dir();
+    let staging = staging_dir(&plugins, command_id);
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        // The recorded answer is final, but the work it describes may have
+        // stopped before it cleaned up after itself; a retry finishes that. The
+        // bytes it names are not recreated: the source's bytes are not on the
+        // record, so the replay answers what was recorded and claims nothing.
+        // An answer that carries a cleanup warning keeps warning while the
+        // cleanup does not finish.
+        let _library = context.library.lock().await;
+        discard_staging(&staging);
+        let failures = finish_recorded_cleanup(context, command_id).await;
+        return Ok(warned_replay(outcome, &failures));
+    }
+
+    let source = source.trim().to_owned();
+    // The record names the source, so it must be one the record holds. The
+    // allow list is a prefix rule, so a source may carry trailing bytes the
+    // record cannot: refuse rather than record part of it.
+    if source.len() > MAX_PLUGIN_SOURCE_BYTES || source.chars().any(char::is_control) {
+        return Err(ApiError::invalid_argument(
+            "a package source is at most 4096 printable bytes",
+        ));
+    }
+    let parsed = parse_source(&source).map_err(plugin_error)?;
+    // Reading a package is the network's work, not the registry's.
+    let mut skipped = Vec::new();
+    let files = match &parsed {
+        // A directory source is authorized and read as one decision: the bytes
+        // that are read are the bytes the allow list decided about.
+        Source::Directory { path } => {
+            read_authorized_directory(path, &context.plugins.sources, &mut skipped)
+                .map_err(plugin_error)?
+        }
+        Source::Repository { .. } => {
+            // What the Space may install from is the loader's one decision, and
+            // it is checked before anything is fetched: a refused source costs
+            // no request.
+            crate::plugins::authorize_source(&parsed, &context.plugins.sources)
+                .map_err(plugin_error)?;
+            let bytes = fetch_archive(&parsed, &context.plugins.sources)
+                .await
+                .map_err(plugin_error)?;
+            extract_archive(&bytes, &mut skipped).map_err(plugin_error)?
+        }
+    };
+    let package = validate(&files).map_err(plugin_error)?;
+    let digest = crate::plugins::digest(&files);
+    let name = package.manifest.name;
+    skipped.extend(package.skipped);
+    // A version the record cannot hold is reported and dropped; the package
+    // still installs, as with every other part a package may get wrong.
+    let version = match package.manifest.version {
+        Some(version)
+            if version.is_empty()
+                || version.len() > 128
+                || version.chars().any(char::is_control) =>
+        {
+            skipped.push(
+                "plugin.json: the `version` field is not short printable text, so it is not kept"
+                    .to_owned(),
+            );
+            None
+        }
+        version => version,
+    };
+    let commit = match &parsed {
+        Source::Repository { commit, .. } => Some(commit.clone()),
+        Source::Directory { .. } => None,
+    };
+    let served = package.servers;
+    let carried = package.skills;
+
+    // The install adds to the Space's library, so it takes the same lock a
+    // skill add or remove takes: its checks and its append are one decision. A
+    // retry of this same command may have finished while this one read, so ask
+    // again under the lock.
+    let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        discard_staging(&staging);
+        let failures = finish_recorded_cleanup(context, command_id).await;
+        return Ok(warned_replay(outcome, &failures));
+    }
+
+    // The Space's servers and the Space library's skills have unique names.
+    // What the record holds is taken, except for what the replaced package
+    // brought: its removal is the first event appended, so its names become
+    // free for this package.
+    let (replaced, servers, skills) = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let replaced = state.plugins.iter().find(|view| view.name == name).cloned();
+        let replaced_id = replaced.as_ref().map(|view| view.plugin);
+        let belongs_to_replaced =
+            |plugin: Option<Id>| replaced_id.is_some_and(|id| plugin == Some(id));
+        let mut server_names: HashSet<String> = state
+            .mcps
+            .iter()
+            .filter(|view| !belongs_to_replaced(view.plugin))
+            .map(|view| view.name.clone())
+            .collect();
+        let mut skill_names: HashSet<String> = state
+            .skills
+            .iter()
+            .filter(|view| view.library == SkillLibrary::Space)
+            .filter(|view| !belongs_to_replaced(view.plugin))
+            .map(|view| view.name.clone())
+            .collect();
+        let mut servers = Vec::with_capacity(served.len());
+        for server in served {
+            // A header that could carry a credential keeps the whole server out
+            // of the record: the loader checks a header's shape, and the command
+            // is what decides which names the Space sends. The report names the
+            // header and never its value.
+            let mut server = server;
+            if let Some(header) = server.headers.keys().find_map(|name| {
+                matches!(header_class(name), Some(HeaderClass::Credential)).then(|| name.clone())
+            }) {
+                skipped.push(format!(
+                    "mcp.json: the server `{}` is skipped because it configures the `{header}` \
+                     header, which could carry a credential",
+                    server.key
+                ));
+                continue;
+            }
+            if server_names.contains(&server.name) {
+                skipped.push(format!(
+                    "mcp.json: the server `{}` is skipped because the Space already holds a \
+                     server named `{}`",
+                    server.key, server.name
+                ));
+                continue;
+            }
+            // The package schema admits addresses the record refuses, and a
+            // server the record cannot hold must not fail the whole package.
+            if !neha::record::McpServerAdded::valid_url(&server.url) {
+                skipped.push(format!(
+                    "mcp.json: the server `{}` names an address this Space cannot call: {}",
+                    server.key, server.url
+                ));
+                continue;
+            }
+            // A header the client owns is dropped with a report: the record
+            // holds visible data, and the client supplies this one itself.
+            let generated: Vec<String> = server
+                .headers
+                .keys()
+                .filter(|name| matches!(header_class(name), Some(HeaderClass::Generated)))
+                .cloned()
+                .collect();
+            for header in generated {
+                server.headers.remove(&header);
+                skipped.push(format!(
+                    "mcp.json: the server `{}` drops the `{header}` header it configures, \
+                     because the Space sets that header itself",
+                    server.key
+                ));
+            }
+            server_names.insert(server.name.clone());
+            servers.push(server);
+        }
+        let mut skills = Vec::with_capacity(carried.len());
+        for skill in carried {
+            if skill_names.contains(&skill.name) {
+                skipped.push(format!(
+                    "skills/{}: the skill `{}` is skipped because the Space's library already \
+                     holds that name",
+                    skill.directory, skill.name
+                ));
+                continue;
+            }
+            skill_names.insert(skill.name.clone());
+            skills.push(skill);
+        }
+        // The server limit would make the projection refuse the appended
+        // events; refuse the install with a clear answer before anything is
+        // written instead.
+        let freed = replaced_id.map_or(0, |id| {
+            state
+                .mcps
+                .iter()
+                .filter(|view| view.plugin == Some(id))
+                .count()
+        });
+        if state.mcps.len().saturating_sub(freed) + servers.len() > crate::state::MAX_MCP_SERVERS {
+            return Err(ApiError::invalid_argument(format!(
+                "a Space connects at most {} MCP servers; this package cannot be installed now",
+                crate::state::MAX_MCP_SERVERS
+            )));
+        }
+        (replaced, servers, skills)
+    };
+
+    let plugin = Id::new();
+    let server_ids: Vec<Id> = servers.iter().map(|_| Id::new()).collect();
+    let skill_ids: Vec<Id> = skills.iter().map(|_| Id::new()).collect();
+    // Every script goes to the File store before the record names it; the
+    // record keeps only its digest.
+    let mut stored: Vec<Vec<SkillScript>> = Vec::with_capacity(skills.len());
+    for skill in &skills {
+        let mut scripts = Vec::with_capacity(skill.scripts.len());
+        for script in &skill.scripts {
+            let sha256 = context.blobs.put(script.content.as_bytes()).await?;
+            scripts.push(SkillScript {
+                name: script.name.clone(),
+                sha256,
+            });
+        }
+        stored.push(scripts);
+    }
+    let result = json!({
+        "plugin": plugin,
+        "name": name,
+        "version": version,
+        "digest": digest,
+        "commit": commit,
+        "source": source,
+        "servers": servers.iter().zip(&server_ids).map(|(server, id)| json!({
+            "server": id,
+            "name": server.name,
+            "url": server.url,
+        })).collect::<Vec<_>>(),
+        "skills": skills.iter().zip(&skill_ids).map(|(skill, id)| json!({
+            "skill": id,
+            "name": skill.name,
+        })).collect::<Vec<_>>(),
+        "skipped": skipped,
+        // A recorded command answers only the User whose command it was.
+        "user": account.id,
+    });
+
+    let package_dir = plugins.join(format!("{name}@{digest}"));
+    // Whether these bytes were already on disk before this command published
+    // them, and whether the record already names them. A failed append removes
+    // only what this command published and no record names.
+    let published_before = package_dir.is_dir();
+    let recorded_before = replaced.as_ref().is_some_and(|old| old.digest == digest);
+    let replaced_a_package = replaced.is_some();
+    let mut drafts = Vec::with_capacity(2 + servers.len() + skills.len());
+    if let Some(old) = &replaced {
+        drafts.push(EventDraft::new(
+            EventKind::PluginRemoved,
+            Author::User(account.id),
+            json!({"plugin": old.plugin}),
+        ));
+    }
+    drafts.push(EventDraft::new(
+        EventKind::PluginInstalled,
+        Author::User(account.id),
+        json!({
+            "plugin": plugin,
+            "name": name,
+            "version": version,
+            "digest": digest,
+            "commit": commit,
+            "source": source,
+            "servers": server_ids,
+            "skills": skill_ids,
+        }),
+    ));
+    for (server, id) in servers.iter().zip(&server_ids) {
+        drafts.push(EventDraft::new(
+            EventKind::McpServerAdded,
+            Author::User(account.id),
+            json!({
+                "server": id,
+                "name": server.name,
+                "url": server.url,
+                "scope": neha::record::McpScope::Space,
+                "user": null,
+                "by": account.id,
+                "plugin": plugin,
+                "headers": server.headers,
+            }),
+        ));
+    }
+    for ((skill, id), scripts) in skills.iter().zip(&skill_ids).zip(stored) {
+        drafts.push(EventDraft::new(
+            EventKind::SkillAdded,
+            Author::User(account.id),
+            json!({
+                "skill": id,
+                "library": SkillLibrary::Space,
+                "bot": null,
+                "name": skill.name,
+                "description": skill.description,
+                "body": skill.body,
+                "scripts": scripts,
+                "plugin": plugin,
+            }),
+        ));
+    }
+    // The bytes the record will name are written to this command's staging
+    // directory and published before the record names them: a command that
+    // answers success names bytes that are on disk, and a failed publish leaves
+    // the record as it was. Publishing never writes into the directory the
+    // Space already serves: an existing directory for the same digest stays.
+    write_package(&staging, &files).map_err(|_| ApiError::internal("cannot write the package"))?;
+    if publish_package(&staging, &package_dir).is_err() {
+        discard_staging(&staging);
+        return Err(ApiError::internal("cannot publish the package"));
+    }
+    let appended = match append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        drafts,
+        Some(result.clone()),
+        None,
+    )
+    .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            // The record did not change, so the bytes this command published
+            // are an orphan. Remove them only when they were not there before
+            // and no record names them: an orphan is harmless, deleting bytes
+            // another command may be about to name is not.
+            let absent = matches!(context.store.command(command_id).await, Ok(None));
+            if !published_before && !recorded_before && absent {
+                let _ = remove_package_dir(&package_dir);
+            }
+            return Err(error);
+        }
+    };
+    if appended.existing {
+        // Another copy of this command wrote the events while this one read the
+        // package; its answer is the command's, and its cleanup is this one's
+        // to finish if it stopped early.
+        discard_staging(&staging);
+    }
+    // The replaced package's events are gone from the projection; its Vault
+    // credentials and its bytes are the Space's, not the record's. A cleanup
+    // that cannot finish is not an error: the record already changed, so the
+    // answer carries the warning and a retry finishes the cleanup.
+    let failures = if appended.existing || replaced_a_package {
+        finish_recorded_cleanup(context, command_id).await
+    } else {
+        Vec::new()
+    };
+    if appended.existing {
+        return Ok(warned_replay(
+            recorded_outcome(context.store, command_id).await?,
+            &failures,
+        ));
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result: with_cleanup(result, &failures),
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Lists the packages the Space installed and what each brought.
+fn plugin_list(context: &CommandContext<'_>, account: &Account) -> Result<Outcome, ApiError> {
+    if !account.is_admin {
+        return Err(ApiError::forbidden(
+            "only the Admin lists installed packages",
+        ));
+    }
+    read(context.state, |state| {
+        let mut packages = Vec::with_capacity(state.plugins.len());
+        for plugin in &state.plugins {
+            // A name comes from the view the id names: an id the projection
+            // no longer holds is left out.
+            let servers: Vec<Value> = plugin
+                .servers
+                .iter()
+                .filter_map(|server| {
+                    state.mcp(*server).map(|view| {
+                        json!({
+                            "server": view.server,
+                            "name": view.name,
+                        })
+                    })
+                })
+                .collect();
+            let skills: Vec<Value> = plugin
+                .skills
+                .iter()
+                .filter_map(|skill| {
+                    state.skill(*skill).map(|view| {
+                        json!({
+                            "skill": view.id,
+                            "name": view.name,
+                        })
+                    })
+                })
+                .collect();
+            packages.push(json!({
+                "plugin": plugin.plugin,
+                "name": plugin.name,
+                "version": plugin.version,
+                "digest": plugin.digest,
+                "commit": plugin.commit,
+                "source": plugin.source,
+                "enabled": plugin.enabled,
+                "servers": servers,
+                "skills": skills,
+            }));
+        }
+        Ok(Value::Array(packages))
+    })
+}
+
+/// Removes one package and everything it brought.
+///
+/// The record keeps the events that installed it and what it brought; what
+/// leaves the Space is the credentials and the package's bytes outside it.
+/// Those are not the record's, so a replay of this command re-attempts their
+/// cleanup before it answers: a Space that stopped between the append and the
+/// cleanup leaves nothing behind once the command is retried.
+///
+/// A cleanup that does not finish is not an error: the record already changed,
+/// so the answer is the command's and carries the cleanup it still owes. A
+/// replay finishes it. The shipped CLI sends a new command id for a retry, so a
+/// removal the record already holds is also finished by a new command that
+/// names the package; that path writes no event. A directory a later command
+/// reinstalled under the same name and digest is the active package and stays.
+async fn plugin_remove(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    plugin: Id,
+) -> Result<Outcome, ApiError> {
+    if !account.is_admin {
+        return Err(ApiError::forbidden("only the Admin removes a package"));
+    }
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        let _library = context.library.lock().await;
+        let failures = finish_recorded_cleanup(context, command_id).await;
+        return Ok(warned_replay(outcome, &failures));
+    }
+    // A removal takes skills away, so it takes the same lock a skill change
+    // takes: its read and its append are one decision.
+    let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        let failures = finish_recorded_cleanup(context, command_id).await;
+        return Ok(warned_replay(outcome, &failures));
+    }
+    let view = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .plugins
+            .iter()
+            .find(|view| view.plugin == plugin)
+            .cloned()
+    };
+    let Some(view) = view else {
+        // The package is not in the projection, but the record may still hold
+        // the removal that took it away. A CLI retry carries a new command id,
+        // so it cannot replay that command; what it can name is the package,
+        // and finishing the removal needs no new event.
+        let Some(removed) = removed_package(context, plugin).await? else {
+            return Err(ApiError::not_found("no such package"));
+        };
+        let name = removed.name.clone();
+        let failures = cleanup_removed_packages(context, std::slice::from_ref(&removed)).await;
+        let result = json!({
+            "plugin": plugin,
+            "name": name,
+            "user": account.id,
+            "cleanup": if failures.is_empty() {
+                CLEANUP_FINISHED.to_owned()
+            } else {
+                cleanup_warning(&failures)
+            },
+        });
+        return Ok(Outcome {
+            committed: None,
+            result,
+            queued: None,
+            events: Vec::new(),
+        });
+    };
+    let result = json!({
+        "plugin": plugin,
+        "name": view.name,
+        "user": account.id,
+    });
+    let draft = EventDraft::new(
+        EventKind::PluginRemoved,
+        Author::User(account.id),
+        json!({"plugin": plugin}),
+    );
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    // The record says the package is gone; its credentials and its bytes are
+    // the Space's. A cleanup that cannot finish is not an error: the record
+    // already changed, and the answer carries what is left for a retry.
+    let failures = finish_recorded_cleanup(context, command_id).await;
+    if appended.existing {
+        return Ok(warned_replay(
+            recorded_outcome(context.store, command_id).await?,
+            &failures,
+        ));
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result: with_cleanup(result, &failures),
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Offers a package's servers and skills, or stops offering them.
+///
+/// The package stays installed either way: a disabled package's servers and
+/// skills stay in the record, and no run is offered them.
+async fn plugin_set_enabled(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    plugin: Id,
+    enabled: bool,
+) -> Result<Outcome, ApiError> {
+    if !account.is_admin {
+        return Err(ApiError::forbidden("only the Admin offers a package"));
+    }
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    // What a package offers changes with this switch, so its read and its
+    // append are one decision under the same lock a library change takes.
+    let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    let view = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state
+            .plugins
+            .iter()
+            .find(|view| view.plugin == plugin)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such package"))?
+    };
+    let result = json!({
+        "plugin": plugin,
+        "enabled": enabled,
+        "user": account.id,
+    });
+    if view.enabled == enabled {
+        // The package already stands as asked; the answer is recorded so a
+        // retry cannot turn into a second change.
+        context
+            .store
+            .record_command_result(command_id, &fingerprint, result.clone())
+            .await
+            .map_err(store_error)?;
+        if let Some(outcome) =
+            replay_owned(context.store, command_id, &fingerprint, account).await?
+        {
+            return Ok(outcome);
+        }
+        return Ok(Outcome {
+            committed: None,
+            result,
+            queued: None,
+            events: Vec::new(),
+        });
+    }
+    let kind = if enabled {
+        EventKind::PluginEnabled
+    } else {
+        EventKind::PluginDisabled
+    };
+    let draft = EventDraft::new(kind, Author::User(account.id), json!({"plugin": plugin}));
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// The staging directory one command writes its package into.
+///
+/// It is the command's, not the Space's: a retried or concurrent install never
+/// writes into the directory the Space serves.
+fn staging_dir(plugins: &Path, command: Id) -> PathBuf {
+    plugins.join(format!(".staging-{command}"))
+}
+
+/// Removes a command's staging directory, when one was left behind.
+fn discard_staging(staging: &Path) {
+    let _ = std::fs::remove_dir_all(staging);
+}
+
+/// Publishes a staged package under the directory the record names it by.
+///
+/// The final directory is never written into: it is either absent, renamed
+/// from the staging directory, or already there for the same digest (another
+/// command published it first), and then the staging directory is removed and
+/// the published one stays.
+fn publish_package(staging: &Path, final_dir: &Path) -> std::io::Result<()> {
+    if final_dir.is_dir() {
+        discard_staging(staging);
+        return Ok(());
+    }
+    match std::fs::rename(staging, final_dir) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            discard_staging(staging);
+            // The final directory may have appeared while the rename ran; the
+            // package the digest names is the one that stays either way.
+            if final_dir.is_dir() {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// One package a recorded command took from the Space.
+struct RemovedPackage {
+    /// The MCP servers it brought, whose Vault credentials leave with it.
+    servers: Vec<Id>,
+    /// Its name from `plugin.json`.
+    name: String,
+    /// The digest of its bytes.
+    digest: String,
+}
+
+/// Reads what a recorded command removed, and what a replay must still clean.
+///
+/// A command's own events name it: `neha.plugin.removed` is what it took away,
+/// and the `neha.plugin.installed` event the removed id names is where the
+/// servers and the directory are read from.
+async fn recorded_removals(
+    context: &CommandContext<'_>,
+    command_id: Id,
+) -> Result<Vec<RemovedPackage>, ApiError> {
+    /// The page one record scan reads.
+    const PAGE: usize = 256;
+    let mut removed: Vec<Id> = Vec::new();
+    let mut installed: HashMap<Id, (String, String, Vec<Id>)> = HashMap::new();
+    let mut cursor = Seq::ZERO;
+    loop {
+        let page = context
+            .store
+            .events_from(cursor, PAGE)
+            .await
+            .map_err(store_error)?;
+        for event in &page.events {
+            match event.kind {
+                EventKind::PluginInstalled => {
+                    let Ok(data) =
+                        serde_json::from_value::<neha::record::PluginInstalled>(event.data.clone())
+                    else {
+                        continue;
+                    };
+                    installed.insert(data.plugin, (data.name, data.digest, data.servers));
+                }
+                EventKind::PluginRemoved if event.command == Some(command_id) => {
+                    let Ok(data) =
+                        serde_json::from_value::<neha::record::PluginRemoved>(event.data.clone())
+                    else {
+                        continue;
+                    };
+                    removed.push(data.plugin);
+                }
+                _ => {}
+            }
+        }
+        if page.next <= cursor {
+            break;
+        }
+        cursor = page.next;
+    }
+    Ok(removed
+        .into_iter()
+        .filter_map(|plugin| {
+            installed
+                .get(&plugin)
+                .map(|(name, digest, servers)| RemovedPackage {
+                    servers: servers.clone(),
+                    name: name.clone(),
+                    digest: digest.clone(),
+                })
+        })
+        .collect())
+}
+
+/// Reads the most recent removal of one package the record holds.
+///
+/// The CLI retries a cleanup that did not finish with a fresh command id, so it
+/// cannot name the command that removed the package; the package is what it can
+/// name. The record's `neha.plugin.removed` for that id is the removal to
+/// finish, and the `neha.plugin.installed` event the removed id names is where
+/// the package's servers, name, and digest are read from.
+async fn removed_package(
+    context: &CommandContext<'_>,
+    plugin: Id,
+) -> Result<Option<RemovedPackage>, ApiError> {
+    /// The page one record scan reads.
+    const PAGE: usize = 256;
+    let mut installed: Option<RemovedPackage> = None;
+    let mut removed = false;
+    let mut cursor = Seq::ZERO;
+    loop {
+        let page = context
+            .store
+            .events_from(cursor, PAGE)
+            .await
+            .map_err(store_error)?;
+        for event in &page.events {
+            match event.kind {
+                EventKind::PluginInstalled => {
+                    let Ok(data) =
+                        serde_json::from_value::<neha::record::PluginInstalled>(event.data.clone())
+                    else {
+                        continue;
+                    };
+                    if data.plugin == plugin {
+                        installed = Some(RemovedPackage {
+                            servers: data.servers,
+                            name: data.name,
+                            digest: data.digest,
+                        });
+                    }
+                }
+                EventKind::PluginRemoved => {
+                    let Ok(data) =
+                        serde_json::from_value::<neha::record::PluginRemoved>(event.data.clone())
+                    else {
+                        continue;
+                    };
+                    if data.plugin == plugin {
+                        removed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if page.next <= cursor {
+            break;
+        }
+        cursor = page.next;
+    }
+    Ok(if removed { installed } else { None })
+}
+
+/// Removes what recorded removals took out of the record but not out of the
+/// Space: Vault credentials and package bytes, reporting what could not be
+/// cleaned.
+///
+/// The current projection decides which bytes stay: a later command may have
+/// installed the same name and digest again, and that installation is the
+/// active package, so the cleanup of an older removal keeps its directory. Each
+/// caller holds the library lock, so the projection cannot change under the
+/// cleanup.
+///
+/// Every step is attempted even when one fails: the steps are idempotent, a
+/// retry finishes what is left, and one failure must not hide another. What
+/// failed is fixed text that never repeats a credential; the record already
+/// changed, so the caller answers success with that text rather than an error.
+async fn cleanup_removed_packages(
+    context: &CommandContext<'_>,
+    packages: &[RemovedPackage],
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for package in packages {
+        for server in &package.servers {
+            if context.secrets.discard_mcp_server(*server).is_err() {
+                failures.push("an MCP server's Vault credential could not be discarded".to_owned());
+            }
+        }
+    }
+    let active: Option<HashSet<(String, String)>> = context
+        .state
+        .lock()
+        .map(|state| {
+            state
+                .plugins
+                .iter()
+                .map(|view| (view.name.clone(), view.digest.clone()))
+                .collect()
+        })
+        .ok();
+    let Some(active) = active else {
+        // Without the projection, no directory can be told from the active
+        // package's, so none of them is deleted.
+        failures.push("the Space's state could not be read to finish the cleanup".to_owned());
+        return failures;
+    };
+    let plugins = context.home.plugins_dir();
+    for package in packages {
+        // A currently-installed package of the same name and digest is the
+        // active one: its bytes are not this removal's to delete.
+        if active.contains(&(package.name.clone(), package.digest.clone())) {
+            continue;
+        }
+        if remove_package_dir(&plugins.join(format!("{}@{}", package.name, package.digest)))
+            .is_err()
+        {
+            failures.push("a package's files could not be deleted".to_owned());
+        }
+    }
+    failures
+}
+
+/// Finishes the cleanup one command's recorded removals need, and reports what
+/// could not be finished.
+///
+/// A record that cannot be read is reported as a cleanup failure rather than a
+/// command error: the caller's append already changed the record.
+async fn finish_recorded_cleanup(context: &CommandContext<'_>, command_id: Id) -> Vec<String> {
+    let packages = match recorded_removals(context, command_id).await {
+        Ok(packages) => packages,
+        Err(_) => return vec!["the record could not be read to finish the cleanup".to_owned()],
+    };
+    cleanup_removed_packages(context, &packages).await
+}
+
+/// The `cleanup` field of an answer whose cleanup did not finish.
+fn cleanup_warning(failures: &[String]) -> String {
+    format!("incomplete: {}", failures.join("; "))
+}
+
+/// The `cleanup` field of an answer whose retried command finished the cleanup.
+const CLEANUP_FINISHED: &str = "finished";
+
+/// Adds the cleanup a command still owes to its answer.
+fn with_cleanup(mut result: Value, failures: &[String]) -> Value {
+    if !failures.is_empty() {
+        result["cleanup"] = json!(cleanup_warning(failures));
+    }
+    result
+}
+
+/// Says a recorded cleanup is still incomplete when the recorded answer already
+/// said so; otherwise the recorded answer is the answer.
+fn warned_replay(mut outcome: Outcome, failures: &[String]) -> Outcome {
+    if !failures.is_empty() && outcome.result.get("cleanup").is_some() {
+        outcome.result["cleanup"] = json!(cleanup_warning(failures));
+    }
+    outcome
+}
+
+/// Removes one package's directory, treating one that is already gone as
+/// removed so a retried cleanup is idempotent.
+fn remove_package_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Finishes the cleanup a new command names by the server the projection says
+/// left.
+///
+/// A CLI retry carries a new command id, so it cannot replay the removal that
+/// did not finish its cleanup; what it can name is the server. The projection
+/// keeps what that removal was, so finishing it reads no page of the record.
+/// Finishing that removal writes no event, and the answer says whether the
+/// cleanup is done.
+///
+/// Only an account that could have removed the server finishes its cleanup: the
+/// Admin for a Space's server, the User a server belonged to. A Space's server
+/// is listed to every account, so a refusal can name the authority it takes; a
+/// User's server is not another account's to see, so the answer is the one a
+/// removal of a server that is not there gives.
+fn finish_removed_mcp_server_cleanup(
+    context: &CommandContext<'_>,
+    account: &Account,
+    server: Id,
+    removed: Option<RemovedMcpView>,
+) -> Result<Outcome, ApiError> {
+    let Some(removed) = removed else {
+        return Err(ApiError::not_found("no such MCP server"));
+    };
+    let permitted = match removed.scope {
+        neha::record::McpScope::Space => account.is_admin,
+        neha::record::McpScope::User => removed.user == Some(account.id),
+    };
+    if !permitted {
+        return Err(match removed.scope {
+            neha::record::McpScope::Space => ApiError::forbidden(
+                "only the account that connected a server, or the Admin for the Space's, removes it",
+            ),
+            neha::record::McpScope::User => ApiError::not_found("no such MCP server"),
+        });
+    }
+    let failures = cleanup_removed_mcp_server(context, server);
+    let result = json!({
+        "server": server,
+        "name": removed.name,
+        // The command's owner, as a removal's answer names it.
+        "user": account.id,
+        "cleanup": if failures.is_empty() {
+            CLEANUP_FINISHED.to_owned()
+        } else {
+            cleanup_warning(&failures)
+        },
+    });
+
+    Ok(Outcome {
+        committed: None,
+        result,
+        queued: None,
+        events: Vec::new(),
+    })
+}
+
+/// Discards one removed MCP server's Vault credentials, reporting a cleanup
+/// that did not finish.
+///
+/// The server's credential directory is the server's: it holds the Space's slot
+/// and every User's, so one discard discards both, and a slot that was never
+/// written is already clean. The record already says the server is gone, so the
+/// caller answers success with the warning rather than an error.
+fn cleanup_removed_mcp_server(context: &CommandContext<'_>, server: Id) -> Vec<String> {
+    match context.secrets.discard_mcp_server(server) {
+        Ok(()) => Vec::new(),
+        Err(_) => vec!["an MCP server's Vault credential could not be discarded".to_owned()],
+    }
+}
+
+/// Writes one validated package under the directory that holds it.
+///
+/// A package path is relative and already free of `..`; every component is
+/// checked once more, so a path another platform reads as absolute cannot
+/// write outside the root. A failed write removes the directory, so a refused
+/// install leaves no partial package behind.
+fn write_package(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
+    if let Err(error) = write_package_files(root, files) {
+        let _ = std::fs::remove_dir_all(root);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn write_package_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
+    let _ = std::fs::remove_dir_all(root);
+    std::fs::create_dir_all(root)?;
+    restrict(root, 0o700)?;
+    for (path, bytes) in files {
+        let mut target = root.to_path_buf();
+        for part in path.split('/') {
+            if !is_path_component(part) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a package path is not a relative file path",
+                ));
+            }
+            target.push(part);
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, bytes)?;
+        restrict(&target, 0o600)?;
+    }
+
+    Ok(())
+}
+
+/// Whether one slash-separated part of a package path names one file name.
+fn is_path_component(part: &str) -> bool {
+    if part.is_empty() || part == "." || part == ".." || part.contains('\\') {
+        return false;
+    }
+    let mut components = Path::new(part).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+/// Sets one path's permissions on Unix. On another platform the home's own
+/// permissions are all a Space can rely on.
+#[cfg(unix)]
+fn restrict(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn restrict(_path: &Path, _mode: u32) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// How one Provider will be recorded.
@@ -5381,9 +6579,10 @@ impl RedactingRuntime<'_> {
                 server.name
             ));
         };
-        let Ok(mut client) = crate::mcp::McpClient::new(&server.url, Some(&credential)) else {
+        let Ok(client) = crate::mcp::McpClient::new(&server.url, Some(&credential)) else {
             return ActionResult::failed("the MCP server's address is not usable");
         };
+        let mut client = client.with_headers(&server.headers);
         if let Err(error) = client.open().await {
             return ActionResult::failed(format!(
                 "the MCP server {:?} did not answer: {error}",
@@ -5947,6 +7146,13 @@ struct OfferedTools {
 ///
 /// A server that cannot answer keeps its tools out of the run and leaves every
 /// other server and skill usable: a broken integration never breaks the Bot.
+///
+/// Discovery speaks to every enabled server the Bot may call, with the
+/// credential it finds and the headers the package configures. The headers are
+/// validated, non-secret package data, so they are sent whatever the credential
+/// is; the tools are still offered without one, so a call can answer that the
+/// server is not connected as the contract says, and a personal credential that
+/// cannot be read stops discovery instead of falling back to the Space's.
 async fn offered_tools(
     state: &Mutex<State>,
     secrets: &Secrets,
@@ -5963,15 +7169,21 @@ async fn offered_tools(
     // a server that pages or stalls cannot keep the Model waiting behind it.
     const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let discovered = futures_util::future::join_all(servers.into_iter().map(|server| async move {
-        // The acting User's credential wins; the Space's answers otherwise.
+        // The acting User's credential wins; the Space's answers otherwise. A
+        // server with neither is still discovered, with the package's headers,
+        // and its tools are still offered, so a call can answer that it is not
+        // connected.
         let credential = match secrets.mcp_credential(server.server, Some(acting)) {
             Ok(Some(credential)) => Some(credential),
             Ok(None) => secrets.mcp_credential(server.server, None).ok().flatten(),
+            // A personal credential that cannot be read is not an absent one:
+            // no request may run as another account.
             Err(_) => return (server, Vec::new(), None),
         };
-        let Ok(mut client) = crate::mcp::McpClient::new(&server.url, credential.as_deref()) else {
-            return (server, Vec::new(), credential);
+        let Ok(client) = crate::mcp::McpClient::new(&server.url, credential.as_deref()) else {
+            return (server, Vec::new(), None);
         };
+        let mut client = client.with_headers(&server.headers);
         let listed = tokio::time::timeout(DISCOVERY_TIMEOUT, async {
             client.open().await?;
             client.tools().await
@@ -5979,7 +7191,7 @@ async fn offered_tools(
         .await;
         match listed {
             Ok(Ok(list)) => (server, list, credential),
-            Ok(Err(_)) | Err(_) => (server, Vec::new(), credential),
+            Ok(Err(_)) | Err(_) => (server, Vec::new(), None),
         }
     }))
     .await;
@@ -5991,8 +7203,9 @@ async fn offered_tools(
             }
             // A schema or name that holds the credential would carry it into
             // every model request; the tool is left out instead.
-            if let Some(credential) = &credential
-                && declaration_carries(&tool, credential)
+            if credential
+                .as_deref()
+                .is_some_and(|credential| declaration_carries(&tool, credential))
             {
                 continue;
             }
@@ -7997,26 +9210,363 @@ fn store_error(error: crate::store::StoreError) -> ApiError {
 mod tests {
     use std::sync::Mutex;
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use neha_computer::ComputerRuntime as _;
 
     use super::{
-        LoopCall, McpCatalog, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path,
-        ambiguous_path_at, grant_folder, grants_with, lasting_rule_path_at,
-        load_resume_continuation, normalized_grants, path_covers, path_matches, path_matches_at,
-        path_parent, persistable_grant, pinned_access, prepare_recovery, prepare_resume,
-        resolve_action_path, resumed_access, rule_covers, rule_matches, run_access, under_root,
-        verify_recovered_action,
+        CommandContext, LoopCall, McpCatalog, RecoveryPlan, RedactingRuntime, RunRuntime,
+        SkillLibrary, ambiguous_path, ambiguous_path_at, grant_folder, grants_with,
+        lasting_rule_path_at, load_resume_continuation, normalized_grants, path_covers,
+        path_matches, path_matches_at, path_parent, persistable_grant, pinned_access, plugin_list,
+        plugin_remove, plugin_set_enabled, prepare_recovery, prepare_resume, resolve_action_path,
+        resumed_access, rule_covers, rule_matches, run_access, under_root, verify_recovered_action,
     };
     use crate::blobs::Blobs;
+    use crate::catalog::CatalogStore;
+    use crate::computer_link::ComputerLinks;
+    use crate::config::{CatalogConfig, PluginsConfig, Storage};
     use crate::home::Home;
+    use crate::identity::{Account, Identity};
+    use crate::runs::RunQueue;
+    use crate::secrets::Secrets;
+    use crate::server::PairingAttempts;
     use crate::state::{AccessView, BotView, RuleView};
     use crate::store::{AppendRequest, ContinuationWrite, Store};
     use neha::error::ErrorCode;
     use neha::id::Id;
-    use neha::record::{EventDraft, RuleEffect};
+    use neha::record::{EventDraft, EventKind, RuleEffect};
     use neha::seq::Seq;
+
+    /// A Space's connections, opened in one temporary home.
+    ///
+    /// The plugin commands read the record, the projection, the package
+    /// directory, and the Vault, so a focused test needs a Space's real
+    /// dependencies rather than a hand-built `CommandContext`.
+    struct TestSpace {
+        home: Home,
+        store: Store,
+        state: Mutex<State>,
+        blobs: Blobs,
+        secrets: Secrets,
+        identity: Identity,
+        links: ComputerLinks,
+        pairings: tokio::sync::Mutex<PairingAttempts>,
+        approvals: tokio::sync::Mutex<()>,
+        library: tokio::sync::Mutex<()>,
+        runs: RunQueue,
+        events: tokio::sync::broadcast::Sender<Event>,
+        catalog: CatalogStore,
+        plugins: PluginsConfig,
+        // Dropped last: it holds the directories the rest of the Space uses.
+        _directory: tempfile::TempDir,
+    }
+
+    impl TestSpace {
+        async fn open() -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let home = Home::open(directory.path()).unwrap();
+            let store = Store::open(&home).await.unwrap();
+            let blobs = Blobs::open(&home, &Storage::Local).unwrap();
+            let secrets = Secrets::load(&home).unwrap();
+            let identity = Identity::open(&home).await.unwrap();
+            let catalog = CatalogStore::open(&home, &CatalogConfig::default());
+            let (events, _) = tokio::sync::broadcast::channel(8);
+
+            Self {
+                home,
+                store,
+                state: Mutex::new(State::default()),
+                blobs,
+                secrets,
+                identity,
+                links: ComputerLinks::new(),
+                pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
+                approvals: tokio::sync::Mutex::new(()),
+                library: tokio::sync::Mutex::new(()),
+                runs: RunQueue::new(),
+                events,
+                catalog,
+                plugins: PluginsConfig::default(),
+                _directory: directory,
+            }
+        }
+
+        fn context(&self) -> CommandContext<'_> {
+            CommandContext {
+                store: &self.store,
+                state: &self.state,
+                home: &self.home,
+                blobs: &self.blobs,
+                secrets: &self.secrets,
+                identity: &self.identity,
+                links: &self.links,
+                pairings: &self.pairings,
+                approvals: &self.approvals,
+                library: &self.library,
+                runs: &self.runs,
+                events: &self.events,
+                catalog: &self.catalog,
+                plugins: &self.plugins,
+            }
+        }
+
+        /// Records the installation of one package and projects it.
+        async fn install_package(&self, admin: Id, name: &str) -> (Id, String) {
+            let plugin = Id::new();
+            let digest = "a".repeat(64);
+            let draft = EventDraft::new(
+                EventKind::PluginInstalled,
+                Author::User(admin),
+                json!({
+                    "plugin": plugin,
+                    "name": name,
+                    "version": "1.0.0",
+                    "digest": digest,
+                    "source": format!("https://example.com/acme/{name}@abc1234"),
+                    "servers": [],
+                    "skills": [],
+                }),
+            );
+            let appended = self
+                .store
+                .append(AppendRequest::new(
+                    Id::new(),
+                    "install".to_owned(),
+                    vec![draft],
+                ))
+                .await
+                .unwrap();
+            super::apply(&self.state, &appended.events).unwrap();
+
+            (plugin, digest)
+        }
+
+        /// Records one command's events and result, and projects them, as the
+        /// record would hold them after the handler wrote them.
+        async fn record(
+            &self,
+            command: Id,
+            fingerprint: &str,
+            drafts: Vec<EventDraft>,
+            result: serde_json::Value,
+        ) {
+            let appended = self
+                .store
+                .append(
+                    AppendRequest::new(command, fingerprint.to_owned(), drafts).with_result(result),
+                )
+                .await
+                .unwrap();
+            assert!(!appended.existing);
+            super::apply(&self.state, &appended.events).unwrap();
+        }
+
+        /// Records one package that brought one MCP server, and projects it.
+        async fn install_package_with_server(&self, admin: Id, name: &str) -> (Id, String, Id) {
+            let plugin = Id::new();
+            let server = Id::new();
+            let digest = "b".repeat(64);
+            self.record(
+                Id::new(),
+                "install",
+                vec![
+                    EventDraft::new(
+                        EventKind::PluginInstalled,
+                        Author::User(admin),
+                        json!({
+                            "plugin": plugin,
+                            "name": name,
+                            "version": "1.0.0",
+                            "digest": digest,
+                            "source": format!("https://example.com/acme/{name}@abc1234"),
+                            "servers": [server],
+                            "skills": [],
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::McpServerAdded,
+                        Author::User(admin),
+                        json!({
+                            "server": server,
+                            "name": format!("{name}-server"),
+                            "url": "https://example.com/mcp",
+                            "scope": "space",
+                            "by": admin,
+                            "plugin": plugin,
+                        }),
+                    ),
+                ],
+                json!({}),
+            )
+            .await;
+
+            (plugin, digest, server)
+        }
+
+        /// Records one MCP server the Space connected, and projects it.
+        async fn connect_server(&self, admin: Id, name: &str, url: &str) -> Id {
+            let server = Id::new();
+            self.record(
+                Id::new(),
+                "connect",
+                vec![EventDraft::new(
+                    EventKind::McpServerAdded,
+                    Author::User(admin),
+                    json!({
+                        "server": server,
+                        "name": name,
+                        "url": url,
+                        "scope": "space",
+                        "by": admin,
+                    }),
+                )],
+                json!({}),
+            )
+            .await;
+
+            server
+        }
+    }
+
+    fn account(is_admin: bool) -> Account {
+        Account {
+            id: Id::new(),
+            display_name: if is_admin { "Admin" } else { "Eve" }.to_owned(),
+            is_admin,
+        }
+    }
+
+    /// Returns the error a plugin command was refused with; an `Outcome` has
+    /// no `Debug`, so `unwrap_err` cannot name one.
+    fn refused<T>(outcome: Result<T, super::ApiError>) -> super::ApiError {
+        match outcome {
+            Ok(_) => panic!("the command must be refused"),
+            Err(error) => error,
+        }
+    }
+
+    /// The staging directories the Space's plugins directory still holds.
+    ///
+    /// Only the Linux-only directory-install tests use it, so it is gated with
+    /// them.
+    #[cfg(target_os = "linux")]
+    fn staging_names(space: &TestSpace) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(space.home.plugins_dir()) else {
+            return Vec::new();
+        };
+        entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".staging-"))
+            .collect()
+    }
+
+    /// One request the fake MCP server received: its JSON-RPC message and the
+    /// headers it was sent with.
+    #[derive(Clone)]
+    struct Received {
+        message: Value,
+        headers: axum::http::HeaderMap,
+    }
+
+    /// The first value of one request header, under its canonical name.
+    fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name)?.to_str().ok()
+    }
+
+    /// How many values one request header carries.
+    fn values(headers: &axum::http::HeaderMap, name: &str) -> usize {
+        headers.get_all(name).iter().count()
+    }
+
+    /// Runs a fake MCP server on a loopback port, answering the handshake and
+    /// listing one tool, and returns its address and a log of what it was sent.
+    async fn fake_mcp_server() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        fake_mcp_server_with_delay(None).await
+    }
+
+    /// The same server, answering after `delay`; a caller that needs another
+    /// command to run while this one waits names a delay.
+    async fn fake_mcp_server_with_delay(
+        delay: Option<std::time::Duration>,
+    ) -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<Received>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::body::{Body, Bytes};
+        use axum::http::{HeaderMap, header::CONTENT_TYPE};
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let log = seen.clone();
+                async move {
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    log.lock().unwrap().push(Received {
+                        message: message.clone(),
+                        headers,
+                    });
+                    if let Some(delay) = delay {
+                        tokio::time::sleep(delay).await;
+                    }
+                    match message["method"].as_str() {
+                        Some("initialize") => Response::builder()
+                            .header(CONTENT_TYPE, "application/json")
+                            .header("mcp-session-id", "session-1")
+                            .body(Body::from(
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": message["id"],
+                                    "result": {
+                                        "protocolVersion": crate::mcp::PROTOCOL_VERSION,
+                                        "capabilities": {"tools": {}},
+                                        "serverInfo": {"name": "fake", "version": "1"},
+                                    },
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        Some("tools/list") => Response::builder()
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": message["id"],
+                                    "result": {
+                                        "tools": [{
+                                            "name": "search",
+                                            "description": "Search.",
+                                            "inputSchema": {"type": "object"},
+                                        }],
+                                    },
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                        _ => Response::builder().status(202).body(Body::empty()).unwrap(),
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), log, task)
+    }
 
     fn ask(tool: &str, command_prefix: Option<&str>, path_prefix: Option<&str>) -> RuleView {
         RuleView {
@@ -8720,7 +10270,7 @@ mod tests {
 
     use crate::state::State;
     use crate::store::Projection as _;
-    use neha::record::{Author, Event, EventKind, KIND_VERSION};
+    use neha::record::{Author, Event, KIND_VERSION};
     use neha::time::Timestamp;
 
     fn event(
@@ -9825,5 +11375,2261 @@ mod tests {
             &ask("shell", None, None),
             &call("shell", json!({"command": "anything"}))
         ));
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_lists_installed_packages() {
+        let space = TestSpace::open().await;
+        let context = space.context();
+
+        let error = refused(plugin_list(&context, &account(false)));
+        assert_eq!(error.code(), ErrorCode::Forbidden);
+
+        let admin = account(true);
+        let (plugin, _) = space.install_package(admin.id, "reports").await;
+        let listed = plugin_list(&context, &admin).unwrap();
+        assert_eq!(
+            listed.result,
+            json!([{
+                "plugin": plugin,
+                "name": "reports",
+                "version": "1.0.0",
+                "digest": "a".repeat(64),
+                "commit": null,
+                "source": "https://example.com/acme/reports@abc1234",
+                "enabled": true,
+                "servers": [],
+                "skills": [],
+            }])
+        );
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_offers_a_package() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (plugin, _) = space.install_package(admin.id, "reports").await;
+        let context = space.context();
+        let fingerprint = "disable".to_owned();
+
+        // A stranger cannot change what the Space offers.
+        let error = refused(
+            plugin_set_enabled(
+                &context,
+                &account(false),
+                Id::new(),
+                fingerprint.clone(),
+                plugin,
+                false,
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::Forbidden);
+
+        // The Admin disables it: the projection follows and the answer says so.
+        let command = Id::new();
+        let disabled = plugin_set_enabled(
+            &context,
+            &admin,
+            command,
+            fingerprint.clone(),
+            plugin,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled.result["plugin"], json!(plugin));
+        assert_eq!(disabled.result["enabled"], json!(false));
+        assert!(disabled.committed.is_some());
+        assert!(!space.state.lock().unwrap().plugins[0].enabled);
+
+        // Disabling it again appends nothing and answers the same.
+        let cursor = space.store.last_seq().await.unwrap();
+        let unchanged = plugin_set_enabled(
+            &context,
+            &admin,
+            Id::new(),
+            fingerprint.clone(),
+            plugin,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unchanged.result, disabled.result);
+        assert!(unchanged.events.is_empty());
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+
+        // A retry of the first command replays the answer it recorded.
+        let replay = plugin_set_enabled(
+            &context,
+            &admin,
+            command,
+            fingerprint.clone(),
+            plugin,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.result, disabled.result);
+
+        // Enabling it again changes the view back, and an absent package is
+        // not found.
+        let enabled = plugin_set_enabled(
+            &context,
+            &admin,
+            Id::new(),
+            fingerprint.clone(),
+            plugin,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled.result["enabled"], json!(true));
+        assert!(space.state.lock().unwrap().plugins[0].enabled);
+
+        let absent = refused(
+            plugin_set_enabled(&context, &admin, Id::new(), fingerprint, Id::new(), true).await,
+        );
+        assert_eq!(absent.code(), ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn only_the_admin_removes_a_package_that_exists() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (plugin, digest) = space.install_package(admin.id, "reports").await;
+        let package_dir = space.home.plugins_dir().join(format!("reports@{digest}"));
+        std::fs::create_dir_all(&package_dir).unwrap();
+        let context = space.context();
+
+        let error = refused(
+            plugin_remove(
+                &context,
+                &account(false),
+                Id::new(),
+                "remove".to_owned(),
+                plugin,
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::Forbidden);
+        assert_eq!(space.state.lock().unwrap().plugins.len(), 1);
+
+        let error = refused(
+            plugin_remove(&context, &admin, Id::new(), "remove".to_owned(), Id::new()).await,
+        );
+        assert_eq!(error.code(), ErrorCode::NotFound);
+
+        let command = Id::new();
+        let removed = plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .unwrap();
+        assert_eq!(removed.result["plugin"], json!(plugin));
+        assert_eq!(removed.result["name"], json!("reports"));
+        assert!(removed.committed.is_some());
+        assert!(space.state.lock().unwrap().plugins.is_empty());
+        assert!(!package_dir.exists(), "the package's bytes leave the Space");
+
+        // A retry answers from the record instead of removing twice.
+        let again = plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .unwrap();
+        assert_eq!(again.result, removed.result);
+        assert!(again.events.is_empty());
+    }
+
+    // The shipped loader reads a directory source only on Linux: it binds each
+    // open to the descriptor of the directory it authorized through
+    // `/proc/self/fd`, and no other platform this Space runs on offers that. A
+    // repository archive installs the same package everywhere, so a test that
+    // installs from a directory runs only here, and the helpers it uses are
+    // gated with it.
+    /// Writes the package of the install tests under a Space's home and
+    /// answers its directory.
+    #[cfg(target_os = "linux")]
+    fn write_package_source(space: &TestSpace, version: &str) -> std::path::PathBuf {
+        let package = space.home.root().join("packages").join("weekly");
+        std::fs::create_dir_all(package.join("skills/summarize/scripts")).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"name\":\"weekly.tools\",\"version\":\"{version}\"}}",
+                crate::plugins::PLUGIN_SCHEMA
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("skills/summarize/SKILL.md"),
+            "---\nname: summarize\ndescription: Write the report.\n---\nFollow the steps.",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("skills/summarize/scripts/gather.sh"),
+            "printf hi",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("mcp.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"mcpServers\":{{\"reports\":{{\"type\":\
+                 \"streamable-http\",\"url\":\"https://example.com/mcp\",\"headers\":\
+                 {{\"X-Tenant\":\"public\"}}}}}}}}",
+                crate::plugins::MCP_SCHEMA
+            ),
+        )
+        .unwrap();
+
+        package
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_admin_installs_a_package_from_a_directory() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let plugin: Id = serde_json::from_value(installed.result["plugin"].clone()).unwrap();
+        let digest = installed.result["digest"].as_str().unwrap().to_owned();
+        assert_eq!(installed.result["name"], json!("weekly.tools"));
+        assert_eq!(installed.result["version"], json!("1.2.0"));
+        assert_eq!(installed.result["commit"], json!(null));
+        assert_eq!(
+            installed.result["source"],
+            json!(package.display().to_string())
+        );
+        assert_eq!(
+            installed.result["servers"][0]["name"],
+            json!("weekly-tools-reports")
+        );
+        assert_eq!(
+            installed.result["servers"][0]["url"],
+            json!("https://example.com/mcp")
+        );
+        assert_eq!(installed.result["skills"][0]["name"], json!("summarize"));
+        assert_eq!(installed.result["skipped"], json!([]));
+        assert!(installed.committed.is_some());
+        // The package's bytes are where its record names them.
+        assert!(
+            space
+                .home
+                .plugins_dir()
+                .join(format!("weekly.tools@{digest}"))
+                .join("plugin.json")
+                .is_file()
+        );
+
+        // The projection holds the package, its server with the package's
+        // headers, and its skill with the script stored by digest.
+        let (server, skill) = {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.plugins.len(), 1);
+            let view = &state.plugins[0];
+            assert_eq!(view.plugin, plugin);
+            assert!(view.enabled);
+            assert_eq!(view.servers.len(), 1);
+            assert_eq!(view.skills.len(), 1);
+            let server = state.mcp(view.servers[0]).unwrap().clone();
+            assert_eq!(server.plugin, Some(plugin));
+            assert_eq!(server.name, "weekly-tools-reports");
+            assert_eq!(server.url, "https://example.com/mcp");
+            assert_eq!(server.scope, neha::record::McpScope::Space);
+            assert_eq!(
+                server.headers.get("X-Tenant").map(String::as_str),
+                Some("public")
+            );
+            let skill = state.skill(view.skills[0]).unwrap().clone();
+            assert_eq!(skill.plugin, Some(plugin));
+            assert_eq!(skill.library, SkillLibrary::Space);
+            assert_eq!(skill.name, "summarize");
+            assert_eq!(skill.scripts.len(), 1);
+            assert_eq!(skill.scripts[0].name, "gather.sh");
+            (server, skill)
+        };
+        let sha256 = skill.scripts[0].sha256.clone();
+        assert_eq!(
+            crate::blobs::digest(b"printf hi"),
+            sha256,
+            "the record names the script's bytes"
+        );
+        assert_eq!(space.blobs.get(&sha256).await.unwrap(), b"printf hi");
+
+        // The record holds exactly the events the answer's ids name, in order.
+        let page = space.store.events_from(Seq::ZERO, 100).await.unwrap();
+        let kinds: Vec<EventKind> = page.events.iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                EventKind::PluginInstalled,
+                EventKind::McpServerAdded,
+                EventKind::SkillAdded,
+            ]
+        );
+        assert_eq!(
+            page.events[0].data["servers"],
+            json!([server.server]),
+            "the package names the server it brought"
+        );
+        assert_eq!(
+            page.events[0].data["skills"],
+            json!([skill.id]),
+            "the package names the skill it brought"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn installing_a_package_again_replaces_it() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let source = package.display().to_string();
+        let first = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "first".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        let first_plugin: Id = serde_json::from_value(first.result["plugin"].clone()).unwrap();
+        let first_digest = first.result["digest"].as_str().unwrap().to_owned();
+        let first_dir = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{first_digest}"));
+        assert!(first_dir.is_dir());
+
+        // The same package at a new version is a new digest: it replaces the
+        // package the Space holds under that name.
+        write_package_source(&space, "2.0.0");
+        let second =
+            super::plugin_install(&context, &admin, Id::new(), "second".to_owned(), source)
+                .await
+                .unwrap();
+        let second_plugin: Id = serde_json::from_value(second.result["plugin"].clone()).unwrap();
+        assert_ne!(second_plugin, first_plugin);
+        assert_eq!(second.result["version"], json!("2.0.0"));
+        assert_eq!(
+            second.result["skipped"],
+            json!([]),
+            "the replaced package's names are free for the new one"
+        );
+        assert_eq!(
+            second.result["servers"][0]["name"],
+            json!("weekly-tools-reports")
+        );
+        assert!(!first_dir.exists(), "the replaced package's bytes leave");
+        {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.plugins.len(), 1, "a Space holds one package per name");
+            assert_eq!(state.plugins[0].plugin, second_plugin);
+            assert_eq!(state.plugins[0].version.as_deref(), Some("2.0.0"));
+            assert_eq!(state.mcps.len(), 1, "the old server is gone");
+            assert_eq!(state.mcps[0].plugin, Some(second_plugin));
+            assert_eq!(state.skills.len(), 1, "the old skill is gone");
+            assert_eq!(state.skills[0].plugin, Some(second_plugin));
+        }
+
+        let page = space.store.events_from(Seq::ZERO, 100).await.unwrap();
+        let kinds: Vec<EventKind> = page.events.iter().map(|event| event.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                EventKind::PluginInstalled,
+                EventKind::McpServerAdded,
+                EventKind::SkillAdded,
+                EventKind::PluginRemoved,
+                EventKind::PluginInstalled,
+                EventKind::McpServerAdded,
+                EventKind::SkillAdded,
+            ],
+            "the removal is recorded before the replacement's events"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_package_part_the_space_already_holds_is_skipped() {
+        let mut space = TestSpace::open().await;
+        // A Space skill and a server whose names the package would take.
+        let user = Id::new();
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::SkillAdded,
+                Author::User(user),
+                json!({
+                    "skill": Id::new(),
+                    "library": "space",
+                    "name": "summarize",
+                    "description": "Write the report.",
+                    "body": "Body.",
+                    "scripts": [],
+                }),
+            ),
+            EventDraft::new(
+                EventKind::McpServerAdded,
+                Author::User(user),
+                json!({
+                    "server": Id::new(),
+                    "name": "weekly-tools-reports",
+                    "url": "https://other.example.com/mcp",
+                    "scope": "space",
+                    "by": user,
+                }),
+            ),
+        ];
+        let appended = space
+            .store
+            .append(AppendRequest::new(Id::new(), "existing".to_owned(), drafts))
+            .await
+            .unwrap();
+        super::apply(&space.state, &appended.events).unwrap();
+
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // The package installs; what the Space already holds keeps its name.
+        assert_eq!(installed.result["servers"], json!([]));
+        assert_eq!(installed.result["skills"], json!([]));
+        let skipped: Vec<&str> = installed.result["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(
+            skipped
+                .iter()
+                .any(|line| line.contains("weekly-tools-reports")),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped.iter().any(|line| line.contains("summarize")),
+            "{skipped:?}"
+        );
+        let state = space.state.lock().unwrap();
+        assert_eq!(state.plugins.len(), 1);
+        assert!(state.plugins[0].servers.is_empty());
+        assert!(state.plugins[0].skills.is_empty());
+        assert_eq!(state.mcps.len(), 1, "the Space's server is still its own");
+        assert_eq!(state.mcps[0].plugin, None);
+        assert_eq!(state.skills.len(), 1, "the Space's skill is still its own");
+        assert_eq!(state.skills[0].plugin, None);
+    }
+
+    #[tokio::test]
+    async fn the_admin_attaches_a_space_credential_to_an_existing_server() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let (url, log, server_task) = fake_mcp_server().await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        let context = space.context();
+
+        // A User who adds the existing Space server with their own credential
+        // connects it for themselves.
+        let own = super::mcp_add(
+            &context,
+            &user,
+            Id::new(),
+            "attach-own".to_owned(),
+            neha::surface::McpAdd {
+                name: "docs".to_owned(),
+                url: url.clone(),
+                scope: neha::record::McpScope::User,
+                credential: Some("user-token".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.result["server"], json!(server));
+        assert_eq!(own.result["connected"], json!(true), "the probe connected");
+        assert_eq!(
+            own.result["user"],
+            json!(user.id),
+            "the recorded answer belongs to the command's owner"
+        );
+        assert_eq!(
+            own.result["scope"],
+            json!("space"),
+            "the server stays the Space's"
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(user.id))
+                .unwrap()
+                .as_deref(),
+            Some("user-token")
+        );
+        assert_eq!(
+            space.secrets.mcp_credential(server, None).unwrap(),
+            None,
+            "a User's credential is not the Space's"
+        );
+
+        // Only the Admin may attach the Space's credential.
+        let refused_attach = refused(
+            super::mcp_add(
+                &context,
+                &user,
+                Id::new(),
+                "attach-space-refused".to_owned(),
+                neha::surface::McpAdd {
+                    name: "docs".to_owned(),
+                    url: url.clone(),
+                    scope: neha::record::McpScope::Space,
+                    credential: Some("another-token".to_owned()),
+                },
+            )
+            .await,
+        );
+        assert_eq!(refused_attach.code(), ErrorCode::Forbidden);
+
+        // The Admin attaches the Space's credential to the same server.
+        let command = Id::new();
+        let attach = || neha::surface::McpAdd {
+            name: "docs".to_owned(),
+            url: url.clone(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("space-token".to_owned()),
+        };
+        let attached = super::mcp_add(
+            &context,
+            &admin,
+            command,
+            "attach-space".to_owned(),
+            attach(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached.result["server"], json!(server));
+        assert_eq!(
+            attached.result["connected"],
+            json!(true),
+            "the answer is the probe's"
+        );
+        assert_eq!(
+            attached.result["user"],
+            json!(admin.id),
+            "the recorded answer belongs to the command's owner, not the server's"
+        );
+        assert_eq!(attached.result["scope"], json!("space"));
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("space-token")
+        );
+
+        // One server stays, and each attach is one update event on it.
+        {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.mcps.len(), 1, "an attach is not a second server");
+            assert_eq!(state.mcps[0].server, server);
+        }
+        let cursor = space.store.last_seq().await.unwrap();
+
+        // A retry of the Admin's attach replays the recorded answer: it stores
+        // no credential and appends no second update.
+        let replayed = super::mcp_add(
+            &context,
+            &admin,
+            command,
+            "attach-space".to_owned(),
+            attach(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed.result, attached.result);
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(
+            space.store.last_seq().await.unwrap(),
+            cursor,
+            "a replay writes no event"
+        );
+
+        let events = space
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events;
+        let updates: Vec<&Value> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::McpServerUpdated)
+            .map(|event| &event.data)
+            .collect();
+        assert_eq!(updates.len(), 2, "one update per attached credential");
+        assert_eq!(updates[1]["server"], json!(server));
+        assert_eq!(updates[1]["credential"], json!(true));
+        assert_eq!(
+            updates[1]["url"],
+            json!(null),
+            "an attach changes no address"
+        );
+        assert!(
+            !log.lock().unwrap().is_empty(),
+            "the probe reached the server"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_credential_rotation_keeps_the_working_token() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (url, log, server_task) =
+            fake_mcp_server_with_delay(Some(std::time::Duration::from_millis(300))).await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        space
+            .secrets
+            .store_mcp_credential(server, None, "old-token")
+            .unwrap();
+        let context = space.context();
+        // The command's id is claimed while the rotation waits for the server's
+        // handshake, so the append finds a command recorded under that id and
+        // fails. A rotation that finds a recorded command is the same append
+        // failure whatever caused it.
+        let command = Id::new();
+        let collision = async {
+            while space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref()
+                != Some("new-token")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            space
+                .record(
+                    command,
+                    "another command",
+                    vec![EventDraft::new(
+                        EventKind::McpServerAdded,
+                        Author::User(admin.id),
+                        json!({
+                            "server": Id::new(),
+                            "name": "collision",
+                            "url": "https://example.com/mcp",
+                            "scope": "space",
+                            "by": admin.id,
+                        }),
+                    )],
+                    json!({}),
+                )
+                .await;
+        };
+        let rotate = async {
+            super::mcp_add(
+                &context,
+                &admin,
+                command,
+                "rotate".to_owned(),
+                neha::surface::McpAdd {
+                    name: "docs".to_owned(),
+                    url: url.clone(),
+                    scope: neha::record::McpScope::Space,
+                    credential: Some("new-token".to_owned()),
+                },
+            )
+            .await
+        };
+        let (rotated, ()) = tokio::join!(rotate, collision);
+        let error = refused(rotated);
+        assert_eq!(error.code(), ErrorCode::IdempotencyConflict);
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("old-token"),
+            "the failed rotation puts the working token back"
+        );
+
+        // The old token is the one a call now sends, and it is still accepted.
+        log.lock().unwrap().clear();
+        let view = {
+            let state = space.state.lock().unwrap();
+            state.mcp(server).cloned().unwrap()
+        };
+        let seen = super::mcp_view(&context, view, admin.id).await.unwrap();
+        assert_eq!(seen["connected"], json!(true));
+        let sent = log.lock().unwrap();
+        assert_eq!(
+            sent.iter()
+                .rev()
+                .find_map(|received| header(&received.headers, "authorization")),
+            Some("Bearer old-token"),
+            "the restored credential is the one the Space sends"
+        );
+        drop(sent);
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_direct_add_refuses_a_query_string() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let context = space.context();
+        let cursor = space.store.last_seq().await.unwrap();
+
+        let error = refused(
+            super::mcp_add(
+                &context,
+                &admin,
+                Id::new(),
+                "query".to_owned(),
+                neha::surface::McpAdd {
+                    name: "docs".to_owned(),
+                    url: "https://example.com/mcp?access_token=secret".to_owned(),
+                    scope: neha::record::McpScope::Space,
+                    credential: None,
+                },
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let message = error.to_string();
+        assert!(
+            !message.contains("access_token") && !message.contains("secret"),
+            "the answer never repeats the address: {message}"
+        );
+        assert_eq!(
+            space.store.last_seq().await.unwrap(),
+            cursor,
+            "a refused add writes no event"
+        );
+        let events = space
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.data.to_string().contains("access_token")),
+            "the address never enters the record"
+        );
+        assert!(space.state.lock().unwrap().mcps.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_package_header_that_carries_a_credential_skips_the_server() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        // The loader admits the header's shape; registering it is the command's
+        // decision, and a credential-bearing header never enters a record.
+        std::fs::write(
+            package.join("mcp.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"mcpServers\":{{\"reports\":{{\"type\":\
+                 \"streamable-http\",\"url\":\"https://example.com/mcp\",\"headers\":\
+                 {{\"Authorization\":\"Bearer hidden\"}}}}}}}}",
+                crate::plugins::MCP_SCHEMA
+            ),
+        )
+        .unwrap();
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(installed.result["servers"], json!([]));
+        let skipped: Vec<&str> = installed.result["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            skipped
+                .iter()
+                .any(|line| line.contains("mcp.json") && line.contains("Authorization")),
+            "{skipped:?}"
+        );
+        assert!(
+            !installed.result.to_string().contains("hidden"),
+            "the refused value never enters the answer"
+        );
+        // Only the server entry is refused: the rest of the package installs.
+        assert_eq!(installed.result["skills"][0]["name"], json!("summarize"));
+        let state = space.state.lock().unwrap();
+        assert!(state.mcps.is_empty(), "no server entered the record");
+        assert_eq!(state.skills.len(), 1, "the package's skill still installs");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_package_server_drops_a_header_the_client_generates() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        // A generated header is the client's: the registration drops it with a
+        // report and keeps the package's own data headers.
+        std::fs::write(
+            package.join("mcp.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"mcpServers\":{{\"reports\":{{\"type\":\
+                 \"streamable-http\",\"url\":\"https://example.com/mcp\",\"headers\":\
+                 {{\"Accept\":\"*/*\",\"X-Tenant\":\"acme\"}}}}}}}}",
+                crate::plugins::MCP_SCHEMA
+            ),
+        )
+        .unwrap();
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            installed.result["servers"][0]["name"],
+            json!("weekly-tools-reports"),
+            "the server still registers with the rest of its headers"
+        );
+        let skipped: Vec<&str> = installed.result["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            skipped
+                .iter()
+                .any(|line| line.contains("mcp.json") && line.contains("Accept")),
+            "{skipped:?}"
+        );
+        assert!(
+            !installed.result.to_string().contains("*/*"),
+            "the dropped value never enters the answer"
+        );
+        let state = space.state.lock().unwrap();
+        let server = state.mcps.first().expect("the server entered the record");
+        assert_eq!(
+            server.headers.get("X-Tenant").map(String::as_str),
+            Some("acme"),
+            "the package's own header stays"
+        );
+        assert!(
+            !server.headers.contains_key("Accept"),
+            "the client sets its own Accept"
+        );
+        assert_eq!(server.headers.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_broken_mcp_configuration_does_not_stop_a_packages_skills() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        // A broken mcp.json disables only MCP; the package's skills still load.
+        std::fs::write(package.join("mcp.json"), "{\"$schema\": 7}").unwrap();
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(installed.result["servers"], json!([]));
+        let skipped: Vec<&str> = installed.result["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            skipped.iter().any(|line| line.starts_with("mcp.json:")),
+            "{skipped:?}"
+        );
+        assert_eq!(installed.result["skills"][0]["name"], json!("summarize"));
+        let state = space.state.lock().unwrap();
+        assert!(state.mcps.is_empty(), "no MCP server entered the record");
+        assert_eq!(state.skills.len(), 1, "the package's skill still installs");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn an_install_publishes_from_staging_and_leaves_none_behind() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let source = package.display().to_string();
+
+        let first = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "first".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        let digest = first.result["digest"].as_str().unwrap().to_owned();
+        let active = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{digest}"));
+        assert!(active.join("plugin.json").is_file());
+        assert!(
+            staging_names(&space).is_empty(),
+            "{:?}",
+            staging_names(&space)
+        );
+
+        // The same bytes install again: the active directory already exists
+        // for the digest, so it is kept and the staging directory is removed.
+        let second = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "second".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(second.result["digest"], json!(digest));
+        assert!(
+            active.join("plugin.json").is_file(),
+            "the active package is not written into or removed"
+        );
+        assert!(
+            staging_names(&space).is_empty(),
+            "{:?}",
+            staging_names(&space)
+        );
+
+        // A stopped attempt can leave its staging directory behind; replaying
+        // its command removes it before answering.
+        let command = Id::new();
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            command,
+            "third".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        let stray = super::staging_dir(&space.home.plugins_dir(), command);
+        std::fs::create_dir_all(stray.join("leftover")).unwrap();
+        let replay = super::plugin_install(&context, &admin, command, "third".to_owned(), source)
+            .await
+            .unwrap();
+        assert_eq!(replay.result, installed.result);
+        assert!(replay.events.is_empty(), "a replay appends nothing");
+        assert!(
+            !stray.exists(),
+            "a replay removes the staging directory it finds"
+        );
+        assert!(
+            staging_names(&space).is_empty(),
+            "{:?}",
+            staging_names(&space)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_failed_publish_leaves_no_record_and_a_retry_installs() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let source = package.display().to_string();
+        // A file where the digest directory belongs makes the publish fail
+        // after the package is staged and before anything enters the record.
+        let mut ignored = Vec::new();
+        let files = crate::plugins::read_directory(&package, &mut ignored).unwrap();
+        let read = crate::plugins::validate(&files).unwrap();
+        let digest = crate::plugins::digest(&files);
+        let blocked = space
+            .home
+            .plugins_dir()
+            .join(format!("{}@{digest}", read.manifest.name));
+        std::fs::write(&blocked, "not a directory").unwrap();
+
+        let command = Id::new();
+        let error = refused(
+            super::plugin_install(
+                &context,
+                &admin,
+                command,
+                "install".to_owned(),
+                source.clone(),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::Internal);
+        assert!(
+            space.store.command(command).await.unwrap().is_none(),
+            "a failed publish records no command"
+        );
+        assert!(space.state.lock().unwrap().plugins.is_empty());
+        assert!(
+            staging_names(&space).is_empty(),
+            "{:?}",
+            staging_names(&space)
+        );
+
+        // With the blocking file gone, the same command installs.
+        std::fs::remove_file(&blocked).unwrap();
+        let installed =
+            super::plugin_install(&context, &admin, command, "install".to_owned(), source)
+                .await
+                .unwrap();
+        assert!(installed.committed.is_some());
+        assert_eq!(installed.result["digest"], json!(digest));
+        assert!(
+            blocked.join("plugin.json").is_file(),
+            "the retry publishes the package's bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replayed_removal_finishes_the_cleanup_it_recorded() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (plugin, digest, server) = space.install_package_with_server(admin.id, "reports").await;
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        let package_dir = space.home.plugins_dir().join(format!("reports@{digest}"));
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("plugin.json"), "{}").unwrap();
+
+        // A removal that wrote its event and answer but stopped before it
+        // cleaned the Vault and the bytes: begin from what the record holds.
+        let command = Id::new();
+        let result = json!({"plugin": plugin, "name": "reports", "user": admin.id});
+        space
+            .record(
+                command,
+                "remove",
+                vec![EventDraft::new(
+                    EventKind::PluginRemoved,
+                    Author::User(admin.id),
+                    json!({"plugin": plugin}),
+                )],
+                result.clone(),
+            )
+            .await;
+
+        let context = space.context();
+        let replayed = super::plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .unwrap();
+
+        assert_eq!(replayed.result, result, "the recorded answer is the answer");
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(
+            space.secrets.mcp_credential(server, None).unwrap(),
+            None,
+            "the Vault credential of a removed server leaves"
+        );
+        assert!(
+            !package_dir.exists(),
+            "the package's bytes are deleted on the replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replay_warns_again_while_the_cleanup_still_fails() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (plugin, _digest, server) =
+            space.install_package_with_server(admin.id, "reports").await;
+        // A plain file where the server's credential directory belongs: the
+        // Vault cannot discard it.
+        let blocked = space
+            .home
+            .root()
+            .join("secrets")
+            .join(format!("mcp-{server}"));
+        std::fs::write(&blocked, "space-token").unwrap();
+
+        // A removal whose recorded answer already warned about its cleanup.
+        let command = Id::new();
+        let recorded = json!({
+            "plugin": plugin,
+            "name": "reports",
+            "user": admin.id,
+            "cleanup": "incomplete: an earlier attempt",
+        });
+        space
+            .record(
+                command,
+                "remove",
+                vec![EventDraft::new(
+                    EventKind::PluginRemoved,
+                    Author::User(admin.id),
+                    json!({"plugin": plugin}),
+                )],
+                recorded.clone(),
+            )
+            .await;
+        let context = space.context();
+
+        // The replay answers what the record holds, and warns again while the
+        // cleanup still does not finish.
+        let replayed = super::plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .unwrap();
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(
+            replayed.result["cleanup"],
+            json!("incomplete: an MCP server's Vault credential could not be discarded")
+        );
+
+        // Once the cleanup finishes, the recorded answer is the answer.
+        std::fs::remove_file(&blocked).unwrap();
+        let replayed = super::plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .unwrap();
+        assert_eq!(replayed.result, recorded);
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_replayed_removal_keeps_a_later_installation_of_the_same_bytes() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let source = package.display().to_string();
+
+        let first = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "first".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        let first_plugin: Id = serde_json::from_value(first.result["plugin"].clone()).unwrap();
+        let digest = first.result["digest"].as_str().unwrap().to_owned();
+        let package_dir = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{digest}"));
+
+        let removal = Id::new();
+        let removed =
+            super::plugin_remove(&context, &admin, removal, "remove".to_owned(), first_plugin)
+                .await
+                .unwrap();
+        assert!(
+            !package_dir.exists(),
+            "the removal deletes the package's bytes"
+        );
+
+        // The same bytes install again: a new package, with a new server and
+        // skill, under the directory name the old removal's record holds.
+        let second =
+            super::plugin_install(&context, &admin, Id::new(), "second".to_owned(), source)
+                .await
+                .unwrap();
+        let second_plugin: Id = serde_json::from_value(second.result["plugin"].clone()).unwrap();
+        assert_eq!(second.result["digest"], json!(digest));
+        let second_server: Id =
+            serde_json::from_value(second.result["servers"][0]["server"].clone()).unwrap();
+        let second_skill: Id =
+            serde_json::from_value(second.result["skills"][0]["skill"].clone()).unwrap();
+        assert!(package_dir.is_dir(), "the active package is published");
+
+        // Retrying the old removal answers what it recorded, and the active
+        // package's bytes are not the old removal's to delete.
+        let replayed =
+            super::plugin_remove(&context, &admin, removal, "remove".to_owned(), first_plugin)
+                .await
+                .unwrap();
+        assert_eq!(replayed.result, removed.result);
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert!(
+            package_dir.is_dir(),
+            "the active package's bytes stay after the replayed removal"
+        );
+        {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.plugins.len(), 1);
+            assert_eq!(state.plugins[0].plugin, second_plugin);
+            assert_eq!(state.plugins[0].servers, vec![second_server]);
+            assert_eq!(state.plugins[0].skills, vec![second_skill]);
+            assert!(
+                state.mcp(second_server).is_some(),
+                "the active package still lists its server"
+            );
+            assert!(
+                state.skill(second_skill).is_some(),
+                "the active package still lists its skill"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_removal_reports_a_credential_it_could_not_discard() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (plugin, digest, server) = space.install_package_with_server(admin.id, "reports").await;
+        let package_dir = space.home.plugins_dir().join(format!("reports@{digest}"));
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("plugin.json"), "{}").unwrap();
+        // A plain file where the server's credential directory belongs: the
+        // Vault cannot discard the credential. It holds a value no answer may
+        // repeat.
+        let credential = "space-token";
+        let blocked = space
+            .home
+            .root()
+            .join("secrets")
+            .join(format!("mcp-{server}"));
+        std::fs::write(&blocked, credential).unwrap();
+
+        let context = space.context();
+        let command = Id::new();
+        // The record changes, so the removal answers; the cleanup it could not
+        // finish is named in the answer instead of turning it into an error.
+        let removed = super::plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .expect("a cleanup that does not finish does not suppress the committed removal");
+
+        assert_eq!(removed.result["plugin"], json!(plugin));
+        assert_eq!(removed.result["name"], json!("reports"));
+        assert_eq!(removed.result["user"], json!(admin.id));
+        assert_eq!(
+            removed.result["cleanup"],
+            json!("incomplete: an MCP server's Vault credential could not be discarded"),
+            "the answer names the cleanup it still owes"
+        );
+        assert!(
+            !removed.result["cleanup"]
+                .as_str()
+                .unwrap()
+                .contains(credential),
+            "the warning never repeats a credential"
+        );
+        assert!(removed.committed.is_some());
+        assert_eq!(
+            removed.events.len(),
+            1,
+            "the committed removal is not suppressed by the cleanup"
+        );
+        assert!(
+            !package_dir.exists(),
+            "the cleanup it could do, it did: the bytes are gone"
+        );
+
+        // Once the obstacle is gone, a replay finishes the cleanup and answers
+        // what the record holds.
+        std::fs::remove_file(&blocked).unwrap();
+        let cursor = space.store.last_seq().await.unwrap();
+        let replayed = super::plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .unwrap();
+        assert_eq!(
+            replayed.result,
+            json!({"plugin": plugin, "name": "reports", "user": admin.id}),
+            "the recorded answer is the answer"
+        );
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+    }
+
+    #[tokio::test]
+    async fn a_removal_reports_package_files_it_could_not_delete() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (plugin, digest, _server) =
+            space.install_package_with_server(admin.id, "reports").await;
+        let package_dir = space.home.plugins_dir().join(format!("reports@{digest}"));
+        // A plain file where the package directory belongs: it cannot be
+        // deleted as a directory, and the record already says the package is
+        // gone.
+        std::fs::write(&package_dir, "blocked").unwrap();
+
+        let context = space.context();
+        let command = Id::new();
+        let removed = super::plugin_remove(&context, &admin, command, "remove".to_owned(), plugin)
+            .await
+            .expect("a cleanup that does not finish does not suppress the committed removal");
+
+        assert_eq!(removed.result["plugin"], json!(plugin));
+        assert_eq!(removed.result["name"], json!("reports"));
+        assert_eq!(removed.result["user"], json!(admin.id));
+        assert_eq!(
+            removed.result["cleanup"],
+            json!("incomplete: a package's files could not be deleted")
+        );
+        assert!(removed.committed.is_some());
+        assert_eq!(removed.events.len(), 1);
+        assert!(package_dir.is_file(), "the obstacle is still there");
+
+        // A CLI retry sends a new command id, so it cannot replay the removal.
+        // The record still names the removal; naming the package finishes its
+        // cleanup, and that path writes no event.
+        std::fs::remove_file(&package_dir).unwrap();
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(package_dir.join("plugin.json"), "{}").unwrap();
+        let cursor = space.store.last_seq().await.unwrap();
+        let recovered =
+            super::plugin_remove(&context, &admin, Id::new(), "recover".to_owned(), plugin)
+                .await
+                .unwrap();
+        assert_eq!(
+            recovered.result,
+            json!({
+                "plugin": plugin,
+                "name": "reports",
+                "user": admin.id,
+                "cleanup": "finished",
+            })
+        );
+        assert!(
+            recovered.events.is_empty(),
+            "finishing a cleanup appends nothing"
+        );
+        assert!(recovered.committed.is_none());
+        assert_eq!(
+            space.store.last_seq().await.unwrap(),
+            cursor,
+            "finishing a cleanup writes no event"
+        );
+        assert!(!package_dir.exists(), "the retry deletes the bytes");
+
+        // The same command again is idempotent: the record still names the
+        // removal and its cleanup is already done.
+        let again = super::plugin_remove(
+            &context,
+            &admin,
+            Id::new(),
+            "recover again".to_owned(),
+            plugin,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.result, recovered.result);
+        assert!(again.events.is_empty());
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+
+        // A package the record never installed is still not found, whatever
+        // the command id.
+        let unknown = refused(
+            super::plugin_remove(&context, &admin, Id::new(), "unknown".to_owned(), Id::new())
+                .await,
+        );
+        assert_eq!(unknown.code(), ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_mcp_removal_runs_the_cleanup_it_recorded() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let server = space
+            .connect_server(admin.id, "docs", "https://example.com/mcp")
+            .await;
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+
+        // A removal that wrote its event and answer but stopped before it
+        // discarded the credential: begin from what the record holds.
+        let command = Id::new();
+        let result = json!({"server": server, "name": "docs", "user": admin.id});
+        space
+            .record(
+                command,
+                "remove",
+                vec![EventDraft::new(
+                    EventKind::McpServerRemoved,
+                    Author::User(admin.id),
+                    json!({"server": server}),
+                )],
+                result.clone(),
+            )
+            .await;
+        let cursor = space.store.last_seq().await.unwrap();
+        let context = space.context();
+
+        let replayed = super::mcp_remove(&context, &admin, command, "remove".to_owned(), server)
+            .await
+            .unwrap();
+
+        assert_eq!(replayed.result, result, "the recorded answer is the answer");
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(
+            space.store.last_seq().await.unwrap(),
+            cursor,
+            "a replay writes no event"
+        );
+        assert_eq!(
+            space.secrets.mcp_credential(server, None).unwrap(),
+            None,
+            "the replayed cleanup discards the credential"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_mcp_cleanup_is_reported_and_a_new_command_finishes_it() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let server = space
+            .connect_server(admin.id, "docs", "https://example.com/mcp")
+            .await;
+        // A Space server may hold the Space's credential and one User's: both
+        // slots are the server's.
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        space
+            .secrets
+            .store_mcp_credential(server, Some(admin.id), "user-token")
+            .unwrap();
+        // A plain file where the server's credential directory belongs: the
+        // Vault cannot discard it. The credentials the failed discard leaves
+        // are held aside and put back before the retry, where it finds them.
+        let blocked = space
+            .home
+            .root()
+            .join("secrets")
+            .join(format!("mcp-{server}"));
+        let held = space.home.root().join("secrets").join("held-credential");
+        std::fs::rename(&blocked, &held).unwrap();
+        std::fs::write(&blocked, "blocked").unwrap();
+
+        let context = space.context();
+        let removed = super::mcp_remove(&context, &admin, Id::new(), "remove".to_owned(), server)
+            .await
+            .expect("a cleanup that does not finish does not suppress the committed removal");
+
+        assert_eq!(removed.result["server"], json!(server));
+        assert_eq!(removed.result["name"], json!("docs"));
+        assert_eq!(removed.result["user"], json!(admin.id));
+        assert_eq!(
+            removed.result["cleanup"],
+            json!("incomplete: an MCP server's Vault credential could not be discarded"),
+            "the answer names the cleanup it still owes"
+        );
+        assert!(removed.committed.is_some());
+        assert_eq!(
+            removed.events.len(),
+            1,
+            "the committed removal is not suppressed by the cleanup"
+        );
+        assert!(space.state.lock().unwrap().mcp(server).is_none());
+
+        // While the obstacle stays, the fresh-id retry answers the warning form
+        // and still writes no event.
+        let cursor = space.store.last_seq().await.unwrap();
+        let still_blocked = super::mcp_remove(
+            &context,
+            &admin,
+            Id::new(),
+            "recover blocked".to_owned(),
+            server,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            still_blocked.result,
+            json!({
+                "server": server,
+                "name": "docs",
+                "user": admin.id,
+                "cleanup": "incomplete: an MCP server's Vault credential could not be discarded",
+            })
+        );
+        assert!(
+            still_blocked.events.is_empty(),
+            "finishing a cleanup appends nothing"
+        );
+        assert!(still_blocked.committed.is_none());
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+
+        // The obstacle is gone, and the credentials the failed discard left are
+        // where the retry will find them.
+        std::fs::remove_file(&blocked).unwrap();
+        std::fs::rename(&held, &blocked).unwrap();
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("space-token"),
+            "the Vault still holds the slot the cleanup owes"
+        );
+
+        // The CLI retries with a fresh command id, so it cannot replay the
+        // removal. Naming the server finishes the cleanup and writes no event.
+        let cursor = space.store.last_seq().await.unwrap();
+        let recovered =
+            super::mcp_remove(&context, &admin, Id::new(), "recover".to_owned(), server)
+                .await
+                .unwrap();
+        assert_eq!(
+            recovered.result,
+            json!({
+                "server": server,
+                "name": "docs",
+                "user": admin.id,
+                "cleanup": "finished",
+            })
+        );
+        assert!(
+            recovered.events.is_empty(),
+            "finishing a cleanup appends nothing"
+        );
+        assert!(recovered.committed.is_none());
+        assert_eq!(
+            space.store.last_seq().await.unwrap(),
+            cursor,
+            "finishing a cleanup writes no event"
+        );
+        assert_eq!(
+            space.secrets.mcp_credential(server, None).unwrap(),
+            None,
+            "the Space slot leaves"
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(admin.id))
+                .unwrap(),
+            None,
+            "the User slot leaves"
+        );
+
+        // The same request again is idempotent: the record still names the
+        // removal and its cleanup is already done.
+        let again = super::mcp_remove(
+            &context,
+            &admin,
+            Id::new(),
+            "recover again".to_owned(),
+            server,
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.result, recovered.result);
+        assert!(again.events.is_empty());
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+    }
+
+    #[tokio::test]
+    async fn a_new_command_for_an_unknown_server_finds_nothing_to_finish() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let context = space.context();
+        let cursor = space.store.last_seq().await.unwrap();
+
+        // A server the record never held cannot be recovered, whatever the
+        // command id.
+        let unknown = refused(
+            super::mcp_remove(&context, &admin, Id::new(), "unknown".to_owned(), Id::new()).await,
+        );
+        assert_eq!(unknown.code(), ErrorCode::NotFound);
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+    }
+
+    #[tokio::test]
+    async fn a_removed_server_does_not_make_an_unknown_server_recoverable() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let server = space
+            .connect_server(admin.id, "docs", "https://example.com/mcp")
+            .await;
+        let context = space.context();
+        super::mcp_remove(&context, &admin, Id::new(), "remove".to_owned(), server)
+            .await
+            .unwrap();
+        let cursor = space.store.last_seq().await.unwrap();
+        assert_eq!(
+            space
+                .state
+                .lock()
+                .unwrap()
+                .removed_mcp(server)
+                .map(|view| view.name.as_str()),
+            Some("docs"),
+            "removing a server keeps it for finishing the cleanup"
+        );
+
+        // The index holds the server that left, not one the record never held:
+        // a fresh command for an unknown id is not found and appends nothing.
+        let unknown = refused(
+            super::mcp_remove(&context, &admin, Id::new(), "unknown".to_owned(), Id::new()).await,
+        );
+        assert_eq!(unknown.code(), ErrorCode::NotFound);
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+    }
+
+    #[tokio::test]
+    async fn only_an_account_that_could_remove_a_server_finishes_its_cleanup() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let stranger = account(false);
+        let server = space
+            .connect_server(admin.id, "docs", "https://example.com/mcp")
+            .await;
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        // The record says the Space's server left, and its credential is still
+        // the Space's.
+        space
+            .record(
+                Id::new(),
+                "remove",
+                vec![EventDraft::new(
+                    EventKind::McpServerRemoved,
+                    Author::User(admin.id),
+                    json!({"server": server}),
+                )],
+                json!({"server": server, "name": "docs", "user": admin.id}),
+            )
+            .await;
+        let context = space.context();
+
+        // A Space's server is listed to every account, but removing it is the
+        // Admin's, so only the Admin finishes its cleanup.
+        for other in [&user, &stranger] {
+            let error = refused(
+                super::mcp_remove(&context, other, Id::new(), "recover".to_owned(), server).await,
+            );
+            assert_eq!(error.code(), ErrorCode::Forbidden);
+        }
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("space-token"),
+            "a refused recovery discards nothing"
+        );
+
+        // A User's own server is not another account's to see: a stranger's
+        // answer is the one a remove of a server that is not there gives.
+        let owner = account(false);
+        let theirs = Id::new();
+        space
+            .record(
+                Id::new(),
+                "connect",
+                vec![EventDraft::new(
+                    EventKind::McpServerAdded,
+                    Author::User(owner.id),
+                    json!({
+                        "server": theirs,
+                        "name": "mine",
+                        "url": "https://example.com/mcp",
+                        "scope": "user",
+                        "user": owner.id,
+                        "by": owner.id,
+                    }),
+                )],
+                json!({}),
+            )
+            .await;
+        space
+            .record(
+                Id::new(),
+                "remove",
+                vec![EventDraft::new(
+                    EventKind::McpServerRemoved,
+                    Author::User(owner.id),
+                    json!({"server": theirs}),
+                )],
+                json!({"server": theirs, "name": "mine", "user": owner.id}),
+            )
+            .await;
+        let hidden = refused(
+            super::mcp_remove(&context, &stranger, Id::new(), "recover".to_owned(), theirs).await,
+        );
+        assert_eq!(hidden.code(), ErrorCode::NotFound);
+
+        // The owner finishes their own server's cleanup.
+        let recovered = super::mcp_remove(
+            &context,
+            &owner,
+            Id::new(),
+            "recover own".to_owned(),
+            theirs,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.result,
+            json!({
+                "server": theirs,
+                "name": "mine",
+                "user": owner.id,
+                "cleanup": "finished",
+            })
+        );
+        assert!(
+            recovered.events.is_empty(),
+            "finishing a cleanup appends nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_sends_the_configured_headers_without_a_credential() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (url, log, server_task) = fake_mcp_server().await;
+        let owner = admin.id;
+        let server = Id::new();
+        let bot = Id::new();
+        let run = Id::new();
+        let action = Id::new();
+        let workspace = tempfile::tempdir().unwrap();
+        space
+            .record(
+                Id::new(),
+                "bot",
+                vec![
+                    EventDraft::new(
+                        EventKind::BotCreated,
+                        Author::User(owner),
+                        json!({
+                            "bot": bot,
+                            "owner": owner,
+                            "name": "Scout",
+                            "computer": Id::new(),
+                            "chat": Id::new(),
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::McpServerAdded,
+                        Author::User(owner),
+                        json!({
+                            "server": server,
+                            "name": "docs",
+                            "url": url,
+                            "scope": "space",
+                            "by": owner,
+                            "headers": {"X-Tenant": "package-data"},
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::BotMcpEnabled,
+                        Author::User(owner),
+                        json!({"bot": bot, "server": server}),
+                    ),
+                    EventDraft::new(
+                        EventKind::RunStarted,
+                        Author::Bot(bot),
+                        json!({
+                            "run": run,
+                            "chat": Id::new(),
+                            "bot": bot,
+                            "command": Id::new(),
+                            "message": Id::new(),
+                        }),
+                    )
+                    .acting(owner),
+                    EventDraft::new(
+                        EventKind::ActionStarted,
+                        Author::Bot(bot),
+                        json!({
+                            "run": run,
+                            "step": 1,
+                            "action": action,
+                            "tool": "search",
+                            "arguments": {"query": "hi"},
+                            "server": server,
+                        }),
+                    )
+                    .acting(owner),
+                ],
+                json!({}),
+            )
+            .await;
+
+        let offered = super::offered_tools(&space.state, &space.secrets, bot, owner, false).await;
+
+        // The tools are offered so a call can answer that the server is not
+        // connected; the configured header is visible package data, so it is
+        // sent even though discovery carries no credential.
+        assert!(
+            !offered.mcp.specs().is_empty(),
+            "a server without a credential still lists its tools"
+        );
+        {
+            let seen = log.lock().unwrap();
+            let listed = seen
+                .iter()
+                .find(|received| received.message["method"] == "tools/list")
+                .expect("discovery reached the server");
+            assert_eq!(
+                header(&listed.headers, "x-tenant"),
+                Some("package-data"),
+                "the configured header reached the anonymous discovery request"
+            );
+        }
+        let sent = log.lock().unwrap().len();
+
+        // A call without a credential answers from the contract and sends no
+        // request at all.
+        let runtime = super::RedactingRuntime {
+            inner: super::RunRuntime::Managed(
+                neha_computer::LocalRuntime::new(workspace.path()).unwrap(),
+            ),
+            secret: None,
+            state: &space.state,
+            blobs: &space.blobs,
+            bot,
+            run,
+            instructions_only: false,
+            acting: owner,
+            secrets: Some(&space.secrets),
+            log: None,
+        };
+        let answer = runtime
+            .mcp_call(action, "mcp__docs__search", &json!({"query": "hi"}))
+            .await;
+        assert_eq!(answer.status, neha_computer::ActionStatus::Failed);
+        assert!(
+            answer
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("is not connected")),
+            "{:?}",
+            answer.error
+        );
+        assert_eq!(
+            log.lock().unwrap().len(),
+            sent,
+            "a call without a credential sends no request"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_generated_header_the_record_holds_never_overrides_the_clients_own() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (url, log, server_task) = fake_mcp_server().await;
+        let owner = admin.id;
+        let server = Id::new();
+        let bot = Id::new();
+        space
+            .record(
+                Id::new(),
+                "bot",
+                vec![
+                    EventDraft::new(
+                        EventKind::BotCreated,
+                        Author::User(owner),
+                        json!({
+                            "bot": bot,
+                            "owner": owner,
+                            "name": "Scout",
+                            "computer": Id::new(),
+                            "chat": Id::new(),
+                        }),
+                    ),
+                    // A record written before the client kept the generated
+                    // headers out of a registration may hold one; the client
+                    // still decides the header it owns.
+                    EventDraft::new(
+                        EventKind::McpServerAdded,
+                        Author::User(owner),
+                        json!({
+                            "server": server,
+                            "name": "docs",
+                            "url": url,
+                            "scope": "space",
+                            "by": owner,
+                            "headers": {"Accept": "*/*", "X-Tenant": "acme"},
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::BotMcpEnabled,
+                        Author::User(owner),
+                        json!({"bot": bot, "server": server}),
+                    ),
+                ],
+                json!({}),
+            )
+            .await;
+
+        let offered = super::offered_tools(&space.state, &space.secrets, bot, owner, false).await;
+
+        assert!(
+            !offered.mcp.specs().is_empty(),
+            "discovery reached the server"
+        );
+        let seen = log.lock().unwrap();
+        let listed = seen
+            .iter()
+            .find(|received| received.message["method"] == "tools/list")
+            .expect("the tool list was requested");
+        assert_eq!(
+            header(&listed.headers, "accept"),
+            Some("application/json, text/event-stream"),
+            "the client's own Accept wins over the configured value"
+        );
+        assert_eq!(
+            values(&listed.headers, "accept"),
+            1,
+            "the configured value does not duplicate the client's"
+        );
+        assert_eq!(
+            header(&listed.headers, "x-tenant"),
+            Some("acme"),
+            "a header the client does not own still reaches the server"
+        );
+        drop(seen);
+        server_task.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_replayed_install_finishes_the_replaced_packages_cleanup() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let source = package.display().to_string();
+
+        let first = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "first".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        let first_digest = first.result["digest"].as_str().unwrap().to_owned();
+        let first_server: Id =
+            serde_json::from_value(first.result["servers"][0]["server"].clone()).unwrap();
+        let first_dir = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{first_digest}"));
+        assert!(first_dir.is_dir());
+
+        // A new version replaces the package under that name.
+        write_package_source(&space, "2.0.0");
+        let command = Id::new();
+        let second = super::plugin_install(&context, &admin, command, "second".to_owned(), source)
+            .await
+            .unwrap();
+        let second_digest = second.result["digest"].as_str().unwrap().to_owned();
+        let second_dir = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{second_digest}"));
+        assert!(!first_dir.exists(), "the replaced package's bytes leave");
+        assert!(second_dir.is_dir());
+
+        // The Space stopped before it cleaned the replaced package. A replay of
+        // the install command finishes that and keeps the active package.
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::write(first_dir.join("plugin.json"), "{}").unwrap();
+        space
+            .secrets
+            .store_mcp_credential(first_server, None, "old-token")
+            .unwrap();
+        let replay = super::plugin_install(
+            &context,
+            &admin,
+            command,
+            "second".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(replay.result, second.result);
+        assert!(replay.events.is_empty(), "a replay appends nothing");
+        assert!(
+            !first_dir.exists(),
+            "the replaced package's bytes leave on the replay"
+        );
+        assert!(second_dir.is_dir(), "the active package stays");
+        assert_eq!(
+            space.secrets.mcp_credential(first_server, None).unwrap(),
+            None,
+            "the replaced package's server credential leaves on the replay"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_replacing_install_reports_a_cleanup_it_could_not_finish() {
+        let mut space = TestSpace::open().await;
+        let package = write_package_source(&space, "1.2.0");
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+        let source = package.display().to_string();
+
+        let first = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "first".to_owned(),
+            source.clone(),
+        )
+        .await
+        .unwrap();
+        let first_digest = first.result["digest"].as_str().unwrap().to_owned();
+        let first_dir = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{first_digest}"));
+        assert!(first_dir.is_dir());
+        // A plain file where the replaced package's directory belongs: the
+        // cleanup cannot delete it as a directory.
+        std::fs::remove_dir_all(&first_dir).unwrap();
+        std::fs::write(&first_dir, "blocked").unwrap();
+
+        write_package_source(&space, "2.0.0");
+        let command = Id::new();
+        // The replacement changes the record, so it answers; the cleanup it
+        // could not finish is named in the answer instead of an error.
+        let second = super::plugin_install(&context, &admin, command, "second".to_owned(), source)
+            .await
+            .expect("a cleanup that does not finish does not suppress the committed replacement");
+        assert_eq!(second.result["version"], json!("2.0.0"));
+        assert_eq!(
+            second.result["cleanup"],
+            json!("incomplete: a package's files could not be deleted")
+        );
+        assert!(
+            !second.events.is_empty(),
+            "the committed replacement is not suppressed by the cleanup"
+        );
+        let second_digest = second.result["digest"].as_str().unwrap().to_owned();
+        let second_dir = space
+            .home
+            .plugins_dir()
+            .join(format!("weekly.tools@{second_digest}"));
+        assert!(second_dir.is_dir(), "the active package is published");
+        assert!(first_dir.is_file(), "the obstacle is still there");
+
+        // With the obstacle gone, a replay finishes the cleanup and answers what
+        // the record holds; the recorded answer is what was recorded.
+        std::fs::remove_file(&first_dir).unwrap();
+        let replay = super::plugin_install(
+            &context,
+            &admin,
+            command,
+            "second".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+        assert!(replay.events.is_empty(), "a replay appends nothing");
+        assert_eq!(replay.result["plugin"], second.result["plugin"]);
+        assert!(
+            replay.result.get("cleanup").is_none(),
+            "a replay answers what the record holds"
+        );
+        assert!(!first_dir.exists(), "the replay finishes the cleanup");
+        assert!(second_dir.is_dir(), "the active package stays");
+    }
+
+    #[test]
+    fn a_published_package_keeps_the_directory_already_under_its_digest() {
+        let root = tempfile::tempdir().unwrap();
+        let final_dir = root.path().join("weekly.tools@abc");
+        let staging = root.path().join(".staging-1");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("plugin.json"), "{\"v\":1}").unwrap();
+
+        super::publish_package(&staging, &final_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(final_dir.join("plugin.json")).unwrap(),
+            "{\"v\":1}"
+        );
+        assert!(!staging.exists(), "the staging directory is renamed away");
+
+        // The same digest is already published: the second command's staging
+        // directory is removed and the published bytes are not written into.
+        let second = root.path().join(".staging-2");
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("plugin.json"), "changed").unwrap();
+        super::publish_package(&second, &final_dir).unwrap();
+
+        assert!(!second.exists());
+        assert_eq!(
+            std::fs::read_to_string(final_dir.join("plugin.json")).unwrap(),
+            "{\"v\":1}",
+            "the published package is not written into"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_clients_cannot_register_one_server_name() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (url, _, server_task) =
+            fake_mcp_server_with_delay(Some(std::time::Duration::from_millis(50))).await;
+        let context = space.context();
+        let call = || neha::surface::McpAdd {
+            name: "docs".to_owned(),
+            url: url.clone(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("token-1".to_owned()),
+        };
+
+        // Both registrations start at once. The first is inside the registry
+        // decision while its slow handshake runs, so the second must wait for
+        // the decision rather than read a record that does not have it yet.
+        let (first, second) = tokio::join!(
+            super::mcp_add(&context, &admin, Id::new(), "first".to_owned(), call()),
+            super::mcp_add(&context, &admin, Id::new(), "second".to_owned(), call()),
+        );
+
+        assert!(first.is_ok(), "one registration answers the connection");
+        assert!(
+            second.is_ok(),
+            "the other attaches its credential to the server the first registered"
+        );
+        let events = space
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == EventKind::McpServerAdded)
+                .count(),
+            1,
+            "one name is registered once"
+        );
+        assert_eq!(
+            space.state.lock().unwrap().mcps.len(),
+            1,
+            "the Space holds one server, not a duplicate the projection would refuse"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_replayed_space_registration_answers_and_appends_nothing() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let (url, _log, server_task) = fake_mcp_server().await;
+        let context = space.context();
+        let call = || neha::surface::McpAdd {
+            name: "docs".to_owned(),
+            url: url.clone(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("space-token".to_owned()),
+        };
+        let command = Id::new();
+        let added = super::mcp_add(&context, &admin, command, "add".to_owned(), call())
+            .await
+            .unwrap();
+        assert_eq!(
+            added.result["user"],
+            json!(admin.id),
+            "the recorded answer belongs to the command's owner"
+        );
+        assert_eq!(added.result["scope"], json!("space"));
+        let cursor = space.store.last_seq().await.unwrap();
+
+        let replayed = super::mcp_add(&context, &admin, command, "add".to_owned(), call())
+            .await
+            .unwrap();
+        assert_eq!(replayed.result, added.result);
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+        assert_eq!(
+            space.state.lock().unwrap().mcps.len(),
+            1,
+            "a replay registers no second server"
+        );
+        server_task.abort();
     }
 }

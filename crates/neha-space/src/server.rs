@@ -111,6 +111,8 @@ pub struct SpaceServer {
     pub(crate) library: tokio::sync::Mutex<()>,
     /// Whether this Space treats skills as instructions only.
     pub(crate) instructions_only: bool,
+    /// Where this Space may install a package from.
+    pub(crate) plugins: crate::config::PluginsConfig,
     /// Local-ticket pair attempts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
     /// The ticket file this start wrote for its Admin, with its digest.
@@ -152,6 +154,7 @@ impl SpaceServer {
         let config = Config::load(&home)?;
         let storage = config.storage.clone();
         let instructions_only = config.skills.instructions_only;
+        let plugins = config.plugins.clone();
         let catalog = std::sync::Arc::new(CatalogStore::open(&home, &config.catalog));
         let store = Store::open(&home).await?;
         let identity = Identity::open(&home).await?;
@@ -198,6 +201,7 @@ impl SpaceServer {
             approvals: tokio::sync::Mutex::new(()),
             library: tokio::sync::Mutex::new(()),
             instructions_only,
+            plugins,
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -1921,6 +1925,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
+                            plugins: &server.plugins,
                         };
                         let reset = matches!(command, CommandCall::ComputerReset { .. });
                         let outcome = commands::execute(&context, &account, id, command).await;
@@ -12763,6 +12768,7 @@ mod tests {
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
+            plugins: &server.plugins,
         }
     }
 
@@ -13313,6 +13319,7 @@ mod tests {
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
+            plugins: &server.plugins,
         };
         let stranger = crate::identity::Account {
             id: Id::new(),
@@ -19546,6 +19553,461 @@ mod tests {
         provider_task.abort();
         old_task.abort();
         new_task.abort();
+        running.shutdown().await;
+    }
+    /// Writes a package directory with one skill and one MCP server.
+    fn write_plugin_package(root: &std::path::Path, mcp_url: &str) -> std::path::PathBuf {
+        let package = root.join("reports-plugin");
+        std::fs::create_dir_all(package.join("skills").join("weekly-report").join("scripts"))
+            .unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            json!({
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+                "name": "reports",
+                "version": "1.2.0",
+                "description": "Weekly reports",
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            package
+                .join("skills")
+                .join("weekly-report")
+                .join("SKILL.md"),
+            "---\nname: weekly-report\ndescription: Write the weekly report.\n---\nCollect and summarize.",
+        )
+        .unwrap();
+        std::fs::write(
+            package
+                .join("skills")
+                .join("weekly-report")
+                .join("scripts")
+                .join("collect.sh"),
+            "printf collected",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("mcp.json"),
+            json!({
+                "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+                "mcpServers": {
+                    "docs": {
+                        "type": "streamable-http",
+                        "url": mcp_url,
+                        "headers": {"X-Tenant": "acme"},
+                    },
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        package
+    }
+
+    /// A fake MCP server that records the headers of every request.
+    async fn fake_mcp_server_with_headers() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::body::{Body, Bytes};
+        use axum::http::{HeaderMap, header::CONTENT_TYPE};
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let log = seen.clone();
+                async move {
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    log.lock().unwrap().push(headers);
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let result = match message["method"].as_str() {
+                        Some("initialize") => json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "docs", "version": "1"},
+                        }),
+                        Some("notifications/initialized") => return Response::new(Body::empty()),
+                        Some("tools/list") => json!({
+                            "tools": [{
+                                "name": "search",
+                                "description": "Search the docs.",
+                                "inputSchema": {"type": "object"},
+                            }],
+                        }),
+                        _ => json!({"content": [{"type": "text", "text": "found"}]}),
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), log, task)
+    }
+
+    /// Packs a package's files into GitHub's `<root>/...` tarball layout.
+    fn plugin_tarball(files: &[(&str, &str)]) -> Vec<u8> {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write as _;
+
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, content) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, content.as_bytes())
+                .unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+        gz.write_all(&tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// Serves one package tarball at `/repo/archive/<anything>.tar.gz`.
+    async fn serve_plugin_archive(tarball: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::Response;
+        use axum::routing::get;
+
+        let app = Router::new().route(
+            "/repo/archive/{file}",
+            get(move || {
+                let tarball = tarball.clone();
+                async move {
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/gzip")
+                        .body(Body::from(tarball))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_admin_installs_a_package_and_its_bot_uses_it() {
+        let (mcp_url, mcp_headers, mcp_task) = fake_mcp_server_with_headers().await;
+        // A repository archive rather than a directory, so the package path is
+        // the same on every platform a Space runs on.
+        let commit = "3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b";
+        let mcp_json = json!({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                "docs": {
+                    "type": "streamable-http",
+                    "url": mcp_url,
+                    "headers": {"X-Tenant": "acme"},
+                },
+            },
+        })
+        .to_string();
+        let tarball = plugin_tarball(&[
+            (
+                "reports-plugin/plugin.json",
+                "{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json\",\"name\":\"reports\",\"version\":\"1.2.0\",\"description\":\"Weekly reports\"}",
+            ),
+            (
+                "reports-plugin/skills/weekly-report/SKILL.md",
+                "---\nname: weekly-report\ndescription: Write the weekly report.\n---\nCollect and summarize.",
+            ),
+            (
+                "reports-plugin/skills/weekly-report/scripts/collect.sh",
+                "printf collected",
+            ),
+            ("reports-plugin/mcp.json", &mcp_json),
+        ]);
+        let (archive, archive_task) = serve_plugin_archive(tarball).await;
+        let config = format!("[plugins]\nsources = [\"{archive}/\"]\n");
+        let (_home, running, invite) = running_with_config(&config).await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+
+        let installed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::PluginInstall {
+                source: format!("{archive}/repo@{commit}"),
+            },
+        )
+        .await;
+        let plugin: Id = serde_json::from_value(installed["plugin"].clone()).unwrap();
+        assert_eq!(installed["name"], json!("reports"));
+        assert_eq!(installed["version"], json!("1.2.0"));
+        assert_eq!(installed["commit"], json!(commit));
+        assert_eq!(installed["servers"].as_array().unwrap().len(), 1);
+        assert_eq!(installed["servers"][0]["name"], json!("reports-docs"));
+        assert_eq!(installed["skills"][0]["name"], json!("weekly-report"));
+        let server: Id = serde_json::from_value(installed["servers"][0]["server"].clone()).unwrap();
+        let skill: Id = serde_json::from_value(installed["skills"][0]["skill"].clone()).unwrap();
+        assert!(
+            installed["digest"].as_str().unwrap().len() == 64,
+            "{installed}"
+        );
+
+        // The package's entries are in the Space's libraries.
+        let skills = command(&mut socket, Id::new(), CommandCall::SkillList { bot: None }).await;
+        assert!(
+            skills
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["id"] == json!(skill)),
+            "{skills}"
+        );
+        let servers = command(&mut socket, Id::new(), CommandCall::McpList).await;
+        assert!(
+            servers
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["server"] == json!(server)),
+            "{servers}"
+        );
+        let listed = command(&mut socket, Id::new(), CommandCall::PluginList).await;
+        assert_eq!(listed[0]["plugin"], json!(plugin));
+        assert_eq!(listed[0]["enabled"], json!(true));
+
+        // The Admin attaches a Space credential, so the package's header reaches
+        // the server with the call.
+        let attached = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpAdd(neha::surface::McpAdd {
+                name: "reports-docs".to_owned(),
+                url: installed["servers"][0]["url"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+                scope: neha::record::McpScope::Space,
+                credential: Some("token-1".to_owned()),
+            }),
+        )
+        .await;
+        assert_eq!(attached["connected"], json!(true));
+
+        // A Bot uses both: the skill loads, and the server's tool asks first.
+        let (base, provider_task) = scripted_provider(vec![
+            tool("skill", json!({"name": "weekly-report"})),
+            tool("mcp__reports-docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+        let run = run_of(&submit(&mut socket, chat, "use it", None).await);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "first_mcp_call");
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        // The package's configured header reached the server together with the
+        // Vault credential the Admin attached.
+        let saw_header = {
+            let headers = mcp_headers.lock().unwrap();
+            headers.iter().any(|headers| {
+                headers
+                    .get("x-tenant")
+                    .and_then(|value| value.to_str().ok())
+                    == Some("acme")
+            })
+        };
+        assert!(saw_header, "the package's header reached the server");
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+
+        // A disabled package offers neither its skill nor its server.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::PluginDisable { plugin },
+        )
+        .await;
+        let listed = command(&mut socket, Id::new(), CommandCall::PluginList).await;
+        assert_eq!(listed[0]["enabled"], json!(false));
+
+        // Removing it removes its entries and keeps the record replayable.
+        command(&mut socket, Id::new(), CommandCall::PluginRemove { plugin }).await;
+        assert!(
+            command(&mut socket, Id::new(), CommandCall::PluginList)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            command(&mut socket, Id::new(), CommandCall::SkillList { bot: None })
+                .await
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["id"] != json!(skill))
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        mcp_task.abort();
+        archive_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_install_from_a_source_the_admin_did_not_allow_is_refused() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let dir = tempfile::tempdir().unwrap();
+        let package = write_plugin_package(dir.path(), "https://example.com/mcp");
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::PluginInstall {
+                source: package.display().to_string(),
+            },
+        )
+        .await
+        .expect_err("a Space allows no source by default");
+        assert_eq!(error.0, ErrorCode::Forbidden, "{}", error.1);
+        assert!(
+            command(&mut socket, Id::new(), CommandCall::PluginList)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_invalid_manifest_rejects_the_package() {
+        // A repository archive keeps this the same on every platform.
+        let tarball = plugin_tarball(&[("broken/plugin.json", "{not json")]);
+        let (archive, archive_task) = serve_plugin_archive(tarball).await;
+        let config = format!("[plugins]\nsources = [\"{archive}/\"]\n");
+        let (_home, running, invite) = running_with_config(&config).await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::PluginInstall {
+                source: format!("{archive}/repo@3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b"),
+            },
+        )
+        .await
+        .expect_err("an invalid manifest rejects the package");
+        assert_eq!(error.0, ErrorCode::InvalidArgument, "{}", error.1);
+        assert!(
+            command(&mut socket, Id::new(), CommandCall::PluginList)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        socket.close(None).await.unwrap();
+        archive_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_repository_package_is_fetched_at_its_commit() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::header::CONTENT_TYPE;
+        use axum::response::{IntoResponse, Response};
+        use axum::routing::get;
+        use std::sync::{Arc, Mutex};
+
+        let tarball = plugin_tarball(&[(
+            "repo/plugin.json",
+            "{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json\",\"name\":\"pinned\",\"version\":\"0.1.0\"}",
+        )]);
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let app = Router::new().route(
+            "/repo/archive/{file}",
+            get(
+                move |axum::extract::Path(file): axum::extract::Path<String>| {
+                    let seen = seen.clone();
+                    let tarball = tarball.clone();
+                    async move {
+                        let commit = file.strip_suffix(".tar.gz").unwrap_or(&file).to_owned();
+                        seen.lock().unwrap().push(commit);
+                        Response::builder()
+                            .header(CONTENT_TYPE, "application/gzip")
+                            .body(Body::from(tarball))
+                            .unwrap()
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let archive_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let config = format!("[plugins]\nsources = [\"http://{address}/\"]\n");
+        let (_home, running, invite) = running_with_config(&config).await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let installed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::PluginInstall {
+                source: format!("http://{address}/repo@3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b"),
+            },
+        )
+        .await;
+        assert_eq!(
+            installed["commit"],
+            json!("3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b")
+        );
+        assert_eq!(installed["name"], json!("pinned"));
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            ["3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b"]
+        );
+        socket.close(None).await.unwrap();
+        archive_task.abort();
         running.shutdown().await;
     }
 }

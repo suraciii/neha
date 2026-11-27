@@ -13,7 +13,9 @@ axum = { version = "0.8", features = ["http1", "json", "tokio", "ws"] }
 base64 = "0.22"
 eventsource-stream = "0.2"
 flate2 = "1"
+tar = "0.4"
 futures-util.workspace = true
+libc = "0.2"
 neha = { path = "../neha" }
 neha-computer = { path = "../neha-computer" }
 neha-loop = { path = "../neha-loop" }

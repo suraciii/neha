@@ -146,12 +146,61 @@ pub struct McpServerView {
     pub user: Option<Id>,
     /// The account that connected it.
     pub by: Id,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
+    /// The fixed headers the package configures.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
     /// The cursor of `mcp.server.added`.
     pub seq: Seq,
 }
 
 /// The most MCP servers one Space connects.
 pub const MAX_MCP_SERVERS: usize = 64;
+
+/// What a removed MCP server was, for finishing its cleanup by server id.
+///
+/// The record keeps the event that removed the server, but a retry can name
+/// only the server: it carries a new command id, so it cannot replay the
+/// command that removed it. This is what the projection keeps about the server
+/// that left, so finishing its cleanup reads no page of the record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemovedMcpView {
+    /// The name its removal answered with.
+    pub name: String,
+    /// The scope the server was connected under.
+    pub scope: McpScope,
+    /// The User the server belonged to, when it was one User's.
+    pub user: Option<Id>,
+}
+
+/// An installed package.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PluginView {
+    /// The package.
+    pub plugin: Id,
+    /// Its name from `plugin.json`.
+    pub name: String,
+    /// Its version from `plugin.json`, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The digest of the package's bytes.
+    pub digest: String,
+    /// The commit it was fetched at, when it came from a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The source it came from.
+    pub source: String,
+    /// Whether the Space offers it.
+    pub enabled: bool,
+    /// The MCP servers it brought.
+    pub servers: Vec<Id>,
+    /// The skills it brought.
+    pub skills: Vec<Id>,
+    /// The cursor of `plugin.installed`.
+    pub seq: Seq,
+}
 
 /// A skill in a library.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -173,6 +222,9 @@ pub struct SkillView {
     pub scripts: Vec<neha::record::SkillScript>,
     /// The User who added it.
     pub by: Id,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
     /// The cursor of `skill.added`.
     pub seq: Seq,
 }
@@ -589,6 +641,12 @@ pub struct State {
     pub skills: Vec<SkillView>,
     /// The MCP servers in the order the record connected them.
     pub mcps: Vec<McpServerView>,
+    /// The installed packages, in the order the record installed them.
+    pub plugins: Vec<PluginView>,
+    /// What removed MCP servers were, by id, so finishing a cleanup that names
+    /// the server needs no scan of the record. Only a removal fills it, and a
+    /// server id is never reused, so a later add never clears an entry.
+    removed_mcps: HashMap<Id, RemovedMcpView>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
@@ -679,7 +737,18 @@ impl State {
                 skill.library == SkillLibrary::Space
                     || matches!(skill.bot, Some(owner) if owner == bot)
             })
+            .filter(|skill| self.plugin_offers(skill.plugin))
             .collect()
+    }
+
+    /// Returns whether the Space offers a package, or everything not from one.
+    #[must_use]
+    pub fn plugin_offers(&self, plugin: Option<Id>) -> bool {
+        plugin.is_none_or(|plugin| {
+            self.plugins
+                .iter()
+                .any(|view| view.plugin == plugin && view.enabled)
+        })
     }
 
     /// Returns the enabled skill a Bot has under a name.
@@ -718,6 +787,15 @@ impl State {
         self.mcps.iter().find(|view| view.name == name)
     }
 
+    /// Returns what a removed MCP server was, when the record removed it.
+    ///
+    /// The entry exists only to finish a cleanup that names the server; it is
+    /// never how a server that is still connected is read.
+    #[must_use]
+    pub fn removed_mcp(&self, server: Id) -> Option<&RemovedMcpView> {
+        self.removed_mcps.get(&server)
+    }
+
     /// Returns the MCP servers a Bot may call for this acting User.
     ///
     /// A server the Space connected is every Bot's; a server a User connected
@@ -734,6 +812,7 @@ impl State {
                 McpScope::Space => true,
                 McpScope::User => server.user == Some(acting),
             })
+            .filter(|server| self.plugin_offers(server.plugin))
             .collect()
     }
 
@@ -1605,6 +1684,7 @@ impl Projection for State {
                 }
                 self.skills.push(SkillView {
                     id: data.skill,
+                    plugin: data.plugin,
                     library: data.library,
                     bot: data.bot,
                     name: data.name,
@@ -1681,6 +1761,8 @@ impl Projection for State {
                 }
                 self.mcps.push(McpServerView {
                     server: data.server,
+                    plugin: data.plugin,
+                    headers: data.headers,
                     name: data.name,
                     url: data.url,
                     scope: data.scope,
@@ -1713,14 +1795,22 @@ impl Projection for State {
                 }
             }
             EventData::McpServerRemoved(data) => {
-                let position = self
-                    .mcps
-                    .iter()
-                    .position(|view| view.server == data.server)
-                    .ok_or("a removed server must exist")?;
-                self.mcps.remove(position);
-                for bot in self.bots.values_mut() {
-                    bot.mcps.retain(|server| *server != data.server);
+                // Keep what a cleanup that names only the server needs before
+                // the view leaves. A removal of a server the projection does
+                // not hold leaves the index alone: a replay of the same removal
+                // is then idempotent, and a historical record's odd shape does
+                // not fail the whole projection.
+                if let Some(position) = self.mcps.iter().position(|view| view.server == data.server)
+                {
+                    let name = self.mcps[position].name.clone();
+                    let scope = self.mcps[position].scope;
+                    let user = self.mcps[position].user;
+                    self.removed_mcps
+                        .insert(data.server, RemovedMcpView { name, scope, user });
+                    self.mcps.remove(position);
+                    for bot in self.bots.values_mut() {
+                        bot.mcps.retain(|server| *server != data.server);
+                    }
                 }
             }
             EventData::BotMcpEnabled(data) => {
@@ -1750,6 +1840,55 @@ impl Projection for State {
                     .ok_or("a disabled server must be enabled")?;
                 bot.mcps.remove(position);
             }
+            EventData::PluginInstalled(data) => {
+                if self.plugins.iter().any(|view| view.name == data.name) {
+                    return Err("a Space holds one package under each name".to_owned());
+                }
+                self.plugins.push(PluginView {
+                    plugin: data.plugin,
+                    name: data.name,
+                    version: data.version,
+                    digest: data.digest,
+                    commit: data.commit,
+                    source: data.source,
+                    enabled: true,
+                    servers: data.servers,
+                    skills: data.skills,
+                    seq: event.seq,
+                });
+            }
+            EventData::PluginRemoved(data) => {
+                let position = self
+                    .plugins
+                    .iter()
+                    .position(|view| view.plugin == data.plugin)
+                    .ok_or("a removed package must exist")?;
+                let removed = self.plugins.remove(position);
+                self.mcps
+                    .retain(|server| !removed.servers.contains(&server.server));
+                self.skills
+                    .retain(|skill| !removed.skills.contains(&skill.id));
+                for bot in self.bots.values_mut() {
+                    bot.mcps.retain(|server| !removed.servers.contains(server));
+                    bot.skills.retain(|skill| !removed.skills.contains(skill));
+                }
+            }
+            EventData::PluginEnabled(data) => {
+                let plugin = self
+                    .plugins
+                    .iter_mut()
+                    .find(|view| view.plugin == data.plugin)
+                    .ok_or("an enabled package must exist")?;
+                plugin.enabled = true;
+            }
+            EventData::PluginDisabled(data) => {
+                let plugin = self
+                    .plugins
+                    .iter_mut()
+                    .find(|view| view.plugin == data.plugin)
+                    .ok_or("a disabled package must exist")?;
+                plugin.enabled = false;
+            }
         }
 
         Ok(())
@@ -1759,7 +1898,7 @@ impl Projection for State {
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
-    use neha::record::{ActionStatus, Author, Event, EventKind, KIND_VERSION};
+    use neha::record::{ActionStatus, Author, Event, EventKind, KIND_VERSION, McpScope};
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
@@ -3800,6 +3939,85 @@ mod tests {
         assert!(
             !state.bots[&bot].full_access,
             "turning it off needs no consent"
+        );
+    }
+
+    #[test]
+    fn a_removal_keeps_what_finishing_its_cleanup_needs() {
+        let owner = Id::new();
+        let space_server = Id::new();
+        let user_server = Id::new();
+        // The events the record holds: two servers connect, then both leave.
+        let record = [
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": space_server,
+                    "name": "docs",
+                    "url": "https://example.com/mcp",
+                    "scope": "space",
+                    "by": owner,
+                }),
+                1,
+            ),
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": user_server,
+                    "name": "mine",
+                    "url": "https://example.com/mine",
+                    "scope": "user",
+                    "user": owner,
+                    "by": owner,
+                }),
+                2,
+            ),
+            event(
+                EventKind::McpServerRemoved,
+                Author::User(owner),
+                serde_json::json!({"server": space_server}),
+                3,
+            ),
+            event(
+                EventKind::McpServerRemoved,
+                Author::User(owner),
+                serde_json::json!({"server": user_server}),
+                4,
+            ),
+        ];
+        // A Space start rebuilds the projection by replaying the record.
+        let mut state = State::default();
+        for event in &record {
+            state.apply(event).unwrap();
+        }
+
+        assert!(state.mcp(space_server).is_none());
+        let space_removed = state
+            .removed_mcp(space_server)
+            .expect("a replay keeps the Space's server that left");
+        assert_eq!(space_removed.name, "docs");
+        assert_eq!(space_removed.scope, McpScope::Space);
+        assert_eq!(space_removed.user, None);
+
+        let user_removed = state
+            .removed_mcp(user_server)
+            .expect("a replay keeps the User's server that left");
+        assert_eq!(user_removed.name, "mine");
+        assert_eq!(user_removed.scope, McpScope::User);
+        assert_eq!(user_removed.user, Some(owner));
+
+        // A removal applied twice changes nothing: the second finds no server
+        // to remove and leaves the index as it was.
+        for event in &record[2..] {
+            state.apply(event).unwrap();
+        }
+        assert_eq!(
+            state
+                .removed_mcp(space_server)
+                .map(|view| view.name.as_str()),
+            Some("docs")
         );
     }
 

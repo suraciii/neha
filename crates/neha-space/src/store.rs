@@ -1208,6 +1208,28 @@ mod tests {
                 Author::User(user),
                 serde_json::json!({"bot": Id::new(), "server": Id::new()}),
             ),
+            EventKind::PluginInstalled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "plugin": Id::new(),
+                    "name": "reports",
+                    "digest": "a".repeat(64),
+                    "source": "https://example.com/acme/reports@abc1234",
+                    "servers": [],
+                    "skills": [],
+                }),
+            ),
+            EventKind::PluginRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"plugin": Id::new()}),
+            ),
+            EventKind::PluginEnabled | EventKind::PluginDisabled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"plugin": Id::new()}),
+            ),
         }
     }
 

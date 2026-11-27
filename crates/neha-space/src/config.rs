@@ -26,6 +26,18 @@ pub struct Config {
     pub catalog: CatalogConfig,
     /// What the Space does with the scripts a skill carries.
     pub skills: SkillsConfig,
+    /// Where the Space may install a package from.
+    pub plugins: PluginsConfig,
+}
+
+/// The sources a Space installs packages from.
+///
+/// An empty list allows none: the Admin names the repositories and directory
+/// prefixes a package may come from.
+#[derive(Clone, Debug, Default)]
+pub struct PluginsConfig {
+    /// Source prefixes a package may come from.
+    pub sources: Vec<String>,
 }
 
 /// What the Space does with the scripts a skill carries.
@@ -77,6 +89,7 @@ impl Config {
             skills: SkillsConfig {
                 instructions_only: document.skills.instructions_only.unwrap_or(false),
             },
+            plugins: document.plugins.into_plugins()?,
         })
     }
 }
@@ -135,6 +148,37 @@ struct Document {
     catalog: CatalogSettings,
     #[serde(default)]
     skills: SkillsSettings,
+    #[serde(default)]
+    plugins: PluginsSettings,
+}
+
+/// The `[plugins]` section.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PluginsSettings {
+    sources: Option<Vec<String>>,
+}
+
+impl PluginsSettings {
+    fn into_plugins(self) -> Result<PluginsConfig, ConfigError> {
+        let Some(sources) = self.sources else {
+            return Ok(PluginsConfig::default());
+        };
+        if sources.len() > 64 {
+            return Err(ConfigError::Invalid(
+                "plugins.sources names at most 64 sources".to_owned(),
+            ));
+        }
+        for source in &sources {
+            if source.is_empty() || source.len() > 512 || source.chars().any(char::is_control) {
+                return Err(ConfigError::Invalid(
+                    "a plugins.sources entry is 1 to 512 printable bytes".to_owned(),
+                ));
+            }
+        }
+
+        Ok(PluginsConfig { sources })
+    }
 }
 
 /// The `[skills]` section.

@@ -4,12 +4,20 @@ import { Commands, type SubscriptionHandlers } from "./ws";
 
 type Listener = (event: { data?: string }) => void;
 
+// The protocol version the Space speaks, as `PROTOCOL_VERSION` in
+// `crates/neha/src/surface.rs` states it. The fake Space refuses a hello that
+// greets with any other version, so a stale browser version fails these tests.
+const SERVER_PROTOCOL_VERSION = 3;
+
 class FakeSocket {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
   static readonly CLOSED = 3;
   static instances: FakeSocket[] = [];
   static pages: Array<{ cursor: string }> = [{ cursor: "5" }];
+  // The version the fake Space speaks; a test sets another to model a Space
+  // that is not the one this client expects.
+  static accepts = SERVER_PROTOCOL_VERSION;
 
   readyState = FakeSocket.CONNECTING;
   readonly sent: Array<Record<string, unknown>> = [];
@@ -40,7 +48,16 @@ class FakeSocket {
     const frame = JSON.parse(raw) as Record<string, unknown>;
     this.sent.push(frame);
     if (frame.type === "hello") {
-      queueMicrotask(() => this.message({ type: "hello", version: 1 }));
+      queueMicrotask(() => {
+        if (frame.version !== FakeSocket.accepts) {
+          this.message({
+            type: "protocol_error",
+            message: `this Space speaks protocol version ${FakeSocket.accepts}`,
+          });
+          return;
+        }
+        this.message({ type: "hello", version: FakeSocket.accepts });
+      });
     }
     if (frame.type === "subscribe") {
       for (const page of FakeSocket.pages) {
@@ -73,9 +90,38 @@ afterEach(() => {
   vi.unstubAllGlobals();
   FakeSocket.instances = [];
   FakeSocket.pages = [{ cursor: "5" }];
+  FakeSocket.accepts = SERVER_PROTOCOL_VERSION;
 });
 
 describe("record subscription", () => {
+  it("greets the Space with the protocol version it speaks", async () => {
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const handlers: SubscriptionHandlers = { onSnapshot: vi.fn() };
+    const commands = new Commands();
+
+    await commands.subscribe(handlers);
+    const socket = FakeSocket.instances[0]!;
+    expect(socket.sent.find((frame) => frame.type === "hello")).toEqual({
+      type: "hello",
+      version: SERVER_PROTOCOL_VERSION,
+    });
+    await commands.close();
+  });
+
+  it("refuses a Space that answers another protocol version", async () => {
+    FakeSocket.accepts = SERVER_PROTOCOL_VERSION - 1;
+    vi.stubGlobal("WebSocket", FakeSocket);
+    const handlers: SubscriptionHandlers = { onSnapshot: vi.fn(), onError: vi.fn() };
+    const commands = new Commands();
+
+    await expect(commands.subscribe(handlers)).rejects.toBeInstanceOf(Error);
+    expect(handlers.onError).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "ProtocolError", code: "protocol" }),
+    );
+    expect(handlers.onSnapshot).not.toHaveBeenCalled();
+    await commands.close();
+  });
+
   it("resumes from a cursor and reports live events", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const handlers: SubscriptionHandlers = {

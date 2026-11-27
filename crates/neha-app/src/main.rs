@@ -118,6 +118,11 @@ enum Top {
         #[command(subcommand)]
         command: McpCommand,
     },
+    /// Install and manage Agent Plugins packages.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -486,6 +491,47 @@ enum SkillCommand {
 }
 
 #[derive(Subcommand)]
+enum PluginCommand {
+    /// Install a package from a source the Admin allows.
+    ///
+    /// A repository source is <url>@<40-or-64-hex-commit>: the commit is the
+    /// 40- or 64-character lowercase hexadecimal object id of the commit to
+    /// read, and a branch or tag is not a commit. A directory source is a
+    /// plain path to a directory that holds plugin.json, read where it is; it
+    /// is supported only on Linux, and on any other platform, install from a
+    /// repository.
+    ///
+    /// The Admin lists the sources the Space allows under [plugins] sources
+    /// in the Space's config.toml; a source the list does not allow is
+    /// refused.
+    ///
+    /// A package is at most 200 files, 1024 entries in all (files and
+    /// directories), 100 KiB per file, and 4 MiB per package; a package above
+    /// one of those is refused with a report.
+    Install {
+        /// The source the package comes from.
+        source: String,
+    },
+    /// List the installed packages and what they brought.
+    List,
+    /// Remove a package and everything it brought.
+    Remove {
+        /// The package identifier.
+        plugin: Id,
+    },
+    /// Let the Space offer a package's servers and skills again.
+    Enable {
+        /// The package identifier.
+        plugin: Id,
+    },
+    /// Stop the Space offering a package's servers and skills.
+    Disable {
+        /// The package identifier.
+        plugin: Id,
+    },
+}
+
+#[derive(Subcommand)]
 enum McpCommand {
     /// Connect an MCP server.
     Add {
@@ -590,6 +636,7 @@ async fn main() -> Result<()> {
         Top::Rule { command } => rule(command).await,
         Top::Skill { command } => skill_command(command).await,
         Top::Mcp { command } => mcp_command(command).await,
+        Top::Plugin { command } => plugin_command(command).await,
     }
 }
 
@@ -1966,6 +2013,176 @@ async fn skill_command(command: SkillCommand) -> Result<()> {
     Ok(())
 }
 
+/// Installs and manages Agent Plugins packages.
+async fn plugin_command(command: PluginCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        PluginCommand::Install { source } => {
+            let result =
+                client::command(&credential, CommandCall::PluginInstall { source }).await?;
+            println!(
+                "Installed package {} ({}{}).",
+                id_of(&result, "plugin")?,
+                result["name"].as_str().unwrap_or_default(),
+                result["version"]
+                    .as_str()
+                    .map_or_else(String::new, |version| format!(" {version}"))
+            );
+            println!(
+                "  digest: {}; source: {}",
+                result["digest"].as_str().unwrap_or_default(),
+                result["source"].as_str().unwrap_or_default()
+            );
+            if let Some(commit) = result["commit"].as_str() {
+                println!("  commit: {commit}");
+            }
+            let servers = result["servers"]
+                .as_array()
+                .map_or(&[][..], std::vec::Vec::as_slice);
+            if servers.is_empty() {
+                println!("  servers: -");
+            }
+            for server in servers {
+                println!(
+                    "  server: {} ({})",
+                    server["name"].as_str().unwrap_or_default(),
+                    server["url"].as_str().unwrap_or_default()
+                );
+            }
+            let skills = result["skills"]
+                .as_array()
+                .map_or(&[][..], std::vec::Vec::as_slice);
+            if skills.is_empty() {
+                println!("  skills: -");
+            }
+            for skill in skills {
+                println!("  skill: {}", skill["name"].as_str().unwrap_or_default());
+            }
+            for skipped in result["skipped"]
+                .as_array()
+                .map_or(&[][..], std::vec::Vec::as_slice)
+            {
+                println!("  skipped: {}", skipped.as_str().unwrap_or_default());
+            }
+            print_cleanup(&result, CleanupStyle::Detail);
+        }
+        PluginCommand::List => {
+            let list = client::command(&credential, CommandCall::PluginList).await?;
+            for row in plugin_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        PluginCommand::Remove { plugin } => {
+            let result = client::command(&credential, CommandCall::PluginRemove { plugin }).await?;
+            println!(
+                "Removed package {}.",
+                result["name"].as_str().unwrap_or_default()
+            );
+            print_cleanup(&result, CleanupStyle::Retry);
+        }
+        PluginCommand::Enable { plugin } | PluginCommand::Disable { plugin } => {
+            let enabled = matches!(command, PluginCommand::Enable { .. });
+            let call = if enabled {
+                CommandCall::PluginEnable { plugin }
+            } else {
+                CommandCall::PluginDisable { plugin }
+            };
+            let result = client::command(&credential, call).await?;
+            println!(
+                "Package {plugin} is {}.",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            print_cleanup(&result, CleanupStyle::Retry);
+        }
+    }
+
+    Ok(())
+}
+
+/// How a command reports the cleanup warning its result may carry.
+#[derive(Clone, Copy)]
+enum CleanupStyle {
+    /// One detail line under the install's report.
+    Detail,
+    /// The sentence a package command prints, which names the retry that
+    /// finishes the cleanup.
+    Retry,
+}
+
+/// The value the Space uses for a cleanup a retried command just finished.
+const CLEANUP_FINISHED: &str = "finished";
+
+/// Formats the top-level `cleanup` field a result may carry, or `None` when it
+/// carries none.
+///
+/// The Space writes `incomplete: …` while it still owes a cleanup, and
+/// `finished` when a retried command completed one it had reported. The Space
+/// sanitizes that text and never puts a secret in it; escaping it here too
+/// keeps a hostile package's words from rewriting the terminal, and one line
+/// keeps the report a row.
+fn cleanup_notice(result: &Value, style: CleanupStyle) -> Option<String> {
+    let cleanup = result.get("cleanup")?.as_str()?.trim();
+    if cleanup.is_empty() {
+        return None;
+    }
+    Some(match style {
+        CleanupStyle::Detail => format!("  cleanup: {}", escape_text(cleanup)),
+        CleanupStyle::Retry if cleanup == CLEANUP_FINISHED => "Cleanup finished.".to_owned(),
+        CleanupStyle::Retry => {
+            // The Space's warning already begins `incomplete: `; naming the
+            // state once keeps the line short.
+            let warning = escape_text(cleanup.strip_prefix("incomplete: ").unwrap_or(cleanup));
+            format!("Cleanup incomplete: {warning}. Run the command again to finish it.")
+        }
+    })
+}
+
+/// Prints the cleanup warning a command's result carries, when it carries one.
+fn print_cleanup(result: &Value, style: CleanupStyle) {
+    if let Some(notice) = cleanup_notice(result, style) {
+        println!("{notice}");
+    }
+}
+
+/// One row per package: package, name, version, commit, digest, enabled, and
+/// what it brought.
+fn plugin_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no packages in the answer")?
+        .iter()
+        .map(|row| {
+            let names = |field: &str, key: &str| -> String {
+                let names: Vec<&str> = row[field]
+                    .as_array()
+                    .map_or(&[][..], std::vec::Vec::as_slice)
+                    .iter()
+                    .filter_map(|entry| entry[key].as_str())
+                    .collect();
+                if names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    names.join(", ")
+                }
+            };
+            Ok(format!(
+                "{}  {}  {}  {}  digest: {}  {}  servers: {}  skills: {}",
+                id_of(row, "plugin")?,
+                row["name"].as_str().unwrap_or_default(),
+                row["version"].as_str().unwrap_or("-"),
+                row["commit"].as_str().unwrap_or("-"),
+                row["digest"].as_str().unwrap_or("-"),
+                if row["enabled"].as_bool().unwrap_or(false) {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                names("servers", "name"),
+                names("skills", "name")
+            ))
+        })
+        .collect()
+}
+
 /// Connects, lists, and disconnects MCP servers.
 async fn mcp_command(command: McpCommand) -> Result<()> {
     let credential = Credential::load()?;
@@ -2001,15 +2218,31 @@ async fn mcp_command(command: McpCommand) -> Result<()> {
         }
         McpCommand::Remove { server } => {
             let result = client::command(&credential, CommandCall::McpRemove { server }).await?;
-            let shown = result
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or("the server");
-            println!("Removed MCP server {shown}.");
+            for line in mcp_remove_lines(&result) {
+                println!("{line}");
+            }
         }
     }
 
     Ok(())
+}
+
+/// The lines `neha mcp remove` prints: the removal, and the cleanup its answer
+/// still owes or has finished.
+///
+/// The cleanup sentence is the one the package commands print, so an operator
+/// reads the same words and the same retry instruction wherever a Space
+/// reports a cleanup.
+fn mcp_remove_lines(result: &Value) -> Vec<String> {
+    let shown = result
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("the server");
+    let mut lines = vec![format!("Removed MCP server {shown}.")];
+    if let Some(cleanup) = cleanup_notice(result, CleanupStyle::Retry) {
+        lines.push(cleanup);
+    }
+    lines
 }
 
 /// The largest `SKILL.md` a skill directory carries: its frontmatter and its
@@ -3166,6 +3399,7 @@ mod tests {
 
     use super::{space_file_name, write_run};
 
+    use clap::CommandFactory as _;
     use clap::Parser as _;
 
     use super::{
@@ -3180,7 +3414,10 @@ mod tests {
         waiting_advice, write_approval_details,
     };
 
-    use super::{BotMcpCommand, BotSkillCommand, McpCommand, SkillCommand, read_skill_directory};
+    use super::{
+        BotMcpCommand, BotSkillCommand, CleanupStyle, McpCommand, SkillCommand, cleanup_notice,
+        mcp_remove_lines, plugin_rows, read_skill_directory,
+    };
 
     use super::{
         BotCommand, checked_grant, confirm_full_access, normalized_grant, revocable_grant,
@@ -4844,6 +5081,125 @@ mod tests {
     }
 
     #[test]
+    fn plugin_install_help_states_the_limits_and_source_rules() {
+        let mut cli = Cli::command();
+        let plugin = cli.find_subcommand_mut("plugin").expect("a plugin command");
+        let install = plugin
+            .find_subcommand_mut("install")
+            .expect("a plugin install command");
+        // Help wraps to the terminal; compare phrases, not line breaks.
+        let help = install
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for stated in [
+            "200 files",
+            "1024 entries in all (files and directories)",
+            "100 KiB per file",
+            "4 MiB per package",
+            "<url>@<40-or-64-hex-commit>",
+            "40- or 64-character lowercase hexadecimal object id",
+            "A directory source is a plain path",
+            "supported only on Linux",
+            "install from a repository",
+            "[plugins] sources",
+        ] {
+            assert!(
+                help.contains(stated),
+                "`plugin install --help` does not state {stated:?}:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleanup_warning_is_reported_escaped_on_one_line() {
+        // A result with no cleanup, or a blank or non-text one, has nothing to
+        // report.
+        let clean = json!({"plugin": Id::new()});
+        assert_eq!(cleanup_notice(&clean, CleanupStyle::Detail), None);
+        assert_eq!(cleanup_notice(&clean, CleanupStyle::Retry), None);
+        assert_eq!(
+            cleanup_notice(&json!({"cleanup": "  "}), CleanupStyle::Detail),
+            None
+        );
+        assert_eq!(
+            cleanup_notice(&json!({"cleanup": 7}), CleanupStyle::Retry),
+            None
+        );
+
+        // The Space sanitizes the text; the CLI still escapes it, so a warning
+        // stays one line and cannot rewrite the terminal.
+        let warning = "incomplete: a package's files could not be deleted\n\u{1b}[31m";
+        let result = json!({"cleanup": warning});
+        assert_eq!(
+            cleanup_notice(&result, CleanupStyle::Detail).unwrap(),
+            "  cleanup: incomplete: a package's files could not be deleted\\n\\u{001b}[31m"
+        );
+        assert_eq!(
+            cleanup_notice(&result, CleanupStyle::Retry).unwrap(),
+            "Cleanup incomplete: a package's files could not be deleted\\n\\u{001b}[31m. Run the command again to finish it."
+        );
+        // A warning that does not carry the Space's prefix is still a warning.
+        assert_eq!(
+            cleanup_notice(
+                &json!({"cleanup": "a package's files could not be deleted"}),
+                CleanupStyle::Retry
+            )
+            .unwrap(),
+            "Cleanup incomplete: a package's files could not be deleted. Run the command again to finish it."
+        );
+        // A retried removal that finished its cleanup says so, and does not ask
+        // for another retry.
+        assert_eq!(
+            cleanup_notice(&json!({"cleanup": "finished"}), CleanupStyle::Retry).unwrap(),
+            "Cleanup finished."
+        );
+    }
+
+    #[test]
+    fn plugin_rows_show_what_a_package_brought() {
+        let plugin = Id::new();
+        let server = Id::new();
+        let skill = Id::new();
+        let digest = "a".repeat(64);
+        let commit = "3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b";
+        let list = json!([{
+            "plugin": plugin,
+            "name": "reports",
+            "version": "1.2.0",
+            "digest": digest,
+            "commit": commit,
+            "source": format!("https://github.com/acme/reports@{commit}"),
+            "enabled": true,
+            "servers": [{"server": server, "name": "reports-docs"}],
+            "skills": [{"skill": skill, "name": "weekly-report"}],
+        }]);
+        assert_eq!(
+            plugin_rows(&list).unwrap(),
+            vec![format!(
+                "{plugin}  reports  1.2.0  {commit}  digest: {digest}  enabled  servers: reports-docs  skills: weekly-report"
+            )]
+        );
+        // A package that brought nothing, and a disabled one with no version.
+        let bare = json!([{
+            "plugin": plugin,
+            "name": "bare",
+            "enabled": false,
+            "servers": [],
+            "skills": [],
+        }]);
+        assert_eq!(
+            plugin_rows(&bare).unwrap(),
+            vec![format!(
+                "{plugin}  bare  -  -  digest: -  disabled  servers: -  skills: -"
+            )]
+        );
+        assert!(plugin_rows(&json!({})).is_err());
+    }
+
+    #[test]
     fn mcp_rows_show_the_server_scope_url_and_connection() {
         let server = Id::new();
         let user_server = Id::new();
@@ -4885,6 +5241,49 @@ mod tests {
             format!("{server}  bare  space  by -  https://x/  not connected")
         );
         assert_eq!(mcp_rows(&json!([])).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_mcp_removal_reports_the_cleanup_its_answer_carries() {
+        // A removal the Space finished its cleanup for leaves one line.
+        let clean = json!({"server": Id::new(), "name": "weather"});
+        assert_eq!(
+            mcp_remove_lines(&clean),
+            vec!["Removed MCP server weather.".to_owned()]
+        );
+
+        // A cleanup the Space still owes is reported on the next line, escaped
+        // into one line so a warning cannot rewrite the terminal, and names the
+        // retry that finishes it.
+        let owes = json!({
+            "server": Id::new(),
+            "name": "weather",
+            "cleanup": "incomplete: an MCP server's Vault credential could not be discarded\n\u{1b}[31m",
+        });
+        let lines = mcp_remove_lines(&owes);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "Removed MCP server weather.");
+        assert_eq!(
+            lines[1],
+            "Cleanup incomplete: an MCP server's Vault credential could not be discarded\\n\\u{001b}[31m. Run the command again to finish it."
+        );
+
+        // A retry that finished the cleanup says so, and asks for no other.
+        let finished = json!({"server": Id::new(), "name": "weather", "cleanup": "finished"});
+        assert_eq!(
+            mcp_remove_lines(&finished),
+            vec![
+                "Removed MCP server weather.".to_owned(),
+                "Cleanup finished.".to_owned(),
+            ]
+        );
+
+        // The Space may hold no name for the server; the line still says which
+        // server was removed.
+        assert_eq!(
+            mcp_remove_lines(&json!({"server": Id::new()})),
+            vec!["Removed MCP server the server.".to_owned()]
+        );
     }
 
     #[test]

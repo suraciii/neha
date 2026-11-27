@@ -12,7 +12,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use futures_util::StreamExt as _;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
 /// The MCP protocol revision this client speaks.
@@ -23,6 +23,63 @@ const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 /// The header a client names the protocol revision it speaks.
 const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
+
+/// How a configured header name is treated.
+///
+/// A package's headers are visible data, not a credential. Two names the Space
+/// decides for itself are told apart so a caller can report one policy apart
+/// from the other: a header that could carry a credential keeps a server out of
+/// the record, and a header the client owns is dropped from it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderClass {
+    /// A header whose name conventionally carries a secret. The Space never
+    /// sends one a package configures, and never stores it.
+    Credential,
+    /// A header the client owns for the protocol, the request's framing, or a
+    /// proxy. A configured value never replaces or duplicates it.
+    Generated,
+}
+
+/// Classifies a configured header name under the policy the Space applies.
+///
+/// The comparison ignores case, as header names do. [`HeaderClass::Credential`]
+/// wins when a name matches both rules, so `Proxy-Authorization` is refused
+/// rather than sent. `None` means a header the Space neither supplies nor
+/// treats as a secret: a package's own data, sent as configured.
+#[must_use]
+pub fn header_class(name: &str) -> Option<HeaderClass> {
+    let name = name.trim().to_ascii_lowercase();
+    // A name that merely contains one of these words is treated as a
+    // credential: a header convention is not something a package's data can
+    // prove, and refusing one visible header costs only a server's entry.
+    if matches!(
+        name.as_str(),
+        "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+    ) || ["auth", "token", "key", "secret", "password", "credential"]
+        .iter()
+        .any(|part| name.contains(part))
+    {
+        return Some(HeaderClass::Credential);
+    }
+    if name.starts_with("proxy-")
+        || matches!(
+            name.as_str(),
+            "accept"
+                | "content-type"
+                | "mcp-session-id"
+                | "mcp-protocol-version"
+                | "host"
+                | "content-length"
+                | "transfer-encoding"
+                | "connection"
+                | "accept-encoding"
+                | "user-agent"
+        )
+    {
+        return Some(HeaderClass::Generated);
+    }
+    None
+}
 
 /// How long one request may wait for its answer.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -96,6 +153,8 @@ pub struct McpClient {
     opened: bool,
     /// How long one request may wait for its answer.
     timeout: Duration,
+    /// Fixed headers a package configures for this server.
+    headers: reqwest::header::HeaderMap,
 }
 
 impl McpClient {
@@ -145,7 +204,66 @@ impl McpClient {
             negotiated: false,
             opened: false,
             timeout: REQUEST_TIMEOUT,
+            headers: reqwest::header::HeaderMap::new(),
         })
+    }
+
+    /// Adds the fixed headers a package configures.
+    ///
+    /// The headers are visible package data. Only a header the Space neither
+    /// owns nor treats as a credential is kept: a credential still comes only
+    /// from the Vault, and a name the client generates is written last, so a
+    /// configured value can neither duplicate nor override it.
+    #[must_use]
+    pub fn with_headers(mut self, headers: &std::collections::BTreeMap<String, String>) -> Self {
+        for (name, value) in headers {
+            if header_class(name).is_some() {
+                continue;
+            }
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                self.headers.insert(name, value);
+            }
+        }
+        self
+    }
+
+    /// The headers of one request.
+    ///
+    /// The configured headers are visible package data; every header this
+    /// client sets for the framing, the protocol, the session, or the
+    /// credential is inserted last: an insert replaces a configured header of
+    /// the same name instead of appending a second value, so a configured
+    /// value cannot duplicate or override one of them.
+    fn request_headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in &self.headers {
+            headers.insert(name.clone(), value.clone());
+        }
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        );
+        if self.negotiated {
+            headers.insert(
+                PROTOCOL_VERSION_HEADER,
+                HeaderValue::from_static(PROTOCOL_VERSION),
+            );
+        }
+        if let Some(session) = &self.session_id
+            && let Ok(value) = HeaderValue::from_str(session)
+        {
+            headers.insert(SESSION_ID_HEADER, value);
+        }
+        if let Some(credential) = &self.credential
+            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {credential}"))
+        {
+            headers.insert(AUTHORIZATION, value);
+        }
+        headers
     }
 
     /// Uses another request timeout, for a caller that shows a status rather
@@ -322,22 +440,10 @@ impl McpClient {
 
     /// Builds the POST for one JSON-RPC message.
     fn start(&self, message: &Value) -> reqwest::RequestBuilder {
-        let mut request = self
-            .http
+        self.http
             .post(self.url.clone())
-            .header(CONTENT_TYPE, "application/json")
-            .header(ACCEPT, "application/json, text/event-stream");
-        if self.negotiated {
-            request = request.header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION);
-        }
-        if let Some(session) = &self.session_id {
-            request = request.header(SESSION_ID_HEADER, session.as_str());
-        }
-        if let Some(credential) = &self.credential {
-            request = request.bearer_auth(credential.as_str());
-        }
-
-        request.json(message)
+            .headers(self.request_headers())
+            .json(message)
     }
 
     /// Sends one request and reads the answer to its id.
@@ -685,7 +791,51 @@ mod tests {
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
 
-    use super::{MAX_ANSWER_BYTES, McpClient, McpContent, McpError, PROTOCOL_VERSION};
+    use super::{
+        HeaderClass, MAX_ANSWER_BYTES, McpClient, McpContent, McpError, PROTOCOL_VERSION,
+        header_class,
+    };
+
+    #[test]
+    fn a_header_name_is_classified_by_what_it_carries() {
+        for name in [
+            "Authorization",
+            "proxy-authorization",
+            "Cookie",
+            "Set-Cookie",
+            "X-Api-Key",
+            "X-Auth-Token",
+            "X-Secret",
+            "X-Password",
+            "X-Credential",
+            "Tenant-Token",
+        ] {
+            assert_eq!(header_class(name), Some(HeaderClass::Credential), "{name}");
+        }
+        for name in [
+            "Accept",
+            "Content-Type",
+            "Mcp-Session-Id",
+            "MCP-Protocol-Version",
+            "Host",
+            "Content-Length",
+            "Transfer-Encoding",
+            "Connection",
+            "Proxy-Connection",
+            "Accept-Encoding",
+            "User-Agent",
+        ] {
+            assert_eq!(header_class(name), Some(HeaderClass::Generated), "{name}");
+        }
+        for name in ["X-Tenant", "X-Trace-Id", ""] {
+            assert_eq!(header_class(name), None, "{name}");
+        }
+        assert_eq!(
+            header_class("proxy-authorization"),
+            Some(HeaderClass::Credential),
+            "a proxy credential is a credential before it is a proxy header"
+        );
+    }
 
     /// The session id the fake server names in its handshake.
     const SESSION: &str = "session-1";
@@ -712,6 +862,11 @@ mod tests {
 
     fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    /// How many values one header carries.
+    fn values(headers: &HeaderMap, name: &str) -> usize {
+        headers.get_all(name).iter().count()
     }
 
     /// Runs a fake MCP server on a loopback port.
@@ -875,6 +1030,106 @@ mod tests {
             header(&notification.headers, "authorization"),
             Some("Bearer secret-token")
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_configured_header_never_replaces_or_duplicates_the_clients_own() {
+        let log = log();
+        let (url, task) = server(
+            log.clone(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                handshake(message).expect("only the handshake messages arrive")
+            }),
+        )
+        .await;
+        let configured: std::collections::BTreeMap<String, String> = [
+            ("Authorization", "Bearer planted"),
+            ("Proxy-Authorization", "Basic planted"),
+            ("Cookie", "session=planted"),
+            ("X-Api-Key", "planted"),
+            ("Content-Type", "text/plain"),
+            ("Accept", "*/*"),
+            ("Mcp-Session-Id", "planted"),
+            ("MCP-Protocol-Version", "1999-01-01"),
+            ("X-Tenant", "acme"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.to_owned(), value.to_owned()))
+        .collect();
+        let mut client = McpClient::new(&url, Some("secret-token"))
+            .unwrap()
+            .with_headers(&configured);
+
+        client.open().await.unwrap();
+
+        let requests = received(&log);
+        let initialize = &requests[0];
+        assert_eq!(
+            header(&initialize.headers, "authorization"),
+            Some("Bearer secret-token"),
+            "the credential is the client's"
+        );
+        assert_eq!(
+            header(&initialize.headers, "proxy-authorization"),
+            None,
+            "a proxy credential is never a package header"
+        );
+        assert_eq!(
+            header(&initialize.headers, "cookie"),
+            None,
+            "a cookie is a credential, so it is never a package header"
+        );
+        assert_eq!(
+            header(&initialize.headers, "x-api-key"),
+            None,
+            "a header whose name says key is a credential"
+        );
+        assert_eq!(
+            header(&initialize.headers, "content-type"),
+            Some("application/json")
+        );
+        assert_eq!(
+            header(&initialize.headers, "accept"),
+            Some("application/json, text/event-stream")
+        );
+        assert_eq!(
+            header(&initialize.headers, "mcp-session-id"),
+            None,
+            "the client sets no session before it has one"
+        );
+        assert_eq!(
+            header(&initialize.headers, "mcp-protocol-version"),
+            None,
+            "the protocol is named only once negotiated"
+        );
+        assert_eq!(
+            header(&initialize.headers, "x-tenant"),
+            Some("acme"),
+            "a header the client does not own still reaches the server"
+        );
+        for name in ["authorization", "content-type", "accept", "x-tenant"] {
+            assert_eq!(values(&initialize.headers, name), 1, "{name}");
+        }
+        assert_eq!(
+            values(&initialize.headers, "proxy-authorization"),
+            0,
+            "a proxy credential never reaches the server"
+        );
+
+        let notification = &requests[1];
+        assert_eq!(
+            header(&notification.headers, "mcp-session-id"),
+            Some(SESSION),
+            "the session the server named replaces the configured one"
+        );
+        assert_eq!(
+            header(&notification.headers, "mcp-protocol-version"),
+            Some(PROTOCOL_VERSION),
+            "the negotiated protocol replaces the configured one"
+        );
+        assert_eq!(values(&notification.headers, "mcp-session-id"), 1);
+        assert_eq!(values(&notification.headers, "mcp-protocol-version"), 1);
         task.abort();
     }
 

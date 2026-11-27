@@ -13,7 +13,7 @@ use crate::seq::Seq;
 use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The largest frame a client or the Space accepts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -224,6 +224,28 @@ pub enum CommandCall {
         bot: Id,
         /// The server.
         server: Id,
+    },
+    /// Installs an Agent Plugins package from an allowed source.
+    PluginInstall {
+        /// The source: a repository URL pinned to a commit, or a directory.
+        source: String,
+    },
+    /// Lists the installed packages.
+    PluginList,
+    /// Removes an installed package and what it brought.
+    PluginRemove {
+        /// The package.
+        plugin: Id,
+    },
+    /// Lets the Space offer a package.
+    PluginEnable {
+        /// The package.
+        plugin: Id,
+    },
+    /// Stops the Space offering a package.
+    PluginDisable {
+        /// The package.
+        plugin: Id,
     },
 }
 
@@ -888,7 +910,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
-            "{\"type\":\"hello\",\"version\":2}"
+            "{\"type\":\"hello\",\"version\":3}"
         );
 
         let error = ServerFrame::Error {
