@@ -108,6 +108,22 @@ describe("App with approvals", () => {
     expect(view.container.querySelector(".approval__scope")).toBeNull();
   });
 
+  it("names the directory the run works in, in the reader's language", async () => {
+    space.approvals.push(
+      { ...firstUse, approval: "a1", cwd: "/work/logs" },
+      // A run that named no directory says nothing about one.
+      { ...firstUse, approval: "a2" },
+      // An empty one is no directory at all.
+      { ...firstUse, approval: "a3", cwd: "" },
+      { ...firstUse, approval: "a4", cwd: null },
+    );
+    const view = await openChat();
+
+    expect(lines(view, ".approval__cwd")).toEqual(["in /work/logs"]);
+    flush(() => fireEvent.click(element(view, ".locale-switch")));
+    expect(lines(view, ".approval__cwd")).toEqual(["在 /work/logs"]);
+  });
+
   it("takes the Space's word on whether an action can be undone", async () => {
     space.approvals.push(
       { ...firstUse, approval: "a1", undoable: "unknown" },

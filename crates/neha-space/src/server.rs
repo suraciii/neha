@@ -4555,6 +4555,22 @@ mod tests {
         .await
     }
 
+    /// Sends a Message that names the directory the run works in.
+    async fn submit_in(socket: &mut Socket, chat: Id, text: &str, cwd: &str) -> Value {
+        command(
+            socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: text.to_owned(),
+                file: None,
+
+                cwd: Some(cwd.to_owned()),
+            }),
+        )
+        .await
+    }
+
     fn run_of(result: &Value) -> Id {
         serde_json::from_value(result["run"].clone()).expect("a run identifier")
     }
@@ -10192,6 +10208,30 @@ mod tests {
         action
     }
 
+    /// Answers the next action and returns its directory and write access.
+    async fn answer_next_action_with_access(
+        device: &mut Socket,
+        output: &str,
+    ) -> (
+        WireAction,
+        Option<String>,
+        neha_computer::channel::AccessFrame,
+    ) {
+        let (id, action, working_dir, access) = match next_host_frame(device).await {
+            HostFrame::Action {
+                id,
+                action,
+                working_dir,
+                access,
+                ..
+            } => (id, action, working_dir, access),
+            other => panic!("expected an action, got {other:?}"),
+        };
+        reply_action(device, id, ActionStatus::Succeeded, output).await;
+
+        (action, working_dir, access)
+    }
+
     /// Returns whether no approval appears for a Chat while a run works.
     ///
     /// Each poll finishes its command, so a poll never cancels a frame the
@@ -10268,6 +10308,10 @@ mod tests {
         assert_eq!(approval["reason"], "first_use_local");
         assert!(approval["decided"].is_null());
         assert!(approval["rule"].is_null());
+        assert!(
+            approval["cwd"].is_null(),
+            "a run that named no directory has none to show: {approval}"
+        );
         assert!(
             approval["summary"].as_str().unwrap().contains("pwd"),
             "the card names the command: {}",
@@ -13114,6 +13158,228 @@ mod tests {
         local.provider_task.abort();
         local.socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_write_inside_the_runs_directory_asks_no_grant() {
+        let (_dir, running, invite) = running().await;
+        let work = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        let outside = elsewhere.path().join("out.txt");
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("write_file", json!({"path": "in.txt", "content": "one"})),
+                text("first"),
+                tool("write_file", json!({"path": "in.txt", "content": "two"})),
+                text("second"),
+                tool(
+                    "write_file",
+                    json!({"path": outside.to_string_lossy(), "content": "three"}),
+                ),
+                text("third"),
+            ],
+        )
+        .await;
+
+        // The first use of the Computer asks whatever the action writes; the
+        // directory the run names is not a grant to ask for.
+        let first = run_of(&submit_in(&mut local.socket, local.chat, "write", &cwd).await);
+        let approval = approval_for_run(&mut local.socket, first).await;
+        assert_eq!(approval["reason"], "first_use_local");
+        assert_eq!(
+            approval["cwd"],
+            json!(cwd),
+            "the card names the directory the run works in: {approval}"
+        );
+        assert!(
+            approval["grant_folder"].is_null(),
+            "a write inside the run's directory asks for no folder: {approval}"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "wrote").await;
+        assert_eq!(
+            action,
+            WireAction::WriteFile {
+                path: "in.txt".to_owned(),
+                content: "one".to_owned()
+            }
+        );
+        assert_eq!(working_dir.as_deref(), Some(cwd.as_str()));
+        assert!(
+            access.write_roots.iter().any(|root| root == &cwd),
+            "the run's directory travels as a write root: {:?}",
+            access.write_roots
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A write inside the directory asks for no grant.
+        let second = run_of(&submit_in(&mut local.socket, local.chat, "again", &cwd).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "a write inside the run's directory needs no approval"
+        );
+        answer_next_action(&mut local.device, "wrote").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // A write outside it still asks for the folder, and one allow opens it
+        // for that action only.
+        let third = run_of(&submit_in(&mut local.socket, local.chat, "elsewhere", &cwd).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "grant");
+        assert_eq!(
+            approval["grant_folder"],
+            json!(elsewhere.path().to_str().unwrap())
+        );
+        assert_eq!(
+            approval["lasting_scope"],
+            json!(format!(
+                "writes under {}",
+                elsewhere.path().to_str().unwrap()
+            ))
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        answer_next_action(&mut local.device, "wrote").await;
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!([]));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_run_never_asks_for_a_folder() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let work = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        let outside = elsewhere.path().join("out.txt");
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "write_file",
+                json!({"path": outside.to_string_lossy(), "content": "x"}),
+            ),
+            text("done"),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        // A Hosted Computer has no fence yet (M2-B): the directory a run
+        // names grants nothing there and asks nothing either.
+        let queued = submit_in(&mut socket, chat, "write", &cwd).await;
+        let run = run_of(&queued);
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+        assert!(
+            approvals_in(&mut socket, None).await.is_empty(),
+            "a Hosted Computer never asks for a folder"
+        );
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["actions"][0]["tool"], "write_file");
+        assert_eq!(
+            shown["actions"][0]["status"], "failed",
+            "the in-process runtime still fences the write"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_run_keeps_its_directory_as_a_write_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let first = start(home, 0).await.unwrap();
+        let invite = first.invite.clone().expect("a fresh Space invites");
+        let work = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![
+                tool("write_file", json!({"path": "in.txt", "content": "one"})),
+                text("done"),
+            ],
+        )
+        .await;
+        let run = run_of(&submit_in(&mut local.socket, local.chat, "write", &cwd).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+
+        // The Space stops while the run still waits for its answer; the
+        // Computer's channel goes with it.
+        local.device.close(None).await.unwrap();
+        local.socket.close(None).await.unwrap();
+        let root = first.server_home();
+        first.shutdown().await;
+
+        let second = start(test_home(&root), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        assert_eq!(
+            wait_status(&mut socket, run, "waiting").await["status"],
+            "waiting",
+            "the run waits where the record left it"
+        );
+        // The replay projects the run's directory onto the card again.
+        let restored = approval_for_run(&mut socket, run).await;
+        assert_eq!(
+            restored["cwd"],
+            json!(cwd),
+            "the restored card still names the directory: {restored}"
+        );
+        let mut device = connect_computer(&second, &local.machine, local.computer).await;
+        wait_online(&mut socket, local.computer).await;
+
+        let decided = decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut device, "wrote").await;
+        assert_eq!(
+            action,
+            WireAction::WriteFile {
+                path: "in.txt".to_owned(),
+                content: "one".to_owned()
+            }
+        );
+        assert_eq!(working_dir.as_deref(), Some(cwd.as_str()));
+        assert!(
+            access.write_roots.iter().any(|root| root == &cwd),
+            "the restored run still writes in the directory it began in: {:?}",
+            access.write_roots
+        );
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+        device.close(None).await.unwrap();
+        local.provider_task.abort();
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

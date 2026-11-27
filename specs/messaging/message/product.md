@@ -39,6 +39,8 @@ When a rule asks and the action can make a lasting rule, the card shows what Alw
 
 It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
 
+An approval for a folder the owner has not granted offers Always allow, which grants that folder for later runs.
+
 A rule-triggered approval also offers no Always allow when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path.
 
 An ambiguous form still offers Always allow when the action can make a lasting rule, and that answer removes no rule.

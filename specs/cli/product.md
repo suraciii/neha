@@ -42,15 +42,15 @@ It finds the startup ticket the Space wrote under the machine's Neha configurati
 
 Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot update <bot>` changes a Bot's file access. Only the Bot's owner can change it, and the next run uses the new access.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines.
 
-`--full-access on` gives it the daemon's own file rights and removes the shell fence. `--full-access off` restores the Bot's Workspace fence.
+`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer. Only the Bot's owner can change a Bot's access, and the next run uses the new access.
 
-`--grant <path>` grants write access to an extra folder; repeat it for more folders. The folder MUST exist on the Local Computer.
+`neha bot full-access <bot> on` gives the Bot the machine user's own file rights and starts no sandbox for it; `neha bot full-access <bot> off` restores the granted folders fence.
 
-`--clear-grants` removes them all and cannot be combined with `--grant`. `neha bot show` prints what is in effect.
+`on` prints the risk, which names the configuration directory the Bot can then read, and asks for confirmation at a terminal. Without a terminal it needs `--yes`, and `off` asks for no confirmation.
 
-`neha chat send --cwd <path>` starts that run's actions in the named directory. Without it they start in the Bot's Workspace. The directory is recorded with the run and shown on an approval card.
+`neha chat send --cwd <path>` starts that run's actions in the named directory. Without it they start in the Bot's Workspace. The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run.
 
 A path that is not absolute is refused.
 

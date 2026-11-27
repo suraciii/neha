@@ -2178,6 +2178,27 @@ fn bot_environment(
     ])
 }
 
+/// The write access one run's actions carry to its Computer.
+///
+/// The run's working directory is a write root for that run alone: the owner
+/// named it for this work, so the Bot writes there without a grant and
+/// without an approval card, and it grants nothing to a later run. A run
+/// without one carries only the owner's grants. Full access adds no directory:
+/// the Computer ignores the roots a full-access frame carries.
+fn run_access(bot: &BotView, cwd: Option<&str>) -> neha_computer::channel::AccessFrame {
+    let mut write_roots = bot.grants.clone();
+    if !bot.full_access
+        && let Some(cwd) = cwd
+    {
+        write_roots.push(cwd.to_owned());
+    }
+
+    neha_computer::channel::AccessFrame {
+        full_access: bot.full_access,
+        write_roots,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finish_run_with(
     store: &Store,
@@ -2228,10 +2249,7 @@ async fn finish_run_with(
                     links.ids(),
                     tool_timeout.saturating_add(TIMEOUT_GRACE),
                 )
-                .with_access(neha_computer::channel::AccessFrame {
-                    full_access: pending.bot.full_access,
-                    write_roots: pending.bot.grants.clone(),
-                });
+                .with_access(run_access(&pending.bot, pending.cwd.as_deref()));
                 if let Some(cwd) = &pending.cwd {
                     runtime = runtime.with_working_dir(cwd);
                 }
@@ -4044,10 +4062,20 @@ fn derived_rule(
 /// not know a Local Bot's absolute Workspace path, so a relative path is only
 /// judged when the run named a working directory. The daemon still enforces
 /// the fence; this check decides when to ask before the action runs.
+///
+/// The run's working directory is a write root for that run alone, so a write
+/// that lands in it asks for nothing, and a full-access Bot asks for nothing
+/// either. A shell names no folder the Space could ask for: its working
+/// directory is already a write root when the run named one, and without one
+/// it works in a Workspace whose absolute path the Space does not know, so the
+/// daemon's fence decides what a shell may write.
 fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(String, String)> {
     if bot.full_access {
         return None;
     }
+    // The run's working directory, normalized. A directory the Space cannot
+    // name stays `None`, which leaves the write to the daemon's fence.
+    let root = cwd.and_then(action_path);
     let (folder, scope) = match call.tool.as_str() {
         // Only `write_file` writes the machine and asks for a folder.
         neha_loop::tools::WRITE_FILE => {
@@ -4055,82 +4083,35 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
             let target = if Path::new(path).is_absolute() {
                 action_path(path)?
             } else {
-                let cwd = cwd?;
-                action_path(&format!("{}/{path}", cwd.trim_end_matches('/')))?
+                let root = root.as_ref()?;
+                action_path(&format!("{}/{path}", root.trim_end_matches('/')))?
             };
-            if under_grants(&target, &bot.grants) {
+            if under_grants(&target, &bot.grants)
+                || root.as_ref().is_some_and(|root| under_root(&target, root))
+            {
                 return None;
             }
             (parent_of(&target), "writes")
-        }
-        neha_loop::tools::SHELL => {
-            // A shell can write anywhere; its working directory is the only
-            // target the Space can name before it runs. A command that reads
-            // only is not turned into a grant card, and a command that writes
-            // without an obvious target still meets the daemon's fence.
-            let command = call.arguments.get("command").and_then(Value::as_str)?;
-            if !shell_may_write(command) {
-                return None;
-            }
-            let cwd = action_path(cwd?)?;
-            if under_grants(&cwd, &bot.grants) {
-                return None;
-            }
-            (cwd, "writes")
         }
         _ => return None,
     };
     Some((folder, scope.to_owned()))
 }
 
-/// Returns whether a shell command is likely to write.
+/// Returns whether a normalized path lies inside one root folder.
 ///
-/// A shell can write through almost anything, so this is only the pre-run
-/// judgement: a command that names a write (a redirect or a common writing
-/// tool) asks the owner for its working directory, while a plainly read-only
-/// command does not. The daemon's fence still refuses anything this missed.
-fn shell_may_write(command: &str) -> bool {
-    if command.contains('>') {
-        return true;
-    }
-    let mut words = command.split_whitespace();
-    words.any(|word| {
-        let word = word.trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-');
-        matches!(
-            word,
-            "tee"
-                | "touch"
-                | "mkdir"
-                | "rmdir"
-                | "rm"
-                | "mv"
-                | "cp"
-                | "ln"
-                | "dd"
-                | "truncate"
-                | "chmod"
-                | "chown"
-                | "install"
-                | "patch"
-                | "sed"
-                | "perl"
-                | "python"
-                | "python3"
-                | "sh"
-                | "bash"
-                | "node"
-        ) || word.ends_with("-i")
-    })
+/// The root itself is a writable place, and a path under it is too. The root
+/// of the filesystem covers every absolute path.
+fn under_root(path: &str, root: &str) -> bool {
+    let root = lexical_path(root);
+    path == root
+        || (root == "/" && path.starts_with('/'))
+        || path.starts_with(&(root.trim_end_matches('/').to_owned() + "/"))
 }
 
 /// Returns whether a normalized path lies in one of the granted folders.
 fn under_grants(path: &str, grants: &[String]) -> bool {
-    grants.iter().any(|grant| {
-        let grant = lexical_path(grant);
-        path == grant
-            || (grant == "/" && path.starts_with('/'))
-            || path.starts_with(&(grant.trim_end_matches('/').to_owned() + "/"))
-    })
+    grants.iter().any(|grant| under_root(path, grant))
 }
 
 /// The largest summary the record keeps whole.
@@ -4531,11 +4512,11 @@ mod tests {
 
     use super::{
         LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
-        lasting_rule_path_at, path_covers, path_matches, path_matches_at, path_parent,
-        prepare_recovery, prepare_resume, resolve_action_path, rule_covers, rule_matches,
-        verify_recovered_action,
+        grant_folder, lasting_rule_path_at, path_covers, path_matches, path_matches_at,
+        path_parent, prepare_recovery, prepare_resume, resolve_action_path, rule_covers,
+        rule_matches, run_access, under_root, verify_recovered_action,
     };
-    use crate::state::RuleView;
+    use crate::state::{BotView, RuleView};
     use neha::id::Id;
     use neha::record::RuleEffect;
     use neha::seq::Seq;
@@ -4559,6 +4540,18 @@ mod tests {
             tool: tool.to_owned(),
             arguments,
             refused: None,
+        }
+    }
+
+    fn bot(full_access: bool, grants: &[&str]) -> BotView {
+        BotView {
+            id: Id::new(),
+            owner: Id::new(),
+            name: "Scout".to_owned(),
+            computer: Id::new(),
+            chat: Id::new(),
+            full_access,
+            grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
         }
     }
 
@@ -5511,6 +5504,165 @@ mod tests {
         assert_eq!(
             lasting_rule_path_at(&json!({"path": "notes.txt"}), Some("/data/work")),
             Some("/data/work".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_runs_directory_is_a_write_root_for_that_run_alone() {
+        let granted = bot(false, &["/data/shared"]);
+        // The grants come first and the run's directory last; the run's own
+        // folder is the Computer's to write, not the Space's to name.
+        assert_eq!(
+            run_access(&granted, Some("/data/work")),
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec!["/data/shared".to_owned(), "/data/work".to_owned()],
+            }
+        );
+        // A run without a named directory carries only the grants.
+        assert_eq!(
+            run_access(&granted, None),
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec!["/data/shared".to_owned()],
+            }
+        );
+        // Full access adds no directory; the Computer ignores the roots a
+        // full-access frame still carries.
+        let full = bot(true, &["/data/shared"]);
+        assert_eq!(
+            run_access(&full, Some("/data/work")),
+            neha_computer::channel::AccessFrame {
+                full_access: true,
+                write_roots: vec!["/data/shared".to_owned()],
+            }
+        );
+    }
+
+    #[test]
+    fn a_write_inside_the_runs_directory_asks_for_no_folder() {
+        let granted = bot(false, &[]);
+        let write = |path: &str| {
+            grant_folder(
+                &granted,
+                Some("/data/work"),
+                &call("write_file", json!({"path": path, "content": "x"})),
+            )
+        };
+        // A relative path lands in the run's directory, which is this run's
+        // write root, and an absolute path inside it is the same.
+        assert_eq!(write("notes.txt"), None);
+        assert_eq!(write("/data/work/logs/out.txt"), None);
+        // Outside it, the parent folder is what an answer would grant.
+        assert_eq!(
+            write("/data/elsewhere/out.txt"),
+            Some(("/data/elsewhere".to_owned(), "writes".to_owned()))
+        );
+        // A path that climbs out with `..` is judged by the same lexical
+        // containment as a grant: the Space shows no card and the Computer's
+        // fence decides what the path may write.
+        assert_eq!(write("../elsewhere/out.txt"), None);
+        // A granted folder asks for nothing either, directory or not.
+        let granted = bot(false, &["/data/shared"]);
+        assert_eq!(
+            grant_folder(
+                &granted,
+                Some("/data/work"),
+                &call(
+                    "write_file",
+                    json!({"path": "/data/shared/out.txt", "content": "x"})
+                )
+            ),
+            None
+        );
+        assert_eq!(
+            grant_folder(
+                &granted,
+                None,
+                &call(
+                    "write_file",
+                    json!({"path": "/data/shared/out.txt", "content": "x"})
+                )
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_write_without_a_named_directory_is_left_to_the_fence() {
+        let granted = bot(false, &[]);
+        // The Space cannot judge the Workspace a relative path lands in, so it
+        // names no folder to ask for and the daemon's fence decides.
+        assert_eq!(
+            grant_folder(
+                &granted,
+                None,
+                &call("write_file", json!({"path": "notes.txt", "content": "x"}))
+            ),
+            None
+        );
+        // An absolute path outside the grants still asks.
+        assert_eq!(
+            grant_folder(
+                &granted,
+                None,
+                &call(
+                    "write_file",
+                    json!({"path": "/tmp/out.txt", "content": "x"})
+                )
+            ),
+            Some(("/tmp".to_owned(), "writes".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_shell_and_full_access_ask_for_no_folder() {
+        let granted = bot(false, &[]);
+        let shell = |command: &str| {
+            grant_folder(
+                &granted,
+                Some("/data/work"),
+                &call("shell", json!({"command": command})),
+            )
+        };
+        // A shell names no folder the Space could ask for: with a directory
+        // that directory is already a write root, and the daemon's fence
+        // decides what the command writes outside it.
+        assert_eq!(shell("echo hi > out.txt"), None);
+        assert_eq!(shell("pwd"), None);
+        // Full access asks for nothing whatever the action writes.
+        let full = bot(true, &[]);
+        assert_eq!(
+            grant_folder(
+                &full,
+                None,
+                &call(
+                    "write_file",
+                    json!({"path": "/tmp/out.txt", "content": "x"})
+                )
+            ),
+            None
+        );
+        assert_eq!(
+            grant_folder(
+                &full,
+                Some("/data/work"),
+                &call("shell", json!({"command": "echo hi > /tmp/out.txt"}))
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_root_covers_itself_and_what_is_under_it() {
+        assert!(under_root("/data/work", "/data/work"));
+        assert!(under_root("/data/work/notes.txt", "/data/work"));
+        assert!(under_root("/anything/at/all", "/"));
+        assert!(!under_root("/data/workshop", "/data/work"));
+        assert!(!under_root("/data", "/data/work"));
+        assert!(
+            !under_root("data/work", "/data/work"),
+            "a relative path is not under an absolute root"
         );
     }
 

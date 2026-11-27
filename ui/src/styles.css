@@ -1039,6 +1039,13 @@ code,
   color: var(--ink-3);
   font-size: var(--text-md);
 }
+/* The directory the run works in, named next to the action it belongs to. */
+.approval__cwd {
+  margin-top: 6px;
+  color: var(--ink-4);
+  font-size: var(--text-md);
+  overflow-wrap: anywhere;
+}
 .approval__undo {
   margin-top: 2px;
   color: var(--ink-4);

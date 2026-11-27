@@ -60,6 +60,8 @@ Before a Computer action, the loop asks whether to proceed. A File action asks l
 
 The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
 
+An action that would write outside the Bot's write range also waits for the owner. [Computer](../computer/design.md#isolation) states that range, and the run's own working directory is part of it. An Always allow on that approval grants the action's folder for later runs.
+
 A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
 
 `RuleAdd` trims and normalizes a path prefix once and stores it; matching does not trim the stored prefix again. A raw action path is trimmed once, then compared after collapsing repeated `/` and removing `.` components, while keeping the absolute or relative form; `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule.

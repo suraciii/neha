@@ -259,6 +259,8 @@ pub struct ApprovalView {
     pub lasting_scope: Option<String>,
     /// The folder a grant answer covers, when the reason is a grant.
     pub grant_folder: Option<String>,
+    /// The directory the run works in, when it named one.
+    pub cwd: Option<String>,
     /// Whether the action can still be undone after it runs.
     pub undoable: Undoability,
     /// The answer, once the acting User gave one.
@@ -919,6 +921,10 @@ impl Projection for State {
                 }
                 run.status = RunStatus::Waiting;
                 run.approval = Some(data.approval);
+                // The card shows the directory the run works in, so the User
+                // answers knowing where the action lands. A record written
+                // before runs named a directory has none to project.
+                let cwd = run.cwd.clone();
                 self.approvals.push(ApprovalView {
                     approval: data.approval,
                     run: data.run,
@@ -938,6 +944,7 @@ impl Projection for State {
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
                     grant_folder: data.grant_folder,
+                    cwd,
                     undoable: data.undoable,
                     decided: None,
                     seq: event.seq,
@@ -1302,6 +1309,129 @@ mod tests {
                 ))
                 .is_err(),
             "a first use is not an ambiguous rule ask"
+        );
+    }
+
+    #[test]
+    fn an_approval_carries_the_directory_its_run_works_in() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let mut state = State::default();
+        let created = |kind, data, seq| event(kind, Author::User(owner), data, seq);
+        state
+            .apply(&created(
+                EventKind::ComputerCreated,
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::BotCreated,
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::ChatCreated,
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+
+        let bot_author = Author::Bot(bot);
+        // Queues one run, records the directory it works in when the run named
+        // one, starts it, and asks for an approval inside it.
+        let ask = |state: &mut State, run: Id, working_dir: Option<&str>, seq: i64| {
+            let run_data = serde_json::json!({
+                "run": run,
+                "chat": chat,
+                "bot": bot,
+                "command": Id::new(),
+                "message": Id::new(),
+            });
+            state
+                .apply(&acted_event(
+                    EventKind::RunQueued,
+                    bot_author,
+                    owner,
+                    run_data.clone(),
+                    seq,
+                ))
+                .unwrap();
+            if let Some(working_dir) = working_dir {
+                state
+                    .apply(&acted_event(
+                        EventKind::RunContext,
+                        bot_author,
+                        owner,
+                        serde_json::json!({"run": run, "working_dir": working_dir}),
+                        seq + 1,
+                    ))
+                    .unwrap();
+            }
+            state
+                .apply(&acted_event(
+                    EventKind::RunStarted,
+                    bot_author,
+                    owner,
+                    run_data,
+                    seq + 2,
+                ))
+                .unwrap();
+            state
+                .apply(&acted_event(
+                    EventKind::ApprovalRequested,
+                    bot_author,
+                    owner,
+                    serde_json::json!({
+                        "approval": Id::new(),
+                        "run": run,
+                        "bot": bot,
+                        "computer": computer,
+                        "chat": chat,
+                        "acting": owner,
+                        "action": Id::new(),
+                        "index": 0,
+                        "step": 1,
+                        "call": "call-1",
+                        "tool": "shell",
+                        "arguments": {"command": "true"},
+                        "summary": "shell: true",
+                        "reason": "rule",
+                        "rule": null,
+                        "lasting_scope": null,
+                        "undoable": "no",
+                    }),
+                    seq + 3,
+                ))
+                .unwrap();
+        };
+
+        // A record from before runs named a directory has none to project.
+        ask(&mut state, Id::new(), None, 4);
+        assert_eq!(state.approvals[0].cwd, None);
+
+        // The directory the run named is the one its card shows.
+        ask(&mut state, Id::new(), Some("/work/logs"), 8);
+        assert_eq!(
+            state.approvals[1].cwd.as_deref(),
+            Some("/work/logs"),
+            "the card names where the run works"
         );
     }
 

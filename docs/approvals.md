@@ -8,6 +8,8 @@ A Bot runs a Computer action without asking by default. It asks before the first
 
 Files move through the Bot's shell (`neha file get` and `neha chat send --file`), so they wait on the shell action's approval; there is no separate File action.
 
+A write outside the Bot's Workspace, its granted folders, and the run's `--cwd` directory asks as well. Allow runs it once, Always allow grants the folder for later runs, and Deny ends the run. [Add a Local Computer](computer.md#file-access-and-a-runs-directory) covers the fence and the commands that widen it.
+
 Only the User the Bot acts for can answer. An Allow runs the action once; an Always allow also covers later actions of that kind.
 
 ## Answer in the Chat
@@ -37,7 +39,7 @@ target/debug/neha approval allow <approval-id>
 target/debug/neha approval deny <approval-id>
 ```
 
-`neha approval show <approval-id>` prints where the action sits and its full arguments. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. A Deny ends the run, and the Bot says that it stopped.
+`neha approval show <approval-id>` prints where the action sits, the directory its run works in when the run named one, and its full arguments. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. On an approval for a folder the owner has not granted, `--always` grants that folder instead, and `neha bot access <bot-id>` shows it among the Bot's grants. A Deny ends the run, and the Bot says that it stopped.
 
 ## What an Always allow covers
 

@@ -7,7 +7,7 @@ This milestone pairs the machine that runs the Space, because the Space listens 
 ## What you need
 
 - A Linux machine with the Neha CLI. [Building and verification](building.md) covers the build; the examples use `target/debug/neha`.
-- `bubblewrap` on that machine. The daemon runs each shell command in a sandbox it starts; the file tools check their own paths.
+- `bubblewrap` on that machine. The daemon runs each shell command in a sandbox it starts, unless the Bot has full access; the file tools check their own paths.
 - A Space running on the same machine, at an address the Local Computer can reach; in this milestone that is the host that runs the Space.
 - A CLI signed in to the Space for commands such as `computer list` and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
 
@@ -45,7 +45,7 @@ target/debug/neha computer run
 
 Keep that terminal open. The Space shows the Computer as online while the daemon runs, and the run prints the Workspace root it serves.
 
-The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, where Bots cannot read it.
+The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, which granted mode hides from Bots.
 
 Each Space's ticket sits at `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`, or `~/.config/neha/spaces/<space-key>/local-computer.ticket` when `XDG_CONFIG_HOME` is not set. `computer pair` scans `spaces/` and pairs the Space whose URL its ticket names; `--ticket-file` names another file. When no ticket file exists, a signed-in CLI asks the Space that saved its session for one, so only that fallback needs a signed-in CLI.
 
@@ -103,17 +103,17 @@ The Workspace root is `~/.neha/workspaces` by default; `--workspace` on `compute
 ~/.neha/workspaces/<bot-id>/
 ```
 
-The folder is created when the Bot first runs an action. Every action of the Bot starts in its Workspace: a relative path names a file inside it, and `pwd` prints it. The `Workspace root:` line from `neha computer run` names the root the daemon actually serves.
+The folder is created when the Bot first runs an action. Every action of the Bot starts in its Workspace, or in the directory `--cwd` names for that run: a relative path names a file inside it, and `pwd` prints it. The `Workspace root:` line from `neha computer run` names the root the daemon actually serves.
 
-The file tools check every write path. A write outside the Workspace fails with `the path is outside this Bot's writable folder`; a `..` climb or a symlink out is refused, and no file is created. The only persistent place a Bot writes on the machine is its Workspace.
+The file tools check every write path. A write outside the Workspace fails with `the path is outside this Bot's writable folder`; a `..` climb or a symlink out is refused, and no file is created. Without a grant, the only persistent place a Bot writes on the machine is its Workspace.
 
 The file tools read with the rights of the machine's user. A file read follows a symlink as the machine user's own tools do, and reaches any file that user can read, including files outside the Workspace and files of another Bot on the machine. A directory listing does not follow a symlink that is the path itself, and a FIFO or a device is not read.
 
-The Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token. The directory is `~/.config/neha` by default.
+In granted mode the Computer's own configuration directory is the exception. A path that resolves into it is refused, even through a symlink; the daemon hides it from the file tools and the shell, so a Bot cannot read the saved pairing or its token. The directory is `~/.config/neha` by default. A Bot with full access reads it as the machine's user does.
 
 The same split reaches Files: in the shell, `neha file get` writes a File of the Chat into the Workspace, and `neha chat send --file` reads a Workspace file and sends it to the Chat. Both run as shell commands and go through the approval gate like other shell commands. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers them.
 
-A shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace is writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
+In granted mode a shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace and its granted folders are writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
 
 The daemon checks a Bot's folder before it serves it. A hard link, a symlink, or a special file in the folder makes the daemon refuse that folder until it is cleaned; keep links and special files out of the Workspace.
 
@@ -161,11 +161,11 @@ The machine ends the command it was running when the channel drops, so no action
 | `pair` or `computer run` reports the workspace is inside the configuration directory | The configuration directory is `~/.config/neha` by default, and a Workspace inside it is refused. Pair again with `--workspace` outside that directory. |
 | `chat send` stops with a run waiting for approval | Answer the card in a terminal, or use `neha approval allow <approval-id>` from the ids it printed. [Approvals](approvals.md) covers it. |
 | The ticket is not valid | A ticket lasts one pairing and one Space start. Restart the Space, then run `neha computer pair` again; a signed-in CLI can also ask for a ticket when no ticket file is present. |
-| A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory. A Bot cannot read that directory. |
+| A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory, which granted mode hides from Bots. A Bot with full access reads it; turn full access off to hide it again. |
 | A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. |
-| A write is refused | The path is outside the Bot's Workspace and the folders its owner granted. Write inside those, grant the folder, or answer the approval card that asks for it. |
+| A write is refused | The path is outside the Bot's Workspace and the folders its owner granted. Write inside those, grant the folder, or answer the approval card that asks for it. Full access removes the fence. |
 
 [Building and verification](building.md#a-local-computer-sandbox) shows how to install `bubblewrap`.
 
@@ -182,17 +182,21 @@ The machine ends the command it was running when the channel drops, so no action
 
 ## File access and a run's directory
 
-A Local Bot starts in its own Workspace and may write only there. The owner can widen that with `neha bot update`:
+A Local Bot starts in its own Workspace and may write only there. The owner can widen that with `neha bot grant` and `neha bot full-access`:
 
 ```sh
-neha bot update <bot-id> --grant /data/shared
-neha bot update <bot-id> --full-access on
-neha bot update <bot-id> --clear-grants
+neha bot access <bot-id>
+neha bot grant <bot-id> /data/shared
+neha bot revoke <bot-id> /data/shared
+neha bot full-access <bot-id> on
+neha bot full-access <bot-id> off
 ```
 
-`--grant` adds one extra folder the Bot may write; repeat it for more. The folder must already exist on this machine. `--full-access on` gives the Bot the daemon process's own write rights and removes the write fence, so its shell sees the machine's own `/tmp`, `/dev`, and process view; `off` restores the fence. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
+`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. `neha bot revoke <bot-id> <path>` takes one away, and `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
 
-When a Bot's action would write outside its Workspace and the granted folders, the run waits for the owner's approval instead of running the action. This covers a file path the Space can see and a shell that names a working directory. A shell that writes from the default Workspace is refused by the fence rather than turned into a request, because the Space does not know the Local Workspace's absolute path; grant the folder, or name it with `--cwd`, to let the Bot ask. A shell mounted into a grant is not writable when the grant contains a hard link, symlink, or special file, so it cannot change a file outside the grant. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. The Computer's configuration directory stays hidden even with full access.
+`neha bot full-access <bot-id> on` gives the Bot the daemon process's own file rights and starts no sandbox for it, so the Bot writes and deletes what the machine's user can and its shell sees the machine's own `/tmp`, `/dev`, and process view. The risk it prints names what that reaches: the Bot can read the Computer's configuration directory, `~/.config/neha` by default, which holds the saved pairing, the machine's token, and the CLI's session credential. Turn full access on only when the Bot needs that range; `off` restores the fence. `on` asks for confirmation at a terminal and needs `--yes` without one; `off` asks for nothing.
+
+When a Bot's action would write outside its Workspace, the granted folders, and the run's `--cwd` directory, the run waits for the owner's approval instead of running the action. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. A shell that writes from the default Workspace is refused by the fence rather than turned into a request, because the Space does not know the Local Workspace's absolute path. A shell mounted into a grant is not writable when the grant contains a hard link, symlink, or special file, so it cannot change a file outside the grant. The approval gate still applies with full access: the first use of the Computer asks, and an Ask rule still asks.
 
 A run can start its actions in another directory with `neha chat send --cwd`:
 
@@ -200,4 +204,4 @@ A run can start its actions in another directory with `neha chat send --cwd`:
 neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
 ```
 
-Without `--cwd` the run starts in the Bot's Workspace. The directory is recorded with the run and appears on an approval card. It must be absolute. Choosing a directory does not make it writable: writes still need the Workspace, a grant, or full access. Reading still follows the machine user's rights, except the Computer's own configuration directory, which stays hidden.
+Without `--cwd` the run starts in the Bot's Workspace. The directory must be absolute. It is that run's write root: the Bot's shell and its file tools may write inside it for that run, and it grants nothing to a later run. The directory is recorded with the run and appears on an approval card. Reading still follows the machine user's rights, except in granted mode, where the Computer's configuration directory stays hidden.

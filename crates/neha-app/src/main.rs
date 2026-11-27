@@ -159,19 +159,35 @@ enum BotCommand {
         #[arg(long)]
         computer: Id,
     },
-    /// Change your Bot's file access.
-    Update {
+    /// Show your Bot's file access.
+    Access {
         /// The Bot identifier.
         bot: Id,
-        /// Allow (on) or refuse (off) writes outside the Bot's Workspace fence.
-        #[arg(long, value_parser = parse_full_access)]
-        full_access: Option<bool>,
-        /// Grant write access to an extra folder; repeatable.
-        #[arg(long = "grant", value_name = "PATH")]
-        grants: Vec<std::path::PathBuf>,
-        /// Remove every extra write grant.
+    },
+    /// Grant your Bot write access to another folder.
+    Grant {
+        /// The Bot identifier.
+        bot: Id,
+        /// The folder the Bot may also write; it must already exist.
+        path: std::path::PathBuf,
+    },
+    /// Take one granted folder away from your Bot.
+    Revoke {
+        /// The Bot identifier.
+        bot: Id,
+        /// The granted folder to take away.
+        path: std::path::PathBuf,
+    },
+    /// Turn your Bot's full access on or off.
+    FullAccess {
+        /// The Bot identifier.
+        bot: Id,
+        /// On removes the sandbox; off restores the granted folders fence.
+        #[arg(action = clap::ArgAction::Set, value_parser = parse_full_access)]
+        full_access: bool,
+        /// Turn full access on without asking for confirmation.
         #[arg(long)]
-        clear_grants: bool,
+        yes: bool,
     },
     /// Show your Bot, its Chat, and its Computer.
     Show {
@@ -596,13 +612,186 @@ async fn model(command: ModelCommand) -> Result<()> {
     Ok(())
 }
 
-/// Parses `--full-access on|off`.
+/// Parses `on|off` for a Bot's full access.
 fn parse_full_access(value: &str) -> Result<bool> {
     match value {
         "on" | "true" | "yes" => Ok(true),
         "off" | "false" | "no" => Ok(false),
-        other => bail!("--full-access expects on or off, not {other:?}"),
+        other => bail!("expects on or off, not {other:?}"),
     }
+}
+
+/// The grants a `bot show` answer reports.
+fn current_grants(shown: &Value) -> Result<Vec<String>> {
+    let grants = shown["bot"]["grants"]
+        .as_array()
+        .context("the answer has no grants")?;
+
+    Ok(grants
+        .iter()
+        .map(|grant| grant.as_str().unwrap_or_default().to_owned())
+        .collect())
+}
+
+/// Checks one grant path and returns its normalized spelling.
+///
+/// The Space stores a grant as the absolute path it was given, so the CLI
+/// checks the shape before sending it: an empty, relative, or `..` path is
+/// refused here, where the message can name the path. Repeated separators and
+/// `.` components fold away, so two spellings of one folder are one grant.
+fn normalized_grant(path: &std::path::Path) -> Result<String> {
+    let spelled = path.to_string_lossy().into_owned();
+    let trimmed = spelled.trim();
+    if trimmed.is_empty() {
+        bail!("a grant cannot be empty");
+    }
+    let path = std::path::Path::new(trimmed);
+    if !path.is_absolute() {
+        bail!("a grant must be an absolute path: {trimmed}");
+    }
+    if spelled.contains('\0')
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        bail!("a grant must not use `..` or a NUL: {trimmed}");
+    }
+    let mut folded = std::path::PathBuf::from("/");
+    for part in path.components() {
+        // The root is already there; a `.` folds away.
+        if let std::path::Component::Normal(name) = part {
+            folded.push(name);
+        }
+    }
+
+    Ok(folded.to_string_lossy().into_owned())
+}
+
+/// Checks one grant path and returns the canonical path to store.
+///
+/// The folder must exist: the Computer opens it as a write root, and a grant
+/// for a folder nobody can see would silently write nowhere.
+fn checked_grant(path: &std::path::Path) -> Result<String> {
+    let granted = normalized_grant(path)?;
+    let folder = std::fs::canonicalize(&granted)
+        .with_context(|| format!("the grant folder does not exist: {granted}"))?;
+    if !folder.is_dir() {
+        bail!("a grant must be a folder: {}", folder.display());
+    }
+
+    Ok(folder.to_string_lossy().into_owned())
+}
+
+/// Returns whether two grants name the same folder.
+///
+/// The Space compares a write path against its grants after the same folding,
+/// so a grant written with a trailing separator or a `.` is the same grant.
+fn same_grant(left: &str, right: &str) -> bool {
+    let fold = |grant: &str| {
+        let mut folded = std::path::PathBuf::from("/");
+        for part in std::path::Path::new(grant.trim()).components() {
+            if let std::path::Component::Normal(name) = part {
+                folded.push(name);
+            }
+        }
+        folded
+    };
+    fold(left) == fold(right)
+}
+
+/// Sends one access change and returns the updated Bot.
+async fn update_access(
+    credential: &Credential,
+    bot: Id,
+    full_access: Option<bool>,
+    grants: Option<Vec<String>>,
+) -> Result<Value> {
+    client::command(
+        credential,
+        CommandCall::BotUpdate(BotUpdate {
+            bot,
+            full_access,
+            grants,
+        }),
+    )
+    .await
+}
+
+/// Prints one Bot's file access from a `bot show` answer or an access change.
+fn print_access(bot: &Value) -> Result<()> {
+    println!("Bot {} ({})", id_of(bot, "id")?, text_of(bot, "name")?);
+    write_access(&mut std::io::stdout().lock(), bot)
+}
+
+/// Writes one Bot's file access: its full-access state, then its grants.
+fn write_access(out: &mut impl Write, bot: &Value) -> Result<()> {
+    let full_access = if bot["full_access"].as_bool().unwrap_or(false) {
+        "on"
+    } else {
+        "off"
+    };
+    writeln!(out, "  full access: {full_access}")?;
+    match bot["grants"].as_array() {
+        Some(grants) if !grants.is_empty() => {
+            for grant in grants {
+                writeln!(out, "  grant {}", grant.as_str().unwrap_or_default())?;
+            }
+        }
+        _ => writeln!(out, "  grants: none")?,
+    }
+
+    Ok(())
+}
+
+/// Prints the risk full access takes and asks the User to confirm it.
+///
+/// `--yes` answers the prompt; a non-interactive run without it is an error,
+/// because silently removing the sandbox from a script would skip the one
+/// decision that asks for.
+fn confirm_full_access(
+    bot: Id,
+    yes: bool,
+    interactive: bool,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<()> {
+    writeln!(
+        output,
+        "Full access starts no sandbox for this Bot: it reads and writes"
+    )?;
+    writeln!(
+        output,
+        "everything this machine's user can, inside and outside its"
+    )?;
+    writeln!(output, "Workspace and granted folders.")?;
+    writeln!(
+        output,
+        "It can also read Neha's configuration directory, ~/.config/neha by"
+    )?;
+    writeln!(
+        output,
+        "default, which holds the saved pairing, the machine's token, and CLI"
+    )?;
+    writeln!(output, "sessions.")?;
+    if yes {
+        return Ok(());
+    }
+    if !interactive {
+        bail!(
+            "full access is not confirmed: stdin is not a terminal; pass --yes to turn it on without a prompt"
+        );
+    }
+    write!(
+        output,
+        "Turn full access on for Bot {bot}? Type yes to confirm: "
+    )?;
+    output.flush()?;
+    let mut answer = String::new();
+    if input.read_line(&mut answer)? == 0 || answer.trim() != "yes" {
+        bail!("full access is not confirmed: answer yes to turn it on");
+    }
+
+    Ok(())
 }
 
 async fn bot(command: BotCommand) -> Result<()> {
@@ -638,66 +827,53 @@ async fn bot(command: BotCommand) -> Result<()> {
                 result["to"]["online"].as_bool().unwrap_or(false),
             );
         }
-        BotCommand::Update {
+        BotCommand::Access { bot } => {
+            let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
+            print_access(&shown["bot"])?;
+        }
+        BotCommand::Grant { bot, path } => {
+            let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
+            let mut grants = current_grants(&shown)?;
+            let granted = checked_grant(&path)?;
+            if grants.iter().any(|grant| same_grant(grant, &granted)) {
+                bail!("the Bot already has a grant for {granted}");
+            }
+            grants.push(granted);
+            let result = update_access(&credential, bot, None, Some(grants)).await?;
+            print_access(&result)?;
+        }
+        BotCommand::Revoke { bot, path } => {
+            let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
+            let grants = current_grants(&shown)?;
+            let revoked = normalized_grant(&path)?;
+            let kept: Vec<String> = grants
+                .iter()
+                .filter(|grant| !same_grant(grant, &revoked))
+                .cloned()
+                .collect();
+            if kept.len() == grants.len() {
+                bail!("the Bot has no grant for {revoked}");
+            }
+            let result = update_access(&credential, bot, None, Some(kept)).await?;
+            print_access(&result)?;
+        }
+        BotCommand::FullAccess {
             bot,
             full_access,
-            grants,
-            clear_grants,
+            yes,
         } => {
-            if clear_grants && !grants.is_empty() {
-                bail!("--clear-grants and --grant cannot be used together");
-            }
-            let grants = if clear_grants {
-                Some(Vec::new())
-            } else if grants.is_empty() {
-                None
-            } else {
-                let mut checked = Vec::new();
-                for path in grants {
-                    // The Space only accepts an absolute path with no `..`;
-                    // check the input before canonicalize would paper over it.
-                    if !path.is_absolute() {
-                        bail!("a grant must be an absolute path: {}", path.display());
-                    }
-                    if path.to_string_lossy().contains('\0')
-                        || path
-                            .components()
-                            .any(|part| matches!(part, std::path::Component::ParentDir))
-                    {
-                        bail!("a grant must not use `..` or a NUL: {}", path.display());
-                    }
-                    let folder = std::fs::canonicalize(&path).with_context(|| {
-                        format!("the grant folder does not exist: {}", path.display())
-                    })?;
-                    if !folder.is_dir() {
-                        bail!("a grant must be a folder: {}", folder.display());
-                    }
-                    checked.push(folder.to_string_lossy().into_owned());
-                }
-                Some(checked)
-            };
-            let result = client::command(
-                &credential,
-                CommandCall::BotUpdate(BotUpdate {
+            if full_access {
+                let stdin = std::io::stdin();
+                confirm_full_access(
                     bot,
-                    full_access,
-                    grants,
-                }),
-            )
-            .await?;
-            println!(
-                "Updated Bot {} ({})",
-                id_of(&result, "id")?,
-                text_of(&result, "name")?
-            );
-            println!(
-                "  full access: {}",
-                result["full_access"].as_bool().unwrap_or(false)
-            );
-            println!(
-                "  grants: {}",
-                result["grants"].as_array().map_or(0, Vec::len)
-            );
+                    yes,
+                    stdin.is_terminal(),
+                    &mut stdin.lock(),
+                    &mut std::io::stdout().lock(),
+                )?;
+            }
+            let result = update_access(&credential, bot, Some(full_access), None).await?;
+            print_access(&result)?;
         }
         BotCommand::Show { bot } => {
             let result = client::command(&credential, CommandCall::BotShow { bot }).await?;
@@ -719,15 +895,8 @@ async fn bot(command: BotCommand) -> Result<()> {
             if !workspace.is_empty() {
                 println!("  Workspace: {workspace}");
             }
-            println!(
-                "  full access: {}",
-                result["bot"]["full_access"].as_bool().unwrap_or(false)
-            );
-            if let Some(grants) = result["bot"]["grants"].as_array() {
-                for grant in grants {
-                    println!("  grant: {}", grant.as_str().unwrap_or_default());
-                }
-            }
+            // `bot access` prints the same lines.
+            write_access(&mut std::io::stdout().lock(), &result["bot"])?;
         }
         BotCommand::List => {
             let result = client::command(&credential, CommandCall::BotList).await?;
@@ -1174,6 +1343,11 @@ fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> 
     if let Some(rule) = approval["rule"].as_str() {
         writeln!(out, "  rule {rule}")?;
     }
+    // The directory the run works in, when it named one: the action lands
+    // there, so the User reads it before answering.
+    if let Some(cwd) = approval["cwd"].as_str() {
+        writeln!(out, "  cwd {}", escape_text(cwd))?;
+    }
     // An ambiguous approval cannot name one rule; saying so lets the User
     // know the answer may create a different lasting rule than expected.
     let ambiguous = approval["ambiguous"].as_bool().unwrap_or(false);
@@ -1450,6 +1624,8 @@ struct ApprovalCard {
     undoable: Option<String>,
     /// What an Always allow would cover, as the Space said or left out.
     lasting_scope: LastingScope,
+    /// The directory the run works in, when it named one.
+    cwd: Option<String>,
     /// The arguments the action runs with.
     arguments: Value,
 }
@@ -1473,6 +1649,7 @@ impl ApprovalCard {
                 Some(_) => LastingScope::Unavailable,
             },
             arguments: approval.get("arguments").cloned().unwrap_or(Value::Null),
+            cwd: approval["cwd"].as_str().map(str::to_owned),
         })
     }
 
@@ -1578,6 +1755,14 @@ impl ApprovalCard {
         } else {
             format!("\n  {}", escape_text(&self.summary))
         };
+        // The action lands in the directory the run works in, when it named
+        // one; the line comes with the action it belongs to.
+        let cwd = self
+            .cwd
+            .as_deref()
+            .filter(|cwd| !cwd.is_empty())
+            .map(|cwd| format!("\n  in {}", escape_text(cwd)))
+            .unwrap_or_default();
 
         let scope = self
             .always_scope()
@@ -1585,10 +1770,11 @@ impl ApprovalCard {
             .unwrap_or_default();
 
         format!(
-            "Approval {} for {}{}\n  reason: {}{}\n  {}",
+            "Approval {} for {}{}{}\n  reason: {}{}\n  {}",
             self.approval,
             escape_text(&self.tool),
             summary,
+            cwd,
             self.reason_text(),
             scope,
             self.undo_text()
@@ -1912,6 +2098,11 @@ mod tests {
         write_approval_details,
     };
 
+    use super::{
+        BotCommand, checked_grant, confirm_full_access, current_grants, normalized_grant,
+        same_grant, write_access,
+    };
+
     /// Parses a CLI command line.
     fn parse(args: &[&str]) -> Top {
         Cli::try_parse_from(std::iter::once("neha").chain(args.iter().copied()))
@@ -1929,6 +2120,7 @@ mod tests {
             ambiguous: false,
             undoable: None,
             lasting_scope: LastingScope::Missing,
+            cwd: None,
             arguments: json!({"command": "printf approved > proof.txt"}),
         }
     }
@@ -2287,6 +2479,47 @@ mod tests {
     }
 
     #[test]
+    fn a_card_names_the_directory_the_run_works_in() {
+        let view = json!({
+            "approval": Id::new(),
+            "tool": "shell",
+            "summary": "printf hi",
+            "reason": "rule",
+            "cwd": "/work/logs",
+            "arguments": {"command": "printf hi"},
+        });
+        let card = ApprovalCard::from_view(&view).unwrap();
+        assert_eq!(card.cwd.as_deref(), Some("/work/logs"));
+        let rendered = card.render();
+        assert!(rendered.contains("\n  in /work/logs"), "{rendered}");
+        // The line sits with the action it belongs to, before the reason.
+        let action = rendered
+            .find("printf hi")
+            .expect("the card names the action");
+        let directory = rendered
+            .find("in /work/logs")
+            .expect("the card names the directory");
+        let reason = rendered.find("reason:").expect("the card names a reason");
+        assert!(action < directory && directory < reason, "{rendered}");
+
+        // A run that named no directory shows no line; an empty one is none.
+        let mut bare = json!({
+            "approval": Id::new(),
+            "tool": "shell",
+            "summary": "printf hi",
+            "reason": "rule",
+            "arguments": {"command": "printf hi"},
+        });
+        let rendered = ApprovalCard::from_view(&bare).unwrap().render();
+        assert!(!rendered.contains("\n  in "), "{rendered}");
+        bare.as_object_mut()
+            .unwrap()
+            .insert("cwd".to_owned(), json!(""));
+        let rendered = ApprovalCard::from_view(&bare).unwrap().render();
+        assert!(!rendered.contains("\n  in "), "{rendered}");
+    }
+
+    #[test]
     fn a_card_says_whether_the_action_can_be_undone() {
         // The Space's undoable field wins over what the tool looks like.
         let mut card = approval_card("read_file", "rule");
@@ -2556,6 +2789,38 @@ mod tests {
     }
 
     #[test]
+    fn approval_show_names_the_directory_the_run_works_in() {
+        let mut approval = json!({
+            "approval": Id::new(),
+            "run": Id::new(),
+            "bot": Id::new(),
+            "action": Id::new(),
+            "chat": Id::new(),
+            "step": 1,
+            "index": 0,
+            "tool": "shell",
+            "reason": "rule",
+            "summary": "printf hi",
+            "arguments": {"command": "printf hi"},
+        });
+        // A view without the directory says nothing about one.
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("cwd"), "{out}");
+
+        // The Space's word is shown, escaped so a card cannot hide itself.
+        approval
+            .as_object_mut()
+            .unwrap()
+            .insert("cwd".to_owned(), json!("/work/logs\u{001b}[2J"));
+        let mut out = Vec::new();
+        write_approval_details(&mut out, &approval).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("  cwd /work/logs\\u{001b}[2J"), "{out}");
+    }
+
+    #[test]
     fn approval_show_prints_the_full_arguments() {
         let command = format!("printf '{}' > proof.txt", "a".repeat(400));
         let rule = Id::new();
@@ -2787,5 +3052,238 @@ mod tests {
         let shown = String::from_utf8(shown).unwrap();
         assert!(shown.contains(&format!("  approval {approval}")), "{shown}");
         assert!(shown.contains("Run "), "{shown}");
+    }
+
+    #[test]
+    fn the_bot_access_commands_parse() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        assert!(matches!(
+            parse(&["bot", "access", bot_text.as_str()]),
+            Top::Bot {
+                command: BotCommand::Access { bot: shown }
+            } if shown == bot
+        ));
+        match parse(&["bot", "grant", bot_text.as_str(), "/data/shared"]) {
+            Top::Bot {
+                command: BotCommand::Grant { bot: shown, path },
+            } => {
+                assert_eq!(shown, bot);
+                assert_eq!(path, std::path::Path::new("/data/shared"));
+            }
+            _ => panic!("bot grant did not parse"),
+        }
+        match parse(&["bot", "revoke", bot_text.as_str(), "/data/shared"]) {
+            Top::Bot {
+                command: BotCommand::Revoke { bot: shown, path },
+            } => {
+                assert_eq!(shown, bot);
+                assert_eq!(path, std::path::Path::new("/data/shared"));
+            }
+            _ => panic!("bot revoke did not parse"),
+        }
+        match parse(&["bot", "full-access", bot_text.as_str(), "off"]) {
+            Top::Bot {
+                command:
+                    BotCommand::FullAccess {
+                        bot: shown,
+                        full_access,
+                        yes,
+                    },
+            } => {
+                assert_eq!(shown, bot);
+                assert!(!full_access);
+                assert!(!yes);
+            }
+            _ => panic!("bot full-access did not parse"),
+        }
+
+        // The one command that changed everything at once is gone.
+        assert!(
+            Cli::try_parse_from(["neha", "bot", "update", bot_text.as_str()]).is_err(),
+            "`bot update` is removed"
+        );
+        for line in [
+            vec!["bot", "grant", bot_text.as_str()],
+            vec!["bot", "revoke", bot_text.as_str()],
+            vec!["bot", "full-access", bot_text.as_str()],
+            vec!["bot", "full-access", bot_text.as_str(), "maybe"],
+        ] {
+            let refused = Cli::try_parse_from(std::iter::once("neha").chain(line.iter().copied()));
+            assert!(refused.is_err(), "{line:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn a_grant_path_is_folded_before_it_is_stored() {
+        assert_eq!(
+            normalized_grant(std::path::Path::new("/data//shared/./notes/")).unwrap(),
+            "/data/shared/notes"
+        );
+        assert_eq!(
+            normalized_grant(std::path::Path::new("  /data/shared  ")).unwrap(),
+            "/data/shared"
+        );
+        assert_eq!(normalized_grant(std::path::Path::new("/")).unwrap(), "/");
+
+        for bad in [
+            "",
+            "   ",
+            "relative/path",
+            "./relative",
+            "/data/../etc",
+            "/data\u{0}notes",
+        ] {
+            let error = normalized_grant(std::path::Path::new(bad))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("empty")
+                    || error.contains("absolute")
+                    || error.contains("`..`")
+                    || error.contains("NUL"),
+                "{bad:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grant_folder_must_exist_and_be_a_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let folder = directory.path().join("shared");
+        std::fs::create_dir(&folder).unwrap();
+        assert_eq!(
+            checked_grant(&folder).unwrap(),
+            std::fs::canonicalize(&folder)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        );
+
+        let error = checked_grant(&directory.path().join("missing"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not exist"), "{error}");
+        let file = directory.path().join("notes.txt");
+        std::fs::write(&file, "notes").unwrap();
+        let error = checked_grant(&file).unwrap_err().to_string();
+        assert!(error.contains("must be a folder"), "{error}");
+    }
+
+    #[test]
+    fn two_spellings_of_one_folder_are_one_grant() {
+        assert!(same_grant("/data/shared", "/data//shared/"));
+        assert!(same_grant("/data/shared", "/data/./shared"));
+        assert!(same_grant("/data/shared", "  /data/shared  "));
+        assert!(!same_grant("/data/shared", "/data/shared-notes"));
+        assert!(!same_grant("/data/shared", "/data"));
+    }
+
+    #[test]
+    fn the_grants_a_bot_show_reports_are_read_back() {
+        let shown = json!({"bot": {"id": Id::new(), "name": "ada", "grants": ["/b", "/a"]}});
+        assert_eq!(
+            current_grants(&shown).unwrap(),
+            vec!["/b".to_owned(), "/a".to_owned()]
+        );
+        let shown = json!({"bot": {"id": Id::new(), "name": "ada", "grants": []}});
+        assert_eq!(current_grants(&shown).unwrap(), Vec::<String>::new());
+        let shown = json!({"bot": {"id": Id::new(), "name": "ada"}});
+        assert!(current_grants(&shown).is_err());
+    }
+
+    #[test]
+    fn bot_access_prints_the_full_access_state_and_every_grant() {
+        let bot = json!({
+            "id": Id::new(),
+            "name": "ada",
+            "full_access": true,
+            "grants": ["/data/shared", "/var/tmp/notes"],
+        });
+        let mut shown = Vec::new();
+        write_access(&mut shown, &bot).unwrap();
+        assert_eq!(
+            String::from_utf8(shown).unwrap(),
+            "  full access: on\n  grant /data/shared\n  grant /var/tmp/notes\n"
+        );
+
+        // A Bot without grants says so instead of printing nothing.
+        let bot = json!({"id": Id::new(), "name": "ada", "full_access": false, "grants": []});
+        let mut shown = Vec::new();
+        write_access(&mut shown, &bot).unwrap();
+        assert_eq!(
+            String::from_utf8(shown).unwrap(),
+            "  full access: off\n  grants: none\n"
+        );
+    }
+
+    #[test]
+    fn full_access_asks_for_yes_and_refuses_everything_else() {
+        let bot = Id::new();
+        let mut asked = Vec::new();
+        confirm_full_access(
+            bot,
+            false,
+            true,
+            &mut std::io::Cursor::new(b"yes\n".as_slice()),
+            &mut asked,
+        )
+        .unwrap();
+        let asked = String::from_utf8(asked).unwrap();
+        // The risk names the configuration directory the Bot can then read.
+        assert!(asked.contains("~/.config/neha"), "{asked}");
+        assert!(asked.contains("no sandbox"), "{asked}");
+        assert!(asked.contains("Type yes to confirm"), "{asked}");
+
+        for answer in ["no\n", "y\n", "\n", "YES\n", "yes please\n"] {
+            let mut shown = Vec::new();
+            let error = confirm_full_access(
+                bot,
+                false,
+                true,
+                &mut std::io::Cursor::new(answer.as_bytes()),
+                &mut shown,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("answer yes"), "{answer:?}: {error}");
+        }
+
+        // A terminal that closed cannot answer.
+        let error = confirm_full_access(
+            bot,
+            false,
+            true,
+            &mut std::io::Cursor::new(b"".as_slice()),
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("answer yes"), "{error}");
+
+        // `--yes` answers the prompt without asking.
+        let mut shown = Vec::new();
+        confirm_full_access(
+            bot,
+            true,
+            true,
+            &mut std::io::Cursor::new(b"".as_slice()),
+            &mut shown,
+        )
+        .unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(!shown.contains("Type yes"), "{shown}");
+
+        // A non-interactive run must say `--yes`.
+        let error = confirm_full_access(
+            bot,
+            false,
+            false,
+            &mut std::io::Cursor::new(b"yes\n".as_slice()),
+            &mut Vec::new(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("--yes"), "{error}");
     }
 }

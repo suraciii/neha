@@ -50,6 +50,12 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   };
   const long = () => isLongSummary(props.approval.summary);
   const folded = () => long() && !expanded();
+  // The directory the run works in, when it named one: the action lands there,
+  // so the card names it next to the action it belongs to.
+  const cwd = () => {
+    const named = props.approval.cwd?.trim();
+    return named ? named : null;
+  };
 
   return (
     <article class="msg msg--bot approval" aria-live="polite">
@@ -71,6 +77,9 @@ export default function ApprovalCard(props: ApprovalCardProps) {
           >
             {expanded() ? t("chat.approval.showLess") : t("chat.approval.showFull")}
           </button>
+        </Show>
+        <Show when={cwd()}>
+          {(path) => <p class="approval__cwd">{t("chat.approval.cwd", { path: path() })}</p>}
         </Show>
         <p class="approval__reason">{reason()}</p>
         <p class="approval__undo">{undo()}</p>

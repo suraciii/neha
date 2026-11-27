@@ -61,9 +61,15 @@ A Computer is the unit of isolation.
 
 Bots assigned to one Computer share its files, processes, and logins. The Space does not isolate them from each other.
 
-On a Local Computer, a Bot's default write range is its own Workspace, and it reads with the machine user's rights. The file tools check every write path, and the shell runs in an operating-system sandbox that mounts the machine read-only except that Workspace. A machine that cannot start its sandbox does not serve as a Computer.
+On a Local Computer with granted folders, a Bot's write range is its own Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path, and the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
 
-A Local Computer's configuration directory is hidden from its Bots. It holds the saved pairing and the token, at `~/.config/neha` by default, and the file tools and the shell cannot reach it.
+A machine that cannot start its sandbox does not serve as a Computer.
+
+A Local Computer's configuration directory is hidden from a Bot with granted folders. It holds the saved pairing and the token, at `~/.config/neha` by default, and the file tools and the shell cannot reach it.
+
+On a Local Computer with full access, the shell starts no sandbox, and the file tools apply no hidden path and no write fence. The Bot then reaches the configuration directory as the machine user does.
+
+A run names one directory as its working directory. That directory is a write root for that run alone, and it grants nothing to a later run.
 
 On a Local Computer, a Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted.
 

@@ -246,6 +246,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_runs_write_roots_cross_the_channel_with_its_once_grant() {
+        let (runtime, link, _bot, mut outgoing) = remote();
+        let runtime = Arc::new(
+            runtime
+                .with_working_dir("/data/work")
+                .with_access(neha_computer::channel::AccessFrame {
+                    full_access: false,
+                    write_roots: vec!["/data/shared".to_owned(), "/data/work".to_owned()],
+                })
+                .with_once_grant("/data/once"),
+        );
+
+        // The run's directory, its grants, and the one-time grant travel with
+        // the action.
+        let first = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .execute(Action::Shell {
+                        command: "pwd".to_owned(),
+                    })
+                    .await
+            }
+        });
+        let HostFrame::Action {
+            id,
+            working_dir,
+            access,
+            ..
+        } = outgoing.recv().await.unwrap()
+        else {
+            panic!("expected an action frame");
+        };
+        assert_eq!(working_dir.as_deref(), Some("/data/work"));
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec![
+                    "/data/shared".to_owned(),
+                    "/data/work".to_owned(),
+                    "/data/once".to_owned(),
+                ],
+            }
+        );
+        link.deliver(
+            id,
+            Answer::ActionResult(neha_computer::ActionResult::succeeded(ToolOutput::full(
+                "/data/work",
+            ))),
+        );
+        assert_eq!(first.await.unwrap().status, ActionStatus::Succeeded);
+
+        // The one-time grant opened one folder for one action only.
+        let second = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .execute(Action::Shell {
+                        command: "pwd".to_owned(),
+                    })
+                    .await
+            }
+        });
+        let HostFrame::Action { id, access, .. } = outgoing.recv().await.unwrap() else {
+            panic!("expected an action frame");
+        };
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec!["/data/shared".to_owned(), "/data/work".to_owned()],
+            },
+            "the spent one-time grant opens nothing more"
+        );
+        link.deliver(
+            id,
+            Answer::ActionResult(neha_computer::ActionResult::succeeded(ToolOutput::full(
+                "/data/work",
+            ))),
+        );
+        assert_eq!(second.await.unwrap().status, ActionStatus::Succeeded);
+    }
+
+    #[tokio::test]
     async fn an_action_crosses_the_channel_and_returns_its_result() {
         let (runtime, link, bot, mut outgoing) = remote();
         let waiting = tokio::spawn(async move {

@@ -1882,12 +1882,12 @@ async fn a_bot_owner_grants_access_and_a_run_can_name_its_directory() {
     let computer = local_computer(directory, &base, &script);
 
     // The Space refuses a non-absolute grant and one that spells `..`; the CLI
-    // checks the input before canonicalize would hide its shape.
+    // checks the input before it is stored.
     for bad in ["relative/path", "/var/tmp/../var/tmp"] {
         let refused = cli(
             &computer.home,
             &computer.credential,
-            &["bot", "update", &computer.bot, "--grant", bad],
+            &["bot", "grant", &computer.bot, bad],
         );
         assert!(!refused.status.success(), "accepted {bad}");
         let stderr = String::from_utf8_lossy(&refused.stderr);
@@ -1897,30 +1897,78 @@ async fn a_bot_owner_grants_access_and_a_run_can_name_its_directory() {
         );
     }
 
-    let updated = run(
+    // A fresh Bot writes only its own folder: no full access, no grants.
+    let access = run(
         &computer.home,
         &computer.credential,
-        &[
-            "bot",
-            "update",
-            &computer.bot,
-            "--full-access",
-            "on",
-            "--grant",
-            granted.to_str().unwrap(),
-        ],
+        &["bot", "access", &computer.bot],
     );
-    assert!(updated.contains("full access: true"), "{updated}");
-    assert!(updated.contains("grants: 1"), "{updated}");
+    assert!(access.contains("full access: off"), "{access}");
+    assert!(access.contains("grants: none"), "{access}");
+
+    let granted_path = granted.to_str().unwrap().to_owned();
+    let granted_access = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "grant", &computer.bot, &granted_path],
+    );
+    assert!(
+        granted_access.contains("full access: off"),
+        "{granted_access}"
+    );
+    assert!(
+        granted_access.contains(&format!("grant {granted_path}")),
+        "{granted_access}"
+    );
+
+    // Granting the same folder twice is refused, and `bot show` prints the
+    // same access lines.
+    let duplicate = cli(
+        &computer.home,
+        &computer.credential,
+        &["bot", "grant", &computer.bot, &granted_path],
+    );
+    assert!(!duplicate.status.success());
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(stderr.contains("already has a grant"), "stderr: {stderr}");
     let shown = run(
         &computer.home,
         &computer.credential,
         &["bot", "show", &computer.bot],
     );
-    assert!(shown.contains("full access: true"), "{shown}");
-    assert!(shown.contains(granted.to_str().unwrap()), "{shown}");
+    assert!(shown.contains("full access: off"), "{shown}");
+    assert!(
+        shown.contains(&format!("grant {granted_path}")),
+        "`bot show` prints the same lines: {shown}"
+    );
 
-    // A run's working directory is where its shell starts.
+    // Turning full access on keeps the grants the Bot already has.
+    let full = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "full-access", &computer.bot, "on", "--yes"],
+    );
+    assert!(full.contains("full access: on"), "{full}");
+    assert!(
+        full.contains(&format!("grant {granted_path}")),
+        "a grant survives full access: {full}"
+    );
+
+    // Turning it off restores the fence without a prompt, grants included.
+    let off = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "full-access", &computer.bot, "off"],
+    );
+    assert!(off.contains("full access: off"), "{off}");
+    assert!(
+        off.contains(&format!("grant {granted_path}")),
+        "a grant survives turning full access off: {off}"
+    );
+
+    // A run's working directory is where its shell starts, and with the fence
+    // back it is this run's own write root: the relative write below lands
+    // there because the run named it, not because a grant covers it.
     let work = computer.path().join("run-directory");
     std::fs::create_dir(&work).unwrap();
     script.call("shell", serde_json::json!({"command": "pwd > started.txt"}));
@@ -1947,6 +1995,375 @@ async fn a_bot_owner_grants_access_and_a_run_can_name_its_directory() {
     );
 
     provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runs_directory_is_writable_for_that_run_alone() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    // Both folders sit outside `/tmp`, which the sandbox replaces with a fresh
+    // tmpfs: what the writes below reach is what the host sees.
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-cwd-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch directory outside /tmp");
+    let outside_dir = tempfile::Builder::new()
+        .prefix("neha-e2e-cwd-folder-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch folder outside the run's directory");
+    let work = directory.path().join("run-directory");
+    std::fs::create_dir(&work).unwrap();
+    let outside = outside_dir.path().join("outside.txt");
+    let computer = local_computer(directory, &base, &script);
+
+    // One run names its working directory: a relative shell write lands there
+    // and asks for nothing, while a write to a folder outside it still asks.
+    script.call(
+        "shell",
+        serde_json::json!({"command": "printf cwd > note.txt"}),
+    );
+    script.call(
+        "write_file",
+        serde_json::json!({
+            "path": outside.to_string_lossy(),
+            "content": "outside",
+        }),
+    );
+    script.say("Both writes are done.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--cwd",
+            work.to_str().unwrap(),
+            "write in the run's directory",
+        ],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+
+    // The shell wrote inside the run's directory without a card, so the run is
+    // already past that action and waits on the one outside it.
+    assert_eq!(
+        std::fs::read_to_string(work.join("note.txt")).unwrap(),
+        "cwd",
+        "a relative write in the run's directory must reach the machine"
+    );
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.starts_with(&format!("Run {run_id}: waiting")),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("shell (succeeded)"),
+        "a write inside the run's directory asks for no card:\n{shown}"
+    );
+
+    // The waiting card names the write outside it, and the folder it needs.
+    let card = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(card.contains("write_file"), "{card}");
+    assert!(card.contains("grant"), "{card}");
+    assert!(
+        card.contains(outside.to_str().unwrap()),
+        "the card names the write it would allow:\n{card}"
+    );
+
+    // One allow opens that folder for this action only, and the write lands.
+    let allowed = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    assert!(
+        allowed.contains(&format!("Allowed {approval} for run {run_id}.")),
+        "{allowed}"
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(
+        shown.contains("write_file (succeeded)"),
+        "the allowed write must run:\n{shown}"
+    );
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
+
+    // The run's directory granted nothing that outlives the run.
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "show", &computer.bot],
+    );
+    assert!(
+        shown.contains("grants: none"),
+        "a run's directory is no grant:\n{shown}"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_full_access_writes_outside_the_workspace_until_it_is_turned_off() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-full-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch directory outside /tmp");
+    let outside_dir = tempfile::Builder::new()
+        .prefix("neha-e2e-full-folder-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch folder outside the Computer workspace");
+    let outside = outside_dir.path().join("outside.txt");
+    let computer = bare_local_computer(directory, &base);
+
+    // Full access starts no sandbox, but the first use of this Computer is
+    // still the owner's to allow.
+    let full = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "full-access", &computer.bot, "on", "--yes"],
+    );
+    assert!(full.contains("full access: on"), "{full}");
+    script.call(
+        "shell",
+        serde_json::json!({"command": format!("printf free > {}", outside.display())}),
+    );
+    script.say("The write reached the machine.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write outside"],
+    );
+    let (run_id, approval) = waiting_run(&sent);
+    let card = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &approval],
+    );
+    assert!(
+        card.contains("first_use_local"),
+        "full access still asks for the first use:\n{card}"
+    );
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &approval],
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(
+        shown.contains("shell (succeeded)"),
+        "the shell must run without a sandbox:\n{shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "free",
+        "the write must reach the machine outside the Workspace"
+    );
+
+    // Turning full access off puts the fence back: the same write is refused,
+    // and a shell names no folder a card could grant.
+    let off = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "full-access", &computer.bot, "off"],
+    );
+    assert!(off.contains("full access: off"), "{off}");
+    script.call(
+        "shell",
+        serde_json::json!({"command": format!("printf fenced > {}", outside.display())}),
+    );
+    script.say("The fence is back.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "write outside again",
+        ],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "a fenced write asks for no card:\n{sent}"
+    );
+    assert!(sent.contains("The fence is back."), "{sent}");
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(
+        &computer.home,
+        &computer.credential,
+        &["run", "show", &run_id],
+    );
+    assert!(
+        shown.contains("shell (failed)"),
+        "the sandbox must refuse the write:\n{shown}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "free",
+        "the refused write must not reach the machine"
+    );
+    let listed = run(&computer.home, &computer.credential, &["approval", "list"]);
+    assert!(listed.trim().is_empty(), "{listed}");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[test]
+fn a_bot_owner_manages_file_access_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let created = run(&home, &credential, &["bot", "create", "Writer"]);
+    let bot = first_word(&field(&created, "Created Bot "));
+
+    // A grant names a folder that exists: a relative path, a `..` climb, and a
+    // folder nobody created are all refused.
+    let shared = directory.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    let shared_path = shared.to_str().unwrap().to_owned();
+    let bad = [
+        "shared".to_owned(),
+        format!("{shared_path}/../shared"),
+        directory
+            .path()
+            .join("missing")
+            .to_str()
+            .unwrap()
+            .to_owned(),
+    ];
+    for bad in &bad {
+        let refused = cli(&home, &credential, &["bot", "grant", &bot, bad]);
+        assert!(!refused.status.success(), "accepted {bad}");
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("absolute")
+                || stderr.contains("`..`")
+                || stderr.contains("does not exist"),
+            "{bad}: stderr: {stderr}"
+        );
+    }
+
+    // The first grant is stored, and the Bot reports it.
+    let granted = run(&home, &credential, &["bot", "grant", &bot, &shared_path]);
+    assert!(granted.contains("full access: off"), "{granted}");
+    assert!(
+        granted.contains(&format!("grant {shared_path}")),
+        "{granted}"
+    );
+
+    // Taking a grant the Bot never had is refused.
+    let never = "/var/tmp/never-granted";
+    let refused = cli(&home, &credential, &["bot", "revoke", &bot, never]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("the Bot has no grant for {never}")),
+        "stderr: {stderr}"
+    );
+
+    // `on` keeps the grants and `off` restores the fence without a prompt.
+    let on = run(
+        &home,
+        &credential,
+        &["bot", "full-access", &bot, "on", "--yes"],
+    );
+    assert!(on.contains("full access: on"), "{on}");
+    assert!(on.contains(&format!("grant {shared_path}")), "{on}");
+    let off = run(&home, &credential, &["bot", "full-access", &bot, "off"]);
+    assert!(off.contains("full access: off"), "{off}");
+    assert!(off.contains(&format!("grant {shared_path}")), "{off}");
+
+    // Revoking names the folder the way the grant stored it.
+    let revoked = run(
+        &home,
+        &credential,
+        &["bot", "revoke", &bot, &format!("{shared_path}/")],
+    );
+    assert!(revoked.contains("grants: none"), "{revoked}");
+    let access = run(&home, &credential, &["bot", "access", &bot]);
+    assert!(access.contains("grants: none"), "{access}");
+
+    // A run that is not a terminal must say `--yes` before the sandbox goes.
+    let refused = cli(&home, &credential, &["bot", "full-access", &bot, "on"]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("--yes"), "stderr: {stderr}");
+    let access = run(&home, &credential, &["bot", "access", &bot]);
+    assert!(access.contains("full access: off"), "{access}");
+
+    drop(server);
+}
+
+#[test]
+fn a_tty_confirms_full_access_before_it_turns_on() {
+    if !tty_available() {
+        eprintln!("skipping the TTY confirmation test: script(1) is not available");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let created = run(&home, &credential, &["bot", "create", "Writer"]);
+    let bot = first_word(&field(&created, "Created Bot "));
+
+    // The risk comes before the question, and anything but yes refuses.
+    let mut tty = TtyCli::spawn(&home, &credential, &["bot", "full-access", &bot, "on"]);
+    let risk = tty.expect_containing("no sandbox");
+    assert!(risk.contains("reads and writes"), "{risk}");
+    let directory_line = tty.expect_containing("~/.config/neha");
+    assert!(
+        directory_line.contains("configuration directory"),
+        "{directory_line}"
+    );
+    tty.expect_containing("saved pairing");
+    // The question ends without a newline, so it is read with the answer.
+    tty.answer("no");
+    let (ok, output) = tty.finish();
+    assert!(!ok, "a refused confirmation must fail:\n{output}");
+    assert!(output.contains("Type yes to confirm"), "{output}");
+    assert!(
+        output.contains(&bot),
+        "the question names the Bot:\n{output}"
+    );
+    assert!(output.contains("answer yes"), "{output}");
+    let access = run(&home, &credential, &["bot", "access", &bot]);
+    assert!(access.contains("full access: off"), "{access}");
+
+    // Answering yes turns it on.
+    let mut tty = TtyCli::spawn(&home, &credential, &["bot", "full-access", &bot, "on"]);
+    tty.expect_containing("saved pairing");
+    tty.answer("yes");
+    let (ok, output) = tty.finish();
+    assert!(ok, "the confirmed command must finish:\n{output}");
+    assert!(output.contains("Type yes to confirm"), "{output}");
+    assert!(output.contains("full access: on"), "{output}");
+    let access = run(&home, &credential, &["bot", "access", &bot]);
+    assert!(access.contains("full access: on"), "{access}");
+
+    drop(server);
 }
 
 #[tokio::test(flavor = "multi_thread")]

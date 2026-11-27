@@ -726,6 +726,10 @@ async fn execute_frame(
 }
 
 /// Returns this Bot's runtime, opening its folder on first use.
+///
+/// `working_dir` is the directory the run works in. Without full access it is
+/// also that run's one-off write root, so the shell may write there and a
+/// relative file path resolves against it.
 #[allow(clippy::too_many_arguments)]
 fn machine(
     config: &Config,
@@ -757,16 +761,11 @@ fn machine(
             // can never redirect the runtime outside its folder.
             let root = LocalRuntime::open_workspace(&config.workspace)
                 .map_err(|error| error.to_string())?;
-            let mut runtime = LocalRuntime::machine_at(&root, bot, hidden.to_vec())
+            let runtime = LocalRuntime::machine_at(&root, bot, hidden.to_vec())
                 .map_err(|error| error.to_string())?
                 .with_denied(denied.to_vec())
-                .with_machine_access(access.full_access, &access.write_roots)
+                .with_machine_access(access.full_access, &access.write_roots, working_dir)
                 .map_err(|error| error.to_string())?;
-            if let Some(working_dir) = working_dir {
-                runtime = runtime
-                    .with_working_dir(working_dir)
-                    .map_err(|error| error.to_string())?;
-            }
             Ok(Arc::clone(entry.insert(Arc::new(runtime))))
         }
     }
@@ -1503,6 +1502,7 @@ mod tests {
 
     use futures_util::{SinkExt as _, StreamExt as _};
     use neha::id::Id;
+    use neha_computer::channel::AccessFrame;
     use neha_computer::{
         Action, ActionStatus, CHANNEL_VERSION, ComputerRuntime as _, DeviceFrame, HostFrame,
         LocalRuntime, ToolOutput, WireAction,
@@ -2866,6 +2866,54 @@ mod tests {
             panic!("expected bytes, got {answer:?}");
         };
         assert_eq!(decode_bytes(&bytes).unwrap(), b"from the run");
+    }
+
+    /// The run's directory reaches the runtime as its write root: a relative
+    /// write from a channel action lands there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_directory_is_a_write_root_through_the_channel() {
+        if std::env::var_os("NEHA_TEST_BWRAP").is_none() {
+            eprintln!("skipping the real-Computer test: NEHA_TEST_BWRAP is not set");
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        std::fs::create_dir(workspace.path().join(bot.to_string())).unwrap();
+        let run_directory = outside_tempdir();
+        let config = channel_config(workspace.path());
+        let runtimes = empty_runtimes();
+
+        let answer = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Action {
+                id: 1,
+                bot: bot.to_string(),
+                action: WireAction::WriteFile {
+                    path: "note.txt".to_owned(),
+                    content: "from the run".to_owned(),
+                },
+                working_dir: Some(run_directory.path().to_string_lossy().into_owned()),
+                access: AccessFrame {
+                    full_access: false,
+                    write_roots: vec![run_directory.path().to_string_lossy().into_owned()],
+                },
+                env: Vec::new(),
+            },
+        )
+        .await;
+        let DeviceFrame::Result { status, .. } = answer else {
+            panic!("expected a result, got {answer:?}");
+        };
+        assert_eq!(status, ActionStatus::Succeeded);
+        assert_eq!(
+            std::fs::read_to_string(run_directory.path().join("note.txt")).unwrap(),
+            "from the run"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

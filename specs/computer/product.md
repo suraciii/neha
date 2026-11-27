@@ -68,11 +68,15 @@ A Bot can ask the User to take control, for example to sign in.
 
 A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a Hosted Computer, a Bot operates the browser. Programs with windows of their own run only on a Local Computer.
 
-On a Local Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read, except the Computer's own configuration directory, which [design](design.md#isolation) hides from it.
+On a Local Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read. [Design](design.md#isolation) hides the Computer's own configuration directory from a Bot with granted folders.
 
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 
-On a Local Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in those folders, and its read range is unchanged. With full access, it writes and deletes what the machine's user can.
+On a Local Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in its Workspace and those folders. With full access, Neha starts no sandbox, and the Bot writes, deletes, and reads with the machine user's own file rights, including the Computer's configuration directory.
+
+The approval gate applies to full access as it does to granted folders. [Bot](../bot/product.md#asking-before-an-action) covers when a Bot asks.
+
+Full access lets a Bot read the saved pairing, the machine's token, and the CLI's session credential in that directory. The owner accepts that risk when they turn full access on.
 
 A new Local Computer starts with granted folders.
 

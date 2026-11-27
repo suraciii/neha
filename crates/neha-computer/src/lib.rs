@@ -5,10 +5,13 @@
 //! a managed workspace
 //! ([`new`](LocalRuntime::new)) where everything stays inside one directory,
 //! and a real machine ([`machine`](LocalRuntime::machine)) where reads reach
-//! the whole machine, writes reach one folder, and the shell runs under
-//! bubblewrap. [`machine_with_hidden`](LocalRuntime::machine_with_hidden) also
-//! hides given root directories from both paths, so a Bot cannot read the
-//! Computer's own channel credential.
+//! the whole machine, writes reach the Bot's folder, the owner's grants, and
+//! the run's own directory, and the shell runs under bubblewrap.
+//! [`machine_with_hidden`](LocalRuntime::machine_with_hidden) also hides given
+//! root directories from both paths, so a Bot cannot read the Computer's own
+//! channel credential. The owner can give a Bot full access instead
+//! ([`with_machine_access`](LocalRuntime::with_machine_access)): the shell then
+//! runs with no sandbox, and the file tools use the machine user's own rights.
 //!
 //! A daemon opens its workspace root with
 //! [`open_workspace`](LocalRuntime::open_workspace), checks the machine with
