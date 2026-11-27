@@ -1,0 +1,77 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/windows.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "apps/desktop/**"
+      - "crates/**"
+      - "ui/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Check the Rust workspace
+        run: cargo check --locked --workspace
+
+      - name: Build the Windows sidecar
+        run: cargo build --locked --release -p neha-app
+
+      - name: Install the UI
+        run: pnpm --dir ui install --frozen-lockfile
+
+      - name: Test and build the UI
+        run: |
+          pnpm --dir ui test
+          pnpm --dir ui build
+
+      - name: Install and test the desktop shell
+        run: |
+          pnpm --dir apps/desktop install --frozen-lockfile
+          pnpm --dir apps/desktop test
+
+      - name: Build the Windows installer
+        run: pnpm --dir apps/desktop package:win
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: neha-windows-installer
+          path: apps/desktop/dist/Neha-Setup-*.exe
+          if-no-files-found: error
