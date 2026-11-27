@@ -59,6 +59,8 @@ Changing the default Model changes no thinking level; the Space's default level 
 
 The new default takes over every Bot that inherits it. The Space refuses a Model that cannot serve a level such a Bot keeps, and the refusal counts those Bots and asks for their levels to be reset first. A Bot with a Model of its own is untouched.
 
+Connecting or refreshing a Provider can move the default Model too, and the Space refuses the whole write when the Model it would set leaves a Bot unable to run, so the Space keeps the default it has.
+
 A Bot's chosen Model MUST be connected and able to call tools. Its thinking level MUST be one the Model accepts.
 
 | Thinking level | What it means |

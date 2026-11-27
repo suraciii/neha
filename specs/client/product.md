@@ -157,7 +157,7 @@ A Space with no Provider shows that empty state with the action that connects on
 
 ## Computers
 
-The settings list every Computer the User owns, Local and Hosted, with its kind and whether it is online. [Computer](../computer/product.md) owns what a Computer is.
+The settings list every Computer the User owns, Local and Hosted, with its kind and whether it is online. Each Computer says what a Bot's shell runs as on it, and one that has not answered the Space yet says it waits. [Computer](../computer/product.md) owns what a Computer is.
 
 The owner resets a Hosted Computer from that list. The reset asks for confirmation and names what it deletes. [Computer](../computer/product.md#keeping-files) covers the reset.
 

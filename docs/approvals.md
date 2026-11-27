@@ -43,7 +43,7 @@ APPROVAL_ID="<the approval you mean>"
 target/debug/neha approval show "$APPROVAL_ID"
 ```
 
-`neha approval show <approval-id>` prints where the action sits, the directory its run works in when the run named one, and its full arguments. The directory its run works in is read exactly as the run recorded it, so a name that ends in a space keeps it and a relative path is matched against that same directory. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. On an approval for a folder the owner has not granted, `--always` grants that folder instead, and `neha bot access <bot-id>` shows it among the Bot's grants.
+`neha approval show <approval-id>` prints where the action sits, the directory its run works in when the run named one, and its full arguments. The directory its run works in is read exactly as the run recorded it, so a name that ends in a space keeps it and a relative path is matched against that same directory. `neha approval allow <approval-id> --always` also makes the action's kind a lasting Allow rule, and it is refused for a first use. On an approval for a folder the owner has not granted, `--always` grants that folder instead, and `neha bot access <bot-id>` shows it among the Bot's grants. On a Computer that cannot serve granted folders, `--always` is refused instead and the approval still waits.
 
 Answer it one way or the other, never both:
 

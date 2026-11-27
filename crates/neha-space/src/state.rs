@@ -1009,17 +1009,21 @@ impl Projection for State {
                 }
             }
             EventData::ComputerCreated(data) => {
+                let kind = data.kind.as_str().to_owned();
+                // A Hosted Computer always runs in the Space's own sandbox;
+                // only a real machine's handshake can tell what it serves.
+                let sandboxed = (kind == "hosted").then_some(true);
                 self.computers.insert(
                     data.computer,
                     ComputerView {
                         id: data.computer,
                         owner: data.owner,
-                        kind: data.kind.as_str().to_owned(),
+                        kind,
                         online: true,
                         workspace: data.workspace,
                         supports_grants: true,
                         supports_full_access: true,
-                        sandboxed: None,
+                        sandboxed,
                     },
                 );
                 self.computer_order.push(data.computer);

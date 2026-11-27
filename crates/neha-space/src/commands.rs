@@ -1171,6 +1171,10 @@ async fn record_provider(
         .get(default_index)
         .map(|data| data["id"].clone())
         .ok_or_else(|| ApiError::invalid_argument("the default Model is not declared"))?;
+    // A Provider write brings a default Model with it. Bot selection changes
+    // take this lock, so holding it keeps a Bot from choosing against the old
+    // default between the check and the event.
+    let _decisions = context.approvals.lock().await;
     {
         let state = context
             .state
@@ -1349,32 +1353,87 @@ async fn provider_refresh(
             .find(|model| model["name"].as_str() == Some(name))
             .map(|model| model["id"].clone())
     });
-    // A refresh can move the Space's default when the old one is retired.
-    // Refuse the write if an inheriting Bot could no longer run.
-    if let Some(name) = default_name.as_deref()
-        && let Some(spec) = specs.iter().find(|model| model.name == name)
+    // The refresh replaces this Provider's Models and may move the Space's
+    // default. Bot selection changes take the same lock as this write, so the
+    // check below and the event cannot interleave with one; the record's final
+    // state must leave every affected Bot runnable. A Bot whose Model retires
+    // starts inheriting the default, so the check works on the Model set the
+    // event would leave behind.
+    let _decisions = context.approvals.lock().await;
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return existing_outcome(context.store, command_id, record).await;
+    }
     {
-        let default_view = ModelView {
-            id: default_model
-                .as_ref()
-                .and_then(Value::as_str)
-                .and_then(|id| id.parse().ok())
-                .unwrap_or_else(Id::new),
-            provider,
-            name: spec.name.clone(),
-            context_limit: spec.context_limit,
-            max_output: spec.max_output,
-            reads_images: spec.reads_images,
-            thinks: spec.thinks,
-            tools: spec.tools,
-            thinking_levels: recorded_thinking_levels(spec),
-            is_default: true,
-        };
         let state = context
             .state
             .lock()
             .map_err(|_| ApiError::internal("state lock"))?;
-        check_default_model(&state, &default_view)?;
+        let mut post: HashMap<Id, ModelView> = state
+            .models
+            .iter()
+            .filter(|(id, _)| !old_models.values().any(|old| &old.id == *id))
+            .map(|(id, model)| (*id, model.clone()))
+            .collect();
+        for (spec, model) in specs.iter().zip(&models) {
+            let id: Id = serde_json::from_value(model["id"].clone())
+                .map_err(|_| ApiError::internal("the refreshed Model id"))?;
+            post.insert(
+                id,
+                ModelView {
+                    id,
+                    provider,
+                    name: spec.name.clone(),
+                    context_limit: spec.context_limit,
+                    max_output: spec.max_output,
+                    reads_images: spec.reads_images,
+                    thinks: spec.thinks,
+                    tools: spec.tools,
+                    thinking_levels: recorded_thinking_levels(spec),
+                    is_default: default_model.as_ref() == Some(&json!(id)),
+                },
+            );
+        }
+        let default_id = default_model
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(|id| id.parse::<Id>().ok())
+            .or_else(|| {
+                post.values()
+                    .find(|model| model.is_default)
+                    .map(|model| model.id)
+            });
+        for bot in state.bots.values() {
+            let retires = bot
+                .model
+                .is_some_and(|selected| !post.contains_key(&selected));
+            let inherits = bot.model.is_none() && was_space_default;
+            if !retires && !inherits {
+                continue;
+            }
+            let Some(model) = default_id.and_then(|id| post.get(&id)) else {
+                continue;
+            };
+            if !model.tools {
+                return Err(ApiError::invalid_argument(format!(
+                    "refreshing the Provider would leave Bot {} without a Model that can call tools; choose a Model for it first",
+                    bot.name
+                )));
+            }
+            if let Some(level) = bot.thinking {
+                if !model.thinks {
+                    return Err(ApiError::invalid_argument(format!(
+                        "refreshing the Provider would leave Bot {} on a thinking level its inherited Model cannot think; reset the thinking level first",
+                        bot.name
+                    )));
+                }
+                if !model.accepted_thinking().contains(&level) {
+                    return Err(ApiError::invalid_argument(format!(
+                        "refreshing the Provider would leave Bot {} on a thinking level its inherited Model does not accept; reset the thinking level first",
+                        bot.name
+                    )));
+                }
+            }
+        }
     }
     let data = json!({
         "provider": provider,
@@ -2631,7 +2690,8 @@ fn fresh_hosted(
         workspace: workspace.to_string_lossy().into_owned(),
         supports_grants: true,
         supports_full_access: true,
-        sandboxed: None,
+        // A Hosted Computer always runs in the Space's own sandbox.
+        sandboxed: Some(true),
     };
 
     Ok((computer, view, Some(workspace)))

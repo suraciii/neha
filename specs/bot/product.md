@@ -104,6 +104,8 @@ An Always allow covers the same tool and either a shell command that starts with
 
 A file at the Workspace root makes the covered directory the Workspace root, so relative paths in the Workspace are covered and absolute ones are not. The first use of a Local Computer offers no Always allow, and no lasting rule covers it.
 
+An Always allow that would grant a folder is refused when the Bot's Computer serves no grants, and the approval still waits for an answer.
+
 An Ask rule makes the Bot ask before a kind of action, and an Allow rule lets it proceed without asking. Which rule wins, which forms a rule cannot judge, and what an Always allow writes follow [design](design.md#approvals).
 
 A rule belongs to a Bot on a Local Computer. A Bot on a Hosted Computer takes no rule: a Hosted Computer does not ask before an action yet, so the Space refuses one rather than record it.

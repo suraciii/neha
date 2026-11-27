@@ -7261,6 +7261,152 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_provider_write_waits_for_the_bot_selection_lock() {
+        use axum::Router;
+        use axum::routing::get;
+
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        // A thinking Model is the default and Scout inherits it at `high`.
+        let added = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::ChatCompletions,
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                api_key: "sk-test".to_owned(),
+                models: vec![model_spec(
+                    "thinker",
+                    true,
+                    true,
+                    vec![ThinkingLevel::Low, ThinkingLevel::High],
+                )],
+                default_model: Some("thinker".to_owned()),
+                thinking: None,
+                vendor: None,
+                discover: false,
+            }),
+        )
+        .await;
+        let thinker: Id = serde_json::from_value(added["models"][0]["id"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: None,
+            }),
+        )
+        .await;
+
+        // The discovery request waits until the test lets it answer.
+        let arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+        let release = std::sync::Arc::new(tokio::sync::Notify::new());
+        let app = {
+            let arrived = std::sync::Arc::clone(&arrived);
+            let release = std::sync::Arc::clone(&release);
+            Router::new().route(
+                "/v1/models",
+                get(move || {
+                    let arrived = std::sync::Arc::clone(&arrived);
+                    let release = std::sync::Arc::clone(&release);
+                    async move {
+                        arrived.notify_one();
+                        release.notified().await;
+                        axum::Json(json!({"data": [{"id": "plain"}]}))
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let models_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut provider_socket = open_socket(&running, &token).await;
+        let mut added = tokio::spawn(async move {
+            try_command(
+                &mut provider_socket,
+                Id::new(),
+                CommandCall::ProviderAdd(ProviderAdd {
+                    protocol: ProviderProtocol::ChatCompletions,
+                    base_url: format!("http://{addr}/v1"),
+                    api_key: "sk-test".to_owned(),
+                    models: Vec::new(),
+                    default_model: None,
+                    thinking: None,
+                    vendor: None,
+                    discover: true,
+                }),
+            )
+            .await
+        });
+        arrived.notified().await;
+
+        // A second client changes the Bot while the Provider request waits.
+        let mut bot_socket = open_socket(&running, &token).await;
+        command(
+            &mut bot_socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot: serde_json::from_value(
+                    command(&mut socket, Id::new(), CommandCall::BotList).await[0]["id"].clone(),
+                )
+                .unwrap(),
+                name: Some("Scout Two".to_owned()),
+                reset_model: false,
+                reset_thinking: false,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            }),
+        )
+        .await;
+
+        // The Provider's check and event take the same lock as that Bot
+        // change: with the lock held, the request cannot finish.
+        let decisions = running.server.approvals.lock().await;
+        release.notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut added)
+                .await
+                .is_err(),
+            "a Provider write waits for the Bot-selection lock"
+        );
+        drop(decisions);
+
+        // It then validates against the selection it will leave behind: the
+        // new default cannot think and Scout keeps `high`.
+        let refused = added.await.unwrap();
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("cannot think")
+                    && message.contains("reset their thinking levels")),
+            "{refused:?}"
+        );
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let default = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["is_default"] == json!(true))
+            .unwrap();
+        assert_eq!(default["id"], json!(thinker), "the default did not move");
+
+        bot_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        models_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_provider_add_that_would_strand_a_bot_is_refused() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -10737,6 +10883,33 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         panic!("Computer {computer} stayed online");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_computer_is_always_sandboxed() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let computer: Id = serde_json::from_value(created["computer"]["id"].clone()).unwrap();
+        assert_eq!(created["computer"]["kind"], "hosted");
+        assert_eq!(created["computer"]["sandboxed"], json!(true));
+
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed["kind"], "hosted");
+        assert_eq!(
+            listed["sandboxed"],
+            json!(true),
+            "a Hosted Computer always runs in the Space's sandbox"
+        );
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
