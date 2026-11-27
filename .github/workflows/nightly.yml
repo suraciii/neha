@@ -1,0 +1,214 @@
+name: Nightly installer
+
+# Packaging is the slowest job here and most merges do not change the installer,
+# so it runs once a night and only when main moved since the last successful
+# run. Dispatch it to rebuild on demand.
+on:
+  schedule:
+    # 02:00 Asia/Shanghai.
+    - cron: '0 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: nightly-installer
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Check for changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The last successful run records the commit it saw, so comparing main
+      # with that commit answers whether anything moved since the last build.
+      - name: Compare main with the last nightly
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(git rev-parse HEAD)
+          previous=$(gh run list --workflow=nightly.yml --branch=main --status=success \
+            --limit=1 --json headSha --jq '.[0].headSha // ""')
+          if [ -n "$previous" ] && [ "$previous" = "$head" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "main has not moved since the last nightly ($head)"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "main moved from ${previous:-no earlier nightly} to $head"
+          fi
+
+  installer:
+    name: Windows installer
+    needs: changes
+    if: github.event_name == 'workflow_dispatch' || needs.changes.outputs.changed == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.21.0
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Check the Rust workspace
+        run: cargo check --locked --workspace
+
+      - name: Build the Windows sidecar
+        run: cargo build --locked --release -p neha-app
+
+      - name: Test the Windows runtime
+        run: cargo test --locked -p neha-computer --test windows_shell
+
+      - name: Install the UI
+        run: pnpm --dir ui install --frozen-lockfile
+
+      - name: Build the UI
+        # The Linux gate owns UI behavior tests; Windows only needs the native
+        # Vite build and the packaging path. The jsdom tests exceed their 5s
+        # per-test budget on the Windows runner.
+        run: pnpm --dir ui build
+
+      - name: Install the desktop shell
+        run: pnpm --dir apps/desktop install --frozen-lockfile
+
+      - name: Test the desktop shell
+        run: pnpm --dir apps/desktop test
+
+      - name: Build the Windows installer
+        run: pnpm --dir apps/desktop package:win
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: neha-windows-installer
+          path: apps/desktop/dist/Neha-Setup-*.exe
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Install the Windows app
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem apps/desktop/dist/Neha-Setup-*.exe | Select-Object -First 1
+          if (-not $installer) { throw "installer was not built" }
+          $process = Start-Process -FilePath $installer.FullName -ArgumentList "/S" -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "installer exited $($process.ExitCode)" }
+          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
+            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
+            Select-Object -First 1
+          if (-not $app) { throw "Neha.exe or its sidecar was not installed" }
+          if (-not (Test-Path (Join-Path $app.Directory "resources\ui\index.html"))) {
+            throw "the installed UI is missing"
+          }
+          Write-Host "installed $($app.FullName)"
+          & (Join-Path $app.Directory "resources\neha.exe") --version | Write-Host
+
+      - name: Launch the installed desktop app
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
+            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
+            Select-Object -First 1
+          if (-not $app) { throw "Neha.exe was not installed" }
+          $env:NEHA_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "neha-desktop-home"
+          $consent = Join-Path $env:NEHA_DESKTOP_HOME "computer\unsandboxed-consent.json"
+          New-Item -ItemType Directory -Force -Path (Split-Path $consent) | Out-Null
+          Set-Content -Path $consent -Value '{"version":1,"accepted":true}' -Encoding ascii
+          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop.png"
+          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop.err.log"
+          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop.out.log"
+          $process = Start-Process -FilePath $app.FullName `
+            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
+            -RedirectStandardError $stderr -RedirectStandardOutput $stdout
+          if (-not $process.WaitForExit(180000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "the desktop app did not exit"
+          }
+          if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
+          if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
+          if ($process.ExitCode -ne 0) { throw "the desktop app exited $($process.ExitCode)" }
+          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) { throw "the desktop app did not write a screenshot" }
+          Write-Host "desktop screenshot: $env:NEHA_DESKTOP_CAPTURE"
+
+      - name: Relaunch the installed desktop app
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
+            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
+            Select-Object -First 1
+          if (-not $app) { throw "Neha.exe was not installed" }
+          $env:NEHA_DESKTOP_HOME = Join-Path $env:RUNNER_TEMP "neha-desktop-home"
+          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-second.png"
+          $stderr = Join-Path $env:RUNNER_TEMP "neha-desktop-second.err.log"
+          $stdout = Join-Path $env:RUNNER_TEMP "neha-desktop-second.out.log"
+          $process = Start-Process -FilePath $app.FullName `
+            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru `
+            -RedirectStandardError $stderr -RedirectStandardOutput $stdout
+          if (-not $process.WaitForExit(180000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "the second desktop launch did not exit"
+          }
+          if (Test-Path $stderr) { Get-Content $stderr | Write-Host }
+          if (Test-Path $stdout) { Get-Content $stdout | Write-Host }
+          if ($process.ExitCode -ne 0) { throw "the second desktop launch exited $($process.ExitCode)" }
+          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) {
+            throw "the second desktop launch did not write a screenshot"
+          }
+          if (-not (Select-String -Path $stderr -Pattern "moved the saved Local Computer pairing" -Quiet)) {
+            throw "the second launch did not resume the saved Local Computer pairing"
+          }
+          if (-not (Select-String -Path $stdout -Pattern "Connected to" -Quiet)) {
+            throw "the second launch's Local Computer did not connect"
+          }
+          Write-Host "second desktop screenshot: $env:NEHA_DESKTOP_CAPTURE"
+
+      - name: Verify declining the Windows Local Computer
+        shell: pwsh
+        run: |
+          $app = Get-ChildItem (Join-Path $env:LOCALAPPDATA "Programs") -Recurse -Filter Neha.exe |
+            Where-Object { Test-Path (Join-Path $_.Directory "resources\neha.exe") } |
+            Select-Object -First 1
+          if (-not $app) { throw "Neha.exe was not installed" }
+          $declinedHome = Join-Path $env:RUNNER_TEMP "neha-desktop-declined"
+          Remove-Item -Recurse -Force $declinedHome -ErrorAction SilentlyContinue
+          $env:NEHA_DESKTOP_HOME = $declinedHome
+          $env:NEHA_DESKTOP_CAPTURE = Join-Path $env:RUNNER_TEMP "neha-desktop-declined.png"
+          $env:NEHA_DESKTOP_DECLINE_UNSANDBOXED = "1"
+          $process = Start-Process -FilePath $app.FullName `
+            -ArgumentList "--no-sandbox", "--disable-gpu", "--headless" -PassThru
+          if (-not $process.WaitForExit(180000)) {
+            Stop-Process -Id $process.Id -Force
+            throw "the declined desktop launch did not exit"
+          }
+          if ($process.ExitCode -ne 0) { throw "the declined desktop launch exited $($process.ExitCode)" }
+          if (-not (Test-Path $env:NEHA_DESKTOP_CAPTURE)) {
+            throw "the declined desktop launch did not write a screenshot"
+          }
+          if (Test-Path (Join-Path $declinedHome "computer\computer.json")) {
+            throw "declining the warning must not pair a Local Computer"
+          }
+          Write-Host "declined screenshot: $env:NEHA_DESKTOP_CAPTURE"
