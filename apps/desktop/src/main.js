@@ -581,8 +581,11 @@ async function openLocalSpace(useLocalComputer) {
 
 async function openRemoteSpace(input, persist = true) {
   const origin = normalizeRemoteUrl(input);
+  // Do not follow a redirect here: the Space may redirect to its browser host
+  // (`*.localhost`), which Node cannot resolve on Windows. Chromium resolves it
+  // when the window loads the address.
   const response = await fetch(probeUrl(origin), {
-    redirect: "follow",
+    redirect: "manual",
     signal: AbortSignal.timeout(8_000),
   });
   if (!response.ok && !(response.status >= 300 && response.status < 400)) {
