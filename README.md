@@ -20,7 +20,7 @@ The target layout, including the shells and the UI, is in [Architecture](eng/arc
 
 ## Build
 
-Rust stable (1.94 or newer), [`just`](https://github.com/casey/just), Python 3 for the documentation and hygiene checks, and Node 24 with pnpm 11 for the browser client.
+Rust, pinned by [`rust-toolchain.toml`](rust-toolchain.toml) (the MSRV is 1.94), [`just`](https://github.com/casey/just), Python 3 for the documentation and hygiene checks, and Node 24 with pnpm 11 for the browser client.
 
 ```bash
 cargo build --locked --workspace

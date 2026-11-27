@@ -8,7 +8,7 @@ File bytes stay in `NEHA_HOME` by default too. [Storage](storage.md) shows how t
 
 ## Requirements
 
-- Rust stable, version 1.94 or newer.
+- Rust, pinned by [`rust-toolchain.toml`](../rust-toolchain.toml); the MSRV is 1.94.
 - `just` for the verification recipes.
 - Node 24 and pnpm 11 for the browser client.
 - A Provider that speaks OpenAI Chat Completions, or a compatible local server.

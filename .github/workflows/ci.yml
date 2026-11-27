@@ -39,11 +39,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
 
@@ -104,9 +99,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -118,3 +110,26 @@ jobs:
 
       - name: Test the Windows runtime
         run: cargo test --locked -p neha-computer --test windows_shell
+
+  # The workspace promises rust-version 1.94 in Cargo.toml. This job checks that
+  # promise with the oldest toolchain the manifest names.
+  msrv:
+    name: Minimum supported Rust
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      # Overrides the toolchain in rust-toolchain.toml for this job.
+      RUSTUP_TOOLCHAIN: 1.94.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the minimum supported Rust
+        run: rustup toolchain install 1.94.0 --profile minimal
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: msrv
+
+      - name: Check the Rust workspace
+        run: cargo check --locked --workspace
