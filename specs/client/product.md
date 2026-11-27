@@ -107,6 +107,8 @@ Unread is the client's own memory of a Message that landed while the User was no
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
 
+A Message that carries a File shows a file card with the File's name and size. Choosing the card downloads the File, and the browser opens no File itself. [Message](../messaging/message/product.md#files) owns what a File is and where its bytes live.
+
 The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online.
 
 The header shows the Chat's [state](../space/design.md#chat-state): working, waiting for an Approval, or failed. The Approval Card remains in the stream while the Run waits.
@@ -132,6 +134,10 @@ The Needs attention entry opens the [Needs attention view](../messaging/notifica
 ## Bots
 
 The Bots entry lists the User's Bots. Selecting one opens that Bot's page.
+
+The list offers **New Bot**: the User names the Bot, and it starts on a Hosted Computer unless the User names a Local Computer they own. The client opens the new Bot's Chat. [Bot](../bot/product.md#creating-a-bot) owns what a new Bot starts with.
+
+A Bots list with no Bot shows the same action.
 
 The page shows the Bot's name, its picture, its Computer, its Model, and its access. [Bot](../bot/product.md#the-bots-page) owns each field and who changes it.
 

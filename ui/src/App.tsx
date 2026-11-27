@@ -1429,7 +1429,11 @@ export default function App() {
     }
   }
 
-  async function createBot(name: string) {
+  // Creates a Bot, which answers with the Bot, its Computer, and the Chat the
+  // Space opened between them, so the new Bot's Chat is the one that opens.
+  // A create is one step of management: it answers whether the Bot is there, so
+  // the form that asked keeps itself open when it is not.
+  async function createBot(name: string): Promise<boolean> {
     update({ busy: true, error: null });
     try {
       const result = await commands.command<BotCreateResult>("bot_create", { name });
@@ -1444,9 +1448,15 @@ export default function App() {
       const sortedChats = [...chats].sort((left, right) => left.id.localeCompare(right.id));
       await loadPreviews(sortedChats);
       const chat = sortedChats.find((candidate) => candidate.id === result.chat.id) ?? chats[0];
+      // The Chat the Space opened with the Bot is the one that opens, the way
+      // the first run's own create leaves the User in it, from wherever the
+      // create was asked for.
+      setView("chats");
       if (chat) await selectChat(chat);
+      return true;
     } catch (reason) {
       update({ error: reason });
+      return false;
     } finally {
       update({ busy: false });
     }
@@ -1982,6 +1992,9 @@ export default function App() {
                 setSection(next);
                 setSectionOpen(true);
               }}
+              onCreateBot={(name) => createBot(name)}
+              error={errorText()}
+              busy={state.busy}
             />
             <main class="main">
               <Show when={showManage()}>

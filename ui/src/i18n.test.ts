@@ -10,6 +10,7 @@ afterEach(() => {
 describe("i18n", () => {
   it("translates product copy", () => {
     expect(t("auth.headline")).toBe("Put work in the hands of a team you can see.");
+    expect(t("bots.new")).toBe("New Bot");
     flush(() => setLocale("zh-CN"));
     expect(t("auth.headline")).toBe("把工作交给一支你看得见的团队。");
   });
@@ -28,6 +29,8 @@ describe("i18n", () => {
     expect(t("sidebar.chats.many", { count: 3 })).toBe("3 个 Chat");
     expect(t("chat.new.title", { name: "Nova" })).toBe("和 Nova 打个招呼。");
     expect(t("chat.aria", { name: "Nova" })).toBe("与 Nova 的 Chat");
+    // The action that makes a Bot, in the User's words.
+    expect(t("bots.new")).toBe("新建 Bot");
   });
 
   it("names what a Chat waits for, in the reader's language", () => {

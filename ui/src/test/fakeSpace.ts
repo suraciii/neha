@@ -101,6 +101,8 @@ const computers = [computer, otherComputer, hostedComputer];
 
 // The Bot that owns a Chat, like the Space answers bot_show.
 function botFor(id: string): Bot {
+  const created = made[id];
+  if (created) return created;
   if (id === otherBot.id) return otherBot;
   if (id === thirdBot.id) return thirdBot;
   return bot;
@@ -110,6 +112,10 @@ function botFor(id: string): Bot {
 function computerFor(id: string): Computer {
   return computers.find((known) => known.id === id) ?? computer;
 }
+
+// The Bots a test created, which bot_list and bot_show answer like the Space's.
+const made: Record<string, Bot> = {};
+let madeBots = 0;
 
 // One Chat as the Space projects it: its own state, and the Run it follows.
 function project(known: Chat): Chat {
@@ -202,6 +208,8 @@ export const space = {
   updates: [] as Record<string, unknown>[],
   // The moves and the resets the Space was asked for.
   moves: [] as { bot: string; computer: string }[],
+  // The Bots a test created, with what each was asked for.
+  creates: [] as { name: string; computer?: string }[],
   resets: [] as string[],
   // The rules the Space was asked to add and to remove.
   ruleAdds: [] as unknown[],
@@ -264,6 +272,9 @@ export const space = {
     space.catalog = null;
     space.updates = [];
     space.moves = [];
+    space.creates = [];
+    for (const key of Object.keys(made)) delete made[key];
+    madeBots = 0;
     space.resets = [];
     space.ruleAdds = [];
     space.ruleRemoves = [];
@@ -415,6 +426,48 @@ export class FakeCommands {
           bot: { ...known },
           computer: { ...computerFor(known.computer) },
           chat: project(own),
+        } as T;
+      }
+      case "bot_create": {
+        // A Bot answers with itself, its Computer, and its Chat, and the Space
+        // records the create, so the client hears about its own write. Without a
+        // named Computer the Bot gets its own Hosted one.
+        const asked = args as { name?: string; computer?: string };
+        const name = (asked.name ?? "").trim();
+        if (name === "") throw new Error("a Bot needs a name");
+        space.creates.push({
+          name,
+          ...(asked.computer === undefined ? {} : { computer: asked.computer }),
+        });
+        madeBots += 1;
+        const id = `b-made-${madeBots}`;
+        const chatId = `h-made-${madeBots}`;
+        const hosted = asked.computer === undefined || asked.computer === "hosted";
+        const created: Bot = {
+          id,
+          owner: "u1",
+          name,
+          computer: hosted ? hostedComputer.id : computer.id,
+          chat: chatId,
+          full_access: false,
+          grants: [],
+          thinking: null,
+          model: null,
+        };
+        made[id] = created;
+        const opened = { id: chatId, owner: "u1", bot: id };
+        space.chats = [...space.chats, opened];
+        emit("neha.bot.created", {
+          bot: id,
+          owner: "u1",
+          name,
+          computer: created.computer,
+          chat: chatId,
+        });
+        return {
+          bot: { ...created },
+          computer: { ...computerFor(created.computer) },
+          chat: project(opened),
         } as T;
       }
       case "bot_update": {

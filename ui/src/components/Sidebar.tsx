@@ -1,4 +1,4 @@
-import { For, Show, createMemo } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 
 import { t } from "../i18n";
 import type { Account, AttentionEntry, Bot, Chat, ChatStatus, Preview } from "../types";
@@ -38,6 +38,13 @@ interface SidebarProps {
   onAttention: (entry: AttentionEntry) => void;
   onBot: (bot: Bot) => void;
   onSection: (section: SettingsSection) => void;
+  // Creates a Bot under the name the form holds, and answers whether it is
+  // there, so a refused create leaves the form to try again.
+  onCreateBot: (name: string) => Promise<boolean>;
+  // A create the Space refused, in the User's words.
+  error: string | null;
+  // A command is in flight, so the form holds its submit still.
+  busy: boolean;
 }
 
 // One approval that waits: its Bot, what it asks for, and where to answer it.
@@ -80,8 +87,64 @@ function ManageRow(props: {
   );
 }
 
+// Naming a Bot, in the list it is about to join. An empty name sends nothing:
+// the Space would refuse it, and a form that cannot be sent needs no answer.
+function NewBotForm(props: {
+  busy: boolean;
+  error: string | null;
+  onCreate: (name: string) => Promise<boolean>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = createSignal("");
+  const blank = () => name().trim() === "";
+
+  async function submit(event: SubmitEvent) {
+    event.preventDefault();
+    if (props.busy || blank()) return;
+    // A refused create keeps the name the User typed, and says what the Space
+    // said, so the form is the one place to fix it.
+    if (await props.onCreate(name().trim())) {
+      setName("");
+      props.onCancel();
+    }
+  }
+
+  return (
+    <form class="side-form" onSubmit={submit}>
+      <label class="field">
+        <span class="field__label">{t("setup.bot.name")}</span>
+        <input
+          class="input"
+          name="bot_name"
+          type="text"
+          value={name()}
+          placeholder={t("setup.bot.nameHint")}
+          onInput={(event) => setName(event.currentTarget.value)}
+        />
+      </label>
+      <div class="side-form__actions">
+        <button class="btn btn--primary" type="submit" disabled={props.busy || blank()}>
+          {t("setup.bot.create")}
+        </button>
+        <button class="btn btn--quiet" type="button" onClick={() => props.onCancel()}>
+          {t("common.cancel")}
+        </button>
+      </div>
+      <Show when={props.error}>
+        <p class="side-form__error" role="alert">
+          {props.error}
+        </p>
+      </Show>
+    </form>
+  );
+}
+
 export default function Sidebar(props: SidebarProps) {
   const botFor = (chat: Chat) => props.bots.find((bot) => bot.id === chat.bot);
+  // Naming a new Bot, which the Bots list holds the action for. The form
+  // replaces the list rather than sitting under it: a list that long scrolls
+  // away from the name being typed.
+  const [naming, setNaming] = createSignal(false);
   const preview = (chat: Chat) => {
     const recorded = props.previews[chat.id];
     if (recorded && "text" in recorded) {
@@ -275,24 +338,46 @@ export default function Sidebar(props: SidebarProps) {
             }
           >
             <Show
-              when={props.bots.length > 0}
+              when={!naming()}
               fallback={
-                <div class="side-empty">
-                  <p class="side-empty__title">{t("sidebar.bots.empty.title")}</p>
-                  <p class="side-empty__text">{t("sidebar.bots.empty.text")}</p>
-                </div>
+                <NewBotForm
+                  busy={props.busy}
+                  error={props.error}
+                  onCreate={(name) => props.onCreateBot(name)}
+                  onCancel={() => setNaming(false)}
+                />
               }
             >
-              <For each={props.bots}>
-                {(bot) => (
-                  <ManageRow
-                    icon="cpu"
-                    name={bot.name}
-                    active={props.activeBot === bot.id}
-                    onSelect={() => props.onBot(bot)}
-                  />
-                )}
-              </For>
+              <>
+                <button
+                  class="side-new"
+                  type="button"
+                  onClick={() => setNaming(true)}
+                >
+                  <Icon name="plus" size="sm" />
+                  {t("bots.new")}
+                </button>
+                <Show
+                  when={props.bots.length > 0}
+                  fallback={
+                    <div class="side-empty">
+                      <p class="side-empty__title">{t("sidebar.bots.empty.title")}</p>
+                      <p class="side-empty__text">{t("sidebar.bots.empty.text")}</p>
+                    </div>
+                  }
+                >
+                  <For each={props.bots}>
+                    {(bot) => (
+                      <ManageRow
+                        icon="cpu"
+                        name={bot.name}
+                        active={props.activeBot === bot.id}
+                        onSelect={() => props.onBot(bot)}
+                      />
+                    )}
+                  </For>
+                </Show>
+              </>
             </Show>
           </Show>
         </div>

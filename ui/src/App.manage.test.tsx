@@ -146,9 +146,21 @@ async function openSettings(section = "Providers"): Promise<View> {
 }
 
 // Opens the second Bot from the sidebar, the way a User moves between Bots.
+// Opens the Bot the test names, by the name its row shows. The list holds more
+// than its Bot rows, so a row is found by what it says rather than by where it
+// sits.
+async function openBotNamed(view: View, name: string) {
+  const row = () =>
+    Array.from(view.container.querySelectorAll<HTMLButtonElement>(".conv")).find(
+      (known) => known.querySelector(".conv__name")?.textContent === name,
+    );
+  if (!row()) throw new Error(`no ${name} row in the view`);
+  flush(() => fireEvent.click(row()!));
+  await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe(name));
+}
+
 async function openOtherBot(view: View) {
-  flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
-  await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Quill"));
+  await openBotNamed(view, "Quill");
 }
 
 // The rule the Bot holds, which a test reads back.
@@ -661,10 +673,7 @@ describe("App management", () => {
     await waitFor(() => expect(space.asked).toContain("bot_update"));
 
     // The answer lands after the User opened another Bot's page.
-    flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
-    await waitFor(() =>
-      expect(element(view, ".page__titles h1").textContent).toBe(space.otherBot.name),
-    );
+    await openOtherBot(view);
     await drain();
 
     // The write the first page asked for never reaches the page now open: its

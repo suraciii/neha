@@ -222,6 +222,7 @@ const en = {
   "sidebar.settings.models": "Models",
   "sidebar.settings.catalog": "Catalog",
   "sidebar.settings.computers": "Computers",
+  "bots.new": "New Bot",
   "bots.select.title": "Select a Bot to open its page.",
 
   "common.cancel": "Cancel",
@@ -586,6 +587,7 @@ const zh: Record<MessageKey, string> = {
   "sidebar.settings.models": "Model",
   "sidebar.settings.catalog": "目录",
   "sidebar.settings.computers": "Computer",
+  "bots.new": "新建 Bot",
   "bots.select.title": "选择一个 Bot 打开它的页面。",
 
   "common.cancel": "取消",

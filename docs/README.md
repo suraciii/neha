@@ -15,5 +15,6 @@ Contracts live in [../specs/](../specs/). Domain terms live in [../CONTEXT.md](.
 - [Approvals](approvals.md) — when a Bot asks before an action, how to answer, and lasting Ask and Allow rules.
 - [Send and receive Files](files.md) — send a file in a Chat, download a File, and let a Bot take and deliver Files.
 - [Storage](storage.md) — where a Space keeps the bytes of its Files, and how to use an S3-compatible bucket.
+- [Upgrade a Space](upgrading.md) — back up the Space's home, replace the binary and the client, and read what the schema migration and the version check do.
 
 New guides are added with the capability they document.

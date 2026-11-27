@@ -878,6 +878,51 @@ code,
   padding: 22px 18px;
 }
 
+/* The action that starts a Bot, above the list it will join, so a list with
+   nothing in it still has a way to fill it. */
+.side-new {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  background: none;
+  color: var(--ink-3);
+  font-family: inherit;
+  font-size: var(--text-sm);
+  font-weight: 500;
+  cursor: pointer;
+  transition: border-color 140ms var(--ease-soft), color 140ms var(--ease-soft);
+}
+.side-new:hover {
+  border-color: var(--ink-4);
+  color: var(--ink);
+}
+
+/* Naming a Bot, in the list it is about to join. */
+.side-form {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 8px;
+  padding: 14px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--raised);
+}
+.side-form__actions {
+  display: flex;
+  gap: 8px;
+}
+.side-form__error {
+  margin: 0;
+  color: var(--danger);
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
 .side-empty__title {
   color: var(--ink-3);
   font-size: var(--text-sm);
