@@ -25,6 +25,7 @@ let server;
 let localComputer;
 let mainWindow;
 let stopping = false;
+let allowUnsandboxedWindowsComputer = false;
 
 function log(...args) {
   console.error("[neha-desktop]", ...args);
@@ -60,7 +61,6 @@ function unsandboxedConsentFile() {
 
 async function confirmUnsandboxedMode() {
   if (process.platform !== "win32") return true;
-  if (process.env.NEHA_DESKTOP_CAPTURE) return true;
   try {
     fs.readFileSync(unsandboxedConsentFile(), "utf8");
     return true;
@@ -108,9 +108,10 @@ function ticketFileFor(origin) {
 
 function spaceEnv() {
   const env = { ...process.env, NEHA_HOME: spaceHome() };
-  if (process.platform === "win32") {
-    // The bundled Windows Local Computer has no OS sandbox. Make that opt-in
-    // explicit for this private Space instead of attesting to a fence.
+  if (process.platform === "win32" && allowUnsandboxedWindowsComputer) {
+    // The bundled Windows Local Computer has no OS sandbox. Enable the opt-in
+    // only after the owner accepted the warning; otherwise the Space starts
+    // without it and refuses the daemon.
     env.NEHA_ALLOW_UNSANDBOXED_COMPUTERS = "1";
   }
   return env;
@@ -397,7 +398,10 @@ async function startLocalComputer(spaceUrl, origin) {
     log("the Local Computer is not available on macOS yet");
     return;
   }
-  if (!(await confirmUnsandboxedMode())) return;
+  if (process.platform === "win32" && !allowUnsandboxedWindowsComputer) {
+    log("the Windows Local Computer is disabled until its warning is accepted");
+    return;
+  }
   let paired = fs.existsSync(computerConfigFile());
   if (paired) {
     // The Space picks a fresh loopback port on every launch. The saved token
@@ -440,6 +444,9 @@ async function startLocalComputer(spaceUrl, origin) {
 }
 
 async function openLocalSpace() {
+  if (process.platform === "win32") {
+    allowUnsandboxedWindowsComputer = await confirmUnsandboxedMode();
+  }
   const started = await startSpace();
   let origin;
   let spaceUrl;
