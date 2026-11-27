@@ -41,6 +41,10 @@ desktop-deps:
 desktop-check: desktop-deps
     pnpm --dir apps/desktop test
 
+# Check licenses, advisories, duplicate versions, and registry sources.
+deny:
+    cargo deny --locked check
+
 # Build the documentation; any rustdoc warning fails.
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
@@ -61,7 +65,7 @@ check-specs-tests:
     python3 scripts/test_check_specs.py
 
 # The full gate. Pull requests and main run the same recipes.
-ci: check-python-cache check-python check-specs fmt clippy test doc ui-check desktop-check
+ci: check-python-cache check-python check-specs fmt clippy test deny doc ui-check desktop-check
 
 # Run the gate and retain source provenance, output, and exit status.
 verify evidence_dir:
