@@ -18746,11 +18746,38 @@ mod tests {
             "an answer given before the switch never reaches a script"
         );
         // The withheld call recorded no identity, so the answer consumed no
-        // first run.
+        // first run, and the card, the action's start, and its result name one
+        // action: a policy refusal does not replace the approved identifier.
+        let events = second
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let of_run = |kind: EventKind| -> Vec<Value> {
+            events
+                .iter()
+                .filter(|event| event.kind == kind && event.data["run"] == json!(run))
+                .map(|event| event.data.clone())
+                .collect()
+        };
         let actions = started_actions(&second, run).await;
         assert_eq!(actions.len(), 1);
         assert_eq!(actions[0].data["skill"], json!(null));
         assert_eq!(actions[0].data["tool"], "run_skill_script");
+        let requested = of_run(EventKind::ApprovalRequested);
+        let finished = of_run(EventKind::ActionFinished);
+        assert_eq!(requested.len(), 1);
+        assert_eq!(finished.len(), 1);
+        assert_eq!(
+            requested[0]["action"], actions[0].data["action"],
+            "the card names the action that started"
+        );
+        assert_eq!(
+            finished[0]["action"], actions[0].data["action"],
+            "the result names the action that started"
+        );
 
         // Turning scripts back on asks again for the still-unrun script.
         second_socket.close(None).await.unwrap();

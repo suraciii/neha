@@ -422,9 +422,11 @@ where
         if !(all_done && from >= calls.len()) {
             for (index, call) in calls.into_iter().enumerate().skip(from) {
                 // The action the User approved runs under its recorded identifier
-                // and is not asked for again. A refused call cannot have been
-                // approved, so it never takes that identifier.
-                let action = if index == from && call.parsed.is_ok() {
+                // and is not asked for again, even when a tool it needed is no
+                // longer offered: the card, the action's start, and its result
+                // must name one action. A call the record itself refused was
+                // never approved, so it takes no identifier.
+                let action = if index == from && call.recorded.refused.is_none() {
                     approved
                 } else {
                     None

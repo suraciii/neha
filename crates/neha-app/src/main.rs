@@ -3428,6 +3428,7 @@ mod tests {
         assert!(Cli::try_parse_from(["neha", "bot", "skill", "enable"]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_skill_directory_reads_its_document_and_scripts() {
         let directory = tempfile::tempdir().unwrap();
@@ -3455,7 +3456,25 @@ mod tests {
         assert!(read_skill_directory(&directory.path().join("missing")).is_err());
     }
 
+    /// A platform without directory descriptors refuses a directory import
+    /// instead of uploading whatever a racing writer put at a path.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_skill_directory_import_is_refused_off_unix() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+        )
+        .unwrap();
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Unix platform"), "{error}");
+    }
+
     /// A skill directory with a `SKILL.md` and one script in `scripts/`.
+    #[cfg(unix)]
     fn skill_directory() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
