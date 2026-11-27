@@ -3055,6 +3055,28 @@ async fn a_bot_created_with_computer_hosted_works_in_the_space() {
         "reset keeps the workspace folder itself"
     );
 
+    // A Hosted run works only in its Workspace: a named host directory is
+    // refused before a Provider request.
+    let cwd = cli(
+        &home,
+        &credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &chat,
+            "--cwd",
+            "/tmp",
+            "elsewhere",
+        ],
+    );
+    assert!(!cwd.status.success(), "Hosted must refuse a host cwd");
+    let stderr = String::from_utf8_lossy(&cwd.stderr);
+    assert!(
+        stderr.contains("works only in its Workspace"),
+        "stderr: {stderr}"
+    );
+
     // Without a Local Computer paired, the default is Hosted as well.
     let fallback = run(&home, &credential, &["bot", "create", "Default"]);
     let fallback_bot = first_word(&field(&fallback, "Created Bot "));
