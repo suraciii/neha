@@ -371,6 +371,9 @@ pub struct State {
     /// live in memory only: a restart drops them and a later run issues new
     /// ones.
     pub bot_tokens: HashMap<String, BotToken>,
+    /// Hosted Computers whose Workspace is being reset. The pumps skip them
+    /// until the clear finishes, so no run starts on a half-emptied folder.
+    pub resetting_computers: HashSet<Id>,
 }
 
 impl State {
@@ -445,6 +448,22 @@ impl State {
     #[must_use]
     pub fn is_final_recovered(&self, run: Id) -> bool {
         self.final_recovered_runs.contains(&run)
+    }
+
+    /// Returns whether a Hosted Computer's Workspace is being reset.
+    #[must_use]
+    pub fn is_resetting(&self, computer: Id) -> bool {
+        self.resetting_computers.contains(&computer)
+    }
+
+    /// Marks a Hosted Computer's Workspace as being reset.
+    pub fn begin_reset(&mut self, computer: Id) {
+        self.resetting_computers.insert(computer);
+    }
+
+    /// Clears the reset mark once the Workspace is ready again.
+    pub fn end_reset(&mut self, computer: Id) {
+        self.resetting_computers.remove(&computer);
     }
 
     /// Returns whether this Space start recovered the run.

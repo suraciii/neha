@@ -8,7 +8,7 @@ Contracts live in [../specs/](../specs/). Domain terms live in [../CONTEXT.md](.
 
 - [Building and verification](building.md) — requirements, commands, and gates.
 - [Quick start: chat with a Bot](quickstart.md) — run a Space, connect a Provider, and talk to a Bot.
-- [Add a Local Computer](computer.md) — pair the machine that runs the Space, create a Bot in its own Workspace, and see its write fence.
+- [Computers](computer.md) — create a Bot on the default Hosted Computer or pair the machine that runs the Space, then see each write fence.
 - [Let a Bot work on its Computer](tools.md) — the shell and file tools, the workspace, and their limits.
 - [Approvals](approvals.md) — when a Bot asks before an action, how to answer, and lasting Ask and Allow rules.
 - [Send and receive Files](files.md) — send a file in a Chat, download a File, and let a Bot take and deliver Files.

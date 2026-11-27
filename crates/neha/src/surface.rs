@@ -67,6 +67,11 @@ pub enum CommandCall {
     },
     /// Lists the caller's Computers.
     ComputerList,
+    /// Clears a Hosted Computer's Workspace.
+    ComputerReset {
+        /// The Hosted Computer to reset.
+        computer: Id,
+    },
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
     /// Changes a Bot's file access.
@@ -194,8 +199,7 @@ pub struct BotCreate {
     pub name: String,
     /// Where the Bot works.
     ///
-    /// An absent value means the owner's Local Computer when they have one,
-    /// and a fresh Hosted Computer otherwise.
+    /// An absent value means a fresh Hosted Computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<BotComputer>,
 }
@@ -216,7 +220,7 @@ pub struct BotUpdate {
 /// The Computer a `bot_create` asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BotComputer {
-    /// The owner's paired Local Computer, or Hosted when they have none.
+    /// The owner's paired Local Computer.
     Local,
     /// A fresh Hosted Computer.
     Hosted,
@@ -431,6 +435,15 @@ mod tests {
             computer: Some(BotComputer::Id(computer)),
         });
         let text = serde_json::to_string(&command).unwrap();
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn a_computer_reset_round_trips() {
+        let computer = Id::new();
+        let command = CommandCall::ComputerReset { computer };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"computer_reset\""));
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 
