@@ -270,6 +270,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path $remoteHome | Out-Null
           $remoteOut = Join-Path $env:RUNNER_TEMP "neha-remote-space.out.log"
           $remoteErr = Join-Path $env:RUNNER_TEMP "neha-remote-space.err.log"
+          $env:NEHA_HOME = $remoteHome
           $sidecar = Join-Path $app.Directory "resources\neha.exe"
           $ui = Join-Path $app.Directory "resources\ui"
           $space = Start-Process -FilePath $sidecar `
