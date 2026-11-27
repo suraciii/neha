@@ -6436,7 +6436,7 @@ mod tests {
             "the default Model cannot think"
         );
 
-        let plain_bot = command(
+        let error = try_command(
             &mut socket,
             Id::new(),
             CommandCall::BotCreate(BotCreate {
@@ -6447,22 +6447,9 @@ mod tests {
             }),
         )
         .await;
-        let plain_chat: Id = serde_json::from_value(plain_bot["chat"]["id"].clone()).unwrap();
-        let error = try_command(
-            &mut socket,
-            Id::new(),
-            CommandCall::MessageSend(MessageSend {
-                chat: plain_chat,
-                text: "hello".to_owned(),
-                file: None,
-                cwd: None,
-                cwd_writable: None,
-            }),
-        )
-        .await;
         assert!(
             matches!(error, Err((ErrorCode::InvalidArgument, _))),
-            "a Model without tools never starts a run"
+            "a Model without tools is never chosen for a Bot"
         );
 
         socket.close(None).await.unwrap();

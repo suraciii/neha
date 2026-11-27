@@ -5365,6 +5365,11 @@ fn check_model_capability(state: &State, model: Id, missing: &str) -> Result<(),
     if !state.providers.contains_key(&view.provider) {
         return Err(ApiError::invalid_argument("the Model has no Provider"));
     }
+    if !view.tools {
+        return Err(ApiError::invalid_argument(
+            "the Model cannot call tools, so a Bot cannot use it",
+        ));
+    }
 
     Ok(())
 }

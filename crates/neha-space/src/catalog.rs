@@ -544,11 +544,19 @@ impl CatalogProvider {
     /// Without a tool-calling Model the first Model stands in.
     #[must_use]
     pub fn default_model_name(&self) -> Option<String> {
-        let candidates: Vec<&CatalogModel> = self
+        let active = |model: &&CatalogModel| model.status.as_deref() != Some("deprecated");
+        let mut candidates: Vec<&CatalogModel> = self
             .models
             .values()
-            .filter(|model| model.tool_call)
+            .filter(|model| model.tool_call && active(model))
             .collect();
+        if candidates.is_empty() {
+            candidates = self
+                .models
+                .values()
+                .filter(|model| model.tool_call)
+                .collect();
+        }
         if candidates.is_empty() {
             return self.models.values().next().map(|model| model.id.clone());
         }
@@ -598,6 +606,9 @@ pub struct CatalogModel {
     /// `default_model_name` orders the Models by it; the wire model drops the
     /// field otherwise, so it is kept beside the declared capabilities.
     pub release_date: Option<String>,
+    /// The lifecycle status the catalog names, such as `deprecated`.
+    #[serde(default)]
+    pub status: Option<String>,
 }
 
 /// The cache state of one Space's catalog.
@@ -787,6 +798,8 @@ struct WireModel {
     #[serde(default)]
     release_date: Option<String>,
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
     limit: WireLimit,
     #[serde(default)]
     reasoning_options: Vec<WireReasoningOption>,
@@ -802,6 +815,7 @@ impl WireModel {
             reasoning,
             tool_call,
             release_date,
+            status,
             limit,
             reasoning_options,
         } = self;
@@ -824,6 +838,7 @@ impl WireModel {
                 .filter(|limit| *limit > 0)
                 .unwrap_or(DEFAULT_MAX_OUTPUT),
             release_date: release_date.filter(|date| !date.is_empty()),
+            status: status.filter(|status| !status.is_empty()),
         }
     }
 }
@@ -1251,6 +1266,13 @@ mod tests {
                             "name": "Newer Tool",
                             "release_date": "2026-01-01",
                             "tool_call": true
+                        },
+                        "deprecated-tool": {
+                            "id": "deprecated-tool",
+                            "name": "Deprecated Tool",
+                            "release_date": "2027-01-01",
+                            "tool_call": true,
+                            "status": "deprecated"
                         },
                         "undated-tool": {
                             "id": "undated-tool",
