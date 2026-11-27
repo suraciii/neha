@@ -84,7 +84,7 @@ describe("the mobile client", () => {
     const view = renderApp();
 
     try {
-      await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+      await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
       expect(history.state?.nehaChat).toBe(space.chat.id);
       expect(location.search).toBe("");
       await waitFor(() =>
