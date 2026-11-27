@@ -116,7 +116,6 @@ Notifications are available in an installed client on the public HTTPS origin. O
 
 - **Address.** One Space serves one public origin. `--domain` takes the host only, such as `neha.example.com` or `neha.example.com:8443`; `NEHA_PUBLIC_URL` takes the full `https://` origin. A scheme or path passed to `--domain` is refused.
 - **Health.** `GET /healthz` answers `ok` on the public origin.
-<<<<<<< HEAD
 - **Upgrade.** Replace the binary and the built client, then restart the Space. [Upgrade a Space](upgrading.md) covers the backup, the schema migration, and the version check. Open clients load the new build on their next open.
 - **Backup.** Back up the Space's home directory, and keep the Vault's master key with it; [Storage](storage.md) covers the File store. The same home holds sealed notification keys and device subscriptions, so a backup restores notifications too.
 - **Notifications.** The Space reaches each browser's push service directly over outbound HTTPS; it does not use HTTP proxy environment variables. A phone must install the client from the public origin; on iOS and iPadOS, Web Push works only from the Home Screen. See [Notifications](notifications.md).

@@ -302,7 +302,6 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Bot's Workspace as the only place where files persist; it has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
-<<<<<<< HEAD
 - One human joins a Space. Group Chats, Boards, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, or search. Notifications are available in an installed browser client on a public HTTPS origin; see [Notifications](notifications.md).
 - The browser client downloads a File and opens no preview of it. Choosing a file card downloads the File.
