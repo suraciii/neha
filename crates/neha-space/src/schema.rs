@@ -8,7 +8,7 @@ use sqlx::{Connection, SqliteConnection};
 use thiserror::Error;
 
 /// The schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// The statements that create the tables of schema version 1.
 ///
@@ -64,6 +64,15 @@ const VERSION_FOUR_STATEMENTS: [&str; 1] = ["CREATE TABLE IF NOT EXISTS computer
         ticket_hash BLOB PRIMARY KEY, owner BLOB NOT NULL, \
         created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)"];
 
+/// The statements schema version 5 adds.
+///
+/// Provider-native state is tied to one Model reply. It is not part of the
+/// record: losing it costs only the reasoning context of a resumed run, so it
+/// lives beside the events as a cache rather than as an Authority event.
+const VERSION_FIVE_STATEMENTS: [&str; 1] = [
+    "CREATE TABLE IF NOT EXISTS run_continuations (        run TEXT NOT NULL, step INTEGER NOT NULL, protocol TEXT NOT NULL,         provider TEXT NOT NULL, model TEXT NOT NULL, state TEXT NOT NULL,         PRIMARY KEY (run, step))",
+];
+
 /// Creates or upgrades the Space database.
 pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaError> {
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -94,6 +103,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_FOUR_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_FIVE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         1 => {
             // A version 1 database has the record and the account tables;
@@ -107,6 +119,9 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_FOUR_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_FIVE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         2 => {
             // Version 2 paired Computers: their token rows were final, which
@@ -117,11 +132,23 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_FOUR_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_FIVE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         3 => {
             // Version 3 pairings are final tokens; local tickets are new and
             // no pairing data is touched.
             for statement in VERSION_FOUR_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_FIVE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+        }
+        4 => {
+            // Version 4 has every table but the continuation cache.
+            for statement in VERSION_FIVE_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
         }
@@ -161,13 +188,13 @@ pub enum SchemaError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCHEMA_VERSION, SchemaError, VERSION_FOUR_STATEMENTS, VERSION_ONE_STATEMENTS,
-        VERSION_THREE_STATEMENTS, VERSION_TWO_STATEMENTS, migrate,
+        SCHEMA_VERSION, SchemaError, VERSION_FIVE_STATEMENTS, VERSION_FOUR_STATEMENTS,
+        VERSION_ONE_STATEMENTS, VERSION_THREE_STATEMENTS, VERSION_TWO_STATEMENTS, migrate,
     };
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{Connection, SqliteConnection};
 
-    const TABLES: [&str; 8] = [
+    const TABLES: [&str; 9] = [
         "meta",
         "events",
         "commands",
@@ -176,6 +203,7 @@ mod tests {
         "computer_codes",
         "computer_tokens",
         "computer_tickets",
+        "run_continuations",
     ];
 
     async fn connection() -> SqliteConnection {
@@ -370,19 +398,41 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_database_from_a_newer_build() {
         let mut connection = connection().await;
-        sqlx::query("PRAGMA user_version = 5")
-            .execute(&mut connection)
-            .await
-            .unwrap();
+        let newer = SCHEMA_VERSION + 1;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA user_version = {newer}"
+        )))
+        .execute(&mut connection)
+        .await
+        .unwrap();
 
         let error = migrate(&mut connection).await;
 
         assert!(matches!(
             error,
-            Err(SchemaError::TooNew {
-                found: 5,
-                supported: SCHEMA_VERSION
-            })
+            Err(SchemaError::TooNew { found, supported })
+                if found == newer && supported == SCHEMA_VERSION
         ));
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_four_database_with_the_continuation_cache() {
+        let mut connection = connection_at_version_three().await;
+        for statement in VERSION_FOUR_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 4")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        assert!(table_exists(&mut connection, "run_continuations").await);
+        assert!(VERSION_FIVE_STATEMENTS.len() == 1);
     }
 }

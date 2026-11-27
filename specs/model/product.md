@@ -39,6 +39,8 @@ The Space has a default Model and thinking level. Every Bot uses them unless its
 | Low, Medium, High | More thought, more time, more cost |
 | Max | The most thought the Model offers |
 
+A Bot's level applies to every step of its runs. A Model marked as not thinking refuses a Bot that asks for a level.
+
 ## Failure
 
 When a Provider fails or runs out, the Bot says so as a Message and the work is done.

@@ -169,6 +169,9 @@ pub struct ProviderAdd {
     /// The Model the Space uses by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<String>,
+    /// The Space's default thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// A provider protocol the Space can speak.
@@ -177,6 +180,28 @@ pub struct ProviderAdd {
 pub enum ProviderProtocol {
     /// OpenAI Chat Completions.
     ChatCompletions,
+    /// OpenAI Responses.
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    /// Anthropic Messages.
+    #[serde(rename = "anthropic_messages")]
+    AnthropicMessages,
+}
+
+/// How much thought a Model should give a reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThinkingLevel {
+    /// Fastest and cheapest.
+    Minimal,
+    /// A little more thought.
+    Low,
+    /// The usual balance.
+    Medium,
+    /// More thought, more time, more cost.
+    High,
+    /// The most thought the Model offers.
+    Max,
 }
 
 /// A Model as the Admin declares it.
@@ -190,6 +215,9 @@ pub struct ModelSpec {
     pub max_output: u32,
     /// Whether the Model reads images.
     pub reads_images: bool,
+    /// Whether the Model can think before it answers.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thinks: bool,
 }
 
 /// The parameters of `bot_create`.
@@ -202,6 +230,9 @@ pub struct BotCreate {
     /// An absent value means a fresh Hosted Computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<BotComputer>,
+    /// The Bot's thinking level; absent uses the Space's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<ThinkingLevel>,
 }
 
 /// The parameters of `bot_update`.
@@ -363,7 +394,7 @@ pub enum ServerFrame {
 mod tests {
     use super::{
         BotComputer, BotCreate, ClientFrame, CommandCall, MessageSend, ModelSpec, PROTOCOL_VERSION,
-        ProviderAdd, ProviderProtocol, ServerFrame,
+        ProviderAdd, ProviderProtocol, ServerFrame, ThinkingLevel,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -378,6 +409,8 @@ mod tests {
             command: CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: None,
+
+                thinking: None,
             }),
         };
 
@@ -406,6 +439,8 @@ mod tests {
         let command = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
             computer: None,
+
+            thinking: None,
         });
         let text = serde_json::to_string(&command).unwrap();
         assert!(
@@ -442,6 +477,8 @@ mod tests {
             let command = CommandCall::BotCreate(BotCreate {
                 name: "Scout".to_owned(),
                 computer: Some(choice),
+
+                thinking: None,
             });
             let text = serde_json::to_string(&command).unwrap();
             assert!(text.contains(&format!("\"computer\":\"{wire}\"")), "{text}");
@@ -460,6 +497,8 @@ mod tests {
         let command = CommandCall::BotCreate(BotCreate {
             name: "Scout".to_owned(),
             computer: Some(BotComputer::Id(computer)),
+
+            thinking: None,
         });
         let text = serde_json::to_string(&command).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
@@ -485,13 +524,61 @@ mod tests {
                 context_limit: 128_000,
                 max_output: 8_192,
                 reads_images: false,
+
+                thinks: false,
             }],
             default_model: Some("test-model".to_owned()),
+
+            thinking: None,
         });
 
         let text = serde_json::to_string(&command).unwrap();
         assert!(text.contains("\"name\":\"provider_add\""));
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn provider_protocols_and_thinking_levels_round_trip() {
+        for (protocol, wire) in [
+            (ProviderProtocol::ChatCompletions, "chat_completions"),
+            (ProviderProtocol::OpenAiResponses, "openai_responses"),
+            (ProviderProtocol::AnthropicMessages, "anthropic_messages"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(protocol).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+        for (level, wire) in [
+            (ThinkingLevel::Minimal, "minimal"),
+            (ThinkingLevel::Low, "low"),
+            (ThinkingLevel::Medium, "medium"),
+            (ThinkingLevel::High, "high"),
+            (ThinkingLevel::Max, "max"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(level).unwrap(),
+                serde_json::json!(wire)
+            );
+        }
+
+        let old: ProviderAdd = serde_json::from_value(serde_json::json!({
+            "protocol": "chat_completions",
+            "base_url": "http://127.0.0.1:9000/v1",
+            "api_key": "secret",
+            "models": [{
+                "name": "test-model",
+                "context_limit": 128000,
+                "max_output": 8192,
+                "reads_images": false
+            }]
+        }))
+        .unwrap();
+        assert!(!old.models[0].thinks);
+        assert_eq!(old.thinking, None);
+        let old_bot: BotCreate =
+            serde_json::from_value(serde_json::json!({"name": "Scout"})).unwrap();
+        assert_eq!(old_bot.thinking, None);
     }
 
     #[test]

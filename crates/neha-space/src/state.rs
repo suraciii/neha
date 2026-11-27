@@ -64,6 +64,8 @@ pub struct ModelView {
     pub max_output: u32,
     /// Whether it reads images.
     pub reads_images: bool,
+    /// Whether it can think before it answers.
+    pub thinks: bool,
     /// Whether it is the Space's default.
     pub is_default: bool,
 }
@@ -87,6 +89,9 @@ pub struct BotView {
     /// Extra folders outside its Workspace it may write.
     #[serde(default)]
     pub grants: Vec<String>,
+    /// Its thinking level; absent uses the Space's default.
+    #[serde(default)]
+    pub thinking: Option<neha::surface::ThinkingLevel>,
 }
 
 /// A Computer.
@@ -372,6 +377,8 @@ pub struct State {
     pub providers: HashMap<Id, ProviderView>,
     /// The Models, by identifier.
     pub models: HashMap<Id, ModelView>,
+    /// The Space's default thinking level.
+    pub default_thinking: Option<neha::surface::ThinkingLevel>,
     /// The Bots, by identifier.
     pub bots: HashMap<Id, BotView>,
     /// The Computers, by identifier.
@@ -684,6 +691,7 @@ impl Projection for State {
                     for model in self.models.values_mut() {
                         model.is_default = false;
                     }
+                    self.default_thinking = data.thinking;
                 }
                 for model in data.models {
                     self.models.insert(
@@ -695,6 +703,7 @@ impl Projection for State {
                             context_limit: model.context_limit,
                             max_output: model.max_output,
                             reads_images: model.reads_images,
+                            thinks: model.thinks,
                             is_default: data.default_model == Some(model.id),
                         },
                     );
@@ -711,6 +720,7 @@ impl Projection for State {
                         chat: data.chat,
                         full_access: false,
                         grants: Vec::new(),
+                        thinking: data.thinking,
                     },
                 );
             }

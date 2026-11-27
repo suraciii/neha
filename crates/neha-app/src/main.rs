@@ -13,7 +13,7 @@ use neha::record::RuleEffect;
 use neha::seq::Seq;
 use neha::surface::{
     BotComputer, BotCreate, BotUpdate, CommandCall, MessageSend, ModelSpec, ProviderAdd,
-    ProviderProtocol,
+    ProviderProtocol, ThinkingLevel,
 };
 use neha_space::Home;
 use serde_json::Value;
@@ -107,14 +107,14 @@ enum Top {
 
 #[derive(Subcommand)]
 enum ProviderCommand {
-    /// Connect an OpenAI Chat Completions Provider.
+    /// Connect a Provider.
     Add {
         /// The Provider's base URL, such as http://127.0.0.1:8000/v1.
         #[arg(long)]
         base_url: String,
-        /// The protocol; only chat-completions is supported.
-        #[arg(long, default_value = "chat-completions")]
-        protocol: String,
+        /// The protocol: chat-completions, openai-responses, or anthropic-messages.
+        #[arg(long, default_value = "chat-completions", value_parser = parse_protocol)]
+        protocol: ProviderProtocol,
         /// A Model name at the Provider; repeat for more.
         #[arg(long = "model", value_name = "NAME", required = true)]
         models: Vec<String>,
@@ -127,6 +127,12 @@ enum ProviderCommand {
         /// The Model does not read images.
         #[arg(long)]
         no_images: bool,
+        /// The Model can think before it answers.
+        #[arg(long)]
+        thinks: bool,
+        /// The Space's default thinking level: minimal, low, medium, high, max.
+        #[arg(long, value_parser = parse_thinking)]
+        thinking: Option<ThinkingLevel>,
     },
     /// List connected Providers.
     List,
@@ -149,6 +155,9 @@ enum BotCommand {
         /// A fresh Hosted Computer when omitted.
         #[arg(long, value_name = "LOCAL|HOSTED|ID")]
         computer: Option<String>,
+        /// The Bot's thinking level: minimal, low, medium, high, max.
+        #[arg(long, value_parser = parse_thinking)]
+        thinking: Option<ThinkingLevel>,
     },
     /// Move your Bot to another real Computer you own.
     Move {
@@ -530,16 +539,15 @@ async fn provider(command: ProviderCommand) -> Result<()> {
             context_limit,
             max_output,
             no_images,
+            thinks,
+            thinking,
         } => {
-            if protocol != "chat-completions" {
-                bail!("this version only speaks chat-completions");
-            }
             let api_key = provider_key()?;
             let default = models.first().cloned();
             let result = client::command(
                 &credential,
                 CommandCall::ProviderAdd(ProviderAdd {
-                    protocol: ProviderProtocol::ChatCompletions,
+                    protocol,
                     base_url: base_url.clone(),
                     api_key,
                     models: models
@@ -549,9 +557,11 @@ async fn provider(command: ProviderCommand) -> Result<()> {
                             context_limit,
                             max_output,
                             reads_images: !no_images,
+                            thinks,
                         })
                         .collect(),
                     default_model: default,
+                    thinking,
                 }),
             )
             .await?;
@@ -602,8 +612,13 @@ async fn model(command: ModelCommand) -> Result<()> {
                 } else {
                     "no images"
                 };
+                let thinks = if model["thinks"].as_bool().unwrap_or(false) {
+                    "thinks"
+                } else {
+                    "no thinking"
+                };
                 println!(
-                    "{}  {}  context {}  max output {}  {images}{default}",
+                    "{}  {}  context {}  max output {}  {images}  {thinks}{default}",
                     id_of(model, "id")?,
                     text_of(model, "name")?,
                     model["context_limit"].as_u64().unwrap_or_default(),
@@ -614,6 +629,30 @@ async fn model(command: ModelCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Parses a protocol name.
+fn parse_protocol(value: &str) -> Result<ProviderProtocol> {
+    match value {
+        "chat-completions" | "chat_completions" => Ok(ProviderProtocol::ChatCompletions),
+        "openai-responses" | "openai_responses" => Ok(ProviderProtocol::OpenAiResponses),
+        "anthropic-messages" | "anthropic_messages" => Ok(ProviderProtocol::AnthropicMessages),
+        other => bail!(
+            "unknown protocol {other:?}; use chat-completions, openai-responses, or anthropic-messages"
+        ),
+    }
+}
+
+/// Parses a thinking level.
+fn parse_thinking(value: &str) -> Result<ThinkingLevel> {
+    match value {
+        "minimal" => Ok(ThinkingLevel::Minimal),
+        "low" => Ok(ThinkingLevel::Low),
+        "medium" => Ok(ThinkingLevel::Medium),
+        "high" => Ok(ThinkingLevel::High),
+        "max" => Ok(ThinkingLevel::Max),
+        other => bail!("unknown thinking level {other:?}; use minimal, low, medium, high, or max"),
+    }
 }
 
 /// Parses `on|off` for a Bot's full access.
@@ -804,13 +843,18 @@ fn confirm_full_access(
 async fn bot(command: BotCommand) -> Result<()> {
     let credential = Credential::load()?;
     match command {
-        BotCommand::Create { name, computer } => {
+        BotCommand::Create {
+            name,
+            computer,
+            thinking,
+        } => {
             let computer = computer.as_deref().map(parse_bot_computer).transpose()?;
             let result = client::command(
                 &credential,
                 CommandCall::BotCreate(BotCreate {
                     name: name.clone(),
                     computer,
+                    thinking,
                 }),
             )
             .await?;
@@ -925,6 +969,9 @@ async fn bot(command: BotCommand) -> Result<()> {
             }
             // `bot access` prints the same lines.
             write_access(&mut std::io::stdout().lock(), &result["bot"])?;
+            if let Some(thinking) = result["bot"]["thinking"].as_str() {
+                println!("  thinking: {thinking}");
+            }
         }
         BotCommand::List => {
             let result = client::command(&credential, CommandCall::BotList).await?;
@@ -2134,7 +2181,10 @@ mod tests {
 
     use clap::Parser as _;
 
-    use super::{Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer};
+    use super::{
+        Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer,
+        parse_protocol, parse_thinking,
+    };
 
     use super::{
         ApprovalCard, ApprovalCommand, Decision, LastingScope, RuleCommand, RuleEffectChoice,
@@ -2192,6 +2242,70 @@ mod tests {
                 "{value:?}: {error}"
             );
         }
+    }
+
+    #[test]
+    fn a_provider_protocol_and_thinking_level_parse() {
+        assert_eq!(
+            parse_protocol("chat-completions").unwrap(),
+            neha::surface::ProviderProtocol::ChatCompletions
+        );
+        assert_eq!(
+            parse_protocol("openai-responses").unwrap(),
+            neha::surface::ProviderProtocol::OpenAiResponses
+        );
+        assert_eq!(
+            parse_protocol("anthropic-messages").unwrap(),
+            neha::surface::ProviderProtocol::AnthropicMessages
+        );
+        assert!(parse_protocol("grpc").is_err());
+        assert_eq!(
+            parse_thinking("minimal").unwrap(),
+            neha::surface::ThinkingLevel::Minimal
+        );
+        assert_eq!(
+            parse_thinking("max").unwrap(),
+            neha::surface::ThinkingLevel::Max
+        );
+        assert!(parse_thinking("turbo").is_err());
+
+        let provider = parse(&[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:9000/v1",
+            "--protocol",
+            "openai-responses",
+            "--model",
+            "m",
+            "--thinks",
+            "--thinking",
+            "high",
+        ]);
+        let Top::Provider {
+            command:
+                super::ProviderCommand::Add {
+                    protocol,
+                    thinks,
+                    thinking,
+                    ..
+                },
+        } = provider
+        else {
+            panic!("expected provider add");
+        };
+        assert_eq!(protocol, neha::surface::ProviderProtocol::OpenAiResponses);
+        assert!(thinks);
+        assert_eq!(thinking, Some(neha::surface::ThinkingLevel::High));
+
+        let bot = parse(&["bot", "create", "Scout", "--thinking", "low"]);
+        let Top::Bot {
+            command: super::BotCommand::Create { thinking, .. },
+        } = bot
+        else {
+            panic!("expected bot create");
+        };
+        assert_eq!(thinking, Some(neha::surface::ThinkingLevel::Low));
     }
 
     #[test]

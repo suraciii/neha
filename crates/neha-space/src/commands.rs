@@ -24,6 +24,7 @@ use neha::record::{
 use neha::seq::Seq;
 use neha::surface::{
     BotComputer, BotCreate, BotUpdate, CommandCall, FileSummary, MessageSend, ProviderAdd,
+    ProviderProtocol, ThinkingLevel,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -40,7 +41,9 @@ use crate::state::{
     ApprovalView, BotView, ChatView, ComputerView, ModelView, ProviderView, RuleView, RunStatus,
     State,
 };
-use crate::store::{AppendRequest, AppendResult, CommandRecord, Projection, Store};
+use crate::store::{
+    AppendRequest, AppendResult, CommandRecord, ContinuationWrite, Projection, Store,
+};
 
 use neha_computer::{
     Action, ActionResult, ActionStatus, ByteError, ComputerRuntime, LocalRuntime, ToolOutput,
@@ -104,6 +107,8 @@ pub struct PendingRun {
     pub provider: ProviderView,
     /// The Provider's API key.
     pub api_key: String,
+    /// The thinking level this run uses, when its Model can think.
+    pub thinking: Option<ThinkingLevel>,
     /// How a run this Space start recovered from the record continues.
     pub recovery: Option<RecoveryPlan>,
 }
@@ -859,6 +864,7 @@ async fn provider_add(
                 "context_limit": model.context_limit,
                 "max_output": model.max_output,
                 "reads_images": model.reads_images,
+                "thinks": model.thinks,
             })
         })
         .collect();
@@ -875,12 +881,15 @@ async fn provider_add(
         })
         .or_else(|| models.first().map(|model| model["id"].clone()))
         .ok_or_else(|| ApiError::invalid_argument("the default Model is not declared"))?;
+    let protocol = serde_json::to_value(arguments.protocol).map_err(json_error)?;
+    let thinking = arguments.thinking.or(Some(ThinkingLevel::Medium));
     let data = json!({
         "provider": provider,
-        "protocol": "chat_completions",
+        "protocol": protocol,
         "base_url": arguments.base_url,
         "models": models,
         "default_model": default_model,
+        "thinking": thinking,
     });
     let result = json!({"provider": provider, "models": models});
     context
@@ -1207,7 +1216,7 @@ async fn bot_create(
     drafts.push(EventDraft::new(
         EventKind::BotCreated,
         Author::User(account.id),
-        json!({"bot": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat}),
+        json!({"bot": bot, "owner": account.id, "name": name, "computer": computer, "chat": chat, "thinking": arguments.thinking}),
     ));
     drafts.push(EventDraft::new(
         EventKind::ChatCreated,
@@ -1223,6 +1232,7 @@ async fn bot_create(
             "chat": chat,
             "full_access": false,
             "grants": Vec::<String>::new(),
+            "thinking": arguments.thinking,
         },
         "computer": computer_view,
         "chat": {"id": chat, "owner": account.id, "bot": bot},
@@ -1998,7 +2008,8 @@ pub async fn resume_pending(
     secrets: &Secrets,
     run: &crate::state::RunView,
 ) -> Result<PendingRun, ApiError> {
-    let (bot, model, provider, api_key) = preflight(state, run.chat, run.acting, secrets, None)?;
+    let (bot, model, provider, api_key, thinking) =
+        preflight(state, run.chat, run.acting, secrets, None)?;
     let chat = {
         let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
         state
@@ -2025,6 +2036,7 @@ pub async fn resume_pending(
         model,
         provider,
         api_key,
+        thinking,
         recovery: None,
     })
 }
@@ -2330,6 +2342,7 @@ pub async fn finish_run(
         pending,
         history,
         None,
+        None,
         neha::usage::Usage::default(),
         None,
     )
@@ -2440,7 +2453,7 @@ pub async fn resume_run(
         (state.is_resumable(run), state.is_recovering(run))
     };
     if resumable {
-        let (history, resume, base_usage) = match prepare_resume(state, run) {
+        let (history, mut resume, base_usage) = match prepare_resume(state, run) {
             Ok(plan) => plan,
             Err(error) => {
                 eprintln!("neha: cannot resume run {}: {error}", run.id);
@@ -2448,6 +2461,13 @@ pub async fn resume_run(
                 return Ok(Finished::Completed(events));
             }
         };
+        if let Some(state) = store
+            .continuation(run.id, resume.step)
+            .await
+            .map_err(store_error)?
+        {
+            resume.continuation = Some(state);
+        }
         let pending = match resume_pending(state, secrets, run).await {
             Ok(pending) => pending,
             Err(error) => {
@@ -2473,6 +2493,7 @@ pub async fn resume_run(
             links,
             pending,
             history,
+            None,
             Some(resume),
             base_usage,
             None,
@@ -2525,10 +2546,27 @@ pub async fn resume_run(
             let ContinuePlan {
                 next_step,
                 history,
-                resume,
+                mut resume,
                 base_usage,
                 unknown,
             } = *plan;
+            let mut continuation = None;
+            if let Some(waiting) = resume.as_mut() {
+                if let Some(state) = store
+                    .continuation(run.id, waiting.step)
+                    .await
+                    .map_err(store_error)?
+                {
+                    waiting.continuation = Some(state);
+                }
+            } else if next_step > 1
+                && let Some(state) = store
+                    .continuation(run.id, next_step - 1)
+                    .await
+                    .map_err(store_error)?
+            {
+                continuation = Some(state);
+            }
             let pending = match resume_pending(state, secrets, run).await {
                 Ok(pending) => pending,
                 Err(error) => {
@@ -2554,6 +2592,7 @@ pub async fn resume_run(
                 links,
                 pending,
                 history,
+                continuation,
                 resume,
                 base_usage,
                 Some((next_step, unknown)),
@@ -2674,6 +2713,7 @@ async fn finish_run_with(
     links: &ComputerLinks,
     pending: PendingRun,
     history: Vec<neha_loop::Message>,
+    continuation: Option<neha_loop::Continuation>,
     resume: Option<Resume>,
     base_usage: neha::usage::Usage,
     recovery: Option<(u32, Option<crate::state::ActionView>)>,
@@ -2866,11 +2906,15 @@ async fn finish_run_with(
             }
         }
     }
+    let protocol = provider_protocol(&pending.provider)?;
+    let provider_id = pending.provider.id.to_string();
     let space_model = SpaceModel::new(
         model,
         &pending.provider.base_url,
         &pending.api_key,
         &pending.model.name,
+        &provider_id,
+        protocol,
     );
     let log = RunLog {
         store,
@@ -2899,7 +2943,9 @@ async fn finish_run_with(
         ),
         history,
         pending.model.max_output,
-    );
+    )
+    .with_thinking(pending.thinking)
+    .with_continuation(continuation);
     if let Some(resume) = resume {
         // A resumed step's calls come from the record; the loop continues at
         // the call after the approved one.
@@ -3197,6 +3243,7 @@ fn prepare_resume(
         approved_action: Some(approval.action),
         usage: reply.usage.unwrap_or_default(),
         recovered: false,
+        continuation: None,
     };
 
     Ok((messages, resume, base_usage))
@@ -3432,6 +3479,7 @@ pub(crate) fn prepare_recovery(
         approved_action: None,
         usage: reply.usage.unwrap_or_default(),
         recovered: done == reply.calls.len(),
+        continuation: None,
     };
     Ok(RecoveryPlan::Continue(Box::new(ContinuePlan {
         next_step,
@@ -3834,25 +3882,53 @@ struct RunLog<'a> {
 }
 
 impl RunLog<'_> {
-    /// Appends the events of the run and streams them to subscribers.
-    async fn append(&self, drafts: Vec<EventDraft>) -> Result<(), LoopError> {
-        let command = Id::new();
-        let appended = append(
-            self.store,
-            self.state,
-            command,
-            format!("run.record:{command}"),
-            drafts,
-            None,
-            None,
-        )
-        .await
-        .map_err(|error| LoopError::Record(error.to_string()))?;
+    /// Appends one run command and streams its events to subscribers.
+    async fn record(&self, request: AppendRequest) -> Result<(), LoopError> {
+        let appended = self
+            .store
+            .append(request)
+            .await
+            .map_err(|error| LoopError::Record(error.to_string()))?;
+        if !appended.existing {
+            apply(self.state, &appended.events)
+                .map_err(|error| LoopError::Record(error.to_string()))?;
+        }
         for event in appended.events {
             let _ = self.events.send(event);
         }
 
         Ok(())
+    }
+
+    /// Appends the events of the run and streams them to subscribers.
+    async fn append(&self, drafts: Vec<EventDraft>) -> Result<(), LoopError> {
+        let command = Id::new();
+        self.record(AppendRequest::new(
+            command,
+            format!("run.record:{command}"),
+            drafts,
+        ))
+        .await
+    }
+
+    /// Appends the reply and the provider-native state in one transaction.
+    async fn append_reply(
+        &self,
+        drafts: Vec<EventDraft>,
+        step: u32,
+        continuation: Option<neha_loop::Continuation>,
+    ) -> Result<(), LoopError> {
+        let command = Id::new();
+        self.record(
+            AppendRequest::new(command, format!("run.record:{command}"), drafts).with_continuation(
+                ContinuationWrite {
+                    run: self.run,
+                    step,
+                    continuation,
+                },
+            ),
+        )
+        .await
     }
 
     /// Returns an event the Bot writes for the User it acts for.
@@ -3895,6 +3971,7 @@ impl Recorder for RunRecorder<'_> {
         content: Option<String>,
         calls: Vec<LoopCall>,
         usage: neha::usage::Usage,
+        continuation: Option<neha_loop::Continuation>,
     ) -> Result<(), LoopError> {
         self.calls.insert(step, calls.clone());
         let calls: Vec<Value> = calls
@@ -3909,16 +3986,20 @@ impl Recorder for RunRecorder<'_> {
             })
             .collect();
         self.log
-            .append(vec![self.log.bot_draft(
-                EventKind::RunReply,
-                json!({
-                    "run": self.log.run,
-                    "step": step,
-                    "content": content,
-                    "calls": calls,
-                    "usage": usage,
-                }),
-            )])
+            .append_reply(
+                vec![self.log.bot_draft(
+                    EventKind::RunReply,
+                    json!({
+                        "run": self.log.run,
+                        "step": step,
+                        "content": content,
+                        "calls": calls,
+                        "usage": usage,
+                    }),
+                )],
+                step,
+                continuation,
+            )
             .await
     }
 
@@ -4762,7 +4843,16 @@ fn preflight(
     owner: Id,
     secrets: &Secrets,
     file: Option<Id>,
-) -> Result<(BotView, ModelView, ProviderView, String), ApiError> {
+) -> Result<
+    (
+        BotView,
+        ModelView,
+        ProviderView,
+        String,
+        Option<ThinkingLevel>,
+    ),
+    ApiError,
+> {
     let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
     state
         .owned_chat(chat, owner)
@@ -4792,8 +4882,23 @@ fn preflight(
     let api_key = secrets
         .provider_key(provider.id)
         .map_err(|_| ApiError::invalid_argument("the Provider key is missing"))?;
+    let thinking = match (bot.thinking, state.default_thinking) {
+        (Some(_), _) if !model.thinks => {
+            return Err(ApiError::invalid_argument(
+                "the Bot asks for thinking but its Model cannot think",
+            ));
+        }
+        (Some(level), _) => Some(level),
+        (None, default) if model.thinks => default,
+        (None, _) => None,
+    };
 
-    Ok((bot, model, provider, api_key))
+    Ok((bot, model, provider, api_key, thinking))
+}
+
+fn provider_protocol(provider: &ProviderView) -> Result<ProviderProtocol, ApiError> {
+    serde_json::from_value(serde_json::Value::String(provider.protocol.clone()))
+        .map_err(|_| ApiError::internal("the Provider records an unknown protocol"))
 }
 
 fn build_history(
@@ -5050,6 +5155,7 @@ mod tests {
             chat: Id::new(),
             full_access: false,
             grants: Vec::new(),
+            thinking: None,
         }
     }
 
