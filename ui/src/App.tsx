@@ -262,6 +262,8 @@ export default function App() {
   }
   // The approval the User asked to see, so its Chat scrolls to its card.
   const [focus, setFocus] = createSignal<string | null>(null);
+  // The Message a notification named, in the Chat it opened.
+  const [focusMessage, setFocusMessage] = createSignal<string | null>(null);
   const commands = new Commands();
   let runGeneration = 0;
   let following = false;
@@ -1119,17 +1121,25 @@ export default function App() {
         chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
       });
       await loadPreviews(chats);
+      const query = new URLSearchParams(location.search);
+      const requested = query.get("chat");
+      const requestedApproval = query.get("approval");
+      const requestedMessage = query.get("message");
+      if (requested || requestedApproval || requestedMessage) {
+        history.replaceState(history.state, "", `${location.pathname}${location.hash}`);
+      }
       const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
       // A reload keeps the Chat entry; reopen that Chat in the same entry.
       const restored: string | null = isMobile() ? (history.state?.nehaChat ?? null) : null;
       const target =
         active ??
+        (requested ? chats.find((chat) => chat.id === requested) : undefined) ??
         (!isMobile()
           ? chats[0]
           : restored
             ? chats.find((chat) => chat.id === restored)
             : undefined);
-      if (target) await selectChat(target);
+      if (target) await selectChat(target, requestedApproval, requestedMessage);
       if (isMobile() && restored && !chats.some((chat) => chat.id === restored)) {
         history.replaceState(null, "");
       }
@@ -1169,7 +1179,7 @@ export default function App() {
     });
   }
 
-  async function selectChat(chat: Chat, focus?: string | null) {
+  async function selectChat(chat: Chat, focus?: string | null, message?: string | null) {
     rememberChat(chat);
     const generation = ++runGeneration;
     followed = null;
@@ -1186,7 +1196,8 @@ export default function App() {
       deciding: null,
       error: null,
     });
-    if (focus) setFocus(focus);
+    setFocus(focus ?? null);
+    setFocusMessage(message ?? null);
     // Opening a Chat answers its new activity.
     setState((draft) => {
       draft.unread[chat.id] = false;
@@ -2067,7 +2078,11 @@ export default function App() {
                     busy={busyChat()}
                     activity={shownActivity()}
                     focus={focus()}
-                    onFocused={() => setFocus(null)}
+                    focusMessage={focusMessage()}
+                    onFocused={() => {
+                      setFocus(null);
+                      setFocusMessage(null);
+                    }}
                     deciding={state.deciding}
                     error={errorText()}
                     onSend={sendMessage}

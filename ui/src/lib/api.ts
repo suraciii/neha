@@ -1,4 +1,11 @@
-import type { Account, ApiErrorBody, FileSummary } from "../types";
+import type {
+  Account,
+  ApiErrorBody,
+  FileSummary,
+  PushMute,
+  PushStatus,
+  PushSubscriptionBody,
+} from "../types";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -48,4 +55,21 @@ export const api = {
       `/api/chats/${encodeURIComponent(chat)}/files?${new URLSearchParams({ name, media_type: mediaType })}`,
       { method: "POST", body: file, headers: { "content-type": mediaType } },
     ),
+  pushStatus: () => request<PushStatus>("/api/push"),
+  subscribePush: (body: PushSubscriptionBody) =>
+    request<{ subscribed: boolean }>("/api/push/subscriptions", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  unsubscribePush: (endpoint: string) =>
+    request<{ subscribed: boolean }>("/api/push/subscriptions", {
+      method: "DELETE",
+      body: JSON.stringify({ endpoint }),
+    }),
+  mutePush: (minutes: number) =>
+    request<PushMute>("/api/push/mute", {
+      method: "POST",
+      body: JSON.stringify({ minutes }),
+    }),
+  unmutePush: () => request<PushMute>("/api/push/unmute", { method: "POST" }),
 };

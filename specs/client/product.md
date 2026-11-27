@@ -78,6 +78,10 @@ An installed client respects the device's safe areas and keeps the composer abov
 
 An installed client keeps its shell when the Space cannot be reached and offers to retry. The shell holds no copy of the record.
 
+An installed browser client can receive a system notification when a Bot finishes a run or waits for the User's Approval. Notifications are off until the User enables them on that device. On iPhone and iPad, Web Push requires the installed Home Screen app; the client shows that prerequisite instead of a permission prompt.
+
+A notification names the Bot, not the content of the work, and opens the Chat at the Bot's reply or the Approval Card. The User can mute the whole Space for one hour, or turn notifications off for that device. A mute silences every subscribed device.
+
 A new build of the client takes effect the next time the client opens.
 
 ## First run

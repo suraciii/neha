@@ -43,6 +43,8 @@ interface ChatViewProps {
   activity: RunActivity | null;
   // The approval the User asked to see, so the Chat scrolls to its card.
   focus: string | null;
+  // The Message a notification named, so the Chat scrolls to it.
+  focusMessage: string | null;
   onFocused: () => void;
   // The approval whose answer is on its way to the Space.
   deciding: string | null;
@@ -71,6 +73,15 @@ export default function ChatView(props: ChatViewProps) {
     },
   );
 
+  // An id comes from a URL, so compare it as a value instead of interpolating
+  // it into a selector.
+  function findAttribute(name: string, value: string): HTMLElement | undefined {
+    if (!stream) return undefined;
+    return Array.from(stream.querySelectorAll<HTMLElement>(`[${name}]`)).find(
+      (element) => element.getAttribute(name) === value,
+    );
+  }
+
   // An approval the attention list named is the one the User came to read, so
   // the Chat brings its card into view once the record has delivered it. The
   // cards arrive with the Chat's reads, so the ask also waits for their count.
@@ -78,11 +89,26 @@ export default function ChatView(props: ChatViewProps) {
     () => ({ approval: props.focus, count: props.approvals.length }),
     ({ approval }) => {
       if (!approval) return;
-      const card = stream?.querySelector<HTMLElement>(`[data-approval="${approval}"]`);
+      const card = findAttribute("data-approval", approval);
       if (!card) return;
       queueMicrotask(() => {
         if (typeof card.scrollIntoView !== "function") return;
         card.scrollIntoView({ block: "center" });
+        props.onFocused();
+      });
+    },
+  );
+
+  // A notification that named a Message opens the Chat at that Message.
+  createEffect(
+    () => ({ message: props.focusMessage, count: props.messages.length }),
+    ({ message }) => {
+      if (!message) return;
+      const row = findAttribute("data-message", message);
+      if (!row) return;
+      queueMicrotask(() => {
+        if (typeof row.scrollIntoView !== "function") return;
+        row.scrollIntoView({ block: "center" });
         props.onFocused();
       });
     },
@@ -252,7 +278,7 @@ export default function ChatView(props: ChatViewProps) {
                       <span>{dayLabel(message.at, locale())}</span>
                     </div>
                   </Show>
-                  <article class={`msg ${isBot() ? "msg--bot" : "msg--user"}`}>
+                  <article class={`msg ${isBot() ? "msg--bot" : "msg--user"}`} data-message={message.id}>
                     <Show when={isBot()}>
                       <Avatar name={props.bot?.name ?? "Bot"} small />
                     </Show>

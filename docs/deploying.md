@@ -104,7 +104,7 @@ The CLI signs in to the same origin, and its commands use `wss://`:
 neha login --name Ada --server https://neha.example.com
 ```
 
-Notifications are not in this milestone.
+Notifications are available in an installed client on the public HTTPS origin. On iPhone and iPad, install the client first: Web Push works only in a Home Screen app. The Space needs outbound HTTPS to reach the browser vendor's push service; it connects directly and does not use HTTP proxy environment variables. [Notifications](notifications.md) covers enabling, muting, and what the push service can see.
 
 ## Other ways to terminate TLS
 
@@ -117,7 +117,8 @@ Notifications are not in this milestone.
 - **Address.** One Space serves one public origin. `--domain` takes the host only, such as `neha.example.com` or `neha.example.com:8443`; `NEHA_PUBLIC_URL` takes the full `https://` origin. A scheme or path passed to `--domain` is refused.
 - **Health.** `GET /healthz` answers `ok` on the public origin.
 - **Upgrade.** Replace the binary and the built client, then restart the Space. Open clients load the new build on their next open.
-- **Backup.** Back up the Space's home directory, and keep the Vault's master key with it; [Storage](storage.md) covers the File store.
+- **Backup.** Back up the Space's home directory, and keep the Vault's master key with it; [Storage](storage.md) covers the File store. The same home holds sealed notification keys and device subscriptions, so a backup restores notifications too.
+- **Notifications.** The Space reaches each browser's push service directly over outbound HTTPS; it does not use HTTP proxy environment variables. A phone must install the client from the public origin; on iOS and iPadOS, Web Push works only from the Home Screen. See [Notifications](notifications.md).
 - **Logs.** Read the Space's output from the service manager, for example `journalctl -u neha`.
 
 ## Limits

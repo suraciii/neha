@@ -22,6 +22,7 @@ use crate::home::Home;
 
 const KEY_BYTES: usize = 32;
 const NONCE_BYTES: usize = 12;
+const VAPID_BYTES: usize = 32;
 
 /// The Space's sealed credentials.
 pub struct Secrets {
@@ -57,6 +58,33 @@ impl Secrets {
         let sealed = fs::read(self.directory.join(provider_file(provider)))?;
         let plain = self.open(&sealed)?;
         String::from_utf8(plain).map_err(|_| SecretsError::Corrupt)
+    }
+
+    /// Returns the VAPID signing key, creating it on first use.
+    ///
+    /// The key is sealed under the Space's master key. Rotating it silently
+    /// would invalidate every browser subscription, so a missing key is the
+    /// only case that writes a new one.
+    pub fn vapid_private_key(&self) -> Result<[u8; VAPID_BYTES], SecretsError> {
+        let path = self.directory.join("vapid.key");
+        if path.exists() {
+            let sealed = fs::read(&path)?;
+            let plain = self.open(&sealed)?;
+            return plain.try_into().map_err(|_| SecretsError::Corrupt);
+        }
+        let mut key = [0_u8; VAPID_BYTES];
+        loop {
+            rand::rng().fill_bytes(&mut key);
+            // A VAPID key is a P-256 scalar. Reject the vanishingly rare
+            // random value that is zero or above the curve order.
+            if p256::SecretKey::from_slice(&key).is_ok() {
+                break;
+            }
+        }
+        let sealed = self.seal(&key)?;
+        write_private(&path, &sealed)?;
+
+        Ok(key)
     }
 
     fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, SecretsError> {

@@ -289,8 +289,8 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Bot's Workspace as the only place where files persist; it has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
-- One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
-- The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, search, or notifications.
+- One human joins a Space. Group Chats, Boards, and search arrive in later milestones.
+- The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, or search. Notifications are available in an installed browser client on a public HTTPS origin; see [Notifications](notifications.md).
 - The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
 - A Bot on a Hosted Computer does not ask before an action yet, so its page offers no Ask or Allow rule to add or remove.
 - The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

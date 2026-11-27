@@ -12,6 +12,7 @@ pub mod config;
 pub mod home;
 pub mod identity;
 pub mod model;
+mod push;
 pub mod remote;
 pub mod runs;
 pub mod schema;
