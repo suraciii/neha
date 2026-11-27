@@ -1,11 +1,11 @@
 # Neha Desktop
 
-The local-first desktop shell. It starts the bundled Space, creates the first
-local Admin without showing the invitation form, starts the Local Computer, and
-loads the existing browser client. No separate server is installed or operated.
+The local-first desktop shell. It asks where the Space lives, starts a bundled
+Space only for the local choice, and then loads the existing browser client. The
+launcher and the Space share one UI build, one design system, and one sign-in.
 
-The shell currently uses the local `target/debug/neha` or an explicit `NEHA_BIN`;
-the packaged Windows build stages a release `neha.exe` under `resources`.
+The shell uses the local `target/debug/neha` or an explicit `NEHA_BIN`; the
+packaged Windows build stages a release `neha.exe` under `resources`.
 
 ## Run
 
@@ -16,8 +16,9 @@ pnpm install
 pnpm start
 ```
 
-The shell needs a built browser client at `ui/dist`. Build it with the repository
-UI command, or set `NEHA_UI_DIR` to an existing `ui/dist`.
+The shell needs a built browser client at `ui/dist` with both `index.html` and
+`desktop.html`. Build it with the repository UI command, or set `NEHA_UI_DIR`
+to an existing `ui/dist`.
 
 Environment:
 
@@ -25,28 +26,51 @@ Environment:
 - `NEHA_UI_DIR` — the built client directory.
 - `NEHA_HOME` — the Space data directory; defaults to `<userData>/space`.
 - `NEHA_DESKTOP_HOME` — the app's user-data directory, useful in tests.
-- `NEHA_DESKTOP_CAPTURE` — write a screenshot of the loaded client and quit.
+- `NEHA_DESKTOP_CAPTURE` — write a screenshot of the loaded page and quit.
 
-## First run and later runs
+## Choose a Space
 
-On a fresh Space the shell reads the one-time invitation, creates the first
-Admin with the local OS account name and a generated internal password, stores
-the password with Electron `safeStorage` (Windows DPAPI), restarts the Space so
-it writes its one-use Local Computer ticket, pairs this machine, starts the
-Local Computer daemon after the Windows warning, and loads the client.
+The first launch shows **Choose a Space**:
 
-On a Space that already has an account, the shell updates the saved Computer
-pairing to the new loopback port, starts the daemon, signs in, and loads the
-client. The invitation form is not shown in either path.
+- **This computer** starts a private bundled Space and opens its normal
+  first-run invitation; the User creates the first Admin and signs in there.
+- **Existing Space** takes an `https://` address (loopback `http://` is allowed
+  for development), checks it, and loads that Space's normal sign-in page.
 
-## Windows Local Computer
+The choice is saved in `desktop-space.json` under the app's user data. Later
+launches open that Space directly. A missing or expired session shows the
+Space's own sign-in page; the shell never signs in for the User. **Neha →
+Change Space…** (`Ctrl/Cmd+Shift+K`) clears the choice, stops the local Space,
+and returns to the chooser.
 
-The Windows runtime is a managed Bot folder: its file tools stay inside the
-folder, but its shell runs with the machine user's rights and has **no OS
-sandbox** in this slice. The first Windows start shows a warning and records the
-owner's consent; the bundled Space is started with
-`NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`. Approvals are the command boundary. Do not
-treat it as equivalent to the Linux bubblewrap fence yet.
+A remote Space never starts the bundled Space or the local Computer daemon.
+
+## Local Computer
+
+The **This computer** choice carries an explicit, unchecked Local Computer
+checkbox. The launcher text states that its commands run with the Windows
+account's rights, in the Bot's folder, with no other OS sandbox. Checking it is
+the owner's consent; the shell then starts the bundled Space with
+`NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`.
+
+The daemon starts only after the local Space has a signed-in session. The shell
+asks the Space for a one-use ticket with that session, pairs this machine, and
+waits for `Connected to` in the daemon's output. Chat remains available if the
+daemon cannot start. Without the checkbox, no Local Computer daemon runs.
+
+On Linux the managed folder and its shell fence still apply. On Windows the file
+tools stay in the folder but the shell runs with the machine user's rights.
+Approvals are the command boundary, not an OS fence. Do not treat Windows as
+equivalent to the Linux bubblewrap fence yet.
+
+## Older alpha data
+
+Older desktop alphas created an Admin with a generated password and signed in
+automatically. That account has no password its owner knows, so this build
+archives `<userData>/space`, `computer`, and `workspace` as
+`*.pre-login-<timestamp>`, removes `account.json`, and starts the new flow from
+the chooser. The backup stays on disk; the old account is not automatically
+signed in.
 
 ## Package for Windows
 
@@ -67,7 +91,8 @@ The script builds the release sidecar (`x86_64-pc-windows-gnu` on Linux,
 pnpm test
 ```
 
-The tests cover the startup-line parser, cookie parsing, display-name fallback,
-and generated passwords. Native Windows CI builds and installs the app and
-launches it against a real first-run Space; a GUI session on a developer machine
-is still needed to inspect the window.
+The unit tests cover startup-line parsing, Space-address validation, and the
+launcher's consent and remote choices. Native Windows CI installs the app,
+captures the chooser, opens the local invitation page, and opens a remote login
+page. Windows runtime tests cover the Local Computer fence. A GUI session on a
+developer machine is still the place to inspect the window chrome.

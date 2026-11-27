@@ -36,9 +36,14 @@
       {
         "from": "resources/ui",
         "to": "ui"
+      },
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
       }
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         "nsis"
       ]

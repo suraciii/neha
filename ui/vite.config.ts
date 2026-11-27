@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 import solid from "@solidjs/vite-plugin";
 
@@ -23,6 +24,12 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    rollupOptions: {
+      input: {
+        app: fileURLToPath(new URL("./index.html", import.meta.url)),
+        desktop: fileURLToPath(new URL("./desktop.html", import.meta.url)),
+      },
+    },
   },
   test: {
     environment: "jsdom",
