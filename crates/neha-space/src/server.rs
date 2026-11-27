@@ -18673,6 +18673,123 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_script_does_not_consume_consent_after_a_switch_to_instructions_only() {
+        let (directory, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+            ),
+            text("first done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+            ),
+            text("second done"),
+        ])
+        .await;
+        let (bot, chat, computer) = tool_bot(&mut socket, base.clone()).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            add_skill(
+                None,
+                "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+                &[("hello.sh", "printf 'ran' > marker.txt")],
+            ),
+        )
+        .await;
+        let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotSkillEnable { bot, skill },
+        )
+        .await;
+        let workspace = running
+            .server
+            .state
+            .lock()
+            .unwrap()
+            .computers
+            .get(&computer)
+            .map(|view| view.workspace.clone())
+            .unwrap();
+
+        let queued = submit(&mut socket, chat, "run it", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+
+        // The Admin turns scripts off while the card waits.
+        let root = running.server_home();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        std::fs::write(
+            root.join("config.toml"),
+            "[skills]\ninstructions_only = true\n",
+        )
+        .unwrap();
+        let second = start(test_home(&root), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut second_socket = open_socket(&second, &token).await;
+        decide_approval(&mut second_socket, approval, true, false).await;
+        assert_eq!(
+            wait_run(&mut second_socket, run).await["status"],
+            "succeeded",
+            "the run ends rather than waiting forever"
+        );
+        assert!(
+            !std::path::Path::new(&workspace).join("marker.txt").exists(),
+            "an answer given before the switch never reaches a script"
+        );
+        // The withheld call recorded no identity, so the answer consumed no
+        // first run.
+        let actions = started_actions(&second, run).await;
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0].data["skill"], json!(null));
+        assert_eq!(actions[0].data["tool"], "run_skill_script");
+
+        // Turning scripts back on asks again for the still-unrun script.
+        second_socket.close(None).await.unwrap();
+        second.shutdown().await;
+        std::fs::write(
+            root.join("config.toml"),
+            "[skills]\ninstructions_only = false\n",
+        )
+        .unwrap();
+        let third = start(test_home(&root), 0).await.unwrap();
+        let token = sign_in(&third, "Ada").await;
+        let mut third_socket = open_socket(&third, &token).await;
+        let queued = submit(&mut third_socket, chat, "run it again", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut third_socket, run, "waiting").await;
+        let approvals = approvals_in(&mut third_socket, Some(chat)).await;
+        assert_eq!(
+            approvals.last().unwrap()["reason"],
+            "first_script_run",
+            "the withheld answer consumed no consent: {approvals:?}"
+        );
+        let approval: Id =
+            serde_json::from_value(approvals.last().unwrap()["approval"].clone()).unwrap();
+        decide_approval(&mut third_socket, approval, true, true).await;
+        assert_eq!(
+            wait_run(&mut third_socket, run).await["status"],
+            "succeeded"
+        );
+        assert_eq!(
+            std::fs::read_to_string(std::path::Path::new(&workspace).join("marker.txt")).unwrap(),
+            "ran"
+        );
+        let _ = directory;
+        third_socket.close(None).await.unwrap();
+        provider_task.abort();
+        third.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_bot_enables_one_skill_under_each_name() {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;

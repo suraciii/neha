@@ -355,7 +355,7 @@ where
                     ..
                 } = resume;
                 continuation = step_continuation.or(continuation);
-                let calls = resumed_calls(calls)?;
+                let calls = resumed_calls(calls, &tools)?;
                 // The results of the done calls end the history, and the
                 // reply's calls come before them.
                 let at = messages.len() - done.min(messages.len() - 1);
@@ -438,7 +438,17 @@ where
                 let mut script = None;
                 let mut refused = None;
                 if approved_here {
-                    script = recorder.authorized_action(action, &call.recorded).await?;
+                    // The answer is a decision about this call; a tool the run
+                    // no longer offers cannot run under it, and recording a
+                    // refused call credits no first run.
+                    if tools.iter().any(|tool| tool.name == call.recorded.tool) {
+                        script = recorder.authorized_action(action, &call.recorded).await?;
+                    } else {
+                        refused = Some(format!(
+                            "the tool {:?} is not offered to this run",
+                            call.recorded.tool
+                        ));
+                    }
                 } else if call.parsed.is_ok() {
                     match recorder.approve(step, &call.recorded, action).await? {
                         Authorization::Wait { .. } => {
@@ -557,7 +567,10 @@ fn step_calls(
 }
 
 /// The recorded calls of a resumed step as the step runs them.
-fn resumed_calls(calls: Vec<RecordedCall>) -> Result<Vec<StepCall>, LoopError> {
+fn resumed_calls(
+    calls: Vec<RecordedCall>,
+    offered: &[ToolSpec],
+) -> Result<Vec<StepCall>, LoopError> {
     let calls: Vec<StepCall> = calls
         .into_iter()
         .map(|recorded| {
@@ -566,6 +579,12 @@ fn resumed_calls(calls: Vec<RecordedCall>) -> Result<Vec<StepCall>, LoopError> {
             // parsing them again could let the call run.
             let parsed = match &recorded.refused {
                 Some(refusal) => Err(refusal.clone()),
+                // A tool the run offers no longer cannot run, whatever the
+                // record of the reply says: the Space's decision now wins.
+                None if !offered.iter().any(|tool| tool.name == recorded.tool) => Err(format!(
+                    "the tool {:?} is not offered to this run",
+                    recorded.tool
+                )),
                 None => tools::parse(&recorded.tool, &recorded.arguments.to_string()),
             };
             StepCall { parsed, recorded }

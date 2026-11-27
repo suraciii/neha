@@ -66,7 +66,7 @@ The first run of one skill's script asks for approval, once for each Bot, acting
 
 An Ask rule for that skill and script makes every run ask. Always allow on that card answers it and removes the Ask rule it covers. [Approvals](approvals.md#lasting-rules) covers the rule commands.
 
-A script runs under the same fence, time limit, and output limit as a shell command, and `write_file` rules do not cover it. A script that the Bot does not have never runs: the action fails without asking. A script never runs on a Windows Computer yet: the action fails and the card offers no way to run it.
+A script runs under the same fence, time limit, and output limit as a shell command, and `write_file` rules do not cover it. The Computer runs the script's exact bytes: a Hosted Computer and a Local Computer without full access run a read-only copy inside the sandbox, and no other run can name or change what executes. A Local Computer with full access has no sandbox, so it runs a private temporary file that is removed when the action ends; a process running with the same machine user's rights could still change that file, which is inside the rights the owner granted with full access. A script that the Bot does not have never runs: the action fails without asking. A script never runs on a Windows Computer yet: the action fails and the card offers no way to run it.
 
 The body says which script to run and what to pass. The Bot names the script by its file name inside `scripts/`.
 

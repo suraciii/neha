@@ -1927,22 +1927,16 @@ fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddS
     ))
 }
 
-/// The portable fallback for a platform with no directory descriptor to read
-/// through. It checks a pathname and later reopens it, so a replacement between
-/// the check and the read is not visible to this path; the Unix path above is
-/// the one that checks and reads the same opened object.
+/// A platform with no directory descriptor to read through refuses the
+/// import instead of checking a pathname and later reopening it.
+///
+/// The Unix path above opens the directory once and reads every member through
+/// its descriptor, so the metadata that authorizes a read and the bytes read
+/// are the same object. This build has no such handle elsewhere, so it fails
+/// closed rather than upload whatever a racing writer put at the path.
 #[cfg(not(unix))]
-fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
-    let Some(metadata) = own_metadata(path)? else {
-        bail!("{} is not a directory", path.display());
-    };
-    if metadata.file_type().is_symlink() {
-        bail!("{} is a symlink, which is not followed", path.display());
-    }
-    if !metadata.file_type().is_dir() {
-        bail!("{} is not a directory", path.display());
-    }
-    Ok((read_skill_document(path)?, read_skill_scripts(path)?))
+fn read_skill_directory(_path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
+    bail!("adding a skill from a directory needs a Unix platform yet")
 }
 
 /// The path of an opened descriptor. It names the object the descriptor holds,
@@ -2203,103 +2197,6 @@ fn read_within_limit(file: &mut std::fs::File, limit: u64) -> std::io::Result<Op
     let mut bounded = std::io::Read::take(file, limit + 1);
     bounded.read_to_end(&mut bytes)?;
     Ok((bytes.len() as u64 <= limit).then_some(bytes))
-}
-
-/// The metadata of `path` itself, never of what a final symlink points at.
-/// `None` means nothing is there.
-#[cfg(not(unix))]
-fn own_metadata(path: &std::path::Path) -> Result<Option<std::fs::Metadata>> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("{} cannot be read", path.display())),
-    }
-}
-
-/// Reads the skill's `SKILL.md` on a platform with no `/proc/self/fd`: one
-/// regular file, bounded before it is read by the path's own size.
-#[cfg(not(unix))]
-fn read_skill_document(path: &std::path::Path) -> Result<String> {
-    let document = path.join("SKILL.md");
-    let Some(metadata) = own_metadata(&document)? else {
-        bail!("{} has no SKILL.md", path.display());
-    };
-    if metadata.file_type().is_symlink() {
-        bail!("{} is a symlink, which is not followed", document.display());
-    }
-    if !metadata.file_type().is_file() {
-        bail!("{} is not a regular file", document.display());
-    }
-    if metadata.len() > MAX_SKILL_DOCUMENT_BYTES {
-        bail!(
-            "{} is {} bytes; a skill document is at most {MAX_SKILL_DOCUMENT_BYTES} bytes",
-            document.display(),
-            metadata.len()
-        );
-    }
-    std::fs::read_to_string(&document)
-        .with_context(|| format!("{} has no SKILL.md", path.display()))
-}
-
-/// Reads every file directly in the skill's `scripts/` folder on a platform
-/// with no `/proc/self/fd`. A `scripts/` that is absent, or is not a directory,
-/// carries no scripts, as this fallback has always behaved.
-#[cfg(not(unix))]
-fn read_skill_scripts(path: &std::path::Path) -> Result<Vec<SkillAddScript>> {
-    let mut scripts = Vec::new();
-    let scripts_dir = path.join("scripts");
-    let Some(metadata) = own_metadata(&scripts_dir)? else {
-        return Ok(scripts);
-    };
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "{} is a symlink, which is not followed",
-            scripts_dir.display()
-        );
-    }
-    if !metadata.file_type().is_dir() {
-        return Ok(scripts);
-    }
-    let mut found: Vec<(std::path::PathBuf, u64)> = Vec::new();
-    for entry in std::fs::read_dir(&scripts_dir)? {
-        let entry = entry?;
-        let script = entry.path();
-        let Some(metadata) = own_metadata(&script)? else {
-            continue;
-        };
-        if metadata.file_type().is_symlink() {
-            bail!("{} is a symlink, which is not followed", script.display());
-        }
-        // A folder in `scripts/` is not a script, as it has never been one.
-        if metadata.file_type().is_dir() {
-            continue;
-        }
-        if !metadata.file_type().is_file() {
-            bail!("{} is not a regular file", script.display());
-        }
-        found.push((script, metadata.len()));
-    }
-    if found.len() > MAX_SKILL_SCRIPTS {
-        bail!("a skill carries at most {MAX_SKILL_SCRIPTS} scripts");
-    }
-    found.sort_by(|left, right| left.0.cmp(&right.0));
-    for (script, size) in found {
-        if size > MAX_SKILL_SCRIPT_BYTES {
-            bail!(
-                "{} is {size} bytes; a script is at most {MAX_SKILL_SCRIPT_BYTES} bytes",
-                script.display()
-            );
-        }
-        let name = script
-            .file_name()
-            .and_then(|name| name.to_str())
-            .context("a script name is not text")?
-            .to_owned();
-        let content = std::fs::read_to_string(&script)
-            .with_context(|| format!("{} is not readable text", script.display()))?;
-        scripts.push(SkillAddScript { name, content });
-    }
-    Ok(scripts)
 }
 
 /// One row per skill: skill, library, name, and what it does.

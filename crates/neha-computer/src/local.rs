@@ -1176,11 +1176,13 @@ impl LocalRuntime {
     /// through the shell a command gets, so the sandbox, the write fence, the
     /// output limits, and the time limit apply exactly as they do to a
     /// command. A fenced runtime hands bubblewrap an anonymous descriptor
-    /// holding the bytes and runs the sandbox's own copy of it; a runtime with
-    /// no sandbox runs a private file outside the Workspace. No file a Bot or
-    /// another run can write holds the script. A script that this platform's
-    /// shell cannot run as written ends as its own failed command; nothing
-    /// else is tried instead.
+    /// holding the bytes and runs the sandbox's own read-only copy of it, so
+    /// no other run can name or change what executes. A runtime with no
+    /// sandbox runs a private file outside the Workspace, removed when the
+    /// action ends; that path has no immutable object to offer, so a process
+    /// with the machine user's own rights could still change the file. A
+    /// script that this platform's shell cannot run as written ends as its own
+    /// failed command; nothing else is tried instead.
     async fn run_script(&self, name: &str, content: &str, arguments: &[String]) -> ActionResult {
         if let Err(message) = check_script_name(name) {
             return ActionResult::failed(message);
@@ -1290,8 +1292,11 @@ impl LocalRuntime {
     /// A managed workspace and the full-access model have no bubblewrap to
     /// seal the bytes with. The script goes to a private file in the system
     /// temporary directory, mode 0500, which the run removes; it is never
-    /// written inside the Workspace, so a Workspace writer cannot name it even
-    /// though this path has no immutable object to offer.
+    /// written inside the Workspace, so a Workspace writer cannot name it.
+    /// This path has no immutable object to offer: the file lives under the
+    /// same machine user, so a process with that user's rights could change it
+    /// before the shell opens it. Full access is the owner's explicit grant of
+    /// those rights to the Bot's shell, and this limit stays inside it.
     #[cfg(unix)]
     async fn run_private_script(
         &self,
