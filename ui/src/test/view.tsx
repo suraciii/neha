@@ -6,7 +6,7 @@ import { afterEach, beforeAll, beforeEach, expect, vi } from "vitest";
 import App from "../App";
 import { setLocale } from "../i18n";
 import { api } from "../lib/api";
-import type { Account } from "../types";
+import type { Account, Author } from "../types";
 import { space } from "./fakeSpace";
 
 export type View = ReturnType<typeof render>;
@@ -34,15 +34,16 @@ export async function openChat(): Promise<View> {
   return view;
 }
 
-// One event the page follows from the record.
-export function record(kind: string, data: Record<string, unknown>) {
+// One event the page follows from the record. A test can name who wrote it,
+// which is how a File event says whose File it is.
+export function record(kind: string, data: Record<string, unknown>, author?: Author) {
   space.seq += 1;
   space.handlers?.onEvent?.({
     seq: String(space.seq),
     kind,
     version: 1,
     at: "2026-01-01T00:00:00.000Z",
-    author: { kind: "bot", id: "b1" },
+    author: author ?? { kind: "bot", id: "b1" },
     acting: "u1",
     data,
   });

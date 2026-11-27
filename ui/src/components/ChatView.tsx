@@ -42,6 +42,9 @@ interface ChatViewProps {
   failed: boolean;
   // The followed Run's tool activity, while it has any.
   activity: RunActivity | null;
+  // The approval the User asked to see, so the Chat scrolls to its card.
+  focus: string | null;
+  onFocused: () => void;
   // The approval whose answer is on its way to the Space.
   deciding: string | null;
   error: string | null;
@@ -65,6 +68,23 @@ export default function ChatView(props: ChatViewProps) {
     () => {
       queueMicrotask(() => {
         if (stream) stream.scrollTop = stream.scrollHeight;
+      });
+    },
+  );
+
+  // An approval the attention list named is the one the User came to read, so
+  // the Chat brings its card into view once the record has delivered it. The
+  // cards arrive with the Chat's reads, so the ask also waits for their count.
+  createEffect(
+    () => ({ approval: props.focus, count: props.approvals.length }),
+    ({ approval }) => {
+      if (!approval) return;
+      const card = stream?.querySelector<HTMLElement>(`[data-approval="${approval}"]`);
+      if (!card) return;
+      queueMicrotask(() => {
+        if (typeof card.scrollIntoView !== "function") return;
+        card.scrollIntoView({ block: "center" });
+        props.onFocused();
       });
     },
   );

@@ -10,7 +10,8 @@ interface ActivityCardProps {
   botName: string;
   // The Chat's Files, so a produced File can name itself.
   files: Record<string, FileSummary>;
-  // The Run failed; the card folds to one line and keeps the reason behind it.
+  // The Run failed; the card opens itself, because the reason is why it failed
+  // and the User must not have to go looking for it.
   failed: boolean;
 }
 
@@ -33,15 +34,15 @@ function toolsOf(actions: ToolAction[]): string {
 
 // What the followed Run is doing: one quiet summary the User can open. It never
 // shows a tool's arguments; it names the steps, the tools, how each action
-// ended, and the Files the Run produced.
+// ended, and the Files the Run produced. It starts folded, so the stream stays
+// calm while the Run works, and a failed Run opens itself to show its reason.
 export default function ActivityCard(props: ActivityCardProps) {
-  const [opened, setOpened] = createSignal(true);
-  // A failed Run folds to one line, so the stream stays calm; the reason waits
-  // behind the fold.
+  const [opened, setOpened] = createSignal(false);
+  // A failed Run opens itself: its reason is what the User came to read.
   createEffect(
     () => props.failed,
     (failed) => {
-      if (failed) setOpened(false);
+      if (failed) setOpened(true);
     },
   );
 

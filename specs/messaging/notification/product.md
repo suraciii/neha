@@ -24,11 +24,13 @@ A Bot's progress never starts a Notification.
 
 ## Needs attention
 
-A User sees a Needs attention view: the Questions and Approvals waiting on them. A failed run and an offline Computer wait for no answer, so the view holds neither.
+A User sees a Needs attention view: the Approvals waiting on them. A failed run and an offline Computer wait for no answer, so the view holds neither.
+
+The view lists one entry for each waiting Approval, named by its id, and not one entry for a Chat.
 
 The view lists only what the User can read.
 
-Opening an item opens its source Message in its Chat or Group.
+Opening an item opens its source Message, the Card that asked, in its Chat or Group. An item leaves the view when the User answers it.
 
 The view is a projection of the record, not a second stream of Messages.
 
@@ -58,3 +60,7 @@ A User can mute the whole Space for a time.
 A Notification arrives as a system notification on the User's desktop and phone, and as a badge on the Chat's or Group's row.
 
 Opening a Notification opens the Chat or Group at the Message that started it.
+
+## Gaps
+
+- A Question has no record event yet; the Needs attention view lists Approvals until the record holds one.

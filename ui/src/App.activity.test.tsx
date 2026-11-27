@@ -1,5 +1,5 @@
 // What the Chat shows while a Run works: one quiet summary of its steps, the
-// tools it used, how each action ended, and the Files it produced.
+// tools it used, how each action ended, and the Files the Run produced.
 import { fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
@@ -56,6 +56,12 @@ function stepRows(view: View): string[] {
   return Array.from(view.container.querySelectorAll(".activity__step")).map((row) => row.textContent ?? "");
 }
 
+// The card starts folded, so a test that reads its steps opens it first.
+function openCard(view: View) {
+  const head = element<HTMLButtonElement>(view, ".activity__head");
+  if (head.getAttribute("aria-expanded") !== "true") flush(() => fireEvent.click(head));
+}
+
 describe("App run activity", () => {
   it("names the steps and tools of the Run the page follows", async () => {
     workingChat();
@@ -73,8 +79,12 @@ describe("App run activity", () => {
       arguments: { command: "printf hi > a.txt" },
     });
     await waitFor(() => expect(cardText(view)).toContain("shell"));
+    // The card stays folded, and its one line names the work.
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("false");
     expect(cardText(view)).toContain("Working");
     expect(cardText(view)).toContain("Step 1");
+    expect(cardText(view)).toContain("shell");
+    openCard(view);
     expect(stepRows(view)).toEqual(["Step 1shellRunning"]);
 
     // The action ends, and the card says how.
@@ -110,7 +120,7 @@ describe("App run activity", () => {
     expect(cardText(view)).not.toContain("notes/a.txt");
   });
 
-  it("folds to one line and opens again on request", async () => {
+  it("starts folded and opens on request", async () => {
     workingChat();
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
@@ -118,19 +128,22 @@ describe("App run activity", () => {
     record("neha.action.started", { run: "r1", step: 1, action: "act1", tool: "shell", arguments: { command: "printf hi" } });
     await waitFor(() => expect(cardText(view)).toContain("shell"));
     const head = element<HTMLButtonElement>(view, ".activity__head");
-    expect(head.getAttribute("aria-expanded")).toBe("true");
-    expect(view.container.querySelector(".activity__steps")).toBeTruthy();
 
-    // Folding keeps one line: what the Run is doing, and the tools it used.
-    flush(() => fireEvent.click(head));
+    // The stream stays calm: one line, with the state, the step, and the tools.
     expect(head.getAttribute("aria-expanded")).toBe("false");
     expect(view.container.querySelector(".activity__steps")).toBeNull();
     expect(cardText(view)).toContain("Working");
+    expect(cardText(view)).toContain("Step 1");
     expect(cardText(view)).toContain("shell");
 
     flush(() => fireEvent.click(head));
     expect(head.getAttribute("aria-expanded")).toBe("true");
     expect(view.container.querySelector(".activity__steps")).toBeTruthy();
+    expect(stepRows(view)).toEqual(["Step 1shellRunning"]);
+
+    flush(() => fireEvent.click(head));
+    expect(head.getAttribute("aria-expanded")).toBe("false");
+    expect(view.container.querySelector(".activity__steps")).toBeNull();
   });
 
   it("names the Files the Run produced", async () => {
@@ -152,12 +165,14 @@ describe("App run activity", () => {
 
     record("neha.file.added", { chat: "h1", file: "f1", name: "report.pdf", media_type: "application/pdf", size: 2048, sha256: "ab".repeat(32) });
     // The File names itself once the Chat reads the record again.
+    await waitFor(() => expect(view.container.querySelector(".activity__tools")).toBeTruthy());
+    openCard(view);
     await waitFor(() => expect(view.container.querySelector(".activity .file-card")).toBeTruthy());
     expect(element(view, ".activity .file-card").textContent).toContain("report.pdf");
     expect(element(view, ".activity .file-card").getAttribute("href")).toBe("/api/files/f1");
   });
 
-  it("keeps one line with the reason when the Run fails", async () => {
+  it("opens itself with the reason when the Run fails", async () => {
     workingChat();
     const view = await openChat();
     record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
@@ -172,20 +187,25 @@ describe("App run activity", () => {
       output: null,
       error: "the shell is not reachable",
     });
-    await waitFor(() => expect(stepRows(view)).toEqual(["Step 1shellFailed"]));
+    await waitFor(() => expect(cardText(view)).toContain("shell"));
+    openCard(view);
+    expect(stepRows(view)).toEqual(["Step 1shellFailed"]);
 
-    // The Run fails: the card folds to one line and keeps the reason behind it.
+    // The Run fails: the card opens itself, because the reason is why it failed.
     failRun("r1", { id: "m2", text: "I could not finish this." }, "the shell is not reachable");
     await waitFor(() => expect(cardText(view)).toContain("Failed"));
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("true");
+    expect(element(view, ".activity__reason").textContent).toContain("the shell is not reachable");
     // The Chat reads the record again, and the Bot's failure Message is in the
     // stream, in its place.
     await waitFor(() => expect(view.container.querySelectorAll(".msg__text")).toHaveLength(2));
-    expect(view.container.querySelector(".activity__steps")).toBeNull();
-    expect(cardText(view)).not.toContain("the shell is not reachable");
-    flush(() => fireEvent.click(element(view, ".activity__head")));
-    expect(element(view, ".activity__reason").textContent).toContain("the shell is not reachable");
     const texts = Array.from(view.container.querySelectorAll(".msg__text")).map((node) => node.textContent ?? "");
     expect(texts).toEqual(["please work", "I could not finish this."]);
+
+    // The User can fold it away again.
+    flush(() => fireEvent.click(element(view, ".activity__head")));
+    expect(element<HTMLButtonElement>(view, ".activity__head").getAttribute("aria-expanded")).toBe("false");
+    expect(view.container.querySelector(".activity__reason")).toBeNull();
   });
 
   it("marks the Chat header failed and closes the composer", async () => {
@@ -213,6 +233,7 @@ describe("App run activity", () => {
     flush(() => fireEvent.click(element(view, ".locale-switch--foot")));
     expect(cardText(view)).toContain("正在处理");
     expect(cardText(view)).toContain("第 1 步");
+    openCard(view);
     expect(stepRows(view)).toEqual(["第 1 步shell进行中"]);
 
     record("neha.action.finished", {
@@ -225,5 +246,67 @@ describe("App run activity", () => {
       error: null,
     });
     await waitFor(() => expect(stepRows(view)).toEqual(["第 1 步shell成功"]));
+  });
+
+  it("shows the steps a Run recorded once its Chat reopens", async () => {
+    workingChat();
+    space.runs["r1"] = {
+      status: "running",
+      steps: [{ index: 1, tool_calls: 1 }, { index: 2, tool_calls: 1 }],
+      actions: [
+        { id: "act1", step: 1, tool: "shell", status: "succeeded" },
+        { id: "act2", step: 2, tool: "read_file", status: "succeeded" },
+      ],
+    };
+    space.messages.push({
+      id: "m2",
+      chat: "h1",
+      author: { kind: "bot", id: "b1" },
+      acting: "u1",
+      text: "the report is ready",
+      at: "2026-01-01T00:00:03.000Z",
+      seq: "2",
+      run: "r1",
+      file: null,
+    });
+    // The Space says the Chat works on r1, so opening it follows that Run.
+    space.statuses["h1"] = "working";
+    space.activeRuns["h1"] = "r1";
+    const view = await openChat();
+    await waitFor(() => expect(space.runShows).toContain("r1"));
+
+    openCard(view);
+    expect(stepRows(view)).toEqual(["Step 1shellSucceeded", "Step 2read_fileSucceeded"]);
+    expect(cardText(view)).toContain("Step 2");
+    // The Run's reply is in the stream beside the card.
+    const texts = Array.from(view.container.querySelectorAll(".msg__text")).map((node) => node.textContent ?? "");
+    expect(texts).toContain("the report is ready");
+  });
+
+  it("leaves a File the User uploaded out of the Run's work", async () => {
+    workingChat();
+    space.files.push({
+      id: "f9",
+      chat: "h1",
+      name: "notes.txt",
+      media_type: "text/plain",
+      size: 12,
+      sha256: "cd".repeat(32),
+      author: { kind: "user", id: "u1" },
+      at: "2026-01-01T00:00:02.000Z",
+      seq: "4",
+    });
+    const view = await openChat();
+    record("neha.run.started", { chat: "h1", run: "r1", bot: "b1", command: "c1", message: "m1" });
+    await waitFor(() => expect(view.container.querySelector(".activity")).toBeTruthy());
+
+    // Another client's User uploaded the File: it is theirs, not the Run's work.
+    record("neha.file.added", { chat: "h1", file: "f9", name: "notes.txt", media_type: "text/plain", size: 12, sha256: "cd".repeat(32) }, {
+      kind: "user",
+      id: "u2",
+    });
+    openCard(view);
+    expect(view.container.querySelector(".activity .file-card")).toBeNull();
+    expect(cardText(view)).not.toContain("notes.txt");
   });
 });

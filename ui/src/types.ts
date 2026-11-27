@@ -50,12 +50,14 @@ export interface Chat {
   active_run?: string | null;
 }
 
-// One Chat that waits for the User, as the attention section names it.
+// One approval the User has not answered yet, as the attention list names it.
+// Each pending approval is its own entry: a Chat with two of them lists two.
 export interface AttentionEntry {
+  approval: Approval;
   chat: Chat;
   botName: string;
-  // What the Chat waits for, when the record named it.
-  detail: string | null;
+  // What the approval asks for, in the record's words.
+  detail: string;
 }
 
 export interface Author {
@@ -132,6 +134,30 @@ export interface RunView {
   reply: string | null;
   error: string | null;
   usage: unknown;
+  // The steps the run recorded, in order, so a reopened Chat shows what the
+  // run already did.
+  steps?: RunStepView[];
+  // The actions the run recorded, in order.
+  actions?: RunActionView[];
+}
+
+// One step of a run, as the Space answers run_show.
+export interface RunStepView {
+  // The step number, starting at one.
+  index: number;
+  // How many tool calls the step asked for.
+  tool_calls: number;
+}
+
+// One action of a run, as the Space answers run_show.
+export interface RunActionView {
+  id: string;
+  step: number;
+  tool: string;
+  // How the action ended.
+  status: "succeeded" | "failed" | "timed_out" | "unknown";
+  // The failure, when it failed.
+  error?: string | null;
 }
 
 // Why a Bot asked before an action: the first use of the User's own Computer,

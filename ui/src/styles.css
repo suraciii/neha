@@ -550,6 +550,7 @@ code,
   height: 38px;
   display: grid;
   place-items: center;
+  position: relative;
   border-radius: 10px;
   color: var(--ink-3);
 }
@@ -561,6 +562,22 @@ code,
 .rail__item.is-active {
   background: var(--ink);
   color: var(--bg);
+}
+
+/* How many approvals wait, on the rail's own attention entry. */
+.rail__count {
+  position: absolute;
+  top: 1px;
+  right: 0;
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--attention);
+  color: var(--attention-ink);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
 }
 
 .rail__spacer {
@@ -623,6 +640,11 @@ code,
   border: 1px solid var(--attention-line);
   border-radius: var(--r-md);
   background: var(--attention-soft);
+  /* A long wait must not push the Chats out of reach, so the block scrolls
+     inside a bounded height instead of growing with the record. */
+  max-height: 42vh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .attention__head {

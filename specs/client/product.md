@@ -28,14 +28,12 @@ A client without a valid session shows the sign-in page. A client with a valid s
 
 The client has one primary navigation rail, one sidebar, and one main area.
 
-The rail selects what the client shows.
+The rail selects what the client shows. It has Chats and Needs attention.
 
 | Entry | What it opens |
 | --- | --- |
 | Chats | The sidebar lists the User's Chats in record order |
 | Needs attention | The sidebar lists the items that wait for the User's answer |
-| Bots | The Bot pages |
-| Settings | The Space's Providers, Models, and catalog |
 
 With Chats selected, the main area shows the selected Chat. On a viewport 900 CSS pixels or narrower, the client shows the Chat list until a User opens a Chat, then shows that Chat alone with a Back action.
 
@@ -78,7 +76,9 @@ A failed Run leaves a Bot Message that states the failure. The Chat keeps the Me
 
 ## Tool activity
 
-While a Run works, each action the Bot takes appears in the Chat as a card when the action completes. A collapsed card names the tool and says what it did, and it never shows the action's raw arguments.
+While a Run works, the Chat shows one collapsible activity card for that Run. The card starts collapsed, and its title row names the state, the step, and the tools in use.
+
+An action appears when it starts and updates with its result when it completes. A failed Run expands the card and shows its reason, and the card never shows an action's raw arguments.
 
 ## Needs attention
 
@@ -105,3 +105,7 @@ Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provi
 Every page distinguishes loading, empty, ready, and failed. An error states what failed and what the User can do next.
 
 A failed command keeps the record the client already shows. The client retries nothing on its own.
+
+## Gaps
+
+- The rail has no Bots or Settings entry; both arrive with the management surfaces they open.

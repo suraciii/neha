@@ -32,8 +32,9 @@ describe("i18n", () => {
 
   it("names what a Chat waits for, in the reader's language", () => {
     expect(t("attention.title")).toBe("Needs attention");
-    expect(t("attention.count.one")).toBe("1 Chat waiting");
-    expect(t("attention.count.many", { count: 2 })).toBe("2 Chats waiting");
+    expect(t("attention.count.one")).toBe("1 approval waiting");
+    expect(t("attention.count.many", { count: 2 })).toBe("2 approvals waiting");
+    expect(t("attention.empty.title")).toBe("Nothing waits");
     expect(t("chat.newActivity")).toBe("New activity");
     expect(t("chat.failed")).toBe("Failed");
     expect(t("chat.activity.step", { count: 2 })).toBe("Step 2");
@@ -41,8 +42,9 @@ describe("i18n", () => {
     expect(t("chat.activity.unknown")).toBe("Unknown");
     flush(() => setLocale("zh-CN"));
     expect(t("attention.title")).toBe("在等你");
-    expect(t("attention.count.one")).toBe("1 个 Chat 在等你");
-    expect(t("attention.count.many", { count: 2 })).toBe("2 个 Chat 在等你");
+    expect(t("attention.count.one")).toBe("1 个审批在等你");
+    expect(t("attention.count.many", { count: 2 })).toBe("2 个审批在等你");
+    expect(t("attention.empty.title")).toBe("没有在等的事");
     expect(t("chat.newActivity")).toBe("有新活动");
     expect(t("chat.failed")).toBe("已失败");
     expect(t("chat.activity.step", { count: 2 })).toBe("第 2 步");

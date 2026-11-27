@@ -4,7 +4,7 @@
 //! events, then apply the same events to keep the projection current.
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
 
 use base64::Engine as _;
@@ -179,6 +179,49 @@ pub struct ChatView {
     /// An idle or failed Chat follows no run.
     #[serde(default)]
     pub active_run: Option<Id>,
+}
+
+/// The runs one Chat follows, for the state the projection shows.
+///
+/// The index holds what the state needs and nothing per run that ended: the
+/// oldest run waiting for an approval, the oldest queued or working run, and
+/// whether the last run event that ended a run ended it in failure. A Space
+/// with a long record therefore keeps one index entry per Chat, not one per
+/// run, and projecting an event reads no earlier run.
+#[derive(Debug, Default)]
+struct ChatRuns {
+    /// The runs that wait for an approval, oldest first.
+    waiting: BTreeSet<(Seq, Id)>,
+    /// The runs that are queued or working, oldest first.
+    working: BTreeSet<(Seq, Id)>,
+    /// Whether the latest event that ended a run in this Chat failed it.
+    ///
+    /// The flag follows the record's order, not a run's place in the queue:
+    /// a later success does not hide an earlier failure and a newer failure
+    /// outlives an older success until the next run begins.
+    failed: bool,
+}
+
+impl ChatRuns {
+    /// Follows a run at its current state.
+    fn follow(&mut self, run: Id, seq: Seq, status: RunStatus) {
+        let entry = (seq, run);
+        match status {
+            RunStatus::Waiting => {
+                self.working.remove(&entry);
+                self.waiting.insert(entry);
+            }
+            RunStatus::Queued | RunStatus::Running => {
+                self.waiting.remove(&entry);
+                self.working.insert(entry);
+            }
+            RunStatus::Succeeded | RunStatus::Failed => {
+                self.waiting.remove(&entry);
+                self.working.remove(&entry);
+                self.failed = status == RunStatus::Failed;
+            }
+        }
+    }
 }
 
 /// A Message.
@@ -448,6 +491,9 @@ pub struct State {
     pub computer_order: Vec<Id>,
     /// The Chats, by identifier.
     pub chats: HashMap<Id, ChatView>,
+    /// The runs each Chat follows, so its state is projected from an index
+    /// instead of a scan of the record's runs.
+    chat_runs: HashMap<Id, ChatRuns>,
     /// The Messages, in cursor order.
     pub messages: Vec<MessageView>,
     /// The Files, in cursor order.
@@ -673,42 +719,59 @@ impl State {
         runs
     }
 
-    /// Projects a Chat's live state from its runs.
+    /// Shows the state a Chat's runs project.
     ///
-    /// The record's order decides: the oldest run waiting for an approval wins,
-    /// then the oldest run queued or working, then its latest run's failure.
-    /// Every other Chat is idle.
-    fn project_chat_status(&mut self, chat: Id) {
-        let mut waiting: Option<&RunView> = None;
-        let mut working: Option<&RunView> = None;
-        let mut latest: Option<&RunView> = None;
-        for run in self.runs.values().filter(|run| run.chat == chat) {
-            if run.status == RunStatus::Waiting && waiting.is_none_or(|older| run.seq < older.seq) {
-                waiting = Some(run);
+    /// The oldest waiting run wins, then the oldest queued or working one.
+    /// With neither, the latest event that ended a run decides: a failed run
+    /// leaves the Chat failed until the next run begins, and any other end
+    /// leaves it idle.
+    fn project_chat_view(&mut self, chat: Id) {
+        let (status, active_run) = match self.chat_runs.get(&chat) {
+            Some(runs) => {
+                if let Some((_, run)) = runs.waiting.first() {
+                    (ChatStatus::Waiting, Some(*run))
+                } else if let Some((_, run)) = runs.working.first() {
+                    (ChatStatus::Working, Some(*run))
+                } else if runs.failed {
+                    (ChatStatus::Failed, None)
+                } else {
+                    (ChatStatus::Idle, None)
+                }
             }
-            if matches!(run.status, RunStatus::Queued | RunStatus::Running)
-                && working.is_none_or(|older| run.seq < older.seq)
-            {
-                working = Some(run);
-            }
-            if latest.is_none_or(|older| older.seq < run.seq) {
-                latest = Some(run);
-            }
-        }
-        let (status, active_run) = if let Some(run) = waiting {
-            (ChatStatus::Waiting, Some(run.id))
-        } else if let Some(run) = working {
-            (ChatStatus::Working, Some(run.id))
-        } else if latest.is_some_and(|run| run.status == RunStatus::Failed) {
-            (ChatStatus::Failed, None)
-        } else {
-            (ChatStatus::Idle, None)
+            None => (ChatStatus::Idle, None),
         };
         let Some(view) = self.chats.get_mut(&chat) else {
             return;
         };
         view.status = status;
         view.active_run = active_run;
+    }
+
+    /// Follows a run that just began; a new run clears the Chat's failure.
+    fn begin_run(&mut self, run: Id) {
+        self.project_run_status(run, true);
+    }
+
+    /// Follows a run whose status changed.
+    fn follow_run(&mut self, run: Id) {
+        self.project_run_status(run, false);
+    }
+
+    /// Follows a run's current state in its Chat's projection.
+    fn project_run_status(&mut self, run: Id, clears_failure: bool) {
+        let Some(view) = self.runs.get(&run) else {
+            return;
+        };
+        let (chat, seq, status) = (view.chat, view.seq, view.status);
+        if !self.chats.contains_key(&chat) {
+            return;
+        }
+        let runs = self.chat_runs.entry(chat).or_default();
+        if clears_failure {
+            runs.failed = false;
+        }
+        runs.follow(run, seq, status);
+        self.project_chat_view(chat);
     }
 
     /// Builds the Model history for a Chat up to a cursor.
@@ -939,6 +1002,7 @@ impl Projection for State {
                         active_run: None,
                     },
                 );
+                self.chat_runs.insert(data.chat, ChatRuns::default());
             }
             EventData::FileAdded(data) => {
                 if !self.chats.contains_key(&data.chat) {
@@ -1009,7 +1073,7 @@ impl Projection for State {
                         actions: Vec::new(),
                     },
                 );
-                self.project_chat_status(data.chat);
+                self.begin_run(data.run);
             }
             EventData::RunStarted(data) => {
                 let acting = event.acting.ok_or("a run names the User it acts for")?;
@@ -1047,7 +1111,7 @@ impl Projection for State {
                         });
                     }
                 }
-                self.project_chat_status(data.chat);
+                self.begin_run(data.run);
             }
             EventData::RunContext(data) => {
                 let run = self
@@ -1082,19 +1146,16 @@ impl Projection for State {
                 self.final_recovered_runs.remove(&data.run);
                 // A token lives only while its run does.
                 self.bot_tokens.retain(|_, token| token.run != data.run);
-                let chat = {
-                    let run = self
-                        .runs
-                        .get_mut(&data.run)
-                        .ok_or("a finished run must have started")?;
-                    run.status = data.status;
-                    run.reply = data.reply;
-                    run.usage = data.usage;
-                    run.error = data.error;
-                    run.approval = None;
-                    run.chat
-                };
-                self.project_chat_status(chat);
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a finished run must have started")?;
+                run.status = data.status;
+                run.reply = data.reply;
+                run.usage = data.usage;
+                run.error = data.error;
+                run.approval = None;
+                self.follow_run(data.run);
             }
             EventData::RunStep(data) => {
                 let run = self
@@ -1209,7 +1270,7 @@ impl Projection for State {
                     decided: None,
                     seq: event.seq,
                 });
-                self.project_chat_status(data.chat);
+                self.follow_run(data.run);
             }
             EventData::ApprovalDecided(data) => {
                 let position = self
@@ -1242,34 +1303,31 @@ impl Projection for State {
                         approval.grant_folder.clone(),
                     )
                 };
-                let chat = {
-                    let run = self
-                        .runs
-                        .get_mut(&data.run)
-                        .ok_or("a decided approval must belong to a started run")?;
-                    if run.approval == Some(data.approval) {
-                        run.approval = None;
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a decided approval must belong to a started run")?;
+                if run.approval == Some(data.approval) {
+                    run.approval = None;
+                }
+                if allow {
+                    run.status = RunStatus::Running;
+                    if reason == ApprovalReason::FirstUseLocal {
+                        self.first_use_allowed.insert((bot, acting, computer));
                     }
-                    if allow {
-                        run.status = RunStatus::Running;
-                        if reason == ApprovalReason::FirstUseLocal {
-                            self.first_use_allowed.insert((bot, acting, computer));
-                        }
-                        if reason == ApprovalReason::Grant {
-                            // The owner answered a grant card, which names the
-                            // Bot, the folder, and the machine: that also answers
-                            // the first use of this machine.
-                            self.first_use_allowed.insert((bot, acting, computer));
-                            // The folder is allowed for the action this answer
-                            // resumed, whether or not the answer also lasts for
-                            // later runs. A lasting answer updates the Bot, which
-                            // the run's pinned access deliberately ignores.
-                            run.once_grant = scope;
-                        }
+                    if reason == ApprovalReason::Grant {
+                        // The owner answered a grant card, which names the
+                        // Bot, the folder, and the machine: that also answers
+                        // the first use of this machine.
+                        self.first_use_allowed.insert((bot, acting, computer));
+                        // The folder is allowed for the action this answer
+                        // resumed, whether or not the answer also lasts for
+                        // later runs. A lasting answer updates the Bot, which
+                        // the run's pinned access deliberately ignores.
+                        run.once_grant = scope;
                     }
-                    run.chat
-                };
-                self.project_chat_status(chat);
+                }
+                self.follow_run(data.run);
             }
             EventData::RuleAdded(data) => {
                 if !self.bots.contains_key(&data.bot) {
@@ -2116,6 +2174,12 @@ mod tests {
         serde_json::json!({"run": run, "status": status})
     }
 
+    /// Applies one event and keeps it, so a test can replay the record later.
+    fn apply_recorded(state: &mut State, record: &mut Vec<Event>, event: Event) {
+        state.apply(&event).unwrap();
+        record.push(event);
+    }
+
     #[test]
     fn a_queued_run_waits_its_turn() {
         let owner = Id::new();
@@ -2589,6 +2653,353 @@ mod tests {
         assert_eq!(value["id"], serde_json::json!(id));
         assert_eq!(value["status"], "working");
         assert_eq!(value["active_run"], serde_json::json!(run));
+    }
+
+    #[test]
+    fn a_later_failure_outlives_an_earlier_success() {
+        // A waiting run does not hold the Bot's queue, so this order is
+        // reachable: the first run waits for its approval, a later run starts
+        // and succeeds, and only then is the first denied.
+        let owner = Id::new();
+        let bot_id = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let (first, second, third) = (Id::new(), Id::new(), Id::new());
+        let first_ask = Id::new();
+        let mut live = State::default();
+        bot_chat(&mut live, owner, bot_id, chat, computer);
+        let mut record = Vec::new();
+
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunQueued,
+                Author::Bot(bot_id),
+                owner,
+                run_data(chat, bot_id, first),
+                4,
+            ),
+        );
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunStarted,
+                Author::Bot(bot_id),
+                owner,
+                run_data(chat, bot_id, first),
+                5,
+            ),
+        );
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::ApprovalRequested,
+                Author::Bot(bot_id),
+                owner,
+                approval_requested(chat, bot_id, computer, owner, first, first_ask),
+                6,
+            ),
+        );
+        assert_eq!(
+            chat_projection(&live, chat),
+            (ChatStatus::Waiting, Some(first))
+        );
+
+        // The newer run starts and succeeds while the first run waits.
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunQueued,
+                Author::Bot(bot_id),
+                owner,
+                run_data(chat, bot_id, second),
+                7,
+            ),
+        );
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunStarted,
+                Author::Bot(bot_id),
+                owner,
+                run_data(chat, bot_id, second),
+                8,
+            ),
+        );
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunFinished,
+                Author::Bot(bot_id),
+                owner,
+                run_finished(second, "succeeded"),
+                9,
+            ),
+        );
+        assert_eq!(
+            chat_projection(&live, chat),
+            (ChatStatus::Waiting, Some(first)),
+            "the wait outranks the newer run"
+        );
+
+        // The first run is denied and fails. Its end is the latest event that
+        // ended a run, so the Chat stays failed even though the run with the
+        // larger queue cursor succeeded.
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::ApprovalDecided,
+                Author::User(owner),
+                owner,
+                approval_decided(first, first_ask, false, owner),
+                10,
+            ),
+        );
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunFinished,
+                Author::Bot(bot_id),
+                owner,
+                run_finished(first, "failed"),
+                11,
+            ),
+        );
+        assert_eq!(
+            chat_projection(&live, chat),
+            (ChatStatus::Failed, None),
+            "the later failure keeps the Chat failed"
+        );
+
+        // A replay of the same record shows the same state.
+        let mut replay = State::default();
+        bot_chat(&mut replay, owner, bot_id, chat, computer);
+        for event in &record {
+            replay.apply(event).unwrap();
+        }
+        assert_eq!(chat_projection(&replay, chat), (ChatStatus::Failed, None));
+        assert_eq!(replay.chats[&chat], live.chats[&chat]);
+
+        // The next run clears the failure when it queues.
+        apply_recorded(
+            &mut live,
+            &mut record,
+            acted_event(
+                EventKind::RunQueued,
+                Author::Bot(bot_id),
+                owner,
+                run_data(chat, bot_id, third),
+                12,
+            ),
+        );
+        assert_eq!(
+            chat_projection(&live, chat),
+            (ChatStatus::Working, Some(third))
+        );
+    }
+
+    #[test]
+    fn the_chat_projection_reads_its_index_not_the_record_history() {
+        // A record long enough that a projection walking the runs would visit
+        // tens of thousands of them: 128 Chats, each with 20 finished runs.
+        const CHATS: usize = 128;
+        const RUNS: usize = 20;
+
+        let owner = Id::new();
+        let user = Author::User(owner);
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::UserJoined,
+                user,
+                serde_json::json!({"display_name": "Ada", "is_admin": true}),
+                0,
+            ))
+            .unwrap();
+        let mut seq = 1_i64;
+        let mut chats: Vec<(Id, (ChatStatus, Option<Id>))> = Vec::with_capacity(CHATS);
+        for index in 0..CHATS {
+            let computer = Id::new();
+            let bot = Id::new();
+            let chat = Id::new();
+            state
+                .apply(&event(
+                    EventKind::ComputerCreated,
+                    user,
+                    serde_json::json!({
+                        "computer": computer,
+                        "owner": owner,
+                        "kind": "hosted",
+                        "workspace": "/tmp/workspace",
+                    }),
+                    seq,
+                ))
+                .unwrap();
+            seq += 1;
+            state
+                .apply(&event(
+                    EventKind::BotCreated,
+                    user,
+                    serde_json::json!({
+                        "bot": bot,
+                        "owner": owner,
+                        "name": "Scout",
+                        "computer": computer,
+                        "chat": chat,
+                    }),
+                    seq,
+                ))
+                .unwrap();
+            seq += 1;
+            state
+                .apply(&event(
+                    EventKind::ChatCreated,
+                    user,
+                    serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                    seq,
+                ))
+                .unwrap();
+            seq += 1;
+
+            // Every Chat finishes 20 runs; an even Chat fails its last one.
+            let mut last_ended = "succeeded";
+            for run_index in 0..RUNS {
+                let run = Id::new();
+                apply_run(
+                    &mut state,
+                    EventKind::RunQueued,
+                    bot,
+                    owner,
+                    run_data(chat, bot, run),
+                    seq,
+                );
+                seq += 1;
+                apply_run(
+                    &mut state,
+                    EventKind::RunStarted,
+                    bot,
+                    owner,
+                    run_data(chat, bot, run),
+                    seq,
+                );
+                seq += 1;
+                let ended = if index % 2 == 0 && run_index + 1 == RUNS {
+                    "failed"
+                } else {
+                    "succeeded"
+                };
+                apply_run(
+                    &mut state,
+                    EventKind::RunFinished,
+                    bot,
+                    owner,
+                    run_finished(run, ended),
+                    seq,
+                );
+                last_ended = ended;
+                seq += 1;
+            }
+
+            // Two Chats end with a live run, so the index keeps one waiting
+            // and one working run.
+            let mut active = None;
+            if index == 0 {
+                let run = Id::new();
+                apply_run(
+                    &mut state,
+                    EventKind::RunQueued,
+                    bot,
+                    owner,
+                    run_data(chat, bot, run),
+                    seq,
+                );
+                seq += 1;
+                apply_run(
+                    &mut state,
+                    EventKind::RunStarted,
+                    bot,
+                    owner,
+                    run_data(chat, bot, run),
+                    seq,
+                );
+                seq += 1;
+                apply_run(
+                    &mut state,
+                    EventKind::ApprovalRequested,
+                    bot,
+                    owner,
+                    approval_requested(chat, bot, computer, owner, run, Id::new()),
+                    seq,
+                );
+                seq += 1;
+                active = Some((ChatStatus::Waiting, Some(run)));
+            } else if index == 1 {
+                let run = Id::new();
+                apply_run(
+                    &mut state,
+                    EventKind::RunQueued,
+                    bot,
+                    owner,
+                    run_data(chat, bot, run),
+                    seq,
+                );
+                seq += 1;
+                active = Some((ChatStatus::Working, Some(run)));
+            }
+            let expected = active.unwrap_or_else(|| {
+                if last_ended == "failed" {
+                    (ChatStatus::Failed, None)
+                } else {
+                    (ChatStatus::Idle, None)
+                }
+            });
+            chats.push((chat, expected));
+        }
+
+        // The projection keeps one index entry per Chat and only the live
+        // runs, not one entry per run the record ever held.
+        assert_eq!(state.chat_runs.len(), CHATS);
+        let mut live = 0;
+        for (index, (chat, expected)) in chats.iter().enumerate() {
+            let view = &state.chats[chat];
+            assert_eq!(
+                (view.status, view.active_run),
+                *expected,
+                "Chat {index} projects its state"
+            );
+            let runs = state.chat_runs.get(chat).unwrap();
+            live += runs.waiting.len() + runs.working.len();
+            assert_eq!(
+                runs.failed,
+                matches!(expected.0, ChatStatus::Failed),
+                "the failure flag follows the latest ended run of Chat {index}"
+            );
+        }
+        assert_eq!(live, 2, "the index keeps only the live runs");
+
+        // The state comes from the index. With the run history gone, the same
+        // Chats project the same state; a projection that walked the runs
+        // would fall back to idle here.
+        let before: Vec<(ChatStatus, Option<Id>)> = chats
+            .iter()
+            .map(|(chat, _)| (state.chats[chat].status, state.chats[chat].active_run))
+            .collect();
+        state.runs.clear();
+        for (chat, _) in &chats {
+            state.project_chat_view(*chat);
+        }
+        let after: Vec<(ChatStatus, Option<Id>)> = chats
+            .iter()
+            .map(|(chat, _)| (state.chats[chat].status, state.chats[chat].active_run))
+            .collect();
+        assert_eq!(before, after);
     }
 
     #[test]

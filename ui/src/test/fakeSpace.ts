@@ -2,7 +2,7 @@
 // Tests import `space` to set up and read what happened, and hand
 // `FakeCommands` to the client in place of its WebSocket.
 import type { SubscriptionHandlers } from "../lib/ws";
-import type { Approval, Chat, ChatStatus, FileSummary, Message, RunView } from "../types";
+import type { Approval, Chat, ChatStatus, FileSummary, Message, RecordEvent, RunView } from "../types";
 
 const account = { id: "u1", display_name: "Ada", is_admin: true };
 const bot = { id: "b1", owner: "u1", name: "Scout", computer: "p1", chat: "h1" };
@@ -18,6 +18,16 @@ function botFor(id: string) {
   if (id === otherBot.id) return otherBot;
   if (id === thirdBot.id) return thirdBot;
   return bot;
+}
+// One Chat as the Space projects it: its own state, and the Run it follows.
+function project(known: Chat): Chat {
+  const status = space.statuses[known.id];
+  const active = space.activeRuns[known.id];
+  return {
+    ...known,
+    ...(status === undefined ? {} : { status }),
+    ...(active === undefined ? {} : { active_run: active }),
+  };
 }
 // A send or a decision can be held open, so a test can act while the Space
 // has not answered yet.
@@ -43,10 +53,24 @@ export const space = {
   chats: [chat] as Chat[],
   // What the Space projects each Chat to be doing. A Chat it omits is idle.
   statuses: {} as Record<string, ChatStatus>,
+  // The Run each Chat works on, as the Space projects it: the waiting Run while
+  // it waits, else the oldest queued or running Run, else none.
+  activeRuns: {} as Record<string, string | null>,
   chatDelay: null as null | ((chatId: string) => Promise<void>),
   handlers: null as SubscriptionHandlers | null,
   // What the record says about each Run. A Run this map omits has succeeded.
-  runs: {} as Record<string, { status: RunView["status"]; position?: number; approval?: string }>,
+  // A Run can also carry the steps and actions the record holds for it, which
+  // is how a reopened Chat shows what the Run already did.
+  runs: {} as Record<
+    string,
+    {
+      status: RunView["status"];
+      position?: number;
+      approval?: string;
+      steps?: { index: number; tool_calls: number }[];
+      actions?: { id: string; step: number; tool: string; status: string; error?: string | null }[];
+    }
+  >,
   runShows: [] as string[],
   // A run_show answer can be held open, so a test can act while it is in flight.
   runHolds: {} as Record<string, { gate: Promise<void>; release: () => void; fail: () => void } | undefined>,
@@ -74,6 +98,7 @@ export const space = {
     space.otherMessages = [];
     space.chats = [chat];
     space.statuses = {};
+    space.activeRuns = {};
     space.chatDelay = null;
     space.handlers = null;
     space.runs = {};
@@ -115,11 +140,21 @@ export const space = {
     });
     space.runHolds[run] = { gate, release, fail };
   },
+  // A page that reconnects reads a snapshot of the events it missed, and the
+  // Space says the cursor it now holds. This is what a real reconnect delivers.
+  resume(events: RecordEvent[]) {
+    space.seq += 1;
+    space.handlers?.onSnapshot?.(events, `s${space.seq}`, true);
+  },
 };
 
 export class FakeCommands {
   async subscribe(handlers: SubscriptionHandlers): Promise<void> {
     space.handlers = handlers;
+    // A real Space answers a subscribe with one snapshot frame, which a page
+    // that asked for no cursor reads as its first page of the record.
+    await Promise.resolve();
+    handlers.onSnapshot?.([], "", false);
   }
 
   async close(): Promise<void> {
@@ -138,10 +173,8 @@ export class FakeCommands {
         return space.chats.map((known) => botFor(known.bot)) as T;
       case "chat_list":
         // Like the Space's JSON, each answer carries its own copies, with what
-        // the Space projects the Chat to be doing.
-        return space.chats.map((known) =>
-          space.statuses[known.id] ? { ...known, status: space.statuses[known.id] } : { ...known },
-        ) as T;
+        // the Space projects the Chat to be doing and the Run it follows.
+        return space.chats.map((known) => project(known)) as T;
       case "chat_read": {
         const asked = args as { chat: string };
         await space.chatDelay?.(asked.chat);
@@ -161,7 +194,7 @@ export class FakeCommands {
         const asked = args as { bot: string };
         const known = botFor(asked.bot);
         const own = space.chats.find((entry) => entry.bot === known.id) ?? space.chat;
-        return { bot: known, computer: space.computer, chat: own } as T;
+        return { bot: known, computer: space.computer, chat: project(own) } as T;
       }
       case "message_send": {
         if (sendGate) await sendGate;
@@ -228,6 +261,8 @@ export class FakeCommands {
           reply: null,
           error: null,
           usage: null,
+          steps: known.steps ?? [],
+          actions: known.actions ?? [],
         } as T;
       }
       default:

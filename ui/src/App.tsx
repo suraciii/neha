@@ -50,6 +50,15 @@ interface RunOutcome {
   error: string | null;
 }
 
+// What the page knows about the Runs of one Chat: the Runs that still hold it
+// (queued, running, or waiting for an approval) and how the latest Run to end
+// ended. Every run and approval event merges into this one projection, so a
+// sibling Run that ends never takes the Chat's state with it.
+interface ChatRuns {
+  active: Record<string, RunStep>;
+  last: "succeeded" | "failed" | null;
+}
+
 function outcomeOf(status: RunView["status"], error: string | null): RunOutcome {
   return { failed: status === "failed", error: status === "failed" ? error : null };
 }
@@ -123,11 +132,12 @@ interface State {
   failed: boolean;
   // What each Chat is doing, from the Space's projection and the record's
   // live events. A Chat the record has not touched is idle.
-  chatStatus: Record<string, ChatStatus>;
+  runs: Record<string, ChatRuns>;
   // The Chats that received a Bot Message while another Chat was on screen.
   unread: Record<string, boolean>;
-  // The approvals waiting in Chats other than the one on screen, by Chat.
-  attention: Record<string, Approval>;
+  // The approvals that still wait for the User, by approval. Each one is its
+  // own entry, so a Chat with two of them needs two answers.
+  pending: Record<string, Approval>;
   // The approval whose answer is on its way to the Space.
   deciding: string | null;
   busy: boolean;
@@ -155,9 +165,9 @@ function emptyState(): State {
     waiting: false,
     queue: null,
     failed: false,
-    chatStatus: {},
+    runs: {},
     unread: {},
-    attention: {},
+    pending: {},
     deciding: null,
     busy: false,
     error: null,
@@ -190,11 +200,17 @@ export default function App() {
   const [authMode, setAuthMode] = createSignal<AuthMode>("login");
   const [authSecret, setAuthSecret] = createSignal("");
   const [isMobile, setIsMobile] = createSignal(false);
+  // What the rail selected: the Chats, or the approvals that wait for the User.
+  const [view, setView] = createSignal<"chats" | "attention">("chats");
+  // The approval the User asked to see, so its Chat scrolls to its card.
+  const [focus, setFocus] = createSignal<string | null>(null);
   const commands = new Commands();
   let runGeneration = 0;
   let following = false;
   let refreshTimer: number | null = null;
   let refreshAgain = false;
+  let calibrating = false;
+  let calibrateAgain = false;
   let previewLoad = 0;
 
   // The Run this page follows: the newest one it submitted, or the one its Chat
@@ -258,16 +274,43 @@ export default function App() {
     });
   }
 
-  function setChatStatus(chat: string, status: ChatStatus) {
+  // A Run the page heard about holds its Chat from now on.
+  function holdRun(chat: string, run: string, step: RunStep) {
     setState((draft) => {
-      draft.chatStatus[chat] = status;
+      const runs = (draft.runs[chat] ??= { active: {}, last: null });
+      runs.active[run] = step;
     });
   }
 
-  // What a Chat is doing: the record's live answer first, else the Space's
-  // projection, else idle.
+  // A Run the page heard about ended. The Chat keeps whatever else holds it:
+  // a Run still waiting or working outranks one that ended.
+  function endRun(chat: string | undefined, run: string, outcome: RunOutcome) {
+    if (!chat) return;
+    setState((draft) => {
+      const runs = (draft.runs[chat] ??= { active: {}, last: null });
+      delete runs.active[run];
+      runs.last = outcome.failed ? "failed" : "succeeded";
+    });
+  }
+
+  // The merged projection of the Runs the page heard about in one Chat, when it
+  // has heard of any. A Run that waits for an approval outranks one that works,
+  // and a Run that works outranks the latest one that ended.
+  function projectRuns(chatId: string): ChatStatus | null {
+    const runs = state.runs[chatId];
+    if (!runs) return null;
+    const active = Object.values(runs.active);
+    if (active.includes("waiting")) return "waiting";
+    if (active.length > 0) return "working";
+    if (runs.last === "failed") return "failed";
+    if (runs.last === "succeeded") return "idle";
+    return null;
+  }
+
+  // What a Chat is doing: the merged projection of its Runs, else the Space's
+  // snapshot, else idle.
   function statusOf(chat: Chat): ChatStatus {
-    return state.chatStatus[chat.id] ?? chat.status ?? "idle";
+    return projectRuns(chat.id) ?? chat.status ?? "idle";
   }
 
   // Whether the Chat on screen still belongs to this piece of work.
@@ -294,10 +337,10 @@ export default function App() {
       draft.waiting = step === "waiting";
       draft.queue = step === "queued" ? { status: "queued", position } : null;
       draft.failed = false;
-      if (draft.activeChat) {
-        draft.chatStatus[draft.activeChat.id] = step === "waiting" ? "waiting" : "working";
-      }
     });
+    // The Chat works on this Run now, whatever else it holds.
+    const chat = state.activeChat;
+    if (chat) holdRun(chat.id, run, step);
     setActivity((current) => (current?.run === run ? current : { run, step: 0, actions: [], files: [], error: null }));
   }
 
@@ -334,7 +377,6 @@ export default function App() {
       draft.working = false;
       draft.waiting = false;
       draft.queue = null;
-      if (draft.activeChat) draft.chatStatus[draft.activeChat.id] = "idle";
     });
   }
 
@@ -342,16 +384,17 @@ export default function App() {
   // Chat: a late answer about an earlier Run must not drop a newer one.
   function finishFollowing(run: string, outcome: RunOutcome = { failed: false, error: null }) {
     settledRuns.add(run);
-    if (!isFollowing(run)) return;
-    followed = null;
+    const wasFollowing = isFollowing(run);
+    if (wasFollowing) followed = null;
+    const chat = state.activeChat;
+    endRun(chat?.id, run, outcome);
+    forgetRunAttention(run);
+    if (!wasFollowing) return;
     update((draft) => {
       draft.working = false;
       draft.waiting = false;
       draft.queue = null;
       draft.failed = outcome.failed;
-      if (draft.activeChat) {
-        draft.chatStatus[draft.activeChat.id] = outcome.failed ? "failed" : "idle";
-      }
     });
     // A failed Run keeps one line in the stream, with its reason behind it; a
     // Run that answered leaves its reply Message in place.
@@ -379,6 +422,38 @@ export default function App() {
     else if (view.status === "running") advanceRun(view.id, "running");
     else if (view.status === "waiting") advanceRun(view.id, "waiting");
     else finishFollowing(view.id, outcomeOf(view.status, view.error));
+    // A reopened Chat shows what the Run already did: its recorded steps and
+    // actions, which the events of a Run the page never saw cannot tell. A Run
+    // that answered leaves its reply in the stream instead.
+    if (view.status !== "succeeded") restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
+  }
+
+  // Puts the recorded steps and actions of one Run into its activity card.
+  function restoreActivity(view: RunView, error: string | null = null) {
+    const steps = view.steps ?? [];
+    const actions = (view.actions ?? []).map((action) => ({
+      action: action.id,
+      step: action.step,
+      tool: action.tool,
+      status: actionStatusOf(action.status),
+      error: action.status === "failed" ? (action.error ?? null) : null,
+    }));
+    if (steps.length === 0 && actions.length === 0) return;
+    setActivity((current) => {
+      if (current && current.run !== view.id) return current;
+      const mine = current?.run === view.id ? current : null;
+      const merged = mine ? [...mine.actions] : [];
+      for (const action of actions) {
+        if (!merged.some((entry) => entry.action === action.action)) merged.push(action);
+      }
+      return {
+        run: view.id,
+        step: steps.reduce((highest, step) => Math.max(highest, step.index), mine?.step ?? 0),
+        actions: merged,
+        files: mine ? mine.files : [],
+        error: error ?? mine?.error ?? null,
+      };
+    });
   }
 
   onSettled(() => {
@@ -411,9 +486,19 @@ export default function App() {
     try {
       await commands.subscribe(
         {
-          onSnapshot: (_events, cursor, resumed) => {
+          // A page that asked to continue reads the events it missed: the gap
+          // is bounded, and the page was gone for it. A page that asked for no
+          // cursor has nothing to catch up on, so it takes the Space's word
+          // instead of reading the whole record.
+          onSnapshot: (events, cursor, resumed) => {
             saveCursor(cursor);
-            if (resumed) queueRefresh();
+            if (resumed) {
+              for (const event of events ?? []) {
+                saveCursor(event.seq);
+                handleRecordEvent(event);
+              }
+            }
+            queueCalibrate();
           },
           onEvent: (event) => {
             saveCursor(event.seq);
@@ -428,6 +513,66 @@ export default function App() {
       following = false;
       update({ error: reason });
     }
+  }
+
+  // Reads the Space's word again after a snapshot: what every Chat is doing,
+  // and every approval that still waits. This calibrates the whole attention
+  // list, not only the Chat on screen, because the events a page missed can
+  // leave an approval waiting in any Chat.
+  async function calibrate() {
+    let chats: Chat[];
+    try {
+      chats = await commands.command<Chat[]>("chat_list");
+    } catch {
+      // A read that failed leaves the replayed events as the answer.
+      return;
+    }
+    update({ chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)) });
+    // A Chat waits when the Space says so, or when the page's own projection of
+    // its Runs still holds an approval.
+    const waiting = chats.filter((chat) => chat.status === "waiting" || projectRuns(chat.id) === "waiting");
+    const answers = new Map<string, Approval[]>();
+    const unread = new Set<string>();
+    await Promise.all(
+      waiting.map(async (chat) => {
+        try {
+          answers.set(chat.id, await commands.command<Approval[]>("approval_list", { chat: chat.id }));
+        } catch {
+          unread.add(chat.id);
+        }
+      }),
+    );
+    setState((draft) => {
+      // The Space's answer is the authority for the Chats it answered: an
+      // approval it no longer lists is answered, wherever the page last heard
+      // about it. A Chat whose read failed keeps what the page knows.
+      for (const [id, approval] of Object.entries(draft.pending)) {
+        const listed = answers.get(approval.chat);
+        if (!listed || unread.has(approval.chat)) continue;
+        if (!listed.some((known) => known.approval === id)) delete draft.pending[id];
+      }
+      for (const [chat, approvals] of answers) {
+        for (const approval of approvals) draft.pending[approval.approval] = approval;
+      }
+    });
+    if (state.activeChat) await refreshActive(state.activeChat, runGeneration);
+  }
+
+  // Coalesces the calibrations a burst of snapshot frames asks for: the page
+  // takes the Space's word now, and once more after the last frame has landed.
+  function queueCalibrate() {
+    if (calibrating) {
+      calibrateAgain = true;
+      return;
+    }
+    calibrating = true;
+    void calibrate().finally(() => {
+      calibrating = false;
+      if (calibrateAgain) {
+        calibrateAgain = false;
+        queueCalibrate();
+      }
+    });
   }
 
   function handleRecordEvent(event: RecordEvent) {
@@ -453,14 +598,18 @@ export default function App() {
       if (event.author.kind === "bot" && chat !== state.activeChat?.id) markUnread(chat);
     }
     if (event.kind === "neha.file.added") {
-      // A File the followed Run produced belongs to its activity card.
+      // A FileAdded names no Run, so the author is what binds it: only a Bot
+      // produces Files for its Run. A File the User uploaded is theirs, and it
+      // never belongs to the activity card.
       const id = typeof data.file === "string" ? data.file : null;
-      if (chat && id && followed && state.activeChat?.id === chat) noteFile(followed.run, id);
+      if (event.author.kind === "bot" && chat && id && followed && state.activeChat?.id === chat) {
+        noteFile(followed.run, id);
+      }
     }
     if (event.kind === "neha.run.queued") {
       if (run && chat) {
         noteRun(run, chat);
-        setChatStatus(chat, "working");
+        holdRun(chat, run, "queued");
         // The command result may hold an older place than the record does.
         if (state.activeChat?.id === chat && isFollowing(run)) void refreshRunPlace(run);
       }
@@ -469,7 +618,7 @@ export default function App() {
     if (event.kind === "neha.run.started") {
       if (!run || !chat) return;
       noteRun(run, chat);
-      setChatStatus(chat, "working");
+      holdRun(chat, run, "running");
       if (state.activeChat?.id !== chat) return;
       if (isFollowing(run)) {
         advanceRun(run, "running");
@@ -513,12 +662,10 @@ export default function App() {
       const approval = approvalRequested(event);
       if (!approval) return;
       noteRun(approval.run, approval.chat);
-      setChatStatus(approval.chat, "waiting");
-      if (approval.chat !== state.activeChat?.id) {
-        // Another Chat waits for the User; the attention section names it.
-        rememberAttention(approval.chat, approval);
-        return;
-      }
+      holdRun(approval.chat, approval.run, "waiting");
+      // Every approval that waits is its own entry, wherever it runs.
+      rememberAttention(approval);
+      if (approval.chat !== state.activeChat?.id) return;
       showApproval(approval);
       // The Run stops here until the User answers, and no longer holds a place.
       if (isFollowing(approval.run)) advanceRun(approval.run, "waiting");
@@ -528,10 +675,14 @@ export default function App() {
     if (event.kind === "neha.approval.decided") {
       const approval = typeof data.approval === "string" ? data.approval : null;
       if (approval && run) applyDecision(approval, run, data.allow === true);
-      // A granted approval lets its Run work again, wherever it runs.
-      if (data.allow === true && run) {
+      // A granted approval lets its Run work again, wherever it runs; a denied
+      // one ends it. Either way the approval no longer waits for the User.
+      if (run) {
         const owner = runChats.get(run);
-        if (owner) setChatStatus(owner, "working");
+        if (owner) {
+          if (data.allow === true) holdRun(owner, run, "running");
+          else endRun(owner, run, { failed: true, error: null });
+        }
       }
       forgetAttention(approval);
       return;
@@ -549,10 +700,11 @@ export default function App() {
     });
   }
 
-  // An approval another Chat waits for, so the attention section can name it.
-  function rememberAttention(chat: string, approval: Approval) {
+  // An approval that waits for the User, so the attention list can name it.
+  // Opening its Chat does not clear it: only the User's answer does.
+  function rememberAttention(approval: Approval) {
     setState((draft) => {
-      draft.attention[chat] = approval;
+      draft.pending[approval.approval] = approval;
     });
   }
 
@@ -560,21 +712,29 @@ export default function App() {
   function forgetAttention(approval: string | null) {
     if (!approval) return;
     setState((draft) => {
-      for (const [chat, waiting] of Object.entries(draft.attention)) {
-        if (waiting.approval === approval) delete draft.attention[chat];
+      delete draft.pending[approval];
+    });
+  }
+
+  // Every approval one Run waited for stops needing attention with it.
+  function forgetRunAttention(run: string) {
+    setState((draft) => {
+      for (const [id, waiting] of Object.entries(draft.pending)) {
+        if (waiting.run === run) delete draft.pending[id];
       }
     });
   }
 
-  // A Run the page heard about ended: its Chat leaves the busy or waiting state.
+  // A Run the page heard about ended: its Chat keeps whatever else holds it,
+  // and the approvals it waited for no longer need attention.
   function settleChat(chat: string | undefined, run: string, outcome: RunOutcome) {
     if (!chat) return;
-    setChatStatus(chat, outcome.failed ? "failed" : "idle");
-    const waiting = state.attention[chat];
-    if (waiting && waiting.run === run) forgetAttention(waiting.approval);
+    endRun(chat, run, outcome);
+    forgetRunAttention(run);
     // A Chat on screen that follows no Run of its own keeps the failure in its
-    // header and one line in its stream.
-    if (outcome.failed && state.activeChat?.id === chat && !followed) {
+    // header and one line in its stream, but only once nothing else holds the
+    // Chat: a sibling Run that still works outranks the one that ended.
+    if (outcome.failed && state.activeChat?.id === chat && !followed && projectRuns(chat) === "failed") {
       update({ failed: true });
       setActivity((current) => failActivity(current, run, outcome.error));
     }
@@ -694,13 +854,6 @@ export default function App() {
         bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
         chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
       });
-      setState((draft) => {
-        for (const chat of chats) {
-          // The Space projects what each Chat is doing; a live event that has
-          // already answered is the newer word.
-          if (draft.chatStatus[chat.id] === undefined) draft.chatStatus[chat.id] = chat.status ?? "idle";
-        }
-      });
       await loadPreviews(chats);
       const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
       const target = active ?? (!isMobile() ? chats[0] : undefined);
@@ -741,11 +894,29 @@ export default function App() {
     });
   }
 
-  async function selectChat(chat: Chat) {
+  async function selectChat(chat: Chat, focus?: string | null) {
     const generation = ++runGeneration;
     followed = null;
     setActivity(null);
-    update({ activeChat: chat, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, working: false, waiting: false, queue: null, failed: false, deciding: null, error: null });
+    // The Space's snapshot says what the Chat was doing when it was last seen,
+    // so the header can mark a failed or waiting Chat before any event lands.
+    const snapshot = statusOf(chat);
+    update({
+      activeChat: chat,
+      messages: [],
+      files: {},
+      approvals: [],
+      activeBot: null,
+      activeComputer: null,
+      submitting: false,
+      working: snapshot === "working" || snapshot === "waiting",
+      waiting: snapshot === "waiting",
+      queue: null,
+      failed: snapshot === "failed",
+      deciding: null,
+      error: null,
+    });
+    if (focus) setFocus(focus);
     // Opening a Chat answers its new activity.
     setState((draft) => {
       draft.unread[chat.id] = false;
@@ -765,25 +936,27 @@ export default function App() {
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
-      await restoreRun(chat, messages, generation);
+      // The Chat the Space answered with is the newest word about the Chat, so
+      // it also names the Run the Chat works on.
+      await restoreRun(bot.chat ?? chat, messages, generation);
     } catch (reason) {
       if (isCurrentChat(chat, generation)) update({ error: reason });
     }
   }
 
   async function restoreRun(chat: Chat, messages: Message[], generation: number) {
-    const run = newestRequestRun(messages);
+    // The Run the Chat works on, in the Space's words. The page never guesses
+    // which Run is the newest: a Chat that waits follows the Run that waits,
+    // even when a later Run already works.
+    const run = chat.active_run ?? newestRequestRun(messages);
     if (!run || !isCurrentChat(chat, generation)) return;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
-      if (isUnfinished(view.status)) {
-        // A waiting Run is unfinished too: show its place and follow it.
-        advanceRun(run, view.status, view.position);
-      } else {
-        finishFollowing(run, outcomeOf(view.status, view.error));
-        await refreshActive(chat, generation);
-      }
+      applyRunView(view);
+      // A Run that answered is over: the Chat reads the record again for the
+      // reply and the Files it produced.
+      if (!isUnfinished(view.status)) await refreshActive(chat, generation);
     } catch {
       // A Run that is already gone leaves the recorded Messages in place.
     }
@@ -985,20 +1158,35 @@ export default function App() {
     return states;
   });
 
-  // The Chats that wait for the User. The Chat on screen answers its own
-  // approvals, so only the others count as needing attention.
+  // Every approval that waits for the User, one entry each. Opening its Chat
+  // does not answer it, so a Chat the User is reading stays listed until its
+  // answer is sent.
   const attentionEntries = createMemo<AttentionEntry[]>(() =>
-    state.chats
-      .filter((chat) => statusOf(chat) === "waiting" && chat.id !== state.activeChat?.id)
-      .map((chat) => {
-        const waiting = state.attention[chat.id];
-        return {
-          chat,
-          botName: state.bots.find((bot) => bot.id === chat.bot)?.name ?? "Bot",
-          detail: waiting ? `${waiting.tool} · ${waiting.summary}` : null,
-        };
+    Object.values(state.pending)
+      .sort((left, right) => left.approval.localeCompare(right.approval))
+      .flatMap((approval) => {
+        const chat = state.chats.find((known) => known.id === approval.chat);
+        if (!chat) return [];
+        return [
+          {
+            approval,
+            chat,
+            botName: state.bots.find((bot) => bot.id === chat.bot)?.name ?? "Bot",
+            detail: `${approval.tool} · ${approval.summary}`,
+          },
+        ];
       }),
   );
+
+  // Opens the Chat an approval waits in and shows its card.
+  function openAttention(entry: AttentionEntry) {
+    setView("chats");
+    if (state.activeChat?.id === entry.chat.id) {
+      setFocus(entry.approval.approval);
+      return;
+    }
+    void selectChat(entry.chat, entry.approval.approval);
+  }
 
   // What the activity card shows: the followed Run's activity while it works,
   // and one line with the reason once it failed. A Run waiting in the queue has
@@ -1023,7 +1211,12 @@ export default function App() {
       >
         {(account) => (
           <div class={`app${showChat() ? " app--chat" : ""}${needsSetup() ? " app--setup" : ""}`}>
-            <Rail account={account()} />
+            <Rail
+              account={account()}
+              view={view()}
+              attentionCount={attentionEntries().length}
+              onSelect={(next) => setView(next)}
+            />
             <Sidebar
               account={account()}
               chats={state.chats}
@@ -1033,7 +1226,12 @@ export default function App() {
               statuses={chatStates()}
               unread={state.unread}
               attention={attentionEntries()}
-              onSelect={(chat) => void selectChat(chat)}
+              attentionOpen={view() === "attention"}
+              onSelect={(chat) => {
+                setView("chats");
+                void selectChat(chat);
+              }}
+              onAttention={(entry) => openAttention(entry)}
             />
             <main class="main">
               <Show
@@ -1075,6 +1273,8 @@ export default function App() {
                   busy={busyChat()}
                   failed={state.failed}
                   activity={shownActivity()}
+                  focus={focus()}
+                  onFocused={() => setFocus(null)}
                   deciding={state.deciding}
                   error={errorText()}
                   onSend={sendMessage}

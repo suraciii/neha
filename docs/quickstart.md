@@ -242,4 +242,4 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - An unattended run's approval does not expire yet.
 - One human joins a Space. Group Chats, Boards, notifications, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait. It does not show Groups, Tasks, search, or notifications.
-- The browser client does not stream a reply. It shows a working state while the Run works, and each action the Bot takes appears when it completes.
+- The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

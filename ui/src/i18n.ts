@@ -53,9 +53,10 @@ const en = {
   "sidebar.online": "Space online",
 
   "attention.title": "Needs attention",
-  "attention.count.one": "1 Chat waiting",
-  "attention.count.many": "{count} Chats waiting",
-  "attention.waiting": "Waiting for your approval",
+  "attention.count.one": "1 approval waiting",
+  "attention.count.many": "{count} approvals waiting",
+  "attention.empty.title": "Nothing waits",
+  "attention.empty.text": "Every Bot has the answer it needs.",
 
   "rail.chats": "Chats",
   "rail.admin": "Admin",
@@ -218,9 +219,10 @@ const zh: Record<MessageKey, string> = {
   "sidebar.online": "Space 在线",
 
   "attention.title": "在等你",
-  "attention.count.one": "1 个 Chat 在等你",
-  "attention.count.many": "{count} 个 Chat 在等你",
-  "attention.waiting": "等待你的审批",
+  "attention.count.one": "1 个审批在等你",
+  "attention.count.many": "{count} 个审批在等你",
+  "attention.empty.title": "没有在等的事",
+  "attention.empty.text": "每个 Bot 都拿到了它要的答案。",
 
   "rail.chats": "Chats",
   "rail.admin": "管理员",

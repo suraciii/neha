@@ -308,12 +308,11 @@ describe("App with Files", () => {
     record("neha.run.finished", { run: "another-run", status: "failed", error: "nope" });
     expect(element(view, ".activity")).toBeTruthy();
 
-    // A failed Run leaves one line behind, with the reason behind the fold, and
-    // the Chat header marks the failure.
+    // A failed Run leaves one line behind, and the card opens itself with the
+    // reason, and the Chat header marks the failure.
     record("neha.run.finished", { run: "r1", status: "failed", error: "nope" });
     await waitFor(() => expect(element(view, ".activity").textContent).toContain("Failed"));
     expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
-    flush(() => fireEvent.click(element(view, ".activity__head")));
     expect(element(view, ".activity__reason").textContent).toContain("nope");
   });
 

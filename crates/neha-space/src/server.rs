@@ -3668,6 +3668,60 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn chat_list_keeps_the_later_failure_after_an_earlier_success() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("second done"),
+            ],
+        )
+        .await;
+        let first = run_of(&submit(&mut local.socket, local.chat, "run pwd", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, first).await["approval"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            chat_view(&mut local.socket, local.chat).await["status"],
+            "waiting"
+        );
+
+        // A waiting run does not hold the Bot's queue, so the next Message's
+        // run starts and succeeds while the first one waits.
+        let second = run_of(&submit(&mut local.socket, local.chat, "second", None).await);
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let view = chat_view(&mut local.socket, local.chat).await;
+        assert_eq!(
+            view["status"], "waiting",
+            "the wait outranks the newer run: {view}"
+        );
+        assert_eq!(view["active_run"], json!(first));
+
+        // Denying the first run fails it. Its end is the latest event that
+        // ended a run, so the Chat stays failed; the newer success must not
+        // hide it.
+        decide_approval(&mut local.socket, approval, false, false).await;
+        assert_eq!(wait_run(&mut local.socket, first).await["status"], "failed");
+        let view = chat_view(&mut local.socket, local.chat).await;
+        assert_eq!(
+            view["status"], "failed",
+            "the later failure outlives the earlier success: {view}"
+        );
+        assert!(view["active_run"].is_null());
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn repeated_wrong_passwords_are_rate_limited() {
         let (_dir, running, invite) = running().await;
         let _session = join(&running, &invite, "Ada", "correct horse battery").await;
