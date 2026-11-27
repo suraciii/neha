@@ -27,7 +27,7 @@ pub use home::{Home, HomeError, SCHEMA_VERSION};
 pub use identity::{Account, Identity, IdentityError};
 pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage};
 pub use secrets::{Secrets, SecretsError};
-pub use server::{Running, ServerError, SpaceServer, start, start_with_ui};
+pub use server::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
 pub use state::{
     BotView, ChatStatus, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView,
     RunStatus, RunView, State, UserView,

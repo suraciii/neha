@@ -2,7 +2,7 @@
 
 This guide starts a Space on one machine, joins it as the Admin, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User and can work in its own Computer workspace with tools.
 
-Everything runs on the local machine. The Space listens on loopback and stores its record in `NEHA_HOME`.
+Everything runs on the local machine. The Space listens on loopback and stores its record in `NEHA_HOME`. To reach it from a phone or another computer, [serve it on a domain](deploying.md).
 
 File bytes stay in `NEHA_HOME` by default too. [Storage](storage.md) shows how to keep them in an S3-compatible bucket instead.
 
@@ -235,6 +235,10 @@ Host and `https` Origin, issues a `Secure` session cookie, and redirects a
 loopback browser request to the public origin. Do not expose the loopback
 listener directly; terminate TLS at the proxy. A desktop client connects with
 the Space URL, or with the invitation link for a Space that has no Admin yet.
+
+For the same origin from a host, `neha serve --domain space.example.com` works
+too. [Serve a Space on a domain](deploying.md) covers the proxy, phone
+installation, and limits.
 
 ## Restart and sign in again
 

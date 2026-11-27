@@ -68,6 +68,16 @@ With Chats selected, the main area shows the selected Chat. On a viewport 900 CS
 
 When the User has no Chats, the sidebar shows the Chat-list empty state. When the User has Chats and none is selected, the main area asks the User to select one.
 
+## The installed client
+
+The browser client installs from its Space's public origin as a web app. An installed client opens in its own window and keeps the same pages, record, and session as the browser.
+
+An installed client respects the device's safe areas and keeps the composer above the on-screen keyboard. On a phone, the system Back action closes an open Chat before it leaves the client.
+
+An installed client keeps its shell when the Space cannot be reached and offers to retry. The shell holds no copy of the record.
+
+A new build of the client takes effect the next time the client opens.
+
 ## First run
 
 A new Space has no Provider and no Bot. The main area then shows two steps.

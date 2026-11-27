@@ -187,6 +187,9 @@ const en = {
 
   "select.title": "Select a Chat to open it.",
   "boot.opening": "Opening the Space…",
+  "boot.offline.title": "This Space cannot be reached.",
+  "boot.offline.text": "Check the connection and try again.",
+  "boot.retry": "Try again",
 
   "format.today": "Today",
   "locale.switch.to.zh": "Switch to Chinese",
@@ -377,6 +380,9 @@ const zh: Record<MessageKey, string> = {
 
   "select.title": "选择一个 Chat 打开。",
   "boot.opening": "正在打开 Space…",
+  "boot.offline.title": "连不上这个 Space。",
+  "boot.offline.text": "请确认连接后重试。",
+  "boot.retry": "重试",
 
   "format.today": "今天",
   "locale.switch.to.zh": "切换到中文",

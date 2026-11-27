@@ -106,6 +106,19 @@ body,
   height: 100%;
 }
 
+@supports (height: 100dvh) {
+  html,
+  body,
+  #root {
+    height: 100dvh;
+  }
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 body {
   margin: 0;
   font-family: var(--font-sans);
@@ -493,7 +506,7 @@ code,
 /* -------------------------------------------------------------- shell --- */
 
 .app {
-  height: 100%;
+  height: var(--viewport-height, 100%);
   display: grid;
   grid-template-columns: 60px 296px minmax(0, 1fr);
   background: var(--bg);
@@ -1863,6 +1876,29 @@ code,
   fill: currentColor;
 }
 
+.offline {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 32px 24px calc(32px + env(safe-area-inset-bottom, 0px));
+  text-align: center;
+}
+.offline__title {
+  margin: 4px 0 0;
+  font-size: var(--text-lg);
+  font-weight: 600;
+  color: var(--ink);
+}
+.offline__text {
+  max-width: 38ch;
+  margin: 0;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+}
+
 /* --------------------------------------------------------- responsive --- */
 
 @media (max-width: 1080px) {
@@ -1891,6 +1927,24 @@ code,
 @media (max-width: 900px) {
   .app {
     grid-template-columns: minmax(0, 1fr);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  /* An installed window owns the status bar and the notch. */
+  .sidebar__head {
+    padding-top: calc(20px + env(safe-area-inset-top, 0px));
+  }
+  .chat__head {
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+  }
+  /* iOS zooms a focused field under 16px, then leaves the page scrolled. */
+  .input,
+  .composer__input {
+    font-size: 16px;
+  }
+  button,
+  a {
+    touch-action: manipulation;
   }
   /* Keep primary form actions on the touch floor when the rail gives way. */
   .btn {
