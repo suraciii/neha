@@ -89,7 +89,7 @@ These patterns state composition; behavior is in [product.md](product.md).
 
 - First run: a quiet shell and raised setup panels.
 - Empty: Chat-list and no-selection empty states are text-only; a Chat with no Messages uses the Bot avatar and prompt chips.
-- Waiting: one attention pill in the header; each waiting Approval has one raised Card in the stream.
+- Waiting: the followed Run uses one header attention pill; each waiting Approval has one raised Card in the stream.
 - Failure: one inline recovery line; no modal.
 - Narrow Chat: one surface at a time, with Back at the top and the composer at the foot.
 - Mobile: 40px primary controls, a 44px attachment row, and safe-area padding.
