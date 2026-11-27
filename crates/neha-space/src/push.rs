@@ -376,8 +376,12 @@ impl Push {
 /// Starts the one task that follows recorded events into notifications.
 pub(crate) fn spawn(server: Arc<SpaceServer>) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut receiver = server.events.subscribe();
+        // Read the cursor before subscribing, then catch up through the store.
+        // An event recorded between the read and the subscription is neither in
+        // the channel nor before the cursor; the catch-up covers that window.
         let mut cursor = server.store.last_seq().await.unwrap_or(Seq::ZERO);
+        let mut receiver = server.events.subscribe();
+        catch_up(&server, &mut cursor).await;
         loop {
             match receiver.recv().await {
                 Ok(event) => process(&server, event, &mut cursor),
