@@ -8,11 +8,7 @@ default:
 fmt:
     cargo fmt --all -- --check
 
-# Type-check every workspace target.
-check:
-    cargo check --locked --workspace --all-targets
-
-# Lint the workspace; any warning fails.
+# Lint the workspace; any warning fails. Clippy also type-checks every target.
 clippy:
     cargo clippy --locked --workspace --all-targets -- -D warnings
 
@@ -65,7 +61,7 @@ check-specs-tests:
     python3 scripts/test_check_specs.py
 
 # The full gate. Pull requests and main run the same recipes.
-ci: check-python-cache check-python check-specs fmt check clippy test doc ui-check desktop-check
+ci: check-python-cache check-python check-specs fmt clippy test doc ui-check desktop-check
 
 # Run the gate and retain source provenance, output, and exit status.
 verify evidence_dir:

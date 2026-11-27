@@ -24,7 +24,6 @@ pnpm --dir ui build
 
 ```bash
 just fmt          # formatting check
-just check        # type check
 just clippy       # lints; warnings fail
 just test         # workspace tests
 just test-s3      # neha-space tests with the S3 tests switched on

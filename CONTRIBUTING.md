@@ -14,7 +14,7 @@ Thank you for contributing. This guide covers the contribution process. Build re
 
 ## Gates and evidence
 
-- `just ci` is the required gate: Python hygiene, documentation checks, formatting, type checks, Clippy, tests, and the documentation build.
+- `just ci` is the required gate: Python hygiene, documentation checks, formatting, Clippy, tests, and the documentation build.
 
 Automated checks are necessary but not sufficient. Exercise the changed behavior through the real entry point and report the exact scenario and result in the pull request.
 
