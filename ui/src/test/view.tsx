@@ -17,6 +17,24 @@ export function element<T extends Element>(view: View, selector: string): T {
   return found;
 }
 
+// The button the test names, found by what it says.
+export function button(view: View, text: string): HTMLButtonElement {
+  const found = Array.from(view.container.querySelectorAll<HTMLButtonElement>("button")).find(
+    (known) => known.textContent?.trim() === text,
+  );
+  if (!found) throw new Error(`no ${text} button in the view`);
+  return found;
+}
+
+// What one panel says, found by its own heading.
+export function panelText(view: View, heading: string): string {
+  const panel = Array.from(view.container.querySelectorAll(".panel")).find(
+    (known) => known.querySelector("h2")?.textContent === heading,
+  );
+  if (!panel) throw new Error(`no ${heading} panel in the view`);
+  return panel.textContent ?? "";
+}
+
 // Renders the client, signed in to the fake Space.
 export function renderApp(): View {
   vi.spyOn(api, "me").mockResolvedValue(space.account as Account);
