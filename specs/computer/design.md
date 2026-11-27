@@ -69,9 +69,13 @@ A Local Computer's configuration directory is hidden from a Bot with granted fol
 
 On a Local Computer with full access, the shell starts no sandbox, and the file tools apply no hidden path and no write fence. The Bot then reaches the configuration directory as the machine user does.
 
+A record that widened a Bot to full access before the owner's answer was versioned replays as granted. The owner turns full access on again with an explicit answer.
+
 A run names one directory as its working directory. That directory is a write root for that run alone, and it grants nothing to a later run.
 
-On a Local Computer, a Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted.
+A grant and a run's working directory keep every component name exactly: `logs` and `logs ` are different folders.
+
+On a Local Computer with granted folders, a Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted. A Bot with full access is served without that check.
 
 A Local Computer's owner grants what a Bot on it can reach. [product.md](product.md) covers the grants.
 

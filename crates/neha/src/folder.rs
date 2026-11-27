@@ -4,7 +4,13 @@
 //! Space hands to a Computer, so the Space and the CLI must read them the same
 //! way. One rule lives here: the lexical form folds repeated separators and
 //! `.` components but keeps `..` for a caller to refuse, and a folder the
-//! Space names is trimmed, absolute, and contains no `..` or NUL.
+//! Space names is absolute and contains no `..` or NUL.
+//!
+//! A raw path is trimmed once at the edge where a User typed it
+//! ([`normalize_folder`]). A path a client already normalized keeps every
+//! component exactly ([`normalize_recorded`]): trimming a normalized name
+//! whose last component ends in a space would name another folder, and the
+//! Computer is promised the folder the record shows.
 
 /// Why a path is not a folder the Space can name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -78,9 +84,36 @@ pub fn normalize_folder(path: &str) -> Result<String, FolderError> {
     Ok(lexical(trimmed))
 }
 
+/// Normalizes one folder path a client already normalized.
+///
+/// The value keeps every component exactly, including a last component that
+/// ends in a space: the CLI trims the raw path once, and the Space records the
+/// folder that trim left. Trimming here again would hand the Computer another
+/// folder than the record names.
+pub fn normalize_recorded(path: &str) -> Result<String, FolderError> {
+    if path.trim().is_empty() {
+        return Err(FolderError::Empty);
+    }
+    if path.contains('\0') {
+        return Err(FolderError::Nul);
+    }
+    let path = std::path::Path::new(path);
+    if !path.is_absolute() {
+        return Err(FolderError::Relative);
+    }
+    if path
+        .components()
+        .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(FolderError::ParentDir);
+    }
+
+    Ok(lexical(path.to_string_lossy().as_ref()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{FolderError, lexical, normalize_folder};
+    use super::{FolderError, lexical, normalize_folder, normalize_recorded};
 
     #[test]
     fn a_path_folds_to_one_lexical_spelling() {
@@ -95,6 +128,36 @@ mod tests {
             "/data/../etc",
             "`..` is kept for a caller to refuse"
         );
+    }
+
+    #[test]
+    fn a_recorded_folder_keeps_its_component_names() {
+        assert_eq!(
+            normalize_recorded("/var/tmp/logs "),
+            Ok("/var/tmp/logs ".to_owned()),
+            "a last component that ends in a space names its own folder"
+        );
+        assert_eq!(
+            normalize_recorded("/var//tmp/./logs /x"),
+            Ok("/var/tmp/logs /x".to_owned())
+        );
+        assert_eq!(
+            normalize_recorded("  /var/tmp/logs  "),
+            Err(FolderError::Relative),
+            "a client path is normalized before it crosses the wire"
+        );
+    }
+
+    #[test]
+    fn a_recorded_folder_is_still_absolute_and_free_of_dot_dot() {
+        for (path, error) in [
+            ("", FolderError::Empty),
+            ("relative/path", FolderError::Relative),
+            ("/var/tmp/../etc", FolderError::ParentDir),
+            ("/var/tmp\u{0}notes", FolderError::Nul),
+        ] {
+            assert_eq!(normalize_recorded(path), Err(error), "{path:?}");
+        }
     }
 
     #[test]

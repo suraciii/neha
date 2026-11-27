@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{Action, ActionStatus, ToolOutput};
 
 /// The protocol version both ends speak.
-pub const CHANNEL_VERSION: u32 = 1;
+pub const CHANNEL_VERSION: u32 = 2;
 
 /// The largest frame either end accepts, 64 MiB.
 pub const MAX_CHANNEL_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -205,8 +205,8 @@ mod tests {
     }
 
     #[test]
-    fn both_ends_are_pinned_to_version_one_and_a_64_mib_frame() {
-        assert_eq!(CHANNEL_VERSION, 1);
+    fn both_ends_are_pinned_to_version_two_and_a_64_mib_frame() {
+        assert_eq!(CHANNEL_VERSION, 2);
         assert_eq!(MAX_CHANNEL_FRAME_BYTES, 64 * 1024 * 1024);
     }
 
@@ -373,14 +373,14 @@ mod tests {
         let cases = [
             (
                 DeviceFrame::Hello {
-                    version: 1,
+                    version: 2,
                     computer: "computer-1".to_owned(),
                     workspace: "/home/me/.neha/workspace".to_owned(),
                     sandbox: true,
                 },
                 json!({
                     "type": "hello",
-                    "version": 1,
+                    "version": 2,
                     "computer": "computer-1",
                     "workspace": "/home/me/.neha/workspace",
                     "sandbox": true,

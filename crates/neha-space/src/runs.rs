@@ -79,8 +79,13 @@ impl RunQueue {
             let mut bots = self.bots.lock().expect("run queue lock");
             Arc::clone(&bots.entry(bot).or_insert_with(Pump::new).admit)
         };
+        #[cfg(test)]
+        let waiting = AdmitWaiter::new(bot);
+        let admit = admit.lock_owned().await;
+        #[cfg(test)]
+        drop(waiting);
 
-        admit.lock_owned().await
+        admit
     }
 
     /// Wakes the Bot's pump, starting one when it is not running.
@@ -151,6 +156,59 @@ impl RunQueue {
             let _ = worker.await;
         }
     }
+}
+
+/// A test seam: counts the callers queued for one Bot's admit lock.
+///
+/// A command that takes the lock can be interleaved with a paused run start
+/// deterministically: a test waits until the command is queued on the lock
+/// instead of sleeping and hoping.
+#[cfg(test)]
+static ADMIT_WAITERS: Mutex<Option<HashMap<Id, usize>>> = Mutex::new(None);
+
+#[cfg(test)]
+struct AdmitWaiter(Id);
+
+#[cfg(test)]
+impl AdmitWaiter {
+    fn new(bot: Id) -> Self {
+        if let Ok(mut waiters) = ADMIT_WAITERS.lock() {
+            *waiters
+                .get_or_insert_with(HashMap::new)
+                .entry(bot)
+                .or_insert(0) += 1;
+        }
+        Self(bot)
+    }
+}
+
+#[cfg(test)]
+impl Drop for AdmitWaiter {
+    fn drop(&mut self) {
+        if let Ok(mut waiters) = ADMIT_WAITERS.lock()
+            && let Some(counts) = waiters.as_mut()
+            && let Some(count) = counts.get_mut(&self.0)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.0);
+            }
+        }
+    }
+}
+
+/// Returns how many callers wait for one Bot's admit lock.
+#[cfg(test)]
+pub(crate) fn admit_waiters(bot: Id) -> usize {
+    ADMIT_WAITERS
+        .lock()
+        .ok()
+        .and_then(|waiters| {
+            waiters
+                .as_ref()
+                .and_then(|counts| counts.get(&bot).copied())
+        })
+        .unwrap_or(0)
 }
 
 /// A test seam: when a test pauses a Bot, its pump waits between snapshotting

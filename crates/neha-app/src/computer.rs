@@ -431,12 +431,12 @@ async fn serve_channel(
 
     let (frames, mut incoming) = mpsc::channel::<(HostFrame, usize)>(CHANNEL_QUEUE);
     let inbound_bytes = Arc::new(AtomicUsize::new(0));
-    // The runtime whose action is running, so the reader can kill it without
-    // waiting for `execute` to return.
+    // The runtime of the action the worker is running, so the worker can stop
+    // it without waiting for `execute` to return. The worker is the one task
+    // that owns the child process; the reader only signals it.
     let current: Arc<Mutex<Option<Arc<LocalRuntime>>>> = Arc::new(Mutex::new(None));
 
     let reader = tokio::spawn({
-        let current = Arc::clone(&current);
         let answers = answers.clone();
         let frames = frames.clone();
         let inbound_bytes = Arc::clone(&inbound_bytes);
@@ -504,15 +504,11 @@ async fn serve_channel(
                     }
                 }
             };
-            // Tell the worker to stop, then kill the action it may be running:
-            // a Space that left must not leave a command running on this
-            // machine. The worker sweeps once more in case `execute` spawned
-            // its process group just after this cancel.
+            // Tell the worker to stop. The worker owns the running child, so
+            // it stops the action and finishes the whole process tree before
+            // the execute future and its pid are released; the reader must not
+            // reach into another task's child.
             let _ = stop.send(true);
-            let running = current.lock().ok().and_then(|mut current| current.take());
-            if let Some(runtime) = running {
-                runtime.cancel_in_flight();
-            }
 
             result
         }
@@ -539,12 +535,32 @@ async fn serve_channel(
                     _ = stopped.changed() => break,
                     frame = incoming.recv() => {
                         let Some((frame, size)) = frame else { break; };
+                        let executing = execute_frame(
+                            &config,
+                            &hidden,
+                            &denied,
+                            &runtimes,
+                            &current,
+                            frame,
+                        );
+                        tokio::pin!(executing);
+                        // This task owns the child process the frame may start.
+                        // When the channel goes away it stops that child and
+                        // ends its whole process tree before the execute future
+                        // and its pid are released; no other task touches the
+                        // child, so the cleanup happens exactly once. A future
+                        // that never started owns no child and is just dropped.
                         let answer = tokio::select! {
                             biased;
-                            _ = stopped.changed() => None,
-                            answer = execute_frame(&config, &hidden, &denied, &runtimes, &current, frame) => {
-                                Some(answer)
+                            _ = stopped.changed() => {
+                                if let Ok(mut current) = current.lock()
+                                    && let Some(runtime) = current.take()
+                                {
+                                    runtime.cancel_in_flight();
+                                }
+                                None
                             }
+                            answer = &mut executing => Some(answer),
                         };
                         release_bytes(&inbound_bytes, size);
                         let Some(answer) = answer else { break; };
@@ -564,16 +580,6 @@ async fn serve_channel(
                 }
             }
             let _ = stop.send(true);
-            // The second half of the cancellation: a frame that was starting
-            // while the reader cancelled may have spawned a shell after it.
-            // Shells run on a runtime derived for their own request, so the
-            // cached base runtimes hold none; the slot below is the one that
-            // could have started one.
-            if let Ok(mut current) = current.lock()
-                && let Some(runtime) = current.take()
-            {
-                runtime.cancel_in_flight();
-            }
         }
     });
 
@@ -659,8 +665,8 @@ async fn execute_frame(
                 Err(message) => return DeviceFrame::Failed { id, message },
             };
             runtime.set_env(env);
-            // The reader cancels whatever sits in this slot when the channel
-            // goes away, even while `execute` still runs.
+            // The worker finds the running action here when the channel goes
+            // away, so it can stop the child it owns.
             *current.lock().expect("current action lock") = Some(Arc::clone(&runtime));
             let result = runtime.execute(action.into()).await;
             *current.lock().expect("current action lock") = None;
@@ -2666,6 +2672,74 @@ mod tests {
         let _ = space.await;
     }
 
+    /// A real channel close while a full-access action is starting ends the
+    /// action's whole process tree. The worker owns the child, so dropping the
+    /// execute future cannot leave a descendant in its own process group.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_channel_ends_a_full_access_actions_process_tree() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let folder = workspace.path().join(bot.to_string());
+        std::fs::create_dir_all(&folder).unwrap();
+        let started = folder.join("started");
+        let alive = folder.join("alive");
+        let config = channel_config(workspace.path());
+        let (listener, address) = space_listener().await;
+        let space = tokio::spawn({
+            let started = started.clone();
+            let alive = alive.clone();
+            let bot = bot.to_string();
+            async move {
+                let mut socket = accept_space(listener).await;
+                send_space_frame(
+                    &mut socket,
+                    HostFrame::Action {
+                        id: 1,
+                        bot,
+                        action: WireAction::Shell {
+                            command: format!(
+                                "setsid sh -c 'sleep 0.6; echo alive > {}' >/dev/null 2>&1 & \
+                                 echo started > {}; sleep 30",
+                                alive.display(),
+                                started.display()
+                            ),
+                        },
+                        working_dir: None,
+                        access: AccessFrame {
+                            full_access: true,
+                            write_roots: Vec::new(),
+                        },
+                        env: Vec::new(),
+                    },
+                )
+                .await;
+                // Leave once the shell is running, so the close races the
+                // action rather than arriving before it started.
+                for _ in 0..400 {
+                    if started.is_file() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                drop(socket);
+            }
+        });
+        let daemon = connect_daemon(address, workspace.path()).await;
+        let error = serve_channel(&config, &[], &[], daemon, empty_runtimes())
+            .await
+            .expect_err("a closed channel ends the session");
+        let _ = space.await;
+        assert!(error.to_string().contains("closed"), "{error}");
+        assert!(started.exists(), "the action started before the Space left");
+
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !alive.exists(),
+            "a lost channel ends a full-access action's whole process tree"
+        );
+    }
+
     /// The accepting side of a fake Space's channel.
     type SpaceSocket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
@@ -3186,6 +3260,59 @@ mod tests {
         assert_eq!(
             std::fs::read(folder.join("delivered.bin")).unwrap(),
             b"hello"
+        );
+    }
+
+    /// The run directory from the frame names the folder it says, trailing
+    /// space included: the daemon does not trim a path the Space normalized.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_run_directory_keeps_the_trailing_space_of_its_name() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let (folder, runtimes) = managed_bot(workspace.path(), bot);
+        let run = folder.join("run");
+        let run_space = folder.join("run ");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::create_dir(&run_space).unwrap();
+        let config = channel_config(workspace.path());
+
+        let answer = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Action {
+                id: 1,
+                bot: bot.to_string(),
+                action: WireAction::WriteFile {
+                    path: "note.txt".to_owned(),
+                    content: "space".to_owned(),
+                },
+                working_dir: Some(run_space.to_string_lossy().into_owned()),
+                access: AccessFrame::default(),
+                env: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                answer,
+                DeviceFrame::Result {
+                    status: ActionStatus::Succeeded,
+                    ..
+                }
+            ),
+            "{answer:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(run_space.join("note.txt")).unwrap(),
+            "space"
+        );
+        assert!(
+            !run.join("note.txt").exists(),
+            "the trailing space must not be trimmed into the other folder"
         );
     }
 

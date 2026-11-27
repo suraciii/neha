@@ -654,18 +654,45 @@ fn checked_grant(path: &std::path::Path) -> Result<String> {
     Ok(folder.to_string_lossy().into_owned())
 }
 
-/// Returns the folder a revoke names.
+/// Returns the folder a revoke names, preferring the path the record shows.
 ///
-/// A grant stores a folder's canonical path, so a revoke reads the path the
-/// way a grant does while the folder still exists: the same argument removes
-/// the grant a symlink path added. A folder that is gone is matched by the
-/// value the record holds, which is all a lexical path can name.
-fn revocable_grant(path: &std::path::Path) -> Result<String> {
+/// A grant stores a folder's canonical path. A path the record still shows is
+/// removed exactly as recorded, so a folder that later became a symlink
+/// revokes its own grant instead of the link's target. Only when no recorded
+/// grant names the path does a live path get resolved as an alias — the same
+/// argument then removes the grant a symlink path added — and a path that is
+/// gone is matched by the value the record holds.
+fn revocable_grant(path: &std::path::Path, shown: &[String]) -> Result<String> {
     let normalized = normalized_grant(path)?;
-    match std::fs::canonicalize(&normalized) {
-        Ok(folder) => Ok(folder.to_string_lossy().into_owned()),
-        Err(_) => Ok(normalized),
+    if let Some(recorded) = recorded_grant(shown, &normalized) {
+        return Ok(recorded);
     }
+    let Ok(alias) = std::fs::canonicalize(&normalized) else {
+        return Ok(normalized);
+    };
+    let alias = alias.to_string_lossy().into_owned();
+    if let Some(recorded) = recorded_grant(shown, &alias) {
+        return Ok(recorded);
+    }
+
+    Ok(alias)
+}
+
+/// Returns the recorded grant that names one folder, if the Bot has it.
+fn recorded_grant(shown: &[String], folder: &str) -> Option<String> {
+    let folder = recorded_form(folder);
+    shown
+        .iter()
+        .find(|grant| recorded_form(grant) == folder)
+        .cloned()
+}
+
+/// Returns one grant path in the form a comparison reads it.
+///
+/// A stored path keeps every component exactly; a path a User typed is trimmed
+/// at the CLI boundary before it gets here.
+fn recorded_form(grant: &str) -> String {
+    neha::folder::normalize_recorded(grant).unwrap_or_else(|_| grant.trim().to_owned())
 }
 
 /// A Bot update that changes nothing yet, for a caller to name its one change.
@@ -813,7 +840,16 @@ async fn bot(command: BotCommand) -> Result<()> {
             print_access(&result)?;
         }
         BotCommand::Revoke { bot, path } => {
-            let revoked = revocable_grant(&path)?;
+            // Which recorded grant this path names is read first; the change
+            // itself stays one atomic remove command.
+            let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
+            let shown: Vec<String> = shown["bot"]["grants"]
+                .as_array()
+                .context("the answer has no grants")?
+                .iter()
+                .map(|grant| grant.as_str().unwrap_or_default().to_owned())
+                .collect();
+            let revoked = revocable_grant(&path, &shown)?;
             let result = update_access(
                 &credential,
                 BotUpdate {
@@ -3170,15 +3206,83 @@ mod tests {
                 .to_string_lossy()
                 .into_owned()
         );
-        assert_eq!(revocable_grant(&link).unwrap(), granted);
+        assert_eq!(
+            revocable_grant(&link, std::slice::from_ref(&granted)).unwrap(),
+            granted
+        );
 
         // A folder that is gone has no target to read, so the recorded value
         // is what a revoke names.
         std::fs::remove_file(&link).unwrap();
         std::fs::remove_dir(&real).unwrap();
         assert_eq!(
-            revocable_grant(&std::path::PathBuf::from(&granted)).unwrap(),
+            revocable_grant(
+                &std::path::PathBuf::from(&granted),
+                std::slice::from_ref(&granted)
+            )
+            .unwrap(),
             granted
+        );
+    }
+
+    #[test]
+    fn a_revoke_removes_the_recorded_grant_a_later_link_points_elsewhere() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let first_grant = checked_grant(&first).unwrap();
+        let second_grant = checked_grant(&second).unwrap();
+        let shown = vec![first_grant.clone(), second_grant.clone()];
+
+        // The granted folder may become a symlink to another granted folder
+        // after it was recorded. The record's own path is what the revoke
+        // names, so the other grant is not removed instead.
+        std::fs::rename(&first, directory.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&second, &first).unwrap();
+        assert_eq!(
+            revocable_grant(&first, &shown).unwrap(),
+            first_grant,
+            "the recorded path wins over the link's target"
+        );
+        assert_eq!(
+            revocable_grant(&second, &shown).unwrap(),
+            second_grant,
+            "a path the record shows is removed exactly as recorded"
+        );
+
+        // An ancestor that becomes a symlink does not redirect the revoke
+        // either: the record's path is matched before anything is resolved.
+        let nested_parent = directory.path().join("nested");
+        let nested = nested_parent.join("shared");
+        std::fs::create_dir_all(&nested).unwrap();
+        let nested_grant = checked_grant(&nested).unwrap();
+        std::fs::rename(&nested_parent, directory.path().join("nested-moved")).unwrap();
+        let other_parent = directory.path().join("other-parent");
+        std::fs::create_dir_all(other_parent.join("shared")).unwrap();
+        std::os::unix::fs::symlink(&other_parent, &nested_parent).unwrap();
+        assert_eq!(
+            revocable_grant(&nested, std::slice::from_ref(&nested_grant)).unwrap(),
+            nested_grant,
+            "a link above the granted folder does not change what was recorded"
+        );
+
+        // A path no grant shows is read as an alias while it exists, so the
+        // grant a symlink path added is still reachable.
+        let alias = directory.path().join("alias");
+        std::os::unix::fs::symlink(&second, &alias).unwrap();
+        assert_eq!(
+            revocable_grant(&alias, &shown).unwrap(),
+            second_grant,
+            "an alias resolves to the recorded folder"
+        );
+        // A path no grant shows and no folder names is sent as the User
+        // spelled it, so the Space refuses it with the name the User used.
+        let missing = directory.path().join("missing");
+        assert_eq!(
+            revocable_grant(&missing, &shown).unwrap(),
+            missing.to_string_lossy().into_owned()
         );
     }
 

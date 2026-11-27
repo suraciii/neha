@@ -485,12 +485,17 @@ impl LocalRuntime {
 
         let mut roots = Vec::new();
         for grant in grants {
+            // The Space already trimmed the grant at the edge where the owner
+            // typed it and folds the path without touching component names
+            // (`logs ` and `logs` stay two folders). Trimming again here would
+            // grant the wrong folder for a name with a trailing space.
+            //
             // Open first, then judge the descriptor: a path replaced between a
             // check and the open could otherwise point the grant somewhere
-            // else. The open never blocks and requires a directory, so a path
-            // swapped or turned into a FIFO after the Space's check cannot
-            // stall the daemon here.
-            let Ok((root, file)) = open_write_root(grant.trim()) else {
+            // else. The open never blocks, requires a directory at every
+            // component, and follows no symlink, so a grant that is or became
+            // a link is skipped instead of authorizing the link's target.
+            let Ok((root, file)) = open_write_root(grant) else {
                 continue;
             };
             if self.is_hidden(&root) || self.is_denied(&root) {
@@ -535,10 +540,18 @@ impl LocalRuntime {
         directory: &str,
         full_access: bool,
     ) -> Result<(PathBuf, std::fs::File), RuntimeError> {
-        let shown = directory.trim();
-        let (path, file) = open_write_root(shown).map_err(|error| {
+        // As with a grant, the Space hands over an already normalized path:
+        // this edge trims nothing, so a name with a trailing space still names
+        // its own folder.
+        let (path, file) = open_write_root(directory).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotADirectory {
-                RuntimeError::Access(format!("the working directory is not a folder: {shown}"))
+                RuntimeError::Access(format!(
+                    "the working directory is not a folder: {directory}"
+                ))
+            } else if is_symlink_error(&error) {
+                RuntimeError::Access(format!(
+                    "the working directory uses a symlink, which is not followed: {directory}"
+                ))
             } else {
                 RuntimeError::Io(error)
             }
@@ -1186,7 +1199,11 @@ impl LocalRuntime {
             Err(error) => return ActionResult::failed(format!("cannot start a shell: {error}")),
         };
         let pid = child.id();
-        let _in_flight = InFlight::start(&self.in_flight, pid);
+        // The guard owns the shell until this task disarms it after its own
+        // cleanup. A future dropped mid-run (a closed channel, a shut-down
+        // worker) then finds the pid still registered and ends the whole
+        // process tree before the child below it is released.
+        let mut in_flight = InFlight::start(&self.in_flight, pid);
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let stdout_task = stdout.map(|stdout| tokio::spawn(read_bounded(stdout)));
@@ -1198,6 +1215,7 @@ impl LocalRuntime {
             Ok(Ok(status)) => Some(status),
             Ok(Err(error)) => {
                 kill_tree(pid);
+                in_flight.disarm();
                 return ActionResult::failed(format!("the shell failed: {error}"));
             }
             Err(_) => {
@@ -1210,8 +1228,10 @@ impl LocalRuntime {
         // The shell may have left children holding the pipes open. The
         // command is over, so the group goes; the readers then drain what
         // the pipes still hold. A full-access shell's wrapper has already
-        // ended the descendants that left its process group.
+        // ended the descendants that left its process group. The tree is
+        // cleaned here, so the guard no longer owns it.
         kill_group(pid);
+        in_flight.disarm();
         let grace = if timed_out {
             DRAIN_GRACE
         } else {
@@ -1936,29 +1956,63 @@ fn open_directory_path(_path: &Path) -> std::io::Result<std::fs::File> {
     ))
 }
 
-/// Opens one folder writes may reach and names it by its descriptor.
+/// Opens one folder writes may reach and names it by its lexical path.
 ///
-/// The open does not block on a FIFO and requires a directory, and the path is
-/// read back from the descriptor: a rename after the open cannot make the root
-/// name something else.
+/// Every component is opened from `/` without following a symlink and must be a
+/// directory, so a grant that is or became a link (or sits below one) opens
+/// nothing and authorizes nothing: the link's target is never a write root. A
+/// path that fails to open is skipped by the caller. The descriptors name the
+/// opened directories, so a rename after the open cannot make the root name
+/// something else.
 #[cfg(unix)]
 fn open_write_root(directory: &str) -> std::io::Result<(PathBuf, std::fs::File)> {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
 
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_DIRECTORY)
-        .open(directory)?;
+    let path = normalize_path(Path::new(directory));
+    if !path.is_absolute() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("a write root must be an absolute folder: {directory}"),
+        ));
+    }
+    let mut file = open_directory_path(Path::new("/"))?;
+    let mut components = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .peekable();
+    while let Some(name) = components.next() {
+        // A component on the way to the granted folder only has to be
+        // traversable, as in a plain path lookup; the folder itself is opened
+        // as a readable directory. Neither follows a symlink.
+        file = if components.peek().is_some() {
+            open_traversal_at(&file, name)?
+        } else {
+            open_directory_at(&file, name)?
+        };
+    }
     // The shell moves the Bot's folder descriptor to a fixed one-digit number.
     // A root that landed there is moved to another descriptor so the two
     // mounts can never name each other.
     while file.as_raw_fd() == MOUNT_FD {
         file = file.try_clone()?;
     }
-    let path = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
 
     Ok((path, file))
+}
+
+/// Returns whether an open failed because a component is a symlink.
+#[cfg(unix)]
+fn is_symlink_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(libc::ELOOP)
+}
+
+/// A system without descriptor-relative opens has no symlink error to name.
+#[cfg(not(unix))]
+fn is_symlink_error(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// A real Computer runs only on Unix, where a write root can be a descriptor.
@@ -2074,6 +2128,43 @@ fn c_name(name: &std::ffi::OsStr) -> Result<std::ffi::CString, String> {
 
     std::ffi::CString::new(name.as_bytes())
         .map_err(|_| format!("the path contains a NUL byte: {}", name.to_string_lossy()))
+}
+
+/// Opens one intermediate directory of a write root without following a
+/// symlink.
+///
+/// On Linux this uses `O_PATH`: the component is only traversed, never read, so
+/// a granted folder below an execute-only ancestor still opens as it did with a
+/// plain path lookup. Other Unix systems open it as a directory instead.
+#[cfg(target_os = "linux")]
+fn open_traversal_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    let name = c_name(name)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    // SAFETY: `parent` is a live directory descriptor and `name` is
+    // NUL-terminated; a successful return is a fresh descriptor this function
+    // owns.
+    let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+/// Opens one intermediate directory of a write root without following a
+/// symlink, on a Unix without `O_PATH`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_traversal_at(
+    parent: &std::fs::File,
+    name: &std::ffi::OsStr,
+) -> std::io::Result<std::fs::File> {
+    open_directory_at(parent, name)
 }
 
 /// Opens one subdirectory of `parent` without following a symlink.
@@ -2248,14 +2339,29 @@ impl<'a> InFlight<'a> {
         slot.store(pid, Ordering::SeqCst);
         Self { slot, pid }
     }
+
+    /// Marks the shell finished and its process tree already cleaned by the
+    /// caller, so dropping the guard kills nothing.
+    fn disarm(&mut self) {
+        let _ = self
+            .slot
+            .compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+    }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        // A cancel may have taken the slot first; only clear our own pid.
-        let _ = self
+        // Whoever takes the pid from the slot owns the cleanup: the running
+        // task disarms after its own kill, a cancel takes the slot first, and
+        // a future dropped mid-run lands here. A second taker sees the slot
+        // empty and does nothing, so every path cleans once.
+        if self
             .slot
-            .compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst);
+            .compare_exchange(self.pid, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            kill_tree(Some(self.pid));
+        }
     }
 }
 
@@ -2590,7 +2696,7 @@ mod tests {
 
     use super::{
         DEFAULT_TIMEOUT, LocalRuntime, MAX_SCAN_DEPTH, Mode, RuntimeError, open_directory_path,
-        sandbox_args,
+        open_write_root, sandbox_args,
     };
     use crate::action::{Action, ActionStatus, ByteError, ComputerRuntime};
 
@@ -4567,6 +4673,210 @@ mod tests {
         );
     }
 
+    /// A grant that is a symlink, or sits below one, authorizes nothing: the
+    /// link's target is never opened as a write root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_grant_authorizes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let target = directory.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+
+        // The grant itself is a link to the folder the owner did not grant.
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let runtime = file_runtime_without_hidden(&root)
+            .with_machine_access(false, &[link.to_string_lossy().into_owned()], None)
+            .unwrap();
+        assert!(
+            runtime.write_roots.is_empty(),
+            "a symlinked grant must not become a write root"
+        );
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: link.join("escaped.txt").to_string_lossy().into_owned(),
+                content: "no".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Failed, "{written:?}");
+        assert!(!target.join("escaped.txt").exists());
+
+        // A grant below a symlinked ancestor of the granted folder names the
+        // link's target too, so it is refused the same way.
+        let real = directory.path().join("real");
+        let nested = real.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let ancestor = directory.path().join("ancestor");
+        std::os::unix::fs::symlink(&real, &ancestor).unwrap();
+        let runtime = file_runtime_without_hidden(&root)
+            .with_machine_access(
+                false,
+                &[ancestor.join("nested").to_string_lossy().into_owned()],
+                None,
+            )
+            .unwrap();
+        assert!(runtime.write_roots.is_empty());
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: ancestor
+                    .join("nested/escaped.txt")
+                    .to_string_lossy()
+                    .into_owned(),
+                content: "no".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Failed, "{written:?}");
+        assert!(!nested.join("escaped.txt").exists());
+    }
+
+    /// A grant below an execute-only ancestor still opens: walking to a folder
+    /// never required reading its ancestors, and the security fix must not
+    /// change that.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_grant_below_an_execute_only_ancestor_still_opens() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let ancestor = directory.path().join("ancestor");
+        let granted = ancestor.join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o111)).unwrap();
+        let opened = open_write_root(granted.to_str().unwrap())
+            .expect("a traversable ancestor is not a grant error");
+        assert_eq!(opened.0, granted);
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A granted shell never mounts a symlinked grant: the fence's write roots
+    /// come from the descriptors opened above, not from the link's target.
+    #[tokio::test]
+    async fn a_real_shell_cannot_write_through_a_symlinked_grant() {
+        if !bwrap_enabled() {
+            return;
+        }
+        let directory = outside_tempdir();
+        let target = directory.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(false, &[link.to_string_lossy().into_owned()], None)
+            .unwrap();
+        assert!(runtime.write_roots.is_empty());
+
+        let shell = runtime
+            .execute(Action::Shell {
+                command: format!("printf escaped > {}/escaped.txt", link.display()),
+            })
+            .await;
+        assert_eq!(shell.status, ActionStatus::Failed, "{shell:?}");
+        assert!(!target.join("escaped.txt").exists());
+    }
+
+    /// The normalized grant and run directory cross the channel with their
+    /// component names intact, so `logs` and `logs ` stay two folders and a
+    /// write lands in the one the owner named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grant_keeps_the_trailing_space_of_its_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let logs = directory.path().join("logs");
+        let logs_space = directory.path().join("logs ");
+        std::fs::create_dir(&logs).unwrap();
+        std::fs::create_dir(&logs_space).unwrap();
+
+        let runtime = file_runtime_without_hidden(&root)
+            .with_machine_access(false, &[logs_space.to_string_lossy().into_owned()], None)
+            .unwrap();
+        assert_eq!(runtime.write_roots.len(), 1);
+        assert_eq!(
+            std::fs::canonicalize(&runtime.write_roots[0].0).unwrap(),
+            std::fs::canonicalize(&logs_space).unwrap()
+        );
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: logs_space.join("note.txt").to_string_lossy().into_owned(),
+                content: "space".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(logs_space.join("note.txt")).unwrap(),
+            "space"
+        );
+        assert!(
+            !logs.join("note.txt").exists(),
+            "the trailing space must not be trimmed into the other folder"
+        );
+
+        // The same holds for the directory a run names.
+        let run = directory.path().join("run");
+        let run_space = directory.path().join("run ");
+        std::fs::create_dir(&run).unwrap();
+        std::fs::create_dir(&run_space).unwrap();
+        let runtime = file_runtime_without_hidden(&root)
+            .with_machine_access(false, &[], Some(run_space.to_str().unwrap()))
+            .unwrap();
+        let written = runtime
+            .execute(Action::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "run".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(run_space.join("note.txt")).unwrap(),
+            "run"
+        );
+        assert!(!run.join("note.txt").exists());
+    }
+
+    /// Dropping a running shell future (the worker is shut down mid-action)
+    /// ends the command's whole process tree, including a descendant in its own
+    /// process group, before the child is released.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn dropping_a_shell_future_ends_its_process_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let runtime = full_access_runtime(&root, &root);
+        let started = directory.path().join("started");
+        let alive = directory.path().join("alive");
+        let command = format!(
+            "setsid sh -c 'sleep 0.6; echo alive > {}' >/dev/null 2>&1 & \
+             echo started > {}; sleep 30",
+            alive.display(),
+            started.display()
+        );
+        let mut running = Box::pin(runtime.execute(Action::Shell { command }));
+        for _ in 0..400 {
+            if started.exists() {
+                break;
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut running)
+                    .await
+                    .is_err(),
+                "the shell ended before the future was dropped"
+            );
+        }
+        assert!(started.exists(), "the shell started");
+
+        drop(running);
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !alive.exists(),
+            "a dropped shell future ends the whole process tree"
+        );
+    }
+
     #[tokio::test]
     async fn a_hard_link_in_a_grant_is_not_writable_by_the_shell() {
         if !bwrap_enabled() {
@@ -4966,11 +5276,14 @@ mod tests {
                 Some(inside_grant.to_str().unwrap()),
             )
             .unwrap();
-        let canonical_granted = std::fs::canonicalize(&granted).unwrap();
-        let canonical_inside = std::fs::canonicalize(&inside_grant).unwrap();
+        // The roots are named by the lexical path the Space sent, so compare
+        // the folders they open, not the spelling.
+        let opened = |root: &std::path::Path| {
+            std::fs::canonicalize(root).expect("the write root names a real folder")
+        };
         assert_eq!(runtime.write_roots.len(), 2);
-        assert_eq!(runtime.write_roots[0].0, canonical_granted);
-        assert_eq!(runtime.write_roots[1].0, canonical_inside);
+        assert_eq!(opened(&runtime.write_roots[0].0), opened(&granted));
+        assert_eq!(opened(&runtime.write_roots[1].0), opened(&inside_grant));
 
         // Of two roots, the outer one covers the inner one for the shell, but
         // both stay as file-tool candidates because the outer scan may fail.
@@ -4991,13 +5304,13 @@ mod tests {
             runtime
                 .write_roots
                 .iter()
-                .any(|(path, _)| path == &canonical_granted)
+                .any(|(path, _)| opened(path) == opened(&granted))
         );
         assert!(
             runtime
                 .write_roots
                 .iter()
-                .any(|(path, _)| path == &std::fs::canonicalize(&inner).unwrap())
+                .any(|(path, _)| opened(path) == opened(&inner))
         );
     }
 

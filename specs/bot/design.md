@@ -52,6 +52,10 @@ A run stops between two actions when it waits for an Approval or an answer, when
 
 A Hosted Computer's recovery, reset, or replacement stops its runs between two actions before its saved Workspace is replaced.
 
+A run records the access it starts with, so a resumed run keeps the access it began with even after the owner changes the Bot's access.
+
+A run recorded before the Space kept that snapshot resumes with conservative granted access: no full access and no grants. Such a run writes only its Workspace and the working directory it named.
+
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 
 ## Approvals
@@ -67,6 +71,8 @@ Only a `write_file` of a Bot with granted folders raises that approval, and only
 A shell that writes outside the range is refused by the Computer's fence instead of being asked about.
 
 An Always allow on that approval grants the action's folder for later runs. The first action of a Local Computer can ask with that reason and shows no Always allow.
+
+A card whose folder no grant can store — a `..` climb, a relative form, or a NUL — also shows no Always allow, and the Space refuses `--always` for it; the action itself still runs once when allowed.
 
 A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
 

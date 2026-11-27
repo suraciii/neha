@@ -2114,6 +2114,115 @@ async fn a_runs_directory_is_writable_for_that_run_alone() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_folder_name_that_ends_in_a_space_keeps_its_name() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-space-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch directory outside /tmp");
+    // `logs` and `logs ` are two folders. The Space trims and folds a raw path
+    // at the edge where the User typed it; every layer after that must keep
+    // each component exactly, or the write below lands in the other folder.
+    let scratch = tempfile::Builder::new()
+        .prefix("neha-e2e-space-name-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch folder outside the Computer's own folders");
+    let plain = scratch.path().join("logs");
+    let spaced = scratch.path().join("logs ");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::create_dir(&spaced).unwrap();
+    // A trailing `.` keeps the space inside the string while the User types
+    // it: the Space trims the raw path at its boundary and folds the `.` away,
+    // so this spelling names the folder whose name ends in a space.
+    let spaced_spelling = format!("{}/.", spaced.display());
+    let computer = local_computer(directory, &base, &script);
+
+    // A run's working directory keeps its name.
+    script.call("shell", serde_json::json!({"command": "pwd > where.txt"}));
+    script.say("I worked in the folder.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "--cwd",
+            &spaced_spelling,
+            "where are you?",
+        ],
+    );
+    assert!(sent.contains("I worked in the folder"), "{sent}");
+    let written = spaced.join("where.txt");
+    wait_until("the shell to write in the folder with the space", || {
+        written.exists()
+    });
+    assert_eq!(
+        std::fs::read_to_string(&written)
+            .unwrap()
+            .trim_end_matches('\n'),
+        spaced.to_str().unwrap(),
+        "the run works in the folder its name shows"
+    );
+    assert!(
+        !plain.join("where.txt").exists(),
+        "the folder whose name has no space must stay untouched"
+    );
+
+    // A granted folder keeps its name the same way.
+    let granted = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "grant", &computer.bot, &spaced_spelling],
+    );
+    assert!(
+        granted.contains(&format!("grant {}", spaced.display())),
+        "the grant keeps the folder's name: {granted}"
+    );
+    script.call(
+        "shell",
+        serde_json::json!({"command": format!("printf granted > '{}'/granted.txt", spaced.display())}),
+    );
+    script.say("The grant let me write.");
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &computer.chat,
+            "write in the granted folder",
+        ],
+    );
+    assert!(sent.contains("The grant let me write"), "{sent}");
+    assert_eq!(
+        std::fs::read_to_string(spaced.join("granted.txt")).unwrap(),
+        "granted"
+    );
+    assert!(
+        !plain.join("granted.txt").exists(),
+        "the grant must not open the folder whose name has no space"
+    );
+    let access = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "access", &computer.bot],
+    );
+    assert!(
+        access.contains(&format!("grant {}", spaced.display())),
+        "the access listing shows the folder's real name: {access}"
+    );
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_full_access_writes_outside_the_workspace_until_it_is_turned_off() {
     if !local_computer_ready() {
         return;
@@ -2335,6 +2444,31 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     assert!(
         revoked.contains("grants: none"),
         "the same symlink revokes its grant: {revoked}"
+    );
+
+    // A granted folder may become a symlink to another granted folder after
+    // it was recorded. Revoking the recorded path takes that grant away, not
+    // the folder the link now names.
+    let first_folder = directory.path().join("first-folder");
+    let second_folder = directory.path().join("second-folder");
+    std::fs::create_dir(&first_folder).unwrap();
+    std::fs::create_dir(&second_folder).unwrap();
+    let first_path = first_folder.to_str().unwrap().to_owned();
+    let second_path = second_folder.to_str().unwrap().to_owned();
+    for path in [&first_path, &second_path] {
+        let granted = run(&home, &credential, &["bot", "grant", &bot, path]);
+        assert!(granted.contains(&format!("grant {path}")), "{granted}");
+    }
+    std::fs::rename(&first_folder, directory.path().join("moved-folder")).unwrap();
+    std::os::unix::fs::symlink(&second_folder, &first_folder).unwrap();
+    let revoked = run(&home, &credential, &["bot", "revoke", &bot, &first_path]);
+    assert!(
+        revoked.contains(&format!("grant {second_path}")),
+        "the other grant must survive: {revoked}"
+    );
+    assert!(
+        !revoked.contains(&format!("grant {first_path}")),
+        "the recorded grant is removed, not the link's target: {revoked}"
     );
 
     // Two grants that arrive together both survive: each command adds to the

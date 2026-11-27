@@ -19,7 +19,7 @@ use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{
     ActionStatus as RecordedActionStatus, ApprovalReason, Author, Event, EventDraft, EventKind,
-    FileAdded, RuleEffect, Undoability,
+    FULL_ACCESS_CONSENT_VERSION, FileAdded, RuleEffect, Undoability,
 };
 use neha::seq::Seq;
 use neha::surface::{
@@ -163,6 +163,11 @@ pub struct CommandContext<'a> {
     /// Serializes answers and rule changes, so two clients cannot decide one
     /// approval or add one rule twice.
     pub approvals: &'a tokio::sync::Mutex<()>,
+    /// The run queue. A command that changes a Bot's authority takes the Bot's
+    /// admit lock, so its read and its event cannot interleave with a run
+    /// start's read and event: the record's order then decides which access a
+    /// run pins.
+    pub runs: &'a crate::runs::RunQueue,
     /// The live event stream a command may broadcast on.
     pub events: &'a tokio::sync::broadcast::Sender<Event>,
 }
@@ -386,6 +391,11 @@ async fn approval_decide(
         ));
     }
 
+    // The read of the Bot's grants and the events this answer writes must not
+    // interleave with a run start's read and start event: hold the Bot's admit
+    // lock in the same order a Bot update takes it.
+    let _admit = context.runs.admit(view.bot).await;
+
     // A lasting answer records the derived rule in the same transaction, and
     // the decision names it.
     let lasting_grant = if lasting && view.reason == ApprovalReason::Grant {
@@ -401,6 +411,15 @@ async fn approval_decide(
     if lasting && view.reason == ApprovalReason::Grant && lasting_grant.is_none() {
         return Err(ApiError::invalid_argument(
             "the action has no folder that can become a lasting grant",
+        ));
+    }
+    if let Some(folder) = &lasting_grant
+        && !persistable_grant(folder)
+    {
+        // A card written before the folder rule was checked can name a folder
+        // no grant may carry; only the one action is allowed then.
+        return Err(ApiError::invalid_argument(
+            "this grant cannot become lasting",
         ));
     }
     let lasting_rule = if lasting && view.reason != ApprovalReason::Grant {
@@ -503,7 +522,7 @@ async fn approval_decide(
                 .bots
                 .get(&view.bot)
                 .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
-            grants_with(&bot.grants, folder)
+            grants_with(&bot.grants, folder)?
         };
         result["grant"] = json!(folder);
         drafts.push(EventDraft::new(
@@ -899,9 +918,11 @@ async fn provider_add(
 /// Returns one grant in the form the Space stores and shows.
 ///
 /// A grant names one absolute folder; the same rule reads a grant added, a
-/// grant removed, and a whole list the owner sends.
+/// grant removed, and a whole list the owner sends. The CLI normalizes the raw
+/// path where the owner typed it, so the value that crosses the wire keeps its
+/// component names exactly (a last component may end in a space).
 fn checked_grant(grant: &str) -> Result<String, ApiError> {
-    neha::folder::normalize_folder(grant).map_err(|error| match error {
+    neha::folder::normalize_recorded(grant).map_err(|error| match error {
         neha::folder::FolderError::Empty => ApiError::invalid_argument("a grant cannot be empty"),
         neha::folder::FolderError::Relative => {
             ApiError::invalid_argument("a grant must be an absolute folder path")
@@ -916,13 +937,14 @@ fn checked_grant(grant: &str) -> Result<String, ApiError> {
 /// Returns a Bot's grants in the one form a new grant is compared against.
 ///
 /// A record written before the fold may hold another spelling of a folder, so
-/// the list is normalized before an add or a remove looks a folder up.
+/// the list is normalized before an add or a remove looks a folder up. The
+/// names themselves are kept exactly: trimming a last component that ends in a
+/// space would compare — and record — another folder. A value that cannot be
+/// normalized at all is left as recorded, so a write never silently drops it.
 fn normalized_grants(grants: &[String]) -> Vec<String> {
     let mut grants: Vec<String> = grants
         .iter()
-        .map(|grant| {
-            neha::folder::normalize_folder(grant).unwrap_or_else(|_| grant.trim().to_owned())
-        })
+        .map(|grant| neha::folder::normalize_recorded(grant).unwrap_or_else(|_| grant.clone()))
         .collect();
     grants.sort();
     grants.dedup();
@@ -930,15 +952,19 @@ fn normalized_grants(grants: &[String]) -> Vec<String> {
 }
 
 /// Returns a Bot's grants with one lasting grant added.
-fn grants_with(grants: &[String], folder: &str) -> Vec<String> {
+///
+/// A folder no grant may carry is refused here, before the answer records
+/// anything: a lasting answer that cannot widen access must not report that it
+/// did.
+fn grants_with(grants: &[String], folder: &str) -> Result<Vec<String>, ApiError> {
     let mut grants = normalized_grants(grants);
-    if let Ok(folder) = checked_grant(folder)
-        && !grants.contains(&folder)
-    {
+    let folder = checked_grant(folder)?;
+    if !grants.contains(&folder) {
         grants.push(folder);
         grants.sort();
     }
-    grants
+
+    Ok(grants)
 }
 
 async fn bot_update(
@@ -990,6 +1016,10 @@ async fn bot_update(
     // change. The lock is the one an approval's lasting grant takes, so a
     // decision and an update cannot write the same list twice.
     let _decisions = context.approvals.lock().await;
+    // A run start snapshots the Bot's access under its admit lock; take the
+    // same lock for the read and the event, so the record's order decides
+    // whether a starting run keeps an access this command is removing.
+    let _admit = context.runs.admit(update.bot).await;
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
@@ -1031,6 +1061,12 @@ async fn bot_update(
         if let Some(full_access) = update.full_access {
             bot.full_access = full_access;
             data["full_access"] = json!(full_access);
+            if full_access {
+                // Full access takes the machine user's rights; the record
+                // keeps the owner's answer that allowed it, so an older record
+                // can never widen access on replay.
+                data["full_access_version"] = json!(FULL_ACCESS_CONSENT_VERSION);
+            }
         }
         if let Some(grants) = grants {
             bot.grants = grants.clone();
@@ -1705,7 +1741,16 @@ pub async fn resume_pending(
     };
 
     let computer = run.computer.unwrap_or(bot.computer);
-    let access = pinned_access(run, &bot);
+    let access = if run.started.is_none() {
+        // The run has not started: the start records the Bot's current access
+        // under the Bot's admit lock.
+        crate::state::AccessView {
+            full_access: bot.full_access,
+            grants: bot.grants.clone(),
+        }
+    } else {
+        pinned_access(run)
+    };
 
     Ok(PendingRun {
         run: run.id,
@@ -2288,14 +2333,17 @@ fn bot_environment(
 
 /// The access one run's actions carry, fixed when the run started.
 ///
-/// A record written before the access event existed has none pinned, and the
-/// Bot's current access answers for that run.
-fn pinned_access(run: &crate::state::RunView, bot: &BotView) -> crate::state::AccessView {
+/// A record written before the access event existed has none pinned. It
+/// continues with the conservative granted access: no full access and no
+/// grants, so an old record cannot widen what its run reaches. A run that has
+/// not started yet names the Bot's current access instead, because its start
+/// records that snapshot.
+fn pinned_access(run: &crate::state::RunView) -> crate::state::AccessView {
     run.access
         .clone()
         .unwrap_or_else(|| crate::state::AccessView {
-            full_access: bot.full_access,
-            grants: bot.grants.clone(),
+            full_access: false,
+            grants: Vec::new(),
         })
 }
 
@@ -3654,6 +3702,7 @@ impl Recorder for RunRecorder<'_> {
                 } else {
                     grant
                         .as_ref()
+                        .filter(|(folder, _)| persistable_grant(folder))
                         .map(|(folder, scope)| format!("{scope} under {folder}"))
                 }
             }
@@ -4156,6 +4205,16 @@ fn derived_rule(
     }
 }
 
+/// Returns whether a card's folder can become a lasting grant.
+///
+/// The folder must be exactly a folder a grant stores: a `..` climb, a
+/// relative form, or a NUL cannot be recorded. A card for such a folder allows
+/// the one action and offers no Always allow, matching the fail-closed rule a
+/// lasting rule derivation uses.
+fn persistable_grant(folder: &str) -> bool {
+    neha::folder::normalize_recorded(folder).is_ok_and(|normalized| normalized == folder)
+}
+
 /// Returns the folder a write action needs granted, when the owner has not
 /// already granted it.
 ///
@@ -4617,11 +4676,12 @@ mod tests {
 
     use super::{
         LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
-        grant_folder, lasting_rule_path_at, path_covers, path_matches, path_matches_at,
-        path_parent, prepare_recovery, prepare_resume, resolve_action_path, rule_covers,
-        rule_matches, run_access, under_root, verify_recovered_action,
+        grant_folder, grants_with, lasting_rule_path_at, normalized_grants, path_covers,
+        path_matches, path_matches_at, path_parent, persistable_grant, pinned_access,
+        prepare_recovery, prepare_resume, resolve_action_path, rule_covers, rule_matches,
+        run_access, under_root, verify_recovered_action,
     };
-    use crate::state::RuleView;
+    use crate::state::{AccessView, RuleView};
     use neha::id::Id;
     use neha::record::RuleEffect;
     use neha::seq::Seq;
@@ -4653,6 +4713,105 @@ mod tests {
             full_access,
             grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
         }
+    }
+
+    fn run_view(access: Option<AccessView>) -> crate::state::RunView {
+        crate::state::RunView {
+            id: Id::new(),
+            chat: Id::new(),
+            bot: Id::new(),
+            acting: Id::new(),
+            command: Id::new(),
+            message: Id::new(),
+            seq: Seq::from_i64(1).unwrap(),
+            started: Some(Seq::from_i64(2).unwrap()),
+            status: crate::state::RunStatus::Running,
+            reply: None,
+            usage: None,
+            error: None,
+            approval: None,
+            cwd: None,
+            once_grant: None,
+            computer: None,
+            access,
+            steps: Vec::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_run_without_a_pinned_access_resumes_granted() {
+        // A record written before the access event existed cannot restore what
+        // it once had; the run continues with the conservative granted access.
+        assert_eq!(
+            pinned_access(&run_view(None)),
+            AccessView {
+                full_access: false,
+                grants: Vec::new(),
+            }
+        );
+        assert_eq!(
+            pinned_access(&run_view(Some(AccessView {
+                full_access: true,
+                grants: vec!["/data/shared".to_owned()],
+            }))),
+            AccessView {
+                full_access: true,
+                grants: vec!["/data/shared".to_owned()],
+            },
+            "a pinned access is never replaced by the fallback"
+        );
+    }
+
+    #[test]
+    fn only_a_storable_folder_can_become_a_lasting_grant() {
+        assert!(persistable_grant("/data/shared"));
+        assert!(persistable_grant("/data/logs /x"));
+        assert!(
+            persistable_grant("/var/tmp/logs "),
+            "a recorded name that ends in a space keeps it"
+        );
+        for unsafe_folder in ["/data/../etc", "relative/dir", "/data\u{0}notes"] {
+            assert!(
+                !persistable_grant(unsafe_folder),
+                "{unsafe_folder:?} must not become a lasting grant"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_grant_keeps_its_component_names_when_compared() {
+        assert_eq!(
+            normalized_grants(&[
+                "/var//tmp/./logs ".to_owned(),
+                "/var/tmp/logs".to_owned(),
+                "/data/../legacy".to_owned(),
+            ]),
+            vec![
+                "/data/../legacy".to_owned(),
+                "/var/tmp/logs".to_owned(),
+                "/var/tmp/logs ".to_owned(),
+            ],
+            "the two folders stay distinct and an unusable value stays recorded"
+        );
+    }
+
+    #[test]
+    fn a_lasting_grant_that_cannot_be_validated_is_refused() {
+        for folder in ["/data/../etc", "relative/dir", "/data\u{0}notes"] {
+            let error = grants_with(&["/data/one".to_owned()], folder)
+                .expect_err("an invalid folder must not be recorded");
+            assert_eq!(error.code(), neha::error::ErrorCode::InvalidArgument);
+        }
+        assert_eq!(
+            grants_with(&["/data/one".to_owned()], "/data/two").unwrap(),
+            vec!["/data/one".to_owned(), "/data/two".to_owned()]
+        );
+        assert_eq!(
+            grants_with(&["/data/one".to_owned()], "/data/one").unwrap(),
+            vec!["/data/one".to_owned()],
+            "a folder already granted is not recorded twice"
+        );
     }
 
     #[test]

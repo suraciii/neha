@@ -857,6 +857,13 @@ pub enum EventData {
 /// The first version of every event kind.
 pub const KIND_VERSION: u16 = 1;
 
+/// The version of the owner's answer that allows a Bot full access.
+///
+/// Full access takes the machine user's own rights, so the record keeps the
+/// answer that widened it: a record written before this version replays as
+/// granted, and the owner turns full access on again with an explicit answer.
+pub const FULL_ACCESS_CONSENT_VERSION: u16 = 1;
+
 impl EventKind {
     /// Returns the version of this kind this build writes.
     #[must_use]
@@ -1064,6 +1071,13 @@ pub struct BotUpdated {
     /// Whether it may write outside its Workspace fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_access: Option<bool>,
+    /// The version of the owner's answer that allows full access.
+    ///
+    /// Absent in a record written before the answer was versioned; such a
+    /// record replays as granted, and only a new explicit answer turns full
+    /// access on again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_access_version: Option<u16>,
     /// The complete list of extra folders it may write.
     ///
     /// `Some(empty)` removes every grant; `None` leaves them unchanged.

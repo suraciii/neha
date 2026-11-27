@@ -51,7 +51,7 @@ An Always allow covers the same tool and one of these:
 
 An Always allow derives its rule from the action itself: a command gives its first word, a path gives its parent directory, and only an action with neither gives a tool-only rule.
 
-A rule-triggered approval offers no Always allow, and `--always` is refused, when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path. An ambiguous form that can still make a lasting rule does offer Always allow, and that answer removes no rule.
+A rule-triggered approval offers no Always allow, and `--always` is refused, when the action cannot make a lasting rule: a path with a `..` or all-whitespace component, a shell command with no first word, or a file action with no usable path. A folder approval offers no Always allow when the folder no grant can store — a `..` climb, a relative form, or a NUL — and `--always` is refused for it; Allow still runs that one action. An ambiguous form that can still make a lasting rule does offer Always allow, and that answer removes no rule.
 
 For a file at the Workspace root, the covered directory is the Workspace root: relative paths are covered and absolute ones are not. When a rule asks, the card names the scope: `shell commands starting with "printf"`, `files under "logs"`, `files in the Workspace root`, or `all <tool> actions`. The first use of a Local Computer never offers Always allow, and no lasting rule covers it.
 

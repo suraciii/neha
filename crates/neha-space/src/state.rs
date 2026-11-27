@@ -13,7 +13,8 @@ use rand::Rng as _;
 
 use neha::id::Id;
 use neha::record::{
-    ActionStatus, ApprovalReason, Author, Event, EventData, RuleEffect, RunReply, Undoability,
+    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
+    RuleEffect, RunReply, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -697,7 +698,14 @@ impl Projection for State {
                     .get_mut(&data.bot)
                     .ok_or("an updated Bot must exist")?;
                 if let Some(full_access) = data.full_access {
-                    bot.full_access = full_access;
+                    // Full access widened the record without a versioned
+                    // answer before this rule: such a record replays as
+                    // granted, and only the owner's new explicit answer turns
+                    // it on again.
+                    let consented = data
+                        .full_access_version
+                        .is_some_and(|version| version == FULL_ACCESS_CONSENT_VERSION);
+                    bot.full_access = full_access && consented;
                 }
                 if let Some(grants) = data.grants {
                     bot.grants = grants;
@@ -1096,7 +1104,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::{AccessView, RunStatus, State};
+    use super::{AccessView, FULL_ACCESS_CONSENT_VERSION, RunStatus, State};
     use crate::store::Projection as _;
 
     fn event(kind: EventKind, author: Author, data: serde_json::Value, seq: i64) -> Event {
@@ -2024,6 +2032,7 @@ mod tests {
                 serde_json::json!({
                     "bot": bot,
                     "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION,
                     "grants": ["/data/shared"],
                 }),
                 4,
@@ -2086,7 +2095,12 @@ mod tests {
             .apply(&event(
                 EventKind::BotUpdated,
                 Author::User(owner),
-                serde_json::json!({"bot": bot_id, "full_access": true, "grants": ["/etc"]}),
+                serde_json::json!({
+                    "bot": bot_id,
+                    "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION,
+                    "grants": ["/etc"],
+                }),
                 7,
             ))
             .unwrap();
@@ -2122,6 +2136,76 @@ mod tests {
                 ))
                 .is_err(),
             "a run's access needs a run that started"
+        );
+    }
+
+    #[test]
+    fn a_full_access_from_an_old_record_replays_as_granted() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        let user = Author::User(owner);
+
+        // A record written before the owner's answer was versioned never
+        // widens access on replay: the Bot restores as granted.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "full_access": true}),
+                4,
+            ))
+            .unwrap();
+        assert!(
+            !state.bots[&bot].full_access,
+            "an unversioned full access restores as granted"
+        );
+
+        // Only a versioned answer turns it on.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({
+                    "bot": bot,
+                    "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION + 1,
+                }),
+                5,
+            ))
+            .unwrap();
+        assert!(
+            !state.bots[&bot].full_access,
+            "a consent this build does not know restores as granted"
+        );
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({
+                    "bot": bot,
+                    "full_access": true,
+                    "full_access_version": FULL_ACCESS_CONSENT_VERSION,
+                }),
+                6,
+            ))
+            .unwrap();
+        assert!(
+            state.bots[&bot].full_access,
+            "the versioned answer allows it"
+        );
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "full_access": false}),
+                7,
+            ))
+            .unwrap();
+        assert!(
+            !state.bots[&bot].full_access,
+            "turning it off needs no consent"
         );
     }
 
