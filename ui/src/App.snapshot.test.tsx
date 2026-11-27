@@ -53,6 +53,17 @@ function press(view: View, label: string) {
   fireEvent.click(button);
 }
 
+// Types into the composer and sends what it holds.
+function send(view: View, text: string) {
+  flush(() => fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: text } }));
+  fireEvent.submit(element(view, "form.composer"));
+}
+
+// What the composer says about the place its Run holds.
+function queueText(view: View): string | undefined {
+  return view.container.querySelector(".composer__queue")?.textContent ?? undefined;
+}
+
 // What each Chat in the list says about its state.
 function badges(view: View): string[] {
   return Array.from(view.container.querySelectorAll(".conv__badge")).map((badge) => badge.textContent ?? "");
@@ -488,6 +499,39 @@ describe("App with a Chat the Space already knows", () => {
     await drain();
     expect(view.container.textContent).not.toContain("write_file");
     expect(element(view, ".activity__tools").textContent).not.toContain("write_file");
+  });
+
+  it("opens the composer when an idle snapshot lands while a queued Run's read is in flight", async () => {
+    // The Bot has one Run ahead, so the Message the User sends takes the second
+    // place in its queue. The Space says the Chat holds no Run and is idle.
+    space.statuses["h1"] = "idle";
+    space.activeRuns["h1"] = null;
+    space.runs["r9"] = { status: "queued", position: 1 };
+    space.holdRunShow("r1");
+    const view = await openChat();
+
+    // The Message the User sends queues second, and the Chat takes no second
+    // Message while it waits.
+    send(view, "second ask");
+    await waitFor(() => expect(queueText(view)).toBe("Waiting behind 1 request"));
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
+    // The read about the Run that queued is on its way.
+    await waitFor(() => expect(space.runShows).toContain("r1"));
+
+    // The Space's word lands: the Chat holds no Run and is idle. The page lets
+    // go of the follow and the place it held before the read answers.
+    space.resume([]);
+    await waitFor(() => expect(view.container.querySelector(".composer__queue")).toBeNull());
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    expect(view.container.querySelector(".activity__tools")).toBeNull();
+
+    // The read answers late, about a Run the Space no longer names: it must not
+    // put the Chat back to work or close the composer again.
+    space.releaseRunShow("r1");
+    await drain();
+    expect(view.container.querySelector(".composer__queue")).toBeNull();
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
+    expect(view.container.querySelector(".activity__tools")).toBeNull();
   });
 
   it("follows the Run the Bot names, not the one the list named", async () => {

@@ -674,8 +674,14 @@ export default function App() {
         // about.
         followNamed(answered.active_run);
         // A Chat the Space says holds no Run and is idle keeps nothing: the page
-        // lets go of the Runs it still holds for it.
-        if (answered.active_run === null && answered.status === "idle") releaseRuns(answered.id);
+        // lets go of the follow, the place it held in the queue and the Runs it
+        // still holds, so the composer opens again — and a read that is still on
+        // its way about a Run the Space no longer names is dropped when it
+        // lands, because the version it was sent with is no longer the page's.
+        if (answered.active_run === null && answered.status === "idle") {
+          clearFollowed();
+          releaseRuns(answered.id);
+        }
         update({ activeChat: answered });
         await refreshActive(answered, runGeneration);
       }
