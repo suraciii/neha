@@ -4,9 +4,11 @@
 //! five measurements so budgets and reports read one shape.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// The normalized usage of one Model call.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "usage.ts")]
 #[serde(deny_unknown_fields)]
 pub struct Usage {
     /// Input tokens that were not cached.

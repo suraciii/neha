@@ -5,6 +5,7 @@
 //! confirmed with its result. Events follow the cursor of the record.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 use crate::error::ErrorCode;
 use crate::id::Id;
@@ -19,7 +20,8 @@ pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
 /// A frame a client sends.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientFrame {
     /// Opens the session and states the protocol version.
@@ -51,7 +53,8 @@ pub enum ClientFrame {
 }
 
 /// A command and its parameters.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 #[serde(tag = "name", content = "args", rename_all = "snake_case")]
 pub enum CommandCall {
     /// Connects a Provider to the Space.
@@ -174,7 +177,8 @@ pub enum CommandCall {
 }
 
 /// The parameters of `provider_add`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct ProviderAdd {
     /// The provider protocol spoken.
     pub protocol: ProviderProtocol,
@@ -199,7 +203,8 @@ pub struct ProviderAdd {
 }
 
 /// The parameters of `provider_connect`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct ProviderConnect {
     /// The catalog vendor id, such as `openai`.
     pub vendor: String,
@@ -217,7 +222,8 @@ pub struct ProviderConnect {
 }
 
 /// A provider protocol the Space can speak.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderProtocol {
     /// OpenAI Chat Completions.
@@ -231,7 +237,8 @@ pub enum ProviderProtocol {
 }
 
 /// How much thought a Model should give a reply.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum ThinkingLevel {
     /// Fastest and cheapest.
@@ -258,7 +265,8 @@ impl ThinkingLevel {
 }
 
 /// A Model as the Admin declares it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct ModelSpec {
     /// The model name the provider expects.
     pub name: String,
@@ -290,7 +298,8 @@ fn is_true(value: &bool) -> bool {
 }
 
 /// The parameters of `bot_create`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct BotCreate {
     /// The Bot's name.
     pub name: String,
@@ -314,7 +323,8 @@ pub struct BotCreate {
 /// applies a grant change to its current projection, so two owners' commands
 /// that arrive together cannot lose one another's change. An update may also
 /// rename the Bot; the Space records a rename as its own event.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct BotUpdate {
     /// The Bot to change.
     pub bot: Id,
@@ -398,7 +408,8 @@ impl<'de> Deserialize<'de> for BotComputer {
 }
 
 /// The parameters of `message_send`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct MessageSend {
     /// The Chat to post in.
     pub chat: Id,
@@ -422,7 +433,8 @@ pub struct MessageSend {
 }
 
 /// A frame the Space sends.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// Answers `hello`.
@@ -450,6 +462,7 @@ pub enum ServerFrame {
         /// The client's command identifier.
         id: Id,
         /// The command's result.
+        #[ts(type = "unknown")]
         result: serde_json::Value,
     },
     /// A command failed.
@@ -989,7 +1002,8 @@ mod tests {
 }
 
 /// One File as a client reads it.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
 pub struct FileSummary {
     /// The File.
     pub id: Id,
@@ -1006,7 +1020,7 @@ pub struct FileSummary {
     /// Who sent it.
     pub author: Author,
     /// The User a Bot acted for, when a Bot sent it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting: Option<Id>,
     /// When the record holds it.
     pub at: Timestamp,

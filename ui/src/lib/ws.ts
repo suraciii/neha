@@ -1,4 +1,4 @@
-import type { RecordEvent } from "../types";
+import type { CommandCall, RecordEvent } from "../types";
 import { uuidv7 } from "./uuid";
 
 export class ProtocolError extends Error {
@@ -48,33 +48,7 @@ export interface SubscribeOptions {
   limit?: number;
 }
 
-type CommandName =
-  | "provider_add"
-  | "provider_connect"
-  | "provider_refresh"
-  | "provider_list"
-  | "catalog_list"
-  | "catalog_status"
-  | "catalog_refresh"
-  | "model_list"
-  | "model_default"
-  | "computer_list"
-  | "computer_reset"
-  | "bot_create"
-  | "bot_update"
-  | "bot_move"
-  | "bot_list"
-  | "bot_show"
-  | "chat_list"
-  | "chat_read"
-  | "file_list"
-  | "approval_list"
-  | "approval_decide"
-  | "message_send"
-  | "run_show"
-  | "rule_list"
-  | "rule_add"
-  | "rule_remove";
+type CommandName = CommandCall["name"];
 
 interface Following {
   handlers: SubscriptionHandlers;

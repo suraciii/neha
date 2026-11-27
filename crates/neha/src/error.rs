@@ -4,11 +4,13 @@
 //! code and never on the message.
 
 use std::fmt;
+use ts_rs::TS;
 
 use serde::{Deserialize, Serialize};
 
 /// A stable command-surface error code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export_to = "error.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     /// A parameter is missing or malformed.

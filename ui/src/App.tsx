@@ -18,6 +18,7 @@ import type {
   Approval,
   AttentionEntry,
   Bot,
+  BotCreateResult,
   BotResult,
   CatalogRefreshResult,
   CatalogStatus,
@@ -31,7 +32,6 @@ import type {
   Model,
   Preview,
   Provider,
-  ProviderResult,
   RecordEvent,
   Rule,
   RunActivity,
@@ -1403,7 +1403,7 @@ export default function App() {
   }) {
     update({ busy: true, error: null });
     try {
-      await commands.command<ProviderResult>("provider_add", {
+      await commands.command<unknown>("provider_add", {
         protocol: "chat_completions",
         base_url: input.baseUrl,
         api_key: input.apiKey,
@@ -1432,7 +1432,7 @@ export default function App() {
   async function createBot(name: string) {
     update({ busy: true, error: null });
     try {
-      const result = await commands.command<BotResult>("bot_create", { name });
+      const result = await commands.command<BotCreateResult>("bot_create", { name });
       const [bots, chats] = await Promise.all([
         commands.command<Bot[]>("bot_list"),
         commands.command<Chat[]>("chat_list"),
@@ -1759,7 +1759,7 @@ export default function App() {
       if (input.baseUrl) args.base_url = input.baseUrl;
       if (input.protocol) args.protocol = input.protocol;
       if (input.thinking) args.thinking = input.thinking;
-      await commands.command<ProviderResult>("provider_connect", args);
+      await commands.command<unknown>("provider_connect", args);
       await refreshProviders();
       update({ managing: false });
       return true;

@@ -8,7 +8,10 @@
 //! polling secret, the User enters the code, and the Space stores only their
 //! digests.
 
+use serde::Serialize;
+
 use std::time::Duration;
+use ts_rs::TS;
 
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
@@ -65,7 +68,8 @@ const CODE_CHARS: usize = 8;
 const CODE_ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
 /// A person who can sign in to the Space.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[ts(export_to = "identity.ts")]
 pub struct Account {
     /// The account identifier.
     pub id: Id,

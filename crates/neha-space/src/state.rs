@@ -6,6 +6,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::Instant;
+use ts_rs::TS;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -28,7 +29,8 @@ use crate::model::Usage;
 use crate::store::Projection;
 
 /// A person in the Space.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct UserView {
     /// The account identifier.
     pub id: Id,
@@ -39,7 +41,8 @@ pub struct UserView {
 }
 
 /// A Provider connected to the Space.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct ProviderView {
     /// The Provider identifier.
     pub id: Id,
@@ -53,7 +56,8 @@ pub struct ProviderView {
 }
 
 /// A Model the Space offers.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct ModelView {
     /// The Model identifier.
     pub id: Id,
@@ -99,7 +103,8 @@ impl ModelView {
 }
 
 /// A Bot.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct BotView {
     /// The Bot identifier.
     pub id: Id,
@@ -126,7 +131,8 @@ pub struct BotView {
 }
 
 /// A Computer.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct ComputerView {
     /// The Computer identifier.
     pub id: Id,
@@ -161,7 +167,8 @@ pub struct ComputerView {
 ///
 /// The state is not recorded. A replay of the same events projects the same
 /// state again, so a snapshot and a client that followed the events agree.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum ChatStatus {
     /// The Chat has no run to follow.
@@ -176,7 +183,8 @@ pub enum ChatStatus {
 }
 
 /// A Chat.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct ChatView {
     /// The Chat identifier.
     pub id: Id,
@@ -242,7 +250,8 @@ impl ChatRuns {
 }
 
 /// A Message.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct MessageView {
     /// The Message identifier.
     pub id: Id,
@@ -265,7 +274,8 @@ pub struct MessageView {
 }
 
 /// One completed step of a run.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct StepView {
     /// The step number, starting at one.
     pub index: u32,
@@ -276,7 +286,8 @@ pub struct StepView {
 }
 
 /// One action of a run.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct ActionView {
     /// The action identifier.
     pub id: Id,
@@ -284,7 +295,9 @@ pub struct ActionView {
     pub step: u32,
     /// The tool's name.
     pub tool: String,
-    /// The tool's arguments.
+    /// The tool's arguments. A refused call keeps them malformed, so the value
+    /// is not always an object.
+    #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
     /// Whether an `ActionFinished` event recorded this action.
     #[serde(skip)]
@@ -318,7 +331,8 @@ pub struct AccessView {
 }
 
 /// A run.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct RunView {
     /// The run identifier.
     pub id: Id,
@@ -381,7 +395,8 @@ pub struct RunView {
 }
 
 /// An action a run waits to run until its acting User answers.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct ApprovalView {
     /// The approval.
     pub approval: Id,
@@ -406,6 +421,7 @@ pub struct ApprovalView {
     /// The tool's name.
     pub tool: String,
     /// The arguments the action runs with.
+    #[ts(type = "Record<string, unknown>")]
     pub arguments: serde_json::Value,
     /// A short text a User reads.
     pub summary: String,
@@ -430,7 +446,8 @@ pub struct ApprovalView {
 }
 
 /// A lasting rule a User gave a Bot.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
 pub struct RuleView {
     /// The rule.
     pub rule: Id,

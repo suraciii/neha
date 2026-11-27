@@ -157,6 +157,7 @@ function askRule(): Rule {
     rule: "rule1",
     bot: "b1",
     user: "u1",
+    seq: "1",
     effect: "ask",
     tool: "shell",
     command_prefix: "git",
@@ -403,6 +404,9 @@ describe("App management", () => {
         protocol: "openai_responses",
         selectable: true,
         api: "https://api.openai.com/v1",
+        npm: "@ai-sdk/openai",
+        env: ["OPENAI_API_KEY"],
+        doc: null,
         model_count: 12,
       },
     ];
@@ -469,6 +473,7 @@ describe("App management", () => {
       age_seconds: 60,
       stale: true,
       provider_count: 42,
+      cache_path: "/home/catalog.json",
       model_count: 900,
     };
     const view = await openSettings("Catalog");
@@ -507,6 +512,7 @@ describe("App management", () => {
       age_seconds: null,
       stale: false,
       provider_count: 3,
+      cache_path: "/home/catalog.json",
       model_count: 40,
     };
     const view = await openSettings("Catalog");
@@ -729,8 +735,8 @@ describe("App management", () => {
 
   it("says when one Provider offers no Models", async () => {
     space.providers = [
-      { id: "v1", protocol: "chat_completions", base_url: "http://one" },
-      { id: "v2", protocol: "chat_completions", base_url: "http://two" },
+      { id: "v1", protocol: "chat_completions", base_url: "http://one", vendor: null },
+      { id: "v2", protocol: "chat_completions", base_url: "http://two", vendor: null },
     ];
     space.models = [thinker];
     const view = await openSettings("Models");
@@ -772,6 +778,9 @@ describe("App management", () => {
         protocol: "openai_responses",
         selectable: true,
         api: "https://api.openai.com/v1",
+        npm: "@ai-sdk/openai",
+        env: ["OPENAI_API_KEY"],
+        doc: null,
         model_count: 12,
       },
     ];
@@ -801,6 +810,9 @@ describe("App management", () => {
         protocol: "openai_responses",
         selectable: true,
         api: "https://api.openai.com/v1",
+        npm: "@ai-sdk/openai",
+        env: ["OPENAI_API_KEY"],
+        doc: null,
         model_count: 12,
       },
       {
@@ -809,6 +821,9 @@ describe("App management", () => {
         protocol: "anthropic_messages",
         selectable: true,
         api: "https://api.anthropic.com/v1",
+        npm: "@ai-sdk/openai",
+        env: ["OPENAI_API_KEY"],
+        doc: null,
         model_count: 4,
       },
     ];

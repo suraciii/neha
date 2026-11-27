@@ -12,6 +12,7 @@ use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use ts_rs::TS;
 
 use flate2::read::GzDecoder;
 use neha::surface::{ModelSpec, ProviderProtocol, ThinkingLevel};
@@ -626,7 +627,8 @@ pub struct CatalogModel {
 }
 
 /// The cache state of one Space's catalog.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export_to = "catalog.ts")]
 pub struct CatalogStatus {
     /// `"builtin"` when the seed is in use, otherwise the cache's source URL.
     pub source: String,
@@ -651,7 +653,8 @@ pub struct CatalogStatus {
 }
 
 /// The result of one refresh.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, TS)]
+#[ts(export_to = "catalog.ts")]
 pub struct CatalogRefresh {
     /// The cache state after the refresh.
     pub status: CatalogStatus,

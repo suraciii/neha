@@ -5,6 +5,7 @@
 //! it names.
 
 use std::str::FromStr;
+use ts_rs::TS;
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +17,8 @@ use crate::time::Timestamp;
 use crate::usage::Usage;
 
 /// Who wrote an event.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Author {
     /// A User.
@@ -26,7 +28,8 @@ pub enum Author {
 }
 
 /// The kinds of event the record carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 pub enum EventKind {
     /// A User joined the Space.
     #[serde(rename = "neha.user.joined")]
@@ -246,7 +249,8 @@ impl EventDraft {
 }
 
 /// A recorded event.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 pub struct Event {
     /// The cursor of the event.
     pub seq: Seq,
@@ -259,12 +263,13 @@ pub struct Event {
     /// Who wrote it.
     pub author: Author,
     /// The User a Bot acts for, when the author is a Bot.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acting: Option<Id>,
     /// The command that wrote it.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Id>,
     /// The data of its kind.
+    #[ts(type = "Record<string, unknown>")]
     pub data: serde_json::Value,
 }
 
@@ -918,7 +923,8 @@ mod tests {
 }
 
 /// Where a run is: waiting, working, or how it ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// The run waits for its Bot to finish the work before it.
@@ -1128,7 +1134,8 @@ pub enum EventDataError {
 }
 
 /// The data of `neha.user.joined`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct UserJoined {
     /// The display name.
@@ -1138,7 +1145,8 @@ pub struct UserJoined {
 }
 
 /// The data of `neha.provider.added`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ProviderAdded {
     /// The Provider identifier.
@@ -1161,7 +1169,8 @@ pub struct ProviderAdded {
 }
 
 /// One Model a Provider offers.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ModelData {
     /// The Model identifier.
@@ -1195,7 +1204,8 @@ const fn model_tools_default() -> bool {
 /// A refresh replaces the Models the Provider offers. Choosing the Space's
 /// default Model also names the Provider's whole current list, so every Model
 /// keeps its identity and the projection holds one default.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ProviderModelsUpdated {
     /// The Provider.
@@ -1208,7 +1218,8 @@ pub struct ProviderModelsUpdated {
 }
 
 /// The data of `neha.bot.created`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct BotCreated {
     /// The Bot identifier.
@@ -1230,7 +1241,8 @@ pub struct BotCreated {
 }
 
 /// The data of `neha.bot.moved`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct BotMoved {
     /// The Bot that moved.
@@ -1242,7 +1254,8 @@ pub struct BotMoved {
 }
 
 /// The data of `neha.bot.updated`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct BotUpdated {
     /// The Bot.
@@ -1280,7 +1293,8 @@ pub struct BotUpdated {
 }
 
 /// The data of `neha.bot.renamed`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct BotRenamed {
     /// The Bot.
@@ -1339,7 +1353,8 @@ impl<'de> Deserialize<'de> for ComputerKind {
 }
 
 /// The data of `neha.computer.created`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ComputerCreated {
     /// The Computer identifier.
@@ -1353,7 +1368,8 @@ pub struct ComputerCreated {
 }
 
 /// The data of `neha.chat.created`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ChatCreated {
     /// The Chat identifier.
@@ -1365,7 +1381,8 @@ pub struct ChatCreated {
 }
 
 /// The data of `neha.message.added`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct MessageAdded {
     /// The Message identifier.
@@ -1388,7 +1405,8 @@ const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_MEDIA_TYPE_BYTES: usize = 127;
 
 /// The data of `neha.file.added`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct FileAdded {
     /// The File identifier.
@@ -1473,7 +1491,8 @@ impl FileAdded {
 }
 
 /// The data of `neha.run.queued`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunQueued {
     /// The run.
@@ -1489,7 +1508,8 @@ pub struct RunQueued {
 }
 
 /// The data of `neha.run.started`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunStarted {
     /// The run.
@@ -1505,7 +1525,8 @@ pub struct RunStarted {
 }
 
 /// How a Bot's action ended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum ActionStatus {
     /// The action did what it was asked.
@@ -1519,7 +1540,8 @@ pub enum ActionStatus {
 }
 
 /// The data of `neha.run.step`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunStep {
     /// The run.
@@ -1534,7 +1556,8 @@ pub struct RunStep {
 }
 
 /// The data of `neha.action.started`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ActionStarted {
     /// The run.
@@ -1545,13 +1568,16 @@ pub struct ActionStarted {
     pub action: Id,
     /// The tool's name.
     pub tool: String,
-    /// The tool's arguments.
+    /// The tool's arguments. A refused call keeps them malformed, so the value
+    /// is not always an object.
     #[serde(default)]
+    #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
 }
 
 /// The data of `neha.action.finished`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ActionFinished {
     /// The run.
@@ -1578,7 +1604,8 @@ pub struct ActionFinished {
 }
 
 /// The data of `neha.run.context`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunContext {
     /// The run.
@@ -1600,7 +1627,8 @@ pub struct RunContext {
 /// The Space writes it with `neha.run.started`: the access the Bot's owner had
 /// granted when the run began is the access every action of that run carries,
 /// and a later change to the Bot applies to the next run.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunAccess {
     /// The run.
@@ -1619,7 +1647,8 @@ pub struct RunAccess {
 }
 
 /// The data of `neha.run.finished`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunFinished {
     /// The run.
@@ -1638,14 +1667,16 @@ pub struct RunFinished {
 }
 
 /// One tool call the Model asked for in one step.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RecordedCall {
     /// The tool-call identifier the provider expects in the result.
     pub call: String,
     /// The tool's name.
     pub tool: String,
-    /// The arguments the tool runs with.
+    /// The arguments the tool runs with; a refused call keeps them malformed.
+    #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
     /// Why the loop refused the call before anything ran; `None` when it can run.
     #[serde(default)]
@@ -1653,7 +1684,8 @@ pub struct RecordedCall {
 }
 
 /// The data of `neha.run.reply`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RunReply {
     /// The run.
@@ -1671,7 +1703,8 @@ pub struct RunReply {
 }
 
 /// Why a run asks its acting User for an approval.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalReason {
     /// The first use of a Local Computer by this Bot for this User.
@@ -1683,7 +1716,8 @@ pub enum ApprovalReason {
 }
 
 /// Whether the User can undo an action after allowing it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum Undoability {
     /// The action cannot be undone.
@@ -1693,7 +1727,8 @@ pub enum Undoability {
 }
 
 /// What a lasting rule does.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(rename_all = "snake_case")]
 pub enum RuleEffect {
     /// Ask before a matching action.
@@ -1703,7 +1738,8 @@ pub enum RuleEffect {
 }
 
 /// The data of `neha.approval.requested`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalRequested {
     /// The approval.
@@ -1729,6 +1765,7 @@ pub struct ApprovalRequested {
     /// The tool's name.
     pub tool: String,
     /// The arguments the action will run with.
+    #[ts(type = "Record<string, unknown>")]
     pub arguments: serde_json::Value,
     /// A short text the User reads.
     pub summary: String,
@@ -1752,7 +1789,8 @@ pub struct ApprovalRequested {
 }
 
 /// The data of `neha.approval.decided`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalDecided {
     /// The approval.
@@ -1771,7 +1809,8 @@ pub struct ApprovalDecided {
 }
 
 /// The data of `neha.rule.added`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RuleAdded {
     /// The rule.
@@ -1793,7 +1832,8 @@ pub struct RuleAdded {
 }
 
 /// The data of `neha.rule.removed`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
 #[serde(deny_unknown_fields)]
 pub struct RuleRemoved {
     /// The rule.

@@ -1,0 +1,9 @@
+# Where `cargo run -p neha-wire` writes the generated client types, and how
+# numbers that are large on paper are spelled. `just wire-types` overrides the
+# directory with a temporary one and still uses the number setting, so both
+# live beside the workspace rather than in a script.
+[env]
+TS_RS_EXPORT_DIR = { value = "ui/src/generated", relative = true }
+# Large integers become `number`: the wire carries byte counts and token counts
+# well below 2^53, and `bigint` would break the client's arithmetic.
+TS_RS_LARGE_INT = "number"
