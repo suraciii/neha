@@ -1,7 +1,8 @@
 name: CI
 
-# A pull request gates the change on Linux and Windows in parallel; a merge
-# re-runs the gate on main. Packaging runs in nightly.yml.
+# The gate runs as two jobs, Checks and Tests, so the fast half reports while the
+# tests still run. A pull request also compiles on Windows; a merge re-runs the
+# gate on main. Packaging runs in nightly.yml.
 on:
   push:
     branches: [main]
@@ -17,25 +18,15 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  gate:
-    name: Verification gate
+  checks:
+    name: Checks
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     env:
       # No debug symbols in CI.
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_INCREMENTAL: '0'
-      # Run the fence and S3 tests against the package and store below.
-      NEHA_TEST_BWRAP: '1'
-      NEHA_TEST_S3: '1'
-      NEHA_TEST_S3_ENDPOINT: 'http://127.0.0.1:8333'
-      NEHA_TEST_S3_BUCKET: 'neha'
-      NEHA_TEST_S3_REGION: 'us-east-1'
-      AWS_ACCESS_KEY_ID: 'neha'
-      AWS_SECRET_ACCESS_KEY: 'neha-secret'
-      # The configured endpoint must win: this URL is a trap.
-      AWS_ENDPOINT_URL: 'http://127.0.0.1:1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
@@ -64,6 +55,48 @@ jobs:
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
 
+      - name: Run checks with evidence
+        run: just verify "$RUNNER_TEMP/verification" checks
+
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: verification-checks
+          path: ${{ runner.temp }}/verification
+          if-no-files-found: error
+
+  # Only this half starts the sandbox and the S3 store, so it runs `just test`
+  # and nothing else.
+  tests:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      # Run the fence and S3 tests against the package and store below.
+      NEHA_TEST_BWRAP: '1'
+      NEHA_TEST_S3: '1'
+      NEHA_TEST_S3_ENDPOINT: 'http://127.0.0.1:8333'
+      NEHA_TEST_S3_BUCKET: 'neha'
+      NEHA_TEST_S3_REGION: 'us-east-1'
+      AWS_ACCESS_KEY_ID: 'neha'
+      AWS_SECRET_ACCESS_KEY: 'neha-secret'
+      # The configured endpoint must win: this URL is a trap.
+      AWS_ENDPOINT_URL: 'http://127.0.0.1:1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - name: Install just
+        uses: taiki-e/install-action@073e1fd0bc889c9aee68dbaaa927cde1b5653a83 # v2.90.11
+        with:
+          tool: just
+
       # Ubuntu 24.04 blocks unprivileged user namespaces, and this bubblewrap is
       # not setuid.
       - name: Prepare the fence sandbox
@@ -76,8 +109,8 @@ jobs:
       - name: Start the S3 test store
         run: eng/s3.sh up
 
-      - name: Run gate with evidence
-        run: just verify "$RUNNER_TEMP/verification"
+      - name: Run tests with evidence
+        run: just verify "$RUNNER_TEMP/verification" test
 
       - name: Collect the S3 store's logs
         if: failure()
@@ -87,7 +120,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: verification-evidence
+          name: verification-tests
           path: ${{ runner.temp }}/verification
           if-no-files-found: error
 

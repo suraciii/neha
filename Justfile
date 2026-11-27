@@ -76,9 +76,12 @@ check-specs: check-specs-tests
 check-specs-tests:
     python3 scripts/test_check_specs.py
 
-# The full gate. Pull requests and main run the same recipes.
-ci: check-python-cache check-python check-specs fmt clippy test wire-types deny doc ui-check desktop-check
+# The gate's fast half; none of it starts the sandbox or the S3 store.
+checks: check-python-cache check-python check-specs fmt clippy wire-types deny doc ui-check desktop-check
 
-# Run the gate and retain source provenance, output, and exit status.
-verify evidence_dir:
-    python3 scripts/verify.py {{quote(evidence_dir)}}
+# The full gate. Pull requests and main run the same recipes.
+ci: checks test
+
+# Run a gate recipe and retain source provenance, output, and exit status.
+verify evidence_dir recipe='ci':
+    python3 scripts/verify.py {{quote(evidence_dir)}} {{quote(recipe)}}
