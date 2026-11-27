@@ -33,6 +33,16 @@ The operator MAY configure server-side encryption with a KMS key (SSE-KMS) for t
 
 Storage is one seam: above it, no directory name and no bucket name appears.
 
+## Schema version
+
+The Space keeps the schema version of its record inside the record's database, and each build writes the version it knows.
+
+A Space migrates the record of an older version in place, in one transaction, and a migration that fails leaves the version it found.
+
+A Space refuses to start when the record's version is newer than its build's, and the refusal names both versions. An older build refuses a record a newer build migrated, so a downgrade needs the operator's own copy of the home.
+
+A Space makes no backup of its home before it migrates. [Storage](#storage) covers what a backup holds.
+
 ## Events
 
 An event has a kind, a version, an author, and data. A kind belongs to one Plugin and declares the schema of its data, and Neha rejects data that does not match it.

@@ -44,6 +44,22 @@ import type {
 
 type AuthMode = "join" | "login" | "missing-invite";
 
+// What one step of a phone's history says the screen showed. A phone shows one
+// surface at a time, so its system Back walks the same steps the page's own Back
+// does: out of a detail, out of a surface, out of a Chat. An entry names the
+// screen rather than only that something is open, so Back and Forward both land
+// on a screen instead of on a guess.
+interface Screen {
+  // The Chat on screen, or null when the list of Chats is.
+  chat: string | null;
+  // The surface the rail names.
+  view: RailView;
+  // The Settings section open inside its surface, or null for its list.
+  section: SettingsSection | null;
+  // The Bot whose page is open, or null for the list of Bots.
+  bot: string | null;
+}
+
 // The answer a full-access switch carries: the version of the risk the owner
 // agreed to. A client that names an older one cannot widen a Bot's access.
 const FULL_ACCESS_CONSENT = 1;
@@ -617,21 +633,17 @@ export default function App() {
     onMediaChange = (event) => {
       setIsMobile(event.matches);
       // A Chat chosen while the window was wide still needs its Back entry.
-      if (event.matches && state.activeChat) rememberChat(state.activeChat, true);
+      if (event.matches && state.activeChat) remember(screen(), true);
     };
     mediaQuery.addEventListener("change", onMediaChange);
     stopViewport = watchViewportHeight();
 
     onPopState = () => {
       if (!isMobile()) return;
-      const chatId = history.state?.nehaChat;
-      if (!chatId) {
-        backToList();
-        return;
-      }
-      // Forward reopens the Chat its entry names.
-      const chat = state.chats.find((candidate) => candidate.id === chatId);
-      if (chat) void selectChat(chat);
+      // The entry the User landed on names the screen it showed, so a Back or a
+      // Forward restores that screen: out of a detail, out of a surface, out of
+      // a Chat, in that order.
+      void showScreen(screenOf(history.state));
     };
     window.addEventListener("popstate", onPopState);
 
@@ -1102,6 +1114,22 @@ export default function App() {
     setReady(true);
     void startFollowing();
     await loadWorkspace();
+    if (isMobile()) await restoreScreen();
+  }
+
+  // Puts the screen the phone's history entry names on the screen, which is how
+  // a reload lands where the User was: on the Chat, the surface, and what was
+  // open inside it rather than on the list behind them. The restore takes no
+  // step of its own — the entry the browser kept is the one the User was on —
+  // so the stack keeps its length and its Back returns to the screen before.
+  async function restoreScreen() {
+    const shown = screenOf(history.state);
+    // An entry that names a Chat the Space no longer has keeps the rest of its
+    // screen, so a Back never lands on a Chat that cannot open.
+    if (shown.chat !== null && !state.chats.some((chat) => chat.id === shown.chat)) {
+      history.replaceState({ ...shown, chat: null }, "");
+    }
+    await showScreen(shown);
   }
 
   async function loadWorkspace() {
@@ -1129,20 +1157,21 @@ export default function App() {
         history.replaceState(history.state, "", `${location.pathname}${location.hash}`);
       }
       const active = state.activeChat ? chats.find((chat) => chat.id === state.activeChat?.id) : undefined;
-      // A reload keeps the Chat entry; reopen that Chat in the same entry.
-      const restored: string | null = isMobile() ? (history.state?.nehaChat ?? null) : null;
+      // A refresh reads the Chat that is open again, and a wide window opens the
+      // newest Chat. What a phone reloads into is its history entry's screen,
+      // which enter() restores once the workspace is read, and a link that names
+      // a Chat is the screen the User asked for.
       const target =
         active ??
         (requested ? chats.find((chat) => chat.id === requested) : undefined) ??
-        (!isMobile()
-          ? chats[0]
-          : restored
-            ? chats.find((chat) => chat.id === restored)
-            : undefined);
-      if (target) await selectChat(target, requestedApproval, requestedMessage);
-      if (isMobile() && restored && !chats.some((chat) => chat.id === restored)) {
-        history.replaceState(null, "");
+        (!isMobile() ? chats[0] : undefined);
+      // The Chat a link names is a step of its own the way choosing one is, so
+      // the entry it landed on records it before it opens: the restore that
+      // follows reads it there rather than closing the Chat the link opened.
+      if (requested && target) {
+        remember({ chat: target.id, view: "chats", section: null, bot: null });
       }
+      if (target) await selectChat(target, requestedApproval, requestedMessage);
     } catch (reason) {
       update({ error: reason });
     } finally {
@@ -1180,7 +1209,6 @@ export default function App() {
   }
 
   async function selectChat(chat: Chat, focus?: string | null, message?: string | null) {
-    rememberChat(chat);
     const generation = ++runGeneration;
     followed = null;
     setActivity(null);
@@ -1429,27 +1457,54 @@ export default function App() {
     }
   }
 
-  async function createBot(name: string) {
+  // Creates a Bot, which answers with the Bot, its Computer, and the Chat the
+  // Space opened between them, so the new Bot's Chat is the one that opens. The
+  // create is the one step that cannot be taken twice: once the Space has
+  // answered it the Bot is there, so everything after only reads, and a read
+  // that fails is never a reason to make another one. It answers what the Space
+  // said when it made no Bot, so the form that asked can say it in its own
+  // words, and nothing when the Bot is there.
+  async function createBot(name: string, computer?: string): Promise<string | null> {
+    // A Space with no Provider has no Model for a Bot to work with, so the
+    // client makes none.
+    if (state.providers.length === 0) return t("bots.new.noProvider");
     update({ busy: true, error: null });
+    let created: BotCreateResult;
     try {
-      const result = await commands.command<BotCreateResult>("bot_create", { name });
-      const [bots, chats] = await Promise.all([
-        commands.command<Bot[]>("bot_list"),
-        commands.command<Chat[]>("chat_list"),
-      ]);
-      update({
-        bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)),
-        chats: [...chats].sort((left, right) => left.id.localeCompare(right.id)),
+      created = await commands.command<BotCreateResult>("bot_create", {
+        name,
+        ...(computer === undefined ? {} : { computer }),
       });
-      const sortedChats = [...chats].sort((left, right) => left.id.localeCompare(right.id));
-      await loadPreviews(sortedChats);
-      const chat = sortedChats.find((candidate) => candidate.id === result.chat.id) ?? chats[0];
-      if (chat) await selectChat(chat);
     } catch (reason) {
-      update({ error: reason });
-    } finally {
-      update({ busy: false });
+      // The Space never confirmed the Bot, so the form may ask again.
+      update({ busy: false, error: reason });
+      return messageFor(reason);
     }
+    // The answer names the Chat by identity: the Space had not projected it
+    // yet, so all the page holds of it is its name, and the Bot's own answer —
+    // read when the Chat opens — and the events the create appended are what
+    // project it.
+    const opened = created.chat as Chat;
+    // The Bot is there from here on, and the create's own answer carries it and
+    // its Chat, so the page reads them from the answer rather than from the
+    // lists: a list that cannot be read leaves the Bot on the screen.
+    update({
+      bots: [...state.bots, created.bot].sort((left, right) => left.id.localeCompare(right.id)),
+      chats: [...state.chats, opened].sort((left, right) => left.id.localeCompare(right.id)),
+      busy: false,
+    });
+    await loadPreviews([opened]);
+    // The Chat the Space opened with the Bot is the one that opens, the way the
+    // first run's own create leaves the User in it, from wherever the create was
+    // asked for.
+    setView("chats");
+    // Opening that Chat is a step of its own the way choosing it is, so the
+    // phone's history records the screen it lands on: a reload after a create
+    // stays in the new Bot's Chat, and Back returns to the list it was made
+    // from rather than to an entry that still names that list.
+    remember({ chat: opened.id, view: "chats", section: null, bot: null });
+    await selectChat(opened);
+    return null;
   }
 
   function backToList() {
@@ -1459,18 +1514,98 @@ export default function App() {
     update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, queue: null, deciding: null, error: null });
   }
 
-  // The mobile Chat is a view of the list's page. Give it one history entry so
-  // the system Back closes the Chat instead of leaving the client, and replace
-  // that entry when another Chat opens.
-  function rememberChat(chat: Chat, force = false) {
+  // The screen the User is on, as one history entry.
+  function screen(): Screen {
+    return {
+      chat: state.activeChat?.id ?? null,
+      view: view(),
+      section: sectionOpen() ? section() : null,
+      bot: pageBotId(),
+    };
+  }
+
+  // The screen one history entry names. An entry the client before this one
+  // wrote names only its Chat, so it is read the same way: that Chat, on the
+  // list of Chats. An entry this client did not write at all reads as the list
+  // of Chats rather than as nothing.
+  function screenOf(written: unknown): Screen {
+    const entry = (written ?? {}) as Partial<Screen> & { nehaChat?: unknown };
+    const named = typeof entry.chat === "string" ? entry.chat : entry.nehaChat;
+    return {
+      chat: typeof named === "string" ? named : null,
+      view: entry.view === "bots" || entry.view === "settings" ? entry.view : "chats",
+      section: typeof entry.section === "string" ? (entry.section as SettingsSection) : null,
+      bot: typeof entry.bot === "string" ? entry.bot : null,
+    };
+  }
+
+  // Whether two entries name the same screen.
+  function sameScreen(left: Screen, right: Screen): boolean {
+    return (
+      left.chat === right.chat &&
+      left.view === right.view &&
+      left.section === right.section &&
+      left.bot === right.bot
+    );
+  }
+
+  // Whether the phone's history holds the step the screen is on, so its system
+  // Back can take the step the page's own Back would. A window narrowed after a
+  // surface opened leaves no step for it, and the trail does the work instead.
+  function onPhoneStep(): boolean {
+    const entry = screenOf(history.state);
+    return (
+      (entry.view === "bots" || entry.view === "settings") && sameScreen(entry, screen())
+    );
+  }
+
+  // Gives the phone's history one entry for the screen. A step the User takes
+  // writes one; restoring a screen from an entry writes none, because the entry
+  // the browser kept is already the one on the stack. Moving between Chats
+  // replaces the entry rather than stacking one per Chat, because the Chats are
+  // one surface. A screen the entry already names writes nothing either.
+  function remember(next: Screen, force = false) {
     if (!force && !isMobile()) return;
-    const entry = { nehaChat: chat.id };
-    if (history.state?.nehaChat) history.replaceState(entry, "");
-    else history.pushState(entry, "");
+    const entry = screenOf(history.state);
+    if (sameScreen(entry, next)) return;
+    const swapping = entry.view === "chats" && entry.chat !== null && next.view === "chats";
+    if (swapping) history.replaceState(next, "");
+    else history.pushState(next, "");
+  }
+
+  // Puts the screen a history entry names on the screen. It takes the steps the
+  // User's own Back and Forward would, so a phone's system Back lands on the
+  // screen it left rather than on an empty shell.
+  async function showScreen(shown: Screen) {
+    if (shown.bot === null) {
+      if (pageBotId() !== null) {
+        pageGen += 1;
+        setPageBotId(null);
+        update({ pageBot: null, pageComputer: null, rules: [], manageError: null });
+      }
+    } else if (shown.bot !== pageBotId()) {
+      const bot = state.bots.find((known) => known.id === shown.bot);
+      if (bot) await selectPageBot(bot);
+    }
+    setView(shown.view);
+    // The Settings surface reads what it connects from, so a screen that lands on
+    // it reads it again, the way opening the surface does.
+    if (shown.view === "settings") void loadSettings();
+    // The Bots surface is where a Bot is made, so a screen that lands on it
+    // reads the Computers a new one may work on, the way opening it does.
+    if (shown.view === "bots") void refreshComputers();
+    setSectionOpen(shown.section !== null);
+    if (shown.section !== null) setSection(shown.section);
+    if (shown.chat === null) {
+      if (state.activeChat !== null) backToList();
+    } else if (state.activeChat?.id !== shown.chat) {
+      const chat = state.chats.find((known) => known.id === shown.chat);
+      if (chat) await selectChat(chat);
+    }
   }
 
   function closeChat() {
-    if (isMobile() && history.state?.nehaChat) {
+    if (isMobile() && screenOf(history.state).chat !== null) {
       history.back();
       return;
     }
@@ -1658,6 +1793,9 @@ export default function App() {
   // Opens one Bot's page from a Computer in the Settings surface, leaving the
   // Settings where Back returns to.
   function openBotPage(bot: Bot) {
+    // The page is a step deeper than the Settings it was opened from, so the
+    // phone's history gets an entry for it.
+    remember({ chat: state.activeChat?.id ?? null, view: "bots", section: null, bot: bot.id });
     void selectPageBot(bot);
     setView("bots");
   }
@@ -1818,12 +1956,25 @@ export default function App() {
     if (next === "settings") setSectionOpen(false);
     setView(next);
     update({ manageError: null });
+    // The phone's history gets the surface, so its system Back leaves it the way
+    // the page's own Back does.
+    remember({ chat: state.activeChat?.id ?? null, view: next, section: null, bot: null });
     if (next === "settings") void loadSettings();
+    // The Bots surface is where a Bot is made, so it reads the Computers a new
+    // one may work on.
+    if (next === "bots") void refreshComputers();
   }
 
   // Leaves a management surface for the one before it, with no Bot selected.
   // The Chats are where the trail runs out.
   function closeManage() {
+    // A phone's system Back leaves a management surface the same way the page's
+    // own Back does, so the page's Back asks the history for the step back rather
+    // than taking one of its own: the two must land on the same screen.
+    if (isMobile() && onPhoneStep()) {
+      history.back();
+      return;
+    }
     // A Settings section is a step inside its surface, not a surface of its own:
     // Back leaves the section for the list of sections first, so a viewport that
     // shows one surface at a time still reaches every section.
@@ -1850,6 +2001,9 @@ export default function App() {
   // What a failed management command says, in the User's words.
   const manageErrorText = () => (state.manageError ? messageFor(state.manageError) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
+  // A Space with no Provider has no Model to work with, and the client creates
+  // no Bot before one exists.
+  const canCreateBot = () => state.providers.length > 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
   // A management surface fills the main area once it has something to show, so
   // a narrow viewport shows one surface at a time with a Back action.
@@ -1905,6 +2059,9 @@ export default function App() {
       setFocus(entry.approval.approval);
       return;
     }
+    // Opening a Chat from an approval is a step of its own, the way choosing one
+    // from the list is.
+    remember({ chat: entry.chat.id, view: "chats", section: null, bot: null });
     void selectChat(entry.chat, entry.approval.approval);
   }
 
@@ -1974,14 +2131,35 @@ export default function App() {
               section={section()}
               onSelect={(chat) => {
                 setView("chats");
+                // Choosing a Chat is a step of its own: the phone's history gets
+                // an entry, so its system Back closes the Chat the way the
+                // page's own Back does.
+                remember({ chat: chat.id, view: "chats", section: null, bot: null });
                 void selectChat(chat);
               }}
               onAttention={(entry) => openAttention(entry)}
-              onBot={(bot) => void selectPageBot(bot)}
+              onBot={(bot) => {
+                // A Bot's page is a step deeper than the list it was opened from,
+                // so the phone's history gets an entry for it.
+                remember({ chat: state.activeChat?.id ?? null, view: "bots", section: null, bot: bot.id });
+                void selectPageBot(bot);
+              }}
               onSection={(next) => {
                 setSection(next);
                 setSectionOpen(true);
+                // A section is a step inside its surface, so the phone's history
+                // gets one for it: its system Back leaves the section for the
+                // list of sections, the way the page's own Back does.
+                remember({
+                  chat: state.activeChat?.id ?? null,
+                  view: "settings",
+                  section: next,
+                  bot: null,
+                });
               }}
+              onCreateBot={(name, computer) => createBot(name, computer)}
+              computers={state.computers}
+              canCreateBot={canCreateBot()}
             />
             <main class="main">
               <Show when={showManage()}>

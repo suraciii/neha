@@ -1,5 +1,6 @@
 import { For, Show, createSignal } from "solid-js";
 
+import { computerLabel } from "../computer";
 import { locale, t, type MessageKey } from "../i18n";
 import { dayLabel } from "../lib/format";
 import type {
@@ -63,11 +64,6 @@ interface SettingsPageProps {
 // Where a Model comes from, which is the base URL of its Provider.
 function baseUrlOf(providers: Provider[], model: Model): string {
   return providers.find((known) => known.id === model.provider)?.base_url ?? "";
-}
-
-// What a Computer is called in the User's words.
-function kindOf(computer: Computer): string {
-  return computer.kind === "local" ? t("chat.localComputer") : t("chat.hostedComputer");
 }
 
 // One Model, with what it can do and the offer to make it the default. A Model
@@ -565,9 +561,13 @@ export default function SettingsPage(props: SettingsPageProps) {
                     {(computer) => (
                       <div class="row">
                         <span class="row__text">
-                          <span class="row__name mono">{computer.workspace}</span>
+                          {/* The row is named the way the forms that choose a
+                              Computer name one, because a Computer the User
+                              paired does not always name a workspace. */}
+                          <span class="row__name mono">{computerLabel(computer)}</span>
+                          {/* The label says which kind this is, so the line under
+                              it says only whether it is online. */}
                           <span class="row__meta">
-                            {kindOf(computer)} ·{" "}
                             {computer.online ? t("chat.online") : t("chat.offline")}
                           </span>
                           <span class="chips">

@@ -8,7 +8,7 @@ import { describe, expect, it, vi } from "vitest";
 import App from "./App";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
-import { drain, element, openChat, record, renderApp, useView } from "./test/view";
+import { button, drain, element, openChat, panelText, record, renderApp, useView } from "./test/view";
 import type { Model, Rule } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
@@ -59,27 +59,9 @@ const quiet: Model = {
   thinking_levels: [],
 };
 
-// The button the test names, found by what it says.
-function button(view: View, text: string): HTMLButtonElement {
-  const found = Array.from(view.container.querySelectorAll<HTMLButtonElement>("button")).find(
-    (known) => known.textContent?.trim() === text,
-  );
-  if (!found) throw new Error(`no ${text} button in the view`);
-  return found;
-}
-
 // The field the test names, by its name.
 function field<T extends HTMLElement>(view: View, name: string): T {
   return element<T>(view, `[name="${name}"]`);
-}
-
-// What one panel says, found by its own heading.
-function panelText(view: View, heading: string): string {
-  const panel = Array.from(view.container.querySelectorAll(".panel")).find(
-    (known) => known.querySelector("h2")?.textContent === heading,
-  );
-  if (!panel) throw new Error(`no ${heading} panel in the view`);
-  return panel.textContent ?? "";
 }
 
 // The value of one fact in a panel: the label says what the value is, so the
@@ -146,9 +128,21 @@ async function openSettings(section = "Providers"): Promise<View> {
 }
 
 // Opens the second Bot from the sidebar, the way a User moves between Bots.
+// Opens the Bot the test names, by the name its row shows. The list holds more
+// than its Bot rows, so a row is found by what it says rather than by where it
+// sits.
+async function openBotNamed(view: View, name: string) {
+  const row = () =>
+    Array.from(view.container.querySelectorAll<HTMLButtonElement>(".conv")).find(
+      (known) => known.querySelector(".conv__name")?.textContent === name,
+    );
+  if (!row()) throw new Error(`no ${name} row in the view`);
+  flush(() => fireEvent.click(row()!));
+  await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe(name));
+}
+
 async function openOtherBot(view: View) {
-  flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
-  await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Quill"));
+  await openBotNamed(view, "Quill");
 }
 
 // The rule the Bot holds, which a test reads back.
@@ -326,10 +320,11 @@ describe("App management", () => {
     const view = await openBots();
     expect(factValue(view, "Computer", "Workspace")).toBe("/w");
 
-    // The other paired Local Computer is where a Bot may move.
+    // The other paired Local Computer is where a Bot may move, named by the
+    // identifier the Space gave it rather than by its workspace alone.
     const target = field<HTMLSelectElement>(view, "move_target");
     expect(target.options).toHaveLength(2);
-    expect(target.options[1]?.textContent).toBe("/other");
+    expect(target.options[1]?.textContent).toBe("Local Computer p9 · /other · Offline");
 
     choose(view, "move_target", "p9");
     press(view, "Move to another Computer");
@@ -661,10 +656,7 @@ describe("App management", () => {
     await waitFor(() => expect(space.asked).toContain("bot_update"));
 
     // The answer lands after the User opened another Bot's page.
-    flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
-    await waitFor(() =>
-      expect(element(view, ".page__titles h1").textContent).toBe(space.otherBot.name),
-    );
+    await openOtherBot(view);
     await drain();
 
     // The write the first page asked for never reaches the page now open: its
@@ -713,6 +705,28 @@ describe("App management", () => {
     // Coming back returns to the Computers list, not to the Chats.
     flush(() => fireEvent.click(element(view, ".page__back")));
     await waitFor(() => expect(panelText(view, "Computers")).toContain("/w"));
+  });
+
+  it("names every Computer it lists, even one with no workspace", async () => {
+    // A Computer the User paired does not always name a workspace, and the
+    // leading part of a time-ordered identifier is the time it was made: two
+    // machines paired within one window begin it alike. The row is named by the
+    // whole identifier, so neither of them is a blank the other matches.
+    space.computer.id = "019a3f2c-1111-7aaa-8bbb-000000000001";
+    space.otherComputer.id = "019a3f2c-2222-7aaa-8bbb-000000000002";
+    space.computer.workspace = "";
+    space.otherComputer.workspace = "";
+    const view = await openSettings("Computers");
+
+    const names = Array.from(view.container.querySelectorAll(".rows .row__name")).map(
+      (row) => row.textContent,
+    );
+    expect(names).toEqual([
+      "Local Computer 019a3f2c-1111-7aaa-8bbb-000000000001",
+      // The label also says this one is offline, which is the row's own line too.
+      "Local Computer 019a3f2c-2222-7aaa-8bbb-000000000002 · Offline",
+      "Hosted Computer p5 · /hosted",
+    ]);
   });
 
   it("resets a Hosted Computer from the Computers list", async () => {
@@ -1131,6 +1145,27 @@ describe("App management", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
     expect(narrow).not.toMatch(/\.rail\s*\{[^}]*display:\s*none/);
+  });
+
+  it("keeps the rail's items out of the notch and the home indicator", () => {
+    // The rail stays on a narrow viewport, so it is the rail's first and last
+    // item that an installed window's notch and home indicator would cover. The
+    // layout itself is a stylesheet rule, so the rule is what the page holds.
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
+    const rail = narrow.match(/\.rail\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(rail).toMatch(/padding-top:\s*calc\([^;]*env\(safe-area-inset-top/);
+    expect(rail).toMatch(/padding-bottom:\s*calc\([^;]*env\(safe-area-inset-bottom/);
+  });
+
+  it("keeps a management page's Back out of the notch", () => {
+    // A narrow viewport shows one surface at a time, so a management page's head
+    // is the only thing over its Back action: an installed window's notch covers
+    // it unless the head reserves the inset. The layout itself is a stylesheet
+    // rule, so the rule is what the page holds.
+    const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+    const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
+    expect(narrow).toMatch(/\.page__head\s*\{[^}]*padding-top:\s*calc\([^;]*env\(safe-area-inset-top/);
   });
 
   it("takes a grant away from a Computer that takes no new one", async () => {

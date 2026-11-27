@@ -217,6 +217,13 @@ The Bot works in its own Workspace on the machine, `~/.neha/workspaces/<bot-id>`
 
 The signed-in client has four entries in its rail: Chats, Needs attention, Bots, and Settings. Open Bots and pick a Bot to open its page.
 
+Bots also offers New Bot. Name the Bot there and pick its Computer: the choice lists the Local Computers you own, and one that is offline cannot be picked. Leave the choice on its default and the Bot starts on a new Hosted Computer. The client opens the new Bot's Chat when it is made, and a Bots list with no Bot offers the same action. The CLI makes one the same way:
+
+```bash
+target/debug/neha bot create "Scout Two"
+target/debug/neha bot create Runner --computer local
+```
+
 The page shows the Bot's name, its picture made from the initials of its name, its Computer and whether it is online, its Model and thinking level, and its access. Change the name there. Choose another Model or thinking level for the Bot; without one it uses the Space's default, and clearing one puts it back on that default. Move the Bot to another Local Computer you own from that page.
 
 For a Bot on a Local Computer, the page shows the folders the Bot may write and whether it has full access. Grant a folder there, or turn full access on: the page states the risk and asks you to confirm before anything changes. The page also lists the Bot's Ask and Allow rules, and you can add and remove them there.
@@ -246,6 +253,12 @@ target/debug/neha chat send --file notes.txt --bot "$RUNNER_ID" "Read the attach
 ```
 
 [Send and receive Files](files.md) shows how to list and download Files, and how the Bot takes a file into its Workspace and delivers one back.
+
+## Open a File in the browser
+
+A Bot delivers a File with a Bot Message. Open that Chat in the browser: the Message shows a file card with the File's name and size, and choosing the card downloads the File.
+
+The browser downloads every File and opens none itself, so a downloaded File opens in the application the machine names for its type. The CLI downloads the same File with `neha file get <file-id>`, from an id that `neha chat files` prints.
 
 ## Connect a remote client
 
@@ -291,6 +304,7 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - An unattended run's approval does not expire yet.
 - One human joins a Space. Group Chats, Boards, and search arrive in later milestones.
 - The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, or search. Notifications are available in an installed browser client on a public HTTPS origin; see [Notifications](notifications.md).
+- The browser client downloads a File and opens no preview of it. Choosing a file card downloads the File.
 - The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
 - A Bot on a Hosted Computer does not ask before an action yet, so its page offers no Ask or Allow rule to add or remove.
 - The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.
