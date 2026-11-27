@@ -2763,7 +2763,10 @@ async fn record_file(
     })
 }
 
-/// Records a Message a Bot's shell posts to its own Chat.
+/// Records a File Message a Bot's shell posts to its own Chat.
+///
+/// The Message names the Run whose token posted it, so a client can show the
+/// File with that Run's work.
 pub async fn bot_message(
     store: &Store,
     state: &Mutex<State>,
@@ -2789,7 +2792,13 @@ pub async fn bot_message(
             .ok_or_else(|| ApiError::not_found("no such File"))?;
     }
     let message = Id::new();
-    let data = json!({"message": message, "chat": chat, "text": text, "file": file});
+    let data = json!({
+        "message": message,
+        "chat": chat,
+        "text": text,
+        "file": file,
+        "run": token.run,
+    });
     let appended = append(
         store,
         state,

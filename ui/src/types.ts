@@ -36,10 +36,28 @@ export interface Computer {
   workspace: string;
 }
 
+// What a Chat's active Run is doing, as the Space projects it.
+export type ChatStatus = "idle" | "working" | "waiting" | "failed";
+
 export interface Chat {
   id: string;
   owner: string;
   bot: string;
+  // The Space projects the Chat's state. A Space that says nothing leaves the
+  // Chat idle.
+  status?: ChatStatus;
+  // The Run the Chat works on, when it has one.
+  active_run?: string | null;
+}
+
+// One approval the User has not answered yet, as the attention list names it.
+// Each pending approval is its own entry: a Chat with two of them lists two.
+export interface AttentionEntry {
+  approval: Approval;
+  chat: Chat;
+  botName: string;
+  // What the approval asks for, in the record's words.
+  detail: string;
 }
 
 export interface Author {
@@ -116,6 +134,30 @@ export interface RunView {
   reply: string | null;
   error: string | null;
   usage: unknown;
+  // The steps the run recorded, in order, so a reopened Chat shows what the
+  // run already did.
+  steps?: RunStepView[];
+  // The actions the run recorded, in order.
+  actions?: RunActionView[];
+}
+
+// One step of a run, as the Space answers run_show.
+export interface RunStepView {
+  // The step number, starting at one.
+  index: number;
+  // How many tool calls the step asked for.
+  tool_calls: number;
+}
+
+// One action of a run, as the Space answers run_show.
+export interface RunActionView {
+  id: string;
+  step: number;
+  tool: string;
+  // How the action ended.
+  status: "succeeded" | "failed" | "timed_out" | "unknown";
+  // The failure, when it failed.
+  error?: string | null;
 }
 
 // Why a Bot asked before an action: the first use of the User's own Computer,
@@ -169,6 +211,38 @@ export interface Decision {
 export interface RunProgress {
   status: "queued" | "running";
   position?: number;
+}
+
+// How one tool action of a Run is doing.
+export type ToolStatus = "running" | "succeeded" | "failed" | "unknown";
+
+// One tool action the record reported for the Run the page follows.
+export interface ToolAction {
+  // The action's identifier.
+  action: string;
+  // The step that asked for it.
+  step: number;
+  // The tool's name.
+  tool: string;
+  // How it ended so far.
+  status: ToolStatus;
+  // Why it failed, when it did.
+  error: string | null;
+}
+
+// The Run the page follows: its steps, its tool actions, and the Files it
+// produced, while it has any.
+export interface RunActivity {
+  // The Run this belongs to.
+  run: string;
+  // The newest step the record reported.
+  step: number;
+  // The actions the Run took, oldest first.
+  actions: ToolAction[];
+  // The Files the Run produced, oldest first.
+  files: string[];
+  // Why the Run failed, when it did.
+  error: string | null;
 }
 
 export type Preview = { text: string; file: boolean } | { error: true } | null;

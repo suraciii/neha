@@ -70,9 +70,9 @@ One rail, one sidebar, and one main area frame every signed-in surface. The prod
 | --- | --- | --- | --- |
 | Auth card | Card, title, fields, error, locale switch | Join, sign in, working, error | [AuthView.tsx](../../ui/src/components/AuthView.tsx) |
 | Setup | Two-step progress, provider and Bot panels | Step 1/2, working, error | [SetupView.tsx](../../ui/src/components/SetupView.tsx) |
-| Rail | Brand, Chats, account role | Selected, idle | [Rail.tsx](../../ui/src/components/Rail.tsx) |
+| Rail | Brand, Chats, Needs attention, account role | Selected, idle | [Rail.tsx](../../ui/src/components/Rail.tsx) |
 | Sidebar | Compact brand, Chat list, count, footer | Empty, selected | [Sidebar.tsx](../../ui/src/components/Sidebar.tsx) |
-| Chat header | Bot, Computer kind, online state, attention | Online, offline, waiting | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
+| Chat header | Bot, Computer kind, online state, attention | Online, offline, working, waiting, failed | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Attention pill | Waiting label, compact icon | Waiting | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Chat empty | Avatar, heading, body, prompt chips | No Messages | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Message | User and Bot alignment, dayline, File card | Text, File, failed | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |

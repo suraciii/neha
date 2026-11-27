@@ -3,7 +3,18 @@ import { For, Show, createEffect, createSignal } from "solid-js";
 import { locale, t } from "../i18n";
 import { dayLabel, timeOfDay } from "../lib/format";
 import { formatBytes } from "../lib/files";
-import type { Account, Approval, Bot, Computer, FileSummary, Message, RunProgress } from "../types";
+import type {
+  Account,
+  Approval,
+  Bot,
+  ChatStatus,
+  Computer,
+  FileSummary,
+  Message,
+  RunActivity,
+  RunProgress,
+} from "../types";
+import ActivityCard from "./ActivityCard";
 import ApprovalCard from "./ApprovalCard";
 import Avatar from "./Avatar";
 import FileCard from "./FileCard";
@@ -19,12 +30,20 @@ interface ChatViewProps {
   approvals: Approval[];
   // A command is in flight; the composer waits for its answer.
   submitting: boolean;
-  // The followed Run is running; the Bot is working.
-  working: boolean;
-  // The followed Run waits for an approval.
-  waiting: boolean;
+  // What the Chat is doing, from the merged projection of its Runs. The
+  // header, its marks, and the composer all read this one word, so a Run the
+  // page does not follow still shows in the Chat.
+  status: ChatStatus;
   // The followed Run waits; the Chat shows the place it holds.
   queue: RunProgress | null;
+  // A Run of this Chat is active, whether or not this page follows it, so the
+  // composer takes no second Message while the Bot works.
+  busy: boolean;
+  // The followed Run's tool activity, while it has any.
+  activity: RunActivity | null;
+  // The approval the User asked to see, so the Chat scrolls to its card.
+  focus: string | null;
+  onFocused: () => void;
   // The approval whose answer is on its way to the Space.
   deciding: string | null;
   error: string | null;
@@ -44,7 +63,7 @@ export default function ChatView(props: ChatViewProps) {
   let picker: HTMLInputElement | undefined;
 
   createEffect(
-    () => ({ count: props.messages.length, working: props.working }),
+    () => ({ count: props.messages.length, status: props.status }),
     () => {
       queueMicrotask(() => {
         if (stream) stream.scrollTop = stream.scrollHeight;
@@ -52,8 +71,25 @@ export default function ChatView(props: ChatViewProps) {
     },
   );
 
+  // An approval the attention list named is the one the User came to read, so
+  // the Chat brings its card into view once the record has delivered it. The
+  // cards arrive with the Chat's reads, so the ask also waits for their count.
+  createEffect(
+    () => ({ approval: props.focus, count: props.approvals.length }),
+    ({ approval }) => {
+      if (!approval) return;
+      const card = stream?.querySelector<HTMLElement>(`[data-approval="${approval}"]`);
+      if (!card) return;
+      queueMicrotask(() => {
+        if (typeof card.scrollIntoView !== "function") return;
+        card.scrollIntoView({ block: "center" });
+        props.onFocused();
+      });
+    },
+  );
+
   const canSend = () =>
-    !props.submitting && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+    !props.submitting && !props.busy && !!props.bot && (draft().trim() !== "" || attachment() !== null);
 
   // How many requests a waiting Run has ahead. A running Run shows the Bot
   // working instead, so the two never show together.
@@ -96,6 +132,16 @@ export default function ChatView(props: ChatViewProps) {
   }
 
   const title = () => props.bot?.name ?? t("chat.title");
+  // What the Chat waits for: an approval, or the Bot's work.
+  const waiting = () => props.status === "waiting";
+  const failed = () => props.status === "failed";
+
+  // Why the composer takes no Message: the Run waits in the queue, waits for an
+  // approval, or works.
+  const closedReason = () =>
+    waiting()
+      ? t("chat.composer.waiting", { name: title() })
+      : t("chat.composer.busy", { name: title() });
 
   return (
     <section class="chat" aria-label={t("chat.aria", { name: title() })}>
@@ -124,7 +170,7 @@ export default function ChatView(props: ChatViewProps) {
             </Show>
           </p>
         </div>
-        <Show when={props.waiting}>
+        <Show when={waiting()}>
           <span
             class="chat__attention"
             role="status"
@@ -134,6 +180,23 @@ export default function ChatView(props: ChatViewProps) {
             <Icon name="alert" size="sm" />
             <span class="chat__attention-long">{t("chat.waiting")}</span>
             <span class="chat__attention-short">{t("chat.waiting.short")}</span>
+          </span>
+        </Show>
+        <Show when={props.busy && !waiting() && !failed()}>
+          <span class="chat__state" role="status" aria-label={t("chat.working")} title={t("chat.working")}>
+            <Icon name="clock" size="sm" />
+            <span class="chat__state-long">{t("chat.working")}</span>
+          </span>
+        </Show>
+        <Show when={failed()}>
+          <span
+            class="chat__state chat__state--failed"
+            role="status"
+            aria-label={t("chat.failed")}
+            title={t("chat.failed")}
+          >
+            <Icon name="alert" size="sm" />
+            <span class="chat__state-long">{t("chat.failed")}</span>
           </span>
         </Show>
       </header>
@@ -225,21 +288,15 @@ export default function ChatView(props: ChatViewProps) {
             )}
           </For>
 
-          <Show when={props.working}>
-            <div class="msg msg--bot msg--working" aria-live="polite">
-              <Avatar name={props.bot?.name ?? "Bot"} small />
-              <div class="msg__body">
-                <div class="msg__meta">
-                  <b>{props.bot?.name ?? "Bot"}</b>
-                  <span>{t("chat.working")}</span>
-                </div>
-                <div class="work-bars" aria-label={t("chat.working")}>
-                  <i />
-                  <i />
-                  <i />
-                </div>
-              </div>
-            </div>
+          <Show when={props.activity}>
+            {(activity) => (
+              <ActivityCard
+                activity={activity()}
+                botName={props.bot?.name ?? "Bot"}
+                files={props.files}
+                failed={failed()}
+              />
+            )}
           </Show>
         </Show>
       </div>
@@ -262,12 +319,10 @@ export default function ChatView(props: ChatViewProps) {
             </div>
           )}
         </Show>
-        <Show when={queueLabel()}>
-          {(label) => (
-            <p class="composer__queue" role="status">
-              {label()}
-            </p>
-          )}
+        <Show when={props.busy}>
+          <p class={queueLabel() ? "composer__queue" : "composer__closed"} role="status">
+            {queueLabel() ?? closedReason()}
+          </p>
         </Show>
         <textarea
           ref={composer}
@@ -278,7 +333,7 @@ export default function ChatView(props: ChatViewProps) {
             props.bot ? t("chat.placeholder", { name: props.bot.name }) : t("chat.placeholder.empty")
           }
           value={draft()}
-          disabled={!props.bot}
+          disabled={!props.bot || props.busy}
           onInput={(event) => setDraft(event.currentTarget.value)}
           onKeyDown={onKeyDown}
         />
@@ -289,7 +344,7 @@ export default function ChatView(props: ChatViewProps) {
               type="button"
               aria-label={t("chat.attach")}
               title={t("chat.attach")}
-              disabled={!props.bot || props.submitting}
+              disabled={!props.bot || props.submitting || props.busy}
               onClick={() => picker?.click()}
             >
               <Icon name="paperclip" size="sm" />
@@ -311,7 +366,7 @@ export default function ChatView(props: ChatViewProps) {
           type="file"
           aria-hidden="true"
           tabindex={-1}
-          disabled={!props.bot || props.submitting}
+          disabled={!props.bot || props.submitting || props.busy}
           onChange={pick}
         />
       </form>
