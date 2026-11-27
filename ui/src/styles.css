@@ -1533,6 +1533,10 @@ code,
   .app {
     grid-template-columns: minmax(0, 1fr);
   }
+  /* Keep primary form actions on the touch floor when the rail gives way. */
+  .btn {
+    min-height: 40px;
+  }
   .rail {
     display: none;
   }

@@ -80,7 +80,8 @@ One rail, one sidebar, and one main area frame every surface. The product owns t
 | Message | User and Bot alignment, dayline, File card | Text, File, failed | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
 | Approval | Heading, tool, summary, reason, scope, actions | Waiting, allowed, denied | [ApprovalCard.tsx](../../ui/src/components/ApprovalCard.tsx) |
 | Composer | Input, attach, send, attachment row | Empty, attached, disabled | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
-| File card | Name, type, size, remove | Ready, removing | [FileCard.tsx](../../ui/src/components/FileCard.tsx) |
+| Attachment | File icon, name, size, remove | Attached | [ChatView.tsx](../../ui/src/components/ChatView.tsx) |
+| File card | Download link, name, size, download icon | Ready, metadata pending | [FileCard.tsx](../../ui/src/components/FileCard.tsx) |
 
 The Approval Card's fields and answers are owned by [the message specification](../messaging/message/product.md). This page owns their visual presentation.
 
@@ -122,7 +123,7 @@ These patterns state composition; behavior is in [product.md](product.md).
 | Color | Warm paper, forest accent, amber attention; semantic roles; 4.5:1 body and placeholder contrast. | `--ground`, `--accent`, `--attention` in [styles.css](../../ui/src/styles.css) |
 | Type | 12px functional floor; 15px body; role-named scale. | `--font-*`, `--text-*` in [styles.css](../../ui/src/styles.css) |
 | Space | 4px rhythm. | `--sp-*` in [styles.css](../../ui/src/styles.css) |
-| Radius | Cards 12–16px; controls 9px; pills for small controls. | [styles.css](../../ui/src/styles.css) |
+| Radius | Cards 12–16px; controls 8–10px; pills for small controls. | [styles.css](../../ui/src/styles.css) |
 | Elevation | Border or shadow, not both; no default card shadow. | `--line` in [styles.css](../../ui/src/styles.css) |
 | Touch | 40px primary controls; 36px compact language switch. | [styles.css](../../ui/src/styles.css) |
 | Breakpoints | 900px product boundary; 1080, 560, and 360px visual breakpoints. | [product.md](product.md), [styles.css](../../ui/src/styles.css) |
