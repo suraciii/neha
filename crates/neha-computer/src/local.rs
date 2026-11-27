@@ -93,7 +93,10 @@ pub struct LocalRuntime {
     /// The folders writes may reach besides `root`: the owner's grants and,
     /// without full access, the run's own directory. Each is opened as a
     /// directory descriptor so a later path swap cannot redirect a write, and
-    /// no root sits inside another or inside `root`.
+    /// no root sits inside `root`. They are candidates, not all mounted: the
+    /// shell mounts only the roots that pass its own scan, and an inner root
+    /// stays a candidate because an outer root the scan refuses must not take
+    /// it down too.
     write_roots: Vec<(PathBuf, std::fs::File)>,
     /// The directory a run works in. It is where relative paths resolve and
     /// where the shell starts; without full access it is also one of the write
@@ -116,8 +119,9 @@ enum Mode {
     Managed,
     /// A real machine, fenced by bubblewrap.
     Machine {
-        /// The resolved `bwrap` binary.
-        bwrap: PathBuf,
+        /// The resolved `bwrap` binary a fenced shell starts. A full-access
+        /// runtime opens no sandbox, so it has none.
+        bwrap: Option<PathBuf>,
         /// The Bot's folder, opened without following a symlink and checked
         /// once. Every write and every listing starts from this descriptor, so
         /// a swap on disk cannot move the root between calls.
@@ -192,6 +196,58 @@ impl LocalRuntime {
         hidden: Vec<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         Self::machine_at_with(workspace, OsStr::new(bot), find_bwrap(), hidden)
+    }
+
+    /// Opens one Bot's folder on a real machine with full access.
+    ///
+    /// The owner gave the Bot the machine user's own rights, so this path
+    /// probes no sandbox and scans nothing: the folder is opened without
+    /// following a symlink and created when absent, and a Bot's own symlink,
+    /// hard link, or special file is not this runtime's business. A machine
+    /// without bubblewrap can still run a full-access Bot, and a Bot that made
+    /// itself a symlink is still served after a restart.
+    pub fn full_access(workspace: &std::fs::File, bot: &str) -> Result<Self, RuntimeError> {
+        Self::full_access_at(workspace, OsStr::new(bot))
+    }
+
+    /// Opens one Bot's folder with full access under a verified workspace root
+    /// descriptor.
+    #[cfg(unix)]
+    fn full_access_at(workspace: &std::fs::File, bot: &OsStr) -> Result<Self, RuntimeError> {
+        if !is_one_component(bot) {
+            return Err(RuntimeError::UnsafeFolder(format!(
+                "{} is not one folder name; clean it and start again (the default is ~/Neha/<bot-id>)",
+                bot.to_string_lossy()
+            )));
+        }
+        let workspace_path = opened_path(workspace).map_err(RuntimeError::Io)?;
+        let folder_path = workspace_path.join(bot);
+        let folder = open_or_create_machine_folder(workspace, bot, &folder_path)?;
+
+        Ok(Self {
+            root: folder_path,
+            mode: Mode::Machine {
+                bwrap: None,
+                folder,
+            },
+            hidden: Vec::new(),
+            denied: Vec::new(),
+            timeout: DEFAULT_TIMEOUT,
+            in_flight: AtomicU32::new(0),
+            full_access: true,
+            write_roots: Vec::new(),
+            cwd: None,
+            env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            cli_dir: default_cli_dir(),
+        })
+    }
+
+    /// A real Computer runs only on Unix, where a folder is a descriptor.
+    #[cfg(not(unix))]
+    fn full_access_at(_workspace: &std::fs::File, _bot: &OsStr) -> Result<Self, RuntimeError> {
+        Err(RuntimeError::NoSandbox(
+            "a real Computer runs only on Unix".to_owned(),
+        ))
     }
 
     /// Opens a machine's workspace root without following a symlink, creating
@@ -287,7 +343,10 @@ impl LocalRuntime {
 
         Ok(Self {
             root: folder_path,
-            mode: Mode::Machine { bwrap, folder },
+            mode: Mode::Machine {
+                bwrap: Some(bwrap),
+                folder,
+            },
             hidden,
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -344,6 +403,12 @@ impl LocalRuntime {
 
     /// Applies the owner's access choice and this run's directory.
     ///
+    /// Returns a runtime over this machine and Bot folder with one request's
+    /// access. A daemon caches a runtime per Bot and calls this for every
+    /// request: the grants and the run's directory are opened for that request
+    /// alone, so a directory archived and rebuilt between two runs is reopened
+    /// instead of being served from an older descriptor.
+    ///
     /// Grant roots and the run's directory are opened now, so a later rename
     /// cannot point a write somewhere else, and every later write and shell
     /// bind uses the opened descriptor.
@@ -352,23 +417,61 @@ impl LocalRuntime {
     /// machine user's own rights, so it keeps no write roots and ignores the
     /// hidden roots. Without it, `cwd` is this run's one-off write root: the
     /// shell binds it read-write and the file tools write through its
-    /// descriptor. It is never persisted as a grant. A root already covered by
-    /// the Bot's folder or by another root is dropped, because the outer root
-    /// covers it.
+    /// descriptor. It is never persisted as a grant.
+    ///
+    /// A root inside the Bot's folder is dropped, because the folder covers
+    /// it. Every other opened root stays a candidate for the file tools; the
+    /// shell mounts only the candidates its scan accepts, and an outer accepted
+    /// root covers an inner one.
     ///
     /// A grant that cannot be opened is skipped: the Space checked it when the
     /// owner added it. A run directory that cannot be opened, or one that is
     /// hidden, is an error: the run named a directory it cannot use.
-    ///
-    /// As with a grant, the shell only mounts a write root whose tree holds no
-    /// link or special file; the file tools write through the opened descriptor
-    /// with their own per-write checks.
     pub fn with_machine_access(
-        mut self,
+        &self,
         full_access: bool,
         grants: &[String],
         cwd: Option<&str>,
     ) -> Result<Self, RuntimeError> {
+        let mut runtime = self.reopened()?;
+        runtime.apply_machine_access(full_access, grants, cwd)?;
+        Ok(runtime)
+    }
+
+    /// Copies this runtime's opened machine and Bot folder without an access
+    /// decision: the copy starts with no grants and no run directory.
+    fn reopened(&self) -> Result<Self, RuntimeError> {
+        let mode = match &self.mode {
+            Mode::Managed => Mode::Managed,
+            Mode::Machine { bwrap, folder } => Mode::Machine {
+                bwrap: bwrap.clone(),
+                folder: folder.try_clone().map_err(RuntimeError::Io)?,
+            },
+        };
+        let env = self.env.lock().map(|env| env.clone()).unwrap_or_default();
+
+        Ok(Self {
+            root: self.root.clone(),
+            mode,
+            hidden: self.hidden.clone(),
+            denied: self.denied.clone(),
+            timeout: self.timeout,
+            in_flight: AtomicU32::new(0),
+            full_access: false,
+            write_roots: Vec::new(),
+            cwd: None,
+            env: Arc::new(std::sync::Mutex::new(env)),
+            cli_dir: self.cli_dir.clone(),
+        })
+    }
+
+    /// Opens one request's grants and run directory on a copied runtime.
+    fn apply_machine_access(
+        &mut self,
+        full_access: bool,
+        grants: &[String],
+        cwd: Option<&str>,
+    ) -> Result<(), RuntimeError> {
         let cwd = match cwd {
             Some(directory) => Some(self.open_run_directory(directory, full_access)?),
             None => None,
@@ -377,7 +480,7 @@ impl LocalRuntime {
             self.full_access = true;
             self.write_roots.clear();
             self.cwd = cwd.map(|(path, _file)| path);
-            return Ok(self);
+            return Ok(());
         }
 
         let mut roots = Vec::new();
@@ -412,11 +515,12 @@ impl LocalRuntime {
                 roots.push((path, file));
             }
         }
-        // The Bot's folder is already a write root, and an inner root adds
-        // nothing to an outer one.
+        // The Bot's folder is already a write root; a root inside it adds
+        // nothing. The rest stay as candidates because the shell decides which
+        // of them it can mount after its own scan.
         roots.retain(|(root, _)| !root.starts_with(&self.root));
-        self.write_roots = dedupe_write_roots(roots);
-        Ok(self)
+        self.write_roots = roots;
+        Ok(())
     }
 
     /// Opens the directory a run works in.
@@ -457,7 +561,7 @@ impl LocalRuntime {
         Ok((path, file))
     }
 
-    /// Kills the process group of the shell that is running, if one is.
+    /// Kills the running shell and every process below it, if one is.
     ///
     /// A caller whose channel closed has no result to wait for: this ends the
     /// work instead of leaving it running. The running [`execute`] sees its
@@ -470,7 +574,7 @@ impl LocalRuntime {
         if pid == 0 {
             return false;
         }
-        kill_group(Some(pid));
+        kill_tree(Some(pid));
         true
     }
 
@@ -914,22 +1018,37 @@ impl LocalRuntime {
     }
 
     /// Builds the shell process for this mode, without starting it.
-    fn shell_command(&self, command: &str) -> Command {
+    ///
+    /// A granted shell rechecks what it is about to mount: the Bot's folder and
+    /// every candidate write root are scanned now, because the machine's host
+    /// may have added a link since the runtime opened them, and only the
+    /// accepted roots are mounted.
+    fn shell_command(&self, command: &str) -> Result<Command, ActionResult> {
         let mut process = match &self.mode {
             Mode::Managed => {
                 let mut process = Command::new("sh");
                 process.arg("-c").arg(command).current_dir(&self.root);
                 process
             }
-            // Full access has no fence to build: the command runs directly as
-            // the machine user from the run's directory, and bubblewrap is
-            // never started.
+            // Full access has no fence to build: the command runs as the
+            // machine user from the run's directory, and bubblewrap is never
+            // started. Its wrapper ends every process the command leaves
+            // behind, including one that moved to its own process group.
             Mode::Machine { .. } if self.full_access => {
-                let mut process = Command::new("sh");
-                process.arg("-c").arg(command).current_dir(self.base());
-                process
+                full_access_shell_command(command, self.base())
             }
             Mode::Machine { bwrap, folder } => {
+                let Some(bwrap) = bwrap else {
+                    return Err(ActionResult::failed(
+                        "this runtime has no sandbox to start a fenced shell",
+                    ));
+                };
+                // A host that added a hard link or a symlink below the Bot's
+                // folder since the runtime started would otherwise be mounted
+                // writable for this shell: scan the folder again for every
+                // shell, exactly as the write roots are scanned.
+                scan_bot_folder(folder, &self.root)
+                    .map_err(|error| ActionResult::failed(error.to_string()))?;
                 #[cfg(unix)]
                 let source = folder_mount_source();
                 #[cfg(not(unix))]
@@ -938,25 +1057,33 @@ impl LocalRuntime {
                 let (write_roots, root_fds): (
                     Vec<(OsString, PathBuf)>,
                     Vec<libc::c_int>,
-                ) = self
-                    .write_roots
-                    .iter()
-                    // A write root the Bot's folder scan would refuse is not
-                    // mounted writable for the shell: a hard link or symlink in
-                    // it could otherwise change a file outside the root. The
-                    // file tools keep their own per-write checks.
-                    .filter(|(root, file)| scan_bot_folder(file, root).is_ok())
-                    .map(|(root, file)| {
-                        use std::os::fd::AsRawFd as _;
-                        (
+                ) = {
+                    // A write root the scan refuses is not mounted writable for
+                    // the shell: a hard link or symlink in it could otherwise
+                    // change a file outside the root. The accepted roots are
+                    // deduped here, after the scan: an outer root the scan
+                    // refuses must not take a clean inner root down with it.
+                    let mut mounted: Vec<&(PathBuf, std::fs::File)> = self
+                        .write_roots
+                        .iter()
+                        .filter(|(root, file)| scan_bot_folder(file, root).is_ok())
+                        .collect();
+                    mounted.sort_by(|(left, _), (right, _)| left.cmp(right));
+                    mounted.dedup_by(|inner, outer| inner.0.starts_with(&outer.0));
+                    mounted
+                        .into_iter()
+                        .map(|(root, file)| {
+                            use std::os::fd::AsRawFd as _;
                             (
-                                OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
-                                root.clone(),
-                            ),
-                            file.as_raw_fd(),
-                        )
-                    })
-                    .unzip();
+                                (
+                                    OsString::from(format!("/proc/self/fd/{}", file.as_raw_fd())),
+                                    root.clone(),
+                                ),
+                                file.as_raw_fd(),
+                            )
+                        })
+                        .unzip()
+                };
                 #[cfg(not(unix))]
                 let (write_roots, root_fds): (
                     Vec<(OsString, PathBuf)>,
@@ -1038,7 +1165,7 @@ impl LocalRuntime {
             .env("TMPDIR", temporary)
             .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
             .kill_on_drop(true);
-        process
+        Ok(process)
     }
 
     async fn shell(&self, command: &str) -> ActionResult {
@@ -1048,7 +1175,10 @@ impl LocalRuntime {
         if command.len() > MAX_COMMAND_BYTES {
             return ActionResult::failed("the command is too long");
         }
-        let mut process = self.shell_command(command);
+        let mut process = match self.shell_command(command) {
+            Ok(process) => process,
+            Err(result) => return result,
+        };
         #[cfg(unix)]
         process.process_group(0);
         let mut child = match process.spawn() {
@@ -1067,19 +1197,20 @@ impl LocalRuntime {
         let status = match tokio::time::timeout_at(deadline, child.wait()).await {
             Ok(Ok(status)) => Some(status),
             Ok(Err(error)) => {
-                kill_group(pid);
+                kill_tree(pid);
                 return ActionResult::failed(format!("the shell failed: {error}"));
             }
             Err(_) => {
                 timed_out = true;
-                kill_group(pid);
+                kill_tree(pid);
                 let _ = child.wait().await;
                 None
             }
         };
         // The shell may have left children holding the pipes open. The
         // command is over, so the group goes; the readers then drain what
-        // the pipes still hold.
+        // the pipes still hold. A full-access shell's wrapper has already
+        // ended the descendants that left its process group.
         kill_group(pid);
         let grace = if timed_out {
             DRAIN_GRACE
@@ -1337,6 +1468,79 @@ fn sandbox_command(
 ) -> Command {
     let mut process = Command::new(bwrap);
     process.args(sandbox_args(source, folder, cwd, hidden, write_roots));
+    process
+}
+
+/// The shell script a full-access command runs under.
+///
+/// A full-access shell has no sandbox, so a descendant that moves to its own
+/// process group (a `setsid` daemon) or double-forks out of it would outlive
+/// the command. This wrapper is a child subreaper: every orphaned descendant is
+/// reparented to it instead of to init, and its exit trap kills those children
+/// before it exits. The command arrives as its own argv element (`$1`) and is
+/// never interpolated into this script.
+#[cfg(target_os = "linux")]
+const FULL_ACCESS_WRAPPER: &str = r#"
+cleanup() {
+    neha_round=0
+    while [ "$neha_round" -lt 100 ]; do
+        neha_found=0
+        for neha_stat in /proc/[0-9]*/stat; do
+            neha_pid=${neha_stat#/proc/}
+            neha_pid=${neha_pid%/stat}
+            [ "$neha_pid" = "$$" ] && continue
+            read -r neha_line < "$neha_stat" 2>/dev/null || continue
+            neha_rest=${neha_line##*') '}
+            set -- $neha_rest
+            if [ "$2" = "$$" ]; then
+                kill -KILL "$neha_pid" 2>/dev/null
+                neha_found=1
+            fi
+        done
+        [ "$neha_found" = 0 ] && return 0
+        neha_round=$((neha_round + 1))
+    done
+}
+trap 'neha_status=$?; cleanup; exit $neha_status' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+/bin/sh -c "$1"
+"#;
+
+/// Builds a full-access shell process: no bubblewrap, and a wrapper that ends
+/// the command's whole process tree when the command ends.
+///
+/// The wrapper needs `/proc` to find descendants that left the process group,
+/// and only Linux has the tracking that a timeout or a closed channel uses; on
+/// another Unix the command keeps the plain process-group rule.
+fn full_access_shell_command(command: &str, base: &Path) -> Command {
+    let mut process = Command::new("sh");
+    #[cfg(target_os = "linux")]
+    {
+        process
+            .arg("-c")
+            .arg(FULL_ACCESS_WRAPPER)
+            .arg("neha")
+            .arg(command);
+        // SAFETY: the closure runs in the child between `fork` and `exec`,
+        // where only async-signal-safe calls are allowed; `prctl` is a plain
+        // syscall that changes only this child's attribute and allocates
+        // nothing. The attribute survives `exec`, so the wrapper script below
+        // is the subreaper that collects the command's orphaned descendants.
+        unsafe {
+            process.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        process.arg("-c").arg(command);
+    }
+    process.current_dir(base);
     process
 }
 
@@ -1764,23 +1968,6 @@ fn open_write_root(_directory: &str) -> std::io::Result<(PathBuf, std::fs::File)
         std::io::ErrorKind::Unsupported,
         "a real Computer runs only on Unix",
     ))
-}
-
-/// Drops write roots another root already covers.
-///
-/// Roots are opened descriptors, so they are compared by the path each names.
-/// Sorting puts a directory before the directories inside it, so one pass
-/// keeps the outermost root of every group and drops the rest.
-fn dedupe_write_roots(mut roots: Vec<(PathBuf, std::fs::File)>) -> Vec<(PathBuf, std::fs::File)> {
-    roots.sort_by(|(left, _), (right, _)| left.cmp(right));
-    let mut kept: Vec<(PathBuf, std::fs::File)> = Vec::new();
-    for (path, file) in roots {
-        if kept.iter().any(|(outer, _)| path.starts_with(outer)) {
-            continue;
-        }
-        kept.push((path, file));
-    }
-    kept
 }
 
 /// Writes bytes to a relative path inside the Bot's folder descriptor without
@@ -2276,6 +2463,105 @@ fn kill_group(pid: Option<u32>) {
 #[cfg(not(unix))]
 fn kill_group(_pid: Option<u32>) {}
 
+/// Kills one shell and every process below it.
+///
+/// A fenced shell dies with its bubblewrap namespace and a shell's own group
+/// with it, but an unsandboxed command can move a descendant to another process
+/// group (a `setsid` daemon) or double-fork it out of reach of the group signal.
+/// The descendants are recorded before the group goes, while their parent links
+/// still exist, and killed after it; the recorded start time refuses a process
+/// id the kernel reused in between.
+fn kill_tree(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    #[cfg(target_os = "linux")]
+    let descendants = process_descendants(pid);
+    kill_group(Some(pid));
+    #[cfg(target_os = "linux")]
+    for (child, start_time) in descendants {
+        if process_start_time(child) != Some(start_time) {
+            continue;
+        }
+        // SAFETY: `child` names a live process with the recorded start time, so
+        // it is the descendant the snapshot saw and not a reused process id.
+        unsafe {
+            libc::kill(child as i32, libc::SIGKILL);
+        }
+    }
+}
+
+/// Returns the live descendants of `root` and their start times.
+///
+/// A `/proc` snapshot is what lets an unsandboxed shell's whole tree be found:
+/// the parent links name every process, including one in its own process group.
+/// A machine without `/proc` records nothing and falls back to the group.
+#[cfg(target_os = "linux")]
+fn process_descendants(root: u32) -> Vec<(u32, u64)> {
+    let mut parents: std::collections::HashMap<u32, (u32, u64)> = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if let Some(parent) = process_parent_and_start(pid) {
+            parents.insert(pid, parent);
+        }
+    }
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    for (pid, (parent, _)) in &parents {
+        children.entry(*parent).or_default().push(*pid);
+    }
+    let mut descendants = Vec::new();
+    let mut seen = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        let Some(kids) = children.get(&parent) else {
+            continue;
+        };
+        for child in kids {
+            if !seen.insert(*child) {
+                continue;
+            }
+            if let Some((_, start_time)) = parents.get(child) {
+                descendants.push((*child, *start_time));
+            }
+            frontier.push(*child);
+        }
+    }
+
+    descendants
+}
+
+/// A process's parent and start time from one `/proc/<pid>/stat` snapshot.
+///
+/// The command name is parenthesized and may itself hold spaces or `)`, so the
+/// fields are read after its last `)`.
+#[cfg(target_os = "linux")]
+fn process_parent_and_start(pid: u32) -> Option<(u32, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = rest.split_whitespace();
+    let _state = fields.next()?;
+    let parent = fields.next()?.parse().ok()?;
+    // `starttime` is the 22nd field of /proc/<pid>/stat; `state` and `ppid` are
+    // the 3rd and 4th, so it is the 18th field after `ppid`.
+    let start_time = fields.nth(17)?.parse().ok()?;
+
+    Some((parent, start_time))
+}
+
+/// Returns a process's start time from `/proc`, or `None` when it is gone.
+#[cfg(target_os = "linux")]
+fn process_start_time(pid: u32) -> Option<u64> {
+    process_parent_and_start(pid).map(|(_, start_time)| start_time)
+}
 /// The runtime cannot open its workspace or fence a real machine.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -2408,7 +2694,7 @@ mod tests {
         LocalRuntime {
             root: std::fs::canonicalize(root).unwrap(),
             mode: Mode::Machine {
-                bwrap: std::path::PathBuf::from("/nonexistent/neha-test-bwrap"),
+                bwrap: Some(std::path::PathBuf::from("/nonexistent/neha-test-bwrap")),
                 folder: open_directory_path(&std::fs::canonicalize(root).unwrap()).unwrap(),
             },
             hidden: vec![std::fs::canonicalize(hidden).unwrap()],
@@ -4648,11 +4934,12 @@ mod tests {
         );
     }
 
-    /// Write roots another root covers are dropped: the Bot's folder always
-    /// covers what is inside it, and an outer root covers an inner one.
+    /// Write roots are kept as candidates: the Bot's folder covers a root
+    /// inside it, but an outer root that the shell's scan refuses must not take
+    /// a clean inner root down with it.
     #[cfg(unix)]
     #[test]
-    fn nested_write_roots_are_deduped() {
+    fn nested_write_roots_stay_candidates() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("bot");
         std::fs::create_dir(&root).unwrap();
@@ -4668,7 +4955,8 @@ mod tests {
             .unwrap();
         assert!(runtime.write_roots.is_empty());
 
-        // A run directory inside a grant is covered by the grant.
+        // A run directory inside a grant stays a candidate: the shell decides
+        // after its scan which of the two it can mount.
         let inside_grant = granted.join("work");
         std::fs::create_dir(&inside_grant).unwrap();
         let runtime = file_runtime_without_hidden(&root)
@@ -4679,10 +4967,13 @@ mod tests {
             )
             .unwrap();
         let canonical_granted = std::fs::canonicalize(&granted).unwrap();
-        assert_eq!(runtime.write_roots.len(), 1);
+        let canonical_inside = std::fs::canonicalize(&inside_grant).unwrap();
+        assert_eq!(runtime.write_roots.len(), 2);
         assert_eq!(runtime.write_roots[0].0, canonical_granted);
+        assert_eq!(runtime.write_roots[1].0, canonical_inside);
 
-        // Of two roots, the outer one covers the inner one.
+        // Of two roots, the outer one covers the inner one for the shell, but
+        // both stay as file-tool candidates because the outer scan may fail.
         let inner = granted.join("inner");
         std::fs::create_dir(&inner).unwrap();
         let runtime = file_runtime_without_hidden(&root)
@@ -4695,7 +4986,284 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(runtime.write_roots.len(), 1);
-        assert_eq!(runtime.write_roots[0].0, canonical_granted);
+        assert_eq!(runtime.write_roots.len(), 2);
+        assert!(
+            runtime
+                .write_roots
+                .iter()
+                .any(|(path, _)| path == &canonical_granted)
+        );
+        assert!(
+            runtime
+                .write_roots
+                .iter()
+                .any(|(path, _)| path == &std::fs::canonicalize(&inner).unwrap())
+        );
+    }
+
+    /// The fenced constructor refuses what a full-access one must accept: a Bot
+    /// folder holding a symlink or a hard link, on a machine where bubblewrap
+    /// is not even looked for.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_access_folder_opens_without_a_scan_or_a_probe() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let bot = "01890a5d-ac96-774b-bcce-b302099a8057";
+        let folder = workspace.join(bot);
+        std::fs::create_dir(&folder).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "outside").unwrap();
+        std::os::unix::fs::symlink(&outside, folder.join("link")).unwrap();
+        std::fs::hard_link(&outside, folder.join("hard")).unwrap();
+
+        let root = LocalRuntime::open_workspace(&workspace).unwrap();
+        assert!(
+            LocalRuntime::machine_at(&root, bot, Vec::new()).is_err(),
+            "the fenced path refuses a folder that holds a link"
+        );
+        let runtime = LocalRuntime::full_access(&root, bot)
+            .expect("full access opens the folder without a scan or a probe");
+
+        assert!(runtime.full_access);
+        assert!(runtime.hidden.is_empty());
+        assert!(matches!(runtime.mode, Mode::Machine { bwrap: None, .. }));
+        assert_eq!(runtime.workspace(), std::fs::canonicalize(&folder).unwrap());
+    }
+
+    /// A full-access command ends the descendants it left behind in another
+    /// process group or below a second fork, not only the group the shell
+    /// started.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_full_access_shell_ends_a_background_process_in_its_own_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let runtime = full_access_runtime(&root, &root);
+        let session = directory.path().join("session-alive");
+        let double_fork = directory.path().join("double-fork-alive");
+        let command = format!(
+            "setsid sh -c 'sleep 0.6; echo alive > {}' >/dev/null 2>&1 & \
+             (setsid sh -c 'sleep 0.6; echo alive > {}' >/dev/null 2>&1 &)",
+            session.display(),
+            double_fork.display()
+        );
+
+        let result = runtime.execute(Action::Shell { command }).await;
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !session.exists(),
+            "a full-access command ends its own-session descendant when it ends"
+        );
+        assert!(
+            !double_fork.exists(),
+            "a full-access command ends a double-forked descendant when it ends"
+        );
+    }
+
+    /// A timed-out full-access command also ends a descendant in another
+    /// process group: only the process group would not reach it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_full_access_timeout_ends_a_background_process_in_its_own_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let runtime = full_access_runtime(&root, &root).with_timeout(Duration::from_millis(200));
+        let marker = directory.path().join("alive");
+        let command = format!(
+            "setsid sh -c 'sleep 0.6; echo alive > {}' >/dev/null 2>&1 & sleep 30",
+            marker.display()
+        );
+
+        let result = runtime.execute(Action::Shell { command }).await;
+        assert_eq!(result.status, ActionStatus::TimedOut, "{result:?}");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !marker.exists(),
+            "a timed-out full-access command ends its whole process tree"
+        );
+    }
+
+    /// A channel close kills a full-access command's whole tree, including a
+    /// descendant that left its process group.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn cancelling_a_full_access_shell_ends_its_whole_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let runtime = std::sync::Arc::new(full_access_runtime(&root, &root));
+        let started = directory.path().join("started");
+        let marker = directory.path().join("alive");
+        let command = format!(
+            "setsid sh -c 'sleep 0.6; echo alive > {}' >/dev/null 2>&1 & echo started > {}; sleep 30",
+            marker.display(),
+            started.display()
+        );
+        let running = tokio::spawn({
+            let runtime = std::sync::Arc::clone(&runtime);
+            async move {
+                runtime
+                    .execute(Action::Shell {
+                        command: command.clone(),
+                    })
+                    .await
+            }
+        });
+        for _ in 0..200 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(started.exists(), "the shell started");
+        assert!(runtime.cancel_in_flight());
+        let result = running.await.unwrap();
+        assert_ne!(result.status, ActionStatus::Succeeded, "{result:?}");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            !marker.exists(),
+            "a cancelled full-access command ends its whole process tree"
+        );
+    }
+
+    /// The cached runtime is reused between commands, so the Bot's folder must
+    /// be scanned again for every shell: the host may have added a hard link
+    /// after the runtime opened the folder.
+    #[tokio::test]
+    async fn a_cached_runtime_scans_the_bot_folder_before_every_shell() {
+        let Some((directory, runtime)) = machine_runtime() else {
+            return;
+        };
+        let folder = runtime.workspace().to_path_buf();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "safe").unwrap();
+
+        let first = runtime
+            .execute(Action::Shell {
+                command: format!("printf first > {}/first.txt", folder.display()),
+            })
+            .await;
+        assert_eq!(first.status, ActionStatus::Succeeded, "{first:?}");
+
+        // The host adds a hard link to a file outside the folder between two
+        // commands that reuse this runtime.
+        std::fs::hard_link(&outside, folder.join("late.txt")).unwrap();
+        let second = runtime
+            .execute(Action::Shell {
+                command: format!("printf changed > {}/late.txt", folder.display()),
+            })
+            .await;
+        assert_eq!(second.status, ActionStatus::Failed, "{second:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "safe");
+    }
+
+    /// A clean inner grant still gets its own mount when an outer grant the
+    /// shell's scan refuses would cover it.
+    #[tokio::test]
+    async fn a_clean_inner_root_survives_a_refused_outer_root() {
+        if !bwrap_enabled() {
+            return;
+        }
+        // The grants sit outside `/tmp`, which the fence replaces with a fresh
+        // tmpfs; only a visible directory proves the shell's write.
+        let directory = outside_tempdir();
+        let outer = directory.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let outside = directory.path().join("outside.txt");
+        std::fs::write(&outside, "safe").unwrap();
+        std::fs::hard_link(&outside, outer.join("linked.txt")).unwrap();
+        let runtime = LocalRuntime::machine(directory.path().join("bot"))
+            .expect("NEHA_TEST_BWRAP is set but bubblewrap cannot start a sandbox")
+            .with_machine_access(
+                false,
+                &[
+                    outer.to_string_lossy().into_owned(),
+                    inner.to_string_lossy().into_owned(),
+                ],
+                None,
+            )
+            .unwrap();
+
+        // The outer root holds a hard link, so it is not mounted; the inner
+        // root is clean and must still be writable for the shell.
+        let shell = runtime
+            .execute(Action::Shell {
+                command: format!("printf inner > {}/note.txt", inner.display()),
+            })
+            .await;
+        assert_eq!(shell.status, ActionStatus::Succeeded, "{shell:?}");
+        assert_eq!(
+            std::fs::read_to_string(inner.join("note.txt")).unwrap(),
+            "inner"
+        );
+
+        // The refused outer root is not a shell write root.
+        let refused = runtime
+            .execute(Action::Shell {
+                command: format!("printf changed > {}/linked.txt", outer.display()),
+            })
+            .await;
+        assert_eq!(refused.status, ActionStatus::Failed, "{refused:?}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "safe");
+    }
+
+    /// Access roots are opened for each access decision, not held from an older
+    /// one: a run directory archived and rebuilt under the same path must be
+    /// written through its new inode.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn access_roots_are_reopened_for_every_decision() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("bot");
+        std::fs::create_dir(&root).unwrap();
+        let work = directory.path().join("run");
+        std::fs::create_dir(&work).unwrap();
+        let base = file_runtime_without_hidden(&root);
+
+        let first = base
+            .with_machine_access(false, &[], Some(work.to_str().unwrap()))
+            .unwrap();
+        let written = first
+            .execute(Action::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "first".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("note.txt")).unwrap(),
+            "first"
+        );
+
+        // Between two runs the directory is archived and rebuilt under the same
+        // path. A descriptor held by a cached runtime would still name the old
+        // inode.
+        let archived = directory.path().join("archived");
+        std::fs::rename(&work, &archived).unwrap();
+        std::fs::create_dir(&work).unwrap();
+        let second = base
+            .with_machine_access(false, &[], Some(work.to_str().unwrap()))
+            .unwrap();
+        let written = second
+            .execute(Action::WriteFile {
+                path: "note.txt".to_owned(),
+                content: "second".to_owned(),
+            })
+            .await;
+        assert_eq!(written.status, ActionStatus::Succeeded, "{written:?}");
+        assert_eq!(
+            std::fs::read_to_string(work.join("note.txt")).unwrap(),
+            "second"
+        );
+        assert_eq!(
+            std::fs::read_to_string(archived.join("note.txt")).unwrap(),
+            "first"
+        );
     }
 }

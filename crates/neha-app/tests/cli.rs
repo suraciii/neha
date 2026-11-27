@@ -2311,7 +2311,271 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     let access = run(&home, &credential, &["bot", "access", &bot]);
     assert!(access.contains("full access: off"), "{access}");
 
+    // A symlink names the folder it points at: a grant stores the canonical
+    // folder, and revoking the same symlink takes that grant away.
+    let real = directory.path().join("real-folder");
+    std::fs::create_dir(&real).unwrap();
+    let link = directory.path().join("linked-folder");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let canonical = std::fs::canonicalize(&real).unwrap();
+    let symlinked = run(
+        &home,
+        &credential,
+        &["bot", "grant", &bot, link.to_str().unwrap()],
+    );
+    assert!(
+        symlinked.contains(&format!("grant {}", canonical.display())),
+        "a grant stores the folder a symlink names: {symlinked}"
+    );
+    let revoked = run(
+        &home,
+        &credential,
+        &["bot", "revoke", &bot, link.to_str().unwrap()],
+    );
+    assert!(
+        revoked.contains("grants: none"),
+        "the same symlink revokes its grant: {revoked}"
+    );
+
+    // Two grants that arrive together both survive: each command adds to the
+    // list the Space holds instead of writing back a stale copy.
+    let concurrent_first = directory.path().join("concurrent-a");
+    let concurrent_second = directory.path().join("concurrent-b");
+    std::fs::create_dir(&concurrent_first).unwrap();
+    std::fs::create_dir(&concurrent_second).unwrap();
+    let spawn_grant = |path: &Path| {
+        Command::new(BIN)
+            .args(["bot", "grant", &bot, path.to_str().unwrap()])
+            .env("NEHA_HOME", &home)
+            .env("NEHA_CREDENTIAL", &credential)
+            .env("NEHA_PASSWORD", PASSWORD)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("neha runs")
+    };
+    let first_grant = spawn_grant(&concurrent_first);
+    let second_grant = spawn_grant(&concurrent_second);
+    let first_output = first_grant.wait_with_output().unwrap();
+    let second_output = second_grant.wait_with_output().unwrap();
+    assert!(
+        first_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first_output.stderr)
+    );
+    assert!(
+        second_output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second_output.stderr)
+    );
+    let access = run(&home, &credential, &["bot", "access", &bot]);
+    for path in [&concurrent_first, &concurrent_second] {
+        assert!(
+            access.contains(&format!("grant {}", path.display())),
+            "a concurrent grant must survive: {access}"
+        );
+    }
+
     drop(server);
+}
+
+/// Waits until `approval list` shows an approval for one run, and returns it.
+fn wait_for_approval_of_run(home: &Path, credential: &Path, run_id: &str) -> String {
+    let mut found = String::new();
+    wait_until("the run to ask for another approval", || {
+        let listed = run(home, credential, &["approval", "list"]);
+        let approval = listed.lines().find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let approval = fields.next()?;
+            (fields.next() == Some(run_id)).then(|| approval.to_owned())
+        });
+        found = approval.unwrap_or_default();
+        !found.is_empty()
+    });
+
+    found
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runs_access_is_fixed_when_it_starts() {
+    if !local_computer_ready() {
+        return;
+    }
+    let (base, script, provider_task) = scripted_provider().await;
+    let directory = tempfile::Builder::new()
+        .prefix("neha-e2e-pinned-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch directory outside /tmp");
+    // The writes land in a folder of their own: the fixture's directory holds
+    // the hidden session directory, and a grant may not contain a hidden path.
+    let outside_directory = tempfile::Builder::new()
+        .prefix("neha-e2e-pinned-folder-")
+        .tempdir_in("/var/tmp")
+        .expect("a writable scratch folder outside /tmp");
+    let outside = outside_directory.path().join("outside.txt");
+    let outside_again = outside_directory.path().join("outside-again.txt");
+    let outside_next = outside_directory.path().join("outside-next.txt");
+    let computer = bare_local_computer(directory, &base);
+
+    // The run asks twice: the first write is allowed once, and the second is
+    // another card while the run's access stays the one it began with.
+    script.call(
+        "write_file",
+        serde_json::json!({"path": outside.to_string_lossy(), "content": "one"}),
+    );
+    script.call(
+        "write_file",
+        serde_json::json!({"path": outside_again.to_string_lossy(), "content": "two"}),
+    );
+    script.say("Both writes are done.");
+    // The next run starts after the access changed.
+    script.call(
+        "write_file",
+        serde_json::json!({"path": outside_next.to_string_lossy(), "content": "three"}),
+    );
+    script.say("The next run ran with full access.");
+
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write twice"],
+    );
+    let (run_id, first_approval) = waiting_run(&sent);
+
+    // The owner turns full access on while the run waits on the first card.
+    let full = run(
+        &computer.home,
+        &computer.credential,
+        &["bot", "full-access", &computer.bot, "on", "--yes"],
+    );
+    assert!(full.contains("full access: on"), "{full}");
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &first_approval],
+    );
+    wait_until("the allowed write to land", || outside.exists());
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "one");
+
+    // The pinned access still fences the run, so the second write asks again
+    // although the Bot's current access is full.
+    let second_approval = wait_for_approval_of_run(&computer.home, &computer.credential, &run_id);
+    let card = run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "show", &second_approval],
+    );
+    assert!(
+        card.contains("grant"),
+        "the run's pinned access asks for the folder:\n{card}"
+    );
+    assert!(
+        card.contains(outside_again.to_str().unwrap()),
+        "the card names the second write:\n{card}"
+    );
+    run(
+        &computer.home,
+        &computer.credential,
+        &["approval", "allow", &second_approval],
+    );
+    let shown = wait_for_run_status(&computer.home, &computer.credential, &run_id, "succeeded");
+    assert!(
+        shown.contains("Both writes are done") || shown.contains("  reply "),
+        "{shown}"
+    );
+    wait_until("the second allowed write to land", || {
+        outside_again.exists()
+    });
+    assert_eq!(std::fs::read_to_string(&outside_again).unwrap(), "two");
+
+    // A run that starts after the change uses full access: no card again.
+    let sent = run(
+        &computer.home,
+        &computer.credential,
+        &["chat", "send", "--chat", &computer.chat, "write once more"],
+    );
+    assert!(
+        !sent.contains("is waiting for approval"),
+        "the next run starts with the new access:\n{sent}"
+    );
+    assert!(
+        sent.contains("The next run ran with full access."),
+        "{sent}"
+    );
+    wait_until("the next run's write to land", || outside_next.exists());
+    assert_eq!(std::fs::read_to_string(&outside_next).unwrap(), "three");
+
+    drop(computer);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_runs_directory_is_shown_normalized_and_cannot_climb() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (base, provider_task) = fake_provider().await;
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let chat = field(&created, "Chat:");
+
+    // A directory that climbs with `..` or is not absolute is refused where
+    // the run is made, not recorded and handed to the Computer.
+    for refused in ["/var/tmp/../etc", "relative/dir"] {
+        let output = cli(
+            &home,
+            &credential,
+            &["chat", "send", "--cwd", refused, "where"],
+        );
+        assert!(!output.status.success(), "accepted {refused}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("`..`") || stderr.contains("absolute"),
+            "{refused}: stderr: {stderr}"
+        );
+    }
+
+    // The accepted directory is shown in the one form the Space recorded.
+    let sent = run(
+        &home,
+        &credential,
+        &[
+            "chat",
+            "send",
+            "--chat",
+            &chat,
+            "--cwd",
+            "/var//tmp/./run",
+            "where",
+        ],
+    );
+    assert!(
+        sent.contains("  cwd /var/tmp/run"),
+        "the send shows the granted directory:\n{sent}"
+    );
+    let run_id = first_word(&field(&sent, "run "));
+    let shown = run(&home, &credential, &["run", "show", &run_id]);
+    assert!(
+        shown.contains("  cwd /var/tmp/run"),
+        "run show names the granted directory:\n{shown}"
+    );
+
+    drop(server);
+    provider_task.abort();
 }
 
 #[test]

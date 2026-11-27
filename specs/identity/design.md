@@ -39,6 +39,8 @@ A Local Computer started on the Space's own machine uses no code. The User who p
 
 The Space issues a short-lived, one-use ticket that binds one User, one Space, and one Space start. Its database keeps only the ticket's digest, and a used or expired ticket admits no one.
 
-A Space that starts with an Admin issues a ticket for that Admin, even with no signed-in client, as one file per Space under the machine's Neha configuration directory, with mode 0600, where the machine's Bots cannot read it. A signed-in User MAY request a ticket from the Space, and it stays in the answer.
+A Space that starts with an Admin issues a ticket for that Admin, even with no signed-in client, as one file per Space under the machine's Neha configuration directory, with mode 0600. A Bot with granted folders cannot read it; [Computer](../computer/product.md#what-a-bot-can-do) states what full access reaches.
+
+A signed-in User MAY request a ticket from the Space, and it stays in the answer.
 
 The ticket's User owns the Computer it pairs. A process that can read the startup ticket MAY pair the machine as its Admin, and a signed-in caller MAY pair as itself.

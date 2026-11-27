@@ -201,6 +201,11 @@ pub struct BotCreate {
 }
 
 /// The parameters of `bot_update`.
+///
+/// An update changes access one way: it replaces the grant list, or adds one
+/// grant, or removes one grant, and may set full access alongside. The Space
+/// applies a grant change to its current projection, so two owners' commands
+/// that arrive together cannot lose one another's change.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BotUpdate {
     /// The Bot to change.
@@ -211,6 +216,12 @@ pub struct BotUpdate {
     /// The complete list of extra folders it may write.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grants: Option<Vec<String>>,
+    /// One folder to add to the grants the Bot has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_add: Option<String>,
+    /// One folder to take away from the grants the Bot has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_remove: Option<String>,
 }
 
 /// The Computer a `bot_create` asks for.

@@ -94,6 +94,8 @@ pub struct PendingRun {
     pub command: Id,
     /// The directory this run works in, when it named one.
     pub cwd: Option<String>,
+    /// The access the run's actions carry, fixed when it starts.
+    pub access: crate::state::AccessView,
     /// A folder allowed for the next action after a one-time grant.
     pub once_grant: Option<String>,
     /// The Model to call.
@@ -501,11 +503,7 @@ async fn approval_decide(
                 .bots
                 .get(&view.bot)
                 .ok_or_else(|| ApiError::internal("the Bot is gone"))?;
-            let mut grants = bot.grants.clone();
-            grants.push(folder.clone());
-            grants.sort();
-            grants.dedup();
-            grants
+            grants_with(&bot.grants, folder)
         };
         result["grant"] = json!(folder);
         drafts.push(EventDraft::new(
@@ -631,7 +629,7 @@ async fn rule_add(
             if prefix.is_empty() {
                 return Err(ApiError::invalid_argument("a path prefix needs a path"));
             }
-            Some(lexical_path(prefix))
+            Some(neha::folder::lexical(prefix))
         }
         None => None,
     };
@@ -898,6 +896,51 @@ async fn provider_add(
     })
 }
 
+/// Returns one grant in the form the Space stores and shows.
+///
+/// A grant names one absolute folder; the same rule reads a grant added, a
+/// grant removed, and a whole list the owner sends.
+fn checked_grant(grant: &str) -> Result<String, ApiError> {
+    neha::folder::normalize_folder(grant).map_err(|error| match error {
+        neha::folder::FolderError::Empty => ApiError::invalid_argument("a grant cannot be empty"),
+        neha::folder::FolderError::Relative => {
+            ApiError::invalid_argument("a grant must be an absolute folder path")
+        }
+        neha::folder::FolderError::ParentDir => {
+            ApiError::invalid_argument("a grant cannot contain `..`")
+        }
+        neha::folder::FolderError::Nul => ApiError::invalid_argument("a grant cannot contain NUL"),
+    })
+}
+
+/// Returns a Bot's grants in the one form a new grant is compared against.
+///
+/// A record written before the fold may hold another spelling of a folder, so
+/// the list is normalized before an add or a remove looks a folder up.
+fn normalized_grants(grants: &[String]) -> Vec<String> {
+    let mut grants: Vec<String> = grants
+        .iter()
+        .map(|grant| {
+            neha::folder::normalize_folder(grant).unwrap_or_else(|_| grant.trim().to_owned())
+        })
+        .collect();
+    grants.sort();
+    grants.dedup();
+    grants
+}
+
+/// Returns a Bot's grants with one lasting grant added.
+fn grants_with(grants: &[String], folder: &str) -> Vec<String> {
+    let mut grants = normalized_grants(grants);
+    if let Ok(folder) = checked_grant(folder)
+        && !grants.contains(&folder)
+    {
+        grants.push(folder);
+        grants.sort();
+    }
+    grants
+}
+
 async fn bot_update(
     context: &CommandContext<'_>,
     account: &Account,
@@ -908,49 +951,49 @@ async fn bot_update(
     if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
         return Ok(outcome);
     }
-    if update.full_access.is_none() && update.grants.is_none() {
+    let replaced = update.grants.is_some();
+    let added = update.grant_add.is_some();
+    let removed = update.grant_remove.is_some();
+    let grant_changes = usize::from(replaced) + usize::from(added) + usize::from(removed);
+    if update.full_access.is_none() && grant_changes == 0 {
         return Err(ApiError::invalid_argument("a Bot update needs a change"));
     }
-    let grants = update.grants.map(|grants| {
-        let mut checked = Vec::new();
-        for grant in grants {
-            let grant = grant.trim();
-            if grant.is_empty() {
-                return Err(ApiError::invalid_argument("a grant cannot be empty"));
-            }
-            let path = std::path::Path::new(grant);
-            if !path.is_absolute() {
-                return Err(ApiError::invalid_argument(
-                    "a grant must be an absolute folder path",
-                ));
-            }
-            if path
-                .components()
-                .any(|part| matches!(part, std::path::Component::ParentDir))
-            {
-                return Err(ApiError::invalid_argument("a grant cannot contain .."));
-            }
-            if grant.contains('\0') {
-                return Err(ApiError::invalid_argument("a grant cannot contain NUL"));
-            }
-            checked.push(grant.to_owned());
-        }
-        checked.sort();
-        checked.dedup();
-        Ok(checked)
-    });
-    let grants = match grants {
-        Some(grants) => Some(grants?),
-        None => None,
-    };
-    let mut data = json!({"bot": update.bot});
-    if let Some(full_access) = update.full_access {
-        data["full_access"] = json!(full_access);
+    if grant_changes > 1 {
+        return Err(ApiError::invalid_argument(
+            "a Bot update replaces, adds, or removes grants, not more than one",
+        ));
     }
-    if let Some(grants) = grants {
-        data["grants"] = json!(grants);
+    let replacement = update
+        .grants
+        .as_ref()
+        .map(|grants| {
+            grants
+                .iter()
+                .map(|grant| checked_grant(grant))
+                .collect::<Result<Vec<String>, ApiError>>()
+                .map(|mut grants| {
+                    grants.sort();
+                    grants.dedup();
+                    grants
+                })
+        })
+        .transpose()?;
+    let add = update.grant_add.as_deref().map(checked_grant).transpose()?;
+    let remove = update
+        .grant_remove
+        .as_deref()
+        .map(checked_grant)
+        .transpose()?;
+
+    // The grant a command adds or removes is applied to the Bot's current
+    // access, so two commands that arrive together never lose each other's
+    // change. The lock is the one an approval's lasting grant takes, so a
+    // decision and an update cannot write the same list twice.
+    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
     }
-    let result = {
+    let (data, result) = {
         let state = context
             .state
             .lock()
@@ -959,18 +1002,43 @@ async fn bot_update(
             .owned_bot(update.bot, account.id)
             .ok_or_else(|| ApiError::not_found("no such Bot"))?
             .clone();
+        let grants = if let Some(grants) = replacement {
+            Some(grants)
+        } else if let Some(add) = add {
+            let mut grants = normalized_grants(&bot.grants);
+            if grants.contains(&add) {
+                return Err(ApiError::invalid_argument(format!(
+                    "the Bot already has a grant for {add}"
+                )));
+            }
+            grants.push(add);
+            grants.sort();
+            Some(grants)
+        } else if let Some(remove) = remove {
+            let mut grants = normalized_grants(&bot.grants);
+            let position = grants
+                .iter()
+                .position(|grant| grant == &remove)
+                .ok_or_else(|| {
+                    ApiError::invalid_argument(format!("the Bot has no grant for {remove}"))
+                })?;
+            grants.remove(position);
+            Some(grants)
+        } else {
+            None
+        };
+        let mut data = json!({"bot": update.bot});
         if let Some(full_access) = update.full_access {
             bot.full_access = full_access;
+            data["full_access"] = json!(full_access);
         }
-        if let Some(grants) = data.get("grants").and_then(|value| value.as_array()) {
-            bot.grants = grants
-                .iter()
-                .filter_map(|value| value.as_str().map(ToOwned::to_owned))
-                .collect();
+        if let Some(grants) = grants {
+            bot.grants = grants.clone();
+            data["grants"] = json!(grants);
         }
         let mut result = serde_json::to_value(bot).map_err(json_error)?;
         result["user"] = json!(account.id);
-        result
+        (data, result)
     };
     let appended = append(
         context.store,
@@ -1220,6 +1288,28 @@ async fn bot_move(
     })
 }
 
+/// Returns the directory a run named, in the form the Space records.
+///
+/// The directory must be absolute and inside no `..` climb, so the directory
+/// a card shows and a Computer grants is the directory the owner named.
+/// Repeated separators and `.` components fold away.
+fn working_directory(cwd: &str) -> Result<String, ApiError> {
+    neha::folder::normalize_folder(cwd).map_err(|error| match error {
+        neha::folder::FolderError::Empty => {
+            ApiError::invalid_argument("a working directory cannot be empty")
+        }
+        neha::folder::FolderError::Relative => {
+            ApiError::invalid_argument("a working directory must be an absolute path")
+        }
+        neha::folder::FolderError::ParentDir => {
+            ApiError::invalid_argument("a working directory cannot contain `..`")
+        }
+        neha::folder::FolderError::Nul => {
+            ApiError::invalid_argument("a working directory cannot contain NUL")
+        }
+    })
+}
+
 async fn message_send(
     context: &CommandContext<'_>,
     account: &Account,
@@ -1241,18 +1331,15 @@ async fn message_send(
     if arguments.file.is_none() && arguments.text.trim().is_empty() {
         return Err(ApiError::invalid_argument("a Message needs text or a File"));
     }
-    let cwd = arguments
+    let cwd = match arguments
         .cwd
         .as_ref()
-        .map(|cwd| cwd.trim().to_owned())
-        .filter(|cwd| !cwd.is_empty());
-    if let Some(cwd) = &cwd
-        && !std::path::Path::new(cwd).is_absolute()
+        .map(|cwd| cwd.trim())
+        .filter(|cwd| !cwd.is_empty())
     {
-        return Err(ApiError::invalid_argument(
-            "a working directory must be an absolute path",
-        ));
-    }
+        Some(cwd) => Some(working_directory(cwd)?),
+        None => None,
+    };
     // The run joins the queue behind the Bot's active runs. It is counted
     // before the append so the confirmed place matches the record order.
     let position = {
@@ -1302,11 +1389,16 @@ async fn message_send(
             .acting(account.id),
         );
     }
-    let provisional = json!({
+    let mut provisional = json!({
         "run": run,
         "status": RESULT_QUEUED,
         "position": position,
     });
+    if let Some(cwd) = &cwd {
+        // The client shows the directory the run actually works in, which is
+        // the normalized path the record holds.
+        provisional["cwd"] = json!(cwd);
+    }
     let appended = append(
         context.store,
         context.state,
@@ -1550,24 +1642,38 @@ pub async fn start_run(
     events: &tokio::sync::broadcast::Sender<Event>,
     pending: &PendingRun,
 ) -> Result<(), ApiError> {
-    let draft = EventDraft::new(
-        EventKind::RunStarted,
-        Author::Bot(pending.bot.id),
-        json!({
-            "run": pending.run,
-            "chat": pending.chat.id,
-            "bot": pending.bot.id,
-            "message": pending.message,
-            "command": pending.command,
-        }),
-    )
-    .acting(pending.acting);
+    let drafts = vec![
+        EventDraft::new(
+            EventKind::RunStarted,
+            Author::Bot(pending.bot.id),
+            json!({
+                "run": pending.run,
+                "chat": pending.chat.id,
+                "bot": pending.bot.id,
+                "message": pending.message,
+                "command": pending.command,
+            }),
+        )
+        .acting(pending.acting),
+        // The access is recorded with the start, so every action this run
+        // takes carries the same permission whatever the owner changes after.
+        EventDraft::new(
+            EventKind::RunAccess,
+            Author::Bot(pending.bot.id),
+            json!({
+                "run": pending.run,
+                "full_access": pending.access.full_access,
+                "grants": pending.access.grants,
+            }),
+        )
+        .acting(pending.acting),
+    ];
     let appended = append(
         store,
         state,
         Id::new(),
         format!("run.start:{}", pending.run),
-        vec![draft],
+        drafts,
         None,
         None,
     )
@@ -1599,6 +1705,7 @@ pub async fn resume_pending(
     };
 
     let computer = run.computer.unwrap_or(bot.computer);
+    let access = pinned_access(run, &bot);
 
     Ok(PendingRun {
         run: run.id,
@@ -1609,6 +1716,7 @@ pub async fn resume_pending(
         message: run.message,
         command: run.command,
         cwd: run.cwd.clone(),
+        access,
         once_grant: run.once_grant.clone(),
         model,
         provider,
@@ -2178,23 +2286,40 @@ fn bot_environment(
     ])
 }
 
+/// The access one run's actions carry, fixed when the run started.
+///
+/// A record written before the access event existed has none pinned, and the
+/// Bot's current access answers for that run.
+fn pinned_access(run: &crate::state::RunView, bot: &BotView) -> crate::state::AccessView {
+    run.access
+        .clone()
+        .unwrap_or_else(|| crate::state::AccessView {
+            full_access: bot.full_access,
+            grants: bot.grants.clone(),
+        })
+}
+
 /// The write access one run's actions carry to its Computer.
 ///
-/// The run's working directory is a write root for that run alone: the owner
-/// named it for this work, so the Bot writes there without a grant and
-/// without an approval card, and it grants nothing to a later run. A run
-/// without one carries only the owner's grants. Full access adds no directory:
+/// The access is the one the run pinned when it started, so a change to the
+/// Bot's access afterwards applies to the next run. The run's working
+/// directory is a write root for that run alone: the owner named it for this
+/// work, so the Bot writes there without a grant and without an approval
+/// card, and it grants nothing to a later run. Full access adds no directory:
 /// the Computer ignores the roots a full-access frame carries.
-fn run_access(bot: &BotView, cwd: Option<&str>) -> neha_computer::channel::AccessFrame {
-    let mut write_roots = bot.grants.clone();
-    if !bot.full_access
+fn run_access(
+    access: &crate::state::AccessView,
+    cwd: Option<&str>,
+) -> neha_computer::channel::AccessFrame {
+    let mut write_roots = access.grants.clone();
+    if !access.full_access
         && let Some(cwd) = cwd
     {
         write_roots.push(cwd.to_owned());
     }
 
     neha_computer::channel::AccessFrame {
-        full_access: bot.full_access,
+        full_access: access.full_access,
         write_roots,
     }
 }
@@ -2249,7 +2374,7 @@ async fn finish_run_with(
                     links.ids(),
                     tool_timeout.saturating_add(TIMEOUT_GRACE),
                 )
-                .with_access(run_access(&pending.bot, pending.cwd.as_deref()));
+                .with_access(run_access(&pending.access, pending.cwd.as_deref()));
                 if let Some(cwd) = &pending.cwd {
                     runtime = runtime.with_working_dir(cwd);
                 }
@@ -2402,6 +2527,7 @@ async fn finish_run_with(
         acting: pending.acting,
         run: pending.run,
         cwd: pending.cwd.clone(),
+        access: pending.access.clone(),
     };
     let mut recorder = RunRecorder {
         log: log.clone(),
@@ -3350,6 +3476,8 @@ struct RunLog<'a> {
     acting: Id,
     run: Id,
     cwd: Option<String>,
+    /// The access this run's actions carry, pinned when it started.
+    access: crate::state::AccessView,
 }
 
 impl RunLog<'_> {
@@ -3489,7 +3617,7 @@ impl Recorder for RunRecorder<'_> {
             // A Hosted Computer has no fence yet (M2-B); it never asks.
             return Ok(Decision::Allow);
         }
-        let grant = grant_folder(&bot, self.log.cwd.as_deref(), call);
+        let grant = grant_folder(&self.log.access, self.log.cwd.as_deref(), call);
         let (reason, rule, ambiguous) = if grant.is_some() {
             (ApprovalReason::Grant, None, false)
         } else if first_use {
@@ -3731,7 +3859,7 @@ fn ambiguous_path_at(path: &str, rules: &[RuleView], cwd: Option<&str>) -> bool 
     rules.iter().any(|rule| {
         rule.path_prefix
             .as_deref()
-            .is_some_and(|prefix| lexical_path(prefix).starts_with('/') != absolute)
+            .is_some_and(|prefix| neha::folder::lexical(prefix).starts_with('/') != absolute)
     })
 }
 
@@ -3814,33 +3942,6 @@ fn rule_matches_at(rule: &RuleView, call: &LoopCall, cwd: Option<&str>) -> bool 
     true
 }
 
-/// The lexical form of one path, without trimming its input.
-///
-/// Repeated separators are folded, `.` components dropped, and a trailing
-/// separator dropped. `..` is kept so callers can refuse it, and an absolute
-/// path stays absolute. Component names are otherwise preserved exactly:
-/// `logs ` and `logs` are different directories.
-fn lexical_path(path: &str) -> String {
-    let absolute = path.starts_with('/');
-    let components: Vec<&str> = path
-        .split('/')
-        .filter(|component| !component.is_empty() && *component != ".")
-        .collect();
-    let joined = components.join("/");
-    if absolute {
-        if joined.is_empty() {
-            "/".to_owned()
-        } else {
-            format!("/{joined}")
-        }
-    } else if joined.is_empty() {
-        // The relative root: `.` names the Workspace root.
-        ".".to_owned()
-    } else {
-        joined
-    }
-}
-
 /// The one normalized form of a raw action path.
 ///
 /// A raw path is trimmed once, as the daemon trims it, and then lexical: the
@@ -3856,7 +3957,7 @@ fn action_path(path: &str) -> Option<String> {
         return path.is_empty().then(|| ".".to_owned());
     }
 
-    Some(lexical_path(trimmed))
+    Some(neha::folder::lexical(trimmed))
 }
 
 /// The target a raw action path names for this run.
@@ -3874,7 +3975,7 @@ fn resolve_action_path(path: &str, cwd: Option<&str>) -> Option<String> {
         return Some(path);
     };
     let base = action_path(cwd)?;
-    Some(lexical_path(&format!(
+    Some(neha::folder::lexical(&format!(
         "{}/{path}",
         base.trim_end_matches('/')
     )))
@@ -3931,7 +4032,7 @@ fn path_matches_at(path: &str, prefix: &str, cwd: Option<&str>) -> bool {
     let Some(path) = resolve_action_path(path, cwd) else {
         return false;
     };
-    let prefix = lexical_path(prefix);
+    let prefix = neha::folder::lexical(prefix);
     if prefix == "/" {
         return path.starts_with('/');
     }
@@ -3952,8 +4053,8 @@ fn path_matches_at(path: &str, prefix: &str, cwd: Option<&str>) -> bool {
 /// `.` covers every relative prefix and no absolute one. A `.` ask is the
 /// relative root itself and is covered only by `.`.
 fn path_covers(derived: &str, ask: &str) -> bool {
-    let derived = lexical_path(derived);
-    let ask = lexical_path(ask);
+    let derived = neha::folder::lexical(derived);
+    let ask = neha::folder::lexical(ask);
     if derived == "." {
         return !ask.starts_with('/');
     }
@@ -4004,7 +4105,7 @@ fn path_parent(path: &str) -> String {
     match action_path(path) {
         Some(path) => parent_of(&path),
         // A path that is only spaces has no parent in the Workspace root.
-        None => lexical_path(path),
+        None => neha::folder::lexical(path),
     }
 }
 
@@ -4069,8 +4170,12 @@ fn derived_rule(
 /// directory is already a write root when the run named one, and without one
 /// it works in a Workspace whose absolute path the Space does not know, so the
 /// daemon's fence decides what a shell may write.
-fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(String, String)> {
-    if bot.full_access {
+fn grant_folder(
+    access: &crate::state::AccessView,
+    cwd: Option<&str>,
+    call: &LoopCall,
+) -> Option<(String, String)> {
+    if access.full_access {
         return None;
     }
     // The run's working directory, normalized. A directory the Space cannot
@@ -4086,7 +4191,7 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
                 let root = root.as_ref()?;
                 action_path(&format!("{}/{path}", root.trim_end_matches('/')))?
             };
-            if under_grants(&target, &bot.grants)
+            if under_grants(&target, &access.grants)
                 || root.as_ref().is_some_and(|root| under_root(&target, root))
             {
                 return None;
@@ -4103,7 +4208,7 @@ fn grant_folder(bot: &BotView, cwd: Option<&str>, call: &LoopCall) -> Option<(St
 /// The root itself is a writable place, and a path under it is too. The root
 /// of the filesystem covers every absolute path.
 fn under_root(path: &str, root: &str) -> bool {
-    let root = lexical_path(root);
+    let root = neha::folder::lexical(root);
     path == root
         || (root == "/" && path.starts_with('/'))
         || path.starts_with(&(root.trim_end_matches('/').to_owned() + "/"))
@@ -4516,7 +4621,7 @@ mod tests {
         path_parent, prepare_recovery, prepare_resume, resolve_action_path, rule_covers,
         rule_matches, run_access, under_root, verify_recovered_action,
     };
-    use crate::state::{BotView, RuleView};
+    use crate::state::RuleView;
     use neha::id::Id;
     use neha::record::RuleEffect;
     use neha::seq::Seq;
@@ -4543,13 +4648,8 @@ mod tests {
         }
     }
 
-    fn bot(full_access: bool, grants: &[&str]) -> BotView {
-        BotView {
-            id: Id::new(),
-            owner: Id::new(),
-            name: "Scout".to_owned(),
-            computer: Id::new(),
-            chat: Id::new(),
+    fn access(full_access: bool, grants: &[&str]) -> crate::state::AccessView {
+        crate::state::AccessView {
             full_access,
             grants: grants.iter().map(|grant| (*grant).to_owned()).collect(),
         }
@@ -5509,11 +5609,10 @@ mod tests {
 
     #[test]
     fn a_runs_directory_is_a_write_root_for_that_run_alone() {
-        let granted = bot(false, &["/data/shared"]);
         // The grants come first and the run's directory last; the run's own
         // folder is the Computer's to write, not the Space's to name.
         assert_eq!(
-            run_access(&granted, Some("/data/work")),
+            run_access(&access(false, &["/data/shared"]), Some("/data/work")),
             neha_computer::channel::AccessFrame {
                 full_access: false,
                 write_roots: vec!["/data/shared".to_owned(), "/data/work".to_owned()],
@@ -5521,7 +5620,7 @@ mod tests {
         );
         // A run without a named directory carries only the grants.
         assert_eq!(
-            run_access(&granted, None),
+            run_access(&access(false, &["/data/shared"]), None),
             neha_computer::channel::AccessFrame {
                 full_access: false,
                 write_roots: vec!["/data/shared".to_owned()],
@@ -5529,9 +5628,8 @@ mod tests {
         );
         // Full access adds no directory; the Computer ignores the roots a
         // full-access frame still carries.
-        let full = bot(true, &["/data/shared"]);
         assert_eq!(
-            run_access(&full, Some("/data/work")),
+            run_access(&access(true, &["/data/shared"]), Some("/data/work")),
             neha_computer::channel::AccessFrame {
                 full_access: true,
                 write_roots: vec!["/data/shared".to_owned()],
@@ -5541,7 +5639,7 @@ mod tests {
 
     #[test]
     fn a_write_inside_the_runs_directory_asks_for_no_folder() {
-        let granted = bot(false, &[]);
+        let granted = access(false, &[]);
         let write = |path: &str| {
             grant_folder(
                 &granted,
@@ -5563,7 +5661,7 @@ mod tests {
         // fence decides what the path may write.
         assert_eq!(write("../elsewhere/out.txt"), None);
         // A granted folder asks for nothing either, directory or not.
-        let granted = bot(false, &["/data/shared"]);
+        let granted = access(false, &["/data/shared"]);
         assert_eq!(
             grant_folder(
                 &granted,
@@ -5590,7 +5688,7 @@ mod tests {
 
     #[test]
     fn a_write_without_a_named_directory_is_left_to_the_fence() {
-        let granted = bot(false, &[]);
+        let granted = access(false, &[]);
         // The Space cannot judge the Workspace a relative path lands in, so it
         // names no folder to ask for and the daemon's fence decides.
         assert_eq!(
@@ -5617,7 +5715,7 @@ mod tests {
 
     #[test]
     fn a_shell_and_full_access_ask_for_no_folder() {
-        let granted = bot(false, &[]);
+        let granted = access(false, &[]);
         let shell = |command: &str| {
             grant_folder(
                 &granted,
@@ -5631,7 +5729,7 @@ mod tests {
         assert_eq!(shell("echo hi > out.txt"), None);
         assert_eq!(shell("pwd"), None);
         // Full access asks for nothing whatever the action writes.
-        let full = bot(true, &[]);
+        let full = access(true, &[]);
         assert_eq!(
             grant_folder(
                 &full,

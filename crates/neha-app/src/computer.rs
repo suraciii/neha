@@ -7,9 +7,11 @@
 //!
 //! The daemon listens on no port and runs each action with the machine user's
 //! rights, fenced by bubblewrap: a Bot reads what that user reads and writes
-//! only its own folder. Reading and running are separate tasks, so a Space
-//! that goes away is noticed at once and the shell it asked for is killed
-//! instead of running on unattended.
+//! only its own folder. A Bot its owner gave full access instead runs without a
+//! sandbox at all, and the daemon opens its folder without the fence's scan or
+//! probe. Reading and running are separate tasks, so a Space that goes away is
+//! noticed at once and the shell it asked for is killed instead of running on
+//! unattended.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -41,14 +43,17 @@ use crate::client::{self, Credential};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// The runtimes this machine opened, one per Bot, kept across reconnects.
-/// What makes one cached runtime different from another.
+/// What makes one cached runtime different from another: a base runtime holds
+/// the Bot's opened folder and, for a granted Bot, the sandboxed mode, and it
+/// is kept across reconnects.
+///
+/// It holds no grant and no run directory: those are opened for each request,
+/// so a directory archived and rebuilt between two runs is never served through
+/// an older descriptor.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct RuntimeKey {
     bot: String,
     full_access: bool,
-    grants: Vec<String>,
-    cwd: Option<String>,
 }
 
 type Runtimes = Arc<Mutex<HashMap<RuntimeKey, Arc<LocalRuntime>>>>;
@@ -561,13 +566,13 @@ async fn serve_channel(
             let _ = stop.send(true);
             // The second half of the cancellation: a frame that was starting
             // while the reader cancelled may have spawned a shell after it.
-            if let Ok(runtimes) = runtimes.lock() {
-                for runtime in runtimes.values() {
-                    runtime.cancel_in_flight();
-                }
-            }
-            if let Ok(mut current) = current.lock() {
-                *current = None;
+            // Shells run on a runtime derived for their own request, so the
+            // cached base runtimes hold none; the slot below is the one that
+            // could have started one.
+            if let Ok(mut current) = current.lock()
+                && let Some(runtime) = current.take()
+            {
+                runtime.cancel_in_flight();
             }
         }
     });
@@ -670,14 +675,18 @@ async fn execute_frame(
             bot,
             path,
             working_dir,
+            access,
         } => {
+            // The read uses the run's own access: a verification of a write an
+            // interrupted full-access run may have made outside the Bot's
+            // folder has to reach the same paths that run could.
             match machine(
                 config,
                 hidden,
                 denied,
                 runtimes,
                 &bot,
-                &AccessFrame::default(),
+                &access,
                 working_dir.as_deref(),
             ) {
                 Ok(runtime) => match runtime.read_bytes(&path).await {
@@ -698,39 +707,44 @@ async fn execute_frame(
             bot,
             path,
             bytes,
-        } => match machine(
-            config,
-            hidden,
-            denied,
-            runtimes,
-            &bot,
-            &AccessFrame::default(),
-            None,
-        ) {
-            Ok(runtime) => match decode_bytes(&bytes) {
-                Ok(bytes) => {
-                    let length = bytes.len();
-                    match runtime.write_bytes(&path, bytes).await {
-                        Ok(()) => write_receipt(id, &path, length),
-                        Err(error) => DeviceFrame::Failed {
-                            id,
-                            message: error.to_string(),
-                        },
-                    }
-                }
+            access,
+        } => {
+            // A File delivery is chosen by the Space, so it stays inside the
+            // Bot's folder whatever the run's access: full access only picks
+            // the base runtime that opens no sandbox, and the delivery then
+            // goes through the folder descriptor with no write roots.
+            match machine_base(config, hidden, denied, runtimes, &bot, access.full_access) {
+                Ok(base) => match base.with_machine_access(false, &[], None) {
+                    Ok(runtime) => match decode_bytes(&bytes) {
+                        Ok(bytes) => {
+                            let length = bytes.len();
+                            match runtime.write_bytes(&path, bytes).await {
+                                Ok(()) => write_receipt(id, &path, length),
+                                Err(error) => DeviceFrame::Failed {
+                                    id,
+                                    message: error.to_string(),
+                                },
+                            }
+                        }
+                        Err(message) => DeviceFrame::Failed { id, message },
+                    },
+                    Err(error) => DeviceFrame::Failed {
+                        id,
+                        message: error.to_string(),
+                    },
+                },
                 Err(message) => DeviceFrame::Failed { id, message },
-            },
-            Err(message) => DeviceFrame::Failed { id, message },
-        },
+            }
+        }
     }
 }
 
-/// Returns this Bot's runtime, opening its folder on first use.
+/// Returns this Bot's runtime with one request's access and run directory.
 ///
 /// `working_dir` is the directory the run works in. Without full access it is
 /// also that run's one-off write root, so the shell may write there and a
-/// relative file path resolves against it.
-#[allow(clippy::too_many_arguments)]
+/// relative file path resolves against it. The access-specific directories are
+/// opened here for this request only; the cached base holds none of them.
 fn machine(
     config: &Config,
     hidden: &[PathBuf],
@@ -740,15 +754,35 @@ fn machine(
     access: &AccessFrame,
     working_dir: Option<&str>,
 ) -> Result<Arc<LocalRuntime>, String> {
+    let base = machine_base(config, hidden, denied, runtimes, bot, access.full_access)?;
+    let runtime = base
+        .with_machine_access(access.full_access, &access.write_roots, working_dir)
+        .map_err(|error| error.to_string())?;
+
+    Ok(Arc::new(runtime))
+}
+
+/// Returns this Bot's opened runtime base, opening it on first use.
+///
+/// The base holds the Bot's folder descriptor and the sandbox decision for its
+/// access model. A full-access base is opened without a scan or a bubblewrap
+/// probe; a granted base is scanned and fenced once per connection.
+#[allow(clippy::too_many_arguments)]
+fn machine_base(
+    config: &Config,
+    hidden: &[PathBuf],
+    denied: &[PathBuf],
+    runtimes: &Runtimes,
+    bot: &str,
+    full_access: bool,
+) -> Result<Arc<LocalRuntime>, String> {
     // The Bot must be one identifier component; reject anything else before
     // touching the filesystem.
     folder_for(&config.workspace, bot)?;
 
     let key = RuntimeKey {
         bot: bot.to_owned(),
-        full_access: access.full_access,
-        grants: access.write_roots.clone(),
-        cwd: working_dir.map(ToOwned::to_owned),
+        full_access,
     };
     let mut runtimes = runtimes
         .lock()
@@ -761,11 +795,17 @@ fn machine(
             // can never redirect the runtime outside its folder.
             let root = LocalRuntime::open_workspace(&config.workspace)
                 .map_err(|error| error.to_string())?;
-            let runtime = LocalRuntime::machine_at(&root, bot, hidden.to_vec())
-                .map_err(|error| error.to_string())?
-                .with_denied(denied.to_vec())
-                .with_machine_access(access.full_access, &access.write_roots, working_dir)
-                .map_err(|error| error.to_string())?;
+            let runtime = if full_access {
+                // The owner gave the Bot the machine user's own rights: no
+                // sandbox is probed and the folder is not scanned, because the
+                // Bot's own links are its business and this must work on a
+                // machine whose bubblewrap cannot start a sandbox.
+                LocalRuntime::full_access(&root, bot).map_err(|error| error.to_string())?
+            } else {
+                LocalRuntime::machine_at(&root, bot, hidden.to_vec())
+                    .map_err(|error| error.to_string())?
+                    .with_denied(denied.to_vec())
+            };
             Ok(Arc::clone(entry.insert(Arc::new(runtime))))
         }
     }
@@ -2577,8 +2617,6 @@ mod tests {
             RuntimeKey {
                 bot: bot.to_string(),
                 full_access: false,
-                grants: Vec::new(),
-                cwd: None,
             },
             Arc::new(runtime),
         )])));
@@ -2686,8 +2724,6 @@ mod tests {
             RuntimeKey {
                 bot: bot.to_string(),
                 full_access: false,
-                grants: Vec::new(),
-                cwd: None,
             },
             Arc::new(runtime),
         )])));
@@ -2844,8 +2880,9 @@ mod tests {
         let bot = Id::new();
         let (folder, runtimes) = managed_bot(workspace.path(), bot);
         std::fs::write(folder.join("report.txt"), "from the workspace").unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("report.txt"), "from the run").unwrap();
+        let directory = folder.join("run");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("report.txt"), "from the run").unwrap();
         let config = channel_config(workspace.path());
 
         let answer = execute_frame(
@@ -2858,7 +2895,8 @@ mod tests {
                 id: 1,
                 bot: bot.to_string(),
                 path: "report.txt".to_owned(),
-                working_dir: Some(directory.path().to_string_lossy().into_owned()),
+                working_dir: Some(directory.to_string_lossy().into_owned()),
+                access: AccessFrame::default(),
             },
         )
         .await;
@@ -2916,6 +2954,241 @@ mod tests {
         );
     }
 
+    /// A full-access Bot's run opens its folder without the fence's scan or
+    /// probe: what the Bot made itself, like a symlink, does not refuse it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_full_access_action_opens_without_the_fence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let folder = workspace.path().join(bot.to_string());
+        std::fs::create_dir(&folder).unwrap();
+        std::os::unix::fs::symlink("/etc/hostname", folder.join("link")).unwrap();
+        let outside = outside_tempdir();
+        let target = outside.path().join("written.txt");
+        let config = channel_config(workspace.path());
+        let runtimes = empty_runtimes();
+
+        let answer = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Action {
+                id: 1,
+                bot: bot.to_string(),
+                action: WireAction::Shell {
+                    command: format!("printf full > {}", target.display()),
+                },
+                working_dir: None,
+                access: AccessFrame {
+                    full_access: true,
+                    write_roots: Vec::new(),
+                },
+                env: Vec::new(),
+            },
+        )
+        .await;
+        let DeviceFrame::Result { status, output, .. } = answer else {
+            panic!("expected a result, got {answer:?}");
+        };
+        assert_eq!(status, ActionStatus::Succeeded, "{output:?}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "full");
+        // The cache holds a full-access base for this Bot; no granted one.
+        let runtimes = runtimes.lock().unwrap();
+        assert_eq!(runtimes.len(), 1);
+        assert!(runtimes.keys().all(|key| key.full_access));
+    }
+
+    /// Switching a Bot from full access to granted access builds a granted base
+    /// instead of reusing the cached full-access one: the folder the Bot made
+    /// links in is scanned and refused.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_granted_run_does_not_reuse_a_full_access_base() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let folder = workspace.path().join(bot.to_string());
+        std::fs::create_dir(&folder).unwrap();
+        let config = channel_config(workspace.path());
+        let runtimes = empty_runtimes();
+        let current = Mutex::new(None);
+
+        let full = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &current,
+            HostFrame::Action {
+                id: 1,
+                bot: bot.to_string(),
+                action: WireAction::Shell {
+                    command: format!("ln -s /etc/hostname {}/link", folder.display()),
+                },
+                working_dir: None,
+                access: AccessFrame {
+                    full_access: true,
+                    write_roots: Vec::new(),
+                },
+                env: Vec::new(),
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                full,
+                DeviceFrame::Result {
+                    status: ActionStatus::Succeeded,
+                    ..
+                }
+            ),
+            "{full:?}"
+        );
+
+        let granted = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &current,
+            HostFrame::Action {
+                id: 2,
+                bot: bot.to_string(),
+                action: WireAction::Shell {
+                    command: "true".to_owned(),
+                },
+                working_dir: None,
+                access: AccessFrame::default(),
+                env: Vec::new(),
+            },
+        )
+        .await;
+        match granted {
+            DeviceFrame::Failed { message, .. } => {
+                assert!(message.contains("symlink"), "{message}");
+            }
+            other => panic!("a granted run must scan the folder: {other:?}"),
+        }
+        // The failed granted open is not cached; the cached base stays the
+        // full-access one, never silently serving a granted run.
+        let runtimes = runtimes.lock().unwrap();
+        assert_eq!(runtimes.len(), 1);
+        assert!(runtimes.keys().all(|key| key.full_access));
+    }
+
+    /// A read that verifies an interrupted full-access run's write uses the
+    /// run's own access, so it reaches a path only full access can read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_full_access_read_reaches_a_hidden_path() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        std::fs::create_dir(workspace.path().join(bot.to_string())).unwrap();
+        let hidden = outside_tempdir();
+        let secret = hidden.path().join("computer.json");
+        std::fs::write(&secret, "dummy-credential").unwrap();
+        let config = channel_config(workspace.path());
+        let runtimes = empty_runtimes();
+
+        let answer = execute_frame(
+            &config,
+            &[hidden.path().to_path_buf()],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Read {
+                id: 1,
+                bot: bot.to_string(),
+                path: secret.to_string_lossy().into_owned(),
+                working_dir: None,
+                access: AccessFrame {
+                    full_access: true,
+                    write_roots: Vec::new(),
+                },
+            },
+        )
+        .await;
+        let DeviceFrame::Bytes { bytes, .. } = answer else {
+            panic!("expected bytes, got {answer:?}");
+        };
+        assert_eq!(decode_bytes(&bytes).unwrap(), b"dummy-credential");
+    }
+
+    /// A File delivery is chosen by the Space, so full access never widens it
+    /// beyond the Bot's folder.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_full_access_file_delivery_stays_inside_the_bot_folder() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bot = Id::new();
+        let folder = workspace.path().join(bot.to_string());
+        std::fs::create_dir(&folder).unwrap();
+        let outside = outside_tempdir();
+        let target = outside.path().join("delivered.bin");
+        let config = channel_config(workspace.path());
+        let runtimes = empty_runtimes();
+        let bytes = encode_bytes(b"hello");
+
+        let refused = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Write {
+                id: 1,
+                bot: bot.to_string(),
+                path: target.to_string_lossy().into_owned(),
+                bytes: bytes.clone(),
+                access: AccessFrame {
+                    full_access: true,
+                    write_roots: Vec::new(),
+                },
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, DeviceFrame::Failed { .. }),
+            "a delivery outside the folder is refused: {refused:?}"
+        );
+        assert!(!target.exists());
+
+        let delivered = execute_frame(
+            &config,
+            &[],
+            &[],
+            &runtimes,
+            &Mutex::new(None),
+            HostFrame::Write {
+                id: 2,
+                bot: bot.to_string(),
+                path: folder.join("delivered.bin").to_string_lossy().into_owned(),
+                bytes,
+                access: AccessFrame {
+                    full_access: true,
+                    write_roots: Vec::new(),
+                },
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                delivered,
+                DeviceFrame::Result {
+                    status: ActionStatus::Succeeded,
+                    ..
+                }
+            ),
+            "{delivered:?}"
+        );
+        assert_eq!(
+            std::fs::read(folder.join("delivered.bin")).unwrap(),
+            b"hello"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_space_that_stops_reading_is_disconnected() {
         let workspace = tempfile::tempdir().unwrap();
@@ -2935,6 +3208,7 @@ mod tests {
                             bot: bot.to_string(),
                             path: "big.bin".to_owned(),
                             working_dir: None,
+                            access: AccessFrame::default(),
                         },
                     )
                     .await;

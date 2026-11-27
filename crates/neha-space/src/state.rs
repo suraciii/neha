@@ -174,6 +174,15 @@ pub struct ActionView {
     pub error: Option<String>,
 }
 
+/// The access a run's actions carry, fixed when it starts.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AccessView {
+    /// Whether full access was on when the run started.
+    pub full_access: bool,
+    /// The folders the owner had granted when the run started.
+    pub grants: Vec<String>,
+}
+
 /// A run.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunView {
@@ -206,7 +215,8 @@ pub struct RunView {
     pub approval: Option<Id>,
     /// The directory the run works in, when it named one.
     pub cwd: Option<String>,
-    /// A write folder allowed for the next action after a one-time grant.
+    /// A write folder allowed for the next action: the action an answered
+    /// grant approval resumed, whether or not the answer also lasts.
     pub once_grant: Option<String>,
     /// The Computer the run started on, from the projection's replay.
     ///
@@ -214,6 +224,14 @@ pub struct RunView {
     /// it began on. It is not part of the wire view.
     #[serde(skip)]
     pub computer: Option<Id>,
+    /// The access the run's actions carry, fixed when it started.
+    ///
+    /// A change to the Bot's access after the start applies to the next run,
+    /// not this one. A record written before the event existed has none, and
+    /// the Bot's current access answers for it. It is not part of the wire
+    /// view.
+    #[serde(skip)]
+    pub access: Option<AccessView>,
     /// The completed steps, in order.
     pub steps: Vec<StepView>,
     /// The actions, in order.
@@ -771,6 +789,7 @@ impl Projection for State {
                         cwd: None,
                         once_grant: None,
                         computer: None,
+                        access: None,
                         steps: Vec::new(),
                         actions: Vec::new(),
                     },
@@ -805,6 +824,7 @@ impl Projection for State {
                             cwd: None,
                             once_grant: None,
                             computer,
+                            access: None,
                             steps: Vec::new(),
                             actions: Vec::new(),
                         });
@@ -820,6 +840,22 @@ impl Projection for State {
                     return Err("a run context is recorded before the run starts".to_owned());
                 }
                 run.cwd = Some(data.working_dir);
+            }
+            EventData::RunAccess(data) => {
+                let run = self
+                    .runs
+                    .get_mut(&data.run)
+                    .ok_or("a run's access must belong to a started run")?;
+                if run.started.is_none() {
+                    return Err("a run's access is recorded after it starts".to_owned());
+                }
+                if run.access.is_some() {
+                    return Err("a run's access is recorded once".to_owned());
+                }
+                run.access = Some(AccessView {
+                    full_access: data.full_access,
+                    grants: data.grants,
+                });
             }
             EventData::RunFinished(data) => {
                 self.recovered_runs.remove(&data.run);
@@ -998,9 +1034,11 @@ impl Projection for State {
                         // Bot, the folder, and the machine: that also answers
                         // the first use of this machine.
                         self.first_use_allowed.insert((bot, acting, computer));
-                        if !data.lasting {
-                            run.once_grant = scope;
-                        }
+                        // The folder is allowed for the action this answer
+                        // resumed, whether or not the answer also lasts for
+                        // later runs. A lasting answer updates the Bot, which
+                        // the run's pinned access deliberately ignores.
+                        run.once_grant = scope;
                     }
                 }
             }
@@ -1058,7 +1096,7 @@ mod tests {
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
-    use super::{RunStatus, State};
+    use super::{AccessView, RunStatus, State};
     use crate::store::Projection as _;
 
     fn event(kind: EventKind, author: Author, data: serde_json::Value, seq: i64) -> Event {
@@ -2007,6 +2045,84 @@ mod tests {
             "an update leaves other fields"
         );
         assert!(state.bots[&bot].grants.is_empty());
+    }
+
+    #[test]
+    fn a_run_access_is_pinned_when_it_starts() {
+        let owner = Id::new();
+        let (computer, bot_id, chat) = (Id::new(), Id::new(), Id::new());
+        let (run, command, message) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot_id, chat, computer);
+        let bot = Author::Bot(bot_id);
+        let run_data = serde_json::json!({
+            "run": run,
+            "chat": chat,
+            "bot": bot_id,
+            "command": command,
+            "message": message,
+        });
+        state
+            .apply(&event(EventKind::RunQueued, bot, run_data.clone(), 4))
+            .unwrap();
+        state
+            .apply(&event(EventKind::RunStarted, bot, run_data, 5))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::RunAccess,
+                bot,
+                serde_json::json!({
+                    "run": run,
+                    "full_access": false,
+                    "grants": ["/data/shared"],
+                }),
+                6,
+            ))
+            .unwrap();
+
+        // A change to the Bot after the start applies to the next run.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                Author::User(owner),
+                serde_json::json!({"bot": bot_id, "full_access": true, "grants": ["/etc"]}),
+                7,
+            ))
+            .unwrap();
+        assert!(state.bots[&bot_id].full_access);
+        assert_eq!(
+            state.runs[&run].access,
+            Some(AccessView {
+                full_access: false,
+                grants: vec!["/data/shared".to_owned()],
+            }),
+            "the run keeps the access it started with"
+        );
+
+        // The access is recorded once, and only after the run starts.
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::RunAccess,
+                    bot,
+                    serde_json::json!({"run": run, "full_access": true, "grants": []}),
+                    8,
+                ))
+                .is_err(),
+            "a run's access is recorded once"
+        );
+        assert!(
+            state
+                .apply(&event(
+                    EventKind::RunAccess,
+                    bot,
+                    serde_json::json!({"run": Id::new(), "full_access": true, "grants": []}),
+                    9,
+                ))
+                .is_err(),
+            "a run's access needs a run that started"
+        );
     }
 
     #[test]

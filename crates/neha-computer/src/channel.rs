@@ -74,6 +74,11 @@ pub enum HostFrame {
         /// The directory this run works in; absent means the Bot's folder.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         working_dir: Option<String>,
+        /// The owner-granted write access this run carries. A read that
+        /// verifies a write from an interrupted run must see the same paths
+        /// that write could reach, including a full-access Bot's own machine.
+        #[serde(default, skip_serializing_if = "AccessFrame::is_default")]
+        access: AccessFrame,
     },
     /// Writes a file's bytes on the machine (a File delivery).
     Write {
@@ -85,6 +90,12 @@ pub enum HostFrame {
         path: String,
         /// The bytes, as URL-safe base64 without padding.
         bytes: String,
+        /// The owner-granted write access this run carries. The delivery
+        /// itself stays inside the Bot's folder: the Computer only uses the
+        /// frame to open a full-access Bot's runtime without the fence's
+        /// sandbox machinery.
+        #[serde(default, skip_serializing_if = "AccessFrame::is_default")]
+        access: AccessFrame,
     },
     /// Keeps the connection alive.
     Ping,
@@ -281,6 +292,7 @@ mod tests {
                     bot: "bot-1".to_owned(),
                     path: "/home/me/report.pdf".to_owned(),
                     working_dir: None,
+                    access: super::AccessFrame::default(),
                 },
                 json!({
                     "type": "read",
@@ -290,11 +302,31 @@ mod tests {
                 }),
             ),
             (
+                HostFrame::Read {
+                    id: 13,
+                    bot: "bot-1".to_owned(),
+                    path: "/home/me/.config/neha/session".to_owned(),
+                    working_dir: None,
+                    access: super::AccessFrame {
+                        full_access: true,
+                        write_roots: Vec::new(),
+                    },
+                },
+                json!({
+                    "type": "read",
+                    "id": 13,
+                    "bot": "bot-1",
+                    "path": "/home/me/.config/neha/session",
+                    "access": { "full_access": true, "write_roots": [] },
+                }),
+            ),
+            (
                 HostFrame::Write {
                     id: 12,
                     bot: "bot-1".to_owned(),
                     path: "out/report.bin".to_owned(),
                     bytes: "aGVsbG8".to_owned(),
+                    access: super::AccessFrame::default(),
                 },
                 json!({
                     "type": "write",
@@ -302,6 +334,26 @@ mod tests {
                     "bot": "bot-1",
                     "path": "out/report.bin",
                     "bytes": "aGVsbG8",
+                }),
+            ),
+            (
+                HostFrame::Write {
+                    id: 14,
+                    bot: "bot-1".to_owned(),
+                    path: "out/report.bin".to_owned(),
+                    bytes: "aGVsbG8".to_owned(),
+                    access: super::AccessFrame {
+                        full_access: false,
+                        write_roots: vec!["/data/shared".to_owned()],
+                    },
+                },
+                json!({
+                    "type": "write",
+                    "id": 14,
+                    "bot": "bot-1",
+                    "path": "out/report.bin",
+                    "bytes": "aGVsbG8",
+                    "access": { "full_access": false, "write_roots": ["/data/shared"] },
                 }),
             ),
             (HostFrame::Ping, json!({ "type": "ping" })),
@@ -375,6 +427,47 @@ mod tests {
                 frame
             );
         }
+    }
+
+    #[test]
+    fn a_frame_without_an_access_field_carries_the_default_access() {
+        // An older Space sends no access; a newer Computer must read that as
+        // the default access rather than refuse the frame.
+        let read = serde_json::from_value::<HostFrame>(json!({
+            "type": "read",
+            "id": 1,
+            "bot": "bot-1",
+            "path": "notes.txt",
+        }))
+        .unwrap();
+        assert!(matches!(
+            read,
+            HostFrame::Read {
+                access: super::AccessFrame {
+                    full_access: false,
+                    ref write_roots,
+                },
+                ..
+            } if write_roots.is_empty()
+        ));
+        let write = serde_json::from_value::<HostFrame>(json!({
+            "type": "write",
+            "id": 2,
+            "bot": "bot-1",
+            "path": "notes.txt",
+            "bytes": "aGVsbG8",
+        }))
+        .unwrap();
+        assert!(matches!(
+            write,
+            HostFrame::Write {
+                access: super::AccessFrame {
+                    full_access: false,
+                    ref write_roots,
+                },
+                ..
+            } if write_roots.is_empty()
+        ));
     }
 
     #[test]

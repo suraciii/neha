@@ -64,6 +64,9 @@ pub enum EventKind {
     /// The directory a run works in.
     #[serde(rename = "neha.run.context")]
     RunContext,
+    /// The file access a run's actions carry, fixed when it starts.
+    #[serde(rename = "neha.run.access")]
+    RunAccess,
     /// A run finished.
     #[serde(rename = "neha.run.finished")]
     RunFinished,
@@ -110,6 +113,7 @@ impl EventKind {
             Self::RunQueued => "neha.run.queued",
             Self::RunStarted => "neha.run.started",
             Self::RunContext => "neha.run.context",
+            Self::RunAccess => "neha.run.access",
             Self::RunFinished => "neha.run.finished",
             Self::RunStep => "neha.run.step",
             Self::ActionStarted => "neha.action.started",
@@ -134,6 +138,7 @@ impl EventKind {
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunContext
+            | Self::RunAccess
             | Self::RunStep
             | Self::ActionStarted
             | Self::ActionFinished
@@ -170,6 +175,7 @@ impl FromStr for EventKind {
             "neha.run.queued" => Ok(Self::RunQueued),
             "neha.run.started" => Ok(Self::RunStarted),
             "neha.run.context" => Ok(Self::RunContext),
+            "neha.run.access" => Ok(Self::RunAccess),
             "neha.run.finished" => Ok(Self::RunFinished),
             "neha.run.step" => Ok(Self::RunStep),
             "neha.action.started" => Ok(Self::ActionStarted),
@@ -252,7 +258,7 @@ pub struct Event {
 mod tests {
     use super::{
         Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
-        FileAdded, FileError, RunQueued,
+        FileAdded, FileError, RunAccess, RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -271,6 +277,7 @@ mod tests {
             EventKind::FileAdded,
             EventKind::RunQueued,
             EventKind::RunStarted,
+            EventKind::RunAccess,
             EventKind::RunFinished,
             EventKind::RunStep,
             EventKind::ActionStarted,
@@ -295,6 +302,7 @@ mod tests {
         assert_eq!(EventKind::RunQueued.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStarted.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunFinished.class(), EventClass::Presentation);
+        assert_eq!(EventKind::RunAccess.class(), EventClass::Authority);
         assert_eq!(EventKind::RunStep.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionFinished.class(), EventClass::Authority);
@@ -338,12 +346,45 @@ mod tests {
     fn a_queued_run_takes_the_authors_a_started_run_takes() {
         let user = Author::User(Id::new());
         let bot = Author::Bot(Id::new());
-        for kind in [EventKind::RunQueued, EventKind::RunStarted] {
+        for kind in [
+            EventKind::RunQueued,
+            EventKind::RunStarted,
+            EventKind::RunAccess,
+        ] {
             assert!(kind.validate_author(bot, Some(Id::new())).is_ok());
             assert!(kind.validate_author(user, None).is_err());
             assert!(kind.validate_author(user, Some(Id::new())).is_err());
             assert!(kind.validate_author(bot, None).is_err());
         }
+    }
+
+    #[test]
+    fn a_run_access_round_trips() {
+        let run = Id::new();
+        let value = serde_json::json!({
+            "run": run,
+            "full_access": false,
+            "grants": ["/data/shared", "/var/tmp/notes"],
+        });
+
+        let EventData::RunAccess(access) = EventKind::RunAccess.decode(&value).unwrap() else {
+            panic!("a run's access decodes to its data");
+        };
+        assert_eq!(
+            access,
+            RunAccess {
+                run,
+                full_access: false,
+                grants: vec!["/data/shared".to_owned(), "/var/tmp/notes".to_owned()],
+            }
+        );
+
+        let mut unknown = value;
+        unknown["write_roots"] = serde_json::json!(["/data/shared"]);
+        assert!(
+            EventKind::RunAccess.decode(&unknown).is_err(),
+            "an access event carries exactly the pinned permission"
+        );
     }
 
     #[test]
@@ -791,6 +832,8 @@ pub enum EventData {
     RunStarted(RunStarted),
     /// The directory a run works in.
     RunContext(RunContext),
+    /// The file access a run's actions carry.
+    RunAccess(RunAccess),
     /// A run finished.
     RunFinished(RunFinished),
     /// A run completed a step.
@@ -841,6 +884,7 @@ impl EventKind {
             Self::RunQueued => EventData::RunQueued(decode(data)?),
             Self::RunStarted => EventData::RunStarted(decode(data)?),
             Self::RunContext => EventData::RunContext(decode(data)?),
+            Self::RunAccess => EventData::RunAccess(decode(data)?),
             Self::RunFinished => {
                 let data: RunFinished = decode(data)?;
                 // Waiting is where a run stands while it asks, not how it
@@ -887,6 +931,7 @@ impl EventKind {
             Self::RunQueued
             | Self::RunStarted
             | Self::RunContext
+            | Self::RunAccess
             | Self::RunFinished
             | Self::RunStep
             | Self::ActionStarted
@@ -1322,6 +1367,22 @@ pub struct RunContext {
     pub run: Id,
     /// The directory it works in.
     pub working_dir: String,
+}
+
+/// The data of `neha.run.access`.
+///
+/// The Space writes it with `neha.run.started`: the access the Bot's owner had
+/// granted when the run began is the access every action of that run carries,
+/// and a later change to the Bot applies to the next run.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunAccess {
+    /// The run.
+    pub run: Id,
+    /// Whether full access was on when the run started.
+    pub full_access: bool,
+    /// The folders the owner had granted when the run started.
+    pub grants: Vec<String>,
 }
 
 /// The data of `neha.run.finished`.

@@ -6,7 +6,7 @@ mod computer;
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal as _, Write};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
 use neha::record::RuleEffect;
@@ -621,50 +621,22 @@ fn parse_full_access(value: &str) -> Result<bool> {
     }
 }
 
-/// The grants a `bot show` answer reports.
-fn current_grants(shown: &Value) -> Result<Vec<String>> {
-    let grants = shown["bot"]["grants"]
-        .as_array()
-        .context("the answer has no grants")?;
-
-    Ok(grants
-        .iter()
-        .map(|grant| grant.as_str().unwrap_or_default().to_owned())
-        .collect())
-}
-
 /// Checks one grant path and returns its normalized spelling.
 ///
-/// The Space stores a grant as the absolute path it was given, so the CLI
-/// checks the shape before sending it: an empty, relative, or `..` path is
-/// refused here, where the message can name the path. Repeated separators and
-/// `.` components fold away, so two spellings of one folder are one grant.
+/// A grant names one absolute folder: an empty, relative, or `..` path is
+/// refused here, where the message can name the path. The Space reads the
+/// path with the same rule and folds repeated separators and `.` components
+/// away, so two spellings of one folder are one grant.
 fn normalized_grant(path: &std::path::Path) -> Result<String> {
-    let spelled = path.to_string_lossy().into_owned();
+    let spelled = path.to_string_lossy();
     let trimmed = spelled.trim();
-    if trimmed.is_empty() {
-        bail!("a grant cannot be empty");
-    }
-    let path = std::path::Path::new(trimmed);
-    if !path.is_absolute() {
-        bail!("a grant must be an absolute path: {trimmed}");
-    }
-    if spelled.contains('\0')
-        || path
-            .components()
-            .any(|part| matches!(part, std::path::Component::ParentDir))
-    {
-        bail!("a grant must not use `..` or a NUL: {trimmed}");
-    }
-    let mut folded = std::path::PathBuf::from("/");
-    for part in path.components() {
-        // The root is already there; a `.` folds away.
-        if let std::path::Component::Normal(name) = part {
-            folded.push(name);
-        }
-    }
-
-    Ok(folded.to_string_lossy().into_owned())
+    let refusal = |message: &str| anyhow!("{message}: {trimmed}");
+    neha::folder::normalize_folder(trimmed).map_err(|error| match error {
+        neha::folder::FolderError::Empty => anyhow!("a grant cannot be empty"),
+        neha::folder::FolderError::Relative => refusal("a grant must be an absolute path"),
+        neha::folder::FolderError::ParentDir => refusal("a grant must not use `..`"),
+        neha::folder::FolderError::Nul => refusal("a grant must not contain a NUL"),
+    })
 }
 
 /// Checks one grant path and returns the canonical path to store.
@@ -682,39 +654,34 @@ fn checked_grant(path: &std::path::Path) -> Result<String> {
     Ok(folder.to_string_lossy().into_owned())
 }
 
-/// Returns whether two grants name the same folder.
+/// Returns the folder a revoke names.
 ///
-/// The Space compares a write path against its grants after the same folding,
-/// so a grant written with a trailing separator or a `.` is the same grant.
-fn same_grant(left: &str, right: &str) -> bool {
-    let fold = |grant: &str| {
-        let mut folded = std::path::PathBuf::from("/");
-        for part in std::path::Path::new(grant.trim()).components() {
-            if let std::path::Component::Normal(name) = part {
-                folded.push(name);
-            }
-        }
-        folded
-    };
-    fold(left) == fold(right)
+/// A grant stores a folder's canonical path, so a revoke reads the path the
+/// way a grant does while the folder still exists: the same argument removes
+/// the grant a symlink path added. A folder that is gone is matched by the
+/// value the record holds, which is all a lexical path can name.
+fn revocable_grant(path: &std::path::Path) -> Result<String> {
+    let normalized = normalized_grant(path)?;
+    match std::fs::canonicalize(&normalized) {
+        Ok(folder) => Ok(folder.to_string_lossy().into_owned()),
+        Err(_) => Ok(normalized),
+    }
+}
+
+/// A Bot update that changes nothing yet, for a caller to name its one change.
+fn access_update(bot: Id) -> BotUpdate {
+    BotUpdate {
+        bot,
+        full_access: None,
+        grants: None,
+        grant_add: None,
+        grant_remove: None,
+    }
 }
 
 /// Sends one access change and returns the updated Bot.
-async fn update_access(
-    credential: &Credential,
-    bot: Id,
-    full_access: Option<bool>,
-    grants: Option<Vec<String>>,
-) -> Result<Value> {
-    client::command(
-        credential,
-        CommandCall::BotUpdate(BotUpdate {
-            bot,
-            full_access,
-            grants,
-        }),
-    )
-    .await
+async fn update_access(credential: &Credential, update: BotUpdate) -> Result<Value> {
+    client::command(credential, CommandCall::BotUpdate(update)).await
 }
 
 /// Prints one Bot's file access from a `bot show` answer or an access change.
@@ -832,29 +799,29 @@ async fn bot(command: BotCommand) -> Result<()> {
             print_access(&shown["bot"])?;
         }
         BotCommand::Grant { bot, path } => {
-            let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
-            let mut grants = current_grants(&shown)?;
             let granted = checked_grant(&path)?;
-            if grants.iter().any(|grant| same_grant(grant, &granted)) {
-                bail!("the Bot already has a grant for {granted}");
-            }
-            grants.push(granted);
-            let result = update_access(&credential, bot, None, Some(grants)).await?;
+            // The Space adds the folder to its current list, so a grant that
+            // arrives with another change cannot overwrite it.
+            let result = update_access(
+                &credential,
+                BotUpdate {
+                    grant_add: Some(granted),
+                    ..access_update(bot)
+                },
+            )
+            .await?;
             print_access(&result)?;
         }
         BotCommand::Revoke { bot, path } => {
-            let shown = client::command(&credential, CommandCall::BotShow { bot }).await?;
-            let grants = current_grants(&shown)?;
-            let revoked = normalized_grant(&path)?;
-            let kept: Vec<String> = grants
-                .iter()
-                .filter(|grant| !same_grant(grant, &revoked))
-                .cloned()
-                .collect();
-            if kept.len() == grants.len() {
-                bail!("the Bot has no grant for {revoked}");
-            }
-            let result = update_access(&credential, bot, None, Some(kept)).await?;
+            let revoked = revocable_grant(&path)?;
+            let result = update_access(
+                &credential,
+                BotUpdate {
+                    grant_remove: Some(revoked),
+                    ..access_update(bot)
+                },
+            )
+            .await?;
             print_access(&result)?;
         }
         BotCommand::FullAccess {
@@ -872,7 +839,14 @@ async fn bot(command: BotCommand) -> Result<()> {
                     &mut std::io::stdout().lock(),
                 )?;
             }
-            let result = update_access(&credential, bot, Some(full_access), None).await?;
+            let result = update_access(
+                &credential,
+                BotUpdate {
+                    full_access: Some(full_access),
+                    ..access_update(bot)
+                },
+            )
+            .await?;
             print_access(&result)?;
         }
         BotCommand::Show { bot } => {
@@ -1019,6 +993,11 @@ async fn chat(command: ChatCommand) -> Result<()> {
             });
             let result = client::command(&credential, command).await?;
             let run = id_of(&result, "run")?;
+            // The Space records the normalized directory, so show the User
+            // the directory this run actually works in.
+            if let Some(cwd) = result["cwd"].as_str() {
+                println!("  cwd {cwd}");
+            }
             let mut progress = Progress::new(follow);
             progress.accepted(&result);
             // A run that stops at an approval stays where it is: a terminal
@@ -1208,6 +1187,9 @@ fn write_run(out: &mut impl Write, result: &Value) -> Result<()> {
     }
     if let Some(approval) = result["approval"].as_str() {
         writeln!(out, "  approval {approval}")?;
+    }
+    if let Some(cwd) = result["cwd"].as_str() {
+        writeln!(out, "  cwd {cwd}")?;
     }
     if let Some(reply) = result["reply"].as_str() {
         writeln!(out, "  reply {reply}")?;
@@ -2099,8 +2081,8 @@ mod tests {
     };
 
     use super::{
-        BotCommand, checked_grant, confirm_full_access, current_grants, normalized_grant,
-        same_grant, write_access,
+        BotCommand, checked_grant, confirm_full_access, normalized_grant, revocable_grant,
+        write_access,
     };
 
     /// Parses a CLI command line.
@@ -3171,25 +3153,33 @@ mod tests {
     }
 
     #[test]
-    fn two_spellings_of_one_folder_are_one_grant() {
-        assert!(same_grant("/data/shared", "/data//shared/"));
-        assert!(same_grant("/data/shared", "/data/./shared"));
-        assert!(same_grant("/data/shared", "  /data/shared  "));
-        assert!(!same_grant("/data/shared", "/data/shared-notes"));
-        assert!(!same_grant("/data/shared", "/data"));
-    }
+    fn a_revoke_reads_a_live_folder_like_a_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("shared");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
 
-    #[test]
-    fn the_grants_a_bot_show_reports_are_read_back() {
-        let shown = json!({"bot": {"id": Id::new(), "name": "ada", "grants": ["/b", "/a"]}});
+        // A grant stores the folder a symlink names; the same argument must
+        // find that folder again when it is revoked.
+        let granted = checked_grant(&link).unwrap();
         assert_eq!(
-            current_grants(&shown).unwrap(),
-            vec!["/b".to_owned(), "/a".to_owned()]
+            granted,
+            std::fs::canonicalize(&real)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
         );
-        let shown = json!({"bot": {"id": Id::new(), "name": "ada", "grants": []}});
-        assert_eq!(current_grants(&shown).unwrap(), Vec::<String>::new());
-        let shown = json!({"bot": {"id": Id::new(), "name": "ada"}});
-        assert!(current_grants(&shown).is_err());
+        assert_eq!(revocable_grant(&link).unwrap(), granted);
+
+        // A folder that is gone has no target to read, so the recorded value
+        // is what a revoke names.
+        std::fs::remove_file(&link).unwrap();
+        std::fs::remove_dir(&real).unwrap();
+        assert_eq!(
+            revocable_grant(&std::path::PathBuf::from(&granted)).unwrap(),
+            granted
+        );
     }
 
     #[test]

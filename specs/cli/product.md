@@ -44,15 +44,19 @@ Without the option, a new Bot starts on a Hosted Computer. `neha bot move` moves
 
 `neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines.
 
-`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer. Only the Bot's owner can change a Bot's access, and the next run uses the new access.
+`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
+
+Only the Bot's owner can change a Bot's access. A run uses the access recorded when it starts, so a change made during a run applies to the next one.
 
 `neha bot full-access <bot> on` gives the Bot the machine user's own file rights and starts no sandbox for it; `neha bot full-access <bot> off` restores the granted folders fence.
 
 `on` prints the risk, which names the configuration directory the Bot can then read, and asks for confirmation at a terminal. Without a terminal it needs `--yes`, and `off` asks for no confirmation.
 
-`neha chat send --cwd <path>` starts that run's actions in the named directory. Without it they start in the Bot's Workspace. The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run.
+`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. A Hosted Computer starts every run in the Bot's own workspace.
 
-A path that is not absolute is refused.
+The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run. A path that is not absolute is refused.
+
+The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
 
 ## Approvals
 

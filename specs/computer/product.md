@@ -72,7 +72,9 @@ On a Local Computer, a Bot starts in its own Workspace on that machine, and its 
 
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 
-On a Local Computer, the owner sets its access: granted folders, or full access. With granted folders, a Bot writes and deletes files only in its Workspace and those folders. With full access, Neha starts no sandbox, and the Bot writes, deletes, and reads with the machine user's own file rights, including the Computer's configuration directory.
+On a Local Computer, the owner sets its access: granted folders, or full access.
+
+With granted folders, a Bot writes and deletes files only in its Workspace, the granted folders, and the run's own working directory. With full access, Neha starts no sandbox, and the Bot writes, deletes, and reads with the machine user's own file rights, including the Computer's configuration directory.
 
 The approval gate applies to full access as it does to granted folders. [Bot](../bot/product.md#asking-before-an-action) covers when a Bot asks.
 

@@ -18,7 +18,9 @@
 //! [`probe_sandbox`](LocalRuntime::probe_sandbox), and opens each Bot's folder
 //! under that verified root with [`machine_at`](LocalRuntime::machine_at). A
 //! real Bot folder is never a symlink, and a folder holding a hard link, a
-//! symlink, or a special file is refused.
+//! symlink, or a special file is refused. A Bot the owner gave full access is
+//! opened with [`full_access`](LocalRuntime::full_access) instead, which scans
+//! nothing and probes no sandbox: the Bot has the machine user's own rights.
 //!
 //! [`channel`] holds the JSON frames a real Computer and its Space exchange.
 

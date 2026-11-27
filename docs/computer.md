@@ -105,7 +105,7 @@ The Workspace root is `~/.neha/workspaces` by default; `--workspace` on `compute
 
 The folder is created when the Bot first runs an action. Every action of the Bot starts in its Workspace, or in the directory `--cwd` names for that run: a relative path names a file inside it, and `pwd` prints it. The `Workspace root:` line from `neha computer run` names the root the daemon actually serves.
 
-The file tools check every write path. A write outside the Workspace fails with `the path is outside this Bot's writable folder`; a `..` climb or a symlink out is refused, and no file is created. Without a grant, the only persistent place a Bot writes on the machine is its Workspace.
+The file tools check every write path. A write outside the Workspace, the granted folders, and the run's `--cwd` directory fails with `the path is outside the Bot's workspace, its grants, and the run's directory`; a `..` climb or a symlink out is refused, and no file is created. Without a grant, the only persistent place a Bot writes on the machine is its Workspace; a run's `--cwd` directory is writable for that run alone.
 
 The file tools read with the rights of the machine's user. A file read follows a symlink as the machine user's own tools do, and reaches any file that user can read, including files outside the Workspace and files of another Bot on the machine. A directory listing does not follow a symlink that is the path itself, and a FIFO or a device is not read.
 
@@ -113,7 +113,7 @@ In granted mode the Computer's own configuration directory is the exception. A p
 
 The same split reaches Files: in the shell, `neha file get` writes a File of the Chat into the Workspace, and `neha chat send --file` reads a Workspace file and sends it to the Chat. Both run as shell commands and go through the approval gate like other shell commands. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers them.
 
-In granted mode a shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace and its granted folders are writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; files written there are gone when the command ends and never reach the machine's own `/tmp`.
+In granted mode a shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace, its granted folders, and the run's `--cwd` directory are writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; a write outside the writable roots, such as one in that `/tmp`, is gone when the command ends and never reaches the machine's own `/tmp`.
 
 The daemon checks a Bot's folder before it serves it. A hard link, a symlink, or a special file in the folder makes the daemon refuse that folder until it is cleaned; keep links and special files out of the Workspace.
 
@@ -162,10 +162,10 @@ The machine ends the command it was running when the channel drops, so no action
 | `chat send` stops with a run waiting for approval | Answer the card in a terminal, or use `neha approval allow <approval-id>` from the ids it printed. [Approvals](approvals.md) covers it. |
 | The ticket is not valid | A ticket lasts one pairing and one Space start. Restart the Space, then run `neha computer pair` again; a signed-in CLI can also ask for a ticket when no ticket file is present. |
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory, which granted mode hides from Bots. A Bot with full access reads it; turn full access off to hide it again. |
-| A Bot's folder is refused | The daemon reports `it contains a hard link`, `a symlink`, or `a special file`, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
+| A Bot's folder is refused | The daemon reports `it contains a hard link`, `it contains a symlink`, or `it contains a special file`, or `it is a symlink` or `it is not a directory` when the folder itself is the problem, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. |
-| A write is refused | The path is outside the Bot's Workspace and the folders its owner granted. Write inside those, grant the folder, or answer the approval card that asks for it. Full access removes the fence. |
+| A write is refused | The path is outside the Bot's Workspace, the folders its owner granted, and the run's `--cwd` directory. Write inside those, grant the folder, or answer the approval card that asks for it. Full access removes the fence. |
 
 [Building and verification](building.md#a-local-computer-sandbox) shows how to install `bubblewrap`.
 
@@ -192,11 +192,11 @@ neha bot full-access <bot-id> on
 neha bot full-access <bot-id> off
 ```
 
-`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. `neha bot revoke <bot-id> <path>` takes one away, and `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this, and the change applies to the next run, not one already running.
+`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. `neha bot revoke <bot-id> <path>` takes one away, and it also takes away a grant whose folder is gone, matching the path `neha bot access <bot-id>` shows. `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this. Each run fixes the access when it starts, so a change made while a run works applies to the next run.
 
 `neha bot full-access <bot-id> on` gives the Bot the daemon process's own file rights and starts no sandbox for it, so the Bot writes and deletes what the machine's user can and its shell sees the machine's own `/tmp`, `/dev`, and process view. The risk it prints names what that reaches: the Bot can read the Computer's configuration directory, `~/.config/neha` by default, which holds the saved pairing, the machine's token, and the CLI's session credential. Turn full access on only when the Bot needs that range; `off` restores the fence. `on` asks for confirmation at a terminal and needs `--yes` without one; `off` asks for nothing.
 
-When a Bot's action would write outside its Workspace, the granted folders, and the run's `--cwd` directory, the run waits for the owner's approval instead of running the action. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. A shell that writes from the default Workspace is refused by the fence rather than turned into a request, because the Space does not know the Local Workspace's absolute path. A shell mounted into a grant is not writable when the grant contains a hard link, symlink, or special file, so it cannot change a file outside the grant. The approval gate still applies with full access: the first use of the Computer asks, and an Ask rule still asks.
+In granted mode a `write_file` action that would write outside the Bot's Workspace, the granted folders, and the run's `--cwd` directory makes the run wait for the owner's approval instead of running the action; the Space asks only when it can locate the target path. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. A shell that writes outside the fence is refused rather than turned into a request, because the Space does not know the Local Workspace's absolute path. A shell mounted into a grant or into the run's `--cwd` directory is not writable when that folder contains a hard link, symlink, or special file, so it cannot change a file outside it. The approval gate still applies with full access: the first use of the Computer asks, and an Ask rule still asks, but full access raises no folder card.
 
 A run can start its actions in another directory with `neha chat send --cwd`:
 
@@ -204,4 +204,6 @@ A run can start its actions in another directory with `neha chat send --cwd`:
 neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
 ```
 
-Without `--cwd` the run starts in the Bot's Workspace. The directory must be absolute. It is that run's write root: the Bot's shell and its file tools may write inside it for that run, and it grants nothing to a later run. The directory is recorded with the run and appears on an approval card. Reading still follows the machine user's rights, except in granted mode, where the Computer's configuration directory stays hidden.
+On a Local Computer, `--cwd` names the directory the run starts in; without it the run starts in the Bot's Workspace. A Hosted Computer starts every run in its own workspace and ignores the option. The directory must be absolute, must already exist, and must be a folder.
+
+The directory is that run's write root: the Bot's shell and its file tools may write inside it for that run, and it grants nothing to a later run. The directory is recorded with the run and appears on an approval card. In granted mode the Computer refuses a run whose directory sits inside a hidden root or holds one. The shell mounts an outside write root as writable only when its tree holds no link or special file and stays inside the scan limits; the file tools check every write path. Reading still follows the machine user's rights, except in granted mode, where the Computer's configuration directory stays hidden.

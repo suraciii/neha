@@ -60,7 +60,13 @@ Before a Computer action, the loop asks whether to proceed. A File action asks l
 
 The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
 
-An action that would write outside the Bot's write range also waits for the owner. [Computer](../computer/design.md#isolation) states that range, and the run's own working directory is part of it. An Always allow on that approval grants the action's folder for later runs.
+A `write_file` that would write outside the Bot's write range also waits for the owner. [Computer](../computer/design.md#isolation) states that range, and the run's own working directory is part of it.
+
+Only a `write_file` of a Bot with granted folders raises that approval, and only when the Space can locate its target: an absolute path, or a relative one resolved against the run's own working directory. Full access raises none.
+
+A shell that writes outside the range is refused by the Computer's fence instead of being asked about.
+
+An Always allow on that approval grants the action's folder for later runs. The first action of a Local Computer can ask with that reason and shows no Always allow.
 
 A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
 
