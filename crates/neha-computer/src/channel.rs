@@ -169,9 +169,12 @@ pub enum WireAction {
         /// The path, relative to the Bot's folder or absolute.
         path: String,
     },
-    /// Runs a script the Space delivered, from inside the Bot's folder.
+    /// Runs a script the Space delivered.
+    ///
+    /// A fenced Computer mounts the exact bytes read-only inside its sandbox
+    /// and runs them; the script never lives in the Bot's folder.
     RunScript {
-        /// The file name the script is written under: one path component.
+        /// The file name the script runs under: one path component.
         name: String,
         /// The script's bytes.
         content: String,

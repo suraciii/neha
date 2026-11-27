@@ -3345,7 +3345,7 @@ mod tests {
     }
 
     /// A skill script the Space delivers runs through the channel: the daemon
-    /// writes it inside the Bot's folder and answers with the shell's output.
+    /// runs the delivered bytes and answers with the shell's output.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_skill_script_runs_through_the_channel() {

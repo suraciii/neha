@@ -60,7 +60,7 @@ Loading a skill touches no Computer and asks no approval.
 
 ## Scripts
 
-A Bot runs a script a skill carries with the `run_skill_script` action on its Computer. The Space writes the script into the Workspace under `.neha/skills/`, runs it there with the action's arguments, and returns its output.
+A Bot runs a script a skill carries with the `run_skill_script` action on its Computer. The Space passes the script's exact bytes to the Computer, which runs them under the same fence as a shell command and returns their output. A fenced Computer mounts the bytes read-only inside its sandbox: no file in the Workspace holds the script, so the file a run executes is the one the Space recorded.
 
 The first run of one skill's script asks for approval, once for each Bot, acting User, skill, and script. Always allow makes a lasting Allow rule for that skill and script alone, so another script of the same skill asks on its first run. The reason on the card is `first_script_run`.
 

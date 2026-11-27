@@ -296,6 +296,15 @@ pub struct ActionView {
     pub tool: String,
     /// The tool's arguments.
     pub arguments: serde_json::Value,
+    /// The skill a `run_skill_script` action ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// The digest of the script's bytes the action ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
     /// Whether an `ActionFinished` event recorded this action.
     #[serde(skip)]
     pub finished: bool,
@@ -1261,51 +1270,29 @@ impl Projection for State {
                 });
             }
             EventData::ActionStarted(data) => {
-                // A script that starts has run: later runs ask only when a rule
-                // says so. A call the Model got wrong never runs, so its
-                // recorded arguments do not parse and it marks nothing; it is
-                // still recorded as an action.
-                let bot = self
-                    .runs
-                    .get(&data.run)
-                    .ok_or("an action must belong to a started run")?
-                    .bot;
-                let script = (data.tool == neha_loop::tools::RUN_SKILL_SCRIPT
-                    && neha_loop::tools::parse(&data.tool, &data.arguments.to_string()).is_ok())
-                .then(|| {
-                    let (skill, script) = (
-                        data.arguments
-                            .get("skill")
-                            .and_then(serde_json::Value::as_str)?,
-                        data.arguments
-                            .get("script")
-                            .and_then(serde_json::Value::as_str)?,
-                    );
-                    let id = self
-                        .skills
-                        .iter()
-                        .find(|view| {
-                            view.name == skill
-                                && (view.library == SkillLibrary::Space || view.bot == Some(bot))
-                        })
-                        .map(|view| view.id)?;
-                    Some((id, script.to_owned()))
-                })
-                .flatten();
+                // A script action carries the identity the Space dispatched,
+                // resolved before it started. A call that never runs has none,
+                // so it never consumes the first-run consent; a record written
+                // before identities existed has none either.
                 let acting = event.acting;
                 let run = self
                     .runs
                     .get_mut(&data.run)
                     .ok_or("an action must belong to a started run")?;
                 run.once_grant = None;
-                if let (Some((skill, script)), Some(acting)) = (script, acting) {
+                if let (Some(skill), Some(script), Some(acting)) =
+                    (data.skill, data.script.clone(), acting)
+                {
                     self.script_runs.insert((run.bot, acting, skill, script));
                 }
                 run.actions.push(ActionView {
                     id: data.action,
                     step: data.step,
                     tool: data.tool,
-                    arguments: data.arguments,
+                    arguments: data.arguments.clone(),
+                    skill: data.skill,
+                    script: data.script,
+                    script_sha256: data.script_sha256,
                     finished: false,
                     status: ActionStatus::Unknown,
                     output: String::new(),

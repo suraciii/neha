@@ -50,9 +50,24 @@ const MAX_SCRIPT_ARGUMENT_BYTES: usize = 4 * 1024;
 /// The file mode a real-machine write keeps: private to the machine user.
 #[cfg(unix)]
 const FILE_MODE: u32 = 0o600;
-/// Staged scripts are readable and executable only by their owner.
+/// Scripts are readable and executable only by their owner.
 #[cfg(unix)]
-const SCRIPT_MODE: Option<u32> = Some(0o500);
+const SCRIPT_MODE: u32 = 0o500;
+/// The descriptor bubblewrap reads a sealed script's bytes from.
+///
+/// One digit: the shell a sandbox starts closes it before the user command
+/// runs, and a plain POSIX shell only accepts a one-digit `IO_NUMBER`.
+#[cfg(target_os = "linux")]
+const SCRIPT_FD: libc::c_int = 3;
+/// The sandbox directory a sealed skill script is mounted in.
+///
+/// It is created after the sandbox's own `/tmp` tmpfs, so the script exists
+/// only inside that sandbox and disappears with it.
+#[cfg(target_os = "linux")]
+const SCRIPT_DIR: &str = "/tmp/neha-script";
+/// The name the anonymous file holding a skill script's bytes carries.
+#[cfg(target_os = "linux")]
+const SCRIPT_MEMFD_NAME: &std::ffi::CStr = c"neha-script";
 const DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// The system directories a shell searches for its commands.
 const SHELL_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -1154,14 +1169,18 @@ impl LocalRuntime {
         ActionResult::succeeded(truncate(lines.join("\n")))
     }
 
-    /// Writes one skill script inside the Workspace and runs it there.
+    /// Runs one skill script through this runtime's shell, without writing it
+    /// into the Workspace.
     ///
-    /// The script is the Space's own bytes, not the Bot's: it is written
-    /// through the path a tool write uses, given the execute bit, and run
-    /// through this runtime's shell, so the sandbox, the write fence, the
+    /// The script is the Space's verified bytes, not the Bot's, and it runs
+    /// through the shell a command gets, so the sandbox, the write fence, the
     /// output limits, and the time limit apply exactly as they do to a
-    /// command. A script that this platform's shell cannot run as written
-    /// ends as its own failed command; nothing else is tried instead.
+    /// command. A fenced runtime hands bubblewrap an anonymous descriptor
+    /// holding the bytes and runs the sandbox's own copy of it; a runtime with
+    /// no sandbox runs a private file outside the Workspace. No file a Bot or
+    /// another run can write holds the script. A script that this platform's
+    /// shell cannot run as written ends as its own failed command; nothing
+    /// else is tried instead.
     async fn run_script(&self, name: &str, content: &str, arguments: &[String]) -> ActionResult {
         if let Err(message) = check_script_name(name) {
             return ActionResult::failed(message);
@@ -1198,37 +1217,124 @@ impl LocalRuntime {
         }
         #[cfg(unix)]
         {
-            let filename = staged_script_name(name);
-            let relative = Path::new(".neha/skills").join(&filename);
-            let path = self.root.join(&relative);
-            let Some(host_path) = path.to_str() else {
-                return ActionResult::failed("the script path is not valid UTF-8");
-            };
-            if let Err(error) = self.write_to_root(host_path, content.as_bytes(), SCRIPT_MODE) {
-                return ActionResult::failed(error.to_string());
-            }
-            // Keep the parent descriptor for cleanup. The script itself (or a
-            // concurrent writer) may rename the directory while the shell runs.
-            let staged = match StagedScript::open(self, &filename) {
-                Ok(staged) => staged,
-                Err(error) => {
-                    return ActionResult::failed(format!(
-                        "cannot open the staged script directory: {error}"
-                    ));
+            if self.script_runs_under_a_sandbox() {
+                #[cfg(target_os = "linux")]
+                {
+                    self.run_sandboxed_script(name, content, arguments).await
                 }
-            };
-            // Hosted mounts this same directory at /workspace in its rootfs.
-            let command = if self.hosted.is_some() {
-                script_command(
-                    &Path::new(HOSTED_WORKSPACE).join(relative).to_string_lossy(),
-                    arguments,
-                )
+                #[cfg(not(target_os = "linux"))]
+                {
+                    ActionResult::failed(
+                        "a sandboxed skill script needs bubblewrap, which only Linux has",
+                    )
+                }
             } else {
-                script_command(host_path, arguments)
-            };
-            let result = self.shell(&command).await;
-            drop(staged);
-            result
+                self.run_private_script(name, content, arguments).await
+            }
+        }
+    }
+
+    /// Returns whether this runtime's shell runs under bubblewrap.
+    ///
+    /// A Hosted runtime always has one; a real-machine runtime has one unless
+    /// the owner gave the Bot full access. A managed workspace has no sandbox.
+    /// The answer is the mode's promise, not whether the binary is present: a
+    /// fenced runtime that lost its `bwrap` must fail the script, never run it
+    /// unfenced.
+    #[cfg(unix)]
+    fn script_runs_under_a_sandbox(&self) -> bool {
+        self.hosted.is_some() || (matches!(&self.mode, Mode::Machine { .. }) && !self.full_access)
+    }
+
+    /// Runs one skill script from an anonymous in-memory file under
+    /// bubblewrap.
+    ///
+    /// The bytes are written to a `memfd`, made executable, and handed to
+    /// bubblewrap as a read-only data mount inside the sandbox's own
+    /// `/tmp/neha-script`. The shell runs that sandbox path, never a path in
+    /// the Workspace, and nothing on disk names the bytes before or after the
+    /// run.
+    #[cfg(target_os = "linux")]
+    async fn run_sandboxed_script(
+        &self,
+        name: &str,
+        content: &str,
+        arguments: &[String],
+    ) -> ActionResult {
+        let bwrap = match self.script_bwrap() {
+            Ok(bwrap) => bwrap,
+            Err(message) => return ActionResult::failed(message),
+        };
+        if let Err(message) = probe_script_binding(bwrap) {
+            return ActionResult::failed(message);
+        }
+        let script = match SealedScript::create(name, content.as_bytes()) {
+            Ok(script) => script,
+            Err(message) => return ActionResult::failed(message),
+        };
+        let command = script_command(&script.destination.to_string_lossy(), arguments);
+        if let Err(result) = check_shell_command(&command) {
+            return result;
+        }
+        let process = match self.shell_command_with(&command, Some(&script)) {
+            Ok(process) => process,
+            Err(result) => return result,
+        };
+        // The descriptor must outlive the child that starts bubblewrap; it is
+        // released as soon as that child exists.
+        self.run_shell(process, || drop(script)).await
+    }
+
+    /// Runs one skill script where the shell has no sandbox.
+    ///
+    /// A managed workspace and the full-access model have no bubblewrap to
+    /// seal the bytes with. The script goes to a private file in the system
+    /// temporary directory, mode 0500, which the run removes; it is never
+    /// written inside the Workspace, so a Workspace writer cannot name it even
+    /// though this path has no immutable object to offer.
+    #[cfg(unix)]
+    async fn run_private_script(
+        &self,
+        name: &str,
+        content: &str,
+        arguments: &[String],
+    ) -> ActionResult {
+        let path = std::env::temp_dir().join(unique_script_name(name));
+        let Some(shown) = path.to_str() else {
+            return ActionResult::failed("the private script path is not valid UTF-8");
+        };
+        let command = script_command(shown, arguments);
+        if let Err(result) = check_shell_command(&command) {
+            return result;
+        }
+        let script = match TemporaryScript::create(path, content.as_bytes()) {
+            Ok(script) => script,
+            Err(message) => return ActionResult::failed(message),
+        };
+        // The guard unlinks the file when this future ends, including when a
+        // channel drop cancels it.
+        let result = self.shell(&command).await;
+        drop(script);
+
+        result
+    }
+
+    /// Returns the bubblewrap binary this runtime's scripts start under.
+    ///
+    /// A runtime that needs a sandbox but has none refuses the script instead
+    /// of running it unfenced.
+    #[cfg(target_os = "linux")]
+    fn script_bwrap(&self) -> Result<&Path, String> {
+        if let Some(bwrap) = &self.hosted {
+            return Ok(bwrap.as_path());
+        }
+        match &self.mode {
+            Mode::Machine {
+                bwrap: Some(bwrap), ..
+            } if !self.full_access => Ok(bwrap.as_path()),
+            Mode::Machine { .. } | Mode::Managed => {
+                Err("this runtime has no sandbox to start a skill script".to_owned())
+            }
         }
     }
 
@@ -1322,17 +1428,44 @@ impl LocalRuntime {
     /// them, and only the accepted roots are mounted. A full-access shell builds
     /// no fence at all.
     fn shell_command(&self, command: &str) -> Result<Command, ActionResult> {
+        self.shell_command_with(command, None)
+    }
+
+    /// Builds one shell process, mounting `script` when it is a sealed script.
+    ///
+    /// A Hosted or granted shell mounts the sealed descriptor read-only inside
+    /// its sandbox and runs that path; the command the sandbox runs closes the
+    /// descriptor once bubblewrap has read it.
+    fn shell_command_with(
+        &self,
+        command: &str,
+        script: Option<&SealedScript>,
+    ) -> Result<Command, ActionResult> {
         let mut process = if let Some(bwrap) = &self.hosted {
+            let mut arguments = hosted_sandbox_args(bwrap, &self.root, self.cli_dir.as_deref());
+            mount_script(&mut arguments, script);
+            #[cfg(target_os = "linux")]
+            let command = match script {
+                Some(_) => format!("exec {SCRIPT_FD}>&-; {command}"),
+                None => command.to_owned(),
+            };
+            #[cfg(not(target_os = "linux"))]
+            let command = command.to_owned();
             let mut process = Command::new(bwrap);
-            process
-                .args(hosted_sandbox_args(
-                    bwrap,
-                    &self.root,
-                    self.cli_dir.as_deref(),
-                ))
-                .arg("/usr/bin/sh")
-                .arg("-c")
-                .arg(command);
+            process.args(arguments);
+            #[cfg(target_os = "linux")]
+            if let Some(script) = script {
+                let script_fd = script.raw_fd();
+                // SAFETY: the closure runs in the child between `fork` and
+                // `exec`, where only async-signal-safe calls are allowed;
+                // `install_script_fd` only moves this child's descriptors and
+                // allocates nothing. The sealed file is still open in the
+                // parent, so the descriptor is valid when the child forks.
+                unsafe {
+                    process.pre_exec(move || install_script_fd(script_fd));
+                }
+            }
+            process.arg("/usr/bin/sh").arg("-c").arg(command);
             process
         } else {
             match &self.mode {
@@ -1423,31 +1556,33 @@ impl LocalRuntime {
                     ) = (Vec::new(), Vec::new());
                     #[cfg(windows)]
                     let _ = &grant_fds;
-                    let mut process = sandbox_command(
-                        bwrap,
-                        &source,
-                        &self.root,
-                        self.base(),
-                        &self.hidden,
-                        &write_roots,
-                    );
-                    // The parent keeps this descriptor close-on-exec, so other
+                    let mut arguments =
+                        sandbox_args(&source, &self.root, self.base(), &self.hidden, &write_roots);
+                    mount_script(&mut arguments, script);
+                    let mut process = Command::new(bwrap);
+                    process.args(arguments);
+                    // The parent keeps these descriptors close-on-exec, so other
                     // runtimes' folders are never inherited. In the child, after
                     // fork and before exec, move this runtime's folder descriptor
-                    // to a one-digit number and clear its close-on-exec flag, so
-                    // bwrap can bind `/proc/self/fd/<fd>` without trusting a path
-                    // a later rename could point somewhere else.
+                    // to a one-digit number, clear the close-on-exec flags, and
+                    // move the sealed script to its own number, so bwrap can bind
+                    // `/proc/self/fd/<fd>` without trusting a path a later rename
+                    // could point somewhere else.
                     #[cfg(unix)]
                     {
                         use std::os::fd::AsRawFd as _;
 
                         let folder_fd = folder.as_raw_fd();
+                        #[cfg(target_os = "linux")]
+                        let script_fd = script.map(SealedScript::raw_fd);
+                        #[cfg(not(target_os = "linux"))]
+                        let _ = script;
                         // SAFETY: the closure runs in the child between `fork` and
                         // `exec`, where only async-signal-safe calls are allowed;
-                        // `dup2` and `fcntl` are, they touch only this child's
-                        // descriptor table, and they allocate nothing. A failure is
-                        // returned so `spawn` reports it instead of exec'ing
-                        // without the descriptor.
+                        // `dup2`, `fcntl`, and `close` are, they touch only this
+                        // child's descriptor table, and they allocate nothing. A
+                        // failure is returned so `spawn` reports it instead of
+                        // exec'ing without the descriptors.
                         unsafe {
                             process.pre_exec(move || {
                                 if folder_fd != MOUNT_FD && libc::dup2(folder_fd, MOUNT_FD) < 0 {
@@ -1461,17 +1596,30 @@ impl LocalRuntime {
                                         return Err(std::io::Error::last_os_error());
                                     }
                                 }
+                                #[cfg(target_os = "linux")]
+                                if let Some(script_fd) = script_fd {
+                                    install_script_fd(script_fd)?;
+                                }
                                 Ok(())
                             });
                         }
-                        // The wrapper is our own shell script: it closes the mount
-                        // descriptor first and only then execs the user's command,
-                        // which arrives as a separate argv element and is never
-                        // interpolated into the script.
+                        // The wrapper is our own shell script: it closes the
+                        // mount and script descriptors and only then execs the
+                        // user's command, which arrives as a separate argv
+                        // element and is never interpolated into the script.
+                        #[cfg(target_os = "linux")]
+                        let close_script = match script {
+                            Some(_) => format!("exec {SCRIPT_FD}>&-; "),
+                            None => String::new(),
+                        };
+                        #[cfg(not(target_os = "linux"))]
+                        let close_script = String::new();
                         process
                             .arg("/bin/sh")
                             .arg("-c")
-                            .arg(format!("exec {MOUNT_FD}>&-; exec /bin/sh -c \"$1\""))
+                            .arg(format!(
+                                "exec {MOUNT_FD}>&-; {close_script}exec /bin/sh -c \"$1\""
+                            ))
                             .arg("neha")
                             .arg(command);
                     }
@@ -1573,19 +1721,27 @@ impl LocalRuntime {
     }
 
     async fn shell(&self, command: &str) -> ActionResult {
-        if command.trim().is_empty() {
-            return ActionResult::failed("the command is empty");
+        if let Err(result) = check_shell_command(command) {
+            return result;
         }
-        if command.len() > MAX_COMMAND_BYTES {
-            return ActionResult::failed("the command is too long");
-        }
-        let mut process = match self.shell_command(command) {
+        let process = match self.shell_command(command) {
             Ok(process) => process,
             Err(result) => return result,
         };
+        self.run_shell(process, || {}).await
+    }
+
+    /// Starts one built shell process and collects its bounded result.
+    ///
+    /// `release` runs as soon as the child exists, or fails to: a sealed
+    /// script's descriptor must stay open until bubblewrap has inherited it,
+    /// and the parent's copy should not outlive that start.
+    async fn run_shell(&self, mut process: Command, release: impl FnOnce()) -> ActionResult {
         #[cfg(unix)]
         process.process_group(0);
-        let mut child = match process.spawn() {
+        let spawned = process.spawn();
+        release();
+        let mut child = match spawned {
             Ok(child) => child,
             Err(error) => return ActionResult::failed(format!("cannot start a shell: {error}")),
         };
@@ -2010,18 +2166,121 @@ fn folder_mount_source() -> OsString {
     OsString::from(format!("/proc/self/fd/{MOUNT_FD}"))
 }
 
-/// Builds the fenced shell process without starting it.
-fn sandbox_command(
-    bwrap: &Path,
-    source: &OsStr,
-    folder: &Path,
-    cwd: &Path,
-    hidden: &[PathBuf],
-    write_roots: &[(OsString, PathBuf)],
-) -> Command {
-    let mut process = Command::new(bwrap);
-    process.args(sandbox_args(source, folder, cwd, hidden, write_roots));
+/// Adds one sealed script to a sandbox's arguments as a read-only data mount.
+///
+/// The arguments end with the `--` separating bubblewrap's own arguments, and
+/// the mount goes last: a later bind (a grant, the run's directory) must not
+/// hide the private directory it lands in.
+#[cfg(target_os = "linux")]
+fn mount_script(arguments: &mut Vec<OsString>, script: Option<&SealedScript>) {
+    let Some(script) = script else {
+        return;
+    };
+    if arguments.last().is_some_and(|last| last == "--") {
+        arguments.pop();
+    }
+    arguments.push(OsString::from("--dir"));
+    arguments.push(OsString::from(SCRIPT_DIR));
+    arguments.push(OsString::from("--perms"));
+    arguments.push(OsString::from(format!("0{SCRIPT_MODE:o}")));
+    arguments.push(OsString::from("--ro-bind-data"));
+    arguments.push(OsString::from(SCRIPT_FD.to_string()));
+    arguments.push(script.destination.as_os_str().to_owned());
+    arguments.push(OsString::from("--"));
+}
+
+/// Only a Linux sandbox can mount a sealed script's descriptor.
+#[cfg(not(target_os = "linux"))]
+fn mount_script(_arguments: &mut Vec<OsString>, _script: Option<&SealedScript>) {}
+
+/// Moves one sealed script's descriptor to `SCRIPT_FD` in the child that is
+/// about to start bubblewrap.
+///
+/// The hook runs between `fork` and `exec`, where only async-signal-safe calls
+/// are allowed: `dup2`, `fcntl`, and `close` are, and they allocate nothing.
+/// `dup2` also clears the close-on-exec flag on the destination, so bubblewrap
+/// inherits the descriptor; a separate descriptor number is closed so only the
+/// one copy remains.
+#[cfg(target_os = "linux")]
+fn install_script_fd(script_fd: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: `script_fd` is an open descriptor of the parent process, inherited
+    // by the child running this hook; the calls only change the child's own
+    // descriptor table and allocate nothing.
+    unsafe {
+        if script_fd != SCRIPT_FD && libc::dup2(script_fd, SCRIPT_FD) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(SCRIPT_FD, libc::F_SETFD, 0) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if script_fd != SCRIPT_FD && libc::close(script_fd) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+
+    Ok(())
+}
+
+/// The bytes the capability probe mounts and reads back.
+#[cfg(target_os = "linux")]
+const SCRIPT_PROBE_BYTES: &[u8] = b"neha-script-probe";
+
+/// Checks that this bubblewrap can turn a sealed descriptor into a file.
+///
+/// `--ro-bind-data` and `--perms` are the options that mount an anonymous
+/// descriptor instead of a path. A bubblewrap without them cannot run the
+/// verified bytes, so the action fails with this message instead of falling
+/// back to a file a Workspace writer could change.
+#[cfg(target_os = "linux")]
+fn probe_script_binding(bwrap: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt as _;
+
+    let probe = SealedScript::create("probe", SCRIPT_PROBE_BYTES)?;
+    let mut process = std::process::Command::new(bwrap);
     process
+        .arg("--ro-bind")
+        .arg("/")
+        .arg("/")
+        .arg("--tmpfs")
+        .arg(SANDBOX_TMPDIR)
+        .arg("--dir")
+        .arg(SCRIPT_DIR)
+        .arg("--perms")
+        .arg(format!("0{SCRIPT_MODE:o}"))
+        .arg("--ro-bind-data")
+        .arg(SCRIPT_FD.to_string())
+        .arg(&probe.destination)
+        .arg("--")
+        .arg("/bin/cat")
+        .arg(&probe.destination);
+    let script_fd = probe.raw_fd();
+    // SAFETY: the closure runs in the child between `fork` and `exec`, where
+    // only async-signal-safe calls are allowed; `install_script_fd` only moves
+    // this child's descriptors and allocates nothing. The probe's file stays
+    // open in the parent until the child exists.
+    unsafe {
+        process.pre_exec(move || install_script_fd(script_fd));
+    }
+    let output = process
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("cannot check bubblewrap's script mount: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "this bubblewrap cannot mount a verified script: {}",
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("no error output")
+        ));
+    }
+    if output.stdout != SCRIPT_PROBE_BYTES {
+        return Err("this bubblewrap did not mount a verified script's exact bytes".to_owned());
+    }
+
+    Ok(())
 }
 
 /// The shell script a full-access command runs under.
@@ -2303,9 +2562,14 @@ fn check_script_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Keep the staging component within the same byte limit as a script name.
+/// Keep one action's script file name within the limit of a script name.
+///
+/// The name keeps the script's own name as a readable prefix and adds a
+/// process-wide counter, the process id, and the current time in nanoseconds,
+/// so two actions never share a name; the whole name stays within one file
+/// name.
 #[cfg(unix)]
-fn staged_script_name(name: &str) -> String {
+fn unique_script_name(name: &str) -> String {
     use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2321,37 +2585,139 @@ fn staged_script_name(name: &str) -> String {
     format!("{prefix}{suffix}")
 }
 
-/// Unlink only in the directory opened before the command started, even if
-/// the command renames it. Dropping a cancelled action also cleans up.
-#[cfg(unix)]
-struct StagedScript {
-    directory: std::fs::File,
-    filename: std::ffi::CString,
+/// The verified bytes of one skill script, held by an anonymous in-memory
+/// file.
+///
+/// The descriptor is the only handle the bytes have before they enter the
+/// sandbox: nothing in the Workspace names them, and bubblewrap mounts the
+/// descriptor read-only. The file also keeps mode 0500, so the sandbox's user
+/// cannot rewrite what it runs.
+#[cfg(target_os = "linux")]
+struct SealedScript {
+    file: std::fs::File,
+    /// The path the sandbox mounts the bytes at.
+    destination: PathBuf,
 }
 
-#[cfg(unix)]
-impl StagedScript {
-    fn open(runtime: &LocalRuntime, filename: &str) -> std::io::Result<Self> {
-        let root = match &runtime.mode {
-            Mode::Machine { folder, .. } if !runtime.full_access => folder.try_clone()?,
-            _ => open_directory_path(&runtime.root)?,
+#[cfg(target_os = "linux")]
+impl SealedScript {
+    /// Writes `bytes` to a fresh `memfd`, makes it executable, and rewinds it.
+    fn create(name: &str, bytes: &[u8]) -> Result<Self, String> {
+        use std::io::Write as _;
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: the name is a NUL-terminated literal and MFD_CLOEXEC keeps
+        // the descriptor out of every other child; a successful return is a
+        // fresh descriptor this function owns.
+        let fd = unsafe { libc::memfd_create(SCRIPT_MEMFD_NAME.as_ptr(), libc::MFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(format!(
+                "cannot create a private script file: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `fd` is a fresh descriptor from `memfd_create`, owned here.
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.write_all(bytes)
+            .map_err(|error| format!("cannot write a private script file: {error}"))?;
+        file.set_permissions(std::fs::Permissions::from_mode(SCRIPT_MODE))
+            .map_err(|error| format!("cannot mark a private script file executable: {error}"))?;
+        // bubblewrap reads the descriptor from its start.
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| format!("cannot rewind a private script file: {error}"))?;
+        // Sandbox setup moves descriptors to `SCRIPT_FD` and `MOUNT_FD` in the
+        // child. A script file that already landed on one of those numbers
+        // would be overwritten before the child read it, so move it away.
+        let file = if matches!(file.as_raw_fd(), SCRIPT_FD | MOUNT_FD) {
+            // SAFETY: `F_DUPFD_CLOEXEC` duplicates the live descriptor to a
+            // fresh number; a successful return is owned by this scope.
+            let moved =
+                unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, MOUNT_FD + 1) };
+            if moved < 0 {
+                return Err(format!(
+                    "cannot keep a private script's descriptor: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: `moved` is a fresh descriptor owned here; the original
+            // number is closed when the old file is dropped.
+            let moved_file = unsafe { std::fs::File::from_raw_fd(moved) };
+            drop(file);
+            moved_file
+        } else {
+            file
         };
-        let neha = open_directory_at(&root, OsStr::new(".neha"))?;
-        let directory = open_directory_at(&neha, OsStr::new("skills"))?;
+
         Ok(Self {
-            directory,
-            filename: std::ffi::CString::new(filename)?,
+            file,
+            destination: Path::new(SCRIPT_DIR).join(unique_script_name(name)),
         })
     }
+
+    /// Returns the descriptor bubblewrap reads.
+    fn raw_fd(&self) -> libc::c_int {
+        use std::os::fd::AsRawFd as _;
+
+        self.file.as_raw_fd()
+    }
+}
+
+/// Only Linux has both `memfd_create` and bubblewrap's anonymous data mounts.
+#[cfg(not(target_os = "linux"))]
+#[allow(dead_code)]
+struct SealedScript(());
+
+/// A skill script's private file where the shell has no sandbox.
+///
+/// Dropping the guard unlinks the file: a run that succeeded, failed, or was
+/// cancelled all clean up the same way, and no Workspace writer ever sees the
+/// path in a directory it controls.
+#[cfg(unix)]
+struct TemporaryScript {
+    path: PathBuf,
 }
 
 #[cfg(unix)]
-impl Drop for StagedScript {
-    fn drop(&mut self) {
-        use std::os::fd::AsRawFd as _;
-        // SAFETY: the descriptor is live and filename is one NUL-terminated component.
-        unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.filename.as_ptr(), 0) };
+impl TemporaryScript {
+    fn create(path: PathBuf, bytes: &[u8]) -> Result<Self, String> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(FILE_MODE)
+            .open(&path)
+            .map_err(|error| format!("cannot create a private script file: {error}"))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("cannot write a private script file: {error}"))?;
+        file.set_permissions(std::fs::Permissions::from_mode(SCRIPT_MODE))
+            .map_err(|error| format!("cannot mark a private script file executable: {error}"))?;
+
+        Ok(Self { path })
     }
+}
+
+#[cfg(unix)]
+impl Drop for TemporaryScript {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Refuses a shell command the tool will not run.
+///
+/// The same limits apply whether the command is a Bot's or a skill script's.
+fn check_shell_command(command: &str) -> Result<(), ActionResult> {
+    if command.trim().is_empty() {
+        return Err(ActionResult::failed("the command is empty"));
+    }
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(ActionResult::failed("the command is too long"));
+    }
+
+    Ok(())
 }
 
 /// Quotes the absolute path and each argument for the runtime's POSIX shell.
@@ -2672,9 +3038,14 @@ fn open_write_root(directory: &str) -> std::io::Result<(PathBuf, std::fs::File)>
             open_directory_at(&file, name)?
         };
     }
-    // The shell moves the Bot's folder descriptor to a fixed one-digit number.
-    // A root that landed there is moved to another descriptor so the two
-    // mounts can never name each other.
+    // The shell moves the Bot's folder descriptor to a fixed one-digit number,
+    // and a sealed skill script uses another. A root that landed there is
+    // moved to another descriptor so the mounts can never name each other.
+    #[cfg(target_os = "linux")]
+    while matches!(file.as_raw_fd(), MOUNT_FD | SCRIPT_FD) {
+        file = file.try_clone()?;
+    }
+    #[cfg(not(target_os = "linux"))]
     while file.as_raw_fd() == MOUNT_FD {
         file = file.try_clone()?;
     }
@@ -3875,7 +4246,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn managed_skill_scripts_stage_in_the_workspace_and_clean_up_after_each_run() {
+    async fn managed_skill_scripts_run_from_a_private_file_and_clean_up_after_each_run() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let (_dir, runtime) = runtime();
@@ -3907,15 +4278,101 @@ mod tests {
             let path = std::path::PathBuf::from(
                 std::fs::read_to_string(observation.path().join("path")).unwrap(),
             );
-            assert_eq!(
-                path.parent().unwrap(),
-                runtime.workspace().join(".neha/skills")
+            assert!(
+                !path.starts_with(runtime.workspace()),
+                "a script is never written inside the Workspace: {}",
+                path.display()
             );
-            assert!(!path.exists());
-            assert_ne!(previous.as_ref(), Some(&path));
+            assert!(!path.exists(), "a finished run removes its private script");
+            assert_ne!(previous.as_ref(), Some(&path), "two runs share one path");
             previous = Some(path);
         }
         assert!(!project.path().join(".neha").exists());
+        assert!(!runtime.workspace().join(".neha").exists());
+    }
+
+    /// A file another run of the same user left where the old staging wrote
+    /// cannot replace the action's own bytes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_workspace_shadow_cannot_replace_the_executed_script() {
+        let (_dir, runtime) = runtime();
+        let shadow_directory = runtime.workspace().join(".neha/skills");
+        std::fs::create_dir_all(&shadow_directory).unwrap();
+        let shadow = shadow_directory.join("marker.sh");
+        let shadow_content = "#!/bin/sh\nprintf shadow > result.txt\n";
+        std::fs::write(&shadow, shadow_content).unwrap();
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "marker.sh".to_owned(),
+                content: "#!/bin/sh\nprintf action > result.txt\nls .neha/skills\n".to_owned(),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(runtime.workspace().join("result.txt")).unwrap(),
+            "action",
+            "the Workspace shadow's bytes ran instead of the action's"
+        );
+        // The script saw exactly the file the test planted: run_script neither
+        // used the old staging path nor cleaned up after it.
+        let stdout = result
+            .output
+            .text
+            .split_once("stdout:\n")
+            .map(|(_, stdout)| stdout.trim_end())
+            .unwrap_or_default();
+        assert_eq!(
+            stdout, "marker.sh",
+            "the run touched the old staging directory: {result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&shadow).unwrap(), shadow_content);
+        assert_eq!(std::fs::read_dir(&shadow_directory).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cancelled_skill_script_leaves_no_file_behind() {
+        let (_dir, runtime) = runtime();
+        let runtime = std::sync::Arc::new(runtime.with_timeout(Duration::from_secs(30)));
+        let observation = tempfile::tempdir().unwrap();
+        let observed = observation.path().join("path");
+        let running = tokio::spawn({
+            let runtime = std::sync::Arc::clone(&runtime);
+            let observed = observed.clone();
+            async move {
+                runtime
+                    .execute(Action::RunScript {
+                        name: "slow.sh".to_owned(),
+                        content: "#!/bin/sh\nprintf '%s' \"$0\" > \"$1\"\nsleep 30\n".to_owned(),
+                        arguments: vec![observed.to_str().unwrap().to_owned()],
+                    })
+                    .await
+            }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !observed.exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the script did not start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            runtime.cancel_in_flight(),
+            "the running script is cancelled"
+        );
+        let result = running.await.unwrap();
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        let path = std::path::PathBuf::from(std::fs::read_to_string(&observed).unwrap());
+        assert!(!path.starts_with(runtime.workspace()));
+        assert!(
+            !path.exists(),
+            "a cancelled run left its private script behind: {}",
+            path.display()
+        );
     }
 
     #[cfg(windows)]
@@ -3939,31 +4396,45 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn hosted_skill_scripts_use_the_mounted_workspace() {
+    async fn hosted_skill_scripts_run_from_the_sandbox_tmp() {
         let Some((_dir, runtime)) = hosted_runtime() else {
             return;
         };
+        // A file another run of the same user left where the old staging wrote
+        // must not replace the action's bytes, and the run must leave it alone.
+        let shadow_directory = runtime.workspace().join(".neha/skills");
+        std::fs::create_dir_all(&shadow_directory).unwrap();
+        let shadow = shadow_directory.join("where.sh");
+        let shadow_content = "#!/bin/sh\nprintf shadow > marker\n";
+        std::fs::write(&shadow, shadow_content).unwrap();
         let result = runtime
             .execute(Action::RunScript {
                 name: "where.sh".to_owned(),
-                content: "#!/bin/sh\nprintf '%s' \"$0\"".to_owned(),
+                content: "#!/bin/sh\nprintf ran > marker\npwd\nprintf '%s' \"$0\"\nls -l \"$0\""
+                    .to_owned(),
                 arguments: Vec::new(),
             })
             .await;
         assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
-        assert!(
-            result
-                .output
-                .text
-                .contains("/workspace/.neha/skills/where.sh."),
-            "{result:?}"
-        );
         assert_eq!(
-            std::fs::read_dir(runtime.workspace().join(".neha/skills"))
-                .unwrap()
-                .count(),
-            0
+            std::fs::read_to_string(runtime.workspace().join("marker")).unwrap(),
+            "ran",
+            "the Workspace shadow's bytes ran instead of the action's"
         );
+        assert!(
+            result.output.text.contains("/workspace\n"),
+            "the script starts in the mounted workspace: {result:?}"
+        );
+        assert!(
+            result.output.text.contains("/tmp/neha-script/where.sh."),
+            "the sandbox mounts the script, not a Workspace path: {result:?}"
+        );
+        assert!(
+            result.output.text.contains("-r-x------"),
+            "the mounted script is read-only and executable: {result:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&shadow).unwrap(), shadow_content);
+        assert_eq!(std::fs::read_dir(&shadow_directory).unwrap().count(), 1);
     }
 
     #[tokio::test]
@@ -4760,7 +5231,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_real_shell_runs_a_skill_script_from_the_bot_folder() {
+    async fn a_real_shell_runs_a_skill_script_from_the_sandbox() {
         let Some((_dir, runtime)) = machine_runtime() else {
             return;
         };
@@ -4777,13 +5248,63 @@ mod tests {
             .await;
 
         assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
-        let expected = format!(
-            "{}\n{}/.neha/skills/where.sh.",
-            project.path().display(),
-            runtime.workspace().display()
-        );
+        let expected = format!("{}\n/tmp/neha-script/where.sh.", project.path().display());
         assert!(result.output.text.contains(&expected), "{result:?}");
         assert!(!project.path().join(".neha").exists());
+        assert!(!runtime.workspace().join(".neha").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_bubblewrap_without_data_mounts_refuses_a_skill_script() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let bwrap = directory.path().join("bwrap");
+        // An older bubblewrap: it starts, but it does not know the option that
+        // mounts a descriptor as a file.
+        std::fs::write(
+            &bwrap,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+    printf 'bubblewrap 0.4.0\n'
+    exit 0
+fi
+for argument in "$@"; do
+    if [ "$argument" = "--ro-bind-data" ]; then
+        printf 'bwrap: Unknown option --ro-bind-data\n' >&2
+        exit 1
+    fi
+done
+exit 0
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&bwrap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let folder = directory.path().join("bot");
+        let runtime = LocalRuntime::machine_with_bwrap(folder.clone(), Some(bwrap), Vec::new())
+            .expect("the old bubblewrap answers the constructor's probe");
+        let result = runtime
+            .execute(Action::RunScript {
+                name: "old.sh".to_owned(),
+                content: "#!/bin/sh\nprintf ran > marker\n".to_owned(),
+                arguments: Vec::new(),
+            })
+            .await;
+
+        assert_eq!(result.status, ActionStatus::Failed, "{result:?}");
+        assert!(
+            result
+                .output
+                .text
+                .contains("cannot mount a verified script"),
+            "the failure names the missing capability: {result:?}"
+        );
+        assert!(
+            !folder.join("marker").exists(),
+            "the script ran without its verified mount"
+        );
+        assert!(!folder.join(".neha").exists());
     }
 
     #[tokio::test]

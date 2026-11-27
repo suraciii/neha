@@ -771,11 +771,24 @@ async fn rule_add(
                     "a run_skill_script rule names its skill and its script",
                 ));
             };
-            let Some(view) = state.skills.iter().find(|view| {
-                view.name == name && (view.library == SkillLibrary::Space || view.bot == Some(bot))
-            }) else {
+            // Only the Bot's owner may look at what its skills hold; and only
+            // a skill the Bot may use can match its call, so the lookup is the
+            // same one the run makes and two libraries cannot be confused.
+            if state.owned_bot(bot, account.id).is_none() {
+                return Err(ApiError::not_found("no such Bot"));
+            }
+            let mut named = state
+                .skills_of(bot)
+                .into_iter()
+                .filter(|view| view.name == name);
+            let Some(view) = named.next() else {
                 return Err(ApiError::not_found("no such skill"));
             };
+            if named.next().is_some() {
+                return Err(ApiError::invalid_argument(
+                    "more than one enabled skill is named this, so the rule names no one skill",
+                ));
+            }
             if !view
                 .scripts
                 .iter()
@@ -970,8 +983,12 @@ async fn skill_add(
         return Ok(outcome);
     }
     // One change to a library at a time: the checks below and the append must
-    // not interleave with another client's.
+    // not interleave with another client's. A retry of this same command may
+    // have finished while this one waited, so ask again under the lock.
     let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
     if arguments.library == SkillLibrary::Space && arguments.bot.is_some() {
         return Err(ApiError::invalid_argument(
             "a skill in the Space's library belongs to no Bot",
@@ -1120,6 +1137,9 @@ async fn skill_remove(
         return Ok(outcome);
     }
     let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
     let view = {
         let state = context
             .state
@@ -1183,6 +1203,9 @@ async fn bot_skill(
         return Ok(outcome);
     }
     let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
     let (skill_view, unchanged) = {
         let state = context
             .state
@@ -4708,35 +4731,79 @@ impl RedactingRuntime<'_> {
         ))
     }
 
-    /// Returns the digest the action's approval covered.
+    /// Returns the script identity the action recorded when it started.
     ///
-    /// A card names the skill and the script's digest it was made for. A
-    /// replacement under the same names has another digest, so the answer can
-    /// never run code the User did not see. An action a rule allowed has no
-    /// card and runs what the skill holds now.
-    fn approved_digest(&self, action: Id, skill: &str, script: &str) -> Result<String, String> {
+    /// The loop resolved it before the action started, so a name that changed
+    /// since cannot make the action run another script.
+    fn dispatched_script(&self, action: Id) -> Result<neha_loop::ScriptIdentity, String> {
         let state = self
             .state
             .lock()
             .map_err(|_| "the Space state is locked".to_owned())?;
-        let view = state
-            .skill_named(self.bot, skill)
-            .ok_or_else(|| format!("the Bot has no skill named {skill:?}"))?;
-        let digest = view
+        let run = state
+            .runs
+            .get(&self.run)
+            .ok_or_else(|| "the run is gone".to_owned())?;
+        let view = run
+            .actions
+            .iter()
+            .find(|view| view.id == action)
+            .ok_or_else(|| "the action is gone".to_owned())?;
+        match (view.skill, view.script.clone(), view.script_sha256.clone()) {
+            (Some(skill), Some(name), Some(sha256)) => Ok(neha_loop::ScriptIdentity {
+                skill,
+                name,
+                sha256,
+            }),
+            _ => Err("the action recorded no skill's script to run".to_owned()),
+        }
+    }
+
+    /// Checks the skill still holds the script the action recorded, and that
+    /// an answer covers exactly it.
+    ///
+    /// A card names the skill and the digest it was made for; a replacement
+    /// under the same names carries another digest, so the answer can never
+    /// run code the User did not see.
+    fn script_still_answers(
+        &self,
+        action: Id,
+        identity: &neha_loop::ScriptIdentity,
+        call_skill: &str,
+        call_script: &str,
+    ) -> Result<(), String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "the Space state is locked".to_owned())?;
+        let live = state
+            .skills_of(self.bot)
+            .into_iter()
+            .find(|view| view.id == identity.skill)
+            .ok_or_else(|| format!("the skill {call_skill:?} is no longer enabled for this Bot"))?;
+        let digest = live
             .scripts
             .iter()
-            .find(|candidate| candidate.name == script)
-            .map(|candidate| candidate.sha256.clone())
-            .ok_or_else(|| format!("the skill {skill:?} carries no script named {script:?}"))?;
+            .find(|candidate| candidate.name == identity.name)
+            .map(|candidate| candidate.sha256.as_str())
+            .ok_or_else(|| {
+                format!("the skill {call_skill:?} no longer carries the script {call_script:?}")
+            })?;
+        if live.name != call_skill || digest != identity.sha256 {
+            return Err(
+                "the skill changed before the script ran, so the answer does not cover it"
+                    .to_owned(),
+            );
+        }
         let answered = state.approvals.iter().find(|approval| {
             approval.run == self.run
                 && approval.action == action
                 && approval.tool == neha_loop::tools::RUN_SKILL_SCRIPT
         });
         if let Some(answered) = answered {
-            let covered = answered.skill == Some(view.id)
-                && answered.script.as_deref() == Some(script)
-                && answered.script_sha256.as_deref() == Some(digest.as_str());
+            let covered = answered.skill == Some(identity.skill)
+                && answered.script.as_deref() == Some(identity.name.as_str())
+                && answered.script_sha256.as_deref() == Some(identity.sha256.as_str());
             if !covered {
                 return Err(
                     "the skill changed before the script ran, so the answer does not cover it"
@@ -4745,7 +4812,7 @@ impl RedactingRuntime<'_> {
             }
         }
 
-        Ok(digest)
+        Ok(())
     }
 }
 
@@ -4805,11 +4872,16 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
                             "this Space treats skills as instructions only, so a skill's script never runs",
                         ));
                     }
-                    let digest = match self.approved_digest(action, &skill, &script) {
-                        Ok(digest) => digest,
+                    let identity = match self.dispatched_script(action) {
+                        Ok(identity) => identity,
                         Err(error) => return Ok(ActionResult::failed(error)),
                     };
-                    let content = match self.blobs.get(&digest).await {
+                    if let Err(error) =
+                        self.script_still_answers(action, &identity, &skill, &script)
+                    {
+                        return Ok(ActionResult::failed(error));
+                    }
+                    let content = match self.blobs.get(&identity.sha256).await {
                         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
                         Err(error) => {
                             return Ok(ActionResult::failed(format!(
@@ -4817,7 +4889,7 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
                             )));
                         }
                     };
-                    if crate::blobs::digest(content.as_bytes()) != digest {
+                    if crate::blobs::digest(content.as_bytes()) != identity.sha256 {
                         return Ok(ActionResult::failed(
                             "the script's bytes are not the ones the Space recorded",
                         ));
@@ -4825,7 +4897,7 @@ impl neha_loop::run::Runtime for RedactingRuntime<'_> {
                     let result = self
                         .inner
                         .execute(Action::RunScript {
-                            name: script,
+                            name: identity.name,
                             content,
                             arguments,
                         })
@@ -5154,11 +5226,11 @@ impl Recorder for RunRecorder<'_> {
         step: u32,
         call: &LoopCall,
         action: Id,
-    ) -> Result<Decision, LoopError> {
+    ) -> Result<neha_loop::Authorization, LoopError> {
         // Loading a skill reads what the Space holds; it touches no Computer
         // and asks nobody.
         if call.tool == neha_loop::tools::SKILL {
-            return Ok(Decision::Allow);
+            return Ok(neha_loop::Authorization::Allow { script: None });
         }
         let plan = {
             let state = self
@@ -5185,9 +5257,13 @@ impl Recorder for RunRecorder<'_> {
                 .is_some_and(|view| view.kind == "local");
             let first_use = local && !state.first_use_allowed(bot.id, self.log.acting, computer);
             // A skill's script asks before its first run for the Bot and the
-            // acting User, whatever Computer runs it. A script the Bot does
-            // not have never runs, so it asks nobody.
-            let script = script_call(&state, bot.id, call);
+            // acting User, whatever Computer runs it. A call that names no
+            // script the Bot has cannot run at all: it fails here, before a
+            // card could consume a Computer's first use or a script's.
+            let script = match script_call(&state, bot.id, call) {
+                Ok(script) => script,
+                Err(reason) => return Ok(neha_loop::Authorization::Refuse(reason)),
+            };
             let script_first = script.as_ref().is_some_and(|script| {
                 !state.script_run_allowed(bot.id, self.log.acting, script.skill, &script.name)
             });
@@ -5218,11 +5294,12 @@ impl Recorder for RunRecorder<'_> {
         };
         let (local, first_use, script_first, computer, matching, tool_rules, run, bot, script) =
             plan;
+        let identity = script.as_ref().map(ScriptCall::identity);
         if !local && call.tool != neha_loop::tools::RUN_SKILL_SCRIPT {
             // A Hosted Computer has no fence yet (M2-B), so the actions it runs
             // never ask. A call the Space answers itself has its own approvals
             // whatever Computer the Bot works on.
-            return Ok(Decision::Allow);
+            return Ok(neha_loop::Authorization::Allow { script: identity });
         }
         let grant = grant_folder(&self.log.access, self.log.cwd.as_deref(), call);
         // An Ask rule for this skill's script asks for itself, so the answer
@@ -5253,7 +5330,9 @@ impl Recorder for RunRecorder<'_> {
                         .map(|rule| rule.rule);
                     (ApprovalReason::Rule, rule, false)
                 }
-                Some(Decision::Allow) | None => return Ok(Decision::Allow),
+                Some(Decision::Allow) | None => {
+                    return Ok(neha_loop::Authorization::Allow { script: identity });
+                }
             }
         };
         let index = self.call_index(step, call)?;
@@ -5276,7 +5355,7 @@ impl Recorder for RunRecorder<'_> {
             ApprovalReason::FirstScriptRun => lasting_scope_at(call, self.log.cwd.as_deref()),
         };
         let (skill_id, script_name, script_sha256) =
-            script.as_ref().map_or((None, None, None), |script| {
+            identity.as_ref().map_or((None, None, None), |script| {
                 (
                     Some(script.skill),
                     Some(script.name.clone()),
@@ -5314,7 +5393,32 @@ impl Recorder for RunRecorder<'_> {
             )])
             .await?;
 
-        Ok(Decision::Wait)
+        Ok(neha_loop::Authorization::Wait { script: identity })
+    }
+
+    async fn authorized_action(
+        &mut self,
+        action: Id,
+        _call: &LoopCall,
+    ) -> Result<Option<neha_loop::ScriptIdentity>, LoopError> {
+        let state = self
+            .log
+            .state
+            .lock()
+            .map_err(|_| LoopError::Record("the Space state is locked".to_owned()))?;
+        let approval = state.approvals.iter().find(|approval| {
+            approval.run == self.log.run
+                && approval.action == action
+                && approval.tool == neha_loop::tools::RUN_SKILL_SCRIPT
+        });
+
+        Ok(approval.and_then(|approval| {
+            Some(neha_loop::ScriptIdentity {
+                skill: approval.skill?,
+                name: approval.script.clone()?,
+                sha256: approval.script_sha256.clone()?,
+            })
+        }))
     }
 
     async fn action_started(
@@ -5323,6 +5427,7 @@ impl Recorder for RunRecorder<'_> {
         action: Id,
         tool: String,
         arguments: Value,
+        script: Option<&neha_loop::ScriptIdentity>,
     ) -> Result<(), LoopError> {
         self.log
             .append(vec![self.log.bot_draft(
@@ -5333,6 +5438,9 @@ impl Recorder for RunRecorder<'_> {
                     "action": action,
                     "tool": tool,
                     "arguments": arguments,
+                    "skill": script.map(|script| script.skill),
+                    "script": script.map(|script| script.name.as_str()),
+                    "script_sha256": script.map(|script| script.sha256.as_str()),
                 }),
             )])
             .await
@@ -5565,6 +5673,17 @@ fn script_fields_call(arguments: &Value) -> (Option<&str>, Option<&str>) {
     )
 }
 
+impl ScriptCall {
+    /// The identity the action records and a card names.
+    fn identity(&self) -> neha_loop::ScriptIdentity {
+        neha_loop::ScriptIdentity {
+            skill: self.skill,
+            name: self.name.clone(),
+            sha256: self.sha256.clone(),
+        }
+    }
+}
+
 /// One script call, resolved against the skills the Bot may use.
 struct ScriptCall {
     /// The skill's identifier, which the run and its rules name.
@@ -5577,25 +5696,46 @@ struct ScriptCall {
 
 /// Resolves a `run_skill_script` call to the skill and script it names.
 ///
-/// A call whose skill or script the Bot does not have resolves to nothing:
-/// it never runs, so it asks nobody and matches no rule.
-fn script_call(state: &State, bot: Id, call: &LoopCall) -> Option<ScriptCall> {
+/// A call whose skill or script the Bot cannot use never runs, so it asks
+/// nobody and matches no rule; the reason becomes its failed result. The
+/// lookup sees only the skills this Bot may use, so a Bot's private skill can
+/// never be reached through another Bot's name.
+fn script_call(state: &State, bot: Id, call: &LoopCall) -> Result<Option<ScriptCall>, String> {
     if call.tool != neha_loop::tools::RUN_SKILL_SCRIPT {
-        return None;
+        return Ok(None);
     }
-    let (skill_name, script_name) = script_fields(call);
-    let skill_name = skill_name?;
-    let script_name = script_name?;
-    let skill = state.skill_named(bot, skill_name)?;
-    let script = skill
+    let (Some(skill_name), Some(script_name)) = script_fields(call) else {
+        return Err("the run_skill_script call names no skill and script".to_owned());
+    };
+    let mut named = state
+        .skills_of(bot)
+        .into_iter()
+        .filter(|skill| skill.name == skill_name);
+    let Some(skill) = named.next() else {
+        return Err(format!("the Bot has no skill named {skill_name:?}"));
+    };
+    if named.next().is_some() {
+        // Two enabled skills with one name are not a choice the Space can
+        // make for the User; the call fails instead of guessing.
+        return Err(format!(
+            "more than one enabled skill is named {skill_name:?}"
+        ));
+    }
+    let Some(script) = skill
         .scripts
         .iter()
-        .find(|candidate| candidate.name == script_name)?;
-    Some(ScriptCall {
+        .find(|candidate| candidate.name == script_name)
+    else {
+        return Err(format!(
+            "the skill {skill_name:?} carries no script named {script_name:?}"
+        ));
+    };
+
+    Ok(Some(ScriptCall {
         skill: skill.id,
         name: script_name.to_owned(),
         sha256: script.sha256.clone(),
-    })
+    }))
 }
 
 /// Returns whether a lasting rule covers one action.
@@ -5613,9 +5753,9 @@ fn rule_matches_at(
     if rule.tool != call.tool {
         return false;
     }
-    // A script rule matches one installed skill and one of its scripts. A rule
-    // written by another version may name no skill: it matches no script call.
-    if rule.skill.is_some() || rule.script.is_some() {
+    // A script rule matches one installed skill and one of its scripts, and a
+    // rule written before identities existed matches no script call at all.
+    if rule.tool == neha_loop::tools::RUN_SKILL_SCRIPT {
         let (Some(rule_skill), Some(script)) = (rule.skill, script) else {
             return false;
         };
@@ -6540,6 +6680,15 @@ mod tests {
         }
     }
 
+    /// A resolved script call for rule-matching tests.
+    fn resolved_script(skill: Id, script: &str) -> super::ScriptCall {
+        super::ScriptCall {
+            skill,
+            name: script.to_owned(),
+            sha256: "a".repeat(64),
+        }
+    }
+
     fn call(tool: &str, arguments: serde_json::Value) -> LoopCall {
         LoopCall {
             call: "call-1".to_owned(),
@@ -6947,6 +7096,29 @@ mod tests {
         assert!(!rule_covers(
             &script_rule(skill, "collect.sh"),
             &ask(neha_loop::tools::RUN_SKILL_SCRIPT, None, None)
+        ));
+    }
+
+    #[test]
+    fn a_rule_written_before_script_rules_names_matches_no_script() {
+        // A parent-format record could hold a rule for the whole tool. It
+        // still projects, but it grants no script authority: the identity is
+        // what a script rule is.
+        let skill = Id::new();
+        let script = resolved_script(skill, "collect.sh");
+        let legacy = ask(neha_loop::tools::RUN_SKILL_SCRIPT, None, None);
+        assert!(!super::rule_matches_at(
+            &legacy,
+            &call(
+                neha_loop::tools::RUN_SKILL_SCRIPT,
+                serde_json::json!({
+                    "skill": "weekly-report",
+                    "script": "collect.sh",
+                    "arguments": [],
+                }),
+            ),
+            None,
+            Some(&script),
         ));
     }
 
@@ -7466,6 +7638,9 @@ mod tests {
             step: 1,
             tool: "write_file".to_owned(),
             arguments: json!({"path": "note.txt", "content": "asked"}),
+            skill: None,
+            script: None,
+            script_sha256: None,
             finished: false,
             status: neha::record::ActionStatus::Unknown,
             output: String::new(),

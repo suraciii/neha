@@ -1559,6 +1559,19 @@ pub struct ActionStarted {
     /// The tool's arguments.
     #[serde(default)]
     pub arguments: serde_json::Value,
+    /// The skill the action runs, when it is a `run_skill_script` action.
+    ///
+    /// This is the identity the Space dispatched, resolved before the action
+    /// started: it is absent for a call that never runs, and a record written
+    /// before it existed has none either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// The digest of the script's bytes the action ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
 }
 
 /// The data of `neha.action.finished`.

@@ -1910,9 +1910,28 @@ const MAX_SKILL_SCRIPTS: usize = 16;
 ///
 /// Nothing here follows a symlink. A link at any level — the directory itself,
 /// `SKILL.md`, `scripts/`, or an entry in it — could carry a file the user
-/// never picked, so every level must be the real thing. Each read is bounded by
-/// the entry's own size, taken before the read, so an oversized file is refused
-/// before its bytes arrive.
+/// never picked, so every level must be the real thing.
+///
+/// On Unix the directory is opened once, and every member is opened relative
+/// to that descriptor through `/proc/self/fd/<dir_fd>/<name>`. The metadata
+/// that authorizes a read is the opened handle's own metadata, and the bytes
+/// come from that same handle, so replacing a path between the check and the
+/// read cannot redirect the upload. Every read is bounded on the stream, so a
+/// file that grows after its metadata is taken is still refused.
+#[cfg(unix)]
+fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
+    let directory = open_skill_directory(path)?;
+    Ok((
+        read_skill_document(&directory, path)?,
+        read_skill_scripts(&directory, path)?,
+    ))
+}
+
+/// The portable fallback for a platform with no directory descriptor to read
+/// through. It checks a pathname and later reopens it, so a replacement between
+/// the check and the read is not visible to this path; the Unix path above is
+/// the one that checks and reads the same opened object.
+#[cfg(not(unix))]
 fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
     let Some(metadata) = own_metadata(path)? else {
         bail!("{} is not a directory", path.display());
@@ -1926,8 +1945,269 @@ fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddS
     Ok((read_skill_document(path)?, read_skill_scripts(path)?))
 }
 
+/// The path of an opened descriptor. It names the object the descriptor holds,
+/// whatever happens to the pathname it was opened from.
+#[cfg(unix)]
+fn descriptor_path(file: &std::fs::File) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd as _;
+
+    std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// The path of one member of an opened directory, resolved through the
+/// directory's descriptor rather than through its pathname.
+#[cfg(unix)]
+fn descriptor_member_path(directory: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
+    descriptor_path(directory).join(name)
+}
+
+/// Opens one member of an opened directory with `flags`, never following a
+/// final symlink. The caller checks and reads the returned handle, so a
+/// replacement after the check cannot change what is read.
+#[cfg(unix)]
+fn open_directory_member(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(descriptor_member_path(directory, name))
+}
+
+/// Returns whether the pathname itself is a symlink, without following it.
+/// A final symlink opened with `O_DIRECTORY | O_NOFOLLOW` is reported as
+/// `ENOTDIR` on Linux, so this only picks the message of a refusal that already
+/// happened; nothing is read through it.
+#[cfg(unix)]
+fn is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Opens the skill directory itself as a directory, never a symlink to one.
+/// It is the descriptor every member below is opened through.
+#[cfg(unix)]
+fn open_skill_directory(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(directory) => Ok(directory),
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ELOOP) => bail!("{} is a symlink, which is not followed", path.display()),
+            Some(libc::ENOTDIR) if is_symlink(path) => {
+                bail!("{} is a symlink, which is not followed", path.display())
+            }
+            Some(libc::ENOTDIR | libc::ENOENT) => {
+                bail!("{} is not a directory", path.display())
+            }
+            _ => Err(error).with_context(|| format!("{} cannot be read", path.display())),
+        },
+    }
+}
+
+/// Reads the skill's `SKILL.md` through the skill directory's descriptor: one
+/// regular file, checked and bounded on the same opened handle that is read.
+#[cfg(unix)]
+fn read_skill_document(directory: &std::fs::File, path: &std::path::Path) -> Result<String> {
+    let document = path.join("SKILL.md");
+    let mut skill_file = match open_directory_member(
+        directory,
+        std::ffi::OsStr::new("SKILL.md"),
+        libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    ) {
+        Ok(file) => file,
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ENOENT) => bail!("{} has no SKILL.md", path.display()),
+            Some(libc::ELOOP) => {
+                bail!("{} is a symlink, which is not followed", document.display())
+            }
+            // A directory, or a socket that cannot be opened, is not a file.
+            Some(libc::EISDIR | libc::ENXIO) => {
+                bail!("{} is not a regular file", document.display())
+            }
+            _ => {
+                return Err(error)
+                    .with_context(|| format!("{} cannot be read", document.display()));
+            }
+        },
+    };
+    let metadata = skill_file
+        .metadata()
+        .with_context(|| format!("{} cannot be read", document.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", document.display());
+    }
+    if metadata.len() > MAX_SKILL_DOCUMENT_BYTES {
+        bail!(
+            "{} is {} bytes; a skill document is at most {MAX_SKILL_DOCUMENT_BYTES} bytes",
+            document.display(),
+            metadata.len()
+        );
+    }
+    let Some(bytes) = read_within_limit(&mut skill_file, MAX_SKILL_DOCUMENT_BYTES)
+        .with_context(|| format!("{} cannot be read", document.display()))?
+    else {
+        bail!(
+            "{} holds more than {MAX_SKILL_DOCUMENT_BYTES} bytes; a skill document is at most \
+             {MAX_SKILL_DOCUMENT_BYTES} bytes",
+            document.display()
+        );
+    };
+    String::from_utf8(bytes).with_context(|| format!("{} is not readable text", document.display()))
+}
+
+/// Reads every file directly in the skill's `scripts/` folder, bounded the way
+/// the Space bounds them.
+///
+/// A `scripts/` that is absent carries no scripts; one that is a symlink, or is
+/// not a directory, is refused. Every entry is opened relative to the
+/// `scripts/` descriptor and checked by its opened handle: a folder is not a
+/// script, a symlink and a special file are refused, and a regular file's bytes
+/// are read from the handle that was checked.
+#[cfg(unix)]
+fn read_skill_scripts(
+    directory: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<Vec<SkillAddScript>> {
+    let scripts_dir = path.join("scripts");
+    let Some(scripts) = open_scripts_directory(directory, &scripts_dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(descriptor_path(&scripts))
+        .with_context(|| format!("{} cannot be read", scripts_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("{} cannot be read", scripts_dir.display()))?;
+        names.push(entry.file_name());
+    }
+    names.sort();
+    // Open every entry first: the opened handle's metadata decides what is a
+    // script and what is refused, and the handles that pass are the ones read
+    // below. No script's bytes are read until the count is within the limit.
+    let mut opened: Vec<(std::ffi::OsString, std::fs::File, std::fs::Metadata)> = Vec::new();
+    for name in names {
+        let shown = scripts_dir.join(&name);
+        let file = match open_directory_member(
+            &scripts,
+            &name,
+            libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        ) {
+            Ok(file) => file,
+            Err(error) => match error.raw_os_error() {
+                // The entry vanished between the listing and the open.
+                Some(libc::ENOENT) => continue,
+                Some(libc::ELOOP) => {
+                    bail!("{} is a symlink, which is not followed", shown.display())
+                }
+                // A folder in `scripts/` is not a script, as it has never been one.
+                Some(libc::EISDIR) => continue,
+                // A socket cannot be opened, and is not a regular file.
+                Some(libc::ENXIO) => bail!("{} is not a regular file", shown.display()),
+                _ => {
+                    return Err(error)
+                        .with_context(|| format!("{} cannot be read", shown.display()));
+                }
+            },
+        };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("{} cannot be read", shown.display()))?;
+        // A directory does not open through `O_NOFOLLOW` on every platform, so
+        // the opened handle may be the first thing to say it is a folder.
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!("{} is not a regular file", shown.display());
+        }
+        opened.push((name, file, metadata));
+        if opened.len() > MAX_SKILL_SCRIPTS {
+            bail!("a skill carries at most {MAX_SKILL_SCRIPTS} scripts");
+        }
+    }
+    let mut scripts = Vec::with_capacity(opened.len());
+    for (name, mut file, metadata) in opened {
+        let shown = scripts_dir.join(&name);
+        if metadata.len() > MAX_SKILL_SCRIPT_BYTES {
+            bail!(
+                "{} is {} bytes; a script is at most {MAX_SKILL_SCRIPT_BYTES} bytes",
+                shown.display(),
+                metadata.len()
+            );
+        }
+        let Some(bytes) = read_within_limit(&mut file, MAX_SKILL_SCRIPT_BYTES)
+            .with_context(|| format!("{} cannot be read", shown.display()))?
+        else {
+            bail!(
+                "{} holds more than {MAX_SKILL_SCRIPT_BYTES} bytes; a script is at most \
+                 {MAX_SKILL_SCRIPT_BYTES} bytes",
+                shown.display()
+            );
+        };
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("{} is not readable text", shown.display()))?;
+        let name = name
+            .to_str()
+            .context("a script name is not text")?
+            .to_owned();
+        scripts.push(SkillAddScript { name, content });
+    }
+    Ok(scripts)
+}
+
+/// Opens the skill's `scripts/` folder relative to the skill directory.
+/// `None` means there is no `scripts/` entry; a symlink there, or anything else
+/// that is not a directory, is refused.
+#[cfg(unix)]
+fn open_scripts_directory(
+    directory: &std::fs::File,
+    shown: &std::path::Path,
+) -> Result<Option<std::fs::File>> {
+    let name = std::ffi::OsStr::new("scripts");
+    match open_directory_member(
+        directory,
+        name,
+        libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(scripts) => Ok(Some(scripts)),
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => bail!("{} is a symlink, which is not followed", shown.display()),
+            Some(libc::ENOTDIR) if is_symlink(&descriptor_member_path(directory, name)) => {
+                bail!("{} is a symlink, which is not followed", shown.display())
+            }
+            Some(libc::ENOTDIR) => bail!("{} is not a directory", shown.display()),
+            _ => Err(error).with_context(|| format!("{} cannot be read", shown.display())),
+        },
+    }
+}
+
+/// Reads at most `limit` bytes from an opened file.
+///
+/// `None` means the file held more than `limit` bytes: its bytes are refused
+/// rather than truncated or uploaded. The bound applies to the stream, not only
+/// to the size the metadata reported before the read, so a file that grows
+/// after that snapshot cannot grow past the limit.
+#[cfg(unix)]
+fn read_within_limit(file: &mut std::fs::File, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    let mut bounded = std::io::Read::take(file, limit + 1);
+    bounded.read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
 /// The metadata of `path` itself, never of what a final symlink points at.
 /// `None` means nothing is there.
+#[cfg(not(unix))]
 fn own_metadata(path: &std::path::Path) -> Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata)),
@@ -1936,7 +2216,9 @@ fn own_metadata(path: &std::path::Path) -> Result<Option<std::fs::Metadata>> {
     }
 }
 
-/// Reads the skill's `SKILL.md`: one regular file, bounded before it is read.
+/// Reads the skill's `SKILL.md` on a platform with no `/proc/self/fd`: one
+/// regular file, bounded before it is read by the path's own size.
+#[cfg(not(unix))]
 fn read_skill_document(path: &std::path::Path) -> Result<String> {
     let document = path.join("SKILL.md");
     let Some(metadata) = own_metadata(&document)? else {
@@ -1959,9 +2241,10 @@ fn read_skill_document(path: &std::path::Path) -> Result<String> {
         .with_context(|| format!("{} has no SKILL.md", path.display()))
 }
 
-/// Reads every file directly in the skill's `scripts/` folder, bounded the way
-/// the Space bounds them. A `scripts/` that is absent, or is not a directory,
-/// carries no scripts.
+/// Reads every file directly in the skill's `scripts/` folder on a platform
+/// with no `/proc/self/fd`. A `scripts/` that is absent, or is not a directory,
+/// carries no scripts, as this fallback has always behaved.
+#[cfg(not(unix))]
 fn read_skill_scripts(path: &std::path::Path) -> Result<Vec<SkillAddScript>> {
     let mut scripts = Vec::new();
     let scripts_dir = path.join("scripts");
@@ -3427,6 +3710,37 @@ mod tests {
             error.contains(&format!("at most {} bytes", super::MAX_SKILL_SCRIPT_BYTES)),
             "{error}"
         );
+    }
+
+    /// A file that holds more than the limit is refused by the read bound
+    /// itself, not only by the size the metadata reported before the read, so a
+    /// file that grows after that snapshot cannot be uploaded past the bound.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_that_grows_past_the_limit_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let grown = directory.path().join("grown.sh");
+        std::fs::write(
+            &grown,
+            "x".repeat(super::MAX_SKILL_SCRIPT_BYTES as usize + 1),
+        )
+        .unwrap();
+        let mut file = std::fs::File::open(&grown).unwrap();
+        assert!(
+            super::read_within_limit(&mut file, super::MAX_SKILL_SCRIPT_BYTES)
+                .unwrap()
+                .is_none(),
+            "a file holding more than the limit is refused"
+        );
+
+        // A file exactly at the limit is still read whole.
+        let exact = directory.path().join("exact.sh");
+        std::fs::write(&exact, "x".repeat(super::MAX_SKILL_SCRIPT_BYTES as usize)).unwrap();
+        let mut file = std::fs::File::open(&exact).unwrap();
+        let bytes = super::read_within_limit(&mut file, super::MAX_SKILL_SCRIPT_BYTES)
+            .unwrap()
+            .expect("a file at the limit is read");
+        assert_eq!(bytes.len() as u64, super::MAX_SKILL_SCRIPT_BYTES);
     }
 
     /// More scripts than a skill carries is refused before any of them is read.

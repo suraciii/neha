@@ -60,7 +60,9 @@ pub fn parse(document: &str) -> Result<SkillDocument, SkillError> {
     let mut offset = 0;
     for line in rest.split('\n') {
         let end = offset + line.len();
-        if line.trim() == "---" {
+        // Only a marker at column zero closes the block: an indented `---` is
+        // content of a YAML block scalar.
+        if line == "---" {
             let body = rest.get(end + 1..).unwrap_or("");
             return read(&rest[..offset], body);
         }
@@ -105,6 +107,14 @@ fn read(frontmatter: &str, body: &str) -> Result<SkillDocument, SkillError> {
 #[cfg(test)]
 mod tests {
     use super::{SkillError, parse};
+
+    #[test]
+    fn a_marker_inside_a_literal_scalar_is_content() {
+        let document = "---\nname: hello\ndescription: |\n  one\n  ---\n  two\n---\nBody.";
+        let parsed = parse(document).unwrap();
+        assert_eq!(parsed.description, "one\n---\ntwo");
+        assert_eq!(parsed.body, "Body.");
+    }
 
     #[test]
     fn reads_the_two_required_fields_and_ignores_the_rest() {
