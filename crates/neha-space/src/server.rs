@@ -6020,6 +6020,51 @@ mod tests {
             .unwrap();
         assert_eq!(google["selectable"], false);
         assert!(google["protocol"].is_null());
+        let templated = providers
+            .iter()
+            .find(|provider| provider["id"] == "databricks")
+            .unwrap();
+        assert_eq!(
+            templated["selectable"], false,
+            "a templated base URL needs an explicit override"
+        );
+        assert!(templated["api"].is_null());
+
+        let no_tools = providers
+            .iter()
+            .find(|provider| provider["id"] == "meragpt")
+            .unwrap();
+        assert_eq!(no_tools["selectable"], false);
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "meragpt".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert!(matches!(error, Err((ErrorCode::InvalidArgument, _))));
+
+        let error = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "databricks".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: None,
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert!(
+            matches!(error, Err((ErrorCode::InvalidArgument, _))),
+            "a templated vendor asks for --base-url"
+        );
 
         let connected = command(
             &mut socket,
@@ -6041,6 +6086,20 @@ mod tests {
 
         let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
         assert_eq!(providers[0]["vendor"], "openai");
+
+        let overridden = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderConnect(ProviderConnect {
+                vendor: "databricks".to_owned(),
+                api_key: "sk-test".to_owned(),
+                base_url: Some("https://example.test/v1".to_owned()),
+                protocol: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        assert_eq!(overridden["base_url"], "https://example.test/v1");
 
         let error = try_command(
             &mut socket,
@@ -6277,9 +6336,13 @@ mod tests {
             }),
         )
         .await;
+        let Err((code, message)) = error else {
+            panic!("a failed discovery must fail");
+        };
+        assert_eq!(code, ErrorCode::InvalidArgument);
         assert!(
-            matches!(error, Err((ErrorCode::InvalidArgument, _))),
-            "a failed discovery asks for manual Models"
+            message.contains("--model"),
+            "a failed discovery asks for manual Models: {message}"
         );
         let providers = command(&mut socket, Id::new(), CommandCall::ProviderList).await;
         assert!(providers.as_array().unwrap().is_empty());

@@ -19,7 +19,9 @@ The Admin connects a Provider to the Space in one of two ways.
 | A known vendor | Picks the vendor and pastes an API key | Reads the vendor's Models and address from the catalog |
 | An OpenAI-compatible server | Pastes the server's address | Finds the server's Models on its own |
 
-A known vendor MUST resolve from the catalog to one of the protocols Neha implements: OpenAI Responses, Anthropic Messages, or Chat Completions. A vendor with any other protocol stays visible in the catalog but cannot be connected.
+A known vendor MUST resolve from the catalog to one of the protocols Neha implements: OpenAI Responses, Anthropic Messages, or Chat Completions. It MUST also name a base URL Neha can use and at least one Model that calls tools.
+
+A vendor without those stays visible in the catalog but cannot be connected without an explicit address or a protocol Neha does not implement.
 
 Under Advanced, a connection names its protocol: chat completions, which is the default, OpenAI Responses, or Anthropic Messages. It can also override the base address.
 

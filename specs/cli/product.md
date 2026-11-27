@@ -53,7 +53,7 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 ## Catalog
 
-`neha catalog list` prints every vendor in the catalog, its protocol, Model count, and whether Neha can connect it. An unsupported vendor prints `(unsupported)`.
+`neha catalog list` prints every vendor in the catalog, its protocol, Model count, and whether Neha can connect it. A vendor Neha cannot connect prints `(not connectable)`; an unsupported protocol is one reason.
 
 `neha catalog status` prints whether the built-in snapshot or the cache is in use, its age, and whether it is stale. `neha catalog refresh` fetches the catalog again; a failed fetch keeps the last known good copy.
 

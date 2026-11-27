@@ -1004,16 +1004,25 @@ async fn catalog_plan(
         .or_else(|| provider.base_url())
         .ok_or_else(|| {
             ApiError::invalid_argument(format!(
-                "the catalog vendor {vendor:?} names no base URL; pass --base-url"
+                "the catalog vendor {vendor:?} names no usable base URL; pass --base-url"
             ))
         })?;
+    if base_url.contains("${") {
+        return Err(ApiError::invalid_argument(
+            "the base URL still contains a catalog template; pass the resolved --base-url",
+        ));
+    }
     let models = provider.models_for_space();
     if models.is_empty() {
         return Err(ApiError::invalid_argument(format!(
             "the catalog vendor {vendor:?} names no usable Models"
         )));
     }
-    let default_model = provider.default_model_name();
+    let default_model = Some(provider.default_model_name().ok_or_else(|| {
+        ApiError::invalid_argument(format!(
+            "the catalog vendor {vendor:?} names no Model that can call tools"
+        ))
+    })?);
 
     Ok(ProviderPlan {
         provider: Id::new(),
@@ -1023,6 +1032,15 @@ async fn catalog_plan(
         models,
         default_model,
     })
+}
+
+/// The levels a Model records; an undeclared set means every level.
+fn recorded_thinking_levels(model: &ModelSpec) -> Vec<ThinkingLevel> {
+    if model.thinks && model.thinking_levels.is_empty() {
+        ThinkingLevel::ALL.to_vec()
+    } else {
+        model.thinking_levels.clone()
+    }
 }
 
 /// Records a Provider and its encrypted key.
@@ -1047,7 +1065,7 @@ async fn record_provider(
                 "reads_images": model.reads_images,
                 "thinks": model.thinks,
                 "tools": model.tools,
-                "thinking_levels": model.thinking_levels,
+                "thinking_levels": recorded_thinking_levels(model),
             })
         })
         .collect();
@@ -1208,7 +1226,7 @@ async fn provider_refresh(
                 "reads_images": model.reads_images,
                 "thinks": model.thinks,
                 "tools": model.tools,
-                "thinking_levels": model.thinking_levels,
+                "thinking_levels": recorded_thinking_levels(model),
             })
         })
         .collect();
@@ -1266,8 +1284,8 @@ async fn catalog_list(context: &CommandContext<'_>) -> Result<Outcome, ApiError>
                 "name": provider.name,
                 "npm": provider.npm,
                 "protocol": provider.protocol(),
-                "selectable": provider.protocol().is_some(),
-                "api": provider.api,
+                "selectable": provider.selectable(),
+                "api": provider.base_url(),
                 "env": provider.env,
                 "doc": provider.doc,
                 "model_count": provider.models.len(),
@@ -1337,18 +1355,21 @@ async fn discover_models(base_url: &str, api_key: &str) -> Result<Vec<String>, A
         .send()
         .await
         .map_err(|error| {
-            ApiError::unavailable(format!("the Provider did not list its Models: {error}"))
+            ApiError::unavailable(format!(
+                "the Provider did not list its Models: {error}; declare them with --model"
+            ))
         })?;
     if !response.status().is_success() {
         return Err(ApiError::invalid_argument(format!(
-            "the Provider answered {} when asked for its Models",
+            "the Provider answered {} when asked for its Models; declare them with --model",
             response.status()
         )));
     }
-    let body: Value = response
-        .json()
-        .await
-        .map_err(|_| ApiError::invalid_argument("the Provider's Model list is not JSON"))?;
+    let body: Value = response.json().await.map_err(|_| {
+        ApiError::invalid_argument(
+            "the Provider's Model list is not JSON; declare them with --model",
+        )
+    })?;
     let entries = body
         .get("data")
         .and_then(Value::as_array)

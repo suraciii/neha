@@ -452,7 +452,7 @@ impl Catalog {
                 let models = models
                     .into_iter()
                     .map(|(key, model)| {
-                        let model = model.into_catalog_model(key);
+                        let model = model.into_catalog_model(key, &npm);
                         (model.id.clone(), model)
                     })
                     .collect();
@@ -517,7 +517,19 @@ impl CatalogProvider {
             "@ai-sdk/openai-compatible" => None,
             _ => return None,
         };
-        self.api.clone().or_else(|| preset.map(str::to_owned))
+        self.api
+            .as_ref()
+            .filter(|url| !url.contains("${"))
+            .cloned()
+            .or_else(|| preset.map(str::to_owned))
+    }
+
+    /// Whether the catalog names enough to connect the Provider without overrides.
+    #[must_use]
+    pub fn selectable(&self) -> bool {
+        self.protocol().is_some()
+            && self.base_url().is_some()
+            && self.default_model_name().is_some()
     }
 
     /// Returns the provider's Models as the Space declares them.
@@ -530,7 +542,9 @@ impl CatalogProvider {
                 context_limit: model.context_limit,
                 max_output: model.max_output,
                 reads_images: model.attachment,
-                thinks: model.reasoning,
+                // A reasoning Model with no level this build can spell is
+                // not offered as a thinking Model.
+                thinks: model.reasoning && !model.thinking_levels.is_empty(),
                 tools: model.tool_call,
                 thinking_levels: model.thinking_levels.clone(),
             })
@@ -558,7 +572,7 @@ impl CatalogProvider {
                 .collect();
         }
         if candidates.is_empty() {
-            return self.models.values().next().map(|model| model.id.clone());
+            return None;
         }
 
         let newest = candidates
@@ -728,33 +742,40 @@ fn unix_now() -> i64 {
 
 /// Returns the thinking level an `effort` value names, if any.
 fn effort_level(value: &str) -> Option<ThinkingLevel> {
+    // Only effort names an adapter can spell exactly are offered: `none`
+    // and `xhigh` have no ThinkingLevel that maps back to them.
     match value {
-        "none" | "minimal" => Some(ThinkingLevel::Minimal),
+        "minimal" => Some(ThinkingLevel::Minimal),
         "low" => Some(ThinkingLevel::Low),
         "medium" => Some(ThinkingLevel::Medium),
         "high" => Some(ThinkingLevel::High),
-        "xhigh" | "max" => Some(ThinkingLevel::Max),
+        "max" => Some(ThinkingLevel::Max),
         _ => None,
     }
 }
 
 /// Returns the thinking levels a Model supports, weakest first.
-fn thinking_levels(reasoning: bool, options: &[WireReasoningOption]) -> Vec<ThinkingLevel> {
+fn thinking_levels(
+    reasoning: bool,
+    options: &[WireReasoningOption],
+    npm: &str,
+) -> Vec<ThinkingLevel> {
     if !reasoning {
         return Vec::new();
     }
+    // The Anthropic adapter sends a token budget, so every ThinkingLevel has
+    // a valid spelling there regardless of which options the catalog names.
+    if npm == "@ai-sdk/anthropic" {
+        return ALL_THINKING_LEVELS.to_vec();
+    }
 
     let mut levels = Vec::new();
-    for option in options {
-        match option.kind.as_str() {
-            "effort" => {
-                levels.extend(option.values.iter().filter_map(|value| effort_level(value)));
-            }
-            "budget_tokens" | "toggle" => levels.extend(ALL_THINKING_LEVELS),
-            _ => {}
-        }
+    for option in options.iter().filter(|option| option.kind == "effort") {
+        levels.extend(option.values.iter().filter_map(|value| effort_level(value)));
     }
-    if levels.is_empty() {
+    if levels.is_empty() && options.is_empty() {
+        // The snapshot names no reasoning option: the adapter's usual
+        // effort values are the only known answer.
         return ALL_THINKING_LEVELS.to_vec();
     }
     levels.sort_unstable();
@@ -807,7 +828,7 @@ struct WireModel {
 
 impl WireModel {
     /// Turns one wire model into the catalog's Model.
-    fn into_catalog_model(self, key: String) -> CatalogModel {
+    fn into_catalog_model(self, key: String, npm: &str) -> CatalogModel {
         let Self {
             id,
             name,
@@ -823,7 +844,7 @@ impl WireModel {
         let name = if name.is_empty() { id.clone() } else { name };
 
         CatalogModel {
-            thinking_levels: thinking_levels(reasoning, &reasoning_options),
+            thinking_levels: thinking_levels(reasoning, &reasoning_options, npm),
             id,
             name,
             reasoning,
@@ -1114,6 +1135,37 @@ mod tests {
         assert!(catalog.provider("no-such-vendor").is_none());
     }
 
+    #[tokio::test]
+    async fn the_seed_offers_only_levels_an_adapter_can_spell() {
+        let (_dir, home) = home();
+        let catalog = CatalogStore::open(&home, &config(DEFAULT_URL))
+            .catalog()
+            .await
+            .unwrap();
+        let openai = catalog.provider("openai").unwrap();
+
+        let pro = &openai.models["gpt-5.2-pro"];
+        assert_eq!(
+            pro.thinking_levels,
+            [ThinkingLevel::Medium, ThinkingLevel::High],
+            "xhigh has no exact level and is not offered as Max"
+        );
+        let five = &openai.models["gpt-5.1"];
+        assert_eq!(
+            five.thinking_levels,
+            [
+                ThinkingLevel::Low,
+                ThinkingLevel::Medium,
+                ThinkingLevel::High
+            ],
+            "none has no exact level and is not offered as Minimal"
+        );
+
+        let anthropic = catalog.provider("anthropic").unwrap();
+        let claude = &anthropic.models["claude-sonnet-5"];
+        assert_eq!(claude.thinking_levels, super::ALL_THINKING_LEVELS);
+    }
+
     #[test]
     fn models_for_space_carries_the_declared_capabilities() {
         let catalog = catalog_from(
@@ -1210,8 +1262,11 @@ mod tests {
             ThinkingLevel::Max,
         ];
 
-        assert_eq!(thinking_levels(false, &[option("effort", &["high"])]), []);
-        assert_eq!(thinking_levels(true, &[]), all);
+        assert_eq!(
+            thinking_levels(false, &[option("effort", &["high"])], "@ai-sdk/openai"),
+            []
+        );
+        assert_eq!(thinking_levels(true, &[], "@ai-sdk/openai"), all);
         assert_eq!(
             thinking_levels(
                 true,
@@ -1220,22 +1275,56 @@ mod tests {
                     &[
                         "none", "minimal", "low", "medium", "high", "xhigh", "max", "default"
                     ]
-                )]
+                )],
+                "@ai-sdk/openai"
             ),
             all,
-            "every effort value maps into the five levels"
+            "every representable effort value maps into the five levels"
         );
         assert_eq!(
-            thinking_levels(true, &[option("effort", &["high", "low"])]),
+            thinking_levels(
+                true,
+                &[option("effort", &["medium", "high", "xhigh"])],
+                "@ai-sdk/openai"
+            ),
+            [ThinkingLevel::Medium, ThinkingLevel::High],
+            "xhigh has no exact level"
+        );
+        assert_eq!(
+            thinking_levels(true, &[option("effort", &["none"])], "@ai-sdk/openai"),
+            [],
+            "none cannot be spelled as a level"
+        );
+        assert_eq!(
+            thinking_levels(
+                true,
+                &[option("effort", &["high", "low"])],
+                "@ai-sdk/openai"
+            ),
             [ThinkingLevel::Low, ThinkingLevel::High],
             "levels are ordered weakest first"
         );
-        assert_eq!(thinking_levels(true, &[option("toggle", &[])]), all);
-        assert_eq!(thinking_levels(true, &[option("budget_tokens", &[])]), all);
         assert_eq!(
-            thinking_levels(true, &[option("toggle", &[]), option("effort", &["low"])]),
-            all,
-            "deduplicated when both kinds name levels"
+            thinking_levels(true, &[option("toggle", &[])], "@ai-sdk/openai"),
+            [],
+            "a toggle has no exact effort level"
+        );
+        assert_eq!(
+            thinking_levels(true, &[option("budget_tokens", &[])], "@ai-sdk/openai"),
+            []
+        );
+        assert_eq!(
+            thinking_levels(true, &[option("toggle", &[])], "@ai-sdk/anthropic"),
+            all
+        );
+        assert_eq!(
+            thinking_levels(
+                true,
+                &[option("toggle", &[]), option("effort", &["low"])],
+                "@ai-sdk/openai"
+            ),
+            [ThinkingLevel::Low],
+            "mixed options offer only the exact effort levels"
         );
     }
 
@@ -1336,8 +1425,8 @@ mod tests {
                 .unwrap()
                 .default_model_name()
                 .as_deref(),
-            Some("first"),
-            "without a tool-calling Model the first one stands in"
+            None,
+            "without a tool-calling Model the vendor has no default"
         );
     }
 

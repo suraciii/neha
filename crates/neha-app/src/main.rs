@@ -723,7 +723,11 @@ async fn catalog(command: CatalogCommand) -> Result<()> {
                     text_of(provider, "name")?,
                     protocol,
                     provider["model_count"].as_u64().unwrap_or_default(),
-                    if selectable { "" } else { "  (unsupported)" }
+                    if selectable {
+                        ""
+                    } else {
+                        "  (not connectable)"
+                    }
                 );
             }
         }

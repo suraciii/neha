@@ -78,7 +78,7 @@ target/debug/neha catalog list
 NEHA_PROVIDER_KEY=sk-... target/debug/neha provider connect openai
 ```
 
-`neha catalog status` shows whether the built-in snapshot or a cached catalog is in use. `neha catalog refresh` fetches it again; a failed fetch keeps the last good copy. A vendor with an unsupported protocol is listed with `(unsupported)` and cannot be connected.
+`neha catalog status` shows whether the built-in snapshot or a cached catalog is in use. `neha catalog refresh` fetches it again; a failed fetch keeps the last good copy. A vendor Neha cannot connect is listed with `(not connectable)`; an unsupported protocol is one reason, and a templated address or no tool-calling Model is another.
 
 For any other OpenAI-compatible endpoint, add it explicitly. `--discover` asks the endpoint for its Models; without it, name each Model:
 
