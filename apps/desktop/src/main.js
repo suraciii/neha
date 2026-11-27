@@ -693,6 +693,7 @@ if (!app.requestSingleInstanceLock()) {
       await openSavedSpace();
     } catch (error) {
       log(error?.stack || String(error));
+      if (error?.cause) log("cause:", error.cause);
       clearSelection();
       await stopLocalComputer();
       await stopSpace();
