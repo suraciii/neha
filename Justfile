@@ -20,6 +20,11 @@ test:
 test-s3:
     cargo test --locked -p neha-space
 
+# Replay synthetic records of 10^5, 10^6, and 10^7 events and report time and
+# memory. Not part of the gate: the largest record needs about 5 GB of disk.
+bench-replay:
+    cargo bench --locked -p neha-space --bench replay
+
 # Run the machine-side tests with the fence switched on; needs bubblewrap (docs/building.md).
 test-bwrap:
     cargo test --locked -p neha-computer

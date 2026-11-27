@@ -36,3 +36,11 @@ tokio-tungstenite = "0.29"
 
 [lints]
 workspace = true
+
+# The replay benchmark. `test = false` keeps `cargo test` (and `just ci`) from
+# running it: a bench target is a test target by default, and with
+# `harness = false` that would execute the whole benchmark inside the gate.
+[[bench]]
+name = "replay"
+harness = false
+test = false
