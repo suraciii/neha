@@ -33,7 +33,7 @@ On a fresh Space the shell reads the one-time invitation, creates the first
 Admin with the local OS account name and a generated internal password, stores
 the password with Electron `safeStorage` (Windows DPAPI), restarts the Space so
 it writes its one-use Local Computer ticket, pairs this machine, starts the
-Local Computer daemon, and loads the client.
+Local Computer daemon after the Windows warning, and loads the client.
 
 On a Space that already has an account, the shell updates the saved Computer
 pairing to the new loopback port, starts the daemon, signs in, and loads the
@@ -43,8 +43,10 @@ client. The invitation form is not shown in either path.
 
 The Windows runtime is a managed Bot folder: its file tools stay inside the
 folder, but its shell runs with the machine user's rights and has **no OS
-sandbox** in this slice. Approvals are the command boundary. Do not treat it as
-equivalent to the Linux bubblewrap fence yet.
+sandbox** in this slice. The first Windows start shows a warning and records the
+owner's consent; the bundled Space is started with
+`NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`. Approvals are the command boundary. Do not
+treat it as equivalent to the Linux bubblewrap fence yet.
 
 ## Package for Windows
 

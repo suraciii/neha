@@ -393,7 +393,9 @@ async fn connect_and_serve(
             version: CHANNEL_VERSION,
             computer: config.computer.clone(),
             workspace: config.workspace.to_string_lossy().into_owned(),
-            sandbox: true,
+            // Windows runs a managed folder without an OS fence. The Space
+            // accepts a truthful false only when its operator opted in.
+            sandbox: !cfg!(windows),
         },
     )
     .await?;
@@ -2720,7 +2722,9 @@ mod tests {
             version: CHANNEL_VERSION,
             computer: config.computer.clone(),
             workspace: config.workspace.to_string_lossy().into_owned(),
-            sandbox: true,
+            // Windows runs a managed folder without an OS fence. The Space
+            // accepts a truthful false only when its operator opted in.
+            sandbox: !cfg!(windows),
         };
         socket
             .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))

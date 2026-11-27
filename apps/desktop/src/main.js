@@ -3,7 +3,7 @@
 // The shell owns a bundled Space process, signs the first local Admin in
 // without showing the invitation form, and loads the existing browser client.
 // The Space remains the only server; this process is its supervisor.
-const { app, BrowserWindow, safeStorage, session, shell } = require("electron");
+const { app, BrowserWindow, dialog, safeStorage, session, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -54,6 +54,40 @@ function computerConfigFile() {
   return path.join(computerHome(), "computer.json");
 }
 
+function unsandboxedConsentFile() {
+  return path.join(computerHome(), "unsandboxed-consent.json");
+}
+
+async function confirmUnsandboxedMode() {
+  if (process.platform !== "win32") return true;
+  if (process.env.NEHA_DESKTOP_CAPTURE) return true;
+  try {
+    fs.readFileSync(unsandboxedConsentFile(), "utf8");
+    return true;
+  } catch {}
+  const answer = await dialog.showMessageBox({
+    type: "warning",
+    title: "Windows Local Computer",
+    message: "Windows Local Computer runs without an operating-system sandbox.",
+    detail: "Commands run with your Windows account's rights and can read or change anything that account can, including Neha's saved credentials. Only use Bots you trust. Chat still works if you choose Not Now.",
+    buttons: ["Use Local Computer", "Not Now"],
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  });
+  if (answer.response !== 0) {
+    log("the Windows Local Computer was not enabled");
+    return false;
+  }
+  fs.mkdirSync(computerHome(), { recursive: true });
+  fs.writeFileSync(
+    unsandboxedConsentFile(),
+    JSON.stringify({ accepted: true, at: new Date().toISOString() }, null, 2),
+    { mode: 0o600 },
+  );
+  return true;
+}
+
 function standardConfigDirectory() {
   if (process.platform === "win32") {
     const base = process.env.LOCALAPPDATA || process.env.APPDATA;
@@ -73,7 +107,13 @@ function ticketFileFor(origin) {
 }
 
 function spaceEnv() {
-  return { ...process.env, NEHA_HOME: spaceHome() };
+  const env = { ...process.env, NEHA_HOME: spaceHome() };
+  if (process.platform === "win32") {
+    // The bundled Windows Local Computer has no OS sandbox. Make that opt-in
+    // explicit for this private Space instead of attesting to a fence.
+    env.NEHA_ALLOW_UNSANDBOXED_COMPUTERS = "1";
+  }
+  return env;
 }
 
 function computerEnv() {
@@ -357,6 +397,7 @@ async function startLocalComputer(spaceUrl, origin) {
     log("the Local Computer is not available on macOS yet");
     return;
   }
+  if (!(await confirmUnsandboxedMode())) return;
   let paired = fs.existsSync(computerConfigFile());
   if (paired) {
     // The Space picks a fresh loopback port on every launch. The saved token

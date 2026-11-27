@@ -1464,6 +1464,19 @@ fn unauthorized_computer() -> ApiError {
     )
 }
 
+/// Whether the Space operator explicitly accepted an unsandboxed Local
+/// Computer. The Windows desktop sets this for its bundled Space; a remote
+/// Space operator must set it deliberately.
+fn unsandboxed_computers_allowed() -> bool {
+    std::env::var("NEHA_ALLOW_UNSANDBOXED_COMPUTERS")
+        .ok()
+        .is_some_and(|value| allows_unsandboxed(Some(value.as_str())))
+}
+
+fn allows_unsandboxed(value: Option<&str>) -> bool {
+    value.is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
 /// Serves one Computer's channel until it goes away.
 ///
 /// The first frame must be a `Hello` naming the Computer the token belongs to,
@@ -1488,12 +1501,16 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         }
         _ => None,
     };
-    // A daemon that cannot fence its machine never runs, and a connection that
-    // names another Computer would act as that Computer: both are refused.
+    // A daemon that cannot fence its machine never runs unless the Space
+    // operator explicitly opted in to unsandboxed Local Computers. A connection
+    // that names another Computer would act as that Computer: both are refused.
     let Some((version, named, sandbox)) = hello else {
         return;
     };
-    if version != CHANNEL_VERSION || named != computer.to_string() || !sandbox {
+    if version != CHANNEL_VERSION
+        || named != computer.to_string()
+        || (!sandbox && !unsandboxed_computers_allowed())
+    {
         return;
     }
 
@@ -2596,6 +2613,15 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unsandboxed_local_computers_need_an_explicit_opt_in() {
+        assert!(!super::allows_unsandboxed(None));
+        assert!(!super::allows_unsandboxed(Some("0")));
+        assert!(!super::allows_unsandboxed(Some("yes")));
+        assert!(super::allows_unsandboxed(Some("1")));
+        assert!(super::allows_unsandboxed(Some("TRUE")));
+    }
+
     use futures_util::{SinkExt as _, StreamExt as _};
     use neha::surface::{ClientFrame, PROTOCOL_VERSION, ServerFrame};
     use serde_json::json;
