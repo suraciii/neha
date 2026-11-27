@@ -6,6 +6,7 @@ import {
   currentPushEnvironment,
   isMuted,
   pushCapability,
+  serviceWorkerReady,
   subscriptionBody,
   urlBase64ToUint8Array,
 } from "../lib/push";
@@ -32,9 +33,25 @@ export default function NotificationSetting() {
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   let root: HTMLDivElement | undefined;
+  let muteTimer: ReturnType<typeof setTimeout> | undefined;
 
   const support = () => pushCapability(currentPushEnvironment());
   const muted = () => isMuted(mutedUntil());
+
+  // Keeps the panel's mute state and its expiry in one place.
+  function rememberMute(until: number | null) {
+    setMutedUntil(until);
+    if (muteTimer !== undefined) {
+      clearTimeout(muteTimer);
+      muteTimer = undefined;
+    }
+    if (until === null || until * 1000 <= Date.now()) return;
+    muteTimer = setTimeout(() => {
+      muteTimer = undefined;
+      setMutedUntil(null);
+      setState((current) => (current === "muted" ? "on" : current));
+    }, until * 1000 - Date.now() + 1000);
+  }
   const muteTime = () => {
     const until = mutedUntil();
     if (until === null) return "";
@@ -55,20 +72,20 @@ export default function NotificationSetting() {
     }
     try {
       const status = await api.pushStatus();
-      setMutedUntil(status.muted_until);
+      rememberMute(status.muted_until);
       if (Notification.permission === "denied") {
         setState("denied");
         return;
       }
       if (Notification.permission === "granted") {
-        const registration = await navigator.serviceWorker.ready;
+        const registration = await serviceWorkerReady();
         const subscription = await registration.pushManager.getSubscription();
         if (subscription) {
           const body = subscriptionBody(subscription);
           // A server restart keeps its state file, but re-posting makes the
           // device and the Space agree after either one lost the other.
           if (body) await api.subscribePush(body);
-          setState(muted() ? "muted" : "on");
+          setState(isMuted(status.muted_until) ? "muted" : "on");
           return;
         }
       }
@@ -88,8 +105,8 @@ export default function NotificationSetting() {
         return;
       }
       const status = await api.pushStatus();
-      setMutedUntil(status.muted_until);
-      const registration = await navigator.serviceWorker.ready;
+      rememberMute(status.muted_until);
+      const registration = await serviceWorkerReady();
       let subscription = await registration.pushManager.getSubscription();
       if (!subscription) {
         subscription = await registration.pushManager.subscribe({
@@ -100,7 +117,7 @@ export default function NotificationSetting() {
       const body = subscriptionBody(subscription);
       if (!body) throw new Error("the browser returned no subscription keys");
       await api.subscribePush(body);
-      setState(muted() ? "muted" : "on");
+      setState(isMuted(status.muted_until) ? "muted" : "on");
     } catch {
       setError(t("notify.error"));
     } finally {
@@ -113,7 +130,7 @@ export default function NotificationSetting() {
     setError(null);
     try {
       const result = await api.mutePush(60);
-      setMutedUntil(result.muted_until);
+      rememberMute(result.muted_until);
       setState("muted");
     } catch {
       setError(t("notify.error"));
@@ -127,7 +144,7 @@ export default function NotificationSetting() {
     setError(null);
     try {
       const result = await api.unmutePush();
-      setMutedUntil(result.muted_until);
+      rememberMute(result.muted_until);
       setState("on");
     } catch {
       setError(t("notify.error"));
@@ -140,18 +157,40 @@ export default function NotificationSetting() {
     setBusy(true);
     setError(null);
     try {
-      const registration = await navigator.serviceWorker.ready;
+      const registration = await serviceWorkerReady();
       const subscription = await registration.pushManager.getSubscription();
       if (subscription) {
-        await api.unsubscribePush(subscription.endpoint).catch(() => undefined);
+        // Delete the server record first. If that fails the device stays
+        // subscribed, so the user can retry instead of leaving a stale entry.
+        await api.unsubscribePush(subscription.endpoint);
         await subscription.unsubscribe();
       }
-      setMutedUntil(null);
+      rememberMute(null);
       setState("off");
     } catch {
       setError(t("notify.error"));
     } finally {
       setBusy(false);
+    }
+  }
+
+  function retry() {
+    setError(null);
+    setState("loading");
+    void initialise();
+  }
+
+  async function toggleOpen() {
+    const next = !open();
+    setOpen(next);
+    if (!next || support() !== "ready" || state() === "loading") return;
+    try {
+      const status = await api.pushStatus();
+      rememberMute(status.muted_until);
+      if (state() === "muted" && !isMuted(status.muted_until)) setState("on");
+      else if (state() === "on" && isMuted(status.muted_until)) setState("muted");
+    } catch {
+      // The panel keeps what it knows; an action reports the error.
     }
   }
 
@@ -170,6 +209,7 @@ export default function NotificationSetting() {
     return () => {
       document.removeEventListener("mousedown", dismiss);
       document.removeEventListener("keydown", escape);
+      if (muteTimer !== undefined) clearTimeout(muteTimer);
     };
   });
 
@@ -183,7 +223,7 @@ export default function NotificationSetting() {
           aria-expanded={open() ? "true" : "false"}
           aria-controls="notifications-panel"
           title={t("notify.button")}
-          onClick={() => { setOpen((value) => !value); }}
+          onClick={() => void toggleOpen()}
         >
           <Icon name="bell" size="sm" />
           <span class={`notify__dot${muted() ? " is-muted" : ""}${state() === "on" ? " is-on" : ""}`} />
@@ -219,6 +259,9 @@ export default function NotificationSetting() {
             </Show>
             <Show when={state() === "unavailable"}>
               <p class="notify__text">{t("notify.unavailable")}</p>
+              <button class="btn btn--quiet btn--wide notify__quiet" type="button" disabled={busy()} onClick={() => retry()}>
+                {t("notify.retry")}
+              </button>
             </Show>
             <Show when={state() === "off"}>
               <p class="notify__text">{t("notify.off.text")}</p>

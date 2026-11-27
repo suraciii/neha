@@ -229,19 +229,29 @@ self.addEventListener("notificationclick", (event) => {
     (async () => {
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
       for (const window of windows) {
-        if ("focus" in window) {
+        if (!("focus" in window)) continue;
+        try {
           await window.focus();
-          if ("navigate" in window) {
-            try {
-              await window.navigate(url.href);
-              return;
-            } catch {
-              // The window may have gone away; try a new one below.
-            }
-          }
-          if (self.clients.openWindow) await self.clients.openWindow(url.href);
-          return;
+        } catch {
+          continue;
         }
+        if ("navigate" in window) {
+          try {
+            const navigated = await window.navigate(url.href);
+            if (navigated) {
+              try {
+                if ("focus" in navigated) await navigated.focus();
+              } catch {
+                // The page is already at the right place.
+              }
+              return;
+            }
+          } catch {
+            // The window may have gone away; fall back to a new one.
+          }
+        }
+        if (self.clients.openWindow) await self.clients.openWindow(url.href);
+        return;
       }
       if (self.clients.openWindow) await self.clients.openWindow(url.href);
     })(),

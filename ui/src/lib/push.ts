@@ -91,3 +91,27 @@ export function subscriptionBody(subscription: PushSubscription): PushSubscripti
 export function isMuted(mutedUntil: number | null): boolean {
   return mutedUntil !== null && mutedUntil * 1000 > Date.now();
 }
+
+// `navigator.serviceWorker.ready` never settles when registration or
+// installation fails, so the panel needs a bounded wait to report it.
+export function serviceWorkerReady(timeout = 5000): Promise<ServiceWorkerRegistration> {
+  if (!("serviceWorker" in navigator)) {
+    return Promise.reject(new Error("the browser has no service worker"));
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("the service worker did not become ready")),
+      timeout,
+    );
+    navigator.serviceWorker.ready.then(
+      (registration) => {
+        clearTimeout(timer);
+        resolve(registration);
+      },
+      (error: unknown) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}

@@ -52,4 +52,4 @@ Subscriptions and the VAPID signing key stay in the Space's home. The key is sea
 | Add to Home Screen hint on iPhone | Install from Safari's Share menu and open the installed app. |
 | Notifications are blocked | Allow notifications for this site in the browser's settings. |
 | Nothing arrives | The Space may be muted, this device may be turned off, or the Space may be stopped. |
-| The control says notifications are unavailable | The Space could not create its VAPID key or save push state; check its logs and the `secrets` directory. |
+| The control says notifications are unavailable | The Space could not create its VAPID key or read its push state; check its logs, the `secrets` directory, and `state/push.json`. A corrupt state file is left untouched; repair or remove it after a backup and restart. |

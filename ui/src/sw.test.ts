@@ -431,6 +431,7 @@ describe("the installed shell worker", () => {
     worker.clients.matchAll.mockResolvedValue([
       { focus: worker.focus, navigate: worker.navigate },
     ]);
+    worker.navigate.mockImplementation(async () => ({ focus: worker.focus }) as never);
     const click = await clicked(worker.handlers, "/?chat=h1&approval=a1");
     expect(click.close).toHaveBeenCalled();
     expect(worker.focus).toHaveBeenCalled();
@@ -438,6 +439,28 @@ describe("the installed shell worker", () => {
       "https://space.example.com/?chat=h1&approval=a1",
     );
     expect(worker.openWindow).not.toHaveBeenCalled();
+  });
+
+  it("opens a window when the click cannot focus the app", async () => {
+    const worker = fakeWorker(async () => new Response("ok"));
+    worker.clients.matchAll.mockResolvedValue([
+      { focus: worker.focus, navigate: worker.navigate },
+    ]);
+    worker.focus.mockRejectedValue(new Error("the window is gone"));
+    await clicked(worker.handlers, "/?chat=h3");
+
+    expect(worker.openWindow).toHaveBeenCalledWith("https://space.example.com/?chat=h3");
+  });
+
+  it("opens a window when navigation returns no client", async () => {
+    const worker = fakeWorker(async () => new Response("ok"));
+    worker.clients.matchAll.mockResolvedValue([
+      { focus: worker.focus, navigate: worker.navigate },
+    ]);
+    await clicked(worker.handlers, "/?chat=h4");
+
+    expect(worker.navigate).toHaveBeenCalled();
+    expect(worker.openWindow).toHaveBeenCalledWith("https://space.example.com/?chat=h4");
   });
 
   it("opens a window when the click has none", async () => {

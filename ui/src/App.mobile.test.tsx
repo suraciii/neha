@@ -75,14 +75,22 @@ describe("the mobile client", () => {
     ];
     history.replaceState(null, "", `/?chat=${space.chat.id}&message=m1`);
     mobile();
+    const scroll = vi.fn();
+    const original = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scroll as unknown as typeof Element.prototype.scrollIntoView;
     const view = renderApp();
 
-    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
-    expect(history.state?.nehaChat).toBe(space.chat.id);
-    expect(location.search).toBe("");
-    await waitFor(() =>
-      expect(view.container.querySelector('[data-message="m1"]')).toBeTruthy(),
-    );
+    try {
+      await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+      expect(history.state?.nehaChat).toBe(space.chat.id);
+      expect(location.search).toBe("");
+      await waitFor(() =>
+        expect(view.container.querySelector('[data-message="m1"]')).toBeTruthy(),
+      );
+      await waitFor(() => expect(scroll).toHaveBeenCalled());
+    } finally {
+      if (original) Element.prototype.scrollIntoView = original;
+    }
     history.replaceState(null, "", "/");
   });
 

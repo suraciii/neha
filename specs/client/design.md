@@ -38,6 +38,8 @@ The installed browser client subscribes each device to Web Push only after the U
 
 It asks the Space for the VAPID public key, subscribes with `userVisibleOnly`, and posts the endpoint and keys to the Space. On a later open it posts an existing subscription again, so the device and the Space agree after either one lost the other.
 
+The control waits a bounded time for the service worker and offers a retry when it cannot become ready; an expired Space mute returns the control to on.
+
 On iOS and iPadOS, the client MUST NOT request notification permission outside an installed Home Screen app. It shows the Add to Home Screen prerequisite instead.
 
 The Space stores a subscription with its account and the endpoint's encryption keys, in a private state file. The VAPID private key lives with the Space's sealed secrets and MUST NOT rotate silently: every subscription is bound to it.

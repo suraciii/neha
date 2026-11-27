@@ -73,6 +73,15 @@ export default function ChatView(props: ChatViewProps) {
     },
   );
 
+  // An id comes from a URL, so compare it as a value instead of interpolating
+  // it into a selector.
+  function findAttribute(name: string, value: string): HTMLElement | undefined {
+    if (!stream) return undefined;
+    return Array.from(stream.querySelectorAll<HTMLElement>(`[${name}]`)).find(
+      (element) => element.getAttribute(name) === value,
+    );
+  }
+
   // An approval the attention list named is the one the User came to read, so
   // the Chat brings its card into view once the record has delivered it. The
   // cards arrive with the Chat's reads, so the ask also waits for their count.
@@ -80,7 +89,7 @@ export default function ChatView(props: ChatViewProps) {
     () => ({ approval: props.focus, count: props.approvals.length }),
     ({ approval }) => {
       if (!approval) return;
-      const card = stream?.querySelector<HTMLElement>(`[data-approval="${approval}"]`);
+      const card = findAttribute("data-approval", approval);
       if (!card) return;
       queueMicrotask(() => {
         if (typeof card.scrollIntoView !== "function") return;
@@ -95,7 +104,7 @@ export default function ChatView(props: ChatViewProps) {
     () => ({ message: props.focusMessage, count: props.messages.length }),
     ({ message }) => {
       if (!message) return;
-      const row = stream?.querySelector<HTMLElement>(`[data-message="${message}"]`);
+      const row = findAttribute("data-message", message);
       if (!row) return;
       queueMicrotask(() => {
         if (typeof row.scrollIntoView !== "function") return;
