@@ -139,6 +139,23 @@ pub fn space_key(home: &Home) -> String {
 /// A relative `XDG_CONFIG_HOME` is ignored, as the XDG base directory
 /// specification requires. Without either variable there is no directory: the
 /// ticket is never written outside the standard configuration directory.
+#[cfg(windows)]
+fn config_directory(
+    _xdg_config_home: Option<PathBuf>,
+    _user_home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("APPDATA"))
+        .map(PathBuf::from)
+        .map(|base| base.join("Neha"))
+}
+
+/// Returns the configuration directory from the variables that may name it.
+///
+/// A relative `XDG_CONFIG_HOME` is ignored, as the XDG base directory
+/// specification requires. Without either variable there is no directory: the
+/// ticket is never written outside the standard configuration directory.
+#[cfg(not(windows))]
 fn config_directory(
     xdg_config_home: Option<PathBuf>,
     user_home: Option<PathBuf>,

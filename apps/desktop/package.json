@@ -1,0 +1,53 @@
+{
+  "name": "neha-desktop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Local-first Neha desktop shell",
+  "main": "src/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "electron .",
+    "start:headless": "electron . --no-sandbox",
+    "test": "node --test test/*.test.js",
+    "package:win": "node scripts/package-windows.mjs"
+  },
+  "devDependencies": {
+    "electron": "45.5.0",
+    "electron-builder": "26.18.0"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "build": {
+    "appId": "ai.neha.desktop",
+    "productName": "Neha",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/neha.exe",
+        "to": "neha.exe"
+      },
+      {
+        "from": "resources/ui",
+        "to": "ui"
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "artifactName": "Neha-Setup-${version}.${ext}"
+    }
+  }
+}

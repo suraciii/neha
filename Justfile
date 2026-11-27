@@ -37,6 +37,14 @@ ui-check: ui-deps
     pnpm --dir ui run check
     pnpm --dir ui run build
 
+# Install the desktop shell's locked dependencies.
+desktop-deps:
+    pnpm --dir apps/desktop install --frozen-lockfile
+
+# Run the desktop shell's unit checks.
+desktop-check: desktop-deps
+    pnpm --dir apps/desktop test
+
 # Build the documentation; any rustdoc warning fails.
 doc:
     RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --no-deps
@@ -57,7 +65,7 @@ check-specs-tests:
     python3 scripts/test_check_specs.py
 
 # The full gate. Pull requests and main run the same recipes.
-ci: check-python-cache check-python check-specs fmt check clippy test doc ui-check
+ci: check-python-cache check-python check-specs fmt check clippy test doc ui-check desktop-check
 
 # Run the gate and retain source provenance, output, and exit status.
 verify evidence_dir:

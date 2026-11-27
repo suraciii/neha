@@ -359,22 +359,44 @@ impl LocalRuntime {
         hidden: Vec<PathBuf>,
     ) -> Result<Self, RuntimeError> {
         let folder = folder.into();
-        let parent = folder
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let name = folder.file_name().ok_or_else(|| {
-            RuntimeError::UnsafeFolder(format!(
-                "{} does not name one folder; clean it and start again (the default is ~/Neha/<bot-id>)",
-                folder.display()
-            ))
-        })?;
-        // The configured parent may be a new path; its final component is
-        // still opened without following a symlink.
-        std::fs::create_dir_all(parent)?;
-        let parent = open_directory_path(parent).map_err(RuntimeError::Io)?;
 
-        Self::machine_at_with(&parent, name, bwrap, hidden)
+        // Windows has no bubblewrap. A Windows Computer uses a managed folder:
+        // its file tools stay inside the Bot's folder, while its shell runs
+        // with the machine user's rights and is not fenced. The daemon must
+        // not claim the Linux sandbox on this path.
+        #[cfg(windows)]
+        {
+            let _ = bwrap;
+            std::fs::create_dir_all(&folder)?;
+            let root = std::fs::canonicalize(&folder)?;
+            let hidden = hidden
+                .into_iter()
+                .map(|path| std::fs::canonicalize(path).map_err(RuntimeError::Io))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut runtime = Self::managed(root)?;
+            runtime.hidden = hidden;
+            return Ok(runtime);
+        }
+
+        #[cfg(not(windows))]
+        {
+            let parent = folder
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = folder.file_name().ok_or_else(|| {
+                RuntimeError::UnsafeFolder(format!(
+                    "{} does not name one folder; clean it and start again (the default is ~/Neha/<bot-id>)",
+                    folder.display()
+                ))
+            })?;
+            // The configured parent may be a new path; its final component is
+            // still opened without following a symlink.
+            std::fs::create_dir_all(parent)?;
+            let parent = open_directory_path(parent).map_err(RuntimeError::Io)?;
+
+            Self::machine_at_with(&parent, name, bwrap, hidden)
+        }
     }
 
     /// Opens a real-machine runtime under a verified workspace root descriptor.
@@ -559,6 +581,27 @@ impl LocalRuntime {
         grants: &[String],
         cwd: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        // The managed Windows runtime has no OS fence and no directory
+        // descriptors. Refuse a widened access model instead of silently
+        // serving a narrower one than the owner asked for.
+        #[cfg(windows)]
+        {
+            if full_access {
+                return Err(RuntimeError::Access(
+                    "full access is not available for a Windows Local Computer".to_owned(),
+                ));
+            }
+            if cwd.is_some() {
+                return Err(RuntimeError::Access(
+                    "a run directory is not available for a Windows Local Computer".to_owned(),
+                ));
+            }
+            if !grants.is_empty() {
+                return Err(RuntimeError::Access(
+                    "granted folders are not available for a Windows Local Computer".to_owned(),
+                ));
+            }
+        }
         let cwd = match cwd {
             Some(directory) => Some(self.open_run_directory(directory, full_access)?),
             None => None,
@@ -786,6 +829,12 @@ impl LocalRuntime {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     return Err("the path uses a symlink, which is not followed".to_owned());
                 }
+                Ok(metadata) if is_reparse_point(&metadata) => {
+                    return Err("the path uses a reparse point, which is not followed".to_owned());
+                }
+                Ok(metadata) if is_hard_link(&current, &metadata) => {
+                    return Err("the path uses a hard link, which is not followed".to_owned());
+                }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
                 Err(error) => {
@@ -973,6 +1022,16 @@ impl LocalRuntime {
         self.refuse_hidden(&file, path)?;
 
         Ok((file, metadata))
+    }
+
+    /// Windows has no `/proc/self/fd`, and its managed runtime does not use
+    /// this method. Keep the match exhaustive with a clear refusal.
+    #[cfg(not(unix))]
+    fn open_machine_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+        Err(format!(
+            "a real-machine read is not available on this platform: {}",
+            path.display()
+        ))
     }
 
     /// Refuses an opened file or directory that is hidden or denied.
@@ -1179,9 +1238,16 @@ impl LocalRuntime {
         } else {
             match &self.mode {
                 Mode::Managed => {
-                    let mut process = Command::new("sh");
-                    process.arg("-c").arg(command).current_dir(&self.root);
-                    process
+                    #[cfg(windows)]
+                    {
+                        windows_shell(command, &self.root)
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        let mut process = Command::new("sh");
+                        process.arg("-c").arg(command).current_dir(&self.root);
+                        process
+                    }
                 }
                 // Full access has no fence to build: the command runs as the
                 // machine user from the run's directory, and bubblewrap is never
@@ -1190,6 +1256,16 @@ impl LocalRuntime {
                 Mode::Machine { .. } if self.full_access => {
                     full_access_shell_command(command, self.base())
                 }
+                #[cfg(windows)]
+                Mode::Machine { .. } => {
+                    // Windows never constructs a Machine runtime; it uses the
+                    // managed folder. Keep the arm unreachable rather than
+                    // compiling Unix descriptor and bubblewrap code here.
+                    let mut process = Command::new("cmd.exe");
+                    process.args(["/C", "exit 1"]);
+                    process
+                }
+                #[cfg(not(windows))]
                 Mode::Machine { bwrap, folder } => {
                     let Some(bwrap) = bwrap else {
                         return Err(ActionResult::failed(
@@ -1244,8 +1320,10 @@ impl LocalRuntime {
                     #[cfg(not(unix))]
                     let (write_roots, grant_fds): (
                         Vec<(OsString, PathBuf)>,
-                        Vec<libc::c_int>,
+                        Vec<i32>,
                     ) = (Vec::new(), Vec::new());
+                    #[cfg(windows)]
+                    let _ = &grant_fds;
                     let mut process = sandbox_command(
                         bwrap,
                         &source,
@@ -1305,36 +1383,91 @@ impl LocalRuntime {
                 }
             }
         };
-        let (home, temporary, path) = if self.hosted.is_some() {
-            (
-                Path::new(HOSTED_WORKSPACE),
-                PathBuf::from(SANDBOX_TMPDIR),
-                match &self.cli_dir {
-                    // The CLI is mounted at a fixed sandbox path, not where it
-                    // sits on the host.
-                    Some(_) => format!("{HOSTED_CLI_DIR}:{SHELL_PATH}"),
-                    None => SHELL_PATH.to_owned(),
-                },
-            )
+        let (home, temporary) = if self.hosted.is_some() {
+            (Path::new(HOSTED_WORKSPACE), PathBuf::from(SANDBOX_TMPDIR))
         } else {
             let temporary = match &self.mode {
                 Mode::Managed => self.root.join(".tmp"),
                 Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
             };
-            let path = match &self.cli_dir {
+            (self.root.as_path(), temporary)
+        };
+        #[cfg(windows)]
+        let path = {
+            let inherited = std::env::var_os("PATH").unwrap_or_default();
+            match &self.cli_dir {
+                Some(directory) => {
+                    format!("{};{}", directory.display(), inherited.to_string_lossy())
+                }
+                None => inherited.to_string_lossy().into_owned(),
+            }
+        };
+        #[cfg(not(windows))]
+        let path = if self.hosted.is_some() {
+            match &self.cli_dir {
+                // The CLI is mounted at a fixed sandbox path, not where it
+                // sits on the host.
+                Some(_) => format!("{HOSTED_CLI_DIR}:{SHELL_PATH}"),
+                None => SHELL_PATH.to_owned(),
+            }
+        } else {
+            match &self.cli_dir {
                 Some(directory) => format!("{}:{SHELL_PATH}", directory.display()),
                 None => SHELL_PATH.to_owned(),
-            };
-            (self.root.as_path(), temporary, path)
+            }
         };
         process
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear()
-            .env("PATH", path)
-            .env("HOME", home)
-            .env("TMPDIR", temporary)
+            .stderr(Stdio::piped());
+        // A Bot gets Windows' system variables it needs to start a shell, not
+        // the daemon's environment: NEHA_MASTER_KEY, provider keys, and proxy
+        // credentials must not reach a command.
+        #[cfg(windows)]
+        {
+            process.env_clear();
+            for key in [
+                "SystemRoot",
+                "SystemDrive",
+                "windir",
+                "COMSPEC",
+                "PATHEXT",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "PROGRAMDATA",
+                "PROGRAMFILES",
+                "PROGRAMFILES(X86)",
+                "COMMONPROGRAMFILES",
+                "COMMONPROGRAMFILES(X86)",
+                "PSModulePath",
+                "OS",
+                "NUMBER_OF_PROCESSORS",
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_IDENTIFIER",
+                "USERNAME",
+                "USERDOMAIN",
+                "COMPUTERNAME",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    process.env(key, value);
+                }
+            }
+            process
+                .env("HOME", home)
+                .env("USERPROFILE", home)
+                .env("TMP", &temporary)
+                .env("TEMP", &temporary)
+                .env("PATH", path);
+        }
+        #[cfg(not(windows))]
+        {
+            process
+                .env_clear()
+                .env("PATH", path)
+                .env("HOME", home)
+                .env("TMPDIR", temporary);
+        }
+        process
             .envs(self.env.lock().map(|env| env.clone()).unwrap_or_default())
             .kill_on_drop(true);
         Ok(process)
@@ -1862,6 +1995,57 @@ fn full_access_shell_command(command: &str, base: &Path) -> Command {
 
 /// Normalizes `.` and `..` without touching the file system; an absolute path
 /// stops at `/`.
+
+/// Windows reparse points, including junctions, are not followed by the
+/// managed file tools. The attribute check also covers a link without a
+/// recognisable symlink tag.
+#[cfg(windows)]
+fn is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
+/// A file with more than one hard link may name an object outside the Bot's
+/// folder; the managed tools refuse it rather than write through it.
+#[cfg(windows)]
+fn is_hard_link(path: &std::path::Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::io::AsRawHandle as _;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    if !metadata.is_file() {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        // A file that exists but cannot be inspected is not safe to write.
+        return true;
+    };
+    let mut information = unsafe { std::mem::zeroed::<BY_HANDLE_FILE_INFORMATION>() };
+    let inspected =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) };
+    inspected == 0 || information.nNumberOfLinks > 1
+}
+
+#[cfg(unix)]
+fn is_hard_link(_path: &std::path::Path, metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    metadata.is_file() && metadata.nlink() > 1
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_hard_link(_path: &std::path::Path, _metadata: &std::fs::Metadata) -> bool {
+    false
+}
+
 fn normalize_path(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
@@ -2862,7 +3046,50 @@ fn kill_group(pid: Option<u32>) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn windows_shell(command: &str, root: &Path) -> Command {
+    // Real Windows machines have Windows PowerShell 5.1 beside the system
+    // directory. Use it with an absolute path so a Bot's PATH cannot shadow
+    // the shell; fall back to cmd.exe on a minimal image.
+    let powershell = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .map(|root| {
+            root.join("System32")
+                .join("WindowsPowerShell")
+                .join("v1.0")
+                .join("powershell.exe")
+        });
+    let mut process = if powershell.as_ref().is_some_and(|path| path.is_file()) {
+        let mut process = Command::new(powershell.expect("checked above"));
+        process
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(command);
+        process
+    } else {
+        let mut process = Command::new("cmd.exe");
+        process.args(["/D", "/S", "/C"]).arg(command);
+        process
+    };
+    process.current_dir(root);
+    process
+}
+
+#[cfg(windows)]
+fn kill_group(pid: Option<u32>) {
+    if let Some(pid) = pid {
+        // Windows has no process-group kill in the standard library. taskkill
+        // /T walks the child tree and /F ends it, matching the Unix path's
+        // intent for a timed-out or cancelled command.
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn kill_group(_pid: Option<u32>) {}
 
 /// Kills one shell and every process below it.

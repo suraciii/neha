@@ -61,7 +61,9 @@ A Computer is the unit of isolation.
 
 Bots assigned to one Computer share its files, processes, and logins. The Space does not isolate them from each other.
 
-On a Local Computer with granted folders, a Bot's write range is its own Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path, and the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
+On a Local Computer with granted folders, a Bot's write range is its own Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path. On Linux, the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
+
+On Windows, an explicitly opted-in Local Computer has no operating-system sandbox. Its file tools stay in the Bot's folder, but its shell runs with the machine user's rights.
 
 On a Hosted Computer, a Bot's shell runs in a sandbox that starts from an empty root. The sandbox mounts the Space machine's system directories read-only, and the Bot's Workspace at `/workspace` is the one place where files persist.
 
@@ -69,7 +71,9 @@ The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev
 
 The sandbox shares the machine's network, so the Bot's shell reaches the Space's loopback for `neha file get` and `neha chat send --file`. The file tools stay in the Workspace, and the sandbox's other writable places are its own `/tmp` and `/dev/shm`.
 
-A machine that cannot start its sandbox does not serve as a Computer.
+A machine that cannot start its sandbox does not serve as a Computer, except for an explicitly opted-in Windows Local Computer. The Space accepts a Windows daemon's truthful `sandbox: false` only when its operator sets `NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`.
+
+The desktop sets the opt-in for its bundled Space after the owner accepts the warning. Such a Computer has no OS fence, and its owner MUST treat approvals and Bot trust as the boundary.
 
 A Local Computer's configuration directory is hidden from a Bot with granted folders. It holds the saved pairing and the token, at `~/.config/neha` by default, and the file tools and the shell cannot reach it.
 

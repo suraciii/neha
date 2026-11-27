@@ -74,9 +74,11 @@ A Bot on a Hosted Computer works only in its Workspace.
 
 On a Local Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read. [Design](design.md#isolation) hides the Computer's own configuration directory from a Bot with granted folders.
 
+A Windows Local Computer is an explicitly unsandboxed mode. Its commands run with the machine user's rights, not only in the Bot's folder; the owner accepts a warning before Neha starts it, and the Space operator opts in on the wire. Grants, full access, and a run directory are unavailable in this mode.
+
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 
-On a Local Computer, the owner sets its access: granted folders, or full access.
+On a Linux Local Computer, the owner sets its access: granted folders, or full access. A Windows Local Computer has no such access model.
 
 With granted folders, a Bot writes and deletes files only in its Workspace, the granted folders, and the run's own working directory. With full access, Neha starts no sandbox, and the Bot writes, deletes, and reads with the machine user's own file rights, including the Computer's configuration directory.
 
