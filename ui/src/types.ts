@@ -16,10 +16,10 @@ import type {
   ActionStatus,
   ApprovalReason,
   Author,
-  Event as WireEvent,
   EventKind,
   RunStatus,
   Undoability,
+  Event as WireEvent,
 } from "./generated/record";
 import type {
   ActionView,
@@ -42,23 +42,33 @@ import type {
 } from "./generated/surface";
 import type { Usage } from "./generated/usage";
 
-export type { Account };
-export type { CatalogRefresh as CatalogRefreshResult, CatalogStatus };
-export type { ErrorCode };
-export type { ActionStatus, ApprovalReason, Author, ChatStatus, EventKind, RunStatus };
-export type { WireEvent as RecordEvent };
-export type { Undoability as Undoable };
-export type { ClientFrame, CommandCall, FileSummary, ServerFrame, ThinkingLevel };
-export type { Usage };
 export type {
+  Account,
+  ActionStatus,
+  ApprovalReason,
+  Author,
   BotView as Bot,
+  CatalogRefresh as CatalogRefreshResult,
+  CatalogStatus,
+  ChatStatus,
   ChatView as Chat,
+  ClientFrame,
+  CommandCall,
   ComputerView as Computer,
+  ErrorCode,
+  EventKind,
+  FileSummary,
   MessageView as Message,
   ModelView as Model,
   ProviderView as Provider,
   RuleView as Rule,
+  RunStatus,
+  ServerFrame,
   StepView as RunStepView,
+  ThinkingLevel,
+  Undoability as Undoable,
+  Usage,
+  WireEvent as RecordEvent,
 };
 
 // The Approval card: `neha.approval.requested` carries the ask, and the

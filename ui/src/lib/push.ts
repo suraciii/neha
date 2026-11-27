@@ -17,7 +17,9 @@ export interface PushEnvironment {
 }
 
 /** Whether this is an iPhone, iPad, or an iPad reporting as a Mac. */
-export function isIos(environment: Pick<PushEnvironment, "userAgent" | "platform" | "maxTouchPoints">): boolean {
+export function isIos(
+  environment: Pick<PushEnvironment, "userAgent" | "platform" | "maxTouchPoints">,
+): boolean {
   return (
     /iPad|iPhone|iPod/.test(environment.userAgent) ||
     (environment.platform === "MacIntel" && environment.maxTouchPoints > 1)
@@ -30,7 +32,8 @@ export function isStandalone(): boolean {
   const navigatorWithStandalone = navigator as Navigator & { standalone?: boolean };
   return (
     navigatorWithStandalone.standalone === true ||
-    (typeof window.matchMedia === "function" && window.matchMedia("(display-mode: standalone)").matches)
+    (typeof window.matchMedia === "function" &&
+      window.matchMedia("(display-mode: standalone)").matches)
   );
 }
 

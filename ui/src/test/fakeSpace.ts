@@ -188,7 +188,10 @@ export const space = {
   >,
   runShows: [] as string[],
   // A run_show answer can be held open, so a test can act while it is in flight.
-  runHolds: {} as Record<string, { gate: Promise<void>; release: () => void; fail: () => void } | undefined>,
+  runHolds: {} as Record<
+    string,
+    { gate: Promise<void>; release: () => void; fail: () => void } | undefined
+  >,
   // Sends that settled in the fake Space.
   sendsDone: 0,
   // Runs the Space accepted, in order.
@@ -280,7 +283,9 @@ export const space = {
     space.approvals = [];
     space.decisions = [];
     space.decidesDone = 0;
-    space.providers = [{ id: "v1", protocol: "chat_completions", base_url: "http://provider", vendor: null }];
+    space.providers = [
+      { id: "v1", protocol: "chat_completions", base_url: "http://provider", vendor: null },
+    ];
     space.models = [];
     space.rules = [];
     space.vendors = [];
@@ -615,7 +620,11 @@ export class FakeCommands {
           .map((known) => ({ ...known })) as T;
       }
       case "rule_add": {
-        const asked = args as Record<string, unknown> & { bot: string; effect: Rule["effect"]; tool: string };
+        const asked = args as Record<string, unknown> & {
+          bot: string;
+          effect: Rule["effect"];
+          tool: string;
+        };
         space.ruleAdds.push(asked);
         const rule: Rule = {
           rule: `rule${space.rules.length + 1}`,
@@ -674,7 +683,8 @@ export class FakeCommands {
         const vendor = space.vendors.find((known) => known.id === asked.vendor);
         const provider: Provider = {
           id: `v${space.providers.length + 1}`,
-          protocol: vendor?.protocol ?? (asked.protocol as Provider["protocol"]) ?? "chat_completions",
+          protocol:
+            vendor?.protocol ?? (asked.protocol as Provider["protocol"]) ?? "chat_completions",
           base_url: (asked.base_url as string) ?? vendor?.api ?? "http://vendor",
           vendor: asked.vendor,
         };
@@ -691,7 +701,10 @@ export class FakeCommands {
       case "model_default": {
         const asked = args as { model: string };
         space.defaults.push(asked.model);
-        space.models = space.models.map((known) => ({ ...known, is_default: known.id === asked.model }));
+        space.models = space.models.map((known) => ({
+          ...known,
+          is_default: known.id === asked.model,
+        }));
         const chosen = space.models.find((known) => known.id === asked.model);
         const provider = chosen?.provider ?? "";
         // The Provider's Models changed, so the page hears about it.

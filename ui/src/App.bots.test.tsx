@@ -2,7 +2,6 @@ import { cleanup, fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
-import App from "./App";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
 import { drain, element, mobile, renderApp, useView } from "./test/view";
@@ -123,7 +122,9 @@ describe("App bots", () => {
     // The Bot is asked for by its name and nothing else: the Space gives a new
     // Bot a Computer of its own, so the arguments at the boundary are the whole
     // of what was sent.
-    await waitFor(() => expect(frames("bot_create")).toEqual([{ name: "bot_create", args: { name: "Nova" } }]));
+    await waitFor(() =>
+      expect(frames("bot_create")).toEqual([{ name: "bot_create", args: { name: "Nova" } }]),
+    );
     expect(space.creates).toEqual([{ name: "Nova" }]);
     // The Space records the create as three events, and the client reads the
     // workspace again for each of them.
@@ -150,9 +151,11 @@ describe("App bots", () => {
     // they choose instead of the fresh Hosted one.
     const view = await openBotsList();
     await openNewBot(view, "");
-    flush(() => fireEvent.change(element<HTMLSelectElement>(view, '[name="bot_computer"]'), {
-      target: { value: space.computer.id },
-    }));
+    flush(() =>
+      fireEvent.change(element<HTMLSelectElement>(view, '[name="bot_computer"]'), {
+        target: { value: space.computer.id },
+      }),
+    );
     flush();
     type(view, "bot_name", "Nova");
     await readyToCreate(view);
@@ -165,7 +168,9 @@ describe("App bots", () => {
       ]),
     );
     // The Chat says which Computer the Bot works on.
-    await waitFor(() => expect(element(view, ".chat__sub").textContent).toContain("Local Computer"));
+    await waitFor(() =>
+      expect(element(view, ".chat__sub").textContent).toContain("Local Computer"),
+    );
     expect(element(view, ".chat__titles h1").textContent).toBe("Nova");
   });
 
@@ -194,7 +199,10 @@ describe("App bots", () => {
     const view = await openBotsList();
     await openNewBot(view, "");
 
-    const option = element<HTMLOptionElement>(view, `[name="bot_computer"] option[value="${space.computer.id}"]`);
+    const option = element<HTMLOptionElement>(
+      view,
+      `[name="bot_computer"] option[value="${space.computer.id}"]`,
+    );
     expect(option.textContent).toBe(`Local Computer ${space.computer.id}`);
     expect(option.disabled).toBe(false);
   });
@@ -206,7 +214,10 @@ describe("App bots", () => {
     const view = await openBotsList();
     await openNewBot(view, "");
 
-    const option = element<HTMLOptionElement>(view, `[name="bot_computer"] option[value="${space.computer.id}"]`);
+    const option = element<HTMLOptionElement>(
+      view,
+      `[name="bot_computer"] option[value="${space.computer.id}"]`,
+    );
     expect(option.textContent).toBe("Local Computer p1 · /w · Offline");
     expect(option.disabled).toBe(true);
     // The list says why it cannot be chosen.
@@ -286,7 +297,9 @@ describe("App bots", () => {
     flush(() => fireEvent.click(element(reloaded, ".rail__item:nth-of-type(3)")));
     await waitFor(() =>
       expect(
-        Array.from(reloaded.container.querySelectorAll(".conv__name")).map((row) => row.textContent),
+        Array.from(reloaded.container.querySelectorAll(".conv__name")).map(
+          (row) => row.textContent,
+        ),
       ).toContain("Nova"),
     );
     await drain();

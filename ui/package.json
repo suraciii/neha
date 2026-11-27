@@ -8,13 +8,14 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "check": "tsc --noEmit && vitest run"
+    "check": "biome check . && tsc --noEmit && vitest run"
   },
   "dependencies": {
     "@solidjs/web": "2.0.4",
     "solid-js": "2.0.4"
   },
   "devDependencies": {
+    "@biomejs/biome": "2.6.9",
     "@solidjs/testing-library": "1.0.0-rc.2",
     "@solidjs/vite-plugin": "3.0.1",
     "@types/fontkit": "^2.0.9",

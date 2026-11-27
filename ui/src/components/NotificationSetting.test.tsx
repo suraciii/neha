@@ -104,9 +104,7 @@ describe("notification settings", () => {
     const subscription = fakeSubscription();
     const { requestPermission } = browser({ subscription });
     vi.spyOn(api, "pushStatus").mockResolvedValue({ key: "BOr", muted_until: null });
-    const subscribe = vi
-      .spyOn(api, "subscribePush")
-      .mockResolvedValue({ subscribed: true });
+    const subscribe = vi.spyOn(api, "subscribePush").mockResolvedValue({ subscribed: true });
     const view = render(() => <NotificationSetting />);
 
     await waitFor(() => expect(view.container.querySelector(".notify__button")).toBeTruthy());
@@ -120,9 +118,7 @@ describe("notification settings", () => {
       endpoint: subscription.endpoint,
       keys: { p256dh: "p256dh", auth: "auth" },
     });
-    await waitFor(() =>
-      expect(view.container.textContent).toContain("Notifications are on."),
-    );
+    await waitFor(() => expect(view.container.textContent).toContain("Notifications are on."));
   });
 
   it("subscribes the browser for the first time", async () => {
@@ -145,9 +141,7 @@ describe("notification settings", () => {
       endpoint: created.endpoint,
       keys: { p256dh: "p256dh", auth: "auth" },
     });
-    await waitFor(() =>
-      expect(view.container.textContent).toContain("Notifications are on."),
-    );
+    await waitFor(() => expect(view.container.textContent).toContain("Notifications are on."));
   });
 
   it("reports a failed service worker and offers a retry", async () => {
@@ -159,9 +153,7 @@ describe("notification settings", () => {
         throw new Error("the worker did not register");
       }),
     });
-    const status = vi
-      .spyOn(api, "pushStatus")
-      .mockResolvedValue({ key: "BOr", muted_until: null });
+    const status = vi.spyOn(api, "pushStatus").mockResolvedValue({ key: "BOr", muted_until: null });
     const view = render(() => <NotificationSetting />);
 
     await waitFor(() => expect(view.container.querySelector(".notify__button")).toBeTruthy());
@@ -201,9 +193,7 @@ describe("notification settings", () => {
     fireEvent.click(view.container.querySelector(".notify__button")!);
 
     await waitFor(() => expect(status).toHaveBeenCalledTimes(2));
-    await waitFor(() =>
-      expect(view.container.textContent).toContain("Notifications are on."),
-    );
+    await waitFor(() => expect(view.container.textContent).toContain("Notifications are on."));
   });
 
   it("keeps the device when the Space cannot forget it", async () => {
@@ -220,7 +210,9 @@ describe("notification settings", () => {
     fireEvent.click(view.container.querySelector(".notify__quiet")!);
 
     await waitFor(() =>
-      expect(view.container.textContent).toContain("The notification setting could not be changed."),
+      expect(view.container.textContent).toContain(
+        "The notification setting could not be changed.",
+      ),
     );
     expect(subscription.unsubscribe).not.toHaveBeenCalled();
     expect(view.container.textContent).toContain("Notifications are on.");
@@ -244,7 +236,9 @@ describe("notification settings", () => {
 
     await waitFor(() => expect(forget).toHaveBeenCalled());
     await waitFor(() =>
-      expect(view.container.textContent).toContain("The notification setting could not be changed."),
+      expect(view.container.textContent).toContain(
+        "The notification setting could not be changed.",
+      ),
     );
     expect(view.container.textContent).toContain("Notifications are on.");
   });
@@ -255,9 +249,7 @@ describe("notification settings", () => {
     browser({ permission: "granted", subscription });
     vi.spyOn(api, "pushStatus").mockResolvedValue({ key: "BOr", muted_until: until });
     vi.spyOn(api, "subscribePush").mockResolvedValue({ subscribed: true });
-    const unmute = vi
-      .spyOn(api, "unmutePush")
-      .mockResolvedValue({ muted_until: null });
+    const unmute = vi.spyOn(api, "unmutePush").mockResolvedValue({ muted_until: null });
     const view = render(() => <NotificationSetting />);
 
     await waitFor(() => expect(view.container.querySelector(".notify__button")).toBeTruthy());
@@ -269,9 +261,7 @@ describe("notification settings", () => {
     fireEvent.click(view.container.querySelector(".notify__action")!);
 
     await waitFor(() => expect(unmute).toHaveBeenCalled());
-    await waitFor(() =>
-      expect(view.container.textContent).toContain("Notifications are on."),
-    );
+    await waitFor(() => expect(view.container.textContent).toContain("Notifications are on."));
   });
 
   it("turns off notifications on this device", async () => {
@@ -279,9 +269,7 @@ describe("notification settings", () => {
     browser({ permission: "granted", subscription });
     vi.spyOn(api, "pushStatus").mockResolvedValue({ key: "BOr", muted_until: null });
     vi.spyOn(api, "subscribePush").mockResolvedValue({ subscribed: true });
-    const unsubscribe = vi
-      .spyOn(api, "unsubscribePush")
-      .mockResolvedValue({ subscribed: false });
+    const unsubscribe = vi.spyOn(api, "unsubscribePush").mockResolvedValue({ subscribed: false });
     const view = render(() => <NotificationSetting />);
 
     await waitFor(() => expect(view.container.querySelector(".notify__button")).toBeTruthy());

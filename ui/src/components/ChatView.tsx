@@ -1,8 +1,8 @@
-import { For, Show, createEffect, createSignal } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 
 import { locale, t } from "../i18n";
-import { dayLabel, timeOfDay } from "../lib/format";
 import { formatBytes } from "../lib/files";
+import { dayLabel, timeOfDay } from "../lib/format";
 import type {
   Account,
   Approval,
@@ -55,7 +55,11 @@ interface ChatViewProps {
   onBack: () => void;
 }
 
-const suggestions = ["chat.suggestion.hello", "chat.suggestion.work", "chat.suggestion.plan"] as const;
+const suggestions = [
+  "chat.suggestion.hello",
+  "chat.suggestion.work",
+  "chat.suggestion.plan",
+] as const;
 
 export default function ChatView(props: ChatViewProps) {
   const [draft, setDraft] = createSignal("");
@@ -115,13 +119,16 @@ export default function ChatView(props: ChatViewProps) {
   );
 
   const canSend = () =>
-    !props.submitting && !props.busy && !!props.bot && (draft().trim() !== "" || attachment() !== null);
+    !props.submitting &&
+    !props.busy &&
+    !!props.bot &&
+    (draft().trim() !== "" || attachment() !== null);
 
   // How many requests a waiting Run has ahead. A running Run shows the Bot
   // working instead, so the two never show together.
   const queueLabel = (): string | null => {
     const queue = props.queue;
-    if (!queue || queue.status !== "queued") return null;
+    if (queue?.status !== "queued") return null;
     // The running run holds place 1, so place N has N - 1 requests ahead.
     const ahead = Math.max((queue.position ?? 1) - 1, 0);
     if (ahead === 0) return t("chat.queue.queued");
@@ -209,7 +216,12 @@ export default function ChatView(props: ChatViewProps) {
           </span>
         </Show>
         <Show when={props.busy && !waiting() && !failed()}>
-          <span class="chat__state" role="status" aria-label={t("chat.working")} title={t("chat.working")}>
+          <span
+            class="chat__state"
+            role="status"
+            aria-label={t("chat.working")}
+            title={t("chat.working")}
+          >
             <Icon name="clock" size="sm" />
             <span class="chat__state-long">{t("chat.working")}</span>
           </span>
@@ -255,7 +267,11 @@ export default function ChatView(props: ChatViewProps) {
                   {(suggestion) => {
                     const text = () => t(suggestion);
                     return (
-                      <button class="chip chip--button" type="button" onClick={() => setDraft(text())}>
+                      <button
+                        class="chip chip--button"
+                        type="button"
+                        onClick={() => setDraft(text())}
+                      >
                         {text()}
                       </button>
                     );
@@ -269,7 +285,8 @@ export default function ChatView(props: ChatViewProps) {
             {(message, index) => {
               const previous = () => props.messages[index() - 1];
               const newDay = () =>
-                !previous() || dayLabel(previous()!.at, locale()) !== dayLabel(message.at, locale());
+                !previous() ||
+                dayLabel(previous()!.at, locale()) !== dayLabel(message.at, locale());
               const isBot = () => message.author.kind === "bot";
               return (
                 <>
@@ -278,13 +295,16 @@ export default function ChatView(props: ChatViewProps) {
                       <span>{dayLabel(message.at, locale())}</span>
                     </div>
                   </Show>
-                  <article class={`msg ${isBot() ? "msg--bot" : "msg--user"}`} data-message={message.id}>
+                  <article
+                    class={`msg ${isBot() ? "msg--bot" : "msg--user"}`}
+                    data-message={message.id}
+                  >
                     <Show when={isBot()}>
                       <Avatar name={props.bot?.name ?? "Bot"} small />
                     </Show>
                     <div class="msg__body">
                       <div class="msg__meta">
-                        <b>{isBot() ? props.bot?.name ?? "Bot" : props.account.display_name}</b>
+                        <b>{isBot() ? (props.bot?.name ?? "Bot") : props.account.display_name}</b>
                         <time datetime={message.at}>{timeOfDay(message.at)}</time>
                         <Show when={isBot() && message.acting}>
                           <span>{t("chat.acting")}</span>
@@ -356,7 +376,9 @@ export default function ChatView(props: ChatViewProps) {
           name="message"
           rows={1}
           placeholder={
-            props.bot ? t("chat.placeholder", { name: props.bot.name }) : t("chat.placeholder.empty")
+            props.bot
+              ? t("chat.placeholder", { name: props.bot.name })
+              : t("chat.placeholder.empty")
           }
           value={draft()}
           disabled={!props.bot || props.busy}
@@ -388,10 +410,8 @@ export default function ChatView(props: ChatViewProps) {
         </div>
         <input
           ref={picker}
-          class="composer__picker"
           type="file"
-          aria-hidden="true"
-          tabindex={-1}
+          hidden
           disabled={!props.bot || props.submitting || props.busy}
           onChange={pick}
         />

@@ -26,15 +26,20 @@ export function undoableOf(approval: Approval): Undoable {
 // keeps every character it was given, so `logs ` stays `logs `.
 export function localScope(approval: Approval): Scope | null {
   if (approval.tool === "shell") {
-    const raw = typeof approval.arguments?.command === "string" ? approval.arguments.command : detailOf(approval);
+    const raw =
+      typeof approval.arguments?.command === "string"
+        ? approval.arguments.command
+        : detailOf(approval);
     const word = raw?.trim().split(/\s+/)[0];
     return word ? { key: "chat.approval.scope.shell", params: { command: word } } : null;
   }
   if (FILE_TOOLS.has(approval.tool)) {
-    const raw = typeof approval.arguments?.path === "string" ? approval.arguments.path : detailOf(approval);
+    const raw =
+      typeof approval.arguments?.path === "string" ? approval.arguments.path : detailOf(approval);
     if (raw === null || (raw.trim() === "" && raw !== "")) return null;
     const derived = raw.trim() === "" ? "." : lexical(raw.trim());
-    if (derived.split("/").some((part) => part === ".." || (part !== "" && part.trim() === ""))) return null;
+    if (derived.split("/").some((part) => part === ".." || (part !== "" && part.trim() === "")))
+      return null;
     const parent = parentOf(derived);
     return parent === "." ? { key: "chat.approval.scope.root", params: {} } : scopeFiles(parent);
   }
@@ -78,6 +83,7 @@ export function isLongSummary(summary: string): boolean {
 // Everything but tab and newline: a carriage return or an escape sequence in
 // an action is something the User should see, not a line break.
 const CONTROLS =
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: finding them is this expression's purpose.
   /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]/g;
 
 // Shows control and bidi characters as escapes, so a summary cannot mislead

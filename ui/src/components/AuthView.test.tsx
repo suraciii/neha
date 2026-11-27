@@ -3,7 +3,7 @@ import { flush } from "solid-js";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { setLocale } from "../i18n";
-import { api, ApiError } from "../lib/api";
+import { ApiError, api } from "../lib/api";
 import AuthView from "./AuthView";
 
 afterEach(() => {

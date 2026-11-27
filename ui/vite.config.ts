@@ -1,15 +1,13 @@
 import { fileURLToPath } from "node:url";
-import { defineConfig } from "vitest/config";
 import solid from "@solidjs/vite-plugin";
+import { defineConfig } from "vitest/config";
 
 // `neha serve` prints the browser hostname; set NEHA_SPACE to that URL for
 // dev. The proxy preserves the dev origin's Host so the Space sees the same
 // per-Space hostname and accepts the cookie.
 const configured = process.env.NEHA_SPACE;
 const browser = configured ? new URL(configured) : null;
-const backend = browser
-  ? `http://127.0.0.1:${browser.port || "7337"}`
-  : "http://127.0.0.1:7337";
+const backend = browser ? `http://127.0.0.1:${browser.port || "7337"}` : "http://127.0.0.1:7337";
 
 export default defineConfig({
   plugins: [solid()],

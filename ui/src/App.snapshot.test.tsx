@@ -48,14 +48,18 @@ function approval(id: string, run: string, tool = "shell"): Approval {
 
 // Presses the button the User presses, by what it says.
 function press(view: View, label: string) {
-  const button = Array.from(view.container.querySelectorAll("button")).find((candidate) => candidate.textContent === label);
+  const button = Array.from(view.container.querySelectorAll("button")).find(
+    (candidate) => candidate.textContent === label,
+  );
   if (!button) throw new Error(`no ${label} button in the view`);
   fireEvent.click(button);
 }
 
 // Types into the composer and sends what it holds.
 function send(view: View, text: string) {
-  flush(() => fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: text } }));
+  flush(() =>
+    fireEvent.input(element<HTMLTextAreaElement>(view, "textarea"), { target: { value: text } }),
+  );
   fireEvent.submit(element(view, "form.composer"));
 }
 
@@ -66,7 +70,9 @@ function queueText(view: View): string | undefined {
 
 // What each Chat in the list says about its state.
 function badges(view: View): string[] {
-  return Array.from(view.container.querySelectorAll(".conv__badge")).map((badge) => badge.textContent ?? "");
+  return Array.from(view.container.querySelectorAll(".conv__badge")).map(
+    (badge) => badge.textContent ?? "",
+  );
 }
 
 describe("App with a Chat the Space already knows", () => {
@@ -92,7 +98,9 @@ describe("App with a Chat the Space already knows", () => {
     expect(view.container.querySelector(".chat__state--working")).toBeNull();
     expect(view.container.querySelector(".chat__attention")).toBeNull();
     // The composer takes a new Message: the Run is over.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
     expect(badges(view)).toEqual([]);
 
     // Opening it again keeps the mark: the Space still says so.
@@ -246,7 +254,13 @@ describe("App with a Chat the Space already knows", () => {
     // The later Run leaves the queue, and then finishes, while r1 still waits.
     record("neha.run.started", { chat: "h1", run: "r2", bot: "b1", command: "c2", message: "m2" });
     await waitFor(() => expect(element(view, ".chat__attention").textContent).toContain("Waiting"));
-    record("neha.run.finished", { run: "r2", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r2",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
     await drain();
 
     // r1 is still the Run the Chat waits on, and its approval still waits.
@@ -288,7 +302,12 @@ describe("App with a Chat the Space already knows", () => {
     });
     space.statuses["h1"] = "failed";
     space.activeRuns["h1"] = null;
-    space.runs["r1"] = { status: "failed", steps: [], actions: [], error: "the Provider refused the command" };
+    space.runs["r1"] = {
+      status: "failed",
+      steps: [],
+      actions: [],
+      error: "the Provider refused the command",
+    };
     space.runs["r2"] = { status: "succeeded", steps: [{ index: 1, tool_calls: 1 }] };
     const view = await openChat();
 
@@ -298,16 +317,24 @@ describe("App with a Chat the Space already knows", () => {
     expect(view.container.querySelector(".chat__state--working")).toBeNull();
     // The card names the Run that failed, with the reason the Run gave: the
     // last reply in the record carries r1, not the newest request.
-    await waitFor(() => expect(element(view, ".activity__reason").textContent).toContain("the Provider refused the command"));
+    await waitFor(() =>
+      expect(element(view, ".activity__reason").textContent).toContain(
+        "the Provider refused the command",
+      ),
+    );
     // That Run is over, so the composer takes a new Message.
-    await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
+    await waitFor(() =>
+      expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false),
+    );
     expect(badges(view)).toEqual([]);
 
     // A refresh reads the same answer: the Space still says so.
     space.resume([]);
     await drain();
     expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
-    expect(element(view, ".activity__reason").textContent).toContain("the Provider refused the command");
+    expect(element(view, ".activity__reason").textContent).toContain(
+      "the Provider refused the command",
+    );
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
   });
 
@@ -355,7 +382,13 @@ describe("App with a Chat the Space already knows", () => {
     space.activeRuns["h1"] = "r2";
     space.runs["r1"] = { status: "succeeded", steps: [] };
     space.approvals = space.approvals.filter((known) => known.approval !== "a1");
-    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r1",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
 
     // The page follows r2: the Run that works, not the one queued behind it.
     space.releaseRunShow("r1");
@@ -368,7 +401,9 @@ describe("App with a Chat the Space already knows", () => {
 
     // The events of the Run the page follows show on its card.
     record("neha.action.started", { run: "r2", step: 1, action: "a9", tool: "read_file" });
-    await waitFor(() => expect(element(view, ".activity__tools").textContent).toContain("read_file"));
+    await waitFor(() =>
+      expect(element(view, ".activity__tools").textContent).toContain("read_file"),
+    );
     // The events of the Run queued behind it do not.
     record("neha.action.started", { run: "r3", step: 1, action: "a8", tool: "list_dir" });
     expect(element(view, ".activity__tools").textContent).not.toContain("list_dir");
@@ -419,7 +454,13 @@ describe("App with a Chat the Space already knows", () => {
     expect(view.container.querySelector('[data-approval="a2"]')).toBeTruthy();
 
     // r1 ends while the page waits on r2: the wait does not move.
-    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r1",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
     await drain();
     expect(element(view, ".chat__attention").textContent).toContain("Waiting");
     expect(view.container.querySelector(".activity__tools")).toBeNull();
@@ -457,13 +498,25 @@ describe("App with a Chat the Space already knows", () => {
     // must not open the composer, and the Chat does not read as failed.
     press(view, "Deny");
     await waitFor(() => expect(element(view, ".approval").textContent).toContain("Denied"));
-    record("neha.run.finished", { run: "r2", status: "failed", reply: null, usage: null, error: "the User turned this down" });
+    record("neha.run.finished", {
+      run: "r2",
+      status: "failed",
+      reply: null,
+      usage: null,
+      error: "the User turned this down",
+    });
     await drain();
     expect(view.container.querySelector(".chat__state--failed")).toBeNull();
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(true);
 
     // r1 ends: the Chat is free, and the composer takes a new Message.
-    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    record("neha.run.finished", {
+      run: "r1",
+      status: "succeeded",
+      reply: null,
+      usage: null,
+      error: null,
+    });
     await drain();
     expect(view.container.querySelector(".chat__state--failed")).toBeNull();
     expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);

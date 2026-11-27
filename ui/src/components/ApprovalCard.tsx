@@ -1,4 +1,4 @@
-import { Show, createSignal } from "solid-js";
+import { createSignal, Show } from "solid-js";
 
 import { t } from "../i18n";
 import { escapeControls, isLongSummary, localScope, undoableOf } from "../lib/approvals";
@@ -30,7 +30,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
           ? t("chat.approval.reason.ambiguous")
           : t("chat.approval.reason.rule");
   const undo = () =>
-    t(undoableOf(props.approval) === "no" ? "chat.approval.undo.none" : "chat.approval.undo.unknown");
+    t(
+      undoableOf(props.approval) === "no"
+        ? "chat.approval.undo.none"
+        : "chat.approval.undo.unknown",
+    );
   // What an Always allow would cover. null, or an empty string, is the Space
   // saying that no lasting rule can come from this action; only a Space that
   // says nothing at all leaves this page to name what it can see.
@@ -60,7 +64,11 @@ export default function ApprovalCard(props: ApprovalCardProps) {
   const cwd = () => props.approval.cwd || null;
 
   return (
-    <article class="msg msg--bot approval" aria-live="polite" data-approval={props.approval.approval}>
+    <article
+      class="msg msg--bot approval"
+      aria-live="polite"
+      data-approval={props.approval.approval}
+    >
       <Avatar name={props.botName} small />
       <div class="msg__body">
         <div class="approval__head">
@@ -98,11 +106,7 @@ export default function ApprovalCard(props: ApprovalCardProps) {
             </p>
           }
         >
-          <Show when={scope()}>
-            {(line) => (
-              <p class="approval__scope">{line()}</p>
-            )}
-          </Show>
+          <Show when={scope()}>{(line) => <p class="approval__scope">{line()}</p>}</Show>
           <div class="approval__actions">
             <button
               class="btn btn--primary"

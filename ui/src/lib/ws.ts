@@ -86,10 +86,7 @@ export class Commands {
    * Follows the record from a cursor. The Space sends a snapshot and then live
    * events; reconnecting resumes from the last cursor.
    */
-  async subscribe(
-    handlers: SubscriptionHandlers,
-    options: SubscribeOptions = {},
-  ): Promise<void> {
+  async subscribe(handlers: SubscriptionHandlers, options: SubscribeOptions = {}): Promise<void> {
     this.closed = false;
     this.following = {
       handlers,
@@ -128,12 +125,7 @@ export class Commands {
   private sendSubscribe(): void {
     const following = this.following;
     const socket = this.socket;
-    if (
-      !following ||
-      following.frameSent ||
-      !socket ||
-      socket.readyState !== WebSocket.OPEN
-    ) {
+    if (!following || following.frameSent || !socket || socket.readyState !== WebSocket.OPEN) {
       return;
     }
     following.frameSent = true;
@@ -197,7 +189,12 @@ export class Commands {
               helloResolve();
             } else if (frame?.type === "protocol_error") {
               socket.removeEventListener("message", onHello);
-              helloReject(new ProtocolError("protocol", frame.message ?? "The Space rejected the hello frame."));
+              helloReject(
+                new ProtocolError(
+                  "protocol",
+                  frame.message ?? "The Space rejected the hello frame.",
+                ),
+              );
             }
           };
           socket.addEventListener("message", onHello);
@@ -253,11 +250,17 @@ export class Commands {
           this.pending.delete(id);
           window.clearTimeout(pending.timer);
           if (frame.type === "confirmed") pending.resolve(frame.result);
-          else pending.reject(new ProtocolError(frame.code ?? "error", frame.message ?? "The command failed."));
+          else
+            pending.reject(
+              new ProtocolError(frame.code ?? "error", frame.message ?? "The command failed."),
+            );
           return;
         }
         if (frame.type === "protocol_error") {
-          const error = new ProtocolError("protocol", frame.message ?? "The Space rejected a frame.");
+          const error = new ProtocolError(
+            "protocol",
+            frame.message ?? "The Space rejected a frame.",
+          );
           this.following?.handlers.onError?.(error);
           this.following = null;
           this.rejectAll(error);
@@ -281,7 +284,9 @@ export class Commands {
         if (!settled) {
           settled = true;
           window.clearTimeout(timer);
-          reject(new ProtocolError("closed", "The Space connection closed before the session opened."));
+          reject(
+            new ProtocolError("closed", "The Space connection closed before the session opened."),
+          );
         }
         this.scheduleReconnect();
       });

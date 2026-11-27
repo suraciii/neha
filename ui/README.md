@@ -36,6 +36,18 @@ The client loads its view, then follows the record over the same WebSocket from 
 
 The client supports English (en-US) and Simplified Chinese (zh-CN). The switch lives on the sign-in card, the setup header, the Chat list footer, and the Chat header. The first visit follows the browser language; the chosen locale is kept in local storage and never changes the record.
 
+## Format and lint
+
+[Biome](https://biomejs.dev) checks formatting, import order, and lint rules.
+Its configuration is `ui/biome.jsonc`; the generated wire types under
+`src/generated` are excluded because `just wire-types` compares them byte for
+byte.
+
+```bash
+pnpm --dir ui run check                    # check only
+pnpm --dir ui exec biome check --write .   # apply formatting and safe fixes
+```
+
 ## Test
 
 ```bash

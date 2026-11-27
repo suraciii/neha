@@ -29,7 +29,9 @@
 
 :root {
   color-scheme: light;
-  --font-sans: "Schibsted Grotesk", "Neha Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-sans:
+    "Schibsted Grotesk", "Neha Sans SC", "Noto Sans SC", "PingFang SC", "Microsoft YaHei",
+    sans-serif;
   --font-mono: "Geist Mono", "SFMono-Regular", "Cascadia Code", Consolas, monospace;
 
   --ground: #e9eae3;
@@ -372,7 +374,9 @@ code,
   background: var(--raised);
   color: var(--ink);
   outline: none;
-  transition: border-color 140ms var(--ease-soft), box-shadow 140ms var(--ease-soft);
+  transition:
+    border-color 140ms var(--ease-soft),
+    box-shadow 140ms var(--ease-soft);
 }
 
 .input:focus {
@@ -395,7 +399,9 @@ code,
   border: 1px solid transparent;
   font-size: var(--text-sm);
   font-weight: 500;
-  transition: background 140ms var(--ease-soft), border-color 140ms var(--ease-soft);
+  transition:
+    background 140ms var(--ease-soft),
+    border-color 140ms var(--ease-soft);
 }
 
 .btn--primary {
@@ -895,7 +901,9 @@ code,
   font-size: var(--text-sm);
   font-weight: 500;
   cursor: pointer;
-  transition: border-color 140ms var(--ease-soft), color 140ms var(--ease-soft);
+  transition:
+    border-color 140ms var(--ease-soft),
+    color 140ms var(--ease-soft);
 }
 .side-new:hover {
   border-color: var(--ink-4);
@@ -1472,7 +1480,9 @@ code,
   background: var(--raised);
   color: var(--ink);
   text-decoration: none;
-  transition: border-color 140ms var(--ease-soft), background 140ms var(--ease-soft);
+  transition:
+    border-color 140ms var(--ease-soft),
+    background 140ms var(--ease-soft);
 }
 .file-card:hover {
   border-color: var(--line-strong);
@@ -1727,20 +1737,13 @@ code,
   height: 32px;
   border-radius: 999px;
   color: var(--ink-3);
-  transition: background 140ms var(--ease-soft), color 140ms var(--ease-soft);
+  transition:
+    background 140ms var(--ease-soft),
+    color 140ms var(--ease-soft);
 }
 .composer__attach:hover:not(:disabled) {
   background: var(--sunken);
   color: var(--ink);
-}
-
-/* The picker stays in the form and clickable, but out of sight. */
-.composer__picker {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
 }
 
 .attachment {
@@ -1923,7 +1926,9 @@ code,
   flex: none;
   border-radius: var(--r-sm);
   color: var(--ink-3);
-  transition: background 140ms var(--ease-soft), color 140ms var(--ease-soft);
+  transition:
+    background 140ms var(--ease-soft),
+    color 140ms var(--ease-soft);
 }
 .row__remove:hover:not(:disabled) {
   background: var(--danger-soft);
@@ -2544,7 +2549,9 @@ html[lang="zh-CN"] .select-chat h2 {
   color: var(--ink);
   text-align: left;
   cursor: pointer;
-  transition: background 160ms ease, border-color 160ms ease;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease;
 }
 
 .desktop__choice:hover:not(:disabled) {

@@ -76,9 +76,7 @@ describe("the mobile client", () => {
       await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
       expect(history.state?.chat).toBe(space.chat.id);
       expect(location.search).toBe("");
-      await waitFor(() =>
-        expect(view.container.querySelector('[data-message="m1"]')).toBeTruthy(),
-      );
+      await waitFor(() => expect(view.container.querySelector('[data-message="m1"]')).toBeTruthy());
       await waitFor(() => expect(scroll).toHaveBeenCalled());
     } finally {
       if (original) Element.prototype.scrollIntoView = original;

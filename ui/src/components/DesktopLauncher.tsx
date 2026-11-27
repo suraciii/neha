@@ -1,4 +1,4 @@
-import { Show, createSignal } from "solid-js";
+import { createSignal, Show } from "solid-js";
 
 import { t } from "../i18n";
 import Brand from "./Brand";
@@ -90,10 +90,7 @@ export default function DesktopLauncher() {
           <h2>{t("desktop.choose")}</h2>
           <p class="auth__hint">{t("desktop.hint")}</p>
 
-          <Show
-            when={bridge()}
-            fallback={<p class="form__error">{t("desktop.unavailable")}</p>}
-          >
+          <Show when={bridge()} fallback={<p class="form__error">{t("desktop.unavailable")}</p>}>
             <button
               class="desktop__choice"
               type="button"
@@ -119,12 +116,8 @@ export default function DesktopLauncher() {
                 onChange={(event) => setUseLocalComputer(event.currentTarget.checked)}
               />
               <span>
-                <span class="desktop__consent-title">
-                  {t("desktop.localComputer.title")}
-                </span>
-                <span class="desktop__consent-text">
-                  {localComputerText()}
-                </span>
+                <span class="desktop__consent-title">{t("desktop.localComputer.title")}</span>
+                <span class="desktop__consent-text">{localComputerText()}</span>
               </span>
             </label>
 
