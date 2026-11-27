@@ -517,11 +517,11 @@ impl CatalogProvider {
             "@ai-sdk/openai-compatible" => None,
             _ => return None,
         };
-        self.api
-            .as_ref()
-            .filter(|url| !url.contains("${"))
-            .cloned()
-            .or_else(|| preset.map(str::to_owned))
+        match &self.api {
+            Some(api) if !api.contains("${") => Some(api.clone()),
+            Some(_) => None,
+            None => preset.map(str::to_owned),
+        }
     }
 
     /// Whether the catalog names enough to connect the Provider without overrides.

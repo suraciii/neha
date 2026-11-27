@@ -1234,7 +1234,13 @@ async fn provider_refresh(
         old_default
             .filter(|name| specs.iter().any(|model| &model.name == name))
             .or_else(|| default_name.filter(|name| specs.iter().any(|model| &model.name == name)))
-            .or_else(|| specs.first().map(|model| model.name.clone()))
+            .or_else(|| {
+                specs
+                    .iter()
+                    .find(|model| model.tools)
+                    .or_else(|| specs.first())
+                    .map(|model| model.name.clone())
+            })
     } else {
         None
     };
