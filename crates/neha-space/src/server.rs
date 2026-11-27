@@ -9656,8 +9656,9 @@ mod tests {
     async fn a_hosted_computers_workspace_can_be_reset() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
-        let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
-        let (_bot, _chat, computer) = tool_bot(&mut socket, base).await;
+        let (base, provider_task, gates, _recorded) =
+            gated_provider(vec![hold("held answer")]).await;
+        let (_bot, chat, computer) = tool_bot(&mut socket, base).await;
         let workspace = running
             .server_home()
             .join("computers")
@@ -9690,8 +9691,13 @@ mod tests {
         assert!(workspace.is_dir(), "reset keeps the workspace directory");
 
         // A repeated command id answers from the record instead of clearing
-        // again: work written after the first reset must survive.
+        // again: work written after the first reset must survive, even while a
+        // new run holds the Computer.
         std::fs::write(workspace.join("late.txt"), "after the reset").unwrap();
+        let queued = submit(&mut socket, chat, "hold the next run", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "running").await;
+        let cursor_before_retry = running.server.store.last_seq().await.unwrap();
         let (again_committed, again) = try_command(
             &mut socket,
             command_id,
@@ -9703,12 +9709,14 @@ mod tests {
         assert_eq!(again, result);
         assert_eq!(
             running.server.store.last_seq().await.unwrap(),
-            cursor_before
+            cursor_before_retry
         );
         assert_eq!(
             std::fs::read_to_string(workspace.join("late.txt")).unwrap(),
             "after the reset"
         );
+        gates[0].open();
+        wait_run(&mut socket, run).await;
 
         socket.close(None).await.unwrap();
         provider_task.abort();

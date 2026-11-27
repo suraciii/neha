@@ -1567,8 +1567,10 @@ async fn computer_reset(
     fingerprint: String,
     computer: Id,
 ) -> Result<Outcome, ApiError> {
+    // Answer a recorded reset before the busy check: a client that lost the
+    // first answer must get it even when the Bot has since started new work.
     let (workspace, bot) = {
-        let mut state = context
+        let state = context
             .state
             .lock()
             .map_err(|_| ApiError::internal("state lock"))?;
@@ -1585,27 +1587,49 @@ async fn computer_reset(
                 "only a Hosted Computer can be reset; a Local Computer belongs to its machine",
             ));
         }
-        if state.is_resetting(computer) {
-            return Err(ApiError::conflict("this Computer is already being reset"));
-        }
         let bot = state
             .bots
             .values()
             .find(|bot| bot.computer == computer)
             .map(|bot| bot.id);
-        if let Some(bot) = bot {
-            let busy = state.runs.values().any(|run| {
+        (context.home.workspace_dir(computer), bot)
+    };
+    if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
+        return reset_replayed(record, account, computer);
+    }
+    let workspace = {
+        let mut state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let view = state
+            .computers
+            .get(&computer)
+            .ok_or_else(|| ApiError::not_found("no such Computer"))?;
+        if view.owner != account.id {
+            return Err(ApiError::not_found("no such Computer"));
+        }
+        if view.kind != "hosted" {
+            return Err(ApiError::invalid_argument(
+                "only a Hosted Computer can be reset; a Local Computer belongs to its machine",
+            ));
+        }
+        if state.is_resetting(computer) {
+            return Err(ApiError::conflict("this Computer is already being reset"));
+        }
+        let busy = bot.is_some_and(|bot| {
+            state.runs.values().any(|run| {
                 run.bot == bot
                     && matches!(
                         run.status,
                         RunStatus::Queued | RunStatus::Running | RunStatus::Waiting
                     )
-            });
-            if busy {
-                return Err(ApiError::conflict(
-                    "this Computer has a run in progress; wait for it to finish and reset again",
-                ));
-            }
+            })
+        });
+        if busy {
+            return Err(ApiError::conflict(
+                "this Computer has a run in progress; wait for it to finish and reset again",
+            ));
         }
         // From here the pump must not start a run on this Computer: the clear
         // would race the run's first write. The mark is dropped before return.
@@ -1613,7 +1637,7 @@ async fn computer_reset(
         // The runtime and the reset both derive the folder from the Computer,
         // not from a recorded path a stale or edited record could redirect at
         // the Space's own data.
-        (context.home.workspace_dir(computer), bot)
+        workspace
     };
     let claimed = context.store.claim_command(command_id, &fingerprint).await;
     let claimed = match claimed {
@@ -1625,22 +1649,7 @@ async fn computer_reset(
     };
     if let Some(record) = claimed {
         end_reset(context, computer)?;
-        let Some(recorded) = record.result else {
-            return Err(ApiError::conflict(
-                "a previous reset with this command id did not finish; use a new command id",
-            ));
-        };
-        if recorded.get("user") != Some(&json!(account.id)) {
-            return Err(ApiError::forbidden(
-                "a recorded reset belongs to another User",
-            ));
-        }
-        return Ok(Outcome {
-            committed: None,
-            result: recorded,
-            queued: None,
-            events: Vec::new(),
-        });
+        return reset_replayed(record, account, computer);
     }
 
     let root = context.home.root().to_path_buf();
@@ -1711,6 +1720,32 @@ fn end_reset(context: &CommandContext<'_>, computer: Id) -> Result<(), ApiError>
     state.end_reset(computer);
 
     Ok(())
+}
+
+/// Returns the result of a reset this command id already recorded.
+fn reset_replayed(
+    record: crate::store::CommandRecord,
+    account: &Account,
+    computer: Id,
+) -> Result<Outcome, ApiError> {
+    let Some(recorded) = record.result else {
+        return Err(ApiError::conflict(
+            "a previous reset with this command id did not finish; use a new command id",
+        ));
+    };
+    if recorded.get("user") != Some(&json!(account.id))
+        || recorded.get("computer") != Some(&json!(computer))
+    {
+        return Err(ApiError::forbidden(
+            "a recorded reset belongs to another User or Computer",
+        ));
+    }
+    Ok(Outcome {
+        committed: None,
+        result: recorded,
+        queued: None,
+        events: Vec::new(),
+    })
 }
 
 /// Removes every entry of a Workspace without following a symlink.
