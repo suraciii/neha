@@ -150,8 +150,13 @@ impl ComputerRuntime for RemoteRuntime {
             let id = self.next_id();
             let answer = tokio::time::timeout(
                 self.timeout,
-                self.link
-                    .read(id, self.bot, &path, self.working_dir.as_deref()),
+                self.link.read(
+                    id,
+                    self.bot,
+                    &path,
+                    self.working_dir.as_deref(),
+                    &self.access,
+                ),
             )
             .await;
             match answer {
@@ -180,9 +185,11 @@ impl ComputerRuntime for RemoteRuntime {
         let path = path.to_owned();
         async move {
             let id = self.next_id();
-            let answer =
-                tokio::time::timeout(self.timeout, self.link.write(id, self.bot, &path, bytes))
-                    .await;
+            let answer = tokio::time::timeout(
+                self.timeout,
+                self.link.write(id, self.bot, &path, bytes, &self.access),
+            )
+            .await;
             match answer {
                 // A File delivery is acknowledged with no bytes back, or with
                 // a successful action result.
@@ -243,6 +250,91 @@ mod tests {
         );
 
         (runtime, link, bot, outgoing)
+    }
+
+    #[tokio::test]
+    async fn a_runs_write_roots_cross_the_channel_with_its_once_grant() {
+        let (runtime, link, _bot, mut outgoing) = remote();
+        let runtime = Arc::new(
+            runtime
+                .with_working_dir("/data/work")
+                .with_access(neha_computer::channel::AccessFrame {
+                    full_access: false,
+                    write_roots: vec!["/data/shared".to_owned(), "/data/work".to_owned()],
+                })
+                .with_once_grant("/data/once"),
+        );
+
+        // The run's directory, its grants, and the one-time grant travel with
+        // the action.
+        let first = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .execute(Action::Shell {
+                        command: "pwd".to_owned(),
+                    })
+                    .await
+            }
+        });
+        let HostFrame::Action {
+            id,
+            working_dir,
+            access,
+            ..
+        } = outgoing.recv().await.unwrap()
+        else {
+            panic!("expected an action frame");
+        };
+        assert_eq!(working_dir.as_deref(), Some("/data/work"));
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec![
+                    "/data/shared".to_owned(),
+                    "/data/work".to_owned(),
+                    "/data/once".to_owned(),
+                ],
+            }
+        );
+        link.deliver(
+            id,
+            Answer::ActionResult(neha_computer::ActionResult::succeeded(ToolOutput::full(
+                "/data/work",
+            ))),
+        );
+        assert_eq!(first.await.unwrap().status, ActionStatus::Succeeded);
+
+        // The one-time grant opened one folder for one action only.
+        let second = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move {
+                runtime
+                    .execute(Action::Shell {
+                        command: "pwd".to_owned(),
+                    })
+                    .await
+            }
+        });
+        let HostFrame::Action { id, access, .. } = outgoing.recv().await.unwrap() else {
+            panic!("expected an action frame");
+        };
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec!["/data/shared".to_owned(), "/data/work".to_owned()],
+            },
+            "the spent one-time grant opens nothing more"
+        );
+        link.deliver(
+            id,
+            Answer::ActionResult(neha_computer::ActionResult::succeeded(ToolOutput::full(
+                "/data/work",
+            ))),
+        );
+        assert_eq!(second.await.unwrap().status, ActionStatus::Succeeded);
     }
 
     #[tokio::test]
@@ -323,15 +415,27 @@ mod tests {
     #[tokio::test]
     async fn read_bytes_and_write_bytes_cross_the_channel() {
         let (runtime, link, _bot, mut outgoing) = remote();
-        let runtime = Arc::new(runtime);
+        // The run's pinned access crosses with every File request, so a read
+        // that verifies an interrupted write sees what that write could reach.
+        let access = neha_computer::channel::AccessFrame {
+            full_access: true,
+            write_roots: vec!["/data/shared".to_owned()],
+        };
+        let runtime = Arc::new(runtime.with_access(access.clone()));
 
         let reader = tokio::spawn({
             let runtime = Arc::clone(&runtime);
             async move { runtime.read_bytes("report.pdf").await }
         });
-        let HostFrame::Read { id, .. } = outgoing.recv().await.unwrap() else {
+        let HostFrame::Read {
+            id,
+            access: read_access,
+            ..
+        } = outgoing.recv().await.unwrap()
+        else {
             panic!("expected a read frame");
         };
+        assert_eq!(read_access, access);
         link.deliver(id, Answer::Bytes(b"%PDF".to_vec()));
         assert_eq!(reader.await.unwrap(), Ok(b"%PDF".to_vec()));
 
@@ -339,9 +443,16 @@ mod tests {
             let runtime = Arc::clone(&runtime);
             async move { runtime.write_bytes("out.bin", b"hello".to_vec()).await }
         });
-        let HostFrame::Write { id, bytes, .. } = outgoing.recv().await.unwrap() else {
+        let HostFrame::Write {
+            id,
+            bytes,
+            access: write_access,
+            ..
+        } = outgoing.recv().await.unwrap()
+        else {
             panic!("expected a write frame");
         };
+        assert_eq!(write_access, access);
         assert_eq!(URL_SAFE_NO_PAD.decode(bytes).unwrap(), b"hello");
         // A File delivery is acknowledged with no bytes back.
         link.deliver(id, Answer::Bytes(Vec::new()));

@@ -46,17 +46,23 @@ Only the Computer's owner resets it, and only a Hosted Computer is reset. A Comp
 
 Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot update <bot>` changes a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses the change because its Workspace is its only write range.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines. A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
 
-`--full-access on` gives it the daemon's own file rights and removes the shell fence. `--full-access off` restores the Bot's Workspace fence.
+`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 
-`--grant <path>` grants write access to an extra folder; repeat it for more folders. The folder MUST exist on the Local Computer.
+A revoke compares the path exactly as the owner spelled it first: a name that ends in a space takes the grant for that name.
 
-`--clear-grants` removes them all and cannot be combined with `--grant`. `neha bot show` prints what is in effect.
+Only the Bot's owner can change a Bot's access. A run uses the access recorded when it starts, so a change made during a run applies to the next one.
 
-`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. The directory is recorded with the run and shown on an approval card.
+`neha bot full-access <bot> on` gives the Bot the machine user's own file rights and starts no sandbox for it; `neha bot full-access <bot> off` restores the granted folders fence. The `on` command sends the current consent version with the owner's answer.
 
-A Hosted Computer runs only in the Bot's Workspace, and a run that names another directory fails. A path that is not absolute is refused.
+`on` prints the risk, which names the configuration directory the Bot can then read, and asks for confirmation at a terminal. Without a terminal it needs `--yes`, and `off` asks for no confirmation.
+
+`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. A Hosted Computer runs only in the Bot's own Workspace, and a run that names another directory fails.
+
+The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run. A path that is not absolute is refused.
+
+The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
 
 ## Approvals
 

@@ -41,7 +41,7 @@ The `neha-space` tests include S3 tests that need a local SeaweedFS container; [
 
 ## A Computer sandbox
 
-A Local Computer runs shell commands in a `bubblewrap` sandbox on Linux, and a Hosted Computer runs them in a minimal one on the Space's machine. The file tools check write paths themselves and never start a command. Install the package with the system's package manager:
+In granted mode a Local Computer runs shell commands in a `bubblewrap` sandbox on Linux; a Hosted Computer runs them in a minimal one on the Space's machine. A Bot with full access starts no sandbox. The file tools check write paths themselves and never start a command. Install the package with the system's package manager:
 
 ```bash
 sudo apt install bubblewrap      # Debian, Ubuntu

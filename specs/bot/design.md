@@ -52,6 +52,12 @@ A run stops between two actions when it waits for an Approval or an answer, when
 
 Resetting a Hosted Computer runs only when its Bot has no queued, running, or waiting run.
 
+A run records the access it starts with, so a resumed run keeps the access it began with even after the owner changes the Bot's access.
+
+A run recorded before the Space kept that snapshot resumes with conservative granted access: no full access and no grants.
+
+A run whose record names a working directory the Space never marked writable does not resume; it fails and asks the User to send the message again, and that directory is not made a write root.
+
 A failed run does not resume; the Bot says so as a Message. A run never resumes a Model stream; [Model](../model/design.md) covers that.
 
 ## Approvals
@@ -59,6 +65,18 @@ A failed run does not resume; the Bot says so as a Message. A run never resumes 
 Before a Computer action, the loop asks whether to proceed. A File action asks like any other. The first use of a Local Computer is never covered by a lasting rule.
 
 The Space allows by default. It waits when the action is the first one on a Local Computer for the Bot and acting User on that machine, or when a lasting Ask rule matches without a more specific Allow rule.
+
+A `write_file` that would write outside the Bot's write range also waits for the owner. [Computer](../computer/design.md#isolation) states that range, and the run's own working directory is part of it.
+
+Only a `write_file` of a Bot with granted folders raises that approval, and only when the Space can locate its target: an absolute path, or a relative one resolved against the run's own working directory. Full access raises none.
+
+Full access is turned on by the owner's answer at the consent version the Space states. A request without that version is refused, and nothing is recorded.
+
+A shell that writes outside the range is refused by the Computer's fence instead of being asked about.
+
+An Always allow on that approval grants the action's folder for later runs. The first action of a Local Computer can ask with that reason and shows no Always allow.
+
+A card whose folder no grant can store — a `..` climb, a relative form, or a NUL — also shows no Always allow, and the Space refuses `--always` for it; the action itself still runs once when allowed.
 
 A rule names one tool, with a command prefix for a shell or a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
 

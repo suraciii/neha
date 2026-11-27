@@ -921,6 +921,16 @@ mod tests {
                 }),
             )
             .acting(user),
+            EventKind::RunAccess => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "full_access": false,
+                    "grants": ["/data/shared"],
+                }),
+            )
+            .acting(user),
             EventKind::RunFinished => EventDraft::new(
                 kind,
                 Author::Bot(Id::new()),

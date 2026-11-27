@@ -1795,6 +1795,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             links: &server.links,
                             pairings: &server.pairings,
                             approvals: &server.approvals,
+                            runs: &server.runs,
                             events: &server.events,
                         };
                         let reset = matches!(command, CommandCall::ComputerReset { .. });
@@ -3242,6 +3243,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -3857,6 +3859,7 @@ mod tests {
             file: None,
 
             cwd: None,
+            cwd_writable: None,
         });
 
         let first = command(&mut socket, send, message.clone()).await;
@@ -3911,6 +3914,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -3930,6 +3934,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -4052,6 +4057,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -4169,6 +4175,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -4226,6 +4233,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -4499,6 +4507,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -4558,6 +4567,24 @@ mod tests {
                 file,
 
                 cwd: None,
+                cwd_writable: None,
+            }),
+        )
+        .await
+    }
+
+    /// Sends a Message that names the directory the run works in.
+    async fn submit_in(socket: &mut Socket, chat: Id, text: &str, cwd: &str) -> Value {
+        command(
+            socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: text.to_owned(),
+                file: None,
+
+                cwd: Some(cwd.to_owned()),
+                cwd_writable: Some(true),
             }),
         )
         .await
@@ -5277,6 +5304,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 )
                 .await
@@ -5369,6 +5397,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -5387,6 +5416,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -5437,6 +5467,7 @@ mod tests {
                     file: None,
 
                     cwd: None,
+                    cwd_writable: None,
                 }),
             ),
         )
@@ -5484,6 +5515,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -5520,6 +5552,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -5566,6 +5599,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -6603,6 +6637,7 @@ mod tests {
                     file: Some(file),
 
                     cwd: None,
+                    cwd_writable: None,
                 }),
             )
             .await,
@@ -8188,7 +8223,13 @@ mod tests {
         // must not grow the Space's memory or strand work.
         let answer = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            link.write(999, Id::new(), "big.bin", vec![7_u8; 16 * 1024 * 1024]),
+            link.write(
+                999,
+                Id::new(),
+                "big.bin",
+                vec![7_u8; 16 * 1024 * 1024],
+                &Default::default(),
+            ),
         )
         .await
         .expect("a blocked write must fail by its deadline");
@@ -8333,15 +8374,16 @@ mod tests {
         send_hello(&mut unfenced, CHANNEL_VERSION, &computer.to_string(), false).await;
         assert!(closed(&mut unfenced).await);
 
-        let mut outdated = raw_computer(&running, &machine).await;
-        send_hello(
-            &mut outdated,
-            CHANNEL_VERSION + 1,
-            &computer.to_string(),
-            true,
-        )
-        .await;
-        assert!(closed(&mut outdated).await);
+        // Both ends must be the same release: the previous channel version and
+        // a future one are refused, in either direction of upgrade.
+        for version in [CHANNEL_VERSION - 1, CHANNEL_VERSION + 1] {
+            let mut other = raw_computer(&running, &machine).await;
+            send_hello(&mut other, version, &computer.to_string(), true).await;
+            assert!(
+                closed(&mut other).await,
+                "version {version} must be refused"
+            );
+        }
 
         // The right Hello registers, and dropping it marks the Computer offline.
         let mut device = connect_computer(&running, &machine, computer).await;
@@ -10381,6 +10423,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            runs: &server.runs,
             events: &server.events,
         }
     }
@@ -10419,6 +10462,38 @@ mod tests {
         }
     }
 
+    fn bot_update(
+        bot: Id,
+        full_access: Option<bool>,
+        grants: Option<Vec<String>>,
+        grant_add: Option<&str>,
+        grant_remove: Option<&str>,
+    ) -> CommandCall {
+        CommandCall::BotUpdate(neha::surface::BotUpdate {
+            bot,
+            full_access,
+            full_access_consent: (full_access == Some(true))
+                .then_some(neha::record::FULL_ACCESS_CONSENT_VERSION),
+            grants,
+            grant_add: grant_add.map(ToOwned::to_owned),
+            grant_remove: grant_remove.map(ToOwned::to_owned),
+        })
+    }
+
+    /// Returns the one `neha.run.access` event an event names.
+    async fn run_access_event(running: &Running, run: Id) -> neha::record::Event {
+        running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .find(|event| event.kind == EventKind::RunAccess && event.data["run"] == json!(run))
+            .unwrap_or_else(|| panic!("run {run} recorded no access"))
+    }
+
     /// Answers the next action a fake Computer receives.
     async fn answer_next_action(device: &mut Socket, output: &str) -> WireAction {
         let (id, _bot, action) = match next_host_frame(device).await {
@@ -10430,6 +10505,30 @@ mod tests {
         reply_action(device, id, ActionStatus::Succeeded, output).await;
 
         action
+    }
+
+    /// Answers the next action and returns its directory and write access.
+    async fn answer_next_action_with_access(
+        device: &mut Socket,
+        output: &str,
+    ) -> (
+        WireAction,
+        Option<String>,
+        neha_computer::channel::AccessFrame,
+    ) {
+        let (id, action, working_dir, access) = match next_host_frame(device).await {
+            HostFrame::Action {
+                id,
+                action,
+                working_dir,
+                access,
+                ..
+            } => (id, action, working_dir, access),
+            other => panic!("expected an action, got {other:?}"),
+        };
+        reply_action(device, id, ActionStatus::Succeeded, output).await;
+
+        (action, working_dir, access)
     }
 
     /// Returns whether no approval appears for a Chat while a run works.
@@ -10508,6 +10607,10 @@ mod tests {
         assert_eq!(approval["reason"], "first_use_local");
         assert!(approval["decided"].is_null());
         assert!(approval["rule"].is_null());
+        assert!(
+            approval["cwd"].is_null(),
+            "a run that named no directory has none to show: {approval}"
+        );
         assert!(
             approval["summary"].as_str().unwrap().contains("pwd"),
             "the card names the command: {}",
@@ -10842,6 +10945,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            runs: &server.runs,
             events: &server.events,
         };
         let stranger = crate::identity::Account {
@@ -11370,7 +11474,10 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot: local.bot,
                 full_access: None,
+                full_access_consent: None,
                 grants: Some(vec!["/tmp".to_owned(), "/etc".to_owned()]),
+                grant_add: None,
+                grant_remove: None,
             }),
         )
         .await;
@@ -11503,6 +11610,147 @@ mod tests {
         local.provider_task.abort();
         local.socket.close(None).await.unwrap();
         running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_run_without_a_directory_marker_keeps_its_directory_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = test_home(dir.path());
+        let first = start(home.clone(), 0).await.unwrap();
+        let invite = first.invite.clone().expect("a fresh Space invites");
+        let mut socket = admin_socket(&first, &invite).await;
+        command(
+            &mut socket,
+            Id::new(),
+            provider_add("http://127.0.0.1:1/v1".to_owned()),
+        )
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let owner: Id = serde_json::from_value(created["bot"]["owner"].clone()).unwrap();
+        socket.close(None).await.unwrap();
+
+        // Two records written before the marker existed: a queued run and a
+        // started run that named a working directory, each with no writer
+        // flag and no access snapshot.
+        let queued_message = Id::new();
+        let queued = Id::new();
+        let queued_command = Id::new();
+        let started_message = Id::new();
+        let started = Id::new();
+        let started_command = Id::new();
+        let legacy = |message: Id, run: Id, command: Id, started: bool| {
+            let mut events = vec![
+                EventDraft::new(
+                    EventKind::MessageAdded,
+                    Author::User(owner),
+                    json!({
+                        "message": message,
+                        "chat": chat,
+                        "text": "work in the logs folder",
+                        "run": run,
+                    }),
+                ),
+                EventDraft::new(
+                    EventKind::RunQueued,
+                    Author::Bot(bot),
+                    json!({
+                        "run": run,
+                        "chat": chat,
+                        "bot": bot,
+                        "message": message,
+                        "command": command,
+                    }),
+                )
+                .acting(owner),
+                EventDraft::new(
+                    EventKind::RunContext,
+                    Author::Bot(bot),
+                    json!({"run": run, "working_dir": "/var/tmp/legacy-logs "}),
+                )
+                .acting(owner),
+            ];
+            if started {
+                events.push(
+                    EventDraft::new(
+                        EventKind::RunStarted,
+                        Author::Bot(bot),
+                        json!({
+                            "run": run,
+                            "chat": chat,
+                            "bot": bot,
+                            "message": message,
+                            "command": command,
+                        }),
+                    )
+                    .acting(owner),
+                );
+            }
+            events
+        };
+        first
+            .server
+            .store
+            .append(AppendRequest {
+                command: queued_command,
+                fingerprint: format!("legacy:{queued_command}"),
+                events: legacy(queued_message, queued, queued_command, false),
+                result: None,
+                confirmation: None,
+            })
+            .await
+            .unwrap();
+        first
+            .server
+            .store
+            .append(AppendRequest {
+                command: started_command,
+                fingerprint: format!("legacy:{started_command}"),
+                events: legacy(started_message, started, started_command, true),
+                result: None,
+                confirmation: None,
+            })
+            .await
+            .unwrap();
+        first.shutdown().await;
+
+        // The restore refuses to widen the old directory into a write root:
+        // each run fails and the Bot asks the User to send the message again.
+        let restarted = start(home, 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        for run in [queued, started] {
+            let shown = wait_run(&mut socket, run).await;
+            assert_eq!(shown["status"], "failed", "{shown}");
+            let error = shown["error"].as_str().unwrap_or_default();
+            assert!(
+                error.contains("send the message again"),
+                "the failure asks for a new message: {shown}"
+            );
+        }
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert!(
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("send the message again"))),
+            "the Chat shows the request to send the message again: {messages}"
+        );
+        // No run started with the old directory as a write root.
+        let bots = command(&mut socket, Id::new(), CommandCall::BotList).await;
+        assert_eq!(bots[0]["grants"], json!([]));
+
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -11946,7 +12194,10 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot: local.bot,
                 full_access: None,
+                full_access_consent: None,
                 grants: Some(vec!["/tmp".to_owned()]),
+                grant_add: None,
+                grant_remove: None,
             }),
         )
         .await;
@@ -13357,8 +13608,1196 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_bot_update_sets_full_access_and_grants_for_its_owner() {
+    async fn a_write_inside_the_runs_directory_asks_no_grant() {
         let (_dir, running, invite) = running().await;
+        let work = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        let outside = elsewhere.path().join("out.txt");
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("write_file", json!({"path": "in.txt", "content": "one"})),
+                text("first"),
+                tool("write_file", json!({"path": "in.txt", "content": "two"})),
+                text("second"),
+                tool(
+                    "write_file",
+                    json!({"path": outside.to_string_lossy(), "content": "three"}),
+                ),
+                text("third"),
+            ],
+        )
+        .await;
+
+        // The first use of the Computer asks whatever the action writes; the
+        // directory the run names is not a grant to ask for.
+        let first = run_of(&submit_in(&mut local.socket, local.chat, "write", &cwd).await);
+        let approval = approval_for_run(&mut local.socket, first).await;
+        assert_eq!(approval["reason"], "first_use_local");
+        assert_eq!(
+            approval["cwd"],
+            json!(cwd),
+            "the card names the directory the run works in: {approval}"
+        );
+        assert!(
+            approval["grant_folder"].is_null(),
+            "a write inside the run's directory asks for no folder: {approval}"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "wrote").await;
+        assert_eq!(
+            action,
+            WireAction::WriteFile {
+                path: "in.txt".to_owned(),
+                content: "one".to_owned()
+            }
+        );
+        assert_eq!(working_dir.as_deref(), Some(cwd.as_str()));
+        assert!(
+            access.write_roots.iter().any(|root| root == &cwd),
+            "the run's directory travels as a write root: {:?}",
+            access.write_roots
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A write inside the directory asks for no grant.
+        let second = run_of(&submit_in(&mut local.socket, local.chat, "again", &cwd).await);
+        assert!(
+            waits_without_approval(&mut local.socket, local.chat).await,
+            "a write inside the run's directory needs no approval"
+        );
+        answer_next_action(&mut local.device, "wrote").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        // A write outside it still asks for the folder, and one allow opens it
+        // for that action only.
+        let third = run_of(&submit_in(&mut local.socket, local.chat, "elsewhere", &cwd).await);
+        let approval = approval_for_run(&mut local.socket, third).await;
+        assert_eq!(approval["reason"], "grant");
+        assert_eq!(
+            approval["grant_folder"],
+            json!(elsewhere.path().to_str().unwrap())
+        );
+        assert_eq!(
+            approval["lasting_scope"],
+            json!(format!(
+                "writes under {}",
+                elsewhere.path().to_str().unwrap()
+            ))
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let decided = decide_approval(&mut local.socket, approval_id, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        answer_next_action(&mut local.device, "wrote").await;
+        assert_eq!(
+            wait_run(&mut local.socket, third).await["status"],
+            "succeeded"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!([]));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hosted_run_never_asks_for_a_folder() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let work = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        let outside = elsewhere.path().join("out.txt");
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "write_file",
+                json!({"path": outside.to_string_lossy(), "content": "x"}),
+            ),
+            text("done"),
+        ])
+        .await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+        // A Hosted Computer works only in its Workspace: a run that names a
+        // host directory fails before it starts, and never asks for a folder.
+        let queued = submit_in(&mut socket, chat, "write", &cwd).await;
+        let finished = finish(&mut socket, chat, queued).await;
+        assert_eq!(finished["status"], "failed");
+        assert!(
+            finished["text"]
+                .as_str()
+                .unwrap()
+                .contains("a Hosted Computer works only in its Workspace"),
+            "{}",
+            finished["text"]
+        );
+        assert!(
+            approvals_in(&mut socket, None).await.is_empty(),
+            "a Hosted Computer never asks for a folder"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_run_keeps_its_directory_as_a_write_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let first = start(home, 0).await.unwrap();
+        let invite = first.invite.clone().expect("a fresh Space invites");
+        let work = tempfile::tempdir().unwrap();
+        let cwd = work.path().to_string_lossy().into_owned();
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![
+                tool("write_file", json!({"path": "in.txt", "content": "one"})),
+                text("done"),
+            ],
+        )
+        .await;
+        let run = run_of(&submit_in(&mut local.socket, local.chat, "write", &cwd).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+
+        // The Space stops while the run still waits for its answer; the
+        // Computer's channel goes with it.
+        local.device.close(None).await.unwrap();
+        local.socket.close(None).await.unwrap();
+        let root = first.server_home();
+        first.shutdown().await;
+
+        let second = start(test_home(&root), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        assert_eq!(
+            wait_status(&mut socket, run, "waiting").await["status"],
+            "waiting",
+            "the run waits where the record left it"
+        );
+        // The replay projects the run's directory onto the card again.
+        let restored = approval_for_run(&mut socket, run).await;
+        assert_eq!(
+            restored["cwd"],
+            json!(cwd),
+            "the restored card still names the directory: {restored}"
+        );
+        let mut device = connect_computer(&second, &local.machine, local.computer).await;
+        wait_online(&mut socket, local.computer).await;
+
+        let decided = decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut device, "wrote").await;
+        assert_eq!(
+            action,
+            WireAction::WriteFile {
+                path: "in.txt".to_owned(),
+                content: "one".to_owned()
+            }
+        );
+        assert_eq!(working_dir.as_deref(), Some(cwd.as_str()));
+        assert!(
+            access.write_roots.iter().any(|root| root == &cwd),
+            "the restored run still writes in the directory it began in: {:?}",
+            access.write_roots
+        );
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+        device.close(None).await.unwrap();
+        local.provider_task.abort();
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_run_keeps_the_access_it_started_with() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "one"}),
+                ),
+                text("first done"),
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "two"}),
+                ),
+                text("second done"),
+            ],
+        )
+        .await;
+        // The run starts with the owner's grants.
+        command(
+            &mut local.socket,
+            Id::new(),
+            bot_update(
+                local.bot,
+                None,
+                Some(vec!["/data/shared".to_owned()]),
+                None,
+                None,
+            ),
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
+        let access = run_access_event(&running, run).await;
+        assert_eq!(access.data["full_access"], json!(false));
+        assert_eq!(access.data["grants"], json!(["/data/shared"]));
+        let approval = approval_for_run(&mut local.socket, run).await;
+        assert_eq!(approval["reason"], "grant");
+        let approval: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+
+        // The owner changes the Bot while the run waits: full access on and
+        // the grants gone. The run keeps what it began with.
+        let changed = command(
+            &mut local.socket,
+            Id::new(),
+            bot_update(local.bot, Some(true), Some(Vec::new()), None, None),
+        )
+        .await;
+        assert_eq!(changed["full_access"], json!(true));
+        assert_eq!(changed["grants"], json!([]));
+
+        let decided = decide_approval(&mut local.socket, approval, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "wrote").await;
+        assert_eq!(
+            action,
+            WireAction::WriteFile {
+                path: "/tmp/outside.txt".to_owned(),
+                content: "one".to_owned()
+            }
+        );
+        assert_eq!(working_dir, None);
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                // The pinned grant, then the one-time grant that answers the
+                // card for the action the User allowed.
+                write_roots: vec!["/data/shared".to_owned(), "/tmp".to_owned()],
+            },
+            "a waiting run executes with the access it started with"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, run).await["status"],
+            "succeeded"
+        );
+
+        // A run that starts after the change uses the new access.
+        let second = run_of(&submit(&mut local.socket, local.chat, "write again", None).await);
+        let (_, _, access) = answer_next_action_with_access(&mut local.device, "wrote").await;
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: true,
+                write_roots: Vec::new(),
+            },
+            "the next run starts with the Bot's current access"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restored_run_replays_its_pinned_access() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let first = start(home, 0).await.unwrap();
+        let invite = first.invite.clone().expect("a fresh Space invites");
+        let mut local = local_bot(
+            &first,
+            &invite,
+            vec![
+                tool(
+                    "write_file",
+                    json!({"path": "/tmp/outside.txt", "content": "one"}),
+                ),
+                text("done"),
+            ],
+        )
+        .await;
+        command(
+            &mut local.socket,
+            Id::new(),
+            bot_update(
+                local.bot,
+                None,
+                Some(vec!["/data/shared".to_owned()]),
+                None,
+                None,
+            ),
+        )
+        .await;
+        let run = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
+        let approval: Id = serde_json::from_value(
+            approval_for_run(&mut local.socket, run).await["approval"].clone(),
+        )
+        .unwrap();
+        // The Bot turns full access on while the run waits, and the Space
+        // stops before the User answers.
+        command(
+            &mut local.socket,
+            Id::new(),
+            bot_update(local.bot, Some(true), None, None, None),
+        )
+        .await;
+        local.device.close(None).await.unwrap();
+        local.socket.close(None).await.unwrap();
+        let root = first.server_home();
+        first.shutdown().await;
+
+        let second = start(test_home(&root), 0).await.unwrap();
+        let token = sign_in(&second, "Ada").await;
+        let mut socket = open_socket(&second, &token).await;
+        assert_eq!(
+            wait_status(&mut socket, run, "waiting").await["status"],
+            "waiting",
+            "the run waits where the record left it"
+        );
+        // The replay restores the pinned access, not today's Bot.
+        let restored = run_access_event(&second, run).await;
+        assert_eq!(restored.data["full_access"], json!(false));
+        assert_eq!(restored.data["grants"], json!(["/data/shared"]));
+        let shown = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["full_access"], json!(true));
+
+        let mut device = connect_computer(&second, &local.machine, local.computer).await;
+        wait_online(&mut socket, local.computer).await;
+        let decided = decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(decided["status"], "allowed");
+        let (_, _, access) = answer_next_action_with_access(&mut device, "wrote").await;
+        assert_eq!(
+            access,
+            neha_computer::channel::AccessFrame {
+                full_access: false,
+                write_roots: vec!["/data/shared".to_owned(), "/tmp".to_owned()],
+            },
+            "a restored run keeps the access it started with"
+        );
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+        device.close(None).await.unwrap();
+        local.provider_task.abort();
+        socket.close(None).await.unwrap();
+        second.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_revoke_waits_for_the_run_start_it_races() {
+        let (_dir, running, invite) = running().await;
+        let (socket, token) = admin(&running, &invite).await;
+        let mut local = local_bot_with(
+            &running,
+            socket,
+            machine_token_n(40),
+            vec![text("one"), text("two")],
+        )
+        .await;
+        let bot = local.bot;
+        // The run begins with a grant the owner takes away while it starts.
+        command(
+            &mut local.socket,
+            Id::new(),
+            bot_update(bot, None, Some(vec!["/data/shared".to_owned()]), None, None),
+        )
+        .await;
+
+        // The pump reads the access, then pauses before recording the start.
+        let (reached, release) = crate::runs::pause_start_for_test(bot);
+        let first = run_of(&submit(&mut local.socket, local.chat, "one", None).await);
+        reached.notified().await;
+
+        // The revoke arrives while the start holds the Bot's admit lock: it
+        // must queue behind the start instead of recording first.
+        let mut revoke_socket = open_socket(&running, &token).await;
+        let revoke = tokio::spawn(async move {
+            try_command(
+                &mut revoke_socket,
+                Id::new(),
+                bot_update(bot, None, None, None, Some("/data/shared")),
+            )
+            .await
+        });
+        loop {
+            if crate::runs::admit_waiters(bot) > 0 {
+                break;
+            }
+            assert!(
+                !revoke.is_finished(),
+                "the revoke must wait for the run start, not run beside it"
+            );
+            tokio::task::yield_now().await;
+        }
+        release.notify_one();
+        let revoked = revoke.await.unwrap();
+        assert!(revoked.is_ok(), "{revoked:?}");
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // The start recorded the access it read before the revoke, and the
+        // record's order puts the start first.
+        let access = run_access_event(&running, first).await;
+        assert_eq!(access.data["grants"], json!(["/data/shared"]));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let revoked_event = events
+            .iter()
+            .rfind(|event| event.kind == EventKind::BotUpdated)
+            .expect("the revoke is recorded");
+        assert_eq!(revoked_event.data["grants"], json!([]));
+        assert!(
+            access.seq < revoked_event.seq,
+            "the run start is recorded before the revoke it raced"
+        );
+
+        // A run that starts after the revoke cannot recover the grant.
+        let second = run_of(&submit(&mut local.socket, local.chat, "two", None).await);
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let access = run_access_event(&running, second).await;
+        assert_eq!(
+            access.data["grants"],
+            json!([]),
+            "a later run pins the revoked access"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unsafe_folder_cannot_become_a_lasting_grant() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "pwd"})),
+                text("first done"),
+                tool(
+                    "write_file",
+                    json!({"path": "/var/tmp/escape/../escaped.txt", "content": "x"}),
+                ),
+                text("second done"),
+            ],
+        )
+        .await;
+        // Answer the Computer's first use, so the next card judges only its
+        // own folder.
+        let first = run_of(&submit(&mut local.socket, local.chat, "first", None).await);
+        let approval = approval_for_run(&mut local.socket, first).await;
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "/home/ada").await;
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A write whose parent climbs with `..` still asks, but its folder
+        // cannot become a grant: the card offers no Always allow.
+        let second = run_of(&submit(&mut local.socket, local.chat, "write", None).await);
+        let approval = approval_for_run(&mut local.socket, second).await;
+        assert_eq!(approval["reason"], "grant");
+        assert!(
+            approval["grant_folder"]
+                .as_str()
+                .is_some_and(|folder| folder.contains("..")),
+            "the card names the folding parent: {approval}"
+        );
+        assert!(
+            approval["lasting_scope"].is_null(),
+            "an unsafe folder offers no Always allow: {approval}"
+        );
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        let refused = try_command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::ApprovalDecide {
+                approval: approval_id,
+                allow: true,
+                lasting: true,
+            },
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err((ErrorCode::InvalidArgument, ref message))
+                    if message.contains("cannot become lasting")
+            ),
+            "{refused:?}"
+        );
+        // The refused answer recorded nothing: the run still waits and no
+        // grant was written.
+        assert_eq!(
+            wait_status(&mut local.socket, second, "waiting").await["status"],
+            "waiting"
+        );
+        let shown = command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::BotShow { bot: local.bot },
+        )
+        .await;
+        assert_eq!(shown["bot"]["grants"], json!([]));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::BotUpdated),
+            "a refused lasting answer records no grant"
+        );
+
+        // The one action may still be allowed.
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        answer_next_action(&mut local.device, "wrote").await;
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_update_adds_and_removes_grants_atomically() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        // Grants belong to a Local Computer; a Hosted Bot has none to change.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let add = |grant: &str| bot_update(bot, None, None, Some(grant), None);
+        let remove = |grant: &str| bot_update(bot, None, None, None, Some(grant));
+
+        // An add joins the current list; the stored spelling is normalized.
+        let added = command(&mut socket, Id::new(), add("/data/shared")).await;
+        assert_eq!(added["grants"], json!(["/data/shared"]));
+        let folded = command(&mut socket, Id::new(), add("/data//team/./notes")).await;
+        assert_eq!(
+            folded["grants"],
+            json!(["/data/shared", "/data/team/notes"])
+        );
+
+        // Adding a grant the Bot already has, and removing one it lacks, are
+        // refused where the whole list would otherwise be written.
+        let duplicate = try_command(&mut socket, Id::new(), add("/data/shared")).await;
+        assert!(
+            matches!(
+                duplicate,
+                Err((ErrorCode::InvalidArgument, ref message))
+                    if message.contains("already has a grant")
+            ),
+            "{duplicate:?}"
+        );
+        let missing = try_command(&mut socket, Id::new(), remove("/data/never")).await;
+        assert!(
+            matches!(
+                missing,
+                Err((ErrorCode::InvalidArgument, ref message))
+                    if message.contains("has no grant")
+            ),
+            "{missing:?}"
+        );
+        // A replacement and a one-grant change cannot share one command.
+        let mixed = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(
+                bot,
+                None,
+                Some(vec!["/data/replaced".to_owned()]),
+                Some("/data/added"),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(mixed, Err((ErrorCode::InvalidArgument, _))),
+            "{mixed:?}"
+        );
+
+        // A remove takes exactly the folder it names, and the record still
+        // holds the complete list in the event's existing shape.
+        let removed = command(&mut socket, Id::new(), remove("/data/shared")).await;
+        assert_eq!(removed["grants"], json!(["/data/team/notes"]));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let updates: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::BotUpdated)
+            .collect();
+        assert_eq!(updates.len(), 3, "each accepted change records one event");
+        for event in updates {
+            let data = event.data.as_object().expect("an object");
+            assert!(
+                data.keys()
+                    .all(|key| ["bot", "full_access", "grants"].contains(&key.as_str())),
+                "the event keeps its shape: {data:?}"
+            );
+            assert!(
+                data.get("grants").is_some_and(Value::is_array),
+                "the event writes the complete list: {data:?}"
+            );
+        }
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["grants"], json!(["/data/team/notes"]));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_working_directory_needs_the_requests_write_authorization() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        command(
+            &mut socket,
+            Id::new(),
+            provider_add("http://127.0.0.1:1/v1".to_owned()),
+        )
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let before = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events
+            .len();
+
+        // A Client written before the field existed sends the directory and no
+        // authorization; a request that says the directory is not writable
+        // cannot be honored either. Both are refused before any run exists.
+        for consent in [None, Some(false)] {
+            let refused = try_command(
+                &mut socket,
+                Id::new(),
+                CommandCall::MessageSend(MessageSend {
+                    chat,
+                    text: "work in the folder".to_owned(),
+                    file: None,
+                    cwd: Some("/var/tmp/legacy-logs /.".to_owned()),
+                    cwd_writable: consent,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err((ErrorCode::InvalidArgument, ref message))
+                        if message.contains("cwd_writable")
+                ),
+                "{refused:?}"
+            );
+        }
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), before, "a refused request records no run");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages, json!([]), "a refused request adds no Message");
+
+        // This build's Client names the directory and its authorization; the
+        // record keeps both, so a restore knows what the run may write.
+        let accepted = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "work in the folder".to_owned(),
+                file: None,
+                cwd: Some("/var/tmp/legacy-logs /.".to_owned()),
+                cwd_writable: Some(true),
+            }),
+        )
+        .await;
+        let run = run_of(&accepted);
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let context = events
+            .iter()
+            .find(|event| event.kind == EventKind::RunContext && event.data["run"] == json!(run))
+            .expect("the accepted run records its directory");
+        assert_eq!(context.data["working_dir"], json!("/var/tmp/legacy-logs "));
+        assert_eq!(context.data["writable"], json!(true));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_named_directory_is_a_write_root_for_one_run_only() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf one"})),
+                text("one done"),
+                tool("shell", json!({"command": "printf two"})),
+                text("two done"),
+            ],
+        )
+        .await;
+        let cwd = "/var/tmp/neha-one-run ";
+        let spelling = "/var/tmp/neha-one-run /.";
+
+        // The first use asks; the directory is a write root for this run.
+        let first = run_of(&submit_in(&mut local.socket, local.chat, "one", spelling).await);
+        allow_first_use(&mut local.socket, local.chat).await;
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "one").await;
+        assert!(matches!(action, WireAction::Shell { .. }));
+        assert_eq!(working_dir.as_deref(), Some(cwd));
+        assert_eq!(access.write_roots, vec![cwd.to_owned()]);
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A later run that names no directory inherits no write root.
+        let second = run_of(&submit(&mut local.socket, local.chat, "two", None).await);
+        let (_, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "two").await;
+        assert_eq!(working_dir, None);
+        assert!(
+            access.write_roots.is_empty(),
+            "a run's directory belongs to the run that named it"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let shown = show_run(&mut local.socket, second).await;
+        assert_eq!(shown["cwd"], json!(null));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_recorded_directory_that_ends_in_a_space_keeps_its_identity() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf first"})),
+                text("first done"),
+                tool("write_file", json!({"path": "notes.txt", "content": "x"})),
+                text("rule done"),
+                tool("write_file", json!({"path": "notes.txt", "content": "y"})),
+                text("folder done"),
+            ],
+        )
+        .await;
+        let spaced = "/var/tmp/neha-cwd-logs ";
+        // The raw spelling keeps the space inside the string while the User
+        // types it: the Space trims the boundary once and folds the `.` away,
+        // so the recorded directory is the one whose name ends in a space.
+        let spelling = "/var/tmp/neha-cwd-logs /.";
+
+        // Answer the Computer's first use on a harmless shell command.
+        let first = run_of(&submit(&mut local.socket, local.chat, "first", None).await);
+        allow_first_use(&mut local.socket, local.chat).await;
+        let action = answer_next_action(&mut local.device, "first").await;
+        assert!(matches!(action, WireAction::Shell { .. }));
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // An Ask rule for the recorded directory must match a relative path
+        // the run resolves against it, and the card must show that target.
+        let rule = command(
+            &mut local.socket,
+            Id::new(),
+            add_rule(
+                local.bot,
+                neha::record::RuleEffect::Ask,
+                "write_file",
+                None,
+                Some(spelling),
+            ),
+        )
+        .await;
+        let rule_id: Id = serde_json::from_value(rule["rule"].clone()).unwrap();
+        let ruled =
+            run_of(&submit_in(&mut local.socket, local.chat, "write notes", spelling).await);
+        let approval = approval_for_run(&mut local.socket, ruled).await;
+        assert_eq!(approval["reason"], "rule", "{approval}");
+        assert_eq!(approval["cwd"], json!(spaced), "{approval}");
+        let summary = approval["summary"].as_str().unwrap_or_default();
+        assert!(
+            summary.contains("/var/tmp/neha-cwd-logs /notes.txt"),
+            "the card shows the directory the run works in: {summary}"
+        );
+
+        // The Ask rule is hit before the daemon is sent the action: no step
+        // and no action is recorded while the run waits.
+        {
+            let state = running.server.state.lock().unwrap();
+            let run = state.runs.get(&ruled).expect("the run exists");
+            assert_eq!(run.status, crate::state::RunStatus::Waiting);
+            assert!(
+                run.steps.is_empty() && run.actions.is_empty(),
+                "an action the User must answer is not sent to the Computer"
+            );
+        }
+
+        let approval_id: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+        decide_approval(&mut local.socket, approval_id, true, false).await;
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "wrote").await;
+        assert!(
+            matches!(&action, WireAction::WriteFile { path, .. } if path == "notes.txt"),
+            "{action:?}"
+        );
+        assert_eq!(working_dir.as_deref(), Some(spaced));
+        assert_eq!(
+            access.write_roots,
+            vec![spaced.to_owned()],
+            "the daemon receives the directory name exactly as recorded"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, ruled).await["status"],
+            "succeeded"
+        );
+
+        // A relative write in that recorded directory needs no folder card:
+        // the directory is a write root for the run, and trimming it would ask
+        // for the folder next to it instead.
+        command(
+            &mut local.socket,
+            Id::new(),
+            CommandCall::RuleRemove { rule: rule_id },
+        )
+        .await;
+        let folder =
+            run_of(&submit_in(&mut local.socket, local.chat, "write more notes", spelling).await);
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "wrote").await;
+        assert!(
+            matches!(&action, WireAction::WriteFile { path, .. } if path == "notes.txt"),
+            "{action:?}"
+        );
+        assert_eq!(working_dir.as_deref(), Some(spaced));
+        assert_eq!(access.write_roots, vec![spaced.to_owned()]);
+        {
+            let state = running.server.state.lock().unwrap();
+            assert!(
+                state.runs[&folder].approval.is_none(),
+                "a write in the run's directory asks no card"
+            );
+        }
+        assert_eq!(
+            wait_run(&mut local.socket, folder).await["status"],
+            "succeeded"
+        );
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_grant_name_that_ends_in_a_space_survives_the_grant_table() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        // Grants belong to a Local Computer; a Hosted Bot has none to change.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let add = |grant: &str| bot_update(bot, None, None, Some(grant), None);
+
+        // `logs` and `logs ` are two folders: a fold keeps them apart, and a
+        // grant that ends in a space keeps its name when another is added.
+        let folded = command(&mut socket, Id::new(), add("/data/logs/")).await;
+        assert_eq!(folded["grants"], json!(["/data/logs"]));
+        let spaced = command(&mut socket, Id::new(), add("/data/logs ")).await;
+        assert_eq!(spaced["grants"], json!(["/data/logs", "/data/logs "]));
+        let both = command(&mut socket, Id::new(), add("/data/archive")).await;
+        assert_eq!(
+            both["grants"],
+            json!(["/data/archive", "/data/logs", "/data/logs "])
+        );
+
+        // A remove drops exactly the named folder, and the event keeps both
+        // of the remaining names exactly.
+        let removed = command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, None, Some("/data/logs ")),
+        )
+        .await;
+        assert_eq!(removed["grants"], json!(["/data/archive", "/data/logs"]));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let last = events
+            .iter()
+            .rfind(|event| event.kind == EventKind::BotUpdated)
+            .expect("the update is recorded");
+        assert_eq!(last.data["grants"], json!(["/data/archive", "/data/logs"]));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_bot_updates_do_not_lose_each_other() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, token) = admin(&running, &invite).await;
+        // Grants belong to a Local Computer; a Hosted Bot has none to change.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // Four commands from four connections arrive together; every grant
+        // must survive, because each add joins the list the Space holds.
+        let mut sockets = Vec::new();
+        for _ in 0..4 {
+            sockets.push(open_socket(&running, &token).await);
+        }
+        let mut pending = Vec::new();
+        for (position, connection) in sockets.iter_mut().enumerate() {
+            let grant = format!("/data/folder-{position}");
+            pending.push(try_command(
+                connection,
+                Id::new(),
+                bot_update(bot, None, None, Some(&grant), None),
+            ));
+        }
+        let outcomes = futures_util::future::join_all(pending).await;
+        for outcome in outcomes {
+            assert!(outcome.is_ok(), "{outcome:?}");
+        }
+        let listed = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        let mut grants: Vec<String> = listed["bot"]["grants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|grant| grant.as_str().unwrap().to_owned())
+            .collect();
+        grants.sort();
+        assert_eq!(
+            grants,
+            vec![
+                "/data/folder-0".to_owned(),
+                "/data/folder-1".to_owned(),
+                "/data/folder-2".to_owned(),
+                "/data/folder-3".to_owned(),
+            ]
+        );
+
+        // An add and a remove that arrive together keep the other grants too.
+        let mut adding = open_socket(&running, &token).await;
+        let mut removing = open_socket(&running, &token).await;
+        let (added, removed) = tokio::join!(
+            try_command(
+                &mut adding,
+                Id::new(),
+                bot_update(bot, None, None, Some("/data/added"), None)
+            ),
+            try_command(
+                &mut removing,
+                Id::new(),
+                bot_update(bot, None, None, None, Some("/data/folder-0"))
+            )
+        );
+        assert!(added.is_ok(), "{added:?}");
+        assert!(removed.is_ok(), "{removed:?}");
+        let listed = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        let grants = listed["bot"]["grants"].clone();
+        assert!(
+            grants.as_array().unwrap().contains(&json!("/data/added")),
+            "the add survives the remove: {grants}"
+        );
+        assert!(
+            !grants
+                .as_array()
+                .unwrap()
+                .contains(&json!("/data/folder-0")),
+            "the remove survives the add: {grants}"
+        );
+        for kept in ["/data/folder-1", "/data/folder-2", "/data/folder-3"] {
+            assert!(
+                grants.as_array().unwrap().contains(&json!(kept)),
+                "{kept} survives: {grants}"
+            );
+        }
+
+        for mut connection in sockets {
+            connection.close(None).await.unwrap();
+        }
+        adding.close(None).await.unwrap();
+        removing.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runs_directory_is_normalized_and_cannot_climb() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (base, provider_task) = fake_provider().await;
+        let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+        let send = |cwd: Option<&str>| {
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "where".to_owned(),
+                file: None,
+                cwd_writable: cwd.is_some().then_some(true),
+                cwd: cwd.map(ToOwned::to_owned),
+            })
+        };
+
+        // A `..` component, a relative path, and a NUL name no directory the
+        // Space can grant as the run's write root.
+        for refused in ["/tmp/../etc", "relative/dir", "/tmp/dir\u{0}"] {
+            let outcome = try_command(&mut socket, Id::new(), send(Some(refused))).await;
+            assert!(
+                matches!(outcome, Err((ErrorCode::InvalidArgument, _))),
+                "{refused:?}: {outcome:?}"
+            );
+        }
+
+        // An accepted directory is recorded in its one lexical form, so the
+        // User sees the directory the run actually works in.
+        let queued = command(&mut socket, Id::new(), send(Some("/tmp//run/./dir"))).await;
+        assert_eq!(
+            queued["cwd"],
+            json!("/tmp/run/dir"),
+            "the command names the granted directory"
+        );
+        let run = run_of(&queued);
+        let shown = show_run(&mut socket, run).await;
+        assert_eq!(shown["cwd"], json!("/tmp/run/dir"));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let context = events
+            .iter()
+            .find(|event| event.kind == EventKind::RunContext && event.data["run"] == json!(run))
+            .expect("the run records its directory");
+        assert_eq!(context.data["working_dir"], json!("/tmp/run/dir"));
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_update_sets_full_access_and_grants_for_its_owner() {
+        let (dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
         let (_computer, _machine) = paired_computer(&mut socket, &running).await;
         let created = command(
@@ -13372,7 +14811,10 @@ mod tests {
         let update = CommandCall::BotUpdate(neha::surface::BotUpdate {
             bot,
             full_access: Some(true),
+            full_access_consent: Some(neha::record::FULL_ACCESS_CONSENT_VERSION),
             grants: Some(vec!["/data/shared".to_owned(), "/data/team".to_owned()]),
+            grant_add: None,
+            grant_remove: None,
         });
         let first = command(&mut socket, command_id, update.clone()).await;
         assert_eq!(first["full_access"], json!(true));
@@ -13380,6 +14822,23 @@ mod tests {
         assert!(
             first["user"].is_string(),
             "the result names the User it belongs to"
+        );
+        // The answer that widens access is versioned in the record, so an old
+        // record can never restore full access by itself.
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let widened = events
+            .iter()
+            .find(|event| event.kind == EventKind::BotUpdated)
+            .expect("the update is recorded");
+        assert_eq!(
+            widened.data["full_access_version"],
+            json!(neha::record::FULL_ACCESS_CONSENT_VERSION)
         );
         let retried = command(&mut socket, command_id, update).await;
         assert_eq!(
@@ -13393,7 +14852,10 @@ mod tests {
             CommandCall::BotUpdate(neha::surface::BotUpdate {
                 bot,
                 full_access: None,
+                full_access_consent: None,
                 grants: Some(vec!["relative/folder".to_owned()]),
+                grant_add: None,
+                grant_remove: None,
             }),
         )
         .await;
@@ -13403,6 +14865,114 @@ mod tests {
         );
         let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
         assert_eq!(shown["bot"]["full_access"], json!(true));
+
+        // The versioned answer replays: a restart keeps full access on.
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(
+            shown["bot"]["full_access"],
+            json!(true),
+            "a versioned full-access answer replays"
+        );
+        assert_eq!(
+            shown["bot"]["grants"],
+            json!(["/data/shared", "/data/team"])
+        );
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn turning_full_access_on_needs_the_current_answer() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        // Full access applies to a Local Computer; a Hosted Bot has only its
+        // Workspace and refuses the update before the answer is considered.
+        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            add_bot_on("Scout", Some(BotComputer::Local)),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let request = |consent: Option<u16>| {
+            CommandCall::BotUpdate(neha::surface::BotUpdate {
+                bot,
+                full_access: Some(true),
+                full_access_consent: consent,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+            })
+        };
+
+        // A request without the answer - what a CLI written before the answer
+        // was versioned sends - cannot widen access.
+        let refused = try_command(&mut socket, Id::new(), request(None)).await;
+        assert!(
+            matches!(
+                refused,
+                Err((ErrorCode::InvalidArgument, ref message))
+                    if message.contains("current answer")
+            ),
+            "{refused:?}"
+        );
+        // An answer this build does not know cannot widen it either.
+        let stale = try_command(
+            &mut socket,
+            Id::new(),
+            request(Some(neha::record::FULL_ACCESS_CONSENT_VERSION + 1)),
+        )
+        .await;
+        assert!(
+            matches!(stale, Err((ErrorCode::InvalidArgument, _))),
+            "{stale:?}"
+        );
+        // Neither refusal recorded anything or changed the Bot.
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["full_access"], json!(false));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == EventKind::BotUpdated),
+            "a refused request records no Bot update"
+        );
+
+        // The current answer is recorded and turns full access on.
+        let on = command(
+            &mut socket,
+            Id::new(),
+            request(Some(neha::record::FULL_ACCESS_CONSENT_VERSION)),
+        )
+        .await;
+        assert_eq!(on["full_access"], json!(true));
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let widened = events
+            .iter()
+            .rfind(|event| event.kind == EventKind::BotUpdated)
+            .expect("the answer is recorded");
+        assert_eq!(
+            widened.data["full_access_version"],
+            json!(neha::record::FULL_ACCESS_CONSENT_VERSION)
+        );
 
         socket.close(None).await.unwrap();
         running.shutdown().await;
@@ -13414,14 +14984,12 @@ mod tests {
         let mut socket = admin_socket(&running, &invite).await;
         let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
         let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        // The answer a Local Computer needs is sent too: this Bot is Hosted,
+        // so the refusal must name the Computer rather than the answer.
         let refused = try_command(
             &mut socket,
             Id::new(),
-            CommandCall::BotUpdate(neha::surface::BotUpdate {
-                bot,
-                full_access: Some(true),
-                grants: None,
-            }),
+            bot_update(bot, Some(true), None, None, None),
         )
         .await;
         match refused {
