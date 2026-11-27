@@ -481,6 +481,9 @@ async fn start_with(
     if let Ok(mut state) = server.state.lock() {
         state.url = Some(format!("http://{addr}"));
     }
+    // Capture the cursor before recovery. A run that recovery fails during
+    // startup is a RunFinished and belongs to this start's notification stream.
+    let push_cursor = server.store.last_seq().await.map_err(ServerError::Store)?;
     recover_interrupted(&server.store, &server.state).await?;
     server.catalog.clone().spawn_background();
     reconcile_pairings(&server).await?;
@@ -522,7 +525,10 @@ async fn start_with(
         }
         (Some(_), None) | (None, _) => None,
     };
-    let push_task = crate::push::spawn(Arc::clone(&server));
+    // Start after recovery so the follower catches up through the ordered store
+    // and can notify the runs recovery just failed. `wake_all` runs after this
+    // spawn, and the task's catch-up covers the window before its subscription.
+    let push_task = crate::push::spawn(Arc::clone(&server), push_cursor);
     server.runs.wake_all(&server);
     let invite_base = server
         .public_url
@@ -3555,7 +3561,13 @@ mod tests {
             )
             .await
             .unwrap();
-            String::from_utf8_lossy(&request).to_lowercase()
+            // A duplicate delivery would open a second connection. Give it a
+            // short chance to arrive before the test decides.
+            let duplicate =
+                tokio::time::timeout(std::time::Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_ok();
+            (String::from_utf8_lossy(&request).to_lowercase(), duplicate)
         });
 
         running
@@ -3621,28 +3633,58 @@ mod tests {
             );
         }
 
-        let event = neha::record::Event {
-            seq: neha::seq::Seq::from_i64(1_000_000).unwrap(),
-            kind: neha::record::EventKind::RunFinished,
-            version: 1,
-            at: neha::time::Timestamp::from_microseconds(0).unwrap(),
-            author: neha::record::Author::Bot(bot),
-            acting: Some(account),
-            command: None,
-            data: serde_json::json!({"run": run, "status": "succeeded"}),
-        };
+        // Commit two real events, then publish the later one first. The push
+        // task must recover the missing lower sequence from the ordered store
+        // instead of advancing its cursor over it.
+        let drafts = vec![
+            neha::record::EventDraft::new(
+                neha::record::EventKind::RunStep,
+                neha::record::Author::Bot(bot),
+                serde_json::json!({"run": run, "step": 1, "tool_calls": 0}),
+            )
+            .acting(account),
+            neha::record::EventDraft::new(
+                neha::record::EventKind::RunFinished,
+                neha::record::Author::Bot(bot),
+                serde_json::json!({"run": run, "status": "succeeded", "reply": reply}),
+            )
+            .acting(account),
+        ];
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(Id::new(), "push-test", drafts))
+            .await
+            .unwrap();
+        let finished = appended
+            .events
+            .iter()
+            .find(|event| event.kind == neha::record::EventKind::RunFinished)
+            .unwrap()
+            .clone();
+        let step = appended
+            .events
+            .iter()
+            .find(|event| event.kind == neha::record::EventKind::RunStep)
+            .unwrap()
+            .clone();
         for _ in 0..100 {
-            if running.server.events.send(event.clone()).is_ok() {
+            if running.server.events.send(finished.clone()).is_ok() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        let request = tokio::time::timeout(std::time::Duration::from_secs(2), device)
+        // Replaying the lower sequence and the same finish must not deliver
+        // either a second time.
+        let _ = running.server.events.send(step);
+        let _ = running.server.events.send(finished);
+        let (request, duplicate) = tokio::time::timeout(std::time::Duration::from_secs(2), device)
             .await
             .expect("the push request arrived")
             .unwrap();
         assert!(request.contains("authorization: vapid t="), "{request}");
         assert!(request.contains("content-encoding: aes128gcm"), "{request}");
+        assert!(!duplicate, "the same finish must reach the device once");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4928,6 +4970,121 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recorded.result.unwrap()["status"], "failed");
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_notifies_about_the_run_it_fails() {
+        use neha::record::{Author, EventDraft, EventKind};
+
+        const P256DH: &str = "BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY";
+        const AUTH: &str = "_ordMnz7uTCmrpBTeUV4Bw";
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let user = Id::new();
+        let bot = Id::new();
+        let computer = Id::new();
+        let chat = Id::new();
+        let message = Id::new();
+        let run = Id::new();
+        let command = Id::new();
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(user),
+                json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventDraft::new(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                json!({"computer": computer, "owner": user, "kind": "managed", "workspace": "/tmp/workspace"}),
+            ),
+            EventDraft::new(
+                EventKind::BotCreated,
+                Author::User(user),
+                json!({"bot": bot, "owner": user, "name": "Scout", "computer": computer, "chat": chat}),
+            ),
+            EventDraft::new(
+                EventKind::ChatCreated,
+                Author::User(user),
+                json!({"chat": chat, "owner": user, "bot": bot}),
+            ),
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({"message": message, "chat": chat, "text": "hello", "run": run}),
+            ),
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "message": message,
+                    "command": command,
+                }),
+            )
+            .acting(user),
+        ];
+        store
+            .append(AppendRequest::new(command, "seed", drafts))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let device = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = tokio::io::AsyncReadExt::read(&mut socket, &mut chunk)
+                    .await
+                    .unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            String::from_utf8_lossy(&request).to_lowercase()
+        });
+
+        let state = home.root().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("push.json"),
+            serde_json::json!({
+                "subscriptions": [{
+                    "endpoint": format!("http://{address}/push"),
+                    "p256dh": P256DH,
+                    "auth": AUTH,
+                    "account": user,
+                }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let running = start(home, 0).await.unwrap();
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), device)
+            .await
+            .expect("the recovered failure reached the device")
+            .unwrap();
+        assert!(request.contains("authorization: vapid t="), "{request}");
+        assert!(request.contains("content-encoding: aes128gcm"), "{request}");
         running.shutdown().await;
     }
 

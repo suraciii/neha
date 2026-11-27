@@ -85,10 +85,45 @@ enum Delivery {
     Failed(u16),
 }
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Resolves only addresses the Space may reach: public push services, and
+/// loopback for a unit test's fake device. Redirects are disabled separately,
+/// so a public service cannot hand the Space a private target.
+struct PublicResolver {
+    allow_loopback: bool,
+}
+
+impl reqwest::dns::Resolve for PublicResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        let allow_loopback = self.allow_loopback;
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> BoxError { Box::new(error) })?;
+            let public: Vec<std::net::SocketAddr> = addresses
+                .filter(|address| {
+                    public_address(address.ip()) || (allow_loopback && address.ip().is_loopback())
+                })
+                .collect();
+            if public.is_empty() {
+                return Err(Box::new(std::io::Error::other(
+                    "the push endpoint has no public address",
+                )) as BoxError);
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
 /// The Space's push devices and signing key.
 pub(crate) struct Push {
     path: PathBuf,
     store: Mutex<Store>,
+    /// A read or parse failure. The file is left untouched until a human
+    /// repairs it; a successful write must not replace other devices' state.
+    storage_error: Option<String>,
     key: Option<[u8; 32]>,
     public: Option<String>,
     /// The VAPID contact URI: the public origin, or a local placeholder.
@@ -103,18 +138,20 @@ impl Push {
     /// instead of refusing to open the Space.
     pub(crate) fn open(home: &Home, secrets: &Secrets, contact: String) -> Arc<Self> {
         let path = home.root().join("state").join("push.json");
-        let store = match fs::read(&path) {
+        let (store, storage_error) = match fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
-                Ok(store) => store,
+                Ok(store) => (store, None),
                 Err(error) => {
-                    eprintln!("neha: the push subscriptions are not readable: {error}");
-                    Store::default()
+                    let message = format!("the push subscriptions are not readable: {error}");
+                    eprintln!("neha: {message}");
+                    (Store::default(), Some(message))
                 }
             },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Store::default(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Store::default(), None),
             Err(error) => {
-                eprintln!("neha: the push subscriptions could not be read: {error}");
-                Store::default()
+                let message = format!("the push subscriptions could not be read: {error}");
+                eprintln!("neha: {message}");
+                (Store::default(), Some(message))
             }
         };
         let key = match secrets.vapid_private_key() {
@@ -131,12 +168,16 @@ impl Push {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(PublicResolver {
+                allow_loopback: cfg!(test),
+            }))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("a push client");
 
         Arc::new(Self {
             path,
             store: Mutex::new(store),
+            storage_error,
             key,
             public,
             contact,
@@ -146,6 +187,9 @@ impl Push {
 
     /// Returns the public key and the current mute, when push is configured.
     pub(crate) fn status(&self) -> Option<Status> {
+        if self.storage_error.is_some() {
+            return None;
+        }
         let key = self.public.clone()?;
         let store = self.store.lock().ok()?;
         Some(Status {
@@ -162,6 +206,7 @@ impl Push {
         p256dh: String,
         auth: String,
     ) -> Result<(), SubscribeError> {
+        self.writable()?;
         validate_subscription(&endpoint, &p256dh, &auth)?;
         let mut store = self.store.lock().map_err(|_| SubscribeError::Store)?;
         let existing = store
@@ -196,6 +241,7 @@ impl Push {
 
     /// Forgets one browser subscription.
     pub(crate) fn unsubscribe(&self, account: Id, endpoint: &str) -> Result<(), SubscribeError> {
+        self.writable()?;
         let mut store = self.store.lock().map_err(|_| SubscribeError::Store)?;
         let mut next = store.clone();
         next.subscriptions.retain(|subscription| {
@@ -212,6 +258,7 @@ impl Push {
 
     /// Mutes the whole Space for a number of minutes.
     pub(crate) fn mute(&self, minutes: u64) -> Result<u64, SubscribeError> {
+        self.writable()?;
         if !(1..=24 * 60).contains(&minutes) {
             return Err(SubscribeError::Invalid("mute from 1 to 1440 minutes"));
         }
@@ -227,6 +274,7 @@ impl Push {
 
     /// Ends a mute.
     pub(crate) fn unmute(&self) -> Result<(), SubscribeError> {
+        self.writable()?;
         let mut store = self.store.lock().map_err(|_| SubscribeError::Store)?;
         if store.muted_until.is_none() {
             return Ok(());
@@ -236,6 +284,13 @@ impl Push {
         self.save(&next).map_err(|_| SubscribeError::Store)?;
         *store = next;
 
+        Ok(())
+    }
+
+    fn writable(&self) -> Result<(), SubscribeError> {
+        if self.storage_error.is_some() {
+            return Err(SubscribeError::Store);
+        }
         Ok(())
     }
 
@@ -337,13 +392,16 @@ impl Push {
         }
     }
 
-    fn remove(&self, endpoint: &str) {
+    fn remove(&self, sent: &Subscription) {
         let Ok(mut store) = self.store.lock() else {
             return;
         };
         let mut next = store.clone();
-        next.subscriptions
-            .retain(|subscription| subscription.endpoint != endpoint);
+        next.subscriptions.retain(|subscription| {
+            !(subscription.endpoint == sent.endpoint
+                && subscription.p256dh == sent.p256dh
+                && subscription.auth == sent.auth)
+        });
         if next.subscriptions.len() == store.subscriptions.len() {
             return;
         }
@@ -373,18 +431,31 @@ impl Push {
     }
 }
 
-/// Starts the one task that follows recorded events into notifications.
-pub(crate) fn spawn(server: Arc<SpaceServer>) -> JoinHandle<()> {
+/// Starts the task that turns new record events into notifications.
+///
+/// `cursor` is the last sequence the caller counted before starting work the
+/// task must see. The task subscribes first, then catches up through the store,
+/// because an event recorded between the capture and the subscription is in
+/// neither the channel nor before the cursor.
+pub(crate) fn spawn(server: Arc<SpaceServer>, mut cursor: Seq) -> JoinHandle<()> {
     tokio::spawn(async move {
-        // Read the cursor before subscribing, then catch up through the store.
-        // An event recorded between the read and the subscription is neither in
-        // the channel nor before the cursor; the catch-up covers that window.
-        let mut cursor = server.store.last_seq().await.unwrap_or(Seq::ZERO);
         let mut receiver = server.events.subscribe();
         catch_up(&server, &mut cursor).await;
         loop {
             match receiver.recv().await {
-                Ok(event) => process(&server, event, &mut cursor),
+                Ok(event) => {
+                    if event.seq <= cursor {
+                        continue;
+                    }
+                    // Publishers append and then broadcast independently, so a
+                    // later sequence may arrive first. Drain the ordered record
+                    // instead of advancing the cursor over the missing event.
+                    if cursor.next() != Some(event.seq) {
+                        catch_up(&server, &mut cursor).await;
+                        continue;
+                    }
+                    process(&server, event, &mut cursor).await;
+                }
                 Err(RecvError::Lagged(_)) => catch_up(&server, &mut cursor).await,
                 Err(RecvError::Closed) => break,
             }
@@ -392,7 +463,7 @@ pub(crate) fn spawn(server: Arc<SpaceServer>) -> JoinHandle<()> {
     })
 }
 
-fn process(server: &Arc<SpaceServer>, event: Event, cursor: &mut Seq) {
+async fn process(server: &Arc<SpaceServer>, event: Event, cursor: &mut Seq) {
     if event.seq <= *cursor {
         return;
     }
@@ -409,20 +480,19 @@ fn process(server: &Arc<SpaceServer>, event: Event, cursor: &mut Seq) {
     let Some((subscriptions, payload)) = server.push.jobs(&notice) else {
         return;
     };
-    let payload = Arc::new(payload);
+    // Sends are sequential: two notifications for one Chat must not race and
+    // let the older tag replace the newer one, and shutdown must not leave a
+    // detached send behind. One slow endpoint delays the next device by at
+    // most the request timeout.
     for subscription in subscriptions {
-        let push = Arc::clone(&server.push);
-        let payload = Arc::clone(&payload);
-        tokio::spawn(async move {
-            match push.deliver(&subscription, &payload).await {
-                Delivery::Sent => {}
-                Delivery::Gone => push.remove(&subscription.endpoint),
-                Delivery::Failed(status) => {
-                    let host = endpoint_host(&subscription.endpoint);
-                    eprintln!("neha: a push to {host} failed ({status})");
-                }
+        match server.push.deliver(&subscription, &payload).await {
+            Delivery::Sent => {}
+            Delivery::Gone => server.push.remove(&subscription),
+            Delivery::Failed(status) => {
+                let host = endpoint_host(&subscription.endpoint);
+                eprintln!("neha: a push to {host} failed ({status})");
             }
-        });
+        }
     }
 }
 
@@ -434,7 +504,7 @@ async fn catch_up(server: &Arc<SpaceServer>, cursor: &mut Seq) {
             return;
         };
         for event in page.events {
-            process(server, event, cursor);
+            process(server, event, cursor).await;
         }
         if page.next <= before {
             return;
@@ -503,16 +573,27 @@ fn validate_subscription(endpoint: &str, p256dh: &str, auth: &str) -> Result<(),
     if !url.username().is_empty() || url.password().is_some() {
         return Err(SubscribeError::Invalid("the endpoint carries credentials"));
     }
-    let host = url.host_str().unwrap_or_default();
-    let loopback = host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false);
+    let host = url.host_str().unwrap_or_default().trim_end_matches('.');
+    // `host_str` keeps the brackets around an IPv6 literal.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    let address = bare.parse::<std::net::IpAddr>().ok();
+    let loopback = bare == "localhost" || address.is_some_and(|address| address.is_loopback());
+    let testing = cfg!(test) && url.scheme() == "http" && loopback;
     // Push services are HTTPS. Loopback HTTP exists only so a unit test can
     // stand a delivery endpoint beside the Space.
-    if url.scheme() != "https" && !(cfg!(test) && url.scheme() == "http" && loopback) {
+    if url.scheme() != "https" && !testing {
         return Err(SubscribeError::Invalid("the endpoint must use HTTPS"));
+    }
+    // The endpoint comes from a signed-in User, but it must not turn the Space
+    // into a probe of its own host or private network. A public https name is
+    // still resolved by the machine; redirects are disabled at delivery.
+    if !testing && !public_destination(host, address) {
+        return Err(SubscribeError::Invalid(
+            "the endpoint must be a public push service",
+        ));
     }
     let Ok(public) = URL_SAFE_NO_PAD.decode(p256dh) else {
         return Err(SubscribeError::Invalid("the p256dh key is not base64url"));
@@ -528,6 +609,42 @@ fn validate_subscription(endpoint: &str, p256dh: &str, auth: &str) -> Result<(),
     }
 
     Ok(())
+}
+
+/// Whether a push destination is a public name or address, not this host or a
+/// private network. A name can still resolve privately; the Space sends only to
+/// an endpoint its signed-in owner registered, and redirects stay disabled.
+fn public_destination(host: &str, address: Option<std::net::IpAddr>) -> bool {
+    if let Some(address) = address {
+        return public_address(address);
+    }
+    !(host.eq_ignore_ascii_case("localhost")
+        || host.ends_with(".localhost")
+        || host.ends_with(".local"))
+}
+
+fn public_address(address: std::net::IpAddr) -> bool {
+    match address {
+        std::net::IpAddr::V4(address) => {
+            !(address.is_loopback()
+                || address.is_private()
+                || address.is_link_local()
+                || address.is_unspecified()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.is_multicast())
+        }
+        std::net::IpAddr::V6(address) => {
+            if let Some(address) = address.to_ipv4_mapped() {
+                return public_address(std::net::IpAddr::V4(address));
+            }
+            !(address.is_loopback()
+                || address.is_unspecified()
+                || address.is_multicast()
+                || address.is_unique_local()
+                || address.is_unicast_link_local())
+        }
+    }
 }
 
 fn public_key(pair: &ES256KeyPair) -> Option<String> {
@@ -683,6 +800,72 @@ mod tests {
             let metadata = std::fs::metadata(home.root().join("secrets/vapid.key")).unwrap();
             assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         }
+    }
+
+    #[test]
+    fn a_private_push_destination_is_refused() {
+        for endpoint in [
+            "https://127.0.0.1/push",
+            "https://localhost/push",
+            "https://10.0.0.1/push",
+            "https://169.254.169.254/latest",
+            "https://[::1]/push",
+            "https://device.local/push",
+        ] {
+            assert!(
+                validate_subscription(endpoint, P256DH, AUTH).is_err(),
+                "{endpoint} must not be a push destination"
+            );
+        }
+        assert!(validate_subscription("https://push.example.com/a", P256DH, AUTH).is_ok());
+        assert!(validate_subscription("http://127.0.0.1/push", P256DH, AUTH).is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_push_client_resolves_only_public_addresses() {
+        use reqwest::dns::Resolve as _;
+
+        let name = "127.0.0.1".parse::<reqwest::dns::Name>().unwrap();
+        assert!(
+            PublicResolver {
+                allow_loopback: false
+            }
+            .resolve(name)
+            .await
+            .is_err()
+        );
+        let name = "127.0.0.1".parse::<reqwest::dns::Name>().unwrap();
+        assert!(
+            PublicResolver {
+                allow_loopback: true
+            }
+            .resolve(name)
+            .await
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_corrupt_subscription_file_is_not_overwritten() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let secrets = Secrets::load(&home).unwrap();
+        let path = home.root().join("state").join("push.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let corrupt = b"not a subscription file";
+        std::fs::write(&path, corrupt).unwrap();
+        let push = Push::open(&home, &secrets, "mailto:test@example.com".to_owned());
+        assert!(push.status().is_none());
+        assert!(
+            push.subscribe(
+                Id::new(),
+                "https://push.example.com/a".to_owned(),
+                P256DH.to_owned(),
+                AUTH.to_owned(),
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupt);
     }
 
     #[test]
