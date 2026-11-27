@@ -1511,6 +1511,10 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         || named != computer.to_string()
         || (!sandbox && !unsandboxed_computers_allowed())
     {
+        eprintln!(
+            "computer handshake rejected: version={version} named={named} sandbox={sandbox} unsandboxed_allowed={}",
+            unsandboxed_computers_allowed()
+        );
         return;
     }
 

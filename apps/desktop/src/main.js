@@ -472,6 +472,7 @@ async function startLocalComputer(spaceUrl, origin) {
 async function openLocalSpace() {
   if (process.platform === "win32") {
     allowUnsandboxedWindowsComputer = await confirmUnsandboxedMode();
+    log(`Windows Local Computer opt-in: ${allowUnsandboxedWindowsComputer ? "accepted" : "declined"}`);
   }
   const started = await startSpace();
   let origin;
