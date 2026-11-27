@@ -7,6 +7,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { space } from "./test/fakeSpace";
 import { drain, element, openChat, record, useView, type View } from "./test/view";
+import type { Approval } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/ws")>()),
@@ -27,6 +28,21 @@ function request(id: string, run: string, text: string, chatId = "h1") {
     seq: "1",
     run,
     file: null,
+  };
+}
+
+// An approval that waits for this User, with the Run that asked for it.
+function approval(id: string, run: string, tool = "shell"): Approval {
+  return {
+    approval: id,
+    run,
+    bot: "b1",
+    chat: "h1",
+    action: `act-${id}`,
+    step: 1,
+    tool,
+    summary: `${tool} the thing`,
+    reason: "first_use_local",
   };
 }
 
@@ -239,6 +255,19 @@ describe("App with a Chat the Space already knows", () => {
       run: "r2",
       file: null,
     });
+    // The Space writes what the Run it turned down has to say, with the Run
+    // that said it. It lands after r2's reply: r2 answered first.
+    space.messages.push({
+      id: "m4",
+      chat: "h1",
+      author: { kind: "bot", id: "b1" },
+      acting: "u1",
+      text: "the Provider refused the command",
+      at: "2026-01-01T00:00:03.000Z",
+      seq: "4",
+      run: "r1",
+      file: null,
+    });
     space.statuses["h1"] = "failed";
     space.activeRuns["h1"] = null;
     space.runs["r1"] = { status: "failed", steps: [], actions: [], error: "the Provider refused the command" };
@@ -249,8 +278,8 @@ describe("App with a Chat the Space already knows", () => {
     // request in the record, must not turn the failed Chat idle.
     expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
     expect(view.container.querySelector(".chat__state--working")).toBeNull();
-    // The card names the request the record shows no answer for, with the
-    // reason the Run gave: the Run the Chat failed on.
+    // The card names the Run that failed, with the reason the Run gave: the
+    // last reply in the record carries r1, not the newest request.
     await waitFor(() => expect(element(view, ".activity__reason").textContent).toContain("the Provider refused the command"));
     // That Run is over, so the composer takes a new Message.
     await waitFor(() => expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false));
@@ -261,6 +290,7 @@ describe("App with a Chat the Space already knows", () => {
     await drain();
     expect(element(view, ".chat__state--failed").textContent).toBe("Failed");
     expect(element(view, ".activity__reason").textContent).toContain("the Provider refused the command");
+    expect(element<HTMLTextAreaElement>(view, "textarea").disabled).toBe(false);
   });
 
   it("follows the Run the Space names when the Run it followed ends", async () => {
@@ -331,6 +361,51 @@ describe("App with a Chat the Space already knows", () => {
     expect(view.container.querySelector(".chat__state--failed")).toBeNull();
     expect(element(view, ".activity__tools").textContent).toContain("read_file");
     expect(view.container.querySelector(".chat__attention")).toBeNull();
+  });
+
+  it("follows the Run the Space names when the page followed another", async () => {
+    // Two Runs wait for an approval each. The User lets the first one work
+    // while the page is away, and the Space follows the second now.
+    space.messages.push(request("m1", "r1", "first ask"));
+    space.messages.push(request("m2", "r2", "second ask"));
+    space.statuses["h1"] = "waiting";
+    space.activeRuns["h1"] = "r1";
+    space.runs["r1"] = { status: "waiting", approval: "a1" };
+    space.runs["r2"] = { status: "waiting", approval: "a2" };
+    space.approvals.push(approval("a1", "r1"));
+    space.approvals.push(approval("a2", "r2", "read_file"));
+    const view = await openChat();
+
+    // The page follows the Run the Space named, and waits on its approval.
+    await waitFor(() => expect(element(view, ".chat__attention").textContent).toContain("Waiting"));
+    space.resume([]);
+    await waitFor(() => expect(space.runShows).toEqual(["r1", "r1"]));
+
+    // While the page was away the User let r1 work: the Space no longer lists
+    // its approval, and it follows r2 now.
+    space.activeRuns["h1"] = "r2";
+    space.runs["r1"] = { status: "running", steps: [{ index: 1, tool_calls: 1 }] };
+    space.approvals = space.approvals.filter((known) => known.approval !== "a1");
+
+    // A reconnect reads the Space's word: the page follows the Run it names.
+    space.resume([]);
+    await waitFor(() => expect(space.runShows).toContain("r2"));
+    // r1 still works, and its events land on the page: they belong to a Run the
+    // page no longer follows, so they do not fill the Chat's card.
+    record("neha.action.started", { run: "r1", step: 1, action: "a9", tool: "write_file" });
+    await drain();
+    expect(view.container.querySelector(".activity__tools")).toBeNull();
+    // The Chat waits on r2: its approval is the one that asks.
+    expect(element(view, ".chat__attention").textContent).toContain("Waiting");
+    expect(view.container.querySelector('[data-approval="a1"]')).toBeNull();
+    expect(view.container.querySelector('[data-approval="a2"]')).toBeTruthy();
+
+    // r1 ends while the page waits on r2: the wait does not move.
+    record("neha.run.finished", { run: "r1", status: "succeeded", reply: null, usage: null, error: null });
+    await drain();
+    expect(element(view, ".chat__attention").textContent).toContain("Waiting");
+    expect(view.container.querySelector(".activity__tools")).toBeNull();
+    expect(view.container.querySelector('[data-approval="a2"]')).toBeTruthy();
   });
 
   it("follows the Run the Bot names, not the one the list named", async () => {

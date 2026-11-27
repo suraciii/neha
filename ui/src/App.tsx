@@ -213,6 +213,10 @@ export default function App() {
   // was already running when it opened. It only moves forward, queued → running,
   // and back to running once an approval it waited for is granted.
   let followed: { run: string; step: RunStep } | null = null;
+  // How many times the page changed the Run it follows. A read that is still on
+  // its way carries the version it was sent with, and an answer that arrives
+  // after the page moved on is dropped.
+  let followVersion = 0;
   // Runs the record already reported finished: a late command result or answer
   // must not revive them.
   const settledRuns = new Set<string>();
@@ -345,11 +349,18 @@ export default function App() {
     return [...messages].reverse().find((message) => message.author.kind === "user" && message.run)?.run ?? null;
   }
 
-  // The Run a Chat's record points at when the Space names none: the request
-  // the record shows no answer for, which is the one a Chat that follows no Run
-  // failed on. A run that answered leaves its reply in the stream instead. A
-  // Chat whose every request was answered has only the newest one to show.
-  function historyRun(messages: Message[]): string | null {
+  // The Run a Chat's record points at when the Space names none. A Chat that
+  // failed shows the Run that failed: the last reply in the record carries its
+  // run, and a reply is the end of a Run — the one the User turned down, not
+  // the newest request that happens to sit above it. A Chat whose record holds
+  // no reply yet falls back to the request it shows no answer for, which is the
+  // one a Chat that follows no Run failed on. A Chat whose every request was
+  // answered has only the newest one to show.
+  function historyRun(messages: Message[], failed: boolean): string | null {
+    if (failed) {
+      const ended = [...messages].reverse().find((message) => message.author.kind === "bot" && message.run);
+      if (ended?.run) return ended.run;
+    }
     const answered = new Set(
       messages.filter((message) => message.author.kind === "bot" && message.run).map((message) => message.run),
     );
@@ -404,8 +415,28 @@ export default function App() {
 
   function clearFollowed() {
     followed = null;
+    followVersion += 1;
     setActivity(null);
     update({ queue: null });
+  }
+
+  // The Space names a different Run than the page follows: the page follows the
+  // one it names. The old follow goes, and with it the place that Run held in
+  // the Chat's projection, so the Run that works while the page follows another
+  // does not keep the Chat busy and its late events do not fill the card.
+  function followNamed(run: string | null | undefined) {
+    if (!followed || followed.run === run) return;
+    const stale = followed.run;
+    followed = null;
+    followVersion += 1;
+    // The place the page held in the queue belonged to that Run.
+    update({ queue: null });
+    const chat = runChats.get(stale);
+    if (!chat) return;
+    setState((draft) => {
+      const runs = draft.runs[chat];
+      if (runs) delete runs.active[stale];
+    });
   }
 
   // The record says this Run ended. Only the Run still followed may settle the
@@ -613,6 +644,11 @@ export default function App() {
         ? { ...state.activeChat, ...chats.find((chat) => chat.id === state.activeChat?.id) }
         : null;
       if (answered) {
+        // The Space's word is the authority: when it names a Run other than the
+        // one the page follows, the page follows the one it names — the Run the
+        // User let work while the page was away, not the one it last heard
+        // about.
+        followNamed(answered.active_run);
         update({ activeChat: answered });
         await refreshActive(answered, runGeneration);
       }
@@ -1017,14 +1053,16 @@ export default function App() {
     // Chat stays failed. The Run the page reads there is history, and it only
     // fills that Chat's card. A Space that names no Run at all, an older one,
     // leaves the page to the newest request in the record.
-    const run = named ?? (named === null ? historyRun(messages) : newestRequestRun(messages));
+    const run = named ?? (named === null ? historyRun(messages, chat.status === "failed") : newestRequestRun(messages));
     if (!run || !isCurrentChat(chat, generation)) return;
     // Only a Run the Space named may write the Chat's state back.
     const holds = named !== null;
+    const sent = followVersion;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
       // The page moved on to another Run while the answer was on its way.
+      if (followVersion !== sent) return;
       if (followed && followed.run !== run) return;
       if (holds) applyRunView(view);
       else restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
@@ -1045,10 +1083,12 @@ export default function App() {
     const named = chat.active_run;
     const run = followed?.run ?? (named === null ? null : (named ?? newestRequestRun(messages)));
     if (!run || settledRuns.has(run)) return;
+    const sent = followVersion;
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
       // The page moved on to another Run while the answer was on its way.
+      if (followVersion !== sent) return;
       if (followed && followed.run !== run) return;
       applyRunView(view);
     } catch {
