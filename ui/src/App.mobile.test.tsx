@@ -1,4 +1,4 @@
-import { fireEvent, waitFor } from "@solidjs/testing-library";
+import { cleanup, fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
@@ -86,7 +86,7 @@ describe("the mobile client", () => {
 
     try {
       await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
-      expect(history.state?.nehaChat).toBe(space.chat.id);
+      expect(history.state?.chat).toBe(space.chat.id);
       expect(location.search).toBe("");
       await waitFor(() =>
         expect(view.container.querySelector('[data-message="m1"]')).toBeTruthy(),
@@ -96,6 +96,54 @@ describe("the mobile client", () => {
       if (original) Element.prototype.scrollIntoView = original;
     }
     history.replaceState(null, "", "/");
+  });
+
+  it("restores the screen its history entry names after a reload", async () => {
+    // A phone reloads into the screen it was on rather than into the Chat behind
+    // it: the entry names the surface and what was open inside it, and restoring
+    // it takes no step of its own, so the stack keeps its length and its Back
+    // returns to the screen before.
+    history.replaceState(null, "");
+    mobile();
+    const opened = renderApp();
+
+    await waitFor(() => expect(opened.container.querySelector(".conv")).toBeTruthy());
+    fireEvent.click(element(opened, ".conv"));
+    await waitFor(() => expect(opened.container.querySelector(".app--detail")).toBeTruthy());
+    flush(() => fireEvent.click(element(opened, ".rail__item:nth-of-type(4)")));
+    await waitFor(() => expect(element(opened, ".app").className).not.toContain("app--detail"));
+    flush(() => fireEvent.click(button(opened, "Models")));
+    await waitFor(() => expect(element(opened, ".app").className).toContain("app--detail"));
+    expect(panelText(opened, "Models")).toBeTruthy();
+    const before = history.length;
+
+    // The reload: a fresh client over the history the steps left behind.
+    cleanup();
+    const view = renderApp();
+
+    await waitFor(() => expect(panelText(view, "Models")).toBeTruthy());
+    expect(element(view, ".app").className).toContain("app--detail");
+    // The restore wrote no entry of its own.
+    expect(history.length).toBe(before);
+
+    // And the step the entry holds returns to the Settings list.
+    history.back();
+    await waitFor(() => expect(element(view, ".app").className).not.toContain("app--detail"));
+    expect(view.container.querySelectorAll(".conv")).toHaveLength(4);
+  });
+
+  it("restores a Chat from an entry the client before this one wrote", async () => {
+    // The client before this one wrote an entry that names only its Chat. An
+    // installed client that upgrades and reloads must land on that Chat, in the
+    // same entry rather than in a new one.
+    history.replaceState({ nehaChat: space.chat.id }, "");
+    const before = history.length;
+    mobile();
+    const view = renderApp();
+
+    await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
+    expect(history.state?.nehaChat).toBe(space.chat.id);
+    expect(history.length).toBe(before);
   });
 
   it("gives a wide-window Chat an entry when the window becomes narrow", async () => {
