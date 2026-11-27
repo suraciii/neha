@@ -109,6 +109,9 @@ jobs:
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # One cache family with the nightly installer, which refreshes it.
+          shared-key: windows
 
       - name: Check the Rust workspace
         run: cargo check --locked --workspace
