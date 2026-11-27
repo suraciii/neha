@@ -37,6 +37,9 @@ unsafe_code = "forbid"
 lto = "thin"
 codegen-units = 1
 opt-level = 3
+# The sidecar ships inside the installer; nothing reads its symbols. Keeping
+# the dynamic symbols alone keeps backtraces in a crash log useful.
+strip = "symbols"
 
 # Test codegen. Unoptimized test code makes numerical and rendering suites
 # several times slower. opt-level 2 inherits `dev`, so debug assertions and
