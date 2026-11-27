@@ -61,7 +61,9 @@ Only the Computer's owner resets it, and only a Hosted Computer is reset. A Comp
 
 Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines and the Bot's own thinking level when set. A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines and the Bot's own thinking level when set.
+
+A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
 
 `neha bot create --thinking minimal|low|medium|high|max` chooses the Bot's level; without it the Bot uses the Space's default. `neha model list` shows which Models can think.
 

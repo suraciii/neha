@@ -2557,7 +2557,8 @@ pub async fn resume_run(
                 {
                     waiting.continuation = Some(state);
                 }
-            } else if next_step > 1
+            } else if unknown.is_none()
+                && next_step > 1
                 && let Some(state) = store
                     .continuation(run.id, next_step - 1)
                     .await
@@ -2711,7 +2712,7 @@ async fn finish_run_with(
     links: &ComputerLinks,
     pending: PendingRun,
     history: Vec<neha_loop::Message>,
-    continuation: Option<neha_loop::Continuation>,
+    mut continuation: Option<neha_loop::Continuation>,
     resume: Option<Resume>,
     base_usage: neha::usage::Usage,
     recovery: Option<(u32, Option<crate::state::ActionView>)>,
@@ -2816,6 +2817,9 @@ async fn finish_run_with(
                                 base_usage: replay_usage,
                                 ..
                             } = *plan;
+                            // The target step's state is authoritative; never
+                            // fall back to the previous completed step here.
+                            continuation = None;
                             load_resume_continuation(store, pending.run, &mut replay_resume)
                                 .await?;
                             start_step = Some(next_step);
@@ -3119,13 +3123,10 @@ async fn load_resume_continuation(
     let Some(waiting) = resume.as_mut() else {
         return Ok(());
     };
-    if let Some(state) = store
+    waiting.continuation = store
         .continuation(run, waiting.step)
         .await
-        .map_err(store_error)?
-    {
-        waiting.continuation = Some(state);
-    }
+        .map_err(store_error)?;
 
     Ok(())
 }
@@ -5403,6 +5404,26 @@ mod tests {
             .unwrap();
 
         assert_eq!(resume.unwrap().continuation, Some(second));
+
+        let mut missing = Some(neha_loop::Resume {
+            step: 3,
+            content: None,
+            calls: Vec::new(),
+            done: 0,
+            approved_action: None,
+            usage: neha::usage::Usage::default(),
+            recovered: false,
+            continuation: Some(neha_loop::Continuation {
+                protocol: "openai_responses".to_owned(),
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+                state: json!({"items": []}),
+            }),
+        });
+        load_resume_continuation(&store, run, &mut missing)
+            .await
+            .unwrap();
+        assert_eq!(missing.unwrap().continuation, None);
         store.close().await.unwrap();
     }
 

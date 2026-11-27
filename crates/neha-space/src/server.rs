@@ -2605,7 +2605,8 @@ mod tests {
     use crate::blobs::test_s3;
     use crate::config::S3Storage;
     use crate::home::Home;
-    use crate::store::{AppendRequest, Store};
+    use crate::secrets::Secrets;
+    use crate::store::{AppendRequest, ContinuationWrite, Store};
 
     async fn running() -> (tempfile::TempDir, Running, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -5173,6 +5174,217 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_recovered_unknown_write_reloads_its_own_continuation() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let (base, provider_task, recorded) = protocol_provider(
+            ProviderProtocol::OpenAiResponses,
+            vec![responses_text_reply()],
+        )
+        .await;
+
+        let user = Id::new();
+        let provider = Id::new();
+        let model = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let message = Id::new();
+        let run = Id::new();
+        let command = Id::new();
+        let action = Id::new();
+        let workspace = home.workspace_dir(computer);
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("note.txt"), "hello").unwrap();
+        let continuation = neha_loop::Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: provider.to_string(),
+            model: "test-model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_recovered"}]}),
+        };
+        let drafts = vec![
+            EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(user),
+                json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventDraft::new(
+                EventKind::ProviderAdded,
+                Author::User(user),
+                json!({
+                    "provider": provider,
+                    "protocol": "openai_responses",
+                    "base_url": base,
+                    "models": [{
+                        "id": model,
+                        "name": "test-model",
+                        "context_limit": 128000,
+                        "max_output": 8192,
+                        "reads_images": false,
+                        "thinks": true,
+                    }],
+                    "default_model": model,
+                    "thinking": "high",
+                }),
+            ),
+            EventDraft::new(
+                EventKind::ComputerCreated,
+                Author::User(user),
+                json!({
+                    "computer": computer,
+                    "owner": user,
+                    "kind": "hosted",
+                    "workspace": workspace.to_string_lossy(),
+                }),
+            ),
+            EventDraft::new(
+                EventKind::BotCreated,
+                Author::User(user),
+                json!({
+                    "bot": bot,
+                    "owner": user,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                    "thinking": null,
+                }),
+            ),
+            EventDraft::new(
+                EventKind::ChatCreated,
+                Author::User(user),
+                json!({"chat": chat, "owner": user, "bot": bot}),
+            ),
+            EventDraft::new(
+                EventKind::MessageAdded,
+                Author::User(user),
+                json!({"message": message, "chat": chat, "text": "write it", "run": run}),
+            ),
+            EventDraft::new(
+                EventKind::RunQueued,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": command,
+                    "message": message,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": command,
+                    "message": message,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunStep,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "usage": {"uncached_input": 1, "cache_read": 0,
+                        "cache_write": 0, "output": 1, "reasoning": 0},
+                    "tool_calls": 1,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::RunReply,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "content": null,
+                    "calls": [{
+                        "call": "call-1",
+                        "tool": "write_file",
+                        "arguments": {"path": "note.txt", "content": "hello"},
+                        "refused": null,
+                    }],
+                    "usage": null,
+                }),
+            )
+            .acting(user),
+            EventDraft::new(
+                EventKind::ActionStarted,
+                Author::Bot(bot),
+                json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": "write_file",
+                    "arguments": {"path": "note.txt", "content": "hello"},
+                }),
+            )
+            .acting(user),
+        ];
+        store
+            .append(
+                AppendRequest::new(command, "seed-unknown-write", drafts).with_continuation(
+                    ContinuationWrite {
+                        run,
+                        step: 1,
+                        continuation: Some(continuation),
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        Secrets::load(&home)
+            .unwrap()
+            .store_provider_key(provider, "sk-test")
+            .unwrap();
+        store.close().await.unwrap();
+
+        let running = start(home, 0).await.unwrap();
+        for _ in 0..500 {
+            let status = running
+                .server
+                .state
+                .lock()
+                .unwrap()
+                .runs
+                .get(&run)
+                .map(|run| run.status);
+            if matches!(
+                status,
+                Some(crate::state::RunStatus::Succeeded | crate::state::RunStatus::Failed)
+            ) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        {
+            let state = running.server.state.lock().unwrap();
+            assert_eq!(
+                state.runs[&run].status,
+                crate::state::RunStatus::Succeeded,
+                "the verified write lets the run continue: {:?}",
+                state.runs[&run].error
+            );
+        }
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]["input"].to_string().contains("rs_recovered"),
+                "the recovered step loads its own continuation: {}",
+                requests[0]
+            );
+        }
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_recovered_run_reuses_the_native_continuation() {
         let directory = tempfile::tempdir().unwrap();
         let home = Home::open(directory.path()).unwrap();
@@ -5283,7 +5495,7 @@ mod tests {
             std::fs::read_to_string(workspace.join("note.txt")).unwrap(),
             "hello"
         );
-        assert_eq!(shown["usage"]["uncached_input"], 250);
+        assert_eq!(shown["usage"]["uncached_input"], 245);
         assert_eq!(shown["usage"]["cache_read"], 20);
         assert_eq!(shown["usage"]["cache_write"], 5);
         assert_eq!(shown["usage"]["output"], 42);
