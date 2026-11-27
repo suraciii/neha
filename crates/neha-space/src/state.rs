@@ -138,6 +138,23 @@ pub struct ComputerView {
     pub online: bool,
     /// The Computer's workspace directory.
     pub workspace: String,
+    /// Whether its owner may grant it folders and name a run's directory.
+    ///
+    /// A real Computer declares this in its channel greeting; the projection
+    /// keeps the broad default and [`crate::commands`] overlays what the
+    /// machine said.
+    #[serde(default = "true_capability")]
+    pub supports_grants: bool,
+    /// Whether its owner may turn a Bot's full access on.
+    #[serde(default = "true_capability")]
+    pub supports_full_access: bool,
+    /// Whether its machine sandboxes runs; absent until it greets the Space.
+    ///
+    /// `Some(false)` marks a runtime with no OS fence (an opted-in Windows
+    /// Local Computer); `None` means this Space process has not seen the
+    /// machine's handshake yet, so a client must not assume either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandboxed: Option<bool>,
 }
 
 /// The live state of a Chat, projected from its runs.
@@ -920,12 +937,25 @@ impl Projection for State {
                 if let Some(grants) = data.grants {
                     bot.grants = grants;
                 }
+                if data.reset_model {
+                    bot.model = None;
+                }
                 if let Some(model) = data.model {
                     bot.model = Some(model);
+                }
+                if data.reset_thinking {
+                    bot.thinking = None;
                 }
                 if let Some(thinking) = data.thinking {
                     bot.thinking = Some(thinking);
                 }
+            }
+            EventData::BotRenamed(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("a renamed Bot must exist")?;
+                bot.name = data.name;
             }
             EventData::ProviderModelsUpdated(data) => {
                 if !self.providers.contains_key(&data.provider) {
@@ -979,14 +1009,21 @@ impl Projection for State {
                 }
             }
             EventData::ComputerCreated(data) => {
+                let kind = data.kind.as_str().to_owned();
+                // A Hosted Computer always runs in the Space's own sandbox;
+                // only a real machine's handshake can tell what it serves.
+                let sandboxed = (kind == "hosted").then_some(true);
                 self.computers.insert(
                     data.computer,
                     ComputerView {
                         id: data.computer,
                         owner: data.owner,
-                        kind: data.kind.as_str().to_owned(),
+                        kind,
                         online: true,
                         workspace: data.workspace,
+                        supports_grants: true,
+                        supports_full_access: true,
+                        sandboxed,
                     },
                 );
                 self.computer_order.push(data.computer);
@@ -3106,6 +3143,106 @@ mod tests {
         assert_eq!(error, "a move goes to an existing Computer");
         assert_eq!(state.bots[&bot].computer, computer);
     }
+    #[test]
+    fn a_bot_rename_changes_only_its_name() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        assert_eq!(
+            state.bots[&bot].name, "Scout",
+            "the Bot keeps the name it was created with"
+        );
+
+        state
+            .apply(&event(
+                EventKind::BotRenamed,
+                Author::User(owner),
+                serde_json::json!({"bot": bot, "name": "Scout the Second"}),
+                4,
+            ))
+            .unwrap();
+
+        assert_eq!(state.bots[&bot].name, "Scout the Second");
+        assert_eq!(state.bots[&bot].owner, owner);
+        assert_eq!(state.bots[&bot].chat, chat);
+    }
+
+    #[test]
+    fn a_renamed_bot_must_exist() {
+        let mut state = State::default();
+        let error = state
+            .apply(&event(
+                EventKind::BotRenamed,
+                Author::User(Id::new()),
+                serde_json::json!({"bot": Id::new(), "name": "Scout"}),
+                1,
+            ))
+            .unwrap_err();
+
+        assert_eq!(error, "a renamed Bot must exist");
+    }
+
+    #[test]
+    fn a_bot_update_resets_the_choices_it_names() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let model = Id::new();
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        let user = Author::User(owner);
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "model": model, "thinking": "low"}),
+                4,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].model, Some(model));
+        assert_eq!(
+            state.bots[&bot].thinking,
+            Some(neha::surface::ThinkingLevel::Low)
+        );
+
+        // An old update without the reset fields never clears a choice.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "grants": []}),
+                5,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].model, Some(model));
+        assert!(state.bots[&bot].thinking.is_some());
+
+        // A reset names the one field it clears.
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "reset_model": true}),
+                6,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].model, None);
+        assert!(
+            state.bots[&bot].thinking.is_some(),
+            "a Model reset leaves the level alone"
+        );
+
+        state
+            .apply(&event(
+                EventKind::BotUpdated,
+                user,
+                serde_json::json!({"bot": bot, "reset_thinking": true}),
+                7,
+            ))
+            .unwrap();
+        assert_eq!(state.bots[&bot].thinking, None);
+    }
+
     #[test]
     fn a_bot_update_changes_only_what_it_names() {
         let owner = Id::new();

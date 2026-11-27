@@ -34,7 +34,7 @@ pub enum EventKind {
     /// The Admin connected a Provider.
     #[serde(rename = "neha.provider.added")]
     ProviderAdded,
-    /// The Admin refreshed a Provider's Models.
+    /// The Admin refreshed a Provider's Models or chose their default.
     #[serde(rename = "neha.provider.models_updated")]
     ProviderModelsUpdated,
     /// A Bot was created.
@@ -46,6 +46,9 @@ pub enum EventKind {
     /// A Bot's owner changed its file access.
     #[serde(rename = "neha.bot.updated")]
     BotUpdated,
+    /// A Bot's owner renamed it.
+    #[serde(rename = "neha.bot.renamed")]
+    BotRenamed,
     /// A Computer was created.
     #[serde(rename = "neha.computer.created")]
     ComputerCreated,
@@ -110,6 +113,7 @@ impl EventKind {
             Self::BotCreated => "neha.bot.created",
             Self::BotMoved => "neha.bot.moved",
             Self::BotUpdated => "neha.bot.updated",
+            Self::BotRenamed => "neha.bot.renamed",
             Self::ComputerCreated => "neha.computer.created",
             Self::ChatCreated => "neha.chat.created",
             Self::MessageAdded => "neha.message.added",
@@ -139,6 +143,9 @@ impl EventKind {
             | Self::RunQueued
             | Self::RunStarted
             | Self::RunFinished => EventClass::Presentation,
+            // A rename decides nothing about access or work: a reader that
+            // does not know it keeps the name it has and reads on.
+            Self::BotRenamed => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunContext
@@ -174,6 +181,7 @@ impl FromStr for EventKind {
             "neha.bot.created" => Ok(Self::BotCreated),
             "neha.bot.moved" => Ok(Self::BotMoved),
             "neha.bot.updated" => Ok(Self::BotUpdated),
+            "neha.bot.renamed" => Ok(Self::BotRenamed),
             "neha.computer.created" => Ok(Self::ComputerCreated),
             "neha.chat.created" => Ok(Self::ChatCreated),
             "neha.message.added" => Ok(Self::MessageAdded),
@@ -263,8 +271,8 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
-        FileAdded, FileError, RunAccess, RunQueued,
+        Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, EventData, EventDataError,
+        EventDraft, EventKind, FileAdded, FileError, RunAccess, RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -278,6 +286,8 @@ mod tests {
             EventKind::ProviderModelsUpdated,
             EventKind::BotCreated,
             EventKind::BotMoved,
+            EventKind::BotUpdated,
+            EventKind::BotRenamed,
             EventKind::ComputerCreated,
             EventKind::ChatCreated,
             EventKind::MessageAdded,
@@ -309,6 +319,7 @@ mod tests {
         assert_eq!(EventKind::RunQueued.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunStarted.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunFinished.class(), EventClass::Presentation);
+        assert_eq!(EventKind::BotRenamed.class(), EventClass::Presentation);
         assert_eq!(EventKind::RunAccess.class(), EventClass::Authority);
         assert_eq!(EventKind::RunStep.class(), EventClass::Authority);
         assert_eq!(EventKind::ActionStarted.class(), EventClass::Authority);
@@ -437,6 +448,65 @@ mod tests {
                 .validate_author(user, Some(Id::new()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_bot_renamed_round_trips() {
+        let data = BotRenamed {
+            bot: Id::new(),
+            name: "Scout".to_owned(),
+        };
+        let value = serde_json::json!({"bot": data.bot, "name": "Scout"});
+
+        assert_eq!(
+            EventKind::BotRenamed.decode(&value).unwrap(),
+            EventData::BotRenamed(data.clone())
+        );
+        assert_eq!(
+            serde_json::from_value::<BotRenamed>(value.clone()).unwrap(),
+            data
+        );
+
+        let mut unknown = value;
+        unknown["computer"] = serde_json::json!(Id::new());
+        assert!(
+            EventKind::BotRenamed.decode(&unknown).is_err(),
+            "a rename names exactly its Bot and new name"
+        );
+    }
+
+    #[test]
+    fn a_bot_renamed_takes_a_user_author() {
+        let user = Author::User(Id::new());
+        let bot = Author::Bot(Id::new());
+        assert!(EventKind::BotRenamed.validate_author(user, None).is_ok());
+        assert!(EventKind::BotRenamed.validate_author(bot, None).is_err());
+        assert!(
+            EventKind::BotRenamed
+                .validate_author(user, Some(Id::new()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_bot_update_reset_is_additive() {
+        let bot = Id::new();
+        // An update written before the reset fields names neither: it must
+        // replay as not resetting anything.
+        let old = serde_json::json!({"bot": bot, "model": null});
+        let EventData::BotUpdated(update) = EventKind::BotUpdated.decode(&old).unwrap() else {
+            panic!("bot_update decodes to its data");
+        };
+        assert!(!update.reset_model);
+        assert!(!update.reset_thinking);
+
+        let reset = serde_json::json!({"bot": bot, "reset_model": true, "reset_thinking": true});
+        let EventData::BotUpdated(update) = EventKind::BotUpdated.decode(&reset).unwrap() else {
+            panic!("bot_update decodes to its data");
+        };
+        assert!(update.reset_model);
+        assert!(update.reset_thinking);
+        assert_eq!(serde_json::from_value::<BotUpdated>(reset).unwrap(), update);
     }
 
     #[test]
@@ -878,6 +948,8 @@ pub enum EventData {
     BotMoved(BotMoved),
     /// A Bot's owner changed its file access.
     BotUpdated(BotUpdated),
+    /// A Bot's owner renamed it.
+    BotRenamed(BotRenamed),
     /// A Computer was created.
     ComputerCreated(ComputerCreated),
     /// A Chat was created.
@@ -940,6 +1012,7 @@ impl EventKind {
             Self::BotCreated => EventData::BotCreated(decode(data)?),
             Self::BotMoved => EventData::BotMoved(decode(data)?),
             Self::BotUpdated => EventData::BotUpdated(decode(data)?),
+            Self::BotRenamed => EventData::BotRenamed(decode(data)?),
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
             Self::MessageAdded => EventData::MessageAdded(decode(data)?),
@@ -987,6 +1060,7 @@ impl EventKind {
             | Self::BotCreated
             | Self::BotMoved
             | Self::BotUpdated
+            | Self::BotRenamed
             | Self::ComputerCreated
             | Self::ChatCreated => {
                 if !matches!(author, Author::User(_)) || acting.is_some() {
@@ -1117,6 +1191,10 @@ const fn model_tools_default() -> bool {
 }
 
 /// The data of `neha.provider.models_updated`.
+///
+/// A refresh replaces the Models the Provider offers. Choosing the Space's
+/// default Model also names the Provider's whole current list, so every Model
+/// keeps its identity and the projection holds one default.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderModelsUpdated {
@@ -1190,6 +1268,25 @@ pub struct BotUpdated {
     /// Its thinking level; absent leaves it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<crate::surface::ThinkingLevel>,
+    /// Whether it goes back to the Space's default Model.
+    ///
+    /// A record written before the field replays false, so an old update
+    /// never clears a Model the owner chose.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_model: bool,
+    /// Whether it goes back to the Space's default thinking level.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_thinking: bool,
+}
+
+/// The data of `neha.bot.renamed`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BotRenamed {
+    /// The Bot.
+    pub bot: Id,
+    /// Its new name.
+    pub name: String,
 }
 
 /// What a Computer is: the machine Neha runs on, or the Space itself.

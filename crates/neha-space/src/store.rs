@@ -952,6 +952,11 @@ mod tests {
                 Author::User(user),
                 serde_json::json!({"bot": Id::new(), "full_access": true}),
             ),
+            EventKind::BotRenamed => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"bot": Id::new(), "name": "Scout"}),
+            ),
             EventKind::BotMoved => EventDraft::new(
                 kind,
                 Author::User(user),

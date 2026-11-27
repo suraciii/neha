@@ -604,6 +604,28 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
     )
 }
 
+/// Serves a model list for one Provider's discovery, as its endpoint would.
+fn models_endpoint(models: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = format!(r#"{{"data":{models}}}"#);
+    let handle = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else {
+                break;
+            };
+            let mut request = [0_u8; 8192];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+        }
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
 /// Runs a Local-Computer test only where this machine can fence a Bot.
 ///
 /// `NEHA_TEST_BWRAP` is the gate, as for the runtime's own fence tests. Once
@@ -5382,4 +5404,431 @@ async fn an_allow_at_an_action_already_started_fails_after_a_restart() {
 
     drop(computer);
     provider_task.abort();
+}
+
+#[test]
+fn a_bot_owner_renames_it_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = first_word(&field(&created, "Created Bot "));
+    assert!(run(&home, &credential, &["bot", "list"]).contains("Scout"));
+
+    // The Space trims the name the owner sends, so the name it shows is the
+    // name it recorded.
+    let renamed = run(
+        &home,
+        &credential,
+        &["bot", "rename", &bot, "  Pathfinder  "],
+    );
+    assert!(renamed.contains("Renamed Bot"), "{renamed}");
+    assert!(renamed.contains("Pathfinder"), "{renamed}");
+    let listed = run(&home, &credential, &["bot", "list"]);
+    assert!(listed.contains("Pathfinder"), "{listed}");
+    assert!(!listed.contains("Scout"), "{listed}");
+
+    // A blank name is refused and the old name stays.
+    let blank = cli(&home, &credential, &["bot", "rename", &bot, "   "]);
+    assert!(!blank.status.success());
+    let stderr = String::from_utf8_lossy(&blank.stderr);
+    assert!(stderr.contains("needs a name"), "{stderr}");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains("Pathfinder"), "{shown}");
+
+    // The rename replays from the record after a restart.
+    let port = space_port(&url);
+    drop(server);
+    let (_server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(restarted_url, url, "the Space restarts on its own address");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains("Pathfinder"), "{shown}");
+}
+
+#[test]
+fn the_admin_changes_the_default_model_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "alpha",
+            "--model",
+            "beta",
+        ],
+    );
+    let id_of = |listing: &str, name: &str| -> String {
+        listing
+            .lines()
+            .find(|line| line.split_whitespace().nth(1) == Some(name))
+            .and_then(|line| line.split_whitespace().next())
+            .unwrap_or_else(|| panic!("no Model {name} in:\n{listing}"))
+            .to_owned()
+    };
+    let default_lines = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .filter(|line| line.contains("default"))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+
+    let listed = run(&home, &credential, &["model", "list"]);
+    let alpha = id_of(&listed, "alpha");
+    let beta = id_of(&listed, "beta");
+    let defaults = default_lines(&listed);
+    assert_eq!(defaults.len(), 1, "{listed}");
+    assert!(defaults[0].starts_with(&alpha), "{listed}");
+
+    // The Admin moves the Space's default to the other Model.
+    let changed = run(&home, &credential, &["model", "default", &beta]);
+    assert!(changed.contains(&beta), "{changed}");
+    assert!(changed.contains("beta"), "{changed}");
+    let listed = run(&home, &credential, &["model", "list"]);
+    let defaults = default_lines(&listed);
+    assert_eq!(defaults.len(), 1, "one Model stays default:\n{listed}");
+    assert!(defaults[0].starts_with(&beta), "{listed}");
+    assert!(
+        listed
+            .lines()
+            .any(|line| line.starts_with(&alpha) && !line.contains("default")),
+        "the other Model is still offered:\n{listed}"
+    );
+
+    // A Model this Space does not offer cannot become the default.
+    let missing = neha::id::Id::new().to_string();
+    let refused = cli(&home, &credential, &["model", "default", &missing]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("no such Model"), "{stderr}");
+
+    // The default replays from the record after a restart.
+    let port = space_port(&url);
+    drop(server);
+    let (_server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(restarted_url, url, "the Space restarts on its own address");
+    let listed = run(&home, &credential, &["model", "list"]);
+    let defaults = default_lines(&listed);
+    assert_eq!(defaults.len(), 1, "the replay holds one default:\n{listed}");
+    assert!(defaults[0].starts_with(&beta), "{listed}");
+}
+
+#[test]
+fn a_bot_owner_resets_its_model_and_thinking_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "alpha",
+            "--thinks",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let model = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("alpha"))
+        .map(first_word)
+        .expect("the Model is listed");
+    let created = run(
+        &home,
+        &credential,
+        &[
+            "bot",
+            "create",
+            "Scout",
+            "--model",
+            &model,
+            "--thinking",
+            "low",
+        ],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(shown.contains(&format!("model: {model}")), "{shown}");
+    assert!(shown.contains("thinking: low"), "{shown}");
+
+    // A reset and a choice at once is refused.
+    let refused = cli(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--model", &model, "--reset-model"],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("resets or chooses its Model"), "{stderr}");
+
+    // Each reset restores one Space default and leaves the other choice.
+    let reset = run(&home, &credential, &["bot", "set", &bot, "--reset-model"]);
+    assert!(reset.contains("model: Space default"), "{reset}");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        !shown.contains("model:"),
+        "the Model reset applies:\n{shown}"
+    );
+    assert!(shown.contains("thinking: low"), "{shown}");
+
+    let reset = run(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--reset-thinking"],
+    );
+    assert!(reset.contains("thinking: Space default"), "{reset}");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        !shown.contains("thinking:"),
+        "the level reset applies:\n{shown}"
+    );
+
+    // Neither reset flag alone is a change the CLI accepts.
+    let empty = cli(&home, &credential, &["bot", "set", &bot]);
+    assert!(!empty.status.success());
+    let stderr = String::from_utf8_lossy(&empty.stderr);
+    assert!(stderr.contains("--reset-model"), "{stderr}");
+
+    // The resets replay from the record after a restart.
+    let port = space_port(&url);
+    drop(server);
+    let (_server, restarted_url, _invite) = serve_on(&home, port);
+    assert_eq!(restarted_url, url, "the Space restarts on its own address");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(
+        !shown.contains("model:"),
+        "the Model reset replays:\n{shown}"
+    );
+    assert!(
+        !shown.contains("thinking:"),
+        "the level reset replays:\n{shown}"
+    );
+}
+
+#[test]
+fn a_provider_whose_default_would_strand_a_bot_is_refused_by_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, _url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:1/v1",
+            "--model",
+            "thinker",
+            "--thinks",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let thinker = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("thinker"))
+        .map(first_word)
+        .expect("thinker is listed");
+    let defaults = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .filter(|line| line.contains("default"))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let before = defaults(&listed);
+    assert_eq!(before.len(), 1, "{listed}");
+    assert!(before[0].starts_with(&thinker), "{listed}");
+
+    let created = run(
+        &home,
+        &credential,
+        &["bot", "create", "Scout", "--thinking", "high"],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+
+    // The second Provider's only Model cannot think; it would become the
+    // Space's default and strand the Bot's level.
+    let refused = cli(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:2/v1",
+            "--model",
+            "plain",
+        ],
+    );
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("cannot think") && stderr.contains("reset their thinking levels"),
+        "{stderr}"
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    assert_eq!(defaults(&listed), before, "the old default stays");
+
+    // After the Bot gives up its level the same connection succeeds.
+    run(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--reset-thinking"],
+    );
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:2/v1",
+            "--model",
+            "plain",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let plain = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("plain"))
+        .map(first_word)
+        .expect("plain is listed");
+    let after = defaults(&listed);
+    assert_eq!(after.len(), 1, "{listed}");
+    assert!(after[0].starts_with(&plain), "{listed}");
+
+    drop(server);
+}
+
+#[test]
+fn a_provider_refresh_that_retires_a_bots_model_is_refused() {
+    let directory = tempfile::tempdir().unwrap();
+    let (server, _url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (endpoint, _served) = models_endpoint(r#"[{"id":"survivor"}]"#);
+
+    // A thinking Model the Bot picks explicitly; the endpoint will later
+    // stop offering it.
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &endpoint,
+            "--model",
+            "thinker",
+            "--thinks",
+        ],
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    let thinker = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("thinker"))
+        .map(first_word)
+        .expect("thinker is listed");
+    let created = run(
+        &home,
+        &credential,
+        &[
+            "bot",
+            "create",
+            "Scout",
+            "--model",
+            &thinker,
+            "--thinking",
+            "high",
+        ],
+    );
+    let bot = first_word(&field(&created, "Created Bot "));
+
+    // Another Provider's non-thinking Model becomes the Space default, so the
+    // Bot no longer inherits it but would after its own Model retired.
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            "http://127.0.0.1:9/v1",
+            "--model",
+            "plain",
+        ],
+    );
+    let defaults = |listing: &str| -> Vec<String> {
+        listing
+            .lines()
+            .filter(|line| line.contains("default"))
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    let listed = run(&home, &credential, &["model", "list"]);
+    let plain = listed
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("plain"))
+        .map(first_word)
+        .expect("plain is listed");
+    let before = defaults(&listed);
+    assert_eq!(before.len(), 1, "{listed}");
+    assert!(before[0].starts_with(&plain), "{listed}");
+
+    // The refresh retires `thinker`; the Bot would fall back to the
+    // non-thinking default while keeping `high`: refused before anything is
+    // written.
+    let providers = run(&home, &credential, &["provider", "list"]);
+    let provider = providers
+        .lines()
+        .find(|line| line.contains(&endpoint))
+        .map(first_word)
+        .expect("the first Provider is listed");
+    let refused = cli(&home, &credential, &["provider", "refresh", &provider]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("refreshing the Provider would leave 1 Bot")
+            && stderr.contains("thinking level"),
+        "{stderr}"
+    );
+    let listed = run(&home, &credential, &["model", "list"]);
+    assert!(
+        !listed.contains("survivor"),
+        "nothing was recorded:\n{listed}"
+    );
+    assert_eq!(defaults(&listed), before, "the default stays");
+
+    // After the Bot gives up its level the same refresh succeeds; the Bot
+    // inherits the default Model.
+    run(
+        &home,
+        &credential,
+        &["bot", "set", &bot, "--reset-thinking"],
+    );
+    run(&home, &credential, &["provider", "refresh", &provider]);
+    let listed = run(&home, &credential, &["model", "list"]);
+    assert!(listed.contains("survivor"), "{listed}");
+    assert_eq!(defaults(&listed), before, "the default stays");
+    let shown = run(&home, &credential, &["bot", "show", &bot]);
+    assert!(!shown.contains("model:"), "the Bot inherits now:\n{shown}");
+    assert!(!shown.contains("thinking:"), "{shown}");
+
+    drop(server);
 }

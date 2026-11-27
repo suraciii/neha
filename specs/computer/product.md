@@ -46,7 +46,7 @@ The Computer belongs to the User the ticket names; that owner sees it among thei
 
 The machine serves the Space while it runs; after a stop, the User starts it again.
 
-A paired Computer connects out to the Space and shows as online or offline.
+A paired Computer connects out to the Space and shows as online or offline. A Computer that has not greeted yet names no access and no fence: the pairing answer and every later listing agree on that.
 
 A Computer that is offline keeps its Bots and their memory, and its Bots work again when it comes back.
 
@@ -79,6 +79,10 @@ A Windows Local Computer is an explicitly unsandboxed mode. Its commands run wit
 On a Computer that several Bots share, one Bot at a time controls the keyboard and mouse.
 
 On a Linux Local Computer, the owner sets its access: granted folders, or full access. A Windows Local Computer has no such access model.
+
+A Local Computer states which access it supports, and a client offers only what the Computer states. The browser disables the controls a Computer does not support, and the CLI refuses a command that asks for them and names what the Computer does not support. An owner always revokes a grant and turns full access off.
+
+A Local Computer also states whether it fences a Bot's run. A Computer that serves no fence runs a Bot's shell with the machine user's own rights, and one that has not answered yet is shown as waiting rather than named either way.
 
 With granted folders, a Bot writes and deletes files only in its Workspace, the granted folders, and the run's own working directory. With full access, Neha starts no sandbox, and the Bot writes, deletes, and reads with the machine user's own file rights, including the Computer's configuration directory.
 

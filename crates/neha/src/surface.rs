@@ -73,6 +73,11 @@ pub enum CommandCall {
     ProviderList,
     /// Lists the Space's Models.
     ModelList,
+    /// Makes a Model the Space's default.
+    ModelDefault {
+        /// The Model the Space uses by default from now on.
+        model: Id,
+    },
     /// Adds a real Computer the User just paired.
     ComputerAdd {
         /// The pairing code the machine showed.
@@ -307,11 +312,18 @@ pub struct BotCreate {
 /// An update changes access one way: it replaces the grant list, or adds one
 /// grant, or removes one grant, and may set full access alongside. The Space
 /// applies a grant change to its current projection, so two owners' commands
-/// that arrive together cannot lose one another's change.
+/// that arrive together cannot lose one another's change. An update may also
+/// rename the Bot; the Space records a rename as its own event.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BotUpdate {
     /// The Bot to change.
     pub bot: Id,
+    /// Its new name.
+    ///
+    /// The Space trims it and refuses an empty name; absent leaves the name
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// Whether it may write outside its Workspace fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_access: Option<bool>,
@@ -337,6 +349,17 @@ pub struct BotUpdate {
     /// The Bot's thinking level; absent leaves it unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking: Option<ThinkingLevel>,
+    /// Whether it goes back to the Space's default Model.
+    ///
+    /// The Space refuses a reset together with a Model: a request either
+    /// chooses one or restores the default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_model: bool,
+    /// Whether it goes back to the Space's default thinking level.
+    ///
+    /// The Space refuses a reset together with a level.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reset_thinking: bool,
 }
 
 /// The Computer a `bot_create` asks for.
@@ -645,6 +668,9 @@ mod tests {
         let (bot, model) = (Id::new(), Id::new());
         let update = CommandCall::BotUpdate(BotUpdate {
             bot,
+            name: None,
+            reset_model: false,
+            reset_thinking: false,
             full_access: None,
             full_access_consent: None,
             grants: None,
@@ -663,6 +689,9 @@ mod tests {
             old,
             CommandCall::BotUpdate(BotUpdate {
                 bot,
+                name: None,
+                reset_model: false,
+                reset_thinking: false,
                 full_access: None,
                 full_access_consent: None,
                 grants: None,
@@ -672,6 +701,93 @@ mod tests {
                 thinking: None,
             })
         );
+    }
+
+    #[test]
+    fn a_bot_update_can_reset_a_choice() {
+        let bot = Id::new();
+        let reset = CommandCall::BotUpdate(BotUpdate {
+            bot,
+            name: None,
+            reset_model: true,
+            reset_thinking: true,
+            full_access: None,
+            full_access_consent: None,
+            grants: None,
+            grant_add: None,
+            grant_remove: None,
+            model: None,
+            thinking: None,
+        });
+        let text = serde_json::to_string(&reset).unwrap();
+        assert!(text.contains("\"reset_model\":true"), "{text}");
+        assert!(text.contains("\"reset_thinking\":true"), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), reset);
+
+        // An update written before the flags sends neither: they read false,
+        // so such a client never clears a choice.
+        let old: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"bot_update\",\"args\":{{\"bot\":\"{bot}\",\"model\":\"{}\"}}}}",
+            Id::new()
+        ))
+        .unwrap();
+        let CommandCall::BotUpdate(old) = old else {
+            panic!("bot_update decodes to its parameters");
+        };
+        assert!(!old.reset_model);
+        assert!(!old.reset_thinking);
+    }
+
+    #[test]
+    fn a_bot_update_names_its_new_name_when_it_has_one() {
+        let bot = Id::new();
+        let named = CommandCall::BotUpdate(BotUpdate {
+            bot,
+            name: Some("Scout".to_owned()),
+            reset_model: false,
+            reset_thinking: false,
+            full_access: None,
+            full_access_consent: None,
+            grants: None,
+            grant_add: None,
+            grant_remove: None,
+            model: None,
+            thinking: None,
+        });
+        let text = serde_json::to_string(&named).unwrap();
+        assert!(text.contains("\"name\":\"Scout\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), named);
+
+        // A client written before the name field sends the old shape: an
+        // absent name leaves the Bot's name unchanged.
+        let old: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"bot_update\",\"args\":{{\"bot\":\"{bot}\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            old,
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                name: None,
+                reset_model: false,
+                reset_thinking: false,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            })
+        );
+    }
+
+    #[test]
+    fn model_default_round_trips() {
+        let command = CommandCall::ModelDefault { model: Id::new() };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"name\":\"model_default\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 
     #[test]

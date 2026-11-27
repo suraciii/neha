@@ -115,6 +115,18 @@ pub enum DeviceFrame {
         workspace: String,
         /// Whether commands run under a sandbox.
         sandbox: bool,
+        /// Whether the machine supports granted folders and a run directory.
+        ///
+        /// Absent in a greeting written before the capability was declared;
+        /// the Space then derives it from `sandbox`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supports_grants: Option<bool>,
+        /// Whether the machine supports a Bot's full access.
+        ///
+        /// Absent in a greeting written before the capability was declared;
+        /// the Space then derives it from `sandbox`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supports_full_access: Option<bool>,
     },
     /// Returns the result of an action.
     Result {
@@ -377,6 +389,8 @@ mod tests {
                     computer: "computer-1".to_owned(),
                     workspace: "/home/me/.neha/workspace".to_owned(),
                     sandbox: true,
+                    supports_grants: Some(true),
+                    supports_full_access: Some(false),
                 },
                 json!({
                     "type": "hello",
@@ -384,6 +398,8 @@ mod tests {
                     "computer": "computer-1",
                     "workspace": "/home/me/.neha/workspace",
                     "sandbox": true,
+                    "supports_grants": true,
+                    "supports_full_access": false,
                 }),
             ),
             (
@@ -467,6 +483,28 @@ mod tests {
                 },
                 ..
             } if write_roots.is_empty()
+        ));
+    }
+
+    #[test]
+    fn a_greeting_without_capabilities_leaves_them_to_the_sandbox() {
+        // A daemon written before the capability fields sends neither; the
+        // Space derives them from `sandbox` rather than reading a default.
+        let hello = serde_json::from_value::<DeviceFrame>(json!({
+            "type": "hello",
+            "version": 2,
+            "computer": "computer-1",
+            "workspace": "/home/me/.neha/workspace",
+            "sandbox": false,
+        }))
+        .unwrap();
+        assert!(matches!(
+            hello,
+            DeviceFrame::Hello {
+                supports_grants: None,
+                supports_full_access: None,
+                ..
+            }
         ));
     }
 

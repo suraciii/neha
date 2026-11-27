@@ -32,6 +32,12 @@ The catalog's `attachment` flag says a file can be attached, not that the Model 
 
 A Model that cannot call tools never enters the loop. The loop's tool schemas are its only way to act, so a text-only Model is refused before a step starts.
 
+## The default Model
+
+The record names one default Model for the whole Space, and an event that names one clears the mark on every other Model.
+
+The Admin's choice arrives as a `neha.provider.models_updated` event on the chosen Model's Provider, which re-states that Provider's Models and names the default one. The event changes no thinking level; the Space's default level comes from a Provider connection.
+
 ## Catalog
 
 The catalog is a versioned data file, not a record event. A build embeds a full models.dev snapshot, and a Space reads the cached copy under its home when one is usable. A failed fetch leaves the last known good catalog in place.

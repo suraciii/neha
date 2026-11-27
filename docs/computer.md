@@ -71,10 +71,12 @@ List the Computers you own:
 target/debug/neha computer list
 ```
 
-Each line gives one Computer's id, kind, online state, and workspace. The kind is `local` for a paired machine and `hosted` for one the Space runs. The pairing printed the new Computer's id; create a Bot on it:
+Each line gives one Computer's id, kind, online state, and workspace. The kind is `local` for a paired machine and `hosted` for one the Space runs. Put your Local Computer's id from the list above in `COMPUTER_ID`, and create a Bot on it:
 
 ```bash
-target/debug/neha bot create Runner --computer <computer-id>
+COMPUTER_ID="<the id of your Local Computer>"
+target/debug/neha bot create Runner --computer "$COMPUTER_ID"
+RUNNER_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
 ```
 
 `--computer` takes `local`, `hosted`, or a Computer id:
@@ -92,7 +94,7 @@ Without `--computer`, a new Bot starts on a Hosted Computer; `--computer local` 
 Ask the Bot to work and check where the work ran:
 
 ```bash
-target/debug/neha chat send --bot <bot-id> "pwd; echo hi > a.txt"
+target/debug/neha chat send --bot "$RUNNER_ID" "pwd; echo hi > a.txt"
 ```
 
 The first action on this Local Computer asks for approval in the Chat: the Bot waits until you Allow or Deny, and the first use has no Always allow. Each Local Computer asks once for each Bot and User, so a Bot moved to another Local Computer asks again there. [Approvals](approvals.md) covers the card and the commands.
@@ -151,10 +153,12 @@ On Linux, a machine whose `bubblewrap` cannot start a sandbox does not serve as 
 
 ## Moving a Bot
 
-Move a Bot from one of your Local Computers to another:
+Move a Bot from one of your Local Computers to another. The target is the other machine, so its id is not the `COMPUTER_ID` you created the Bot with:
 
 ```bash
-target/debug/neha bot move <bot-id> --computer <computer-id>
+BOT_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
+COMPUTER_ID="<the id of the other Local Computer>"
+target/debug/neha bot move "$BOT_ID" --computer "$COMPUTER_ID"
 ```
 
 The command prints the Computer the Bot now works on. The Bot's memory, its Chats, and the Files it delivered stay with it.
@@ -229,11 +233,12 @@ The machine ends the command it was running when the channel drops, so no action
 A Local Bot starts in its own Workspace and may write only there. The owner can widen that with `neha bot grant` and `neha bot full-access`:
 
 ```sh
-neha bot access <bot-id>
-neha bot grant <bot-id> /data/shared
-neha bot revoke <bot-id> /data/shared
-neha bot full-access <bot-id> on
-neha bot full-access <bot-id> off
+BOT_ID=$(neha bot list | awk '$2 == "Runner" {print $1; exit}')
+neha bot access "$BOT_ID"
+neha bot grant "$BOT_ID" /data/shared
+neha bot revoke "$BOT_ID" /data/shared
+neha bot full-access "$BOT_ID" on
+neha bot full-access "$BOT_ID" off
 ```
 
 `neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. The path is trimmed once where you type it, and a folder name that ends in a space is its own folder: `logs` and `logs ` are different. `neha bot revoke <bot-id> <path>` takes one away, and it also takes away a grant whose folder is gone, matching the path `neha bot access <bot-id>` shows. A revoke compares the path exactly as you spell it first, so keep a trailing space by quoting the path: `neha bot revoke <bot-id> '/data/logs '` takes the grant for `/data/logs ` and leaves `/data/logs` alone. `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this. Each run fixes the access when it starts, so a change made while a run works applies to the next run.
@@ -247,7 +252,7 @@ In granted mode on Linux a `write_file` action that would write outside the Bot'
 A run can start its actions in another directory with `neha chat send --cwd`:
 
 ```sh
-neha chat send --bot <bot-id> --cwd /data/project "review the notes here"
+neha chat send --bot "$BOT_ID" --cwd /data/project "review the notes here"
 ```
 
 On a Local Computer, `--cwd` names the directory the run starts in; without it the run starts in the Bot's Workspace. A Hosted Computer runs only in the Bot's own Workspace, and a run that names another directory fails. The directory must be absolute, must already exist, and must be a folder. A directory whose name ends in a space is typed with a trailing `/.`, which folds away and keeps the space: `--cwd '/data/logs /.'` records `/data/logs `. A path that ends in the space itself is trimmed and names the folder next to it.

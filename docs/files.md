@@ -31,7 +31,8 @@ target/debug/neha chat send --file todo.txt
 With several Chats, name the Chat or the Bot as for any `chat send`:
 
 ```bash
-target/debug/neha chat send --file notes.txt --bot <bot-id> "Summarize this file."
+BOT_ID=$(target/debug/neha bot list | awk '$2 == "Scout" {print $1; exit}')
+target/debug/neha chat send --file notes.txt --bot "$BOT_ID" "Summarize this file."
 ```
 
 The Space records a File as soon as it has the file's bytes; the Message carries it after that. When a Message then fails to send, the File is in the Chat's list already, and `neha chat files` shows it.
@@ -56,7 +57,8 @@ Each line shows one File's id, name, size, and media type. `neha chat read <chat
 Download a File:
 
 ```bash
-target/debug/neha file get <file-id>
+FILE_ID=$(target/debug/neha chat files | awk '$2 == "notes.txt" {print $1; exit}')
+target/debug/neha file get "$FILE_ID"
 ```
 
 The command prints the path it wrote. Where the File goes follows `--out`:
@@ -66,7 +68,7 @@ The command prints the path it wrote. Where the File goes follows `--out`:
 - With an existing directory, the File is written inside it under the name the Space gave it.
 
 ```bash
-target/debug/neha file get <file-id> --out summary.md
+target/debug/neha file get "$FILE_ID" --out summary.md
 ```
 
 ## Send and download in the browser

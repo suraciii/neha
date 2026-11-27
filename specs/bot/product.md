@@ -22,21 +22,27 @@ A Bot works once the Space has a Provider.
 
 ## The Bot's page
 
-A Bot has a page with its name, picture, Computer, access, and Model. The owner edits all of them; other Users read them.
+A Bot has a page with its name, picture, Computer, access, and Model. The owner edits them; other Users read them.
 
 | Field | What it holds | Who changes it |
 | --- | --- | --- |
-| Name | The Bot's name | The owner |
+| Name | The Bot's name | The owner, on the page or with `neha bot rename` |
 | Picture | The Bot's avatar | The owner |
-| Computer | The Hosted or Local Computer it lives on | The owner |
-| Access | Who else can use it: only the owner, everyone, or named Users | The owner |
-| Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner |
+| Computer | The Hosted or Local Computer it lives on | The owner, on the page or with `neha bot move` |
+| Access | Who else can use the Bot, the folders it can write, whether it has full access, and its Ask and Allow rules | The owner |
+| Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner; the Admin sets the Space's default |
 
-[Model](../model/product.md) covers connecting Providers and choosing a Model.
+The page shows what the Bot can reach on its Computer: the granted folders, full access, and the rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.
+
+The owner chooses the Bot's Model and thinking level, and clears each back to the Space's default. A clear and a choice for the same field in one change are refused, so the result never depends on their order. [Model](../model/product.md) covers connecting Providers and choosing a Model.
+
+A change to the Bot's Model or its thinking level leaves the Bot able to run: the Space refuses one that leaves a thinking level the Model cannot serve, and names the reset that fixes it.
 
 ## Moving a Bot
 
 [Computer](../computer/product.md#assigning-a-computer) covers who can move a Bot and where. Its memory, its Chats, and the Files it delivered stay with it, and it starts in its own Workspace on the new Computer. Work it did not deliver stays on the old Computer.
+
+A move to a Computer that does not serve the access the Bot carries is refused, and the refusal names what to revoke or turn off first. A Bot that moves keeps its grants and its full access, and they mean the same on the new Computer.
 
 ## Memory
 
@@ -98,7 +104,11 @@ An Always allow covers the same tool and either a shell command that starts with
 
 A file at the Workspace root makes the covered directory the Workspace root, so relative paths in the Workspace are covered and absolute ones are not. The first use of a Local Computer offers no Always allow, and no lasting rule covers it.
 
+An Always allow that would grant a folder is refused when the Bot's Computer serves no grants, and the approval still waits for an answer.
+
 An Ask rule makes the Bot ask before a kind of action, and an Allow rule lets it proceed without asking. Which rule wins, which forms a rule cannot judge, and what an Always allow writes follow [design](design.md#approvals).
+
+A rule belongs to a Bot on a Local Computer. A Bot on a Hosted Computer takes no rule: a Hosted Computer does not ask before an action yet, so the Space refuses one rather than record it.
 
 While a Bot waits for an answer, its other work goes on.
 
@@ -160,3 +170,5 @@ The owner shares a Bot as a template: a link that admits any User of the Space t
 - The Bot's page does not show approvals yet.
 - An independent reviewer of approvals is not yet specified.
 - A template shared across Spaces is not yet specified.
+- Changing a Bot's picture is not yet available; a Bot's picture is the initials of its name, and a User cannot upload or replace one.
+- Changing who else can use a Bot is not yet available; it arrives when a Bot is shared among several Users.

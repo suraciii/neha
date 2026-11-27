@@ -10,6 +10,9 @@ vi.mock("./lib/ws", async (importOriginal) => ({
 }));
 
 // The client at a phone width: the Chat list is the page until a Chat opens.
+// The shell names the layout by what the main area holds rather than by a Chat
+// alone: a management page is a detail of its list the same way, so the merged
+// client carries one class for both.
 function mobile() {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
@@ -31,21 +34,21 @@ describe("the mobile client", () => {
     const view = renderApp();
 
     await waitFor(() => expect(view.container.querySelector(".conv")).toBeTruthy());
-    expect(view.container.querySelector(".app--chat")).toBeNull();
+    expect(view.container.querySelector(".app--detail")).toBeNull();
     const before = history.length;
 
     fireEvent.click(element(view, ".conv"));
-    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+    await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
     expect(history.state?.nehaChat).toBe(space.chat.id);
     // A push, not a replace, so the entry has somewhere to go back to.
     expect(history.length).toBe(before + 1);
 
     history.back();
-    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeNull());
+    await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeNull());
 
     // Forward reopens the Chat its entry names.
     history.forward();
-    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+    await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
   });
 
   it("restores an open Chat from its history entry after a reload", async () => {
@@ -54,7 +57,7 @@ describe("the mobile client", () => {
     mobile();
     const view = renderApp();
 
-    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+    await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
     expect(history.state?.nehaChat).toBe(space.chat.id);
     expect(history.length).toBe(before);
   });
@@ -80,7 +83,7 @@ describe("the mobile client", () => {
     });
     const view = renderApp();
 
-    await waitFor(() => expect(view.container.querySelector(".app--chat")).toBeTruthy());
+    await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
     expect(history.state?.nehaChat ?? null).toBeNull();
 
     narrow = true;

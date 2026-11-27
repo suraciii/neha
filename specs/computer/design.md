@@ -33,6 +33,12 @@ The Space sends each action with an id, and the Computer answers that id with th
 
 A connection that ends makes every action in flight unknown. The process reconnects while it runs, and the Space shows the Computer offline until it does.
 
+The greeting a Computer sends when its channel opens states whether its machine serves granted folders, whether it serves a Bot's full access, and whether it fences a Bot's run. A greeting that names neither takes both from its `sandbox` flag: a machine that fences its Bots serves both, and one that does not serves neither.
+
+The Space keeps the statement after the Computer's channel drops, and its view carries it. Before a Computer's first greeting in this Space's process the Space knows nothing about its access, and shows and allows none of it. A client offers only the access the statement names, and a command that widens access past it is refused.
+
+The view also names whether the machine fences a Bot's run, and it names nothing at all before the first greeting. A Computer that has not answered is not a Computer without a fence, so a client that knows nothing says it waits and claims nothing about what a Bot's shell runs as.
+
 ## The machine
 
 A Local Computer runs on the machine where Neha runs, which its owner paired. A Hosted Computer runs in a sandbox on the Space's machine.

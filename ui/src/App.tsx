@@ -1,10 +1,12 @@
 import { Show, createMemo, createSignal, createStore, onCleanup, onSettled } from "solid-js";
 
 import AuthView from "./components/AuthView";
+import BotPage from "./components/BotPage";
 import ChatView from "./components/ChatView";
-import Rail from "./components/Rail";
+import Rail, { type RailView } from "./components/Rail";
+import SettingsPage from "./components/SettingsPage";
 import SetupView from "./components/SetupView";
-import Sidebar from "./components/Sidebar";
+import Sidebar, { type SettingsSection } from "./components/Sidebar";
 import { t, type MessageKey } from "./i18n";
 import { api, ApiError } from "./lib/api";
 import { MAX_FILE_BYTES,
@@ -16,6 +18,10 @@ import type {
   Approval,
   AttentionEntry,
   Bot,
+  BotResult,
+  CatalogRefreshResult,
+  CatalogStatus,
+  CatalogVendor,
   Chat,
   ChatStatus,
   Computer,
@@ -23,19 +29,24 @@ import type {
   FileSummary,
   Message,
   Model,
+  Preview,
   Provider,
   ProviderResult,
-  BotResult,
-  Preview,
   RecordEvent,
+  Rule,
   RunActivity,
   RunProgress,
   RunView,
   SendResult,
+  ThinkingLevel,
   ToolAction,
 } from "./types";
 
 type AuthMode = "join" | "login" | "missing-invite";
+
+// The answer a full-access switch carries: the version of the risk the owner
+// agreed to. A client that names an older one cannot widen a Bot's access.
+const FULL_ACCESS_CONSENT = 1;
 
 // Where the followed Run is: in the queue, working, or waiting for an approval.
 type RunStep = "queued" | "running" | "waiting";
@@ -142,6 +153,19 @@ interface State {
   deciding: string | null;
   busy: boolean;
   error: unknown | null;
+  // The Bot page: the Bot on screen, the Computer it works on, the Computers it
+  // may move to, and the rules that hold it.
+  pageBot: Bot | null;
+  pageComputer: Computer | null;
+  computers: Computer[];
+  rules: Rule[];
+  // The Settings surface: every vendor the catalog knows, and the cache state.
+  vendors: CatalogVendor[];
+  catalog: CatalogStatus | null;
+  // A management read or write is in flight.
+  managing: boolean;
+  // What the last failed management command said.
+  manageError: unknown | null;
 }
 
 // The state a page starts from. Each page builds its own, so the containers one
@@ -168,6 +192,14 @@ function emptyState(): State {
     deciding: null,
     busy: false,
     error: null,
+    pageBot: null,
+    pageComputer: null,
+    computers: [],
+    rules: [],
+    vendors: [],
+    catalog: null,
+    managing: false,
+    manageError: null,
   };
 }
 
@@ -198,8 +230,36 @@ export default function App() {
   const [authMode, setAuthMode] = createSignal<AuthMode>("login");
   const [authSecret, setAuthSecret] = createSignal("");
   const [isMobile, setIsMobile] = createSignal(false);
-  // What the rail selected: the Chats, or the approvals that wait for the User.
-  const [view, setView] = createSignal<"chats" | "attention">("chats");
+  // What the rail selected: the Chats, the approvals that wait, or one of the
+  // management surfaces.
+  const [view, setView] = createSignal<RailView>("chats");
+  // What the Settings surface shows.
+  const [section, setSection] = createSignal<SettingsSection>("providers");
+  // Whether the Settings surface has a section open. A narrow viewport shows
+  // one surface at a time, so opening Settings shows the list of sections and
+  // choosing one opens its detail, with Back returning to the list. A wide
+  // viewport shows the list beside the detail, so this only says which of the
+  // two a narrow one is looking at.
+  const [sectionOpen, setSectionOpen] = createSignal(false);
+  // The Bot whose page is open, so a read that lands late can tell.
+  const [pageBotId, setPageBotId] = createSignal<string | null>(null);
+  // Which opening of a Bot page the User is on. A write that lands after they
+  // opened another Bot belongs to the page they left, so every answer checks
+  // this before it writes: the User may have moved on while it was on its way.
+  // It counts openings rather than naming a Bot, so opening the same Bot again
+  // drops what the first opening asked for. Nothing renders from it, so it is a
+  // plain count rather than a signal.
+  let pageGen = 0;
+  // The management surfaces the User came through, oldest first, so Back
+  // returns to the one before the surface they are leaving: a narrow viewport
+  // shows one surface at a time.
+  const [manageTrail, setManageTrail] = createSignal<RailView[]>([]);
+
+  // Remembers a surface Back will return to. The same surface twice in a row is
+  // one step, not two.
+  function pushTrail(entry: RailView) {
+    setManageTrail((trail) => (trail[trail.length - 1] === entry ? trail : [...trail, entry]));
+  }
   // The approval the User asked to see, so its Chat scrolls to its card.
   const [focus, setFocus] = createSignal<string | null>(null);
   const commands = new Commands();
@@ -752,6 +812,35 @@ export default function App() {
       event.kind === "neha.provider.added"
     ) {
       void loadWorkspace();
+      // A Computer another client paired is one the Settings surface lists.
+      if (event.kind === "neha.computer.created") void refreshComputers();
+      return;
+    }
+    // A Bot's page reads its own Bot, its Computers, and its rules again, so a
+    // change another client made shows without a reload.
+    if (
+      event.kind === "neha.bot.updated" ||
+      event.kind === "neha.bot.moved" ||
+      event.kind === "neha.bot.renamed"
+    ) {
+      void refreshBots();
+      const opened = pageBotId();
+      if (opened) void reloadPageBot(opened);
+      // A rename renames the Chat on screen too: its header names the Bot, so
+      // it shows the new name without waiting for a read.
+      const name = typeof data.name === "string" ? data.name : null;
+      const bot = typeof data.bot === "string" ? data.bot : null;
+      if (bot !== null && name !== null && state.activeBot?.id === bot) {
+        update({ activeBot: { ...state.activeBot, name } });
+      }
+      return;
+    }
+    if (event.kind === "neha.rule.added" || event.kind === "neha.rule.removed") {
+      void refreshRules();
+      return;
+    }
+    if (event.kind === "neha.provider.models_updated") {
+      void refreshProviders();
       return;
     }
     const run = typeof data.run === "string" ? data.run : null;
@@ -766,10 +855,10 @@ export default function App() {
       // belongs to that Run's work: only a Bot reply does. A File the User
       // uploaded is theirs, and a File another Run of the same Bot made is
       // that Run's.
-      if (event.author.kind === "bot" && carried && run && chat === state.activeChat?.id && isFollowing(run)) {
+      if (event.author.kind === "bot" && carried && run && readsChat(chat) && isFollowing(run)) {
         noteFile(run, carried);
       }
-      if (event.author.kind === "bot" && chat !== state.activeChat?.id) markUnread(chat);
+      if (event.author.kind === "bot" && !readsChat(chat)) markUnread(chat);
     }
     if (event.kind === "neha.run.queued") {
       if (run && chat) {
@@ -856,6 +945,10 @@ export default function App() {
       queueRefresh();
     }
   }
+
+  // A Chat the User is reading. A management surface leaves the Chat open, but
+  // the User is not reading it there, so its new activity is still new.
+  const readsChat = (chat: string) => view() === "chats" && state.activeChat?.id === chat;
 
   // A Bot Message that arrived while another Chat was on screen is new activity
   // for that Chat. Opening it answers the mark.
@@ -1373,9 +1466,394 @@ export default function App() {
     backToList();
   }
 
+  // Reads the Bot list again, so a rename or a move shows in the sidebar.
+  async function refreshBots() {
+    try {
+      const bots = await commands.command<Bot[]>("bot_list");
+      update({ bots: [...bots].sort((left, right) => left.id.localeCompare(right.id)) });
+    } catch {
+      // A failed read keeps the list the page already shows.
+    }
+  }
+
+  // Opens one Bot's page: the Bot, its Computer, the Computers it may move to,
+  // its Models, and its rules.
+  async function selectPageBot(bot: Bot) {
+    // A Bot's page is a step deeper than the surface it was opened from, so Back
+    // returns to that surface.
+    pushTrail(view());
+    pageGen += 1;
+    setPageBotId(bot.id);
+    update({ pageBot: null, pageComputer: null, rules: [], manageError: null, managing: true });
+    await reloadPageBot(bot.id);
+  }
+
+  // Everything one Bot's page shows, read together so the Bot, its Computer,
+  // the Computers it may move to, its Models, and its rules are one answer
+  // rather than reads that can disagree with each other.
+  async function readBotPage(id: string) {
+    const [shown, computers, models, rules] = await Promise.all([
+      commands.command<BotResult>("bot_show", { bot: id }),
+      commands.command<Computer[]>("computer_list"),
+      commands.command<Model[]>("model_list"),
+      commands.command<Rule[]>("rule_list", { bot: id }),
+    ]);
+    return {
+      pageBot: shown.bot,
+      pageComputer: shown.computer,
+      computers,
+      models,
+      rules,
+    };
+  }
+
+  // Reads the Bot page again from the Space. A read that lands after the User
+  // opened another Bot is dropped.
+  async function reloadPageBot(id: string) {
+    const gen = pageGen;
+    update({ managing: true });
+    try {
+      const page = await readBotPage(id);
+      if (gen !== pageGen) return;
+      update({ ...page, managing: false });
+    } catch (reason) {
+      if (gen !== pageGen) return;
+      update({ manageError: reason, managing: false });
+    }
+  }
+
+  // Sends one Bot change and reads the Bot again, so the page shows what the
+  // Space holds. It answers whether the Space accepted the change.
+  async function updateBot(patch: Record<string, unknown>): Promise<boolean> {
+    const id = state.pageBot?.id;
+    if (!id) return false;
+    const gen = pageGen;
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("bot_update", { bot: id, ...patch });
+      // A write that lands after the User opened another Bot is dropped: the
+      // page it would write belongs to a Bot the User is no longer reading. The
+      // answer is checked again before the page is written, because the User
+      // may have moved on while the second read was on its way.
+      if (gen !== pageGen) return false;
+      const page = await readBotPage(id);
+      if (gen !== pageGen) return false;
+      update({ ...page, managing: false });
+      await refreshBots();
+      return true;
+    } catch (reason) {
+      if (gen !== pageGen) return false;
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  async function renameBot(name: string) {
+    await updateBot({ name });
+  }
+
+  // Sends only what changed: a Bot without its own Model or level follows the
+  // Space's default, and an absent field leaves the Bot's own choice alone.
+  // Going back to the default is a field of its own, because an absent Model or
+  // level leaves the choice alone.
+  async function saveBotModel(model: string | null, thinking: ThinkingLevel | null) {
+    const patch: Record<string, unknown> = {};
+    if (model !== (state.pageBot?.model ?? null)) {
+      if (model === null) patch.reset_model = true;
+      else patch.model = model;
+    }
+    if (thinking !== (state.pageBot?.thinking ?? null)) {
+      if (thinking === null) patch.reset_thinking = true;
+      else patch.thinking = thinking;
+    }
+    if (Object.keys(patch).length === 0) return;
+    await updateBot(patch);
+  }
+
+  async function grantFolder(path: string) {
+    await updateBot({ grant_add: path });
+  }
+
+  async function dropGrant(path: string) {
+    await updateBot({ grant_remove: path });
+  }
+
+  // Widening a Bot's access carries the owner's answer at the current consent
+  // version; an older client cannot turn full access on without it.
+  async function setFullAccess(on: boolean) {
+    const consent = on ? { full_access: true, full_access_consent: FULL_ACCESS_CONSENT } : { full_access: false };
+    await updateBot(consent);
+  }
+
+  async function moveBotTo(computer: string) {
+    const id = state.pageBot?.id;
+    if (!id) return;
+    const gen = pageGen;
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("bot_move", { bot: id, computer });
+      if (gen !== pageGen) return;
+      const page = await readBotPage(id);
+      if (gen !== pageGen) return;
+      update({ ...page, managing: false });
+      await refreshBots();
+    } catch (reason) {
+      if (gen !== pageGen) return;
+      update({ manageError: reason, managing: false });
+    }
+  }
+
+  async function resetWorkspace() {
+    // The Bot on screen names its Computer, which is the one the reset clears.
+    // Reading it from the page's own Bot keeps the reset on the Computer the
+    // User asked about, whichever Bot they have opened since.
+    const computer = state.pageBot?.computer;
+    if (!computer) return;
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("computer_reset", { computer });
+      update({ managing: false });
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+    }
+  }
+
+  // Reads the Computers this Space can use, which the Settings surface lists and
+  // a Bot page moves between.
+  async function refreshComputers() {
+    try {
+      const computers = await commands.command<Computer[]>("computer_list");
+      update({ computers });
+    } catch {
+      // A failed read keeps the Computers the page already shows.
+    }
+  }
+
+  // Clears a Hosted Computer's Workspace from the Computers list, which is
+  // where an Admin finds one before they know which Bot works on it.
+  async function resetComputer(computer: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("computer_reset", { computer });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Opens one Bot's page from a Computer in the Settings surface, leaving the
+  // Settings where Back returns to.
+  function openBotPage(bot: Bot) {
+    void selectPageBot(bot);
+    setView("bots");
+  }
+
+  // Reads one Bot's rules again, so a change shows without a page reload. A
+  // read that lands after the User opened another Bot is dropped.
+  async function refreshRules() {
+    const id = state.pageBot?.id;
+    if (!id) return;
+    const gen = pageGen;
+    try {
+      const rules = await commands.command<Rule[]>("rule_list", { bot: id });
+      if (gen !== pageGen) return;
+      update({ rules });
+    } catch {
+      // A failed read keeps the rules the page already shows.
+    }
+  }
+
+  // Sends one rule change and reads the Bot's rules again, so a change shows
+  // without a page reload. A write that lands after the User opened another Bot
+  // is dropped: the rules it would write belong to a Bot the User is not
+  // reading, and they may have moved on while the second read was on its way.
+  async function writeRule(
+    id: string,
+    name: "rule_add" | "rule_remove",
+    args: Record<string, unknown>,
+  ) {
+    const gen = pageGen;
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command(name, args);
+      if (gen !== pageGen) return;
+      const rules = await commands.command<Rule[]>("rule_list", { bot: id });
+      if (gen !== pageGen) return;
+      update({ rules, managing: false });
+    } catch (reason) {
+      if (gen !== pageGen) return;
+      update({ manageError: reason, managing: false });
+    }
+  }
+
+  async function addRule(rule: {
+    effect: Rule["effect"];
+    tool: string;
+    command_prefix: string | null;
+    path_prefix: string | null;
+  }) {
+    const id = state.pageBot?.id;
+    if (!id) return;
+    await writeRule(id, "rule_add", { bot: id, ...rule });
+  }
+
+  async function removeRule(rule: string) {
+    const id = state.pageBot?.id;
+    if (!id) return;
+    await writeRule(id, "rule_remove", { rule });
+  }
+
+  // Reads the catalog's vendors and its cache state, which is what the Settings
+  // surface connects from and shows.
+  async function loadSettings() {
+    update({ managing: true, manageError: null });
+    try {
+      const [vendors, catalog, computers] = await Promise.all([
+        commands.command<CatalogVendor[]>("catalog_list"),
+        commands.command<CatalogStatus>("catalog_status"),
+        commands.command<Computer[]>("computer_list"),
+      ]);
+      update({ vendors, catalog, computers, managing: false });
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+    }
+  }
+
+  // Reads the Providers and their Models again after a change to either.
+  async function refreshProviders() {
+    try {
+      const [providers, models] = await Promise.all([
+        commands.command<Provider[]>("provider_list"),
+        commands.command<Model[]>("model_list"),
+      ]);
+      update({ providers, models });
+    } catch {
+      // A failed read keeps the lists the page already shows.
+    }
+  }
+
+  async function connectVendor(input: {
+    vendor: string;
+    apiKey: string;
+    baseUrl: string | null;
+    protocol: string | null;
+    thinking: ThinkingLevel | null;
+  }): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      const args: Record<string, unknown> = { vendor: input.vendor, api_key: input.apiKey };
+      if (input.baseUrl) args.base_url = input.baseUrl;
+      if (input.protocol) args.protocol = input.protocol;
+      if (input.thinking) args.thinking = input.thinking;
+      await commands.command<ProviderResult>("provider_connect", args);
+      await refreshProviders();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  async function refreshProviderModels(provider: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("provider_refresh", { provider });
+      await refreshProviders();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  async function makeDefaultModel(model: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("model_default", { model });
+      await refreshProviders();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  async function refreshCatalog(): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<CatalogRefreshResult>("catalog_refresh");
+      update({ catalog: answer.status, managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Opens a management surface, reading what it shows before it appears. The
+  // surface the User is leaving goes on the trail, so Back returns to it: a
+  // narrow viewport shows one surface at a time.
+  function openManage(next: RailView) {
+    // The surface the User is leaving is the one Back returns to.
+    if (view() === "bots" || view() === "settings") pushTrail(view());
+    // Opening the Settings surface again starts from its list of sections, so
+    // every section stays reachable on a viewport that shows one surface.
+    if (next === "settings") setSectionOpen(false);
+    setView(next);
+    update({ manageError: null });
+    if (next === "settings") void loadSettings();
+  }
+
+  // Leaves a management surface for the one before it, with no Bot selected.
+  // The Chats are where the trail runs out.
+  function closeManage() {
+    // A Settings section is a step inside its surface, not a surface of its own:
+    // Back leaves the section for the list of sections first, so a viewport that
+    // shows one surface at a time still reaches every section.
+    if (view() === "settings" && sectionOpen()) {
+      setSectionOpen(false);
+      return;
+    }
+    // The page is closing, so a read it asked for belongs to a page that is gone:
+    // the count moves on, and the answer is dropped when it lands.
+    pageGen += 1;
+    const trail = manageTrail();
+    setManageTrail(trail.slice(0, -1));
+    const back = trail[trail.length - 1] ?? "chats";
+    setView(back);
+    // Coming back to the Settings surface keeps the section that was open, so a
+    // Bot opened from a section returns to that section. Leaving it forgets the
+    // section, so the surface opens on its list next time.
+    if (back !== "settings") setSectionOpen(false);
+    setPageBotId(null);
+    update({ pageBot: null, pageComputer: null, manageError: null });
+  }
+
   const errorText = () => (state.error ? messageFor(state.error) : null);
+  // What a failed management command says, in the User's words.
+  const manageErrorText = () => (state.manageError ? messageFor(state.manageError) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
+  // A management surface fills the main area once it has something to show, so
+  // a narrow viewport shows one surface at a time with a Back action.
+  const showManage = () => view() === "bots" || view() === "settings";
+  const showPage = () =>
+    (view() === "settings" && sectionOpen()) || (view() === "bots" && state.pageBot !== null);
+  // The main area holds a detail rather than a list: on a narrow viewport that is
+  // the one surface on screen and the sidebar is the one hidden. Which of the two
+  // is on screen follows the rail view, not what is open behind it: a Chat left
+  // open must not hide the list of the surface the User just opened.
+  const showDetail = () => (showManage() ? showPage() : showChat());
+  // The setup view fills the main area too, so the sidebar is the one hidden —
+  // unless a management surface is open, where its list is how a Space with no
+  // Provider yet gets one.
+  const showSetup = () => needsSetup() && !showManage();
 
   // What each Chat is doing, for the list and the attention section.
   const chatStates = createMemo<Record<string, ChatStatus>>(() => {
@@ -1458,12 +1936,17 @@ export default function App() {
           }
         >
         {(account) => (
-          <div class={`app${showChat() ? " app--chat" : ""}${needsSetup() ? " app--setup" : ""}`}>
+          <div
+            class={`app${showDetail() ? " app--detail" : ""}${showSetup() ? " app--setup" : ""}`}
+          >
             <Rail
               account={account()}
               view={view()}
               attentionCount={attentionEntries().length}
-              onSelect={(next) => setView(next)}
+              onSelect={(next) => {
+                if (next === "bots" || next === "settings") openManage(next);
+                else setView(next);
+              }}
             />
             <Sidebar
               account={account()}
@@ -1475,58 +1958,123 @@ export default function App() {
               unread={state.unread}
               attention={attentionEntries()}
               attentionOpen={view() === "attention"}
+              view={view()}
+              activeBot={pageBotId()}
+              section={section()}
               onSelect={(chat) => {
                 setView("chats");
                 void selectChat(chat);
               }}
               onAttention={(entry) => openAttention(entry)}
+              onBot={(bot) => void selectPageBot(bot)}
+              onSection={(next) => {
+                setSection(next);
+                setSectionOpen(true);
+              }}
             />
             <main class="main">
-              <Show
-                when={showChat() ? state.activeChat?.id : null}
-                keyed
-                fallback={
+              <Show when={showManage()}>
+                <Show when={view() === "bots"}>
                   <Show
-                    when={needsSetup()}
+                    when={state.pageBot}
                     fallback={
                       <div class="select-chat">
-                        <h2>{t("select.title")}</h2>
+                        <h2>{t("bots.select.title")}</h2>
                       </div>
                     }
                   >
-                    <SetupView
-                      account={account()}
-                      providers={state.providers}
-                      models={state.models}
-                      bots={state.bots}
-                      busy={state.busy}
-                      error={errorText()}
-                      onProvider={(input) => void connectProvider(input)}
-                      onBot={(name) => void createBot(name)}
-                    />
+                    {(bot) => (
+                      <BotPage
+                        bot={bot()}
+                        computer={state.pageComputer}
+                        computers={state.computers}
+                        models={state.models}
+                        rules={state.rules}
+                        busy={state.managing}
+                        error={manageErrorText()}
+                        onBack={closeManage}
+                        onRename={(name) => renameBot(name)}
+                        onModel={(model, thinking) => saveBotModel(model, thinking)}
+                        onGrantAdd={(path) => grantFolder(path)}
+                        onGrantRemove={(path) => dropGrant(path)}
+                        onFullAccess={(on) => setFullAccess(on)}
+                        onMove={(computer) => moveBotTo(computer)}
+                        onReset={() => resetWorkspace()}
+                        onRuleAdd={(rule) => addRule(rule)}
+                        onRuleRemove={(rule) => removeRule(rule)}
+                      />
+                    )}
                   </Show>
-                }
-              >
-                <ChatView
-                  account={account()}
-                  bot={state.activeBot}
-                  computer={state.activeComputer}
-                  messages={state.messages}
-                  files={state.files}
-                  approvals={state.approvals}
-                  submitting={state.submitting}
-                  status={chatStatus()}
-                  queue={state.queue}
-                  busy={busyChat()}
-                  activity={shownActivity()}
-                  focus={focus()}
-                  onFocused={() => setFocus(null)}
-                  deciding={state.deciding}
-                  error={errorText()}
-                  onSend={sendMessage}
-                  onDecide={decideApproval}
-                  onBack={closeChat}
-                />
+                </Show>
+                <Show when={view() === "settings"}>
+                  <SettingsPage
+                    account={account()}
+                    providers={state.providers}
+                    models={state.models}
+                    computers={state.computers}
+                    bots={state.bots}
+                    vendors={state.vendors}
+                    catalog={state.catalog}
+                    section={section()}
+                    busy={state.managing}
+                    error={manageErrorText()}
+                    onBack={closeManage}
+                    onReset={(computer) => resetComputer(computer)}
+                    onOpenBot={(bot) => openBotPage(bot)}
+                    onConnect={(input) => connectVendor(input)}
+                    onRefresh={(provider) => refreshProviderModels(provider)}
+                    onDefault={(model) => makeDefaultModel(model)}
+                    onCatalog={() => refreshCatalog()}
+                  />
+                </Show>
+              </Show>
+              <Show when={!showManage()}>
+                <Show
+                  when={showChat() ? state.activeChat?.id : null}
+                  keyed
+                  fallback={
+                    <Show
+                      when={needsSetup()}
+                      fallback={
+                        <div class="select-chat">
+                          <h2>{t("select.title")}</h2>
+                        </div>
+                      }
+                    >
+                      <SetupView
+                        account={account()}
+                        providers={state.providers}
+                        models={state.models}
+                        bots={state.bots}
+                        busy={state.busy}
+                        error={errorText()}
+                        onProvider={(input) => void connectProvider(input)}
+                        onBot={(name) => void createBot(name)}
+                      />
+                    </Show>
+                  }
+                >
+                  <ChatView
+                    account={account()}
+                    bot={state.activeBot}
+                    computer={state.activeComputer}
+                    messages={state.messages}
+                    files={state.files}
+                    approvals={state.approvals}
+                    submitting={state.submitting}
+                    status={chatStatus()}
+                    queue={state.queue}
+                    busy={busyChat()}
+                    activity={shownActivity()}
+                    focus={focus()}
+                    onFocused={() => setFocus(null)}
+                    deciding={state.deciding}
+                    error={errorText()}
+                    onSend={sendMessage}
+                    onDecide={decideApproval}
+                    onBack={closeChat}
+                  />
+                </Show>
               </Show>
             </main>
           </div>
@@ -1666,7 +2214,9 @@ function messageFor(reason: unknown): string {
   }
   if (reason instanceof ProtocolError) {
     if (reason.code === "unauthorized") return t("error.session");
+    if (reason.code === "forbidden") return t("error.permission");
     if (reason.code === "not_found") return t("error.record");
+    if (reason.code === "invalid_argument") return t("error.invalid");
     if (
       reason.code === "closed" ||
       reason.code === "network" ||
@@ -1679,6 +2229,7 @@ function messageFor(reason: unknown): string {
   }
   if (reason instanceof ApiError) {
     if (reason.code === "unauthorized") return t("error.session");
+    if (reason.code === "forbidden") return t("error.permission");
     if (reason.code === "not_found") return t("error.record");
     if (reason.code === "rate_limited") return t("error.rate");
     if (reason.code === "invalid_argument" && /password/i.test(reason.message)) {
