@@ -59,6 +59,16 @@ impl AccessCapabilities {
         grants: true,
         full_access: true,
     };
+
+    /// What a Local Computer can serve until its handshake says otherwise.
+    ///
+    /// A Space restart forgets what a machine declared; until the daemon
+    /// reconnects the machine is treated as serving none of it, so no recorded
+    /// command widens access the Space cannot ask about.
+    pub const UNSUPPORTED: Self = Self {
+        grants: false,
+        full_access: false,
+    };
 }
 
 /// What a request waits for.

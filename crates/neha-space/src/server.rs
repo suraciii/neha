@@ -1743,6 +1743,23 @@ fn allows_unsandboxed(value: Option<&str>) -> bool {
 /// Bots. The channel then registers, the run queue wakes, and frames flow both
 /// ways until the connection drops, the Computer stays silent for too long, or
 /// the Computer breaks the protocol.
+/// Returns the access a Computer's greeting declares.
+///
+/// A greeting written before the capability fields takes them from its
+/// `sandbox` flag: a sandboxed machine had the access model, and an
+/// unsandboxed machine (an opted-in Windows daemon) had none of it. The
+/// explicit fields win when a newer daemon sends them.
+fn hello_access(
+    sandbox: bool,
+    supports_grants: Option<bool>,
+    supports_full_access: Option<bool>,
+) -> AccessCapabilities {
+    AccessCapabilities {
+        grants: supports_grants.unwrap_or(sandbox),
+        full_access: supports_full_access.unwrap_or(sandbox),
+    }
+}
+
 async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>, computer: Id) {
     // A connection that never greets is not the Computer we paired: it must
     // not hold a task open while waiting for a frame that may never come.
@@ -1760,10 +1777,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
                     version,
                     named,
                     sandbox,
-                    AccessCapabilities {
-                        grants: supports_grants,
-                        full_access: supports_full_access,
-                    },
+                    hello_access(sandbox, supports_grants, supports_full_access),
                 )),
                 _ => None,
             }
@@ -2903,6 +2917,26 @@ pub enum ServerError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_greeting_written_before_access_fields_derives_them_from_sandbox() {
+        assert_eq!(
+            super::hello_access(false, None, None),
+            AccessCapabilities::UNSUPPORTED
+        );
+        assert_eq!(
+            super::hello_access(true, None, None),
+            AccessCapabilities::SUPPORTED
+        );
+        // A newer greeting declares each capability itself.
+        assert_eq!(
+            super::hello_access(true, Some(false), Some(true)),
+            AccessCapabilities {
+                grants: false,
+                full_access: true,
+            }
+        );
+    }
+
     #[test]
     fn unsandboxed_local_computers_need_an_explicit_opt_in() {
         assert!(!super::allows_unsandboxed(None));
@@ -4895,6 +4929,45 @@ mod tests {
         assert_eq!(computers, 1, "a replay must not leave an orphan workspace");
         socket.close(None).await.unwrap();
         provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_old_bot_create_replays_for_its_creator() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let call = add_bot("Scout", None);
+        let created = command(&mut socket, Id::new(), call.clone()).await;
+        // A result written before the top-level `user` names the creator as
+        // the Bot's owner instead.
+        let mut legacy = created.clone();
+        legacy.as_object_mut().unwrap().remove("user");
+        let command_id = Id::new();
+        running
+            .server
+            .store
+            .record_command_result(command_id, &command_fingerprint(&call), legacy.clone())
+            .await
+            .unwrap();
+        let replay = command(&mut socket, command_id, call.clone()).await;
+        assert_eq!(replay, legacy);
+
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace = sign_in(&running, "Grace").await;
+        let mut grace_socket = open_socket(&running, &grace).await;
+        let refused = try_command(&mut grace_socket, command_id, call).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::Forbidden, _))),
+            "another account cannot replay an old Bot create: {refused:?}"
+        );
+
+        grace_socket.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 
@@ -10389,6 +10462,15 @@ mod tests {
         (computer, machine_token())
     }
 
+    /// Pairs a fake machine, approves it, and connects it as a sandboxed
+    /// runtime that serves the whole access model.
+    async fn paired_computer_online(socket: &mut Socket, running: &Running) -> (Id, Socket) {
+        let (computer, machine) = paired_computer(socket, running).await;
+        let device = connect_computer(running, &machine, computer).await;
+        wait_online(socket, computer).await;
+        (computer, device)
+    }
+
     /// Connects a fake machine with a Computer token, before sending Hello.
     async fn raw_computer(running: &Running, token: &str) -> Socket {
         try_raw_computer(running, token).await.unwrap()
@@ -10435,8 +10517,8 @@ mod tests {
             computer: computer.to_owned(),
             workspace: MACHINE_WORKSPACE.to_owned(),
             sandbox,
-            supports_grants: access.grants,
-            supports_full_access: access.full_access,
+            supports_grants: Some(access.grants),
+            supports_full_access: Some(access.full_access),
         };
         socket
             .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -11788,6 +11870,491 @@ mod tests {
         .await;
         assert!(matches!(refused, Err((ErrorCode::InvalidArgument, _))));
 
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restarted_space_refuses_widening_an_unknown_computer() {
+        let (dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (computer, machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(81)).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let mut device = connect_computer(&running, &machine, computer).await;
+        wait_online(&mut socket, computer).await;
+        let granted = command(
+            &mut socket,
+            Id::new(),
+            bot_update(
+                bot,
+                None,
+                Some(vec!["/data/a".to_owned(), "/data/b".to_owned()]),
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(granted["grants"], json!(["/data/a", "/data/b"]));
+        device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+
+        // The restarted Space forgot what the machine declared. Until it
+        // greets again nothing is known, so nothing widens its access.
+        let restarted = start(test_home(dir.path()), 0).await.unwrap();
+        let token = sign_in(&restarted, "Ada").await;
+        let mut socket = open_socket(&restarted, &token).await;
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed["online"], json!(false));
+        assert_eq!(listed["supports_grants"], json!(false));
+        assert_eq!(listed["supports_full_access"], json!(false));
+
+        // Dropping a path introduces nothing, so it passes...
+        let narrowed = command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, Some(vec!["/data/a".to_owned()]), None, None),
+        )
+        .await;
+        assert_eq!(narrowed["grants"], json!(["/data/a"]));
+        // ...while a new path or full access waits for the greeting.
+        let before = restarted.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(
+                bot,
+                None,
+                Some(vec!["/data/a".to_owned(), "/data/b".to_owned()]),
+                None,
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support granted folders")),
+            "{refused:?}"
+        );
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, Some("/data/c"), None),
+        )
+        .await;
+        assert!(matches!(refused, Err((ErrorCode::InvalidArgument, _))));
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(true), None, None, None),
+        )
+        .await;
+        assert!(matches!(refused, Err((ErrorCode::InvalidArgument, _))));
+        assert_eq!(
+            restarted.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused widening records nothing"
+        );
+        // Turning full access off, or clearing a grant, stays possible.
+        command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(false), None, None, None),
+        )
+        .await;
+
+        // The reconnected machine declares the access it really serves; the
+        // same rule holds once that declaration is known.
+        let mut device = connect_computer_with(
+            &restarted,
+            &machine,
+            computer,
+            AccessCapabilities::UNSUPPORTED,
+        )
+        .await;
+        wait_online(&mut socket, computer).await;
+        let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+        let listed = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|view| view["id"] == json!(computer))
+            .unwrap();
+        assert_eq!(listed["supports_grants"], json!(false));
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, Some("/data/b"), None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support granted folders")),
+            "{refused:?}"
+        );
+        // A replacement that keeps only a path the Bot already has introduces
+        // nothing, so it is a narrowing and passes even with the declaration
+        // known.
+        let kept = command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, Some(vec!["/data/a".to_owned()]), None, None),
+        )
+        .await;
+        assert_eq!(kept["grants"], json!(["/data/a"]));
+        let cleared = command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, Some(Vec::new()), None, None),
+        )
+        .await;
+        assert_eq!(cleared["grants"], json!([]));
+
+        device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_widening_check_uses_the_computer_the_bot_moved_to() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (first, first_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(84)).await;
+        let (second, second_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(85)).await;
+        let mut first_device = connect_computer(&running, &first_machine, first).await;
+        let mut second_device = connect_computer_with(
+            &running,
+            &second_machine,
+            second,
+            AccessCapabilities::UNSUPPORTED,
+        )
+        .await;
+        wait_online(&mut socket, first).await;
+        wait_online(&mut socket, second).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(first))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // The machine the Bot lands on serves no granted folders, so widening
+        // is refused against that Computer, not the one it left.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, Some("/data/b"), None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support granted folders")),
+            "{refused:?}"
+        );
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(true), None, None, None),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support full access")),
+            "{refused:?}"
+        );
+        let listed = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(listed["bot"]["grants"], json!([]));
+
+        first_device.close(None).await.unwrap();
+        second_device.close(None).await.unwrap();
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_default_model_change_keeps_every_inheriting_bot_runnable() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ProviderAdd(ProviderAdd {
+                protocol: ProviderProtocol::ChatCompletions,
+                base_url: "http://127.0.0.1:1/v1".to_owned(),
+                api_key: "sk-test".to_owned(),
+                models: vec![
+                    model_spec(
+                        "thinker",
+                        true,
+                        true,
+                        vec![ThinkingLevel::Low, ThinkingLevel::High],
+                    ),
+                    model_spec("slow", false, true, Vec::new()),
+                    model_spec("narrow", true, true, vec![ThinkingLevel::Low]),
+                ],
+                default_model: Some("thinker".to_owned()),
+                thinking: None,
+                vendor: None,
+                discover: false,
+            }),
+        )
+        .await;
+        let model = |name: &str| -> Id {
+            added["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|model| model["name"] == json!(name))
+                .map(|model| serde_json::from_value(model["id"].clone()).unwrap())
+                .unwrap()
+        };
+        let (thinker, slow, narrow) = (model("thinker"), model("slow"), model("narrow"));
+
+        // Scout inherits the Space default and keeps `high`.
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: None,
+            }),
+        )
+        .await;
+        let scout: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        // Runner has its own Model; it never inherits the default.
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Runner".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: Some(thinker),
+            }),
+        )
+        .await;
+        let runner: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        // A Model that cannot think would strand Scout at its next run.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: slow },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("cannot think")
+                    && message.contains("1 Bot")
+                    && message.contains("reset their thinking levels")),
+            "{refused:?}"
+        );
+        // A Model that thinks but not at Scout's level is refused too.
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: narrow },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not accept")
+                    && message.contains("1 Bot")
+                    && message.contains("reset their thinking levels")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused default records nothing"
+        );
+        let models = command(&mut socket, Id::new(), CommandCall::ModelList).await;
+        let default = models
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|model| model["is_default"] == json!(true))
+            .unwrap();
+        assert_eq!(default["id"], json!(thinker), "the default did not move");
+
+        // Runner's own choice does not block: reset Scout's level, then the
+        // same change succeeds.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotUpdate(BotUpdate {
+                bot: scout,
+                name: None,
+                reset_model: false,
+                reset_thinking: true,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            }),
+        )
+        .await;
+        let changed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: slow },
+        )
+        .await;
+        assert_eq!(changed["default_model"], json!(slow));
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot: scout }).await;
+        assert_eq!(shown["bot"]["thinking"], json!(null));
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot: runner }).await;
+        assert_eq!(shown["bot"]["model"], json!(thinker));
+        assert_eq!(shown["bot"]["thinking"], json!("high"));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_move_refuses_access_the_target_cannot_serve() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (first, first_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(86)).await;
+        let (second, second_machine) =
+            paired_computer_with_token(&mut socket, &running, &machine_token_n(87)).await;
+        let mut first_device = connect_computer(&running, &first_machine, first).await;
+        let mut second_device = connect_computer_with(
+            &running,
+            &second_machine,
+            second,
+            AccessCapabilities::UNSUPPORTED,
+        )
+        .await;
+        wait_online(&mut socket, first).await;
+        wait_online(&mut socket, second).await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", Some(first))).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let added = command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, None, Some("/data/a"), None),
+        )
+        .await;
+        assert_eq!(added["grants"], json!(["/data/a"]));
+
+        // The target cannot serve a grant the Bot carries: refuse the move, so
+        // the record never leaves a grant on a runtime that refuses it.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support granted folders")
+                    && message.contains("revoke")),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["computer"]["id"], json!(first));
+
+        // With nothing to serve the same move passes.
+        command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, None, Some(Vec::new()), None, None),
+        )
+        .await;
+        let moved = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert_eq!(moved["bot"]["computer"], json!(second));
+
+        // Back to the machine that serves access, turn full access on, then the
+        // move to the unsupported machine is refused for that reason.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: first,
+            },
+        )
+        .await;
+        command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(true), None, None, None),
+        )
+        .await;
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not support full access")
+                    && message.contains("turn the Bot's full access off")),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+
+        // Turning full access off lets the move through.
+        command(
+            &mut socket,
+            Id::new(),
+            bot_update(bot, Some(false), None, None, None),
+        )
+        .await;
+        let moved = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: second,
+            },
+        )
+        .await;
+        assert_eq!(moved["bot"]["computer"], json!(second));
+
+        first_device.close(None).await.unwrap();
+        second_device.close(None).await.unwrap();
         socket.close(None).await.unwrap();
         running.shutdown().await;
     }
@@ -17526,7 +18093,8 @@ mod tests {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
         // Grants belong to a Local Computer; a Hosted Bot has none to change.
-        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        // The machine greets first, so its access capability is known.
+        let (_computer, _device) = paired_computer_online(&mut socket, &running).await;
         let created = command(
             &mut socket,
             Id::new(),
@@ -17897,7 +18465,8 @@ mod tests {
         let (_dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
         // Grants belong to a Local Computer; a Hosted Bot has none to change.
-        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        // The machine greets first, so its access capability is known.
+        let (_computer, _device) = paired_computer_online(&mut socket, &running).await;
         let created = command(
             &mut socket,
             Id::new(),
@@ -17950,7 +18519,8 @@ mod tests {
         let (_dir, running, invite) = running().await;
         let (mut socket, token) = admin(&running, &invite).await;
         // Grants belong to a Local Computer; a Hosted Bot has none to change.
-        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        // The machine greets first, so its access capability is known.
+        let (_computer, _device) = paired_computer_online(&mut socket, &running).await;
         let created = command(
             &mut socket,
             Id::new(),
@@ -18101,7 +18671,7 @@ mod tests {
     async fn a_bot_update_sets_full_access_and_grants_for_its_owner() {
         let (dir, running, invite) = running().await;
         let (mut socket, _token) = admin(&running, &invite).await;
-        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        let (_computer, _device) = paired_computer_online(&mut socket, &running).await;
         let created = command(
             &mut socket,
             Id::new(),
@@ -18206,7 +18776,8 @@ mod tests {
         let (mut socket, _token) = admin(&running, &invite).await;
         // Full access applies to a Local Computer; a Hosted Bot has only its
         // Workspace and refuses the update before the answer is considered.
-        let (_computer, _machine) = paired_computer(&mut socket, &running).await;
+        // The machine greets first, so its access capability is known.
+        let (_computer, _device) = paired_computer_online(&mut socket, &running).await;
         let created = command(
             &mut socket,
             Id::new(),
@@ -18549,18 +19120,26 @@ mod tests {
             provider_add_models(
                 "http://127.0.0.1:1/v1".to_owned(),
                 vec![
-                    model_spec("fast", false, true, Vec::new()),
                     model_spec(
                         "thinker",
                         true,
                         true,
                         vec![ThinkingLevel::Low, ThinkingLevel::High],
                     ),
+                    model_spec("fast", false, true, Vec::new()),
                 ],
             ),
         )
         .await;
-        let thinker: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+        let thinker: Id = serde_json::from_value(added["models"][0]["id"].clone()).unwrap();
+        // The Space's default Model must accept the level the Bot keeps, or a
+        // reset would leave a combination its next run cannot start with.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: thinker },
+        )
+        .await;
         let created = command(
             &mut socket,
             Id::new(),
@@ -18662,6 +19241,163 @@ mod tests {
         );
         socket.close(None).await.unwrap();
         restarted.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_reset_keeps_a_thinking_level_its_next_model_can_use() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                "http://127.0.0.1:1/v1".to_owned(),
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec(
+                        "thinker",
+                        true,
+                        true,
+                        vec![ThinkingLevel::Low, ThinkingLevel::High],
+                    ),
+                ],
+            ),
+        )
+        .await;
+        // `fast` is the Space default; the Bot uses the thinking Model.
+        let thinker: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: Some(thinker),
+            }),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let reset = |reset_model: bool, reset_thinking: bool| {
+            CommandCall::BotUpdate(BotUpdate {
+                bot,
+                name: None,
+                reset_model,
+                reset_thinking,
+                full_access: None,
+                full_access_consent: None,
+                grants: None,
+                grant_add: None,
+                grant_remove: None,
+                model: None,
+                thinking: None,
+            })
+        };
+
+        // A reset alone would leave the Bot on a Model that cannot think,
+        // which only fails at its next run: refuse it and name the fix.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(&mut socket, Id::new(), reset(true, false)).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("cannot think") && message.contains("--reset-thinking")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            before,
+            "a refused reset records nothing"
+        );
+        let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+        assert_eq!(shown["bot"]["model"], json!(thinker));
+
+        // Resetting both leaves a runnable Bot.
+        let done = command(&mut socket, Id::new(), reset(true, true)).await;
+        assert_eq!(done["model"], json!(null));
+        assert_eq!(done["thinking"], json!(null));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_model_reset_checks_the_default_models_thinking_levels() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let added = command(
+            &mut socket,
+            Id::new(),
+            provider_add_models(
+                "http://127.0.0.1:1/v1".to_owned(),
+                vec![
+                    model_spec("fast", false, true, Vec::new()),
+                    model_spec("narrow", true, true, vec![ThinkingLevel::Low]),
+                    model_spec(
+                        "thinker",
+                        true,
+                        true,
+                        vec![ThinkingLevel::Low, ThinkingLevel::High],
+                    ),
+                ],
+            ),
+        )
+        .await;
+        let narrow: Id = serde_json::from_value(added["models"][1]["id"].clone()).unwrap();
+        let thinker: Id = serde_json::from_value(added["models"][2]["id"].clone()).unwrap();
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: narrow },
+        )
+        .await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: Some(ThinkingLevel::High),
+                model: Some(thinker),
+            }),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let reset_model = CommandCall::BotUpdate(BotUpdate {
+            bot,
+            name: None,
+            reset_model: true,
+            reset_thinking: false,
+            full_access: None,
+            full_access_consent: None,
+            grants: None,
+            grant_add: None,
+            grant_remove: None,
+            model: None,
+            thinking: None,
+        });
+
+        // The default Model thinks, but not at the level the Bot keeps.
+        let before = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(&mut socket, Id::new(), reset_model.clone()).await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("does not accept") && message.contains("--reset-thinking")),
+            "{refused:?}"
+        );
+        assert_eq!(running.server.store.last_seq().await.unwrap(), before);
+
+        // Once the Space default is a Model that accepts the level, the same
+        // reset succeeds and the level stays.
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ModelDefault { model: thinker },
+        )
+        .await;
+        let done = command(&mut socket, Id::new(), reset_model).await;
+        assert_eq!(done["model"], json!(null));
+        assert_eq!(done["thinking"], json!("high"));
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

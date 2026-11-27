@@ -31,6 +31,9 @@ interface Draft {
   armedMove: boolean;
   // The risk is on screen and waits for the User's answer.
   armedFull: boolean;
+  // What the full access switch shows while its write is on its way, or null
+  // when it shows what the Space holds.
+  fullWanted: boolean | null;
 }
 
 // The Model the Space uses by default, when the catalog names one.
@@ -73,7 +76,9 @@ function inUse(models: Model[], model: string): Model | undefined {
 
 function draftOf(bot: Bot | null, models: Model[]): Draft {
   const model = bot?.model ?? "";
-  const thinking = bot?.thinking ?? accepted(inUse(models, model))[0] ?? "";
+  // A Bot that names no level follows the Space's, so the draft holds none too:
+  // filling it in here would name a level the Bot never chose.
+  const thinking = bot?.thinking ?? "";
   return {
     name: bot?.name ?? "",
     model,
@@ -87,6 +92,9 @@ function draftOf(bot: Bot | null, models: Model[]): Draft {
     armedReset: false,
     armedMove: false,
     armedFull: false,
+    // What the full access switch shows while its write is on its way, or null
+    // when it shows what the Space holds.
+    fullWanted: null as boolean | null,
   };
 }
 
@@ -141,7 +149,10 @@ export default function BotPage(props: BotPageProps) {
   // Windows Computer never opens a grant it would refuse.
   const grantsOpen = () => (props.computer?.supports_grants ?? false) === true;
   const fullOpen = () => (props.computer?.supports_full_access ?? false) === true;
-  const fullOn = () => (props.bot?.full_access ?? false) || draft().armedFull;
+  // The switch shows the Bot's own state, or what the User just asked for while
+  // that write is on its way: a switch that snapped back would say the press did
+  // nothing. The Space's answer puts it back on what the Space holds.
+  const fullOn = () => draft().fullWanted ?? (props.bot?.full_access ?? false);
   const renamed = () => {
     const name = draft().name.trim();
     return name !== "" && name !== (props.bot?.name ?? "");
@@ -165,9 +176,16 @@ export default function BotPage(props: BotPageProps) {
   // A Model the catalog names no level for keeps the one the Bot already has.
   function pickModel(model: string) {
     // The level stays one the new Model accepts: the nearest one it offers to
-    // what the page holds, or its cheapest when the page holds none.
+    // what the page holds, or its cheapest when the page holds none. A Bot that
+    // follows the Space's default keeps following it, so choosing a Model never
+    // names a level the Bot did not choose.
     const levels = accepted(inUse(props.models, model));
-    patch({ model, thinking: nearestLevel(levels, draft().thinking) ?? "", armedMove: false });
+    const held = draft().thinking;
+    patch({
+      model,
+      thinking: held === "" ? "" : (nearestLevel(levels, held) ?? ""),
+      armedMove: false,
+    });
   }
 
   async function saveName() {
@@ -195,13 +213,11 @@ export default function BotPage(props: BotPageProps) {
   // risk; taking it away needs no answer.
   async function fullAccess(on: boolean) {
     if (props.busy) return;
-    if (!on) {
-      patch({ armedFull: false });
-      await props.onFullAccess(false);
-      return;
-    }
-    patch({ armedFull: false });
-    await props.onFullAccess(true);
+    patch({ armedFull: false, fullWanted: on });
+    await props.onFullAccess(on);
+    // The Space's word is what the switch shows again, so a write it refused
+    // leaves the switch where the Bot really is.
+    patch({ fullWanted: null });
   }
 
   async function reset() {
@@ -451,6 +467,9 @@ export default function BotPage(props: BotPageProps) {
                     value={draft().thinking}
                     onChange={(event) => patch({ thinking: event.currentTarget.value })}
                   >
+                    {/* A Bot that names no level follows the Space's, which is
+                        a choice of its own: this is how it goes back to it. */}
+                    <option value="">{t("bot.model.default")}</option>
                     <For each={levels()}>
                       {(level) => <option value={level}>{t(`level.${level}`)}</option>}
                     </For>
@@ -519,14 +538,13 @@ export default function BotPage(props: BotPageProps) {
                   when={!hosted()}
                   fallback={<p class="panel__note">{t("bot.folders.hosted")}</p>}
                 >
+                  {/* A grant the Bot holds can always be taken away: the Space
+                      reads a removal as a narrowing and allows it, whichever way
+                      this Computer answers. Only the offer of a new one goes. */}
                   <Show
-                    when={grantsOpen()}
-                    fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
+                    when={shown().grants.length > 0}
+                    fallback={<p class="rows__empty">{t("bot.folders.empty")}</p>}
                   >
-                    <Show
-                      when={shown().grants.length > 0}
-                      fallback={<p class="rows__empty">{t("bot.folders.empty")}</p>}
-                    >
                       <div class="rows">
                         <For each={shown().grants}>
                           {(path) => (
@@ -548,34 +566,41 @@ export default function BotPage(props: BotPageProps) {
                         </For>
                       </div>
                     </Show>
-                    <form
-                      class="field"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void grant();
-                      }}
+                    {/* Only a new grant goes: a Computer whose daemon takes no
+                        grant says so instead of offering a folder it would
+                        refuse. */}
+                    <Show
+                      when={grantsOpen()}
+                      fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
                     >
-                      <span class="field__label">{t("bot.folders.add")}</span>
-                      <div class="field-row">
-                        <input
-                          class="input mono"
-                          name="grant_path"
-                          placeholder={t("bot.folders.placeholder")}
-                          value={draft().grant}
-                          onInput={(event) => patch({ grant: event.currentTarget.value })}
-                        />
-                        <button
-                          class="btn btn--quiet"
-                          type="submit"
-                          disabled={props.busy || draft().grant.trim() === ""}
-                        >
-                          {props.busy ? t("bot.folders.adding") : t("common.add")}
-                        </button>
-                      </div>
-                      <span class="field__hint">{t("bot.folders.hint")}</span>
-                    </form>
+                      <form
+                        class="field"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void grant();
+                        }}
+                      >
+                        <span class="field__label">{t("bot.folders.add")}</span>
+                        <div class="field-row">
+                          <input
+                            class="input mono"
+                            name="grant_path"
+                            placeholder={t("bot.folders.placeholder")}
+                            value={draft().grant}
+                            onInput={(event) => patch({ grant: event.currentTarget.value })}
+                          />
+                          <button
+                            class="btn btn--quiet"
+                            type="submit"
+                            disabled={props.busy || draft().grant.trim() === ""}
+                          >
+                            {props.busy ? t("bot.folders.adding") : t("common.add")}
+                          </button>
+                        </div>
+                        <span class="field__hint">{t("bot.folders.hint")}</span>
+                      </form>
+                    </Show>
                   </Show>
-                </Show>
               </div>
             </section>
 
@@ -588,8 +613,10 @@ export default function BotPage(props: BotPageProps) {
                   when={!hosted()}
                   fallback={<p class="panel__note">{t("bot.fullAccess.hosted")}</p>}
                 >
+                  {/* Full access that is on can always be turned off; only
+                      turning it on needs a Computer whose daemon allows it. */}
                   <Show
-                    when={fullOpen()}
+                    when={fullOpen() || shown().full_access}
                     fallback={<p class="panel__note">{t("bot.access.machine")}</p>}
                   >
                     <label class="check">
@@ -599,8 +626,14 @@ export default function BotPage(props: BotPageProps) {
                         checked={fullOn()}
                         disabled={props.busy}
                         onChange={(event) => {
-                          if (event.currentTarget.checked) patch({ armedFull: true });
-                          else void fullAccess(false);
+                          // Turning it on asks first, and only where this
+                          // Computer's daemon allows it. Turning it off never
+                          // asks: what is on can always go off.
+                          if (event.currentTarget.checked) {
+                            if (fullOpen()) patch({ armedFull: true, fullWanted: true });
+                          } else {
+                            void fullAccess(false);
+                          }
                         }}
                       />
                       <span>{t("bot.fullAccess.label")}</span>
@@ -625,7 +658,7 @@ export default function BotPage(props: BotPageProps) {
                           <button
                             class="btn btn--quiet"
                             type="button"
-                            onClick={() => patch({ armedFull: false })}
+                            onClick={() => patch({ armedFull: false, fullWanted: null })}
                           >
                             {t("common.cancel")}
                           </button>

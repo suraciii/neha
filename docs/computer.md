@@ -71,10 +71,10 @@ List the Computers you own:
 target/debug/neha computer list
 ```
 
-Each line gives one Computer's id, kind, online state, and workspace. The kind is `local` for a paired machine and `hosted` for one the Space runs. The pairing printed the new Computer's id, and the list shows it again; create a Bot on it:
+Each line gives one Computer's id, kind, online state, and workspace. The kind is `local` for a paired machine and `hosted` for one the Space runs. Put your Local Computer's id from the list above in `COMPUTER_ID`, and create a Bot on it:
 
 ```bash
-COMPUTER_ID=$(target/debug/neha computer list | awk '$2 == "local" {print $1; exit}')
+COMPUTER_ID="<the id of your Local Computer>"
 target/debug/neha bot create Runner --computer "$COMPUTER_ID"
 RUNNER_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
 ```
@@ -153,11 +153,11 @@ On Linux, a machine whose `bubblewrap` cannot start a sandbox does not serve as 
 
 ## Moving a Bot
 
-Move a Bot from one of your Local Computers to another, naming the target Computer's id from `neha computer list`:
+Move a Bot from one of your Local Computers to another. The target is the other machine, so its id is not the `COMPUTER_ID` you created the Bot with:
 
 ```bash
 BOT_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
-COMPUTER_ID=$(target/debug/neha computer list | awk '$2 == "local" {print $1; exit}')
+COMPUTER_ID="<the id of the other Local Computer>"
 target/debug/neha bot move "$BOT_ID" --computer "$COMPUTER_ID"
 ```
 

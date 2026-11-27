@@ -34,11 +34,15 @@ A Bot has a page with its name, picture, Computer, access, and Model. The owner 
 
 The page shows what the Bot can reach on its Computer: the granted folders, full access, and the rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.
 
-The owner chooses the Bot's Model and thinking level, and clears each back to the Space's default. A clear and a choice in one change are refused, so the result never depends on their order. [Model](../model/product.md) covers connecting Providers and choosing a Model.
+The owner chooses the Bot's Model and thinking level, and clears each back to the Space's default. A clear and a choice for the same field in one change are refused, so the result never depends on their order. [Model](../model/product.md) covers connecting Providers and choosing a Model.
+
+A change to the Bot's Model or its thinking level leaves the Bot able to run: the Space refuses one that leaves a thinking level the Model cannot serve, and names the reset that fixes it.
 
 ## Moving a Bot
 
 [Computer](../computer/product.md#assigning-a-computer) covers who can move a Bot and where. Its memory, its Chats, and the Files it delivered stay with it, and it starts in its own Workspace on the new Computer. Work it did not deliver stays on the old Computer.
+
+A move to a Computer that does not serve the access the Bot carries is refused, and the refusal names what to revoke or turn off first. A Bot that moves keeps its grants and its full access, and they mean the same on the new Computer.
 
 ## Memory
 

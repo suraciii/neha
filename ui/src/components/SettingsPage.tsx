@@ -205,12 +205,20 @@ export default function SettingsPage(props: SettingsPageProps) {
   // Local Computer's access belongs to its Bots, so this is where the summary
   // lives; the Bot's own page is where it changes.
   const botsOn = (computer: Computer) => props.bots.filter((bot) => bot.computer === computer.id);
-  const accessOf = (bot: Bot): string =>
-    bot.full_access
+  // A Computer whose daemon serves no fence runs the Bot's shell with the
+  // machine user's own rights: the folders the Bot names are ones the daemon
+  // would have to honor, and this one honors none of them. So the summary says
+  // what the shell really runs as instead of a fence that is not there.
+  const accessOf = (bot: Bot, computer: Computer | undefined): string => {
+    if (computer && !(computer.supports_grants ?? false)) {
+      return t("settings.computers.access.machine");
+    }
+    return bot.full_access
       ? t("settings.computers.access.full")
       : bot.grants.length === 0
         ? t("settings.computers.access.none")
         : t("settings.computers.access.folders", { count: bot.grants.length });
+  };
 
   // The Computer whose reset the Admin armed with a first press. Clearing a
   // Workspace deletes its files, so it asks twice wherever it is asked from.
@@ -571,7 +579,7 @@ export default function SettingsPage(props: SettingsPageProps) {
                                     type="button"
                                     onClick={() => props.onOpenBot(bot)}
                                   >
-                                    {bot.name} · {accessOf(bot)}
+                                    {bot.name} · {accessOf(bot, computer)}
                                   </button>
                                 )}
                               </For>

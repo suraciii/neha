@@ -18,7 +18,6 @@ import type {
   Approval,
   AttentionEntry,
   Bot,
-  BotMoveResult,
   BotResult,
   CatalogRefreshResult,
   CatalogStatus,
@@ -236,8 +235,21 @@ export default function App() {
   const [view, setView] = createSignal<RailView>("chats");
   // What the Settings surface shows.
   const [section, setSection] = createSignal<SettingsSection>("providers");
+  // Whether the Settings surface has a section open. A narrow viewport shows
+  // one surface at a time, so opening Settings shows the list of sections and
+  // choosing one opens its detail, with Back returning to the list. A wide
+  // viewport shows the list beside the detail, so this only says which of the
+  // two a narrow one is looking at.
+  const [sectionOpen, setSectionOpen] = createSignal(false);
   // The Bot whose page is open, so a read that lands late can tell.
   const [pageBotId, setPageBotId] = createSignal<string | null>(null);
+  // Which opening of a Bot page the User is on. A write that lands after they
+  // opened another Bot belongs to the page they left, so every answer checks
+  // this before it writes: the User may have moved on while it was on its way.
+  // It counts openings rather than naming a Bot, so opening the same Bot again
+  // drops what the first opening asked for. Nothing renders from it, so it is a
+  // plain count rather than a signal.
+  let pageGen = 0;
   // The management surfaces the User came through, oldest first, so Back
   // returns to the one before the surface they are leaving: a narrow viewport
   // shows one surface at a time.
@@ -1470,32 +1482,42 @@ export default function App() {
     // A Bot's page is a step deeper than the surface it was opened from, so Back
     // returns to that surface.
     pushTrail(view());
+    pageGen += 1;
     setPageBotId(bot.id);
     update({ pageBot: null, pageComputer: null, rules: [], manageError: null, managing: true });
     await reloadPageBot(bot.id);
   }
 
+  // Everything one Bot's page shows, read together so the Bot, its Computer,
+  // the Computers it may move to, its Models, and its rules are one answer
+  // rather than reads that can disagree with each other.
+  async function readBotPage(id: string) {
+    const [shown, computers, models, rules] = await Promise.all([
+      commands.command<BotResult>("bot_show", { bot: id }),
+      commands.command<Computer[]>("computer_list"),
+      commands.command<Model[]>("model_list"),
+      commands.command<Rule[]>("rule_list", { bot: id }),
+    ]);
+    return {
+      pageBot: shown.bot,
+      pageComputer: shown.computer,
+      computers,
+      models,
+      rules,
+    };
+  }
+
   // Reads the Bot page again from the Space. A read that lands after the User
   // opened another Bot is dropped.
   async function reloadPageBot(id: string) {
+    const gen = pageGen;
     update({ managing: true });
     try {
-      const [shown, computers, models, rules] = await Promise.all([
-        commands.command<BotResult>("bot_show", { bot: id }),
-        commands.command<Computer[]>("computer_list"),
-        commands.command<Model[]>("model_list"),
-        commands.command<Rule[]>("rule_list", { bot: id }),
-      ]);
-      if (pageBotId() !== id) return;
-      update({
-        pageBot: shown.bot,
-        pageComputer: shown.computer,
-        computers,
-        models,
-        rules,
-        managing: false,
-      });
+      const page = await readBotPage(id);
+      if (gen !== pageGen) return;
+      update({ ...page, managing: false });
     } catch (reason) {
+      if (gen !== pageGen) return;
       update({ manageError: reason, managing: false });
     }
   }
@@ -1505,21 +1527,22 @@ export default function App() {
   async function updateBot(patch: Record<string, unknown>): Promise<boolean> {
     const id = state.pageBot?.id;
     if (!id) return false;
+    const gen = pageGen;
     update({ managing: true, manageError: null });
     try {
-      const bot = await commands.command<Bot>("bot_update", { bot: id, ...patch });
+      await commands.command("bot_update", { bot: id, ...patch });
       // A write that lands after the User opened another Bot is dropped: the
-      // page it would write belongs to a Bot the User is no longer reading.
-      if (pageBotId() !== id) return false;
-      const [computers, rules] = await Promise.all([
-        commands.command<Computer[]>("computer_list"),
-        commands.command<Rule[]>("rule_list", { bot: id }),
-      ]);
-      update({ pageBot: bot, computers, rules, managing: false });
+      // page it would write belongs to a Bot the User is no longer reading. The
+      // answer is checked again before the page is written, because the User
+      // may have moved on while the second read was on its way.
+      if (gen !== pageGen) return false;
+      const page = await readBotPage(id);
+      if (gen !== pageGen) return false;
+      update({ ...page, managing: false });
       await refreshBots();
       return true;
     } catch (reason) {
-      if (pageBotId() !== id) return false;
+      if (gen !== pageGen) return false;
       update({ manageError: reason, managing: false });
       return false;
     }
@@ -1565,14 +1588,17 @@ export default function App() {
   async function moveBotTo(computer: string) {
     const id = state.pageBot?.id;
     if (!id) return;
+    const gen = pageGen;
     update({ managing: true, manageError: null });
     try {
-      const shown = await commands.command<BotMoveResult>("bot_move", { bot: id, computer });
-      if (pageBotId() !== id) return;
-      update({ pageBot: shown.bot, pageComputer: shown.to, managing: false });
+      await commands.command("bot_move", { bot: id, computer });
+      if (gen !== pageGen) return;
+      const page = await readBotPage(id);
+      if (gen !== pageGen) return;
+      update({ ...page, managing: false });
       await refreshBots();
     } catch (reason) {
-      if (pageBotId() !== id) return;
+      if (gen !== pageGen) return;
       update({ manageError: reason, managing: false });
     }
   }
@@ -1625,16 +1651,41 @@ export default function App() {
     setView("bots");
   }
 
-  // Reads one Bot's rules again, so a change shows without a page reload.
+  // Reads one Bot's rules again, so a change shows without a page reload. A
+  // read that lands after the User opened another Bot is dropped.
   async function refreshRules() {
     const id = state.pageBot?.id;
     if (!id) return;
+    const gen = pageGen;
     try {
       const rules = await commands.command<Rule[]>("rule_list", { bot: id });
-      if (pageBotId() !== id) return;
+      if (gen !== pageGen) return;
       update({ rules });
     } catch {
       // A failed read keeps the rules the page already shows.
+    }
+  }
+
+  // Sends one rule change and reads the Bot's rules again, so a change shows
+  // without a page reload. A write that lands after the User opened another Bot
+  // is dropped: the rules it would write belong to a Bot the User is not
+  // reading, and they may have moved on while the second read was on its way.
+  async function writeRule(
+    id: string,
+    name: "rule_add" | "rule_remove",
+    args: Record<string, unknown>,
+  ) {
+    const gen = pageGen;
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command(name, args);
+      if (gen !== pageGen) return;
+      const rules = await commands.command<Rule[]>("rule_list", { bot: id });
+      if (gen !== pageGen) return;
+      update({ rules, managing: false });
+    } catch (reason) {
+      if (gen !== pageGen) return;
+      update({ manageError: reason, managing: false });
     }
   }
 
@@ -1646,27 +1697,13 @@ export default function App() {
   }) {
     const id = state.pageBot?.id;
     if (!id) return;
-    update({ managing: true, manageError: null });
-    try {
-      await commands.command("rule_add", { bot: id, ...rule });
-      if (pageBotId() !== id) return;
-      const rules = await commands.command<Rule[]>("rule_list", { bot: id });
-      update({ rules, managing: false });
-    } catch (reason) {
-      if (pageBotId() !== id) return;
-      update({ manageError: reason, managing: false });
-    }
+    await writeRule(id, "rule_add", { bot: id, ...rule });
   }
 
   async function removeRule(rule: string) {
-    update({ managing: true, manageError: null });
-    try {
-      await commands.command("rule_remove", { rule });
-      await refreshRules();
-      update({ managing: false });
-    } catch (reason) {
-      update({ manageError: reason, managing: false });
-    }
+    const id = state.pageBot?.id;
+    if (!id) return;
+    await writeRule(id, "rule_remove", { rule });
   }
 
   // Reads the catalog's vendors and its cache state, which is what the Settings
@@ -1765,6 +1802,9 @@ export default function App() {
   function openManage(next: RailView) {
     // The surface the User is leaving is the one Back returns to.
     if (view() === "bots" || view() === "settings") pushTrail(view());
+    // Opening the Settings surface again starts from its list of sections, so
+    // every section stays reachable on a viewport that shows one surface.
+    if (next === "settings") setSectionOpen(false);
     setView(next);
     update({ manageError: null });
     if (next === "settings") void loadSettings();
@@ -1773,9 +1813,21 @@ export default function App() {
   // Leaves a management surface for the one before it, with no Bot selected.
   // The Chats are where the trail runs out.
   function closeManage() {
+    // A Settings section is a step inside its surface, not a surface of its own:
+    // Back leaves the section for the list of sections first, so a viewport that
+    // shows one surface at a time still reaches every section.
+    if (view() === "settings" && sectionOpen()) {
+      setSectionOpen(false);
+      return;
+    }
     const trail = manageTrail();
     setManageTrail(trail.slice(0, -1));
-    setView(trail[trail.length - 1] ?? "chats");
+    const back = trail[trail.length - 1] ?? "chats";
+    setView(back);
+    // Coming back to the Settings surface keeps the section that was open, so a
+    // Bot opened from a section returns to that section. Leaving it forgets the
+    // section, so the surface opens on its list next time.
+    if (back !== "settings") setSectionOpen(false);
     setPageBotId(null);
     update({ pageBot: null, pageComputer: null, manageError: null });
   }
@@ -1789,7 +1841,7 @@ export default function App() {
   // a narrow viewport shows one surface at a time with a Back action.
   const showManage = () => view() === "bots" || view() === "settings";
   const showPage = () =>
-    view() === "settings" || (view() === "bots" && state.pageBot !== null);
+    (view() === "settings" && sectionOpen()) || (view() === "bots" && state.pageBot !== null);
 
   // What each Chat is doing, for the list and the attention section.
   const chatStates = createMemo<Record<string, ChatStatus>>(() => {
@@ -1905,7 +1957,10 @@ export default function App() {
               }}
               onAttention={(entry) => openAttention(entry)}
               onBot={(bot) => void selectPageBot(bot)}
-              onSection={(next) => setSection(next)}
+              onSection={(next) => {
+                setSection(next);
+                setSectionOpen(true);
+              }}
             />
             <main class="main">
               <Show when={showManage()}>

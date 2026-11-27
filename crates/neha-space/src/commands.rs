@@ -31,7 +31,7 @@ use sha2::{Digest, Sha256};
 
 use crate::blobs::Blobs;
 use crate::catalog::CatalogStore;
-use crate::computer_link::ComputerLinks;
+use crate::computer_link::{AccessCapabilities, ComputerLinks};
 use crate::home::Home;
 use crate::identity::{Account, Identity, PairingRequest};
 use crate::model::{ModelClient, SpaceModel};
@@ -1352,6 +1352,11 @@ async fn model_default(
         return existing_outcome(context.store, command_id, record).await;
     }
     let _provider_write = context.provider_writes.lock().await;
+    // A default change and a Bot's own selection answer one question: which
+    // Model and level a Bot runs with. Bot changes already hold this lock, so
+    // taking it here keeps a Bot from choosing a level against the old default
+    // between the check below and the event.
+    let _decisions = context.approvals.lock().await;
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return existing_outcome(context.store, command_id, record).await;
     }
@@ -1375,6 +1380,35 @@ async fn model_default(
             return Err(ApiError::invalid_argument(
                 "the Model cannot call tools, so a Bot cannot use it",
             ));
+        }
+        // The new default takes over every Bot that inherits it. A Bot that
+        // keeps its own thinking level must still start a run with this Model,
+        // so a Model that cannot serve a level is refused before anything is
+        // recorded. Bots with their own Model are untouched.
+        let mut cannot_think = 0_usize;
+        let mut unaccepted = 0_usize;
+        for bot in state.bots.values() {
+            let Some(level) = bot.thinking else {
+                continue;
+            };
+            if bot.model.is_some() {
+                continue;
+            }
+            if !selected.thinks {
+                cannot_think += 1;
+            } else if !selected.accepted_thinking().contains(&level) {
+                unaccepted += 1;
+            }
+        }
+        if cannot_think > 0 {
+            return Err(ApiError::invalid_argument(format!(
+                "the new default Model cannot think, but {cannot_think} Bot(s) using the Space's default keep a thinking level; reset their thinking levels first"
+            )));
+        }
+        if unaccepted > 0 {
+            return Err(ApiError::invalid_argument(format!(
+                "the new default Model does not accept the thinking level of {unaccepted} Bot(s) using the Space's default; reset their thinking levels first"
+            )));
         }
         let mut provider_models: Vec<&ModelView> = state
             .models
@@ -1678,29 +1712,6 @@ async fn bot_update(
                 "file access changes apply only to a Local Computer; a Hosted Computer works only in its Workspace",
             ));
         }
-        // A Local Computer declares what its machine can serve. Widening
-        // access it cannot serve is refused here, before anything is
-        // recorded; removing a grant or turning full access off stays
-        // possible so an owner can always narrow access.
-        if computer.kind == "local"
-            && let Some(access) = context.links.access_capabilities(computer.id)
-        {
-            let grant_widening = update
-                .grants
-                .as_ref()
-                .is_some_and(|grants| !grants.is_empty())
-                || update.grant_add.is_some();
-            if grant_widening && !access.grants {
-                return Err(ApiError::invalid_argument(
-                    "this Local Computer does not support granted folders",
-                ));
-            }
-            if update.full_access == Some(true) && !access.full_access {
-                return Err(ApiError::invalid_argument(
-                    "this Local Computer does not support full access",
-                ));
-            }
-        }
     }
     let replacement = update
         .grants
@@ -1752,6 +1763,38 @@ async fn bot_update(
             .owned_bot(update.bot, account.id)
             .ok_or_else(|| ApiError::not_found("no such Bot"))?
             .clone();
+        // The update holds the Bot's admit lock, so this is the Computer the
+        // Bot will finally be on: a move cannot slip in after the check. A
+        // Local Computer that has not greeted this Space process yet is
+        // unknown, and unknown is treated as unsupported; only a change that
+        // adds no new path (or turns full access on) widens the runtime's
+        // reach, while dropping paths or turning full access off passes.
+        if update.full_access.is_some() || replacement.is_some() || add.is_some() {
+            let computer = state
+                .computers
+                .get(&bot.computer)
+                .ok_or_else(|| ApiError::internal("the Bot has no Computer"))?;
+            if computer.kind == "local" {
+                let access = context
+                    .links
+                    .access_capabilities(computer.id)
+                    .unwrap_or(AccessCapabilities::UNSUPPORTED);
+                if update.full_access == Some(true) && !access.full_access {
+                    return Err(ApiError::invalid_argument(
+                        "this Local Computer does not support full access",
+                    ));
+                }
+                let widening = replacement.as_ref().is_some_and(|wanted| {
+                    let current = normalized_grants(&bot.grants);
+                    wanted.iter().any(|grant| !current.contains(grant))
+                }) || add.is_some();
+                if widening && !access.grants {
+                    return Err(ApiError::invalid_argument(
+                        "this Local Computer does not support granted folders",
+                    ));
+                }
+            }
+        }
         let grants = if let Some(grants) = replacement {
             Some(grants)
         } else if let Some(add) = add {
@@ -1828,6 +1871,32 @@ async fn bot_update(
             bot.name = name.clone();
             renamed = Some(name);
         }
+        // A Bot must leave this command in a combination its next run can
+        // start with: a reset can hand it the Space's default Model, which may
+        // not fit the level the Bot keeps.
+        if selection_change {
+            let effective = bot.model.or_else(|| {
+                state
+                    .models
+                    .values()
+                    .find(|model| model.is_default)
+                    .map(|model| model.id)
+            });
+            if let (Some(selected), Some(level)) = (effective, bot.thinking)
+                && let Some(view) = state.models.get(&selected)
+            {
+                if !view.thinks {
+                    return Err(ApiError::invalid_argument(
+                        "the Model the Bot would use cannot think, but the Bot keeps its thinking level; reset the thinking level too (--reset-thinking)",
+                    ));
+                }
+                if !view.accepted_thinking().contains(&level) {
+                    return Err(ApiError::invalid_argument(
+                        "the Model the Bot would use does not accept its thinking level; reset the thinking level too (--reset-thinking)",
+                    ));
+                }
+            }
+        }
         let mut result = serde_json::to_value(bot).map_err(json_error)?;
         result["user"] = json!(account.id);
         (renamed, data, result)
@@ -1883,7 +1952,17 @@ async fn bot_create(
     // A recorded create answers only its creator: its result names the Bot,
     // the Chat, and the Computer, so another account that knows the command
     // id and parameters must not read it.
-    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+    if let Some(outcome) =
+        replay_owned_bot_create(context.store, command_id, &fingerprint, account).await?
+    {
+        return Ok(outcome);
+    }
+    // A new Bot's inherited default Model and thinking level are checked
+    // below; the lock keeps the answer true through the event.
+    let _decisions = context.approvals.lock().await;
+    if let Some(outcome) =
+        replay_owned_bot_create(context.store, command_id, &fingerprint, account).await?
+    {
         return Ok(outcome);
     }
     {
@@ -2009,7 +2088,7 @@ async fn bot_create(
         if let Some(workspace) = &created_workspace {
             let _ = std::fs::remove_dir_all(workspace);
         }
-        return replay_owned(context.store, command_id, &fingerprint, account)
+        return replay_owned_bot_create(context.store, command_id, &fingerprint, account)
             .await?
             .ok_or_else(|| ApiError::internal("the recorded Bot create vanished"));
     }
@@ -2080,6 +2159,24 @@ async fn bot_move(
     if bot_view.computer == computer {
         return Err(ApiError::invalid_argument(
             "the Bot already works on that Computer",
+        ));
+    }
+    // The target machine must serve the access the Bot carries. A move would
+    // otherwise leave grants or full access on a runtime that refuses them;
+    // unknown access (the machine has not greeted this Space process yet) is
+    // treated as unsupported, as it is for a widening update.
+    let access = context
+        .links
+        .access_capabilities(computer)
+        .unwrap_or(AccessCapabilities::UNSUPPORTED);
+    if !bot_view.grants.is_empty() && !access.grants {
+        return Err(ApiError::invalid_argument(
+            "this Local Computer does not support granted folders; revoke the Bot's grants before moving it there",
+        ));
+    }
+    if bot_view.full_access && !access.full_access {
+        return Err(ApiError::invalid_argument(
+            "this Local Computer does not support full access; turn the Bot's full access off before moving it there",
         ));
     }
 
@@ -2696,10 +2793,13 @@ fn viewed_computer(computer: &ComputerView, links: &ComputerLinks) -> ComputerVi
     computer.online = computer.kind != "local" || links.online(computer.id);
     // A real Computer declares which access its machine can serve. The links
     // keep the last declaration after it disconnects, so an offline machine
-    // does not show a control its runtime refuses.
-    if computer.kind == "local"
-        && let Some(access) = links.access_capabilities(computer.id)
-    {
+    // does not show a control its runtime refuses. Before the first handshake
+    // of this Space process nothing is known, and unknown is shown as no
+    // access: a control must not be offered until the machine says it works.
+    if computer.kind == "local" {
+        let access = links
+            .access_capabilities(computer.id)
+            .unwrap_or(AccessCapabilities::UNSUPPORTED);
         computer.supports_grants = access.grants;
         computer.supports_full_access = access.full_access;
     }
@@ -5923,6 +6023,43 @@ async fn replay_owned_computer(
         .and_then(|owner| owner.parse::<Id>().ok());
     if owner != Some(account.id) {
         return Err(ApiError::not_found("no such Computer"));
+    }
+
+    Ok(Some(existing_outcome(store, command_id, record).await?))
+}
+
+/// Returns a recorded Bot create's outcome, but only to the account that
+/// created the Bot.
+///
+/// A result written before the top-level `user` existed names its creator as
+/// `bot.owner`; the command fingerprint has already matched, so the fallback
+/// can only replay the same create to that owner. Another account is refused
+/// either way.
+async fn replay_owned_bot_create(
+    store: &Store,
+    command_id: Id,
+    fingerprint: &str,
+    account: &Account,
+) -> Result<Option<Outcome>, ApiError> {
+    let Some(record) = existing(store, command_id, fingerprint).await? else {
+        return Ok(None);
+    };
+    let owner = record
+        .result
+        .as_ref()
+        .and_then(|result| {
+            result.get("user").and_then(Value::as_str).or_else(|| {
+                result
+                    .get("bot")
+                    .and_then(|bot| bot.get("owner"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .and_then(|owner| owner.parse::<Id>().ok());
+    if owner != Some(account.id) {
+        return Err(ApiError::forbidden(
+            "a recorded command belongs to another User",
+        ));
     }
 
     Ok(Some(existing_outcome(store, command_id, record).await?))

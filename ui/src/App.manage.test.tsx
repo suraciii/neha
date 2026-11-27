@@ -82,6 +82,20 @@ function panelText(view: View, heading: string): string {
   return panel.textContent ?? "";
 }
 
+// The value of one fact in a panel: the label says what the value is, so the
+// test reads the answer rather than every word the panel holds.
+function factValue(view: View, heading: string, label: string): string {
+  const panel = Array.from(view.container.querySelectorAll(".panel")).find(
+    (known) => known.querySelector("h2")?.textContent === heading,
+  );
+  if (!panel) throw new Error(`no ${heading} panel in the view`);
+  const fact = Array.from(panel.querySelectorAll(".fact")).find(
+    (known) => known.querySelector(".fact__label")?.textContent === label,
+  );
+  if (!fact) throw new Error(`no ${label} fact in the ${heading} panel`);
+  return fact.querySelector(".fact__value")?.textContent ?? "";
+}
+
 // Types into a field, and lets the page read it.
 function type(view: View, name: string, value: string) {
   flush();
@@ -105,13 +119,15 @@ function press(view: View, text: string) {
 }
 
 // Opens the Bots surface and the one Bot's page in it.
-async function openBots(): Promise<View> {
+// `which` names the Bot in the sidebar list, so a test can start on a later one.
+async function openBots(which = 0): Promise<View> {
   const view = renderApp();
   await waitFor(() => expect(element(view, ".rail__item:nth-of-type(3)")).toBeTruthy());
   flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
   // The sidebar lists every Bot the Space knows.
-  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(1));
-  flush(() => fireEvent.click(element(view, ".conv")));
+  const bots = () => view.container.querySelectorAll(".conv");
+  await waitFor(() => expect(bots().length).toBeGreaterThan(which));
+  flush(() => fireEvent.click(bots()[which]!));
   await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
   return view;
 }
@@ -127,6 +143,12 @@ async function openSettings(section = "Providers"): Promise<View> {
   flush(() => fireEvent.click(button(view, section)));
   await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
   return view;
+}
+
+// Opens the second Bot from the sidebar, the way a User moves between Bots.
+async function openOtherBot(view: View) {
+  flush(() => fireEvent.click(element(view, ".conv:nth-of-type(2)")));
+  await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Quill"));
 }
 
 // The rule the Bot holds, which a test reads back.
@@ -175,9 +197,15 @@ describe("App management", () => {
     expect(models.options[2]?.disabled).toBe(true);
     expect(models.options[2]?.textContent).toContain("Cannot call tools");
 
-    // A Model that thinks names the levels it accepts.
+    // A Model that thinks names the levels it accepts, beside the Space's own
+    // default, which is where a Bot that names no level stays.
     choose(view, "bot_model", "m1");
-    await waitFor(() => expect(field<HTMLSelectElement>(view, "bot_thinking").options).toHaveLength(3));
+    await waitFor(() =>
+      expect(field<HTMLSelectElement>(view, "bot_thinking").options).toHaveLength(4),
+    );
+    expect(field<HTMLSelectElement>(view, "bot_thinking").options[0]?.textContent).toBe(
+      "Space default",
+    );
     choose(view, "bot_thinking", "medium");
     await waitFor(() => expect(panelText(view, "Model")).toContain("Reads images"));
 
@@ -199,6 +227,9 @@ describe("App management", () => {
     choose(view, "bot_thinking", "high");
     press(view, "Save Model");
     await waitFor(() => expect(space.bot.thinking).toBe("high"));
+    // The page reads the Bot again, so it stops offering to save what the Bot
+    // already holds.
+    await waitFor(() => expect(button(view, "Save Model").disabled).toBe(true));
 
     // The second Model thinks less: it accepts no "high", so the Bot keeps the
     // nearest level it does accept.
@@ -292,7 +323,7 @@ describe("App management", () => {
 
   it("moves a Bot to another paired Computer", async () => {
     const view = await openBots();
-    expect(panelText(view, "Computer")).toContain("/w");
+    expect(factValue(view, "Computer", "Workspace")).toBe("/w");
 
     // The other paired Local Computer is where a Bot may move.
     const target = field<HTMLSelectElement>(view, "move_target");
@@ -307,9 +338,10 @@ describe("App management", () => {
 
     press(view, "Press again to move");
     await waitFor(() => expect(space.moves).toEqual([{ bot: "b1", computer: "p9" }]));
-    await waitFor(() => expect(panelText(view, "Computer")).toContain("/other"));
-    // The page names the new Computer offline, as the Space knows it.
-    expect(panelText(view, "Computer")).toContain("Offline");
+    // The page reads the Bot again, so it names the Computer it moved to.
+    await waitFor(() => expect(factValue(view, "Computer", "Workspace")).toBe("/other"));
+    // The new Computer is offline, as the Space knows it.
+    expect(factValue(view, "Computer", "Online")).toBe("Offline");
   });
 
   it("adds a rule and takes it away", async () => {
@@ -546,15 +578,66 @@ describe("App management", () => {
     await waitFor(() => expect(button(view, "Save Model").disabled).toBe(true));
 
     // Back to the default is a field of its own: the Space holds the default,
-    // and an absent Model leaves the Bot's own choice alone. The level the page
-    // shows is the default Model's own, so it travels with the choice.
+    // and an absent Model leaves the Bot's own choice alone. The Bot names no
+    // level by then, so going back to the default Model names none either: it
+    // follows the Space's level instead of the default Model's cheapest.
     choose(view, "bot_model", "");
     press(view, "Save Model");
     await waitFor(() => expect(space.updates).toHaveLength(3));
-    expect(space.updates[2]).toMatchObject({ bot: "b1", reset_model: true, thinking: "minimal" });
+    expect(space.updates[2]).toMatchObject({ bot: "b1", reset_model: true });
     expect(space.updates[2]).not.toHaveProperty("model");
+    expect(space.updates[2]).not.toHaveProperty("thinking");
+    expect(space.updates[2]).not.toHaveProperty("reset_thinking");
     // The page shows the Bot following the Space's default again.
     await waitFor(() => expect(panelText(view, "Model")).toContain("Space default"));
+  });
+
+  it("takes a level back to the Space's default", async () => {
+    space.models = [thinker, plain];
+    space.bot.model = "m1";
+    space.bot.thinking = "high";
+    const view = await openBots();
+
+    // The page shows the level the Bot names, not the Space's default.
+    expect(field<HTMLSelectElement>(view, "bot_thinking").value).toBe("high");
+
+    // Clearing only the level is a field of its own, and it leaves the Model
+    // the Bot chose alone.
+    choose(view, "bot_thinking", "");
+    press(view, "Save Model");
+    await waitFor(() => expect(space.updates).toHaveLength(1));
+    expect(space.updates[0]).toMatchObject({ bot: "b1", reset_thinking: true });
+    expect(space.updates[0]).not.toHaveProperty("thinking");
+    expect(space.updates[0]).not.toHaveProperty("model");
+    expect(space.updates[0]).not.toHaveProperty("reset_model");
+
+    // The Bot follows the Space's level again, so the page stops offering to
+    // save what the Bot already holds.
+    await waitFor(() => expect(button(view, "Save Model").disabled).toBe(true));
+    expect(field<HTMLSelectElement>(view, "bot_thinking").value).toBe("");
+    await drain();
+  });
+
+  it("keeps a level the Bot never chose when it goes back to the default Model", async () => {
+    space.models = [thinker, plain];
+    // The Bot names a Model but no level: it follows the Space's.
+    space.bot.model = "m1";
+    space.bot.thinking = null;
+    const view = await openBots();
+
+    expect(field<HTMLSelectElement>(view, "bot_thinking").value).toBe("");
+    expect(panelText(view, "Model")).toContain("Space default");
+
+    // Going back to the default Model names no level: the Bot keeps following
+    // the Space's, which is what it was doing before it named a Model.
+    choose(view, "bot_model", "");
+    press(view, "Save Model");
+    await waitFor(() => expect(space.updates).toHaveLength(1));
+    expect(space.updates[0]).toMatchObject({ bot: "b1", reset_model: true });
+    expect(space.updates[0]).not.toHaveProperty("model");
+    expect(space.updates[0]).not.toHaveProperty("thinking");
+    expect(space.updates[0]).not.toHaveProperty("reset_thinking");
+    await drain();
   });
 
   it("drops a Bot page write that lands after another Bot was opened", async () => {
@@ -880,6 +963,67 @@ describe("App management", () => {
     }
   });
 
+  it("says what a Windows Computer's shell really runs as", async () => {
+    // An online Windows Local daemon serves no fence: it runs the Bot's shell
+    // with the machine user's own rights, so a summary that named the Bot's
+    // folders would describe a fence that is not there.
+    space.computer.supports_grants = false;
+    space.computer.supports_full_access = false;
+    const view = await openSettings("Computers");
+
+    expect(panelText(view, "Computers")).toContain("Shell runs as the machine user");
+    // The Bot's own page says the same thing about the same Computer.
+    flush(() => fireEvent.click(element(view, ".chip--button")));
+    await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Scout"));
+    expect(panelText(view, "Granted folders")).toContain(
+      "What this Computer allows is decided by its machine.",
+    );
+    await drain();
+  });
+
+  it("opens the Settings sections before their detail on a narrow viewport", async () => {
+    // A narrow viewport shows one surface at a time, so the Settings surface
+    // opens on its list of sections and a section opens its detail. Every
+    // section stays reachable, and Back returns to the list.
+    const wide = window.matchMedia;
+    try {
+      Object.defineProperty(window, "matchMedia", {
+        writable: true,
+        value: (query: string) => ({
+          matches: true,
+          media: query,
+          addEventListener: () => undefined,
+          removeEventListener: () => undefined,
+        }),
+      });
+      const view = renderApp();
+      await waitFor(() => expect(element(view, ".rail__item:nth-of-type(4)")).toBeTruthy());
+
+      // The rail opens the list of sections: the class the narrow viewport
+      // reads to hide the sidebar is not on the shell, so the section buttons
+      // are the ones on screen.
+      flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+      expect(element(view, ".app").className).not.toContain("app--detail");
+
+      // A section opens its detail, and Back returns to the list.
+      flush(() => fireEvent.click(button(view, "Computers")));
+      await waitFor(() => expect(element(view, ".app").className).toContain("app--detail"));
+      expect(panelText(view, "Computers")).toBeTruthy();
+      flush(() => fireEvent.click(element(view, ".page__back")));
+      await waitFor(() => expect(element(view, ".app").className).not.toContain("app--detail"));
+      expect(view.container.querySelectorAll(".conv")).toHaveLength(4);
+
+      // The stylesheet the class is read from hides the sidebar beside a detail,
+      // so the class is what decides which of the two a narrow viewport shows.
+      const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
+      const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
+      expect(narrow).toContain(".app--detail .sidebar");
+    } finally {
+      window.matchMedia = wide;
+    }
+  });
+
   it("keeps the rail a narrow viewport can reach", () => {
     // The rail is the only way to a management surface, so the narrow layout
     // keeps it: a hidden rail would leave a narrow User no way to the Bots or
@@ -888,6 +1032,106 @@ describe("App management", () => {
     const css = readFileSync(resolve(process.cwd(), "src/styles.css"), "utf8");
     const narrow = css.slice(css.indexOf("@media (max-width: 900px)"));
     expect(narrow).not.toMatch(/\.rail\s*\{[^}]*display:\s*none/);
+  });
+
+  it("takes a grant away from a Computer that takes no new one", async () => {
+    // The daemon on this Computer names no grant it does not have, but the Bot
+    // already holds folders from a Computer that did: what is held can always be
+    // taken away, because the Space reads a removal as a narrowing.
+    space.computer.supports_grants = false;
+    space.bot.grants = ["/data/one", "/data/two"];
+    const view = await openBots();
+
+    // The folders are listed, each with the way back.
+    expect(panelText(view, "Granted folders")).toContain("/data/one");
+    expect(view.container.querySelectorAll(".row__remove")).toHaveLength(2);
+    // Only the offer of a new one is gone.
+    expect(view.container.querySelector('[name="grant_path"]')).toBeNull();
+
+    // Taking one away still writes, and the page reads the Bot again.
+    flush(() => fireEvent.click(element(view, ".row__remove")));
+    await waitFor(() => expect(view.container.querySelectorAll(".row__remove")).toHaveLength(1));
+    expect(space.updates.at(-1)).toMatchObject({ bot: "b1", grant_remove: "/data/one" });
+    await drain();
+  });
+
+  it("turns full access off on a Computer that cannot run without its sandbox", async () => {
+    // The daemon names no full access it does not have, but the Bot has it from
+    // a Computer that did: what is on can always be turned off.
+    space.computer.supports_full_access = false;
+    space.bot.full_access = true;
+    const view = await openBots();
+
+    // The switch is there, it is not asking, and it says full access is on.
+    const box = field<HTMLInputElement>(view, "full_access");
+    expect(box.checked).toBe(true);
+    expect(box.disabled).toBe(false);
+    expect(panelText(view, "Full access")).toContain("Full access is on.");
+    // Turning it on again is not offered: no risk is asked, because the switch
+    // only goes off from here.
+    expect(view.container.querySelector(".risk")).toBeNull();
+
+    flush(() => fireEvent.click(box));
+    // The page reads the Bot again, so the note that said it was on goes.
+    await waitFor(() => expect(panelText(view, "Full access")).not.toContain("Full access is on."));
+    expect(space.updates.at(-1)).toMatchObject({ bot: "b1", full_access: false });
+    expect(space.updates.at(-1)).not.toHaveProperty("full_access_consent");
+    await drain();
+  });
+
+  it("drops a Model read that answers after the User opened another Bot", async () => {
+    space.chats = [space.chat, space.otherChat];
+    space.models = [thinker, quiet];
+    const view = await openBots();
+
+    // The write goes out, and the read that would bring the Bot back is held.
+    space.holdRules("b1");
+    choose(view, "bot_model", "m1");
+    press(view, "Save Model");
+    await waitFor(() => expect(space.updates).toHaveLength(1));
+    expect(space.updates[0]).toMatchObject({ bot: "b1", model: "m1" });
+
+    // The User opens another Bot while the answer is still in flight.
+    await openOtherBot(view);
+    await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Quill"));
+
+    // The held read answers now. It belongs to the Bot the User left, so the
+    // page it would write is gone: the page still names the Bot that is open.
+    space.releaseRules();
+    await drain();
+    expect(element(view, ".page__titles h1").textContent).toBe("Quill");
+    await drain();
+  });
+
+  it("drops a rule read that answers after the User opened another Bot", async () => {
+    // Two Bots, one rule each, so a read that lands on the wrong page shows the
+    // wrong Bot's rule.
+    space.chats = [space.chat, space.otherChat];
+    space.rules = [
+      askRule(),
+      { ...askRule(), rule: "rule2", bot: "b2", tool: "write_file", command_prefix: null },
+    ];
+    const view = await openBots();
+    expect(element(view, ".rows .row__name").textContent).toBe("shell");
+
+    // The write goes out, and the read that would bring the rules back is held.
+    space.holdRules("b1");
+    flush(() => fireEvent.click(element<HTMLButtonElement>(view, ".row__remove")));
+    await waitFor(() => expect(space.ruleRemoves).toEqual(["rule1"]));
+
+    // The User opens another Bot while the answer is still in flight.
+    await openOtherBot(view);
+    await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Quill"));
+    expect(element(view, ".rows .row__name").textContent).toBe("write_file");
+
+    // The held read answers now. It belongs to the Bot the User left, so the
+    // page it would write is gone.
+    space.releaseRules();
+    await drain();
+    expect(element(view, ".page__titles h1").textContent).toBe("Quill");
+    expect(element(view, ".rows .row__name").textContent).toBe("write_file");
+    expect(panelText(view, "Ask and Allow rules")).not.toContain("No rule is set.");
+    await drain();
   });
 
   it("names a rule's tool from the set every Bot has", async () => {

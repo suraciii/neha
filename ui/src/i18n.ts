@@ -339,6 +339,7 @@ const en = {
   "settings.computers.access.none": "Only its Workspace",
   "settings.computers.access.folders": "{count} granted folders",
   "settings.computers.access.full": "Full access",
+  "settings.computers.access.machine": "Shell runs as the machine user",
 
   "error.permission": "This Space does not allow that change.",
 
@@ -678,6 +679,7 @@ const zh: Record<MessageKey, string> = {
   "settings.computers.access.none": "仅自己的 Workspace",
   "settings.computers.access.folders": "{count} 个授权文件夹",
   "settings.computers.access.full": "完全访问",
+  "settings.computers.access.machine": "Shell 以机器用户权限运行",
 
   "error.permission": "这个 Space 不允许这个修改。",
 

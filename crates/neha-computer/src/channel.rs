@@ -117,16 +117,16 @@ pub enum DeviceFrame {
         sandbox: bool,
         /// Whether the machine supports granted folders and a run directory.
         ///
-        /// Absent in a greeting written before the capability was declared:
-        /// such a machine keeps the granted behaviour it had.
-        #[serde(default = "supported")]
-        supports_grants: bool,
+        /// Absent in a greeting written before the capability was declared;
+        /// the Space then derives it from `sandbox`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supports_grants: Option<bool>,
         /// Whether the machine supports a Bot's full access.
         ///
-        /// Absent in a greeting written before the capability was declared:
-        /// such a machine keeps the full-access behaviour it had.
-        #[serde(default = "supported")]
-        supports_full_access: bool,
+        /// Absent in a greeting written before the capability was declared;
+        /// the Space then derives it from `sandbox`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supports_full_access: Option<bool>,
     },
     /// Returns the result of an action.
     Result {
@@ -153,11 +153,6 @@ pub enum DeviceFrame {
     },
     /// Answers [`HostFrame::Ping`].
     Pong,
-}
-
-/// The capability a greeting written before capabilities had.
-const fn supported() -> bool {
-    true
 }
 
 /// An action's wire spelling, one-to-one with [`Action`].
@@ -394,8 +389,8 @@ mod tests {
                     computer: "computer-1".to_owned(),
                     workspace: "/home/me/.neha/workspace".to_owned(),
                     sandbox: true,
-                    supports_grants: true,
-                    supports_full_access: false,
+                    supports_grants: Some(true),
+                    supports_full_access: Some(false),
                 },
                 json!({
                     "type": "hello",
@@ -492,23 +487,22 @@ mod tests {
     }
 
     #[test]
-    fn a_greeting_without_capabilities_keeps_the_access_it_had() {
-        // A daemon written before the capabilities keeps the granted and
-        // full-access behaviour it always had; only a newer daemon states
-        // which access this machine can serve.
+    fn a_greeting_without_capabilities_leaves_them_to_the_sandbox() {
+        // A daemon written before the capability fields sends neither; the
+        // Space derives them from `sandbox` rather than reading a default.
         let hello = serde_json::from_value::<DeviceFrame>(json!({
             "type": "hello",
             "version": 2,
             "computer": "computer-1",
             "workspace": "/home/me/.neha/workspace",
-            "sandbox": true,
+            "sandbox": false,
         }))
         .unwrap();
         assert!(matches!(
             hello,
             DeviceFrame::Hello {
-                supports_grants: true,
-                supports_full_access: true,
+                supports_grants: None,
+                supports_full_access: None,
                 ..
             }
         ));

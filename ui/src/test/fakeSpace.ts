@@ -17,6 +17,7 @@ import type {
   RecordEvent,
   Rule,
   RunView,
+  ThinkingLevel,
 } from "../types";
 
 const account = { id: "u1", display_name: "Ada", is_admin: true };
@@ -28,8 +29,10 @@ const bot = {
   chat: "h1",
   full_access: false,
   grants: [] as string[],
-  thinking: null,
-  model: null,
+  // The Space holds these as absent until a Bot names one, and a test may give
+  // the Bot either.
+  thinking: null as ThinkingLevel | null,
+  model: null as string | null,
 };
 const otherBot = {
   id: "b2",
@@ -115,6 +118,9 @@ let decideGate: Promise<void> | null = null;
 let openDecide: (() => void) | null = null;
 let approvalGate: Promise<void> | null = null;
 let openApproval: (() => void) | null = null;
+// A rule read for one Bot can be held open, so a test can move to another page
+// while the answer the first page asked for is still in flight.
+let ruleGate: { bot: string; gate: Promise<void>; open: () => void } | null = null;
 
 export const space = {
   account,
@@ -253,6 +259,7 @@ export const space = {
     space.catalogRefreshes = 0;
     space.refuse = {};
     space.seq = 100;
+    ruleGate = null;
   },
   holdSends() {
     sendGate = new Promise<void>((resolve) => {
@@ -263,6 +270,20 @@ export const space = {
     openSend?.();
     openSend = null;
     sendGate = null;
+  },
+  // Holds one Bot's rule reads open, so a test can act while that Bot's page
+  // is still waiting on the rules its own write asked to read again.
+  holdRules(bot: string) {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    ruleGate = { bot, gate, open };
+  },
+  // Lets the held rule reads answer.
+  releaseRules() {
+    ruleGate?.open();
+    ruleGate = null;
   },
   // An approval read can be held open, so a test can answer while the Space's
   // word about the record is still in flight.
@@ -452,6 +473,7 @@ export class FakeCommands {
       }
       case "rule_list": {
         const asked = args as { bot?: string };
+        if (ruleGate && asked.bot === ruleGate.bot) await ruleGate.gate;
         return space.rules
           .filter((known) => asked.bot === undefined || known.bot === asked.bot)
           .map((known) => ({ ...known })) as T;

@@ -70,7 +70,7 @@ An owner renames a Bot with a `bot_update` that names the new name. The Space re
 
 A rename changes no authority, so the Bot's owner, its access, and its rules stay as they were.
 
-A `bot_update` that clears the Bot's Model or its thinking level records the clear on the same `neha.bot.updated` event, and a replay leaves the field empty so the Bot uses the Space's default. A record written before that flag replays as no clear. The Space refuses a clear and a choice together, so one event never holds both.
+A `bot_update` that clears the Bot's Model or thinking level records the clear on the same `neha.bot.updated` event; a replay leaves the field empty and the Bot uses the Space's default. A record written before that flag replays as no clear. The Space refuses a clear and a choice for the same field together, so no event holds both.
 
 ## Event visibility
 

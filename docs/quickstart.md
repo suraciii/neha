@@ -230,7 +230,7 @@ The CLI does the same work. Read the ids from the lists, then rename a Bot and s
 ```bash
 BOT_ID=$(target/debug/neha bot list | awk '$2 == "Scout" {print $1; exit}')
 target/debug/neha bot rename "$BOT_ID" "Scout Two"
-MODEL_ID=$(target/debug/neha model list | awk 'NR==1 {print $1}')
+MODEL_ID=$(target/debug/neha model list | awk '/  tools/ {print $1; exit}')
 target/debug/neha model default "$MODEL_ID"
 ```
 
