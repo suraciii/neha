@@ -203,8 +203,8 @@ async function joinFirstAdmin(invite, browserUrl) {
   // can sign in to.
   await saveAccount(displayName, password);
   // Windows does not resolve arbitrary *.localhost names through the system
-  // resolver. Send the request to loopback, keep the browser Space's Origin
-  // (the server checks it), then store the cookie for the browser origin.
+  // resolver. Send the request to loopback as a CLI-style request (no Origin),
+  // then store its returned token as the browser Space's session cookie.
   const response = await postJson(
     `${loopback}/api/join`,
     { secret, display_name: displayName, password },
@@ -320,7 +320,7 @@ async function restartSpace() {
   const old = server;
   server = undefined;
   if (old) {
-    old.kill("SIGTERM");
+    killTree(old);
     await waitForExit(old);
   }
   return startSpace();
@@ -467,20 +467,34 @@ async function openLocalSpace() {
   }
 }
 
+function killTree(child) {
+  if (!child || child.killed || !child.pid) return;
+  if (process.platform === "win32") {
+    // child.kill() reaches only the daemon. taskkill /T also ends the
+    // PowerShell/cmd command it started, so closing Neha cannot orphan a Bot.
+    const killer = spawn("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+      stdio: "ignore",
+      windowsHide: true,
+    });
+    killer.unref();
+    return;
+  }
+  child.kill("SIGTERM");
+  setTimeout(() => child.kill("SIGKILL"), 500).unref();
+}
+
 function stopServer() {
   if (stopping) return;
   stopping = true;
-  if (localComputer && !localComputer.killed) {
+  if (localComputer) {
     const child = localComputer;
     localComputer = undefined;
-    child.kill("SIGTERM");
-    setTimeout(() => child.kill("SIGKILL"), 500).unref();
+    killTree(child);
   }
-  if (server && !server.killed) {
+  if (server) {
     const child = server;
     server = undefined;
-    child.kill("SIGTERM");
-    setTimeout(() => child.kill("SIGKILL"), 500).unref();
+    killTree(child);
   }
 }
 

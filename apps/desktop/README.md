@@ -66,5 +66,6 @@ pnpm test
 ```
 
 The tests cover the startup-line parser, cookie parsing, display-name fallback,
-and generated passwords. The Electron/Local Computer integration is exercised
-manually with a real Space until native Windows CI exists.
+and generated passwords. Native Windows CI builds and installs the app and
+launches it against a real first-run Space; a GUI session on a developer machine
+is still needed to inspect the window.

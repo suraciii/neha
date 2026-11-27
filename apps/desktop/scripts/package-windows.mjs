@@ -12,12 +12,26 @@ const target = process.platform === "win32"
   ? "x86_64-pc-windows-msvc"
   : "x86_64-pc-windows-gnu";
 
+function quoteWindowsArg(value) {
+  if (!/[\s"]/u.test(value)) return value;
+  const escaped = value
+    .replace(/(\\*)"/g, (_match, slashes) => `${slashes}${slashes}\"`)
+    .replace(/(\\+)$/g, (_match, slashes) => `${slashes}${slashes}`);
+  return `"${escaped}"`;
+}
+
 function run(command, args, extraEnv = {}) {
   console.log(`> ${command} ${args.join(" ")}`);
-  const result = spawnSync(command, args, {
+  // A Windows batch file needs cmd.exe, and cmd.exe needs every path quoted:
+  // ordinary checkouts can live under "C:\\Users\\Ada Lovelace\\neha".
+  const batch = process.platform === "win32" && /\.(cmd|bat)$/i.test(command);
+  const file = batch ? (process.env.ComSpec || "cmd.exe") : command;
+  const argv = batch
+    ? ["/D", "/S", "/C", [command, ...args].map(quoteWindowsArg).join(" ")]
+    : args;
+  const result = spawnSync(file, argv, {
     cwd: desktop,
     stdio: "inherit",
-    shell: process.platform === "win32",
     env: { ...process.env, ...extraEnv },
   });
   if (result.status !== 0) process.exit(result.status ?? 1);

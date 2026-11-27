@@ -581,6 +581,27 @@ impl LocalRuntime {
         grants: &[String],
         cwd: Option<&str>,
     ) -> Result<(), RuntimeError> {
+        // The managed Windows runtime has no OS fence and no directory
+        // descriptors. Refuse a widened access model instead of silently
+        // serving a narrower one than the owner asked for.
+        #[cfg(windows)]
+        {
+            if full_access {
+                return Err(RuntimeError::Access(
+                    "full access is not available for a Windows Local Computer".to_owned(),
+                ));
+            }
+            if cwd.is_some() {
+                return Err(RuntimeError::Access(
+                    "a run directory is not available for a Windows Local Computer".to_owned(),
+                ));
+            }
+            if !grants.is_empty() {
+                return Err(RuntimeError::Access(
+                    "granted folders are not available for a Windows Local Computer".to_owned(),
+                ));
+            }
+        }
         let cwd = match cwd {
             Some(directory) => Some(self.open_run_directory(directory, full_access)?),
             None => None,
@@ -1393,11 +1414,38 @@ impl LocalRuntime {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        // PowerShell needs the inherited system environment to start. Only the
-        // Unix path clears it; the Windows path overrides the values a Bot
-        // should see while preserving SystemRoot, PATHEXT, and friends.
+        // A Bot gets Windows' system variables it needs to start a shell, not
+        // the daemon's environment: NEHA_MASTER_KEY, provider keys, and proxy
+        // credentials must not reach a command.
         #[cfg(windows)]
         {
+            process.env_clear();
+            for key in [
+                "SystemRoot",
+                "SystemDrive",
+                "windir",
+                "COMSPEC",
+                "PATHEXT",
+                "APPDATA",
+                "LOCALAPPDATA",
+                "PROGRAMDATA",
+                "PROGRAMFILES",
+                "PROGRAMFILES(X86)",
+                "COMMONPROGRAMFILES",
+                "COMMONPROGRAMFILES(X86)",
+                "PSModulePath",
+                "OS",
+                "NUMBER_OF_PROCESSORS",
+                "PROCESSOR_ARCHITECTURE",
+                "PROCESSOR_IDENTIFIER",
+                "USERNAME",
+                "USERDOMAIN",
+                "COMPUTERNAME",
+            ] {
+                if let Some(value) = std::env::var_os(key) {
+                    process.env(key, value);
+                }
+            }
             process
                 .env("HOME", home)
                 .env("USERPROFILE", home)

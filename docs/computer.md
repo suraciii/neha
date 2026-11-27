@@ -49,7 +49,7 @@ Keep that terminal open. The Space shows the Computer as online while the daemon
 
 The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, which granted mode hides from Bots.
 
-Each Space's ticket sits at `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`, or `~/.config/neha/spaces/<space-key>/local-computer.ticket` when `XDG_CONFIG_HOME` is not set. `computer pair` scans `spaces/` and pairs the Space whose URL its ticket names; `--ticket-file` names another file. When no ticket file exists, a signed-in CLI asks the Space that saved its session for one, so only that fallback needs a signed-in CLI.
+Each Space's ticket sits at `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`, or `~/.config/neha/spaces/<space-key>/local-computer.ticket` when `XDG_CONFIG_HOME` is not set; on Windows it is under `%LOCALAPPDATA%\Neha\spaces`. `computer pair` scans `spaces/` and pairs the Space whose URL its ticket names; `--ticket-file` names another file. When no ticket file exists, a signed-in CLI asks the Space that saved its session for one, so only that fallback needs a signed-in CLI.
 
 The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one.
 
@@ -141,11 +141,13 @@ In granted mode the Computer's own configuration directory is the exception. A p
 
 The same split reaches Files: in the shell, `neha file get` writes a File of the Chat into the Workspace, and `neha chat send --file` reads a Workspace file and sends it to the Chat. Both run as shell commands and go through the approval gate like other shell commands. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers them.
 
-In granted mode a shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace, its granted folders, and the run's `--cwd` directory are writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; a write outside the writable roots, such as one in that `/tmp`, is gone when the command ends and never reaches the machine's own `/tmp`.
+In granted mode on Linux a shell command runs in an operating-system sandbox: the machine is read-only, the Bot's Workspace, its granted folders, and the run's `--cwd` directory are writable, and an empty tmpfs covers the Computer's configuration directory. A command also gets a fresh `/tmp` inside the sandbox; a write outside the writable roots, such as one in that `/tmp`, is gone when the command ends and never reaches the machine's own `/tmp`.
 
-In granted mode the daemon checks a Bot's folder before it serves it. A hard link, a symlink, or a special file in the folder makes the daemon refuse that folder until it is cleaned; keep links and special files out of the Workspace. A Bot with full access is served without that check.
+On Windows the sandbox is not available. The file tools stay inside the Bot's folder, but a shell command runs with the machine user's rights and can reach the rest of the machine. Grants, full access, and `--cwd` are refused on Windows rather than silently narrowed.
 
-A machine whose `bubblewrap` cannot start a sandbox does not serve as a Computer.
+In granted mode on Linux the daemon checks a Bot's folder before it serves it. A hard link, a symlink, or a special file in the folder makes the daemon refuse that folder until it is cleaned; keep links and special files out of the Workspace. A Bot with full access is served without that check.
+
+On Linux, a machine whose `bubblewrap` cannot start a sandbox does not serve as a Computer.
 
 ## Moving a Bot
 
@@ -239,7 +241,7 @@ neha bot full-access <bot-id> off
 
 A record that turned full access on before the owner's answer was versioned replays as granted, so a Space updated from an older build shows the Bot as granted. The owner turns it on again with `neha bot full-access <bot-id> on --yes`, which records the new answer.
 
-In granted mode a `write_file` action that would write outside the Bot's Workspace, the granted folders, and the run's `--cwd` directory makes the run wait for the owner's approval instead of running the action; the Space asks only when it can locate the target path. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. A shell that writes outside the fence is refused rather than turned into a request, because the Space does not know the Local Workspace's absolute path. A shell mounted into a grant or into the run's `--cwd` directory is not writable when that folder contains a hard link, symlink, or special file, so it cannot change a file outside it. The approval gate still applies with full access: the first use of the Computer asks, and an Ask rule still asks, but full access raises no folder card.
+In granted mode on Linux a `write_file` action that would write outside the Bot's Workspace, the granted folders, and the run's `--cwd` directory makes the run wait for the owner's approval instead of running the action; the Space asks only when it can locate the target path. Allow runs that action once; Always allow grants the folder for later runs. Deny stops the run. A shell that writes outside the fence is refused rather than turned into a request, because the Space does not know the Local Workspace's absolute path. A shell mounted into a grant or into the run's `--cwd` directory is not writable when that folder contains a hard link, symlink, or special file, so it cannot change a file outside it. The approval gate still applies with full access: the first use of the Computer asks, and an Ask rule still asks, but full access raises no folder card. On Windows the shell is not fenced; approvals are the command boundary, and grants, full access, and `--cwd` are unavailable.
 
 A run can start its actions in another directory with `neha chat send --cwd`:
 
