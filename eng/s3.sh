@@ -11,9 +11,10 @@ case ${1:-} in
 up)
   docker rm -f $name >/dev/null 2>&1 || true
   docker run -d --name $name -p 8333:8333 $image server -s3 -dir=/data >/dev/null
-  for attempt in $(seq 1 30); do
-    if curl -fsS --max-time 2 $endpoint/ >/dev/null 2>&1; then break; fi
-    if [ "$attempt" = 30 ]; then
+  attempt=0
+  until curl -fsS --max-time 2 $endpoint/ >/dev/null 2>&1; do
+    attempt=$((attempt + 1))
+    if [ $attempt -ge 30 ]; then
       echo "the S3 test store did not start" >&2
       docker logs $name >&2
       exit 1
