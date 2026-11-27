@@ -4,9 +4,9 @@
 
 `just ci` is the single gate. It runs the Python hygiene checks, the documentation checks, formatting, Clippy, the workspace test suite, and the documentation build.
 
-Pull requests and pushes to `main` run the same gate. Split it into a fast pull-request gate and a full main gate when the total cost exceeds ten minutes on a hosted runner.
+Pull requests and pushes to `main` run the same gate. CI runs the checks and the test suite as separate jobs, so the checks report while the tests still run. Split it into a fast pull-request gate and a full main gate when the total cost exceeds ten minutes on a hosted runner.
 
-`just verify <directory>` runs the gate recipe by recipe and retains the source snapshot, tool versions, per-recipe timings, and output outside the repository.
+`just verify <directory> [recipe]` runs the gate, or the named recipe, recipe by recipe and retains the source snapshot, tool versions, per-recipe timings, and output outside the repository.
 
 ## Browser client
 

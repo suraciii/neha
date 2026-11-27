@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local gate and retain its result with source provenance."""
+"""Run a gate recipe and retain its result with source provenance."""
 
 import argparse
 import hashlib
@@ -11,7 +11,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 
-GATE = 'ci'
+DEFAULT_RECIPE = 'ci'
 
 
 def timestamp():
@@ -45,7 +45,18 @@ def source_identity(snapshot):
     return {key: value for key, value in snapshot.items() if key != 'diff_file'}
 
 
-def run(root, evidence):
+def recipe_order(dump, recipe):
+    """Recipe names in execution order; only a bodyless aggregate expands."""
+    dependencies = [dependency['recipe'] for dependency in dump['recipes'][recipe]['dependencies']]
+    if not dependencies or dump['recipes'][recipe]['body']:
+        return [recipe]
+    recipes = []
+    for dependency in dependencies:
+        recipes.extend(recipe_order(dump, dependency))
+    return recipes
+
+
+def run(root, evidence, recipe=DEFAULT_RECIPE):
     root = root.resolve()
     evidence = evidence.resolve()
     if evidence == root or root in evidence.parents:
@@ -55,7 +66,7 @@ def run(root, evidence):
         'status': 'running',
         'started_at': timestamp(),
         'repository': str(root),
-        'command': ['just', GATE],
+        'command': ['just', recipe],
         'platform': platform.platform(),
         'python_version': platform.python_version(),
         'log_file': 'gate.log',
@@ -63,6 +74,7 @@ def run(root, evidence):
     }
     process = None
     exit_code = 1
+    returncode = 1
     timeline = []
     try:
         report['before'] = snapshot(root, evidence, 'before')
@@ -81,23 +93,19 @@ def run(root, evidence):
             # Recipe names, in execution order, from just's own dump. Dry-run
             # output cannot be used: it lists command lines, and a multi-line
             # recipe breaks the one-line-per-recipe assumption.
-            recipes = [
-                dependency['recipe']
-                for dependency in json.loads(
-                    subprocess.check_output(
-                        ['just', '--dump', '--dump-format', 'json'],
-                        cwd=root, stderr=subprocess.STDOUT,
-                    ).decode()
-                )['recipes'][GATE]['dependencies']
-            ]
-            for recipe in recipes:
+            dump = json.loads(subprocess.check_output(
+                ['just', '--dump', '--dump-format', 'json'],
+                cwd=root, stderr=subprocess.STDOUT,
+            ).decode())
+            recipes = recipe_order(dump, recipe)
+            for step in recipes:
                 started = datetime.now(timezone.utc)
-                header = f"==> {recipe}\n".encode()
+                header = f"==> {step}\n".encode()
                 log.write(header)
                 log.flush()
                 sys.stdout.buffer.write(header)
                 sys.stdout.buffer.flush()
-                process = subprocess.Popen(['just', recipe], cwd=root,
+                process = subprocess.Popen(['just', step], cwd=root,
                                            stdout=subprocess.PIPE,
                                            stderr=subprocess.STDOUT)
                 while chunk := process.stdout.read1(65536):
@@ -108,7 +116,7 @@ def run(root, evidence):
                 returncode = process.wait()
                 finished = datetime.now(timezone.utc)
                 timeline.append({
-                    'recipe': recipe,
+                    'recipe': step,
                     'started_at': started.isoformat(),
                     'finished_at': finished.isoformat(),
                     'seconds': round((finished - started).total_seconds(), 3),
@@ -147,8 +155,10 @@ def run(root, evidence):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('evidence_dir', type=Path, help='New directory outside the repository')
+    parser.add_argument('recipe', nargs='?', default=DEFAULT_RECIPE,
+                        help='Gate recipe to run, defaulting to the full gate')
     args = parser.parse_args()
-    return run(Path(__file__).resolve().parents[1], args.evidence_dir)
+    return run(Path(__file__).resolve().parents[1], args.evidence_dir, args.recipe)
 
 
 if __name__ == '__main__':
