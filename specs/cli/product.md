@@ -46,7 +46,7 @@ Only the Computer's owner resets it, and only a Hosted Computer is reset. A Comp
 
 Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
 
-`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines. A Hosted Bot has no file access to change: its Workspace is its only write range.
+`neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines. A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
 
 `neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 

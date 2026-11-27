@@ -77,7 +77,7 @@ On a Local Computer with full access, the shell starts no sandbox, and the file 
 
 A record that widened a Bot to full access before the owner's answer was versioned replays as granted. The owner turns full access on again with an explicit answer.
 
-A run names one directory as its working directory. That directory is a write root for that run alone, and it grants nothing to a later run.
+On a Local Computer, a run MAY name another existing directory as its working directory. That directory is a write root for that run alone, and it grants nothing to a later run.
 
 A grant and a run's working directory keep every component name exactly: `logs` and `logs ` are different folders.
 
