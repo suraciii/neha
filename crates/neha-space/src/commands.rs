@@ -1386,6 +1386,15 @@ async fn message_send(
         Some(cwd) => Some(working_directory(cwd)?),
         None => None,
     };
+    // A run's directory is a write root for that run, so the request must name
+    // that authorization. A Client written before the marker existed never
+    // sends it: refuse the request before any event records a run, instead of
+    // widening a directory the User may only have wanted to read.
+    if cwd.is_some() && arguments.cwd_writable != Some(true) {
+        return Err(ApiError::invalid_argument(
+            "a run with a working directory needs cwd_writable true; upgrade the client",
+        ));
+    }
     // The run joins the queue behind the Bot's active runs. It is counted
     // before the append so the confirmed place matches the record order.
     let position = {
@@ -1433,7 +1442,7 @@ async fn message_send(
                 json!({
                     "run": run,
                     "working_dir": cwd,
-                    "writable": true,
+                    "writable": arguments.cwd_writable == Some(true),
                 }),
             )
             .acting(account.id),

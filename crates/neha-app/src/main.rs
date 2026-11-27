@@ -1035,9 +1035,11 @@ async fn chat(command: ChatCommand) -> Result<()> {
                 Some(path) => Some(client::upload_file(&credential, chat, path).await?),
                 None => None,
             };
+            let cwd = cwd.map(|path| path.to_string_lossy().into_owned());
             let command = CommandCall::MessageSend(MessageSend {
                 chat,
-                cwd: cwd.map(|path| path.to_string_lossy().into_owned()),
+                cwd_writable: cwd.is_some().then_some(true),
+                cwd,
                 text: text.unwrap_or_default(),
                 file: uploaded.as_ref().map(|file| file.id),
             });

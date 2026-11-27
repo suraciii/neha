@@ -45,6 +45,10 @@ A rule-triggered approval also offers no Always allow when the action cannot mak
 
 An ambiguous form still offers Always allow when the action can make a lasting rule, and that answer removes no rule.
 
+## Sending a Message
+
+A request that names a working directory carries the write authorization for it. A request that names a directory without that authorization is refused before it joins a queue, and it records no Message and no run.
+
 ## Files
 
 A Message carries at most one File. A Message names the File by its id, and the record keeps the File's name, type, and size.

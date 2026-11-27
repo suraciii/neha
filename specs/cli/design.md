@@ -47,6 +47,8 @@ A caller and a Space tell each other what they can do. A missing capability that
 
 Turning full access on needs the consent version the Space states. An older caller that sends none is refused, and nothing is recorded.
 
+A request that names a working directory carries its write authorization, so a client written before the marker existed is refused and told to upgrade. The CLI sends the marker with `--cwd`; the browser composer names no directory.
+
 ## Streams
 
 A client reads events from a cursor and resumes from it after a reconnect. A cursor the Space can no longer serve gives the client a fresh snapshot.

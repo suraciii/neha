@@ -279,6 +279,15 @@ pub struct MessageSend {
     /// The directory this run works in; absent means the Bot's Workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Whether the User authorizes writing in that directory for this run
+    /// alone.
+    ///
+    /// A request that names a directory must carry `true`: a Client written
+    /// before the marker existed never sends it, so the Space refuses the
+    /// request instead of recording a directory as a write root the User did
+    /// not name for writing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd_writable: Option<bool>,
 }
 
 /// A frame the Space sends.
@@ -480,6 +489,7 @@ mod tests {
             text: "hello".to_owned(),
             file: None,
             cwd: None,
+            cwd_writable: None,
         });
         let text = serde_json::to_string(&plain).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), plain);
@@ -487,15 +497,49 @@ mod tests {
             !text.contains("\"file\""),
             "a Message without a File omits it"
         );
+        assert!(
+            !text.contains("cwd_writable"),
+            "a Message without a directory omits its authorization"
+        );
 
         let file = CommandCall::MessageSend(MessageSend {
             chat,
             text: String::new(),
             file: Some(Id::new()),
             cwd: None,
+            cwd_writable: None,
         });
         let text = serde_json::to_string(&file).unwrap();
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), file);
+
+        // A request that names a directory can say it authorizes writing there.
+        let directory = CommandCall::MessageSend(MessageSend {
+            chat,
+            text: "work".to_owned(),
+            file: None,
+            cwd: Some("/data/project".to_owned()),
+            cwd_writable: Some(true),
+        });
+        let text = serde_json::to_string(&directory).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CommandCall>(&text).unwrap(),
+            directory
+        );
+        assert!(text.contains("\"cwd_writable\":true"));
+        // A request from a Client written before the field existed decodes with
+        // no authorization, so the Space can refuse it as an old form.
+        let old = serde_json::json!({
+            "name": "message_send",
+            "args": {
+                "chat": chat,
+                "text": "work",
+                "cwd": "/data/project",
+            },
+        });
+        let CommandCall::MessageSend(sent) = serde_json::from_value(old).unwrap() else {
+            panic!("the old form still decodes as a Message");
+        };
+        assert_eq!(sent.cwd_writable, None);
     }
 
     #[test]

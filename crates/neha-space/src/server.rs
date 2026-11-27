@@ -3235,6 +3235,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -3850,6 +3851,7 @@ mod tests {
             file: None,
 
             cwd: None,
+            cwd_writable: None,
         });
 
         let first = command(&mut socket, send, message.clone()).await;
@@ -3904,6 +3906,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -3923,6 +3926,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -4045,6 +4049,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -4162,6 +4167,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -4219,6 +4225,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -4492,6 +4499,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -4551,6 +4559,7 @@ mod tests {
                 file,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await
@@ -4567,6 +4576,7 @@ mod tests {
                 file: None,
 
                 cwd: Some(cwd.to_owned()),
+                cwd_writable: Some(true),
             }),
         )
         .await
@@ -5286,6 +5296,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 )
                 .await
@@ -5378,6 +5389,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -5396,6 +5408,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -5446,6 +5459,7 @@ mod tests {
                     file: None,
 
                     cwd: None,
+                    cwd_writable: None,
                 }),
             ),
         )
@@ -5493,6 +5507,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -5529,6 +5544,7 @@ mod tests {
                 file: None,
 
                 cwd: None,
+                cwd_writable: None,
             }),
         )
         .await;
@@ -5575,6 +5591,7 @@ mod tests {
                         file: None,
 
                         cwd: None,
+                        cwd_writable: None,
                     }),
                 })
                 .unwrap()
@@ -6608,6 +6625,7 @@ mod tests {
                     file: Some(file),
 
                     cwd: None,
+                    cwd_writable: None,
                 }),
             )
             .await,
@@ -14051,6 +14069,153 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_working_directory_needs_the_requests_write_authorization() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        command(
+            &mut socket,
+            Id::new(),
+            provider_add("http://127.0.0.1:1/v1".to_owned()),
+        )
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let before = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events
+            .len();
+
+        // A Client written before the field existed sends the directory and no
+        // authorization; a request that says the directory is not writable
+        // cannot be honored either. Both are refused before any run exists.
+        for consent in [None, Some(false)] {
+            let refused = try_command(
+                &mut socket,
+                Id::new(),
+                CommandCall::MessageSend(MessageSend {
+                    chat,
+                    text: "work in the folder".to_owned(),
+                    file: None,
+                    cwd: Some("/var/tmp/legacy-logs /.".to_owned()),
+                    cwd_writable: consent,
+                }),
+            )
+            .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err((ErrorCode::InvalidArgument, ref message))
+                        if message.contains("cwd_writable")
+                ),
+                "{refused:?}"
+            );
+        }
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        assert_eq!(events.len(), before, "a refused request records no run");
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert_eq!(messages, json!([]), "a refused request adds no Message");
+
+        // This build's Client names the directory and its authorization; the
+        // record keeps both, so a restore knows what the run may write.
+        let accepted = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MessageSend(MessageSend {
+                chat,
+                text: "work in the folder".to_owned(),
+                file: None,
+                cwd: Some("/var/tmp/legacy-logs /.".to_owned()),
+                cwd_writable: Some(true),
+            }),
+        )
+        .await;
+        let run = run_of(&accepted);
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        let context = events
+            .iter()
+            .find(|event| event.kind == EventKind::RunContext && event.data["run"] == json!(run))
+            .expect("the accepted run records its directory");
+        assert_eq!(context.data["working_dir"], json!("/var/tmp/legacy-logs "));
+        assert_eq!(context.data["writable"], json!(true));
+
+        socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_named_directory_is_a_write_root_for_one_run_only() {
+        let (_dir, running, invite) = running().await;
+        let mut local = local_bot(
+            &running,
+            &invite,
+            vec![
+                tool("shell", json!({"command": "printf one"})),
+                text("one done"),
+                tool("shell", json!({"command": "printf two"})),
+                text("two done"),
+            ],
+        )
+        .await;
+        let cwd = "/var/tmp/neha-one-run ";
+        let spelling = "/var/tmp/neha-one-run /.";
+
+        // The first use asks; the directory is a write root for this run.
+        let first = run_of(&submit_in(&mut local.socket, local.chat, "one", spelling).await);
+        allow_first_use(&mut local.socket, local.chat).await;
+        let (action, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "one").await;
+        assert!(matches!(action, WireAction::Shell { .. }));
+        assert_eq!(working_dir.as_deref(), Some(cwd));
+        assert_eq!(access.write_roots, vec![cwd.to_owned()]);
+        assert_eq!(
+            wait_run(&mut local.socket, first).await["status"],
+            "succeeded"
+        );
+
+        // A later run that names no directory inherits no write root.
+        let second = run_of(&submit(&mut local.socket, local.chat, "two", None).await);
+        let (_, working_dir, access) =
+            answer_next_action_with_access(&mut local.device, "two").await;
+        assert_eq!(working_dir, None);
+        assert!(
+            access.write_roots.is_empty(),
+            "a run's directory belongs to the run that named it"
+        );
+        assert_eq!(
+            wait_run(&mut local.socket, second).await["status"],
+            "succeeded"
+        );
+        let shown = show_run(&mut local.socket, second).await;
+        assert_eq!(shown["cwd"], json!(null));
+
+        local.device.close(None).await.unwrap();
+        local.provider_task.abort();
+        local.socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_recorded_directory_that_ends_in_a_space_keeps_its_identity() {
         let (_dir, running, invite) = running().await;
         let mut local = local_bot(
@@ -14323,6 +14488,7 @@ mod tests {
                 chat,
                 text: "where".to_owned(),
                 file: None,
+                cwd_writable: cwd.is_some().then_some(true),
                 cwd: cwd.map(ToOwned::to_owned),
             })
         };
