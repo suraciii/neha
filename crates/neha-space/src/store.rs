@@ -1195,6 +1195,17 @@ mod tests {
                 serde_json::json!({"memory": Id::new()}),
             )
             .acting(user),
+            EventKind::MemoryAnswered => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "call": "call-1",
+                    "answer": "{}",
+                }),
+            )
+            .acting(user),
         }
     }
 

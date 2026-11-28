@@ -62,7 +62,7 @@ The page adds and changes no entry. You add and change memory in a Chat.
 
 ### From the CLI
 
-The Bot's owner and a User allowed to use the Bot read its memory from the CLI. Copy the Bot's id from `neha bot list` into `BOT_ID`, then list its memory:
+The owner reads a Bot's memory from the CLI. A User allowed to use a shared Bot will read it there once sharing is available. Copy the Bot's id from `neha bot list` into `BOT_ID`, then list its memory:
 
 ```bash
 target/debug/neha bot list
@@ -79,7 +79,7 @@ ENTRY_ID="<the entry's id>"
 target/debug/neha bot memory remove "$BOT_ID" "$ENTRY_ID"
 ```
 
-The command removes an entry when the User can clear it, and the owner can clear any entry. It refuses an entry the User cannot clear.
+The owner can remove any entry. The command refuses an entry the User running it cannot clear.
 
 ### In a Chat
 

@@ -113,6 +113,9 @@ pub enum EventKind {
     /// A Bot's memory entry was removed.
     #[serde(rename = "neha.memory.removed")]
     MemoryRemoved,
+    /// A memory tool call answered its Bot.
+    #[serde(rename = "neha.memory.answered")]
+    MemoryAnswered,
 }
 
 impl EventKind {
@@ -147,6 +150,7 @@ impl EventKind {
             Self::RuleRemoved => "neha.rule.removed",
             Self::MemoryAdded => "neha.memory.added",
             Self::MemoryRemoved => "neha.memory.removed",
+            Self::MemoryAnswered => "neha.memory.answered",
         }
     }
 
@@ -163,8 +167,10 @@ impl EventKind {
             // does not know it keeps the name it has and reads on.
             Self::BotRenamed => EventClass::Presentation,
             // Memory decides nothing about access or work either: a reader
-            // that does not know an entry skips it and reads on.
-            Self::MemoryAdded | Self::MemoryRemoved => EventClass::Presentation,
+            // that does not know an entry or an answer skips it and reads on.
+            Self::MemoryAdded | Self::MemoryRemoved | Self::MemoryAnswered => {
+                EventClass::Presentation
+            }
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunContext
@@ -222,6 +228,7 @@ impl FromStr for EventKind {
             "neha.rule.removed" => Ok(Self::RuleRemoved),
             "neha.memory.added" => Ok(Self::MemoryAdded),
             "neha.memory.removed" => Ok(Self::MemoryRemoved),
+            "neha.memory.answered" => Ok(Self::MemoryAnswered),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -298,7 +305,7 @@ mod tests {
     use super::{
         Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, ComputerSharing, ComputerUpdated,
         EventData, EventDataError, EventDraft, EventKind, FileAdded, FileError, MemoryAdded,
-        MemoryRemoved, RunAccess, RunQueued,
+        MemoryAnswered, MemoryRemoved, RunAccess, RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -334,6 +341,7 @@ mod tests {
             EventKind::RuleRemoved,
             EventKind::MemoryAdded,
             EventKind::MemoryRemoved,
+            EventKind::MemoryAnswered,
         ];
 
         for kind in kinds {
@@ -363,6 +371,7 @@ mod tests {
         assert_eq!(EventKind::RuleRemoved.class(), EventClass::Authority);
         assert_eq!(EventKind::MemoryAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::MemoryRemoved.class(), EventClass::Presentation);
+        assert_eq!(EventKind::MemoryAnswered.class(), EventClass::Presentation);
     }
 
     #[test]
@@ -1096,6 +1105,31 @@ mod tests {
     }
 
     #[test]
+    fn a_memory_answered_round_trips() {
+        let data = MemoryAnswered {
+            run: Id::new(),
+            step: 2,
+            call: "call-1".to_owned(),
+            answer: "{\"removed\": []}".to_owned(),
+        };
+        let value = serde_json::json!({
+            "run": data.run,
+            "step": data.step,
+            "call": data.call,
+            "answer": data.answer,
+        });
+
+        assert_eq!(
+            EventKind::MemoryAnswered.decode(&value).unwrap(),
+            EventData::MemoryAnswered(data)
+        );
+
+        let mut unknown = value;
+        unknown["bot"] = serde_json::json!(Id::new());
+        assert!(EventKind::MemoryAnswered.decode(&unknown).is_err());
+    }
+
+    #[test]
     fn memory_events_take_their_authors() {
         let bot = Author::Bot(Id::new());
         let user = Author::User(Id::new());
@@ -1110,6 +1144,22 @@ mod tests {
         assert!(EventKind::MemoryAdded.validate_author(bot, None).is_err());
         assert!(
             EventKind::MemoryAdded
+                .validate_author(user, Some(acting))
+                .is_err()
+        );
+        // An answer is the Bot's record operation too, acting for a User.
+        assert!(
+            EventKind::MemoryAnswered
+                .validate_author(bot, Some(acting))
+                .is_ok()
+        );
+        assert!(
+            EventKind::MemoryAnswered
+                .validate_author(bot, None)
+                .is_err()
+        );
+        assert!(
+            EventKind::MemoryAnswered
                 .validate_author(user, Some(acting))
                 .is_err()
         );
@@ -1212,6 +1262,8 @@ pub enum EventData {
     MemoryAdded(MemoryAdded),
     /// A memory entry was removed.
     MemoryRemoved(MemoryRemoved),
+    /// A memory tool call answered its Bot.
+    MemoryAnswered(MemoryAnswered),
 }
 
 /// The first version of every event kind.
@@ -1282,6 +1334,7 @@ impl EventKind {
                 EventData::MemoryAdded(data)
             }
             Self::MemoryRemoved => EventData::MemoryRemoved(decode(data)?),
+            Self::MemoryAnswered => EventData::MemoryAnswered(decode(data)?),
         };
 
         Ok(decoded)
@@ -1327,9 +1380,10 @@ impl EventKind {
                     return Err(EventDataError::Author);
                 }
             }
-            // A memory write is a record operation the Bot runs: it is
-            // authored by the Bot with the User it acts for.
-            Self::MemoryAdded => {
+            // A memory write and a memory answer are record operations the
+            // Bot runs: they are authored by the Bot with the User it acts
+            // for.
+            Self::MemoryAdded | Self::MemoryAnswered => {
                 if !matches!(author, Author::Bot(_)) || acting.is_none() {
                     return Err(EventDataError::Author);
                 }
@@ -2221,4 +2275,24 @@ impl MemoryAdded {
 pub struct MemoryRemoved {
     /// The entry.
     pub memory: Id,
+}
+
+/// The data of `neha.memory.answered`.
+///
+/// The exact answer one memory tool call gave its Bot: its run, step, and
+/// call, and the text the Model read. The answer covers a no-op, a refusal,
+/// and an error alike, so a replay returns it instead of running the call
+/// again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAnswered {
+    /// The run.
+    pub run: Id,
+    /// The step the call belongs to.
+    pub step: u32,
+    /// The call's identifier, the one its tool result answers under.
+    pub call: String,
+    /// The exact text the Model read.
+    pub answer: String,
 }

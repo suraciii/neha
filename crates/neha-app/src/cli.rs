@@ -1115,7 +1115,7 @@ fn memory_rows(list: &Value) -> Result<Vec<String>> {
 /// in place of the text the Space withheld.
 fn memory_row(entry: &Value) -> Result<String> {
     let content = if entry["readable"].as_bool().unwrap_or(false) {
-        text_of(entry, "text")?.to_owned()
+        visible_text(text_of(entry, "text")?)
     } else {
         "(metadata only)".to_owned()
     };
@@ -1131,6 +1131,29 @@ fn memory_row(entry: &Value) -> Result<String> {
         byte_size(size_of(entry, "size")?),
         content,
     ))
+}
+
+/// Makes a memory text printable on one line.
+///
+/// A memory text is what the Bot or a User wrote, so it may hold a line break
+/// or a terminal control sequence. Escaping those keeps one entry on one line
+/// and keeps the terminal's state out of the Bot's memory. Only a control
+/// character changes; a literal backslash stays as it was written.
+fn visible_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\n' => shown.push_str("\\n"),
+            '\r' => shown.push_str("\\r"),
+            '\t' => shown.push_str("\\t"),
+            ch if ch.is_control() => {
+                shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
+            }
+            ch => shown.push(ch),
+        }
+    }
+
+    shown
 }
 
 /// The room each memory kind has: its used size and its limit.
@@ -2729,7 +2752,7 @@ mod tests {
 
     use super::{
         BotCommand, MemoryCommand, byte_size, confirm_full_access, memory_rows, normalized_grant,
-        write_access,
+        visible_text, write_access,
     };
 
     /// Parses a CLI command line.
@@ -3937,6 +3960,62 @@ mod tests {
         assert!(rows[1].ends_with("1.5 KiB  (metadata only)"), "{rows:?}");
         assert_eq!(rows[2], "rule: 30 B used / 4.0 KiB limit");
         assert_eq!(rows[3], "note: 1.5 KiB used / 16 KiB limit");
+    }
+
+    #[test]
+    fn a_memory_text_never_breaks_its_line() {
+        let list = json!({
+            "entries": [{
+                "memory": Id::new(),
+                "kind": "rule",
+                "scope": "owner",
+                "author": Id::new(),
+                "author_bot": false,
+                "source": Id::new(),
+                "source_kind": "run",
+                "size": 48,
+                "readable": true,
+                "text": "first line\nsecond\tone\rbell\u{7}\u{85} — 注意 📌",
+            }],
+            "used": {"rule": 48, "note": 0},
+            "limits": {"rule": 4096, "note": 16384},
+        });
+
+        let rows = memory_rows(&list).unwrap();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let row = &rows[0];
+        assert_eq!(
+            row.lines().count(),
+            1,
+            "one memory entry is one output line: {row:?}"
+        );
+        assert!(!row.contains('\n'), "a newline is escaped: {row:?}");
+        assert!(!row.contains('\r'), "a carriage return is escaped: {row:?}");
+        assert!(!row.contains('\t'), "a tab is escaped: {row:?}");
+        assert!(
+            row.ends_with(r"first line\nsecond\tone\rbell\u{7}\u{85} — 注意 📌"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn a_memory_text_escapes_controls_and_keeps_unicode() {
+        assert_eq!(visible_text("plain text"), "plain text");
+        assert_eq!(visible_text("one\ntwo"), r"one\ntwo");
+        assert_eq!(visible_text("one\ttwo"), r"one\ttwo");
+        assert_eq!(visible_text("one\rtwo"), r"one\rtwo");
+        // Every other control character, including the C1 block, is named.
+        assert_eq!(
+            visible_text("\u{0}\u{7}\u{1b}\u{7f}\u{85}"),
+            r"\u{0}\u{7}\u{1b}\u{7f}\u{85}"
+        );
+        // Unicode that is not a control character passes through unchanged.
+        assert_eq!(
+            visible_text("记住：部署笔记 — naïve 📌"),
+            "记住：部署笔记 — naïve 📌"
+        );
+        // Only a control character changes; a literal backslash stays as typed.
+        assert_eq!(visible_text(r"a\nb"), r"a\nb");
     }
 
     #[test]

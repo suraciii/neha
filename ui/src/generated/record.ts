@@ -415,7 +415,7 @@ data: Record<string, unknown>, };
 /**
  * The kinds of event the record carries.
  */
-export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.memory.added" | "neha.memory.removed";
+export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.memory.added" | "neha.memory.removed" | "neha.memory.answered";
 
 /**
  * The data of `neha.file.added`.
@@ -504,6 +504,32 @@ text: string,
  * The entries this write replaces; they stop applying.
  */
 replaces: Array<string>, };
+
+/**
+ * The data of `neha.memory.answered`.
+ *
+ * The exact answer one memory tool call gave its Bot: its run, step, and
+ * call, and the text the Model read. The answer covers a no-op, a refusal,
+ * and an error alike, so a replay returns it instead of running the call
+ * again.
+ */
+export type MemoryAnswered = { 
+/**
+ * The run.
+ */
+run: string, 
+/**
+ * The step the call belongs to.
+ */
+step: number, 
+/**
+ * The call's identifier, the one its tool result answers under.
+ */
+call: string, 
+/**
+ * The exact text the Model read.
+ */
+answer: string, };
 
 /**
  * What a memory entry is for.

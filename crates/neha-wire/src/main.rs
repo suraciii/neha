@@ -43,6 +43,7 @@ fn main() {
         neha::record::EventKind,
         neha::record::FileAdded,
         neha::record::MemoryAdded,
+        neha::record::MemoryAnswered,
         neha::record::MemoryRemoved,
         neha::record::MessageAdded,
         neha::record::ModelData,

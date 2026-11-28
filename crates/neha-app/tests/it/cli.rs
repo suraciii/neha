@@ -5567,8 +5567,8 @@ async fn a_bot_owner_reads_and_removes_memory_from_the_cli() {
     assert!(stderr.contains("needs a Bot"), "{stderr}");
 
     // A run the owner starts writes a rule; the CLI shows its id, kind, scope,
-    // author, source, size, and content.
-    let rule = "Keep the deploy notes current.";
+    // author, source, size, and content, with the text escaped onto one line.
+    let rule = "Keep the deploy notes current.\n\tCheck them every week.";
     script.call(
         "remember",
         serde_json::json!({"kind": "rule", "scope": "owner", "text": rule}),
@@ -5587,7 +5587,10 @@ async fn a_bot_owner_reads_and_removes_memory_from_the_cli() {
     assert!(row.contains("  rule  owner  "), "{listed}");
     assert!(row.contains(&format!("author {user}")), "{listed}");
     assert!(row.contains("source run "), "{listed}");
-    assert!(row.ends_with(rule), "{listed}");
+    assert!(
+        listed.contains(r"Keep the deploy notes current.\n\tCheck them every week."),
+        "the entry's line breaks are escaped:\n{listed}"
+    );
     assert!(
         listed.contains(&format!("rule: {} B used / 4.0 KiB limit", rule.len())),
         "{listed}"

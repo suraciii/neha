@@ -1261,6 +1261,10 @@ async fn gated_protocol_provider(
 }
 
 async fn open_socket(running: &Running, token: &str) -> Socket {
+    open_socket_with(running, token, &[]).await
+}
+
+async fn open_socket_with(running: &Running, token: &str, capabilities: &[&str]) -> Socket {
     let mut request = format!("ws://{}/api/socket", running.addr)
         .into_client_request()
         .unwrap();
@@ -1272,7 +1276,10 @@ async fn open_socket(running: &Running, token: &str) -> Socket {
         .send(Message::Text(
             serde_json::to_string(&ClientFrame::Hello {
                 version: PROTOCOL_VERSION,
-                capabilities: Vec::new(),
+                capabilities: capabilities
+                    .iter()
+                    .map(|capability| (*capability).to_owned())
+                    .collect(),
             })
             .unwrap()
             .into(),
@@ -3165,7 +3172,15 @@ async fn an_event_larger_than_one_frame_is_reported() {
     let reader = store.reader();
     let (out, mut frames) = tokio::sync::mpsc::channel(8);
 
-    let result = catch_up(&reader, &out, neha::seq::Seq::ZERO, None, user).await;
+    let result = catch_up(
+        &reader,
+        &out,
+        neha::seq::Seq::ZERO,
+        None,
+        user,
+        &std::collections::HashSet::new(),
+    )
+    .await;
 
     assert!(matches!(result, Err(CatchUpError::Oversized(_))));
     assert!(matches!(
@@ -5891,7 +5906,7 @@ async fn a_bot_remembers_what_its_owner_told_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bot_forgets_the_note_its_owner_asks_it_to() {
     let (_dir, running, invite) = running().await;
-    let (mut socket, _token) = admin(&running, &invite).await;
+    let (mut socket, token) = admin(&running, &invite).await;
     let note = "the build uses nix";
     let (base, provider_task, _gates, recorded) = gated_provider(vec![
         tool(
@@ -5933,7 +5948,10 @@ async fn a_bot_forgets_the_note_its_owner_asks_it_to() {
     // no longer shows it.
     let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
     assert!(listed["entries"].as_array().unwrap().is_empty(), "{listed}");
-    let (_cursor, events) = snapshot_events(&mut socket).await;
+    // A reader that names the memory capability reads the removal; the
+    // browser-shaped socket the admin used names none and skips it.
+    let mut reader = open_socket_with(&running, &token, &[neha::surface::MEMORY_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut reader).await;
     assert!(
         events.iter().any(|event| {
             event.kind == neha::record::EventKind::MemoryRemoved
@@ -5941,7 +5959,192 @@ async fn a_bot_forgets_the_note_its_owner_asks_it_to() {
         }),
         "the record keeps the removal: {events:?}"
     );
+    reader.close(None).await.unwrap();
 
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_memory_tool_answer_is_recorded_with_its_run_step_and_call() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        tool(
+            "remember",
+            json!({"kind": "note", "scope": "owner", "text": "the build uses nix"}),
+        ),
+        text("Noted."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+    let first = send(&mut socket, chat, "remember that the build uses nix").await;
+    assert_eq!(first["status"], "succeeded");
+    let run: Id = serde_json::from_value(first["run"].clone()).unwrap();
+    // The answer is the exact text the Model read on its next step.
+    let answer = {
+        let requests = recorded.lock().unwrap();
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("the Model read the memory answer")
+            .to_owned()
+    };
+
+    let mut reader = open_socket_with(&running, &token, &[neha::surface::MEMORY_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut reader).await;
+    let answered = events
+        .iter()
+        .find(|event| event.kind == neha::record::EventKind::MemoryAnswered)
+        .expect("the record keeps the memory answer");
+    assert_eq!(answered.data["run"], json!(run));
+    assert_eq!(answered.data["step"], json!(1));
+    assert_eq!(answered.data["call"], json!("call-0"));
+    assert_eq!(answered.data["answer"], json!(answer));
+
+    reader.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_memory_call_records_the_refusal_as_its_answer() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    // The tool arguments miss the text the tool needs, so the loop refuses the
+    // call before it runs; the refusal is still the memory tool's answer.
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        tool("remember", json!({"kind": "note", "scope": "owner"})),
+        text("Noted."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+    let first = send(&mut socket, chat, "remember that the build uses nix").await;
+    assert_eq!(first["status"], "succeeded");
+    let answer = {
+        let requests = recorded.lock().unwrap();
+        requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .expect("the Model read the refusal")
+            .to_owned()
+    };
+
+    let mut reader = open_socket_with(&running, &token, &[neha::surface::MEMORY_CAPABILITY]).await;
+    let (_cursor, events) = snapshot_events(&mut reader).await;
+    let answered = events
+        .iter()
+        .find(|event| event.kind == neha::record::EventKind::MemoryAnswered)
+        .expect("the record keeps the refusal");
+    assert_eq!(answered.data["call"], json!("call-0"));
+    assert_eq!(answered.data["answer"], json!(answer));
+    assert!(
+        answered.data["answer"].as_str().unwrap().contains("text"),
+        "the answer is the tool's refusal: {}",
+        answered.data["answer"]
+    );
+
+    reader.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_events_reach_only_a_caller_that_names_the_capability() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+        tool(
+            "remember",
+            json!({"kind": "note", "scope": "owner", "text": "first note"}),
+        ),
+        text("Noted."),
+        tool(
+            "remember",
+            json!({"kind": "note", "scope": "owner", "text": "second note"}),
+        ),
+        text("Noted again."),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let first = send(&mut socket, chat, "remember the first note").await;
+    assert_eq!(first["status"], "succeeded");
+
+    // The browser-shaped reader names no capability; the new one names
+    // `memory`.
+    let mut old = open_socket(&running, &token).await;
+    let mut capable = open_socket_with(&running, &token, &[neha::surface::MEMORY_CAPABILITY]).await;
+    let (_, old_events) = snapshot_events(&mut old).await;
+    assert!(
+        old_events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::MessageAdded),
+        "an old reader still reads the Messages"
+    );
+    assert!(
+        !old_events.iter().any(|event| matches!(
+            event.kind,
+            neha::record::EventKind::MemoryAdded
+                | neha::record::EventKind::MemoryRemoved
+                | neha::record::EventKind::MemoryAnswered
+        )),
+        "an old reader skips the memory kinds: {:?}",
+        old_events
+            .iter()
+            .map(|event| event.kind)
+            .collect::<Vec<_>>()
+    );
+    let (_, capable_events) = snapshot_events(&mut capable).await;
+    assert!(
+        capable_events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::MemoryAdded),
+        "a capable reader reads the entries"
+    );
+    assert!(
+        capable_events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::MemoryAnswered),
+        "a capable reader reads the answers"
+    );
+
+    // The live forwarder filters the same way: the second run's memory events
+    // reach the capable reader and never the old one.
+    let second = send(&mut socket, chat, "remember the second note").await;
+    assert_eq!(second["status"], "succeeded");
+    let old_kinds = event_kinds_until_run_finished(&mut old).await;
+    assert!(
+        !old_kinds.iter().any(|kind| matches!(
+            kind,
+            neha::record::EventKind::MemoryAdded
+                | neha::record::EventKind::MemoryRemoved
+                | neha::record::EventKind::MemoryAnswered
+        )),
+        "the old reader receives no memory event live: {old_kinds:?}"
+    );
+    let capable_kinds = event_kinds_until_run_finished(&mut capable).await;
+    assert!(
+        capable_kinds.contains(&neha::record::EventKind::MemoryAdded),
+        "the capable reader receives the entry live: {capable_kinds:?}"
+    );
+    assert!(
+        capable_kinds.contains(&neha::record::EventKind::MemoryAnswered),
+        "the capable reader receives the answer live: {capable_kinds:?}"
+    );
+
+    old.close(None).await.unwrap();
+    capable.close(None).await.unwrap();
     socket.close(None).await.unwrap();
     provider_task.abort();
     running.shutdown().await;
@@ -7346,7 +7549,15 @@ async fn a_long_record_of_large_events_catches_up_across_frames() {
     let (out, mut frames) = tokio::sync::mpsc::channel(64);
     // The account is the one the record's events act for; the whole
     // record is visible to it.
-    let result = catch_up(&reader, &out, neha::seq::Seq::ZERO, None, user).await;
+    let result = catch_up(
+        &reader,
+        &out,
+        neha::seq::Seq::ZERO,
+        None,
+        user,
+        &std::collections::HashSet::new(),
+    )
+    .await;
     assert!(result.is_ok());
     drop(out);
     let mut seen = std::collections::BTreeSet::new();
@@ -14903,6 +15114,22 @@ async fn an_always_allow_of_a_bare_relative_file_covers_relative_paths() {
 // ---- Event visibility, machine-scoped first use, and the approval fence ----
 
 /// Subscribes and returns the snapshot's cursor and events.
+async fn event_kinds_until_run_finished(socket: &mut Socket) -> Vec<neha::record::EventKind> {
+    let mut kinds = Vec::new();
+    loop {
+        match next_frame(socket).await {
+            ServerFrame::Event { event } => {
+                kinds.push(event.kind);
+                if event.kind == neha::record::EventKind::RunFinished {
+                    return kinds;
+                }
+            }
+            ServerFrame::Heartbeat { .. } => {}
+            other => panic!("expected an event, got {other:?}"),
+        }
+    }
+}
+
 async fn snapshot_events(socket: &mut Socket) -> (Seq, Vec<neha::record::Event>) {
     socket
         .send(Message::Text(

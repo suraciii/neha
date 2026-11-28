@@ -19,6 +19,25 @@ pub const PROTOCOL_VERSION: u16 = 1;
 /// The largest frame a client or the Space accepts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// The capability a caller names to receive the memory event kinds.
+pub const MEMORY_CAPABILITY: &str = "memory";
+
+/// Returns the capability a caller must name to read one event kind the
+/// protocol version does not already carry.
+///
+/// A kind this function does not name is one every caller of the current
+/// protocol version reads; the memory kinds are the later Presentation kinds
+/// a capability admits.
+#[must_use]
+pub const fn event_capability(kind: crate::record::EventKind) -> Option<&'static str> {
+    match kind {
+        crate::record::EventKind::MemoryAdded
+        | crate::record::EventKind::MemoryRemoved
+        | crate::record::EventKind::MemoryAnswered => Some(MEMORY_CAPABILITY),
+        _ => None,
+    }
+}
+
 /// A frame a client sends.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export_to = "surface.ts")]
@@ -539,9 +558,9 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, MessageSend, ModelSpec,
-        PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol, ServerFrame,
-        ThinkingLevel,
+        BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, MEMORY_CAPABILITY,
+        MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol,
+        ServerFrame, ThinkingLevel, event_capability,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -1053,6 +1072,28 @@ mod tests {
         assert!(text.contains(&format!("\"bot\":\"{bot}\"")), "{text}");
         assert!(text.contains(&format!("\"memory\":\"{memory}\"")), "{text}");
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), remove);
+    }
+
+    #[test]
+    fn the_memory_capability_admits_the_memory_kinds() {
+        let memory_kinds = [
+            crate::record::EventKind::MemoryAdded,
+            crate::record::EventKind::MemoryRemoved,
+            crate::record::EventKind::MemoryAnswered,
+        ];
+        for kind in memory_kinds {
+            assert_eq!(event_capability(kind), Some(MEMORY_CAPABILITY));
+        }
+        for kind in [
+            crate::record::EventKind::MessageAdded,
+            crate::record::EventKind::RunReply,
+        ] {
+            assert_eq!(
+                event_capability(kind),
+                None,
+                "an older kind needs no capability"
+            );
+        }
     }
 }
 

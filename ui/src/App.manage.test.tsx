@@ -123,6 +123,20 @@ async function openBots(which = 0): Promise<View> {
   return view;
 }
 
+// Opens the Bots surface and asks for the first Bot's page without waiting for
+// it to finish reading: a test holds one of the page's reads and acts while the
+// page is still opening.
+async function openBotLoading(): Promise<View> {
+  const view = renderApp();
+  await waitFor(() => expect(element(view, ".rail__item:nth-of-type(3)")).toBeTruthy());
+  await waitFor(() => expect(space.handlers).not.toBeNull());
+  flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
+  const bots = () => view.container.querySelectorAll(".conv");
+  await waitFor(() => expect(bots().length).toBeGreaterThan(0));
+  flush(() => fireEvent.click(bots()[0]!));
+  return view;
+}
+
 // Opens the Settings surface on the section the test names: Providers, Models,
 // Computers, or the catalog.
 async function openSettings(section = "Providers"): Promise<View> {
@@ -639,6 +653,54 @@ describe("App management", () => {
     space.memories = { b1: [] };
     record("neha.memory.removed", { memory: "mem4" });
     await waitFor(() => expect(memory()).toContain("Ask the Bot in a Chat to remember something."));
+  });
+
+  it("keeps the newest memory answer when two reads land out of order", async () => {
+    space.memories = { b1: [memoryOf({ memory: "mem1", text: "Old rule." })] };
+    // Every memory read waits until the test lets it answer.
+    space.holdMemories();
+    const view = await openBotLoading();
+    await waitFor(() => expect(space.memoryHolds).toHaveLength(1));
+
+    // The memory changes while the page is opening: a new entry replaces the old
+    // one, and the event's read answers about the newer record.
+    space.memories = { b1: [memoryOf({ memory: "mem2", text: "New rule." })] };
+    record("neha.memory.added", { memory: "mem2", bot: "b1" });
+    await waitFor(() => expect(space.memoryHolds).toHaveLength(2));
+
+    // The newer read answers first, the page-opening read after it. The older
+    // answer speaks about a record the page has already replaced, so it is
+    // dropped rather than taking the new entry away.
+    space.releaseMemoryRead(1);
+    await drain();
+    space.releaseMemoryRead(0);
+    await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+    await waitFor(() => expect(panelText(view, "Memory")).toContain("New rule."));
+    expect(panelText(view, "Memory")).not.toContain("Old rule.");
+  });
+
+  it("does not lose a memory entry that lands while the page is opening", async () => {
+    space.memories = { b1: [memoryOf({ memory: "mem1", text: "Old rule." })] };
+    // The page's memory answer lands, and the page still waits on its rules.
+    space.holdRules("b1");
+    const view = await openBotLoading();
+    await waitFor(() => expect(space.asked).toContain("memory_list"));
+    await drain();
+    expect(view.container.querySelector(".page__body")).toBeNull();
+
+    // The memory changes after that answer, while the page has no Bot yet.
+    space.memories = { b1: [memoryOf({ memory: "mem2", text: "New rule." })] };
+    record("neha.memory.added", { memory: "mem2", bot: "b1" });
+    await waitFor(() =>
+      expect(space.asked.filter((name) => name === "memory_list")).toHaveLength(2),
+    );
+
+    // The rules answer lets the page finish. The event's read fills memory in,
+    // so the entry is not lost with the page's first answer.
+    space.releaseRules();
+    await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+    await waitFor(() => expect(panelText(view, "Memory")).toContain("New rule."));
+    expect(panelText(view, "Memory")).not.toContain("Old rule.");
   });
 
   it("says why the Space refused a change", async () => {

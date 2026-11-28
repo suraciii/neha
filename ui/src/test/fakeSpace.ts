@@ -160,6 +160,10 @@ let openApproval: (() => void) | null = null;
 // A rule read for one Bot can be held open, so a test can move to another page
 // while the answer the first page asked for is still in flight.
 let ruleGate: { bot: string; gate: Promise<void>; open: () => void } | null = null;
+// Memory reads can be held open, so a test can answer two reads in the order it
+// chooses. Each read answers with the entries it held when it was asked, so an
+// answer that leaves later speaks about a newer record.
+let holdingMemories = false;
 
 export const space = {
   account,
@@ -256,6 +260,10 @@ export const space = {
   // The memory removals the Space was asked for, in order: the Bot the entry
   // must belong to, and the entry.
   memoryRemoves: [] as { bot: string; memory: string }[],
+  // The memory reads the Space is holding, oldest first. A test lets one answer
+  // with `releaseMemoryRead`, so two reads can land out of the order they were
+  // asked for.
+  memoryHolds: [] as { release: () => void }[],
   // The Providers the Space connected and refreshed, and the Models made default.
   connects: [] as unknown[],
   refreshes: [] as string[],
@@ -273,6 +281,7 @@ export const space = {
     space.releaseCreates();
     space.releaseDecide();
     space.releaseApprovals();
+    space.releaseMemories();
     space.computer.kind = "local";
     space.computer.online = true;
     space.computer.name = "Workstation";
@@ -387,6 +396,23 @@ export const space = {
   releaseRules() {
     ruleGate?.open();
     ruleGate = null;
+  },
+  // Holds every memory read open, so a test can answer the reads in the order it
+  // chooses rather than the order the page asked for them.
+  holdMemories() {
+    holdingMemories = true;
+    space.memoryHolds = [];
+  },
+  // Lets the held memory read at `which` answer, counted from the oldest.
+  releaseMemoryRead(which = 0) {
+    const [held] = space.memoryHolds.splice(which, 1);
+    held?.release();
+  },
+  // Lets every held memory read answer, oldest first.
+  releaseMemories() {
+    holdingMemories = false;
+    const held = space.memoryHolds.splice(0);
+    for (const hold of held) hold.release();
   },
   // An approval read can be held open, so a test can answer while the Space's
   // word about the record is still in flight.
@@ -715,6 +741,16 @@ export class FakeCommands {
         const used: Record<MemoryKind, number> = { rule: 0, note: 0 };
         for (const entry of entries) used[entry.kind] += entry.size;
         const answer: MemoryList = { entries, used, limits: { ...space.memoryLimits } };
+        // A held read keeps the answer it had when it was asked, so a test can
+        // let a later read answer before an earlier one.
+        if (holdingMemories) {
+          let release!: () => void;
+          const gate = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          space.memoryHolds.push({ release });
+          await gate;
+        }
         return answer as T;
       }
       case "memory_remove": {

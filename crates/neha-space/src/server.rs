@@ -4,7 +4,7 @@
 //! every capability through one WebSocket and sends and receives Files over
 //! HTTP. The server listens on loopback until a remote Space is configured.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2163,8 +2163,14 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
     let Some(Ok(Message::Text(text))) = socket.recv().await else {
         return;
     };
-    let hello = match serde_json::from_str::<ClientFrame>(text.as_str()) {
-        Ok(ClientFrame::Hello { version, .. }) => version,
+    let (hello, capabilities) = match serde_json::from_str::<ClientFrame>(text.as_str()) {
+        Ok(ClientFrame::Hello {
+            version,
+            capabilities,
+        }) => (
+            version,
+            capabilities.into_iter().collect::<HashSet<String>>(),
+        ),
         _ => {
             let _ = send_raw(
                 &mut socket,
@@ -2248,6 +2254,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             cursor.unwrap_or(neha::seq::Seq::ZERO),
                             limit,
                             account.id,
+                            capabilities.clone(),
                         ));
                     }
                     Ok(ClientFrame::Command { id, command }) => {
@@ -2415,9 +2422,12 @@ fn spawn_forwarder(
     cursor: neha::seq::Seq,
     limit: Option<usize>,
     account: Id,
+    capabilities: HashSet<String>,
 ) -> JoinHandle<()> {
+    let capabilities = Arc::new(capabilities);
     tokio::spawn(async move {
-        let mut cursor = match catch_up(&reader, &out, cursor, limit, account).await {
+        let mut cursor = match catch_up(&reader, &out, cursor, limit, account, &capabilities).await
+        {
             Ok(cursor) => cursor,
             Err(StreamError::Oversized(event)) => {
                 let _ = out
@@ -2445,10 +2455,11 @@ fn spawn_forwarder(
                         continue;
                     }
                     let seq = event.seq;
-                    // A client sees its own events and the Space-wide ones;
-                    // the rest only advance the cursor so a later reconnect
-                    // neither repeats nor misses them.
-                    if !visible_to(account, &event) {
+                    // A client sees its own events and the Space-wide ones,
+                    // and a later kind only when it named the capability that
+                    // admits it. A skipped event still advances the cursor, so
+                    // a later reconnect neither repeats nor misses it.
+                    if !visible_to(account, &event) || !admits(&capabilities, event.kind) {
                         cursor = seq;
                         continue;
                     }
@@ -2467,7 +2478,7 @@ fn spawn_forwarder(
                     cursor = seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    match catch_up(&reader, &out, cursor, limit, account).await {
+                    match catch_up(&reader, &out, cursor, limit, account, &capabilities).await {
                         Ok(next) => cursor = next,
                         Err(StreamError::Oversized(event)) => {
                             let _ = out
@@ -2506,6 +2517,7 @@ async fn catch_up(
     cursor: neha::seq::Seq,
     limit: Option<usize>,
     account: Id,
+    capabilities: &HashSet<String>,
 ) -> Result<neha::seq::Seq, StreamError> {
     let page_size = limit.unwrap_or(256).clamp(1, 256);
     let mut cursor = cursor;
@@ -2537,12 +2549,13 @@ async fn catch_up(
         let first = page.events[0].seq;
         let page_next = page.next;
         // Only the account's own events and the Space-wide ones go into a
-        // snapshot; a filtered event still counts as scanned, so the cursor
+        // snapshot, and a later kind only to a caller that named its
+        // capability; a filtered event still counts as scanned, so the cursor
         // never repeats it.
         let mut events: Vec<neha::record::Event> = page
             .events
             .into_iter()
-            .filter(|event| visible_to(account, event))
+            .filter(|event| visible_to(account, event) && admits(capabilities, event.kind))
             .collect();
         if events.is_empty() {
             cursor = page_next;
@@ -2608,6 +2621,15 @@ async fn catch_up(
 /// is one every account can already read through `provider list` or
 /// `model list`: the Provider's address and its Models are not per-account
 /// secrets, so a settings page open in another account follows them too.
+/// Returns whether a caller's declared capabilities admit one event kind.
+///
+/// A kind the protocol version already carries needs no capability; a later
+/// Presentation kind reaches only a caller that named the capability the
+/// command surface gives it.
+fn admits(capabilities: &HashSet<String>, kind: neha::record::EventKind) -> bool {
+    neha::surface::event_capability(kind).is_none_or(|capability| capabilities.contains(capability))
+}
+
 fn visible_to(account: Id, event: &neha::record::Event) -> bool {
     if matches!(event.author, neha::record::Author::User(author) if author == account) {
         return true;
@@ -3445,8 +3467,9 @@ pub mod test_support {
         cursor: neha::seq::Seq,
         limit: Option<usize>,
         account: neha::id::Id,
+        capabilities: &std::collections::HashSet<String>,
     ) -> Result<neha::seq::Seq, CatchUpError> {
-        super::catch_up(reader, out, cursor, limit, account)
+        super::catch_up(reader, out, cursor, limit, account, capabilities)
             .await
             .map_err(|error| match error {
                 StreamError::Store => CatchUpError::Store,

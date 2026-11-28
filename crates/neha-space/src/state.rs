@@ -593,6 +593,9 @@ pub struct State {
     /// The memory entries in the order the record added them; a removed entry
     /// is gone and a replaced one keeps its record but no longer applies.
     pub memories: Vec<MemoryView>,
+    /// The answers memory tool calls gave, by run, step, and call. A replay
+    /// returns the answer instead of running the call again.
+    pub memory_answers: HashMap<(Id, u32, String), String>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
@@ -683,6 +686,18 @@ impl State {
             .filter(|entry| entry.bot == bot && !entry.superseded && entry.kind == kind)
             .map(|entry| entry.text.len())
             .sum()
+    }
+
+    /// Returns the answer one memory tool call recorded, when it has one.
+    ///
+    /// The answer is keyed by the run, the step, and the call's identifier, so
+    /// a replay finds the exact text the Model read and does not run the call
+    /// again.
+    #[must_use]
+    pub fn memory_answer(&self, run: Id, step: u32, call: &str) -> Option<&str> {
+        self.memory_answers
+            .get(&(run, step, call.to_owned()))
+            .map(String::as_str)
     }
 
     /// Returns whether a User reads a memory entry's text.
@@ -1620,17 +1635,33 @@ impl Projection for State {
                 if event.acting != Some(data.acting) {
                     return Err("a memory entry names the User the Bot acts for".to_owned());
                 }
-                if let MemoryScope::User = data.scope {
-                    let Some(scope) = data.scope_id else {
-                        return Err("a user entry names its Chat".to_owned());
-                    };
-                    if self
-                        .chats
-                        .get(&scope)
-                        .is_none_or(|chat| chat.bot != data.bot)
-                    {
-                        return Err("a user entry belongs to one of the Bot's Chats".to_owned());
+                // The scope follows from the conversation the entry was
+                // written in: the owner's entries are `owner`, and a User's
+                // entries live in that User's own Chat with the Bot.
+                match data.scope {
+                    MemoryScope::Owner => {
+                        if data.acting != owner {
+                            return Err("an owner entry is written for the Bot's owner".to_owned());
+                        }
                     }
+                    MemoryScope::User => {
+                        let Some(scope) = data.scope_id else {
+                            return Err("a user entry names its Chat".to_owned());
+                        };
+                        let chat = self
+                            .chats
+                            .get(&scope)
+                            .ok_or("a user entry belongs to one of the Bot's Chats")?;
+                        if chat.bot != data.bot {
+                            return Err("a user entry belongs to one of the Bot's Chats".to_owned());
+                        }
+                        if chat.owner != data.acting || data.acting == owner {
+                            return Err(
+                                "a user entry belongs to the acting User's own Chat".to_owned()
+                            );
+                        }
+                    }
+                    MemoryScope::Group => {}
                 }
                 if self
                     .memories
@@ -1721,6 +1752,29 @@ impl Projection for State {
                     }
                 }
                 self.memories.remove(position);
+            }
+            EventData::MemoryAnswered(data) => {
+                let (bot, acting) = self
+                    .runs
+                    .get(&data.run)
+                    .map(|run| (run.bot, run.acting))
+                    .ok_or("a memory answer must belong to an existing run")?;
+                if !matches!(event.author, Author::Bot(author) if author == bot) {
+                    return Err("a memory answer is written by the run's Bot".to_owned());
+                }
+                if event.acting != Some(acting) {
+                    return Err("a memory answer names the User the run acts for".to_owned());
+                }
+                if data.call.trim().is_empty() {
+                    return Err("a memory answer names its call".to_owned());
+                }
+                if self
+                    .memory_answers
+                    .insert((data.run, data.step, data.call), data.answer)
+                    .is_some()
+                {
+                    return Err("a memory answer is recorded once".to_owned());
+                }
             }
         }
 
@@ -4073,7 +4127,7 @@ mod tests {
 
     #[test]
     fn a_memory_entry_projects_and_a_write_supersedes_what_it_replaces() {
-        let (mut state, owner, bot, chat) = bot_state(1);
+        let (mut state, owner, bot, _chat) = bot_state(1);
         let rule = Id::new();
         let note = Id::new();
         // The owner's words gave a rule; the Bot wrote a note acting for the
@@ -4107,8 +4161,8 @@ mod tests {
                     note,
                     bot,
                     "note",
-                    "user",
-                    Some(chat),
+                    "owner",
+                    None,
                     bot,
                     true,
                     owner,
@@ -4141,7 +4195,7 @@ mod tests {
 
     #[test]
     fn a_memory_entry_removal_leaves_no_entry_behind() {
-        let (mut state, owner, bot, chat) = bot_state(1);
+        let (mut state, owner, bot, _chat) = bot_state(1);
         let memory = Id::new();
         state
             .apply(&acted_event(
@@ -4152,8 +4206,8 @@ mod tests {
                     memory,
                     bot,
                     "note",
-                    "user",
-                    Some(chat),
+                    "owner",
+                    None,
                     bot,
                     true,
                     owner,
@@ -4214,8 +4268,9 @@ mod tests {
             ))
             .unwrap();
 
-        // Bob may not replace Alice's rule; the owner may. A refused write
-        // leaves the projection as it was.
+        // Bob does not write in Alice's Chat; the owner replaces Alice's rule
+        // with an owner entry. A refused write leaves the projection as it
+        // was.
         assert!(
             state
                 .apply(&acted_event(
@@ -4247,8 +4302,8 @@ mod tests {
                     Id::new(),
                     bot,
                     "note",
-                    "user",
-                    Some(chat),
+                    "owner",
+                    None,
                     bot,
                     true,
                     owner,
@@ -4264,6 +4319,220 @@ mod tests {
                 .iter()
                 .any(|entry| entry.memory == rule && entry.superseded),
             "the owner's write replaced the rule"
+        );
+    }
+
+    #[test]
+    fn a_memory_answer_projects_and_reads_by_its_call() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        let run = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::RunQueued,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "chat": chat,
+                    "bot": bot,
+                    "command": Id::new(),
+                    "message": Id::new(),
+                }),
+                4,
+            ))
+            .unwrap();
+        // The Bot records the answer of its second step's first call.
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAnswered,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "step": 2,
+                    "call": "call-1",
+                    "answer": "{\"removed\": []}",
+                }),
+                5,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            state.memory_answer(run, 2, "call-1"),
+            Some("{\"removed\": []}")
+        );
+        assert_eq!(state.memory_answer(run, 2, "call-2"), None);
+        assert_eq!(state.memory_answer(run, 1, "call-1"), None);
+
+        // The run's Bot writes the answer, for the User the run acts for.
+        let other = Id::new();
+        let answer = |author: Author, acting: Id| {
+            acted_event(
+                EventKind::MemoryAnswered,
+                author,
+                acting,
+                serde_json::json!({
+                    "run": run,
+                    "step": 3,
+                    "call": "call-3",
+                    "answer": "{}",
+                }),
+                6,
+            )
+        };
+        assert!(state.apply(&answer(Author::User(owner), owner)).is_err());
+        assert!(state.apply(&answer(Author::Bot(other), other)).is_err());
+        assert!(state.apply(&answer(Author::Bot(bot), other)).is_err());
+        // A duplicated answer is refused: one call answers once.
+        assert!(state.apply(&answer(Author::Bot(bot), owner)).is_ok());
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAnswered,
+                    Author::Bot(bot),
+                    owner,
+                    serde_json::json!({
+                        "run": run,
+                        "step": 3,
+                        "call": "call-3",
+                        "answer": "{}",
+                    }),
+                    7,
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_memory_entry_scope_follows_the_conversation() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        // The owner writes owner entries; another User's entry lives in that
+        // User's own Chat with the Bot.
+        let note = Id::new();
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAdded,
+                    Author::Bot(bot),
+                    owner,
+                    memory_added(
+                        note,
+                        bot,
+                        "note",
+                        "owner",
+                        None,
+                        bot,
+                        true,
+                        owner,
+                        "owner's note",
+                        &[],
+                    ),
+                    4,
+                ))
+                .is_ok()
+        );
+
+        let alice = Id::new();
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAdded,
+                    Author::Bot(bot),
+                    alice,
+                    memory_added(
+                        Id::new(),
+                        bot,
+                        "note",
+                        "user",
+                        Some(chat),
+                        bot,
+                        true,
+                        alice,
+                        "not Alice's Chat",
+                        &[],
+                    ),
+                    5,
+                ))
+                .is_err(),
+            "the owner's Chat is not the acting User's Chat"
+        );
+
+        let alice_chat = Id::new();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                Author::User(alice),
+                serde_json::json!({"chat": alice_chat, "owner": alice, "bot": bot}),
+                6,
+            ))
+            .unwrap();
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAdded,
+                    Author::Bot(bot),
+                    alice,
+                    memory_added(
+                        Id::new(),
+                        bot,
+                        "note",
+                        "user",
+                        Some(alice_chat),
+                        bot,
+                        true,
+                        alice,
+                        "Alice's note",
+                        &[],
+                    ),
+                    7,
+                ))
+                .is_ok()
+        );
+        // The owner does not write a user entry in Alice's Chat.
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAdded,
+                    Author::Bot(bot),
+                    owner,
+                    memory_added(
+                        Id::new(),
+                        bot,
+                        "note",
+                        "user",
+                        Some(alice_chat),
+                        bot,
+                        true,
+                        owner,
+                        "owner's user entry",
+                        &[],
+                    ),
+                    8,
+                ))
+                .is_err()
+        );
+        // A non-owner never writes an owner entry.
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAdded,
+                    Author::Bot(bot),
+                    alice,
+                    memory_added(
+                        Id::new(),
+                        bot,
+                        "note",
+                        "owner",
+                        None,
+                        bot,
+                        true,
+                        alice,
+                        "Alice's owner entry",
+                        &[],
+                    ),
+                    9,
+                ))
+                .is_err()
         );
     }
 
@@ -4340,7 +4609,7 @@ mod tests {
 
     #[test]
     fn a_memory_removal_belongs_to_a_user_who_may_clear_it() {
-        let (mut state, owner, bot, chat) = bot_state(1);
+        let (mut state, owner, bot, _chat) = bot_state(1);
         let memory = Id::new();
         state
             .apply(&acted_event(
@@ -4351,8 +4620,8 @@ mod tests {
                     memory,
                     bot,
                     "note",
-                    "user",
-                    Some(chat),
+                    "owner",
+                    None,
                     bot,
                     true,
                     owner,

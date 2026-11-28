@@ -274,6 +274,19 @@ export default function App() {
   // drops what the first opening asked for. Nothing renders from it, so it is a
   // plain count rather than a signal.
   let pageGen = 0;
+  // The newest memory read a Bot page asked for, and the newest answer it has
+  // shown. Reads overlap — the page-opening read beside an event's read, or a
+  // write's read beside either — and the record answers them in any order, so a
+  // read a later one replaced is dropped: it speaks about an older record.
+  let memoryReads = 0;
+  let memoryShown = 0;
+  // A memory change may be newer than the answer the page holds. A read that
+  // starts after the change clears this; a read already on its way sees it set
+  // again and asks once more.
+  let memoryStale = false;
+  // A memory read is on its way, so a change waits for it and lets it read once
+  // more when it lands rather than racing it with a second read.
+  let memoryReading = false;
   // The management surfaces the User came through, oldest first, so Back
   // returns to the one before the surface they are leaving: a narrow viewport
   // shows one surface at a time.
@@ -896,7 +909,16 @@ export default function App() {
       return;
     }
     if (event.kind === "neha.memory.added" || event.kind === "neha.memory.removed") {
-      void refreshMemories();
+      // A memory event names its Bot only when it adds an entry; a removal
+      // belongs to the Bot whose page is open, so any open page reads again. A
+      // page that is still opening reads once more after its first answer,
+      // because that answer may predate the event.
+      const changed = typeof data.bot === "string" ? data.bot : null;
+      const opened = pageBotId();
+      if (opened === null || changed === null || changed === opened) {
+        memoryStale = true;
+        if (opened !== null) void refreshMemories();
+      }
       return;
     }
     if (event.kind === "neha.provider.models_updated") {
@@ -1722,10 +1744,22 @@ export default function App() {
     await reloadPageBot(bot.id);
   }
 
+  // Applies one memory answer when it is newer than the one the page shows. A
+  // read that lost the race answers about an older record, so its answer is
+  // dropped and the newer one stays.
+  function showMemories(read: number, memories: MemoryList) {
+    if (read <= memoryShown) return;
+    memoryShown = read;
+    update({ memories });
+  }
+
   // Everything one Bot's page shows, read together so the Bot, its Computer,
   // the Computers it may move to, its Models, its rules, and its memory are one
-  // answer rather than reads that can disagree with each other.
+  // answer rather than reads that can disagree with each other. The memory
+  // answer takes its place in the order memory answers land in, so an event's
+  // read that leaves later can land first without being overwritten.
   async function readBotPage(id: string) {
+    const memoryRead = ++memoryReads;
     const [shown, computers, models, rules, memories] = await Promise.all([
       commands.command<BotResult>("bot_show", { bot: id }),
       commands.command<Computer[]>("computer_list"),
@@ -1734,11 +1768,14 @@ export default function App() {
       commands.command<MemoryList>("memory_list", { bot: id }),
     ]);
     return {
-      pageBot: shown.bot,
-      pageComputer: shown.computer,
-      computers,
-      models,
-      rules,
+      page: {
+        pageBot: shown.bot,
+        pageComputer: shown.computer,
+        computers,
+        models,
+        rules,
+      },
+      memoryRead,
       memories,
     };
   }
@@ -1749,9 +1786,13 @@ export default function App() {
     const gen = pageGen;
     update({ managing: true });
     try {
-      const page = await readBotPage(id);
+      const { page, memoryRead, memories } = await readBotPage(id);
       if (gen !== pageGen) return;
       update({ ...page, managing: false });
+      showMemories(memoryRead, memories);
+      // A memory change that landed while this read was on its way is newer
+      // than its answer, so the page reads memory once more.
+      if (memoryStale) void refreshMemories();
     } catch (reason) {
       if (gen !== pageGen) return;
       update({ manageError: reason, managing: false });
@@ -1772,9 +1813,11 @@ export default function App() {
       // answer is checked again before the page is written, because the User
       // may have moved on while the second read was on its way.
       if (gen !== pageGen) return false;
-      const page = await readBotPage(id);
+      const { page, memoryRead, memories } = await readBotPage(id);
       if (gen !== pageGen) return false;
       update({ ...page, managing: false });
+      showMemories(memoryRead, memories);
+      if (memoryStale) void refreshMemories();
       await refreshBots();
       return true;
     } catch (reason) {
@@ -1831,9 +1874,11 @@ export default function App() {
     try {
       await commands.command("bot_move", { bot: id, computer });
       if (gen !== pageGen) return;
-      const page = await readBotPage(id);
+      const { page, memoryRead, memories } = await readBotPage(id);
       if (gen !== pageGen) return;
       update({ ...page, managing: false });
+      showMemories(memoryRead, memories);
+      if (memoryStale) void refreshMemories();
       await refreshBots();
     } catch (reason) {
       if (gen !== pageGen) return;
@@ -1984,18 +2029,41 @@ export default function App() {
     await writeRule(id, "rule_remove", { rule });
   }
 
-  // Reads one Bot's memory again, so a write shows without a page reload. A
-  // read that lands after the User opened another Bot is dropped.
+  // Reads one Bot's memory again, so a change shows without a page reload. It
+  // targets the Bot the page names even before the page has its first answer,
+  // and keeps reading while changes land: the page applies only the newest
+  // answer, whichever read lands last. A read that lands after the User opened
+  // another Bot is dropped.
   async function refreshMemories() {
-    const id = state.pageBot?.id;
+    const id = pageBotId();
     if (!id) return;
+    if (memoryReading) {
+      // The read on its way may predate this change, so it reads once more when
+      // it lands rather than letting a second read race it.
+      memoryStale = true;
+      return;
+    }
+    memoryReading = true;
     const gen = pageGen;
     try {
-      const memories = await commands.command<MemoryList>("memory_list", { bot: id });
-      if (gen !== pageGen) return;
-      update({ memories });
-    } catch {
-      // A failed read keeps the memory the page already shows.
+      do {
+        // This read starts after every change seen so far, so it answers about
+        // all of them.
+        memoryStale = false;
+        const read = ++memoryReads;
+        try {
+          const memories = await commands.command<MemoryList>("memory_list", { bot: id });
+          if (gen !== pageGen) return;
+          showMemories(read, memories);
+        } catch {
+          // A failed read keeps the memory the page already shows.
+        }
+      } while (memoryStale && gen === pageGen);
+    } finally {
+      memoryReading = false;
+      // A change waited for this read while the page moved on, so the page the
+      // change belongs to reads now rather than waiting for another event.
+      if (memoryStale) void refreshMemories();
     }
   }
 
@@ -2011,9 +2079,13 @@ export default function App() {
     try {
       await commands.command("memory_remove", { bot: id, memory });
       if (gen !== pageGen) return;
+      // The removal's read takes its place behind any read already on its way,
+      // so an older answer cannot bring the entry back.
+      const read = ++memoryReads;
       const memories = await commands.command<MemoryList>("memory_list", { bot: id });
       if (gen !== pageGen) return;
-      update({ memories, managing: false });
+      showMemories(read, memories);
+      update({ managing: false });
     } catch (reason) {
       if (gen !== pageGen) return;
       update({ manageError: reason, managing: false });
