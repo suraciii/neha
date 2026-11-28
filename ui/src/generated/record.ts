@@ -19,9 +19,13 @@ step: number,
  */
 action: string, 
 /**
- * The tool's name.
+ * The tool's name: the server's original name when it belongs to one.
  */
 tool: string, 
+/**
+ * The MCP server the action called, when its tool belongs to one.
+ */
+server?: string | null, 
 /**
  * How it ended.
  */
@@ -67,7 +71,27 @@ tool: string,
  * The tool's arguments. A refused call keeps them malformed, so the value
  * is not always an object.
  */
-arguments: unknown, };
+arguments: unknown, 
+/**
+ * The MCP server the action called, when its tool belongs to one.
+ */
+server?: string | null, 
+/**
+ * The skill the action runs, when it is a `run_skill_script` action.
+ *
+ * This is the identity the Space dispatched, resolved before the action
+ * started: it is absent for a call that never runs, and a record written
+ * before it existed has none either.
+ */
+skill?: string | null, 
+/**
+ * The script's file name within that skill.
+ */
+script?: string | null, 
+/**
+ * The digest of the script's bytes the action ran.
+ */
+script_sha256?: string | null, };
 
 /**
  * How a Bot's action ended.
@@ -106,7 +130,7 @@ rule: string | null, };
 /**
  * Why a run asks its acting User for an approval.
  */
-export type ApprovalReason = "first_use_local" | "rule" | "grant";
+export type ApprovalReason = "first_use_local" | "rule" | "grant" | "first_script_run" | "first_mcp_call";
 
 /**
  * The data of `neha.approval.requested`.
@@ -181,6 +205,22 @@ rule: string | null,
  * What an "Always allow" would allow, in words the User reads.
  */
 lasting_scope: string | null, 
+/**
+ * The MCP server the action calls, when its tool belongs to one.
+ */
+server?: string | null, 
+/**
+ * The skill the action runs when its tool is `run_skill_script`.
+ */
+skill?: string | null, 
+/**
+ * The script's file name within that skill.
+ */
+script?: string | null, 
+/**
+ * The digest of the skill's script the card was made for.
+ */
+script_sha256?: string | null, 
 /**
  * The folder a grant answer covers, when the reason is a grant.
  */
@@ -305,6 +345,36 @@ reset_model?: boolean,
 reset_thinking?: boolean, };
 
 /**
+ * A Card a Message shows after its text.
+ *
+ * A Card's kind picks the fields it takes: an `app` Card names the File that
+ * holds its HTML and carries the tool's input and result, while a kind this
+ * build does not know keeps its fields as bounded opaque data, so a client
+ * shows a placeholder and a reader still replays the record.
+ */
+export type CardData = { 
+/**
+ * The Card's kind.
+ */
+kind: string, 
+/**
+ * The File that holds an `app` Card's HTML.
+ */
+file?: string | null, 
+/**
+ * The tool arguments an `app` Card shows.
+ */
+input?: unknown, 
+/**
+ * The tool result an `app` Card shows.
+ */
+result?: unknown, 
+/**
+ * The Content Security Policy a client applies to an `app` Card.
+ */
+csp?: string | null, };
+
+/**
  * The data of `neha.chat.created`.
  */
 export type ChatCreated = { 
@@ -382,7 +452,7 @@ data: Record<string, unknown>, };
 /**
  * The kinds of event the record carries.
  */
-export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed";
+export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.skill.added" | "neha.skill.removed" | "neha.bot.skill.enabled" | "neha.bot.skill.disabled" | "neha.mcp.server.added" | "neha.mcp.server.updated" | "neha.mcp.server.removed" | "neha.bot.mcp.enabled" | "neha.bot.mcp.disabled" | "neha.plugin.installed" | "neha.plugin.removed" | "neha.plugin.enabled" | "neha.plugin.disabled";
 
 /**
  * The data of `neha.file.added`.
@@ -414,6 +484,11 @@ size: number,
 sha256: string, };
 
 /**
+ * Where an MCP server's credential and tools belong.
+ */
+export type McpScope = "space" | "user";
+
+/**
  * The data of `neha.message.added`.
  */
 export type MessageAdded = { 
@@ -436,7 +511,11 @@ file?: string | null,
 /**
  * The run it belongs to.
  */
-run: string | null, };
+run: string | null, 
+/**
+ * The Card it carries.
+ */
+card?: CardData | null, };
 
 /**
  * One Model a Provider offers.
@@ -538,9 +617,23 @@ export type RecordedCall = {
  */
 call: string, 
 /**
- * The tool's name.
+ * The tool's name: the server's original name when it belongs to one.
  */
 tool: string, 
+/**
+ * The MCP server the call names, when its tool belongs to one.
+ */
+server?: string | null, 
+/**
+ * The name the Model used for this call, when the record names the tool
+ * by its server and original name.
+ *
+ * The loop's history and a replay read the name the Model saw, so a
+ * record whose server no longer offers the tool still resumes with the
+ * same conversation. An older record has none, and the Space forms the
+ * name it would have offered.
+ */
+model_name?: string | null, 
 /**
  * The arguments the tool runs with; a refused call keeps them malformed.
  */
@@ -581,7 +674,19 @@ command_prefix: string | null,
 /**
  * The path prefix a matching file action's path starts with.
  */
-path_prefix: string | null, };
+path_prefix: string | null, 
+/**
+ * The MCP server whose tool a matching call names.
+ */
+server?: string | null, 
+/**
+ * The skill whose script a matching `run_skill_script` action runs.
+ */
+skill?: string | null, 
+/**
+ * The script a matching `run_skill_script` action runs, within that skill.
+ */
+script?: string | null, };
 
 /**
  * What a lasting rule does.
@@ -782,6 +887,11 @@ usage: Usage | null,
  * How many tool calls the step requested.
  */
 tool_calls: number, };
+
+/**
+ * The libraries that hold skills.
+ */
+export type SkillLibrary = "space" | "bot";
 
 /**
  * Whether the User can undo an action after allowing it.

@@ -28,8 +28,9 @@ interface SidebarProps {
   attention: AttentionEntry[];
   // The rail selected the attention list, so it fills the sidebar.
   attentionOpen: boolean;
-  // What the rail selected: the Chats, the waiting approvals, or a management
-  // surface. A management surface fills the sidebar with its own list.
+  // What the rail selected: the Chats, the waiting approvals, a management
+  // surface, or one of the libraries. A management surface fills the sidebar
+  // with its own list; a library view marks its compact entry here.
   view: RailView;
   // The Bot whose page is open, when one is.
   activeBot: string | null;
@@ -39,6 +40,8 @@ interface SidebarProps {
   onAttention: (entry: AttentionEntry) => void;
   onBot: (bot: Bot) => void;
   onSection: (section: SettingsSection) => void;
+  // A compact entry to a library view, one tap away from the Chat list.
+  onView: (view: RailView) => void;
   // Creates a Bot under the name and the Computer the form holds, and answers
   // what the Space said when it made none.
   onCreateBot: (name: string, computer?: string) => Promise<string | null>;
@@ -193,6 +196,7 @@ export default function Sidebar(props: SidebarProps) {
     const recorded = props.previews[chat.id];
     if (recorded && "text" in recorded) {
       if (recorded.text) return recorded.text;
+      if (recorded.card) return t("sidebar.app");
       return recorded.file ? t("sidebar.file") : "";
     }
     if (recorded && "error" in recorded) return t("sidebar.openChat");
@@ -225,6 +229,28 @@ export default function Sidebar(props: SidebarProps) {
 
   return (
     <aside class="sidebar" aria-label={label()}>
+      {/* The library views the rail opens stay one tap away from the Chat
+          list, and their compact entries mark the open one. */}
+      <nav class="sidebar__views" aria-label={t("rail.primary")}>
+        <button
+          class={`chip chip--button${props.view === "integrations" ? " is-active" : ""}`}
+          type="button"
+          aria-current={props.view === "integrations" ? "page" : undefined}
+          onClick={() => props.onView("integrations")}
+        >
+          <Icon name="server" size="sm" />
+          {t("rail.integrations")}
+        </button>
+        <button
+          class={`chip chip--button${props.view === "skills" ? " is-active" : ""}`}
+          type="button"
+          aria-current={props.view === "skills" ? "page" : undefined}
+          onClick={() => props.onView("skills")}
+        >
+          <Icon name="book" size="sm" />
+          {t("rail.skills")}
+        </button>
+      </nav>
       <Show
         when={managing()}
         fallback={

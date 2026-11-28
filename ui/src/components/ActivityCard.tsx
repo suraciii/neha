@@ -96,6 +96,9 @@ export default function ActivityCard(props: ActivityCardProps) {
                 </span>
                 <span class="activity__tool">{action.tool}</span>
                 <span class="activity__status">{statusOf(action)}</span>
+                <Show when={action.status !== "failed" && action.error}>
+                  {(note) => <span class="activity__note">{note()}</span>}
+                </Show>
               </li>
             )}
           </For>

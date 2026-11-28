@@ -200,6 +200,81 @@ describe("the mobile client", () => {
     expect(history.state?.chat ?? null).toBeNull();
   });
 
+  it("walks the Skills library back out of the phone's history", async () => {
+    // The rail opens a library from a management surface. The library is a step
+    // of its own, so the system Back leaves it for the surface before it rather
+    // than skipping that surface, and Forward lands on the library again.
+    history.replaceState(null, "");
+    mobile();
+    const view = renderApp();
+
+    await waitFor(() => expect(view.container.querySelector(".conv")).toBeTruthy());
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
+    await waitFor(() => expect(element(view, ".sidebar__title").textContent).toBe("Settings"));
+    expect(history.state?.view).toBe("settings");
+
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(6)")));
+    await waitFor(() => expect(element(view, ".library > h1").textContent).toBe("Skills"));
+    expect(history.state?.view).toBe("skills");
+    await waitFor(() => expect(space.asked).toContain("skill_list"));
+
+    history.back();
+    await waitFor(() => expect(element(view, ".sidebar__title").textContent).toBe("Settings"));
+    expect(history.state?.view).toBe("settings");
+    expect(view.container.querySelector(".library")).toBeNull();
+
+    history.forward();
+    await waitFor(() => expect(element(view, ".library > h1").textContent).toBe("Skills"));
+    expect(history.state?.view).toBe("skills");
+
+    // The view's own Back selects the Chats, and the history records the screen
+    // it lands on: the system Back then walks the screens the User saw rather
+    // than leaving an entry that names a library the screen has left.
+    flush(() => fireEvent.click(element(view, ".library__back button")));
+    await waitFor(() => expect(element(view, ".sidebar__title").textContent).toBe("Chats"));
+    expect(history.state?.view).toBe("chats");
+    expect(view.container.querySelector(".library")).toBeNull();
+  });
+
+  it("walks the Integrations library back out of the phone's history", async () => {
+    history.replaceState(null, "");
+    mobile();
+    const view = renderApp();
+
+    await waitFor(() => expect(view.container.querySelector(".conv")).toBeTruthy());
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
+    await waitFor(() => expect(element(view, ".sidebar__title").textContent).toBe("Bots"));
+    expect(history.state?.view).toBe("bots");
+
+    flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(5)")));
+    await waitFor(() => expect(element(view, ".library > h1").textContent).toBe("Integrations"));
+    expect(history.state?.view).toBe("integrations");
+    await waitFor(() => expect(space.asked).toContain("mcp_list"));
+
+    history.back();
+    await waitFor(() => expect(element(view, ".sidebar__title").textContent).toBe("Bots"));
+    expect(history.state?.view).toBe("bots");
+    expect(view.container.querySelector(".library")).toBeNull();
+
+    history.forward();
+    await waitFor(() => expect(element(view, ".library > h1").textContent).toBe("Integrations"));
+    expect(history.state?.view).toBe("integrations");
+  });
+
+  it("restores a library view from its history entry after a reload", async () => {
+    // A phone reloads into the library its entry names: the decoder reads the
+    // view back as Skills rather than as Chats, and the view reads its list.
+    history.replaceState({ chat: null, view: "skills", section: null, bot: null }, "");
+    const before = history.length;
+    mobile();
+    const view = renderApp();
+
+    await waitFor(() => expect(element(view, ".library > h1").textContent).toBe("Skills"));
+    await waitFor(() => expect(space.asked).toContain("skill_list"));
+    // The restore wrote no entry of its own.
+    expect(history.length).toBe(before);
+  });
+
   it("takes a management page's Back out of the phone's history", async () => {
     // The page's Back and the system Back are one step: pressing the page's Back
     // leaves the same entry behind, so the system Back then leaves the surface

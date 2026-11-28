@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 import { fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
-
+import { setLocale, t } from "./i18n";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
 import {
@@ -106,6 +106,12 @@ function choose(view: View, name: string, value: string) {
 // with `waitFor` when it reads the screen back.
 function press(view: View, text: string) {
   fireEvent.click(button(view, text));
+}
+
+// How many times one phrase appears in a text, so a test can see that a note
+// is said once rather than repeated.
+function occurrences(text: string, phrase: string): number {
+  return text.split(phrase).length - 1;
 }
 
 // Opens the Bots surface and the one Bot's page in it.
@@ -392,6 +398,64 @@ describe("App management", () => {
     await waitFor(() => expect(element(view, ".rows .row__name").textContent).toBe("write_file"));
     expect(panelText(view, "Ask and Allow rules")).toContain("Ask");
     expect(element(view, ".rows .row__meta").textContent).toContain("/data");
+  });
+
+  it("shows the skill and the script a rule runs", async () => {
+    // A rule for one skill's script covers that script, not every
+    // run_skill_script action. The record holds the skill's identifier, and
+    // the Space's read adds its name, which the row shows.
+    space.rules = [
+      {
+        ...askRule(),
+        tool: "run_skill_script",
+        command_prefix: null,
+        skill: "k1",
+        script: "report.sh",
+      },
+    ];
+    const view = await openBots();
+
+    await waitFor(() =>
+      expect(element(view, ".rows .row__meta").textContent).toBe(
+        'skill "Weekly report" · script "report.sh"',
+      ),
+    );
+    expect(element(view, ".rows .row__name").textContent).toBe("run_skill_script");
+    expect(panelText(view, "Ask and Allow rules")).not.toContain("Every run_skill_script action");
+  });
+
+  it("keeps two servers' rules for the same tool apart", async () => {
+    // Two MCP servers may offer a tool of the same name. Each rule names one
+    // server, so each row says which one it belongs to and its Remove control
+    // says so too.
+    space.rules = [
+      { ...askRule(), rule: "rule1", tool: "search", command_prefix: null, server: "s1" },
+      { ...askRule(), rule: "rule2", tool: "search", command_prefix: null, server: "s2" },
+    ];
+    const view = await openBots();
+
+    const rows = () => Array.from(view.container.querySelectorAll<HTMLElement>(".rows .row"));
+    await waitFor(() => expect(rows()).toHaveLength(2));
+    expect(rows().map((row) => row.querySelector(".row__name")?.textContent)).toEqual([
+      "search",
+      "search",
+    ]);
+    expect(rows().map((row) => row.querySelector(".row__meta")?.textContent)).toEqual([
+      'tool "search" on server "Search"',
+      'tool "search" on server "Reports"',
+    ]);
+    expect(
+      rows().map((row) => row.querySelector(".row__remove")?.getAttribute("aria-label")),
+    ).toEqual([
+      'Remove the rule for tool "search" on server "Search"',
+      'Remove the rule for tool "search" on server "Reports"',
+    ]);
+
+    // Removing the second takes away that server's rule, not the first one's.
+    flush(() =>
+      fireEvent.click(element<HTMLButtonElement>(view, ".rows .row:nth-child(2) .row__remove")),
+    );
+    await waitFor(() => expect(space.ruleRemoves).toEqual(["rule2"]));
   });
 
   it("says why the Space refused a change", async () => {
@@ -901,7 +965,7 @@ describe("App management", () => {
     await waitFor(() => expect(space.providers[1]?.base_url).toBe("https://api.anthropic.com/v1"));
   });
 
-  it("adds no rule to a Bot a Hosted Computer runs", async () => {
+  it("adds no rule for a Computer's action to a Hosted Bot", async () => {
     space.computer.kind = "hosted";
     space.rules = [askRule()];
     const view = await openBots();
@@ -909,9 +973,14 @@ describe("App management", () => {
     // The rules the Bot still holds are listed, and can be taken away.
     expect(panelText(view, "Ask and Allow rules")).toContain("shell");
 
-    // The page says why nothing can be added, and offers no form to add it.
+    // The page says which rules a Hosted Computer takes, and offers no form
+    // for the Computer-action rules it would refuse.
     const rules = panelText(view, "Ask and Allow rules");
-    expect(rules).toContain("A Hosted Computer applies no Ask or Allow rule");
+    expect(rules).toContain("applies only to a Local Computer");
+    expect(rules).toContain("a Hosted Computer takes none of those");
+    expect(rules).toContain("a skill's script or an MCP server's tool");
+    expect(rules).toContain("applies on either Computer");
+    expect(rules).not.toContain("applies no Ask or Allow rule");
     expect(view.container.querySelector('[name="rule_effect"]')).toBeNull();
     expect(view.container.querySelector('[name="rule_tool"]')).toBeNull();
     expect(
@@ -919,6 +988,36 @@ describe("App management", () => {
         (known) => known.textContent?.trim() === "Add rule",
       ),
     ).toBe(false);
+  });
+
+  it("says which rules a Hosted Bot keeps, in both languages", async () => {
+    // A Hosted Bot holds no rule for its Computer's own actions, but it does
+    // hold rules for the calls the Space answers: those fire on either
+    // Computer. The note has to say both, and say each once.
+    space.computer.kind = "hosted";
+    space.rules = [
+      {
+        ...askRule(),
+        rule: "rule2",
+        tool: "run_skill_script",
+        command_prefix: null,
+        skill: "k1",
+        script: "report.sh",
+      },
+    ];
+    const view = await openBots();
+    const rules = () => panelText(view, t("bot.section.rules"));
+
+    await waitFor(() => expect(rules()).toContain("a Hosted Computer takes none of those"));
+    expect(rules()).toContain("a skill's script or an MCP server's tool");
+    expect(occurrences(rules(), "a Hosted Computer takes none of those")).toBe(1);
+
+    flush(() => setLocale("zh-CN"));
+    await waitFor(() => expect(rules()).toContain("Hosted Computer 不接受这类规则"));
+    expect(rules()).toContain("技能的脚本或 MCP 服务器的工具");
+    expect(rules()).toContain("两类 Computer 上都适用");
+    expect(occurrences(rules(), "Hosted Computer 不接受这类规则")).toBe(1);
+    expect(rules()).not.toContain("暂不支持 Ask/Allow 规则");
   });
 
   it("offers no grant or full access a Computer's daemon refuses", async () => {
@@ -1048,7 +1147,7 @@ describe("App management", () => {
 
     expect(panelText(view, "Computers")).toContain("Shell runs as the machine user");
     // The Bot's own page says the same thing about the same Computer.
-    flush(() => fireEvent.click(element(view, ".chip--button")));
+    flush(() => fireEvent.click(element(view, ".page .chip--button")));
     await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Scout"));
     expect(panelText(view, "Granted folders")).toContain(
       "What this Computer allows is decided by its machine.",

@@ -447,6 +447,8 @@ async fn a_finished_run_reaches_its_subscribed_device() {
                 grants: Vec::new(),
                 thinking: None,
                 model: None,
+                skills: Vec::new(),
+                mcps: Vec::new(),
             },
         );
         state.chats.insert(
@@ -620,6 +622,8 @@ async fn a_mute_stops_the_next_device_in_the_same_event() {
                 grants: Vec::new(),
                 thinking: None,
                 model: None,
+                skills: Vec::new(),
+                mcps: Vec::new(),
             },
         );
         state.chats.insert(
@@ -10796,7 +10800,16 @@ async fn concurrent_moves_of_one_bot_record_one_event() {
     .await;
     expect_accepted(&mut first, first_id).await;
     expect_accepted(&mut second, second_id).await;
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Wait until both commands are observably waiting on the Bot's lock: a
+    // fixed sleep races a slow machine and lets the loser read the moved
+    // Computer instead of the one it saw before the wait.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while neha_space::test_support::server::admit_waiters(bot) < 2 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("both moves wait on the Bot's lock");
     drop(held);
 
     let one = expect_answer(&mut first, first_id).await;
@@ -12241,22 +12254,7 @@ async fn approval_for_run(socket: &mut Socket, run: Id) -> Value {
 }
 
 fn command_context(running: &Running) -> neha_space::commands::CommandContext<'_> {
-    let fields = running.test_fields();
-
-    neha_space::commands::CommandContext {
-        store: fields.store,
-        state: fields.state,
-        home: fields.home,
-        secrets: fields.secrets,
-        identity: fields.identity,
-        links: fields.links,
-        pairings: fields.pairings,
-        approvals: fields.approvals,
-        provider_writes: fields.provider_writes,
-        runs: fields.runs,
-        events: fields.events,
-        catalog: fields.catalog,
-    }
+    running.command_context()
 }
 
 async fn decide_approval(socket: &mut Socket, approval: Id, allow: bool, lasting: bool) -> Value {
@@ -12272,6 +12270,24 @@ async fn decide_approval(socket: &mut Socket, approval: Id, allow: bool, lasting
     .await
 }
 
+fn add_rule_to_server(
+    bot: Id,
+    effect: neha::record::RuleEffect,
+    tool: &str,
+    server: &str,
+) -> CommandCall {
+    CommandCall::RuleAdd {
+        bot,
+        effect,
+        tool: tool.to_owned(),
+        command_prefix: None,
+        path_prefix: None,
+        skill: None,
+        script: None,
+        server: Some(server.to_owned()),
+    }
+}
+
 fn add_rule(
     bot: Id,
     effect: neha::record::RuleEffect,
@@ -12285,6 +12301,9 @@ fn add_rule(
         tool: tool.to_owned(),
         command_prefix: command_prefix.map(ToOwned::to_owned),
         path_prefix: path_prefix.map(ToOwned::to_owned),
+        skill: None,
+        script: None,
+        server: None,
     }
 }
 
@@ -12765,21 +12784,7 @@ async fn only_the_acting_user_answers_once() {
     ));
 
     // Only the User the Bot acts for answers.
-    let fields = running.test_fields();
-    let context = neha_space::commands::CommandContext {
-        store: fields.store,
-        state: fields.state,
-        home: fields.home,
-        secrets: fields.secrets,
-        identity: fields.identity,
-        links: fields.links,
-        pairings: fields.pairings,
-        approvals: fields.approvals,
-        provider_writes: fields.provider_writes,
-        runs: fields.runs,
-        events: fields.events,
-        catalog: fields.catalog,
-    };
+    let context = running.command_context();
     let stranger = neha_space::identity::Account {
         id: Id::new(),
         display_name: "Eve".to_owned(),
@@ -14153,7 +14158,7 @@ async fn snapshot_events(socket: &mut Socket) -> (Seq, Vec<neha::record::Event>)
     loop {
         match next_frame(socket).await {
             ServerFrame::Snapshot { cursor, events } => return (cursor, events),
-            ServerFrame::Heartbeat { .. } => {}
+            ServerFrame::Heartbeat { .. } | ServerFrame::Event { .. } => {}
             other => panic!("expected a snapshot, got {other:?}"),
         }
     }
@@ -18031,5 +18036,7746 @@ async fn a_rule_add_replays_its_recorded_result() {
     );
 
     socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+use neha::record::SkillLibrary;
+use neha::surface::{SkillAdd, SkillAddScript};
+use neha_space::test_support::server as test_support;
+
+/// One request the fake MCP server received.
+type McpLog = std::sync::Arc<std::sync::Mutex<Vec<Value>>>;
+
+/// The fixture MCP server the stdio end-to-end tests launch.
+///
+/// Its first act names the process in the package's data directory, so a
+/// test can tell a launch from a list's launch check; it writes the token
+/// the sandbox gave it there too. The one tool names an app, so a call also
+/// exercises the card path over stdio.
+#[cfg(target_os = "linux")]
+const STDIO_FIXTURE: &str = r#"
+import json, os, sys
+
+with open(os.path.join(os.environ["HOME"], "started"), "w") as marker:
+    marker.write(os.environ.get("NEHA_MCP_TOKEN", ""))
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+def answer(request_id, result):
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    params = message.get("params") or {}
+    if method == "initialize":
+        answer(request_id, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "fixture", "version": "1"}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        answer(request_id, {"tools": [
+            {"name": "echo", "description": "Echo text back.", "inputSchema": {"type": "object"}, "_meta": {"ui": {"resourceUri": "ui://stdio/app.html", "visibility": ["model"]}}},
+        ]})
+    elif method == "tools/call":
+        arguments = params.get("arguments") or {}
+        answer(request_id, {"content": [{"type": "text", "text": str(arguments.get("text", ""))}], "isError": False})
+    elif method == "resources/read":
+        answer(request_id, {"contents": [{"uri": params.get("uri"), "mimeType": "text/html;profile=mcp-app", "text": "<!doctype html><html><body>stdio app</body></html>"}]})
+"#;
+
+/// A fake authorization server's gate on the first token exchange.
+///
+/// The exchange announces itself through `arrived`, then waits for
+/// `release`, so a test can start another sign-in while one token request
+/// is in flight.
+#[derive(Clone)]
+struct TokenDelay {
+    arrived: std::sync::Arc<tokio::sync::Notify>,
+    release: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl TokenDelay {
+    fn new() -> Self {
+        Self {
+            arrived: std::sync::Arc::new(tokio::sync::Notify::new()),
+            release: std::sync::Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+/// A scripted Provider that keeps the requests it saw, for a test that
+/// asserts what reached the Model.
+async fn scripted_provider_recording(
+    script: Vec<ScriptedReply>,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+) {
+    let (base, task, _gates, recorded) = gated_provider(script).await;
+
+    (base, task, recorded)
+}
+
+fn add_script_rule(
+    bot: Id,
+    effect: neha::record::RuleEffect,
+    skill: &str,
+    script: &str,
+) -> CommandCall {
+    CommandCall::RuleAdd {
+        bot,
+        effect,
+        tool: "run_skill_script".to_owned(),
+        command_prefix: None,
+        path_prefix: None,
+        skill: Some(skill.to_owned()),
+        script: Some(script.to_owned()),
+        server: None,
+    }
+}
+
+/// Reads the live events a subscribed socket carries until the stream is
+/// quiet for a moment. A heartbeat is not an event.
+async fn live_events(socket: &mut Socket) -> Vec<neha::record::Event> {
+    let mut events = Vec::new();
+    while let Ok(frame) =
+        tokio::time::timeout(std::time::Duration::from_millis(300), next_frame(socket)).await
+    {
+        match frame {
+            ServerFrame::Event { event } => events.push(event),
+            ServerFrame::Heartbeat { .. } => {}
+            other => panic!("expected a stream frame, got {other:?}"),
+        }
+    }
+
+    events
+}
+
+/// The `SkillAdd` that adds one skill with its scripts.
+fn add_skill(bot: Option<Id>, document: &str, scripts: &[(&str, &str)]) -> CommandCall {
+    CommandCall::SkillAdd(SkillAdd {
+        library: if bot.is_some() {
+            SkillLibrary::Bot
+        } else {
+            SkillLibrary::Space
+        },
+        bot,
+        document: document.to_owned(),
+        scripts: scripts
+            .iter()
+            .map(|(name, content)| SkillAddScript {
+                name: (*name).to_owned(),
+                content: (*content).to_owned(),
+            })
+            .collect(),
+    })
+}
+
+/// The tool names in one recorded Model request.
+fn tool_names(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The system text in one recorded Model request.
+fn system_text(request: &Value) -> String {
+    request["messages"]
+        .as_array()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .map(|message| message["content"].as_str().unwrap_or_default().to_owned())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+/// Reads one command's answer without assuming the order two commands
+/// answered in.
+async fn settled(socket: &mut Socket, wanted: Id) -> Result<Value, (ErrorCode, String)> {
+    loop {
+        match next_frame(socket).await {
+            ServerFrame::Confirmed { id, result } if id == wanted => return Ok(result),
+            ServerFrame::Error {
+                id: Some(id),
+                code,
+                message,
+            } if id == wanted => return Err((code, message)),
+            ServerFrame::Heartbeat { .. }
+            | ServerFrame::Event { .. }
+            | ServerFrame::Snapshot { .. }
+            | ServerFrame::Accepted { .. }
+            | ServerFrame::Committed { .. }
+            | ServerFrame::Confirmed { .. }
+            | ServerFrame::Error { .. } => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+}
+
+/// The bytes the Space holds under one access rule, as a count.
+fn staged_blob_count(running: &Running) -> usize {
+    std::fs::read_dir(running.test_fields().home.blobs_dir())
+        .map(|entries| {
+            entries
+                .filter_map(std::result::Result::ok)
+                .filter(|entry| entry.path().is_dir())
+                .map(|entry| std::fs::read_dir(entry.path()).map_or(0, |files| files.count()))
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Runs a fake MCP server on a loopback port, answering the handshake and
+/// listing one tool. Returns its URL and a log of what it was asked.
+async fn fake_mcp_server(
+    tool_answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+) -> (String, McpLog, tokio::task::JoinHandle<()>) {
+    fake_mcp_server_tool("search", tool_answer).await
+}
+
+/// Runs a fake MCP server that lists one named tool.
+async fn fake_mcp_server_tool(
+    tool: &'static str,
+    tool_answer: impl Fn(&Value) -> Value + Send + Sync + 'static,
+) -> (String, McpLog, tokio::task::JoinHandle<()>) {
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, header::CONTENT_TYPE};
+    use axum::response::Response;
+    use axum::routing::post;
+
+    let log: McpLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let answer = std::sync::Arc::new(tool_answer);
+    let app = Router::new().route(
+        "/",
+        post(move |_headers: HeaderMap, body: Bytes| {
+            let log = seen.clone();
+            let answer = answer.clone();
+            async move {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                log.lock().unwrap().push(message.clone());
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                let result = match message["method"].as_str() {
+                    Some("initialize") => serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "docs", "version": "1"},
+                    }),
+                    Some("notifications/initialized") => return Response::new(Body::empty()),
+                    Some("tools/list") => serde_json::json!({
+                        "tools": [{
+                            "name": tool,
+                            "description": "A tool the test names.",
+                            "inputSchema": {"type": "object"},
+                        }],
+                    }),
+                    Some("tools/call") => answer(&message),
+                    _ => Value::Null,
+                };
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", "session-1")
+                    .body(Body::from(
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{address}"), log, task)
+}
+
+/// A fake MCP server whose tool list a test can hold open.
+///
+/// Its `tools/list` answer waits for `release`, so discovery of that server is
+/// still in flight while the test changes what the Space holds.
+struct GatedMcpServer {
+    url: String,
+    log: McpLog,
+    release: std::sync::Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Runs a fake MCP server that lists one named tool, holding its `tools/list`
+/// answer until `release` is notified.
+async fn fake_mcp_server_tool_gated(tool: &'static str) -> GatedMcpServer {
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, header::CONTENT_TYPE};
+    use axum::response::Response;
+    use axum::routing::post;
+
+    let log: McpLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let release = std::sync::Arc::new(tokio::sync::Notify::new());
+    let gate = release.clone();
+    let app = Router::new().route(
+        "/",
+        post(move |_headers: HeaderMap, body: Bytes| {
+            let log = seen.clone();
+            let gate = gate.clone();
+            async move {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                log.lock().unwrap().push(message.clone());
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                let result = match message["method"].as_str() {
+                    Some("initialize") => serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "docs", "version": "1"},
+                    }),
+                    Some("notifications/initialized") => return Response::new(Body::empty()),
+                    Some("tools/list") => {
+                        gate.notified().await;
+                        serde_json::json!({
+                            "tools": [{
+                                "name": tool,
+                                "description": "A tool the test names.",
+                                "inputSchema": {"type": "object"},
+                            }],
+                        })
+                    }
+                    _ => Value::Null,
+                };
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", "session-1")
+                    .body(Body::from(
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    GatedMcpServer {
+        url: format!("http://{address}"),
+        log,
+        release,
+        task,
+    }
+}
+
+/// Waits until a fake MCP server's log records one method.
+///
+/// The wait is a bounded poll: the fake server records the request before it
+/// answers, so a test that sees it here knows discovery is held open.
+async fn wait_for_logged_method(log: &McpLog, method: &str) {
+    for _ in 0..500 {
+        let seen = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message["method"] == json!(method));
+        if seen {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the fake MCP server never saw a {method} request");
+}
+
+/// An MCP server address on loopback that no server answers.
+async fn unreachable_mcp_url() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    // Nothing listens on the address once the listener is dropped, so a
+    // discovery attempt is refused at once instead of waiting for a timeout.
+    drop(listener);
+    format!("http://{address}/")
+}
+
+/// Adds an MCP server to the Space under a name and returns its id.
+async fn add_mcp_server(
+    socket: &mut Socket,
+    name: &str,
+    url: &str,
+    credential: Option<&str>,
+) -> Id {
+    let result = command(
+        socket,
+        Id::new(),
+        CommandCall::McpAdd(neha::surface::McpAdd {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            scope: neha::record::McpScope::Space,
+            credential: credential.map(ToOwned::to_owned),
+        }),
+    )
+    .await;
+    assert_eq!(result["name"], json!(name));
+    serde_json::from_value(result["server"].clone()).unwrap()
+}
+
+/// Runs a fake MCP server whose one tool names an app, answering the
+/// `resources/read` for it with `resource` and the call with `call_result`.
+/// Returns its URL and a log.
+async fn fake_mcp_app_server(
+    meta: Value,
+    resource: Value,
+    call_result: Value,
+) -> (String, McpLog, tokio::task::JoinHandle<()>) {
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, header::CONTENT_TYPE};
+    use axum::response::Response;
+    use axum::routing::post;
+
+    let log: McpLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let resource = std::sync::Arc::new(resource);
+    let meta = std::sync::Arc::new(meta);
+    let call_result = std::sync::Arc::new(call_result);
+    let app = Router::new().route(
+        "/",
+        post(move |_headers: HeaderMap, body: Bytes| {
+            let log = seen.clone();
+            let resource = resource.clone();
+            let meta = meta.clone();
+            let call_result = call_result.clone();
+            async move {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                log.lock().unwrap().push(message.clone());
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                let result = match message["method"].as_str() {
+                    Some("initialize") => serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}, "resources": {}},
+                        "serverInfo": {"name": "docs", "version": "1"},
+                    }),
+                    Some("notifications/initialized") => return Response::new(Body::empty()),
+                    Some("tools/list") => serde_json::json!({
+                        "tools": [{
+                            "name": "search",
+                            "description": "Search the docs.",
+                            "inputSchema": {"type": "object"},
+                            "_meta": *meta,
+                        }],
+                    }),
+                    Some("tools/call") => (*call_result).clone(),
+                    Some("resources/read") => (*resource).clone(),
+                    _ => Value::Null,
+                };
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", "session-1")
+                    .body(Body::from(
+                        serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{address}"), log, task)
+}
+
+/// Runs one MCP app call through the socket and returns what the record,
+/// the fake server, and the fake provider saw.
+async fn mcp_app_run(
+    running: &Running,
+    socket: &mut Socket,
+    meta: Value,
+    resource: Value,
+) -> (
+    Id,
+    Id,
+    Vec<neha::record::Event>,
+    McpLog,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    mcp_app_run_with(
+        running,
+        socket,
+        meta,
+        resource,
+        serde_json::json!({"content": [{"type": "text", "text": "the answer is token-1"}]}),
+        "token-1",
+    )
+    .await
+}
+
+/// Runs one MCP app call with a chosen answer and credential.
+async fn mcp_app_run_with(
+    running: &Running,
+    socket: &mut Socket,
+    meta: Value,
+    resource: Value,
+    call_result: Value,
+    credential: &str,
+) -> (
+    Id,
+    Id,
+    Vec<neha::record::Event>,
+    McpLog,
+    std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (url, log, server_task) = fake_mcp_app_server(meta, resource, call_result).await;
+    let server = add_mcp_server(socket, "docs", &url, Some(credential)).await;
+    let (base, provider_task, recorded) = scripted_provider_recording(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(socket, Id::new(), provider_add(base)).await;
+    command(socket, Id::new(), CommandCall::BotMcpEnable { bot, server }).await;
+    let queued = submit(socket, chat, "search", None).await;
+    let run = run_of(&queued);
+    wait_status(socket, run, "waiting").await;
+    let approvals = approvals_in(socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(socket, approval, true, true).await;
+    let finished = wait_run(socket, run).await;
+    assert_eq!(finished["status"], "succeeded", "{}", finished["error"]);
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100_000)
+        .await
+        .unwrap()
+        .events;
+
+    (chat, run, events, log, recorded, server_task, provider_task)
+}
+
+/// Returns what one finished action of a run answered.
+fn finished_action_output(events: &[neha::record::Event], run: Id) -> String {
+    finished_action(events, run)["output"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Returns the one finished action's data of a run.
+fn finished_action(events: &[neha::record::Event], run: Id) -> &Value {
+    events
+        .iter()
+        .find(|event| event.kind == EventKind::ActionFinished && event.data["run"] == json!(run))
+        .map(|event| &event.data)
+        .expect("the run finished one action")
+}
+
+/// Writes a package directory with one skill and one MCP server.
+fn write_plugin_package(root: &std::path::Path, mcp_url: &str) -> std::path::PathBuf {
+    let package = root.join("reports-plugin");
+    std::fs::create_dir_all(package.join("skills").join("weekly-report").join("scripts")).unwrap();
+    std::fs::write(
+        package.join("plugin.json"),
+        json!({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            "name": "reports",
+            "version": "1.2.0",
+            "description": "Weekly reports",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        package
+            .join("skills")
+            .join("weekly-report")
+            .join("SKILL.md"),
+        "---\nname: weekly-report\ndescription: Write the weekly report.\n---\nCollect and summarize.",
+    )
+    .unwrap();
+    std::fs::write(
+        package
+            .join("skills")
+            .join("weekly-report")
+            .join("scripts")
+            .join("collect.sh"),
+        "printf collected",
+    )
+    .unwrap();
+    std::fs::write(
+        package.join("mcp.json"),
+        json!({
+            "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+            "mcpServers": {
+                "docs": {
+                    "type": "streamable-http",
+                    "url": mcp_url,
+                    "headers": {"X-Tenant": "acme"},
+                },
+            },
+        })
+        .to_string(),
+    )
+    .unwrap();
+    package
+}
+
+/// A fake MCP server that records the headers of every request.
+async fn fake_mcp_server_with_headers() -> (
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<axum::http::HeaderMap>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, header::CONTENT_TYPE};
+    use axum::response::Response;
+    use axum::routing::post;
+
+    let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let app = Router::new().route(
+        "/",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let log = seen.clone();
+            async move {
+                let message: Value = serde_json::from_slice(&body).unwrap();
+                log.lock().unwrap().push(headers);
+                let id = message.get("id").cloned().unwrap_or(Value::Null);
+                let result = match message["method"].as_str() {
+                    Some("initialize") => json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "docs", "version": "1"},
+                    }),
+                    Some("notifications/initialized") => return Response::new(Body::empty()),
+                    Some("tools/list") => json!({
+                        "tools": [{
+                            "name": "search",
+                            "description": "Search the docs.",
+                            "inputSchema": {"type": "object"},
+                        }],
+                    }),
+                    _ => json!({"content": [{"type": "text", "text": "found"}]}),
+                };
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{address}"), log, task)
+}
+
+/// Packs a package's files into GitHub's `<root>/...` tarball layout.
+fn plugin_tarball(files: &[(&str, &str)]) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write as _;
+
+    let mut tar = tar::Builder::new(Vec::new());
+    for (path, content) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(content.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, path, content.as_bytes())
+            .unwrap();
+    }
+    let tar = tar.into_inner().unwrap();
+    let mut gz = GzEncoder::new(Vec::new(), Compression::default());
+    gz.write_all(&tar).unwrap();
+    gz.finish().unwrap()
+}
+
+/// Serves one package tarball at `/repo/archive/<anything>.tar.gz`.
+async fn serve_plugin_archive(tarball: Vec<u8>) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::Response;
+    use axum::routing::get;
+
+    let app = Router::new().route(
+        "/repo/archive/{file}",
+        get(move || {
+            let tarball = tarball.clone();
+            async move {
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/gzip")
+                    .body(Body::from(tarball))
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{address}"), task)
+}
+
+/// The plugin tarball the stdio end-to-end test installs: one stdio server
+/// this machine can launch, one whose command it cannot resolve, and the
+/// app the launchable server's tool renders.
+#[cfg(target_os = "linux")]
+fn stdio_plugin_tarball() -> Vec<u8> {
+    let manifest = json!({
+        "$schema": neha_space::plugins::PLUGIN_SCHEMA,
+        "name": "stdio-tools",
+        "version": "1.0.0",
+    })
+    .to_string();
+    let mcp = json!({
+        "$schema": neha_space::plugins::MCP_SCHEMA,
+        "mcpServers": {
+            "local": {
+                "type": "stdio",
+                "command": "python3",
+                "args": ["${PLUGIN_ROOT}/server.py"],
+                "cwd": "${PLUGIN_ROOT}",
+                "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+            },
+            "broken": {
+                "type": "stdio",
+                "command": "neha-no-such-mcp-server-program",
+            },
+        },
+    })
+    .to_string();
+    plugin_tarball(&[
+        ("stdio-tools/plugin.json", &manifest),
+        ("stdio-tools/mcp.json", &mcp),
+        ("stdio-tools/server.py", STDIO_FIXTURE),
+    ])
+}
+
+/// The commands a stdio end-to-end test needs this machine to have.
+#[cfg(target_os = "linux")]
+fn stdio_commands() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    // The smoke check proves the sandbox actually starts, not merely that
+    // bubblewrap is installed: a machine with user namespaces refused
+    // would otherwise panic here instead of skipping.
+    if !test_support::sandbox_smoke() {
+        return None;
+    }
+    let bwrap = neha_space::stdio::resolve_command("bwrap", std::path::Path::new("/")).ok()?;
+    let python = neha_space::stdio::resolve_command("python3", std::path::Path::new("/")).ok()?;
+
+    Some((bwrap, python))
+}
+
+/// Installs the stdio package on a fresh Space and answers the socket, the
+/// Space, its data directory, and the two servers.
+#[cfg(target_os = "linux")]
+#[allow(clippy::type_complexity)]
+async fn install_stdio_package(
+    commit: &str,
+    tarball: Vec<u8>,
+) -> (
+    tempfile::TempDir,
+    Running,
+    Socket,
+    tokio::task::JoinHandle<()>,
+    std::path::PathBuf,
+    Id,
+    Id,
+    Id,
+) {
+    let (archive, archive_task) = serve_plugin_archive(tarball).await;
+    let config = format!("[plugins]\nsources = [\"{archive}/\"]\n");
+    let (dir, running, invite) = running_with_config(&config).await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let installed = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::PluginInstall {
+            source: format!("{archive}/repo@{commit}"),
+        },
+    )
+    .await;
+    let plugin: Id = serde_json::from_value(installed["plugin"].clone()).unwrap();
+    let servers = installed["servers"].as_array().unwrap().clone();
+    let server = |name: &str| -> Id {
+        serde_json::from_value(
+            servers
+                .iter()
+                .find(|row| row["name"] == json!(name))
+                .unwrap_or_else(|| panic!("the package registers {name}"))["server"]
+                .clone(),
+        )
+        .unwrap()
+    };
+    let local = server("stdio-tools-local");
+    let broken = server("stdio-tools-broken");
+    let data = running.test_fields().home.plugin_data_dir("stdio-tools");
+
+    (
+        dir,
+        running,
+        socket,
+        archive_task,
+        data,
+        plugin,
+        local,
+        broken,
+    )
+}
+
+/// The text one `application/x-www-form-urlencoded` field carries.
+fn form_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                decoded.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                    Some(byte) => {
+                        decoded.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        decoded.push(b'%');
+                        index += 1;
+                    }
+                }
+            }
+            byte => {
+                decoded.push(byte);
+                index += 1;
+            }
+        }
+    }
+
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// A fake authorization server and a fake MCP server that asks for OAuth.
+///
+/// The MCP server answers its uncleared `initialize` with a 401 that names
+/// the authorization server's protected resource metadata, and accepts one
+/// bearer token afterwards. The authorization server serves the two
+/// metadata documents, registers the public client, and exchanges the
+/// code. Both listen on loopback ports, the only HTTP the OAuth rules
+/// admit.
+#[allow(clippy::type_complexity)]
+async fn fake_sign_in_landscape() -> (
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    fake_sign_in_landscape_with(false).await
+}
+
+/// The same fake landscape, with the authorization server optionally
+/// advertising that every authorization response carries RFC 9207's `iss`.
+///
+/// The token exchange count, the discovery requests, the dynamic client
+/// registrations, and both tasks are returned to the test.
+#[allow(clippy::type_complexity)]
+async fn fake_sign_in_landscape_with(
+    iss_required: bool,
+) -> (
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    fake_sign_in_landscape_controlled(iss_required, None).await
+}
+
+/// The same landscape with the first token exchange held until the test
+/// releases it.
+///
+/// Each accepted exchange answers a different token, numbered in arrival
+/// order, so a test can tell which sign-in's credential the Vault kept.
+#[allow(clippy::type_complexity)]
+async fn fake_sign_in_landscape_delayed() -> (
+    (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ),
+    TokenDelay,
+) {
+    let delay = TokenDelay::new();
+    let landscape = fake_sign_in_landscape_controlled(false, Some(delay.clone())).await;
+    (landscape, delay)
+}
+
+#[allow(clippy::type_complexity)]
+async fn fake_sign_in_landscape_controlled(
+    iss_required: bool,
+    delay: Option<TokenDelay>,
+) -> (
+    String,
+    String,
+    std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    use axum::Router;
+    use axum::body::{Body, Bytes};
+    use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::WWW_AUTHENTICATE};
+    use axum::response::Response;
+    use axum::routing::{get, post};
+
+    let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mcp_address = mcp_listener.local_addr().unwrap();
+    let mcp_url = format!("http://{mcp_address}");
+    let as_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let as_address = as_listener.local_addr().unwrap();
+    let issuer = format!("http://{as_address}");
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let registrations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let challenge =
+        format!("Bearer resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\"");
+    let counted = calls.clone();
+    let mcp_app = Router::new().route(
+        "/",
+        post(move |headers: HeaderMap, body: Bytes| {
+            let log = log.clone();
+            let challenge = challenge.clone();
+            let counted = counted.clone();
+            async move {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(value) = headers
+                    .get("x-package")
+                    .and_then(|value| value.to_str().ok())
+                {
+                    log.lock().unwrap().push(format!("x-package:{value}"));
+                }
+                let authorization = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default()
+                    .to_owned();
+                log.lock().unwrap().push(authorization.clone());
+                // The delayed landscape numbers its tokens, so the flow
+                // that wins the race may hold the second one.
+                if authorization != "Bearer token-1" && authorization != "Bearer token-2" {
+                    return Response::builder()
+                        .status(StatusCode::UNAUTHORIZED)
+                        .header(WWW_AUTHENTICATE, challenge)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                if message["method"] == "notifications/initialized" {
+                    return Response::builder()
+                        .status(StatusCode::ACCEPTED)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                let result = match message["method"].as_str() {
+                    Some("initialize") => json!({
+                        "protocolVersion": neha_space::mcp::PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "docs", "version": "1"},
+                    }),
+                    _ => json!({"tools": []}),
+                };
+                Response::builder()
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", "session-1")
+                    .body(Body::from(
+                        json!({"jsonrpc": "2.0", "id": message["id"], "result": result})
+                            .to_string(),
+                    ))
+                    .unwrap()
+            }
+        }),
+    );
+
+    let forms = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_forms = forms.clone();
+    let counted_registrations = registrations.clone();
+    let exchanges = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let numbered = delay.is_some();
+    let resource_for_metadata = mcp_url.clone();
+    let resource_for_token = mcp_url.clone();
+    let issuer_for_metadata = issuer.clone();
+    let issuer_for_document = issuer.clone();
+    let as_app = Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(move || {
+                let resource = resource_for_metadata.clone();
+                let issuer = issuer_for_metadata.clone();
+                async move {
+                    axum::Json(json!({
+                        "resource": resource,
+                        "authorization_servers": [issuer],
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/.well-known/oauth-authorization-server",
+            get(move || {
+                let issuer = issuer_for_document.clone();
+                async move {
+                    let mut metadata = json!({
+                        "issuer": issuer,
+                        "authorization_endpoint": format!("{issuer}/authorize"),
+                        "token_endpoint": format!("{issuer}/token"),
+                        "registration_endpoint": format!("{issuer}/register"),
+                        "code_challenge_methods_supported": ["S256"],
+                    });
+                    if iss_required {
+                        metadata["authorization_response_iss_parameter_supported"] = json!(true);
+                    }
+                    axum::Json(metadata)
+                }
+            }),
+        )
+        .route(
+            "/register",
+            post(move |body: Bytes| {
+                let registrations = counted_registrations.clone();
+                async move {
+                    registrations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // The answer describes a public client for the exact
+                    // redirect it was asked for, the way a registration server
+                    // does.
+                    let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    let redirects = request
+                        .get("redirect_uris")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    axum::Json(json!({
+                        "client_id": "test-client",
+                        "redirect_uris": redirects,
+                        "token_endpoint_auth_method": "none",
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/token",
+            post(move |body: Bytes| {
+                let forms = seen_forms.clone();
+                let resource = resource_for_token.clone();
+                let exchanges = exchanges.clone();
+                let gate = delay.clone();
+                async move {
+                    let text = String::from_utf8_lossy(&body);
+                    let form: std::collections::HashMap<String, String> = text
+                        .split('&')
+                        .filter_map(|pair| pair.split_once('='))
+                        .map(|(name, value)| (form_decode(name), form_decode(value)))
+                        .collect();
+                    let accepted = form.get("grant_type").map(String::as_str)
+                        == Some("authorization_code")
+                        && form.get("code").map(String::as_str) == Some("fake-code")
+                        && form
+                            .get("code_verifier")
+                            .is_some_and(|value| !value.is_empty())
+                        && form
+                            .get("redirect_uri")
+                            .is_some_and(|value| !value.is_empty())
+                        && form.get("client_id").map(String::as_str) == Some("test-client")
+                        && form.get("resource").map(String::as_str) == Some(resource.as_str());
+                    forms.lock().unwrap().push(form);
+                    if !accepted {
+                        return Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({
+                                    "error": "invalid_grant",
+                                    "error_description": "the-provider-secret-code",
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    let order = exchanges.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    if order == 1
+                        && let Some(gate) = &gate
+                    {
+                        gate.arrived.notify_one();
+                        gate.release.notified().await;
+                    }
+                    let token = if numbered {
+                        format!("token-{order}")
+                    } else {
+                        "token-1".to_owned()
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            json!({"access_token": token, "token_type": "Bearer"}).to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        )
+        .route("/authorize", get(|| async { "authorize" }));
+
+    let mcp_task = tokio::spawn(async move {
+        let _ = axum::serve(mcp_listener, mcp_app).await;
+    });
+    let as_task = tokio::spawn(async move {
+        let _ = axum::serve(as_listener, as_app).await;
+    });
+
+    (
+        mcp_url,
+        issuer,
+        seen,
+        forms,
+        calls,
+        registrations,
+        mcp_task,
+        as_task,
+    )
+}
+
+/// The value of one query parameter of a URL.
+fn query_parameter(url: &str, name: &str) -> Option<String> {
+    reqwest::Url::parse(url)
+        .ok()?
+        .query_pairs()
+        .find(|(key, _)| key == name)
+        .map(|(_, value)| value.into_owned())
+}
+
+/// Signs an account in the way its browser page does: on the Space's own
+/// browser hostname and with that page's Origin. Returns the session cookie
+/// the bind route requires.
+async fn browser_session(running: &Running, name: &str) -> String {
+    let page = running.browser_url();
+    let login = reqwest::Client::new()
+        .post(format!("{page}/api/login"))
+        .header("origin", page.clone())
+        .json(&json!({"display_name": name, "password": "correct horse battery"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    login
+        .headers()
+        .get(reqwest::header::SET_COOKIE)
+        .expect("a browser sign-in sets the session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+/// The callback URL one issuer's browser flow returns to.
+fn sign_in_callback(running: &Running, issuer: &str) -> String {
+    format!(
+        "{}/api/mcp/signin/{}/callback",
+        running.url(),
+        neha_space::oauth::issuer_key(issuer)
+    )
+}
+
+/// Binds one browser flow and returns the binding cookie the browser must
+/// send back, the nonce that cookie carries, and the provider URL the bind
+/// route redirects to.
+///
+/// The request is the initiating browser's: it addresses the Space's own
+/// hostname and carries the session cookie the page that opened the URL
+/// holds. A command line flow's browser need not be signed in to the
+/// Space, so its tests bind with `None` (an empty cookie jar).
+///
+/// The binding cookie is the flow's own: its name carries the sign-in, so a
+/// later answer of an older flow can never overwrite it.
+async fn bind_sign_in(
+    client: &reqwest::Client,
+    running: &Running,
+    sign_in: Id,
+    session_cookie: Option<&str>,
+) -> (String, String, String) {
+    let mut request = client
+        .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+        .query(&[("sign_in", sign_in.to_string())]);
+    if let Some(session_cookie) = session_cookie {
+        request = request.header("cookie", session_cookie);
+    }
+    let response = request.send().await.unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    let set_cookie = response
+        .headers()
+        .get("set-cookie")
+        .and_then(|value| value.to_str().ok())
+        .expect("the bind answer sets a cookie")
+        .to_owned();
+    for attribute in [
+        "HttpOnly",
+        "SameSite=Lax",
+        "Path=/api/mcp/signin",
+        "Max-Age=600",
+    ] {
+        assert!(
+            set_cookie.contains(attribute),
+            "{attribute} missing from {set_cookie}"
+        );
+    }
+    assert!(
+        !set_cookie.contains("Secure"),
+        "a plain-HTTP Space sets no Secure cookie: {set_cookie}"
+    );
+    let cookie = set_cookie
+        .split(';')
+        .next()
+        .expect("the cookie's name and value")
+        .to_owned();
+    let (name, nonce) = cookie.split_once('=').expect("a cookie name and value");
+    assert_eq!(
+        name,
+        test_support::sign_in_cookie_name(sign_in),
+        "the bind answer sets this flow's cookie"
+    );
+    assert_eq!(
+        nonce.len(),
+        43,
+        "32 random bytes, base64url without padding"
+    );
+    let nonce = nonce.to_owned();
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .expect("the bind answer redirects")
+        .to_owned();
+
+    (cookie, nonce, location)
+}
+
+/// Binds one command line flow and returns the provider URL the bind route
+/// redirects to.
+///
+/// A command line flow sets no browser cookie: its loopback receiver and
+/// the authenticated finish bind the second hop, and a command line flow
+/// owns no browser binding.
+async fn bind_command_line_sign_in(
+    client: &reqwest::Client,
+    running: &Running,
+    sign_in: Id,
+) -> String {
+    let response = client
+        .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+        .query(&[("sign_in", sign_in.to_string())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    assert!(
+        response.headers().get("set-cookie").is_none(),
+        "a command line flow binds no browser cookie"
+    );
+
+    response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .expect("the bind answer redirects")
+        .to_owned()
+}
+
+/// The path of one URL: what a loopback receiver passes as the callback's
+/// path.
+fn url_path(url: &str) -> String {
+    reqwest::Url::parse(url)
+        .expect("a valid URL")
+        .path()
+        .to_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_card_sandbox_proxy_serves_the_fixed_relay_page() {
+    let (_dir, running, _invite) = running().await;
+
+    // The route needs no session: a Card's sandbox is loaded as a frame's
+    // document by a page of this Space, and it carries nothing secret.
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/mcp/card/sandbox", running.url()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    // The inherited categories stay as they are, and the route appends the
+    // one frame-src the Card decides: with no policy in the query, the app
+    // frame may not navigate anywhere at all.
+    let expected = format!("{}; frame-src 'none'", test_support::CARD_SANDBOX_CSP);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected
+    );
+
+    // The document is fixed: it reports itself, relays both directions,
+    // and names the one message that stops the relay. The relay is one
+    // transferred `MessageChannel`: the app's half is handed to the page
+    // during the mounted document's bootstrap, and no secret is ever
+    // written into the app's document.
+    let page = response.text().await.unwrap();
+    assert_eq!(
+        page,
+        test_support::CARD_SANDBOX_PAGE,
+        "the proxy page is fixed"
+    );
+    for kind in [
+        "sandbox-ready",
+        "sandbox-message",
+        "sandbox-post",
+        "sandbox-navigation",
+        "__nehaPort",
+        "MessageChannel",
+        "[hostPort]",
+    ] {
+        assert!(page.contains(kind), "{kind} missing from the proxy page");
+    }
+    // A received host message must name the app's visible parent as its
+    // source, and that parent must be a real `EventTarget`: a plain object
+    // there made Chromium throw before dispatch, so the app never got the
+    // host's answer. The markers are the regression guard a route test can
+    // keep without a browser.
+    for marker in [
+        "extends EventTarget",
+        "new Bridge()",
+        r#"Object.defineProperty(window, "parent""#,
+        r#"Object.defineProperty(message, "source""#,
+        "window.parent",
+    ] {
+        assert!(
+            page.contains(marker),
+            "{marker} missing from the proxy page"
+        );
+    }
+    // The sandbox document fills the frame the host allocates: no default
+    // body margin or auto height, no scrolling, and the app's frame laid
+    // over the whole viewport.
+    for marker in [
+        "margin:0",
+        "height:100%",
+        "overflow:hidden",
+        "position:absolute",
+        "inset:0",
+    ] {
+        assert!(
+            page.contains(marker),
+            "{marker} missing from the proxy page"
+        );
+    }
+    assert!(
+        !page.contains("token"),
+        "the relay carries no secret: {page}"
+    );
+    assert!(
+        page.contains(r#"sandbox="allow-scripts""#),
+        "the app frame is the sandboxed one: {page}"
+    );
+    assert!(
+        page.contains(r#"Content-Security-Policy"#),
+        "the app's policy meta is built by the page: {page}"
+    );
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_card_sandbox_proxy_carries_the_cards_frame_sources() {
+    let (_dir, running, _invite) = running().await;
+
+    // The embedding page names the Card's effective policy, percent-
+    // encoded, and the proxy rebuilds only its frame-src: every other
+    // directive stays inherited, never copied from the query.
+    let response = reqwest::Client::new()
+        .get(format!("{}/api/mcp/card/sandbox", running.url()))
+        .query(&[(
+            "csp",
+            "default-src 'none'; frame-src https://frames.example",
+        )])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let expected = format!(
+        "{}; frame-src https://frames.example",
+        test_support::CARD_SANDBOX_CSP
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        expected
+    );
+    // The policy is a header, never markup: the fixed page is unchanged,
+    // so where the app may navigate cannot be rewritten by app bytes.
+    assert_eq!(
+        response.text().await.unwrap(),
+        test_support::CARD_SANDBOX_PAGE
+    );
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_card_sandbox_proxy_falls_back_to_no_frame_source() {
+    let (_dir, running, _invite) = running().await;
+    let client = reqwest::Client::new();
+    let none = format!("{}; frame-src 'none'", test_support::CARD_SANDBOX_CSP);
+    let many_sources = {
+        let sources: Vec<String> = (0..=test_support::MAX_FRAME_SOURCES)
+            .map(|index| format!("https://frames{index}.example"))
+            .collect();
+        format!(
+            "default-src 'none'; frame-src {}; object-src 'none'",
+            sources.join(" ")
+        )
+    };
+    let oversized = format!(
+        "frame-src https://frames.example {}",
+        "a".repeat(neha::record::MAX_CARD_CSP_BYTES)
+    );
+    for policy in [
+        "frame-src 'none'".to_owned(),
+        "frame-src https://a;b".to_owned(),
+        "frame-src javascript:alert(1)".to_owned(),
+        "frame-src *".to_owned(),
+        "frame-src 127.0.0.2".to_owned(),
+        "frame-src http://example.com".to_owned(),
+        "frame-src https://frames.example/path".to_owned(),
+        "frame-src https://user@frames.example".to_owned(),
+        "default-src 'none'; object-src 'none'".to_owned(),
+        many_sources,
+        oversized,
+    ] {
+        let response = client
+            .get(format!("{}/api/mcp/card/sandbox", running.url()))
+            .query(&[("csp", policy.as_str())])
+            .send()
+            .await
+            .unwrap();
+        // A policy this Space cannot vouch for narrows the app to no
+        // navigation, and the fixed page still serves: the mount never
+        // depends on the query.
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{policy}");
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            none,
+            "{policy}"
+        );
+        assert_eq!(
+            response.text().await.unwrap(),
+            test_support::CARD_SANDBOX_PAGE,
+            "{policy}"
+        );
+    }
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_enters_the_bot_context_only_when_enabled() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, recorded) =
+        scripted_provider_recording(vec![text("done"), text("done")]).await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: weekly-report\ndescription: Write the weekly status report.\n---\nCollect the docs.",
+            &[],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    // The Space's library holds it; the Bot has not enabled it.
+    let listed = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::SkillList { bot: Some(bot) },
+    )
+    .await;
+    assert_eq!(listed, json!([]), "an added skill is not enabled");
+    let queued = submit(&mut socket, chat, "hello", None).await;
+    finish(&mut socket, chat, queued).await;
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let names = tool_names(&requests[0]);
+        assert!(
+            !names.iter().any(|name| name == "skill"),
+            "a Bot without skills is offered no skill tool: {names:?}"
+        );
+        assert!(!system_text(&requests[0]).contains("weekly-report"));
+    }
+
+    let enabled = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    assert_eq!(enabled["enabled"], json!(true));
+    let queued = submit(&mut socket, chat, "again", None).await;
+    finish(&mut socket, chat, queued).await;
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let names = tool_names(&requests[1]);
+        assert!(
+            names.iter().any(|name| name == "skill"),
+            "an enabled skill offers the skill tool: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "run_skill_script"),
+            "a skill without scripts offers no script tool: {names:?}"
+        );
+        let system = system_text(&requests[1]);
+        assert!(
+            system.contains("weekly-report: Write the weekly status report."),
+            "{system}"
+        );
+    }
+
+    // Disabling takes the skill's name and tool away again.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillDisable { bot, skill },
+    )
+    .await;
+    let queued = submit(&mut socket, chat, "third", None).await;
+    finish(&mut socket, chat, queued).await;
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(!tool_names(&requests[2]).iter().any(|name| name == "skill"));
+        assert!(!system_text(&requests[2]).contains("weekly-report"));
+    }
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_loads_a_skill_body_without_an_approval() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let body = "1. Collect the docs.\n2. Summarize under a page.";
+    let (base, provider_task, recorded) = scripted_provider_recording(vec![
+        tool("skill", json!({"name": "weekly-report"})),
+        text("done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            &format!(
+                "---\nname: weekly-report\ndescription: Write the weekly status report.\n---\n{body}"
+            ),
+            &[],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let finished = finish(&mut socket, chat, queued).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert!(
+        approvals_in(&mut socket, None).await.is_empty(),
+        "loading a skill touches no Computer and asks nobody"
+    );
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let tool_messages: Vec<&Value> = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        let text = tool_messages
+            .last()
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_default();
+        assert!(
+            text.contains(body),
+            "the skill's body reaches the Model: {text}"
+        );
+        assert!(
+            !text.contains("description:"),
+            "the frontmatter stays out of the body: {text}"
+        );
+    }
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_asks_before_its_first_run_and_always_allow_covers_it() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, recorded) = scripted_provider_recording(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": ["world"]}),
+        ),
+        text("done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": ["again"]}),
+        ),
+        text("second done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+            &[("hello.sh", "printf 'hello %s' \"$1\"")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["reason"], "first_script_run");
+    assert_eq!(approvals[0]["tool"], "run_skill_script");
+    assert_eq!(approvals[0]["arguments"]["skill"], "hello");
+    assert_eq!(approvals[0]["arguments"]["script"], "hello.sh");
+    let summary = approvals[0]["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("hello") && summary.contains("hello.sh"),
+        "the card names the skill and the script it will run: {summary}"
+    );
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    let decided = decide_approval(&mut socket, approval, true, true).await;
+    assert_eq!(decided["status"], "allowed");
+    assert!(
+        decided["rule"].is_string(),
+        "Always allow writes a rule: {decided}"
+    );
+    let finished = wait_run(&mut socket, run).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+    {
+        // The script's own output is the action's result.
+        let requests = recorded.lock().unwrap();
+        let results: Vec<&str> = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .filter_map(|message| message["content"].as_str())
+            .collect();
+        assert!(
+            results.iter().any(|text| text.contains("hello world")),
+            "the script ran with its argument: {results:?}"
+        );
+    }
+
+    // The rule names the skill and its script.
+    let rules = approvals_of(&mut socket, bot).await;
+    let rule = rules
+        .iter()
+        .find(|rule| rule["rule"] == decided["rule"])
+        .unwrap_or_else(|| panic!("the derived rule is listed: {rules:?}"));
+    assert_eq!(rule["tool"], "run_skill_script");
+    assert_eq!(rule["skill_name"], "hello");
+    assert_eq!(rule["script"], "hello.sh");
+    assert_eq!(rule["effect"], "allow");
+
+    // The second run needs no answer.
+    let second = submit(&mut socket, chat, "again", None).await;
+    let second_run = run_of(&second);
+    let finished = wait_run(&mut socket, second_run).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert!(
+        approvals_in(&mut socket, Some(chat)).await.is_empty(),
+        "a lasting rule answers the second run"
+    );
+    assert_eq!(last_message(&mut socket, chat).await["text"], "second done");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_script_call_marks_no_run_and_breaks_no_replay() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        // The Model names the pair but adds a field the tool refuses.
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "surprise": true}),
+        ),
+        text("first done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": ["one"]}),
+        ),
+        text("second done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+
+    // The refused call is recorded as an action and stops nothing: the
+    // record still projects, so the run finishes.
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let finished = finish(&mut socket, chat, queued).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert_eq!(last_message(&mut socket, chat).await["text"], "first done");
+
+    // It also marks no run: the pair's first real run still asks.
+    let queued = submit(&mut socket, chat, "run it properly", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(
+        approvals[0]["reason"], "first_script_run",
+        "a refused call is not a first run: {approvals:?}"
+    );
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_ask_rule_for_a_script_asks_every_run() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": ["one"]}),
+        ),
+        text("first done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": ["two"]}),
+        ),
+        text("second done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": ["three"]}),
+        ),
+        text("third done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let ask = command(
+        &mut socket,
+        Id::new(),
+        add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
+    )
+    .await;
+    let ask: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+
+    // A Space-served call has its own approvals on every Computer kind.
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "rule", "{approvals:?}");
+    assert_eq!(approvals[0]["rule"], json!(ask));
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+    // Allow once leaves the Ask rule: the next run asks again.
+    let queued = submit(&mut socket, chat, "again", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "rule", "{approvals:?}");
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    let decided = decide_approval(&mut socket, approval, true, true).await;
+    assert_eq!(decided["overridden"], json!(ask));
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+    // The covered Ask rule is gone, so the next run starts without a card.
+    let queued = submit(&mut socket, chat, "one more", None).await;
+    let run = run_of(&queued);
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    assert!(
+        approvals_in(&mut socket, Some(chat)).await.is_empty(),
+        "no rule asks after Always allow covers the Ask rule"
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_script_run_asks_once_and_its_rule_answers_later_runs() {
+    let (_dir, running, invite) = running().await;
+    let mut local = local_bot(
+        &running,
+        &invite,
+        vec![
+            tool("shell", json!({"command": "pwd"})),
+            text("first done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["one"]}),
+            ),
+            text("script done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["two"]}),
+            ),
+            text("second script done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["three"]}),
+            ),
+            text("third script done"),
+            tool(
+                "run_skill_script",
+                json!({"skill": "hello", "script": "hello.sh", "arguments": ["four"]}),
+            ),
+            text("fourth script done"),
+        ],
+    )
+    .await;
+    let added = command(
+        &mut local.socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun the script.",
+            &[("hello.sh", "printf 'hello %s' \"$1\"")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut local.socket,
+        Id::new(),
+        CommandCall::BotSkillEnable {
+            bot: local.bot,
+            skill,
+        },
+    )
+    .await;
+
+    // The machine's first use asks first; one Allow answers it.
+    let first = run_of(&submit(&mut local.socket, local.chat, "pwd", None).await);
+    let approval = approval_for_run(&mut local.socket, first).await;
+    assert_eq!(approval["reason"], "first_use_local");
+    let approval: Id = serde_json::from_value(approval["approval"].clone()).unwrap();
+    decide_approval(&mut local.socket, approval, true, false).await;
+    let action = answer_next_action(&mut local.device, "/home/ada/.neha/workspace").await;
+    assert!(matches!(action, WireAction::Shell { .. }));
+    assert_eq!(
+        wait_run(&mut local.socket, first).await["status"],
+        "succeeded"
+    );
+
+    // The script's own first run asks, and Always allow makes its rule.
+    let second = run_of(&submit(&mut local.socket, local.chat, "run the script", None).await);
+    wait_status(&mut local.socket, second, "waiting").await;
+    let approvals = approvals_in(&mut local.socket, Some(local.chat)).await;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["reason"], "first_script_run");
+    assert_eq!(approvals[0]["arguments"]["skill"], "hello");
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    let decided = decide_approval(&mut local.socket, approval, true, true).await;
+    assert!(decided["rule"].is_string(), "{decided}");
+    // The script the Space delivered is the one the skill carries.
+    let action = answer_next_action(&mut local.device, "hello one").await;
+    match action {
+        WireAction::RunScript {
+            name,
+            content,
+            arguments,
+        } => {
+            assert_eq!(name, "hello.sh");
+            assert_eq!(content, "printf 'hello %s' \"$1\"");
+            assert_eq!(arguments, vec!["one".to_owned()]);
+        }
+        other => panic!("expected a script action, got {other:?}"),
+    }
+    assert_eq!(
+        wait_run(&mut local.socket, second).await["status"],
+        "succeeded"
+    );
+
+    // The lasting rule answers the next run: it starts without a card.
+    let third = run_of(&submit(&mut local.socket, local.chat, "run it again", None).await);
+    let action = answer_next_action(&mut local.device, "hello two").await;
+    assert!(matches!(action, WireAction::RunScript { .. }));
+    assert_eq!(
+        wait_run(&mut local.socket, third).await["status"],
+        "succeeded"
+    );
+    assert!(
+        approvals_in(&mut local.socket, Some(local.chat))
+            .await
+            .is_empty(),
+        "the rule the first script run made answers later runs"
+    );
+    assert_eq!(
+        last_message(&mut local.socket, local.chat).await["text"],
+        "second script done"
+    );
+
+    // An Ask rule for the same pair asks, and the answer names it: the
+    // Allow rule it makes covers that Ask rule, so Neha removes it.
+    let ask = command(
+        &mut local.socket,
+        Id::new(),
+        add_script_rule(
+            local.bot,
+            neha::record::RuleEffect::Ask,
+            "hello",
+            "hello.sh",
+        ),
+    )
+    .await;
+    let ask: Id = serde_json::from_value(ask["rule"].clone()).unwrap();
+    let fourth = run_of(&submit(&mut local.socket, local.chat, "again", None).await);
+    wait_status(&mut local.socket, fourth, "waiting").await;
+    let approvals = approvals_in(&mut local.socket, Some(local.chat)).await;
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0]["reason"], "rule", "{approvals:?}");
+    assert_eq!(approvals[0]["rule"], json!(ask));
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    let decided = decide_approval(&mut local.socket, approval, true, true).await;
+    assert_eq!(decided["overridden"], json!(ask), "{decided}");
+    let action = answer_next_action(&mut local.device, "hello three").await;
+    assert!(matches!(action, WireAction::RunScript { .. }));
+    assert_eq!(
+        wait_run(&mut local.socket, fourth).await["status"],
+        "succeeded"
+    );
+    let rules = approvals_of(&mut local.socket, local.bot).await;
+    assert!(
+        rules.iter().all(|rule| rule["rule"] != json!(ask)),
+        "the covered Ask rule is removed: {rules:?}"
+    );
+
+    // The next run starts without a card: the Ask rule is gone and the
+    // Allow rule answers for the pair.
+    let fifth = run_of(&submit(&mut local.socket, local.chat, "one more", None).await);
+    let action = answer_next_action(&mut local.device, "hello four").await;
+    assert!(matches!(action, WireAction::RunScript { .. }));
+    assert_eq!(
+        wait_run(&mut local.socket, fifth).await["status"],
+        "succeeded"
+    );
+    assert!(
+        approvals_in(&mut local.socket, Some(local.chat))
+            .await
+            .is_empty(),
+        "no rule asks any more"
+    );
+    local.device.close(None).await.unwrap();
+    local.provider_task.abort();
+    local.socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skill_cannot_be_added_twice_or_from_another_user() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let call = add_skill(
+        None,
+        "---\nname: weekly-report\ndescription: Write the weekly report.\n---\nBody.",
+        &[],
+    );
+    command(&mut socket, Id::new(), call.clone()).await;
+    let (code, message) = try_command(&mut socket, Id::new(), call).await.unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    assert!(message.contains("already holds"), "{message}");
+
+    // A document that is not a skill is refused before anything is
+    // recorded, and the Space says which rule it broke.
+    let (code, message) = try_command(
+        &mut socket,
+        Id::new(),
+        add_skill(None, "---\nname: Bad Name\ndescription: d\n---\n", &[]),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    assert!(message.contains("skill name"), "{message}");
+
+    // A script name that is not one path component is refused too.
+    let (code, _message) = try_command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: escaped\ndescription: d\n---\n",
+            &[("../escape.sh", "true")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_add_asks_for_a_scripts_pair() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    // The tool alone names nothing to match.
+    let (code, message) = try_command(
+        &mut socket,
+        Id::new(),
+        add_rule(
+            bot,
+            neha::record::RuleEffect::Ask,
+            "run_skill_script",
+            None,
+            None,
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    assert!(message.contains("names its skill"), "{message}");
+    // A pair names an installed skill and one of its scripts.
+    let (code, _message) = try_command(
+        &mut socket,
+        Id::new(),
+        add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::NotFound);
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let (code, message) = try_command(
+        &mut socket,
+        Id::new(),
+        add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "other.sh"),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    assert!(message.contains("carries no such script"), "{message}");
+    let added_rule = command(
+        &mut socket,
+        Id::new(),
+        add_script_rule(bot, neha::record::RuleEffect::Allow, "hello", "hello.sh"),
+    )
+    .await;
+    let rule: Id = serde_json::from_value(added_rule["rule"].clone()).unwrap();
+    let rules = approvals_of(&mut socket, bot).await;
+    assert!(
+        rules.iter().any(|view| view["rule"] == json!(rule)
+            && view["skill"] == json!(skill)
+            && view["skill_name"] == "hello"
+            && view["script"] == "hello.sh"),
+        "the rule names the installed skill and its script: {rules:?}"
+    );
+    // A pair on a tool that is not run_skill_script is refused.
+    let (code, message) = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleAdd {
+            bot,
+            effect: neha::record::RuleEffect::Ask,
+            tool: "shell".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: Some("hello".to_owned()),
+            script: Some("hello.sh".to_owned()),
+            server: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    assert!(message.contains("no other tool"), "{message}");
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_a_skill_takes_it_away_from_every_bot() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (bot, _chat, _computer) = tool_bot(&mut socket, "http://127.0.0.1:9/v1".to_owned()).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(None, "---\nname: shared\ndescription: d\n---\nBody.", &[]),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+    assert_eq!(shown["bot"]["skills"], json!([skill]));
+
+    command(&mut socket, Id::new(), CommandCall::SkillRemove { skill }).await;
+    let shown = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
+    assert_eq!(
+        shown["bot"]["skills"],
+        json!([]),
+        "the Bot forgets a removed skill"
+    );
+    let listed = command(&mut socket, Id::new(), CommandCall::SkillList { bot: None }).await;
+    assert_eq!(listed, json!([]));
+    // Removing it again names no skill rather than throwing.
+    let (code, _message) = try_command(&mut socket, Id::new(), CommandCall::SkillRemove { skill })
+        .await
+        .unwrap_err();
+    assert_eq!(code, ErrorCode::NotFound);
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_script_the_skill_lacks_never_asks() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "missing.sh", "arguments": []}),
+        ),
+        text("done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let finished = finish(&mut socket, chat, queued).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert!(
+        approvals_in(&mut socket, Some(chat)).await.is_empty(),
+        "a script the skill does not carry asks nobody"
+    );
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answered_card_never_runs_a_replacement_script() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("ran the replacement"),
+    ])
+    .await;
+    let (bot, chat, computer) = tool_bot(&mut socket, base.clone()).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'old' > result.txt")],
+        ),
+    )
+    .await;
+    let first_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable {
+            bot,
+            skill: first_skill,
+        },
+    )
+    .await;
+
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "first_script_run");
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+
+    // The card waits while the skill it named is replaced under the same
+    // names by another script.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::SkillRemove { skill: first_skill },
+    )
+    .await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'new' > result.txt")],
+        ),
+    )
+    .await;
+    let second_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable {
+            bot,
+            skill: second_skill,
+        },
+    )
+    .await;
+    // The run keeps the Computer it began on, and that workspace is where
+    // either script would write.
+    let workspace = running
+        .test_fields()
+        .state
+        .lock()
+        .unwrap()
+        .computers
+        .get(&computer)
+        .map(|view| view.workspace.clone())
+        .unwrap();
+
+    decide_approval(&mut socket, approval, true, false).await;
+    let finished = wait_run(&mut socket, run).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert!(
+        !std::path::Path::new(&workspace).join("result.txt").exists(),
+        "no replacement script ran under the old card"
+    );
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    let text = messages.as_array().unwrap().last().unwrap()["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(text, "done");
+
+    // The replacement never ran, so it must ask before its first run
+    // instead of inheriting the old skill's consent.
+    let queued = submit(&mut socket, chat, "run the replacement", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let latest = approvals.last().expect("the replacement asks");
+    assert_eq!(
+        latest["reason"], "first_script_run",
+        "the replacement asks for its own first run: {approvals:?}"
+    );
+    assert_eq!(latest["arguments"]["script"], "hello.sh");
+    let approval: Id = serde_json::from_value(latest["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, true).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&workspace).join("result.txt")).unwrap(),
+        "new",
+        "the replacement runs under its own card"
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_script_call_survives_a_restart() {
+    let (directory, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "surprise": true}),
+        ),
+        text("first done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("second done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let finished = finish(&mut socket, chat, queued).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+
+    // The record replays: the refused call it holds projects as before.
+    let root = test_support::server_home(&running);
+    running.shutdown().await;
+    let (second_base, second_provider) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("replayed done"),
+    ])
+    .await;
+    let second = start(test_home(&root), 0).await.unwrap();
+    let token = sign_in(&second, "Ada").await;
+    let mut socket = open_socket(&second, &token).await;
+    command(&mut socket, Id::new(), provider_add(second_base)).await;
+    let _ = directory;
+    let skills = command(&mut socket, Id::new(), CommandCall::SkillList { bot: None }).await;
+    assert_eq!(skills.as_array().map(Vec::len), Some(1), "{skills}");
+    let queued = submit(&mut socket, chat, "run it again", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(
+        approvals[0]["reason"], "first_script_run",
+        "the replay still knows the refused call never ran: {approvals:?}"
+    );
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    socket.close(None).await.unwrap();
+    second_provider.abort();
+    second.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_clients_cannot_add_the_same_skill_name() {
+    let (_dir, running, invite) = running().await;
+    let (mut first, token) = admin(&running, &invite).await;
+    let mut second = open_socket(&running, &token).await;
+    let call = add_skill(
+        None,
+        "---\nname: shared\ndescription: One skill.\n---\nBody.",
+        &[],
+    );
+    let (first_id, second_id) = (Id::new(), Id::new());
+    send_command(&mut first, first_id, call.clone()).await;
+    send_command(&mut second, second_id, call).await;
+    let answered = tokio::join!(async { settled(&mut first, first_id).await }, async {
+        settled(&mut second, second_id).await
+    },);
+    let ok = [&answered.0, &answered.1]
+        .iter()
+        .filter(|answer| answer.is_ok())
+        .count();
+    assert_eq!(ok, 1, "only one add wins: {answered:?}");
+    let skills = command(&mut first, Id::new(), CommandCall::SkillList { bot: None }).await;
+    assert_eq!(
+        skills.as_array().map(Vec::len),
+        Some(1),
+        "the library holds one skill: {skills}"
+    );
+    first.close(None).await.unwrap();
+    second.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_instructions_only_space_offers_no_scripts() {
+    let (_dir, running, invite) = running_with_config("[skills]\ninstructions_only = true\n").await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, recorded) = scripted_provider_recording(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let finished = finish(&mut socket, chat, queued).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    {
+        let requests = recorded.lock().unwrap();
+        let names = tool_names(&requests[0]);
+        assert!(
+            names.iter().any(|name| name == "skill")
+                && !names.iter().any(|name| name == "run_skill_script"),
+            "an instructions-only Space offers the body but no script: {names:?}"
+        );
+    }
+    assert!(
+        approvals_in(&mut socket, Some(chat)).await.is_empty(),
+        "no card is made for a script the Space will never run"
+    );
+
+    // The refused call is in the record, but it never ran. Turning the
+    // setting off and restarting must still ask for the first real run.
+    let root = test_support::server_home(&running);
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+    std::fs::write(
+        root.join("config.toml"),
+        "[skills]\ninstructions_only = false\n",
+    )
+    .unwrap();
+    let (second_base, second_provider, second_recorded) = scripted_provider_recording(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("ran"),
+    ])
+    .await;
+    let second = start(test_home(&root), 0).await.unwrap();
+    let token = sign_in(&second, "Ada").await;
+    let mut second_socket = open_socket(&second, &token).await;
+    command(&mut second_socket, Id::new(), provider_add(second_base)).await;
+    let queued = submit(&mut second_socket, chat, "run it for real", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut second_socket, run, "waiting").await;
+    {
+        let requests = second_recorded.lock().unwrap();
+        // The first request of the run names the tools the Space offers.
+        let names = tool_names(&requests[0]);
+        assert!(
+            names.iter().any(|name| name == "run_skill_script"),
+            "a Space that runs scripts offers the tool: {names:?}"
+        );
+    }
+    let approvals = approvals_in(&mut second_socket, Some(chat)).await;
+    assert_eq!(
+        approvals[0]["reason"], "first_script_run",
+        "a call that never ran leaves the first run to ask: {approvals:?}"
+    );
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut second_socket, approval, true, false).await;
+    assert_eq!(
+        wait_run(&mut second_socket, run).await["status"],
+        "succeeded"
+    );
+    second_socket.close(None).await.unwrap();
+    second_provider.abort();
+    second.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_script_does_not_consume_consent_after_a_switch_to_instructions_only() {
+    let (directory, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("first done"),
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("second done"),
+    ])
+    .await;
+    let (bot, chat, computer) = tool_bot(&mut socket, base.clone()).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'ran' > marker.txt")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let workspace = running
+        .test_fields()
+        .state
+        .lock()
+        .unwrap()
+        .computers
+        .get(&computer)
+        .map(|view| view.workspace.clone())
+        .unwrap();
+
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+
+    // The Admin turns scripts off while the card waits.
+    let root = test_support::server_home(&running);
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+    std::fs::write(
+        root.join("config.toml"),
+        "[skills]\ninstructions_only = true\n",
+    )
+    .unwrap();
+    let second = start(test_home(&root), 0).await.unwrap();
+    let token = sign_in(&second, "Ada").await;
+    let mut second_socket = open_socket(&second, &token).await;
+    decide_approval(&mut second_socket, approval, true, false).await;
+    assert_eq!(
+        wait_run(&mut second_socket, run).await["status"],
+        "succeeded",
+        "the run ends rather than waiting forever"
+    );
+    assert!(
+        !std::path::Path::new(&workspace).join("marker.txt").exists(),
+        "an answer given before the switch never reaches a script"
+    );
+    // The withheld call recorded no identity, so the answer consumed no
+    // first run, and the card, the action's start, and its result name one
+    // action: a policy refusal does not replace the approved identifier.
+    let events = second
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100_000)
+        .await
+        .unwrap()
+        .events;
+    let of_run = |kind: EventKind| -> Vec<Value> {
+        events
+            .iter()
+            .filter(|event| event.kind == kind && event.data["run"] == json!(run))
+            .map(|event| event.data.clone())
+            .collect()
+    };
+    let actions = started_actions(&second, run).await;
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].data["skill"], json!(null));
+    assert_eq!(actions[0].data["tool"], "run_skill_script");
+    let requested = of_run(EventKind::ApprovalRequested);
+    let finished = of_run(EventKind::ActionFinished);
+    assert_eq!(requested.len(), 1);
+    assert_eq!(finished.len(), 1);
+    assert_eq!(
+        requested[0]["action"], actions[0].data["action"],
+        "the card names the action that started"
+    );
+    assert_eq!(
+        finished[0]["action"], actions[0].data["action"],
+        "the result names the action that started"
+    );
+
+    // Turning scripts back on asks again for the still-unrun script.
+    second_socket.close(None).await.unwrap();
+    second.shutdown().await;
+    std::fs::write(
+        root.join("config.toml"),
+        "[skills]\ninstructions_only = false\n",
+    )
+    .unwrap();
+    let third = start(test_home(&root), 0).await.unwrap();
+    let token = sign_in(&third, "Ada").await;
+    let mut third_socket = open_socket(&third, &token).await;
+    let queued = submit(&mut third_socket, chat, "run it again", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut third_socket, run, "waiting").await;
+    let approvals = approvals_in(&mut third_socket, Some(chat)).await;
+    assert_eq!(
+        approvals.last().unwrap()["reason"],
+        "first_script_run",
+        "the withheld answer consumed no consent: {approvals:?}"
+    );
+    let approval: Id =
+        serde_json::from_value(approvals.last().unwrap()["approval"].clone()).unwrap();
+    decide_approval(&mut third_socket, approval, true, true).await;
+    assert_eq!(
+        wait_run(&mut third_socket, run).await["status"],
+        "succeeded"
+    );
+    assert_eq!(
+        std::fs::read_to_string(std::path::Path::new(&workspace).join("marker.txt")).unwrap(),
+        "ran"
+    );
+    let _ = directory;
+    third_socket.close(None).await.unwrap();
+    provider_task.abort();
+    third.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_enables_one_skill_under_each_name() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "run_skill_script",
+            json!({"skill": "hello", "script": "hello.sh", "arguments": []}),
+        ),
+        text("done"),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let document = "---\nname: hello\ndescription: Say hello.\n---\nRun it.";
+    let shared = command(
+        &mut socket,
+        Id::new(),
+        add_skill(None, document, &[("hello.sh", "printf 'a'")]),
+    )
+    .await;
+    let shared: Id = serde_json::from_value(shared["skill"].clone()).unwrap();
+    let own = command(
+        &mut socket,
+        Id::new(),
+        add_skill(Some(bot), document, &[("hello.sh", "printf 'b'")]),
+    )
+    .await;
+    let own: Id = serde_json::from_value(own["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill: shared },
+    )
+    .await;
+    // A script call resolves one enabled skill, so a second enabled skill
+    // under the same name is refused where it is enabled.
+    let (code, message) = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill: own },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::InvalidArgument);
+    assert!(
+        message.contains("already has a skill under this name"),
+        "{message}"
+    );
+
+    let queued = submit(&mut socket, chat, "run it", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    let actions = started_actions(&running, run).await;
+    assert_eq!(actions.len(), 1);
+    assert_eq!(
+        actions[0].data["skill"],
+        json!(shared),
+        "the call ran the one enabled skill"
+    );
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_account_cannot_add_a_skill_to_another_library() {
+    let (_dir, running, invite) = running().await;
+    let (mut admin_socket, _token) = admin(&running, &invite).await;
+    let created = command(&mut admin_socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let grace_token = sign_in(&running, "Grace").await;
+    let mut grace = open_socket(&running, &grace_token).await;
+
+    let before = staged_blob_count(&running);
+    let (code, message) = try_command(
+        &mut grace,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: shared\ndescription: One skill.\n---\nBody.",
+            &[("run.sh", "printf 'x'")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::Forbidden, "{message}");
+    let (code, message) = try_command(
+        &mut grace,
+        Id::new(),
+        add_skill(
+            Some(bot),
+            "---\nname: shared\ndescription: One skill.\n---\nBody.",
+            &[("run.sh", "printf 'x'")],
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(code, ErrorCode::Forbidden, "{message}");
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "a refused add stores no bytes"
+    );
+    let skills = command(&mut grace, Id::new(), CommandCall::SkillList { bot: None }).await;
+    assert_eq!(skills, json!([]), "the refused adds recorded nothing");
+    admin_socket.close(None).await.unwrap();
+    grace.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_calls_an_mcp_tool_after_one_answer() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, log, server_task) = fake_mcp_server(|call| {
+        assert_eq!(call["params"]["name"], json!("search"));
+        json!({"content": [{"type": "text", "text": "the answer"}]})
+    })
+    .await;
+    let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+        tool("mcp__docs__search", json!({"query": "again"})),
+        text("second done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    let queued = submit(&mut socket, chat, "search", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "first_mcp_call");
+    assert_eq!(approvals[0]["server"], json!(server));
+    assert_eq!(approvals[0]["computer"], json!(server));
+    let summary = approvals[0]["summary"].as_str().unwrap();
+    assert!(
+        summary.contains("docs") && summary.contains("search"),
+        "{summary}"
+    );
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, true).await;
+    let finished = wait_run(&mut socket, run).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+    {
+        let calls = log.lock().unwrap();
+        let calls: Vec<&Value> = calls
+            .iter()
+            .filter(|message| message["method"] == "tools/call")
+            .collect();
+        assert_eq!(calls.len(), 1, "one tool call reached the server");
+        assert_eq!(calls[0]["params"]["name"], json!("search"));
+    }
+    // The record names the server and the tool's original name.
+    let events = started_actions(&running, run).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["server"], json!(server));
+    assert_eq!(events[0].data["tool"], json!("search"));
+    // The Always allow wrote a rule, so the next call asks nothing.
+    let second = run_of(&submit(&mut socket, chat, "again", None).await);
+    assert_eq!(wait_run(&mut socket, second).await["status"], "succeeded");
+    assert_eq!(
+        show_run(&mut socket, second).await["status"],
+        "succeeded",
+        "the second run ended without a card"
+    );
+    let calls = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|message| message["method"] == "tools/call")
+        .count();
+    assert_eq!(calls, 2, "the rule let the second call through");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_app_tool_records_its_card_and_html() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let html =
+        "<!doctype html><html><body><script>const token = 'token-1';</script>the app</body></html>";
+    let (chat, run, events, log, recorded, server_task, provider_task) = mcp_app_run(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": html,
+            }],
+        }),
+    )
+    .await;
+
+    // Exactly one File holds the HTML, and exactly one Bot Message carries
+    // the Card that shows it in the Chat.
+    let files: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::FileAdded)
+        .collect();
+    let carded: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::MessageAdded && event.data.get("card").is_some())
+        .collect();
+    assert_eq!(files.len(), 1, "the app's HTML is one File");
+    assert_eq!(carded.len(), 1, "exactly one Card is recorded");
+    let card = &carded[0].data["card"];
+    assert_eq!(card["kind"], "app");
+    let file: Id = serde_json::from_value(card["file"].clone()).unwrap();
+    assert_eq!(files[0].data["file"], json!(file));
+    assert_eq!(files[0].data["chat"], json!(chat));
+    assert_eq!(files[0].data["name"], json!("search-app.html"));
+    assert_eq!(
+        files[0].data["media_type"],
+        json!(neha_space::mcp::APP_MIME_TYPE)
+    );
+    assert_eq!(staged_blob_count(&running), 1, "only the HTML is stored");
+
+    // The Card names the arguments and the raw tool result, and the policy
+    // a client applies when the resource declares none.
+    assert_eq!(card["input"], json!({"query": "hi"}));
+    assert_eq!(
+        card["result"],
+        json!({"content": [{"type": "text", "text": "the answer is [redacted]"}]})
+    );
+    assert_eq!(card["csp"], json!(neha_space::mcp::DEFAULT_APP_CSP));
+
+    // The stored HTML is the resource's, passed through the same
+    // redaction as every other answer.
+    let sha256: String = serde_json::from_value(files[0].data["sha256"].clone()).unwrap();
+    let bytes = running.test_fields().blobs.get(&sha256).await.unwrap();
+    assert_eq!(neha_space::blobs::digest(&bytes), sha256);
+    let stored = String::from_utf8(bytes).unwrap();
+    assert!(stored.contains("the app"));
+    assert!(!stored.contains("token-1"), "{stored}");
+    assert!(stored.contains("[redacted]"));
+    assert!(
+        !serde_json::to_string(card).unwrap().contains("token-1"),
+        "the Card never carries the credential"
+    );
+
+    // The client reads the Card on the Chat's Message.
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    let shown: Vec<&Value> = messages
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["card"].is_object())
+        .collect();
+    assert_eq!(shown.len(), 1, "the Chat lists the Card's Message");
+    assert_eq!(shown[0]["author"]["kind"], json!("bot"));
+    assert_eq!(shown[0]["text"], json!(""));
+    assert_eq!(shown[0]["card"], card.clone());
+    assert_eq!(shown[0]["card"]["file"], json!(file));
+
+    // The Model still reads the tool's text, and never sees the app.
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the Model is asked again after the tool");
+        let body = requests[1].to_string();
+        assert!(
+            body.contains("the answer is [redacted]"),
+            "the model reads the plain text answer: {body}"
+        );
+        assert!(
+            !body.contains("<html"),
+            "the app's HTML never reaches the model"
+        );
+        assert!(!body.contains("token-1"));
+    }
+    // The app is read once, by the client the call used.
+    {
+        let seen = log.lock().unwrap();
+        let reads: Vec<&Value> = seen
+            .iter()
+            .filter(|message| message["method"] == "resources/read")
+            .collect();
+        assert_eq!(reads.len(), 1, "one app read per call");
+        assert_eq!(reads[0]["params"], json!({"uri": "ui://docs/search"}));
+        assert!(
+            finished_action_output(&events, run).contains("the answer is [redacted]"),
+            "the action result is the tool's text as before"
+        );
+    }
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_app_with_a_wrong_media_type_records_no_card() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    let (chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html",
+                "text": "<html>not an MCP App</html>",
+            }],
+        }),
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "a resource of the wrong type stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "a resource of the wrong type records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "a refused app leaves no orphaned bytes"
+    );
+    // The Model reads the plain text result, unchanged: the presentation
+    // failure rides the action's non-model field instead.
+    let output = finished_action_output(&events, run);
+    assert_eq!(output, "the answer is [redacted]", "{output}");
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("succeeded"));
+    assert!(
+        action["error"]
+            .as_str()
+            .is_some_and(|error| error == "the MCP server's app is not an MCP App"),
+        "the presentation failure is reported separately: {}",
+        action["error"]
+    );
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| !message["card"].is_object())
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_mcp_app_records_no_card() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    // An answer over the cap never becomes a File or a Card.
+    let padding = "a".repeat(test_support::MAX_ANSWER_BYTES + 1);
+    let (_chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": padding,
+            }],
+        }),
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "an oversized app stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "an oversized app records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "an oversized app leaves no orphaned bytes"
+    );
+    // The Model reads the plain text result; the refused app is reported
+    // on the action's non-model field.
+    let output = finished_action_output(&events, run);
+    assert_eq!(output, "the answer is [redacted]", "{output}");
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("succeeded"));
+    assert!(
+        action["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("the server's answer is too large")),
+        "the action reports the refused app separately: {}",
+        action["error"]
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_app_is_not_staged_when_the_answer_is_refused() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    // A decoded image carries the credential, so the call refuses the
+    // whole answer. The tool declares a perfectly good app: a Card staged
+    // before the refusal would enter the record with the refused result.
+    let image = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+    let (chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": "<html>the app</html>",
+            }],
+        }),
+        json!({"content": [{
+            "type": "image",
+            "mimeType": "image/png",
+            "data": image,
+        }]}),
+        "token-1",
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "a refused answer stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "a refused answer records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "a refused answer leaves no orphaned app bytes"
+    );
+    // The record holds no base64 of the image, nor the credential.
+    let record = serde_json::to_string(
+        &events
+            .iter()
+            .map(|event| event.data.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        !record.contains(&image),
+        "the image bytes never enter the record"
+    );
+    assert!(
+        !record.contains("token-1"),
+        "the credential never enters the record"
+    );
+    // The action itself failed with the refusal the Model reads.
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("failed"));
+    assert!(
+        action["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("carried its credential")),
+        "{}",
+        action["output"]
+    );
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| !message["card"].is_object())
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_resource_blob_that_hides_the_credential_records_nothing() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    // The answer embeds a resource whose base64 payload decodes to the
+    // credential. The literal token does not appear in the block, so only
+    // decoding the blob can find it: the answer must be refused before any
+    // File or Card is staged.
+    let blob = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+    let (chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": "<html>the app</html>",
+            }],
+        }),
+        json!({"content": [{
+            "type": "resource",
+            "resource": {
+                "uri": "file:///data.bin",
+                "mimeType": "application/octet-stream",
+                "blob": blob,
+            },
+        }]}),
+        "token-1",
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "a refused answer stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "a refused answer records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "a refused answer leaves no orphaned app bytes"
+    );
+    // Neither the encoded blob nor the credential reaches the record.
+    let record = serde_json::to_string(
+        &events
+            .iter()
+            .map(|event| event.data.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(!record.contains(&blob), "the blob never enters the record");
+    assert!(
+        !record.contains("token-1"),
+        "the credential never enters the record"
+    );
+    // The action itself failed with the refusal the Model reads.
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("failed"));
+    assert!(
+        action["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("carried its credential")),
+        "{}",
+        action["output"]
+    );
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| !message["card"].is_object())
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_audio_block_that_hides_the_credential_records_nothing() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    // An audio block's base64 payload spells nothing the literal redaction
+    // could see: only decoding it finds the credential. The answer must be
+    // refused before the app's File, the Card, or the action's output is
+    // staged, and neither the payload nor the credential may reach the
+    // record or the Model.
+    let audio = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+    let (chat, run, events, _log, recorded, server_task, provider_task) = mcp_app_run_with(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": "<html>the app</html>",
+            }],
+        }),
+        json!({"content": [{
+            "type": "audio",
+            "mimeType": "audio/wav",
+            "data": audio,
+        }]}),
+        "token-1",
+    )
+    .await;
+
+    // The refused answer stages no File, no Card, and no audio File.
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "a refused answer stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "a refused answer records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "a refused answer leaves no orphaned app bytes"
+    );
+    // Neither the base64 audio nor the credential reaches the record.
+    let record = serde_json::to_string(
+        &events
+            .iter()
+            .map(|event| event.data.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        !record.contains(&audio),
+        "the audio bytes never enter the record"
+    );
+    assert!(
+        !record.contains("token-1"),
+        "the credential never enters the record"
+    );
+    // The action failed with the one refusal the Model reads, and the
+    // Model reads neither the audio nor the credential.
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("failed"));
+    assert!(
+        action["output"]
+            .as_str()
+            .is_some_and(|output| output.contains("carried its credential")),
+        "{}",
+        action["output"]
+    );
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the Model is asked again after the tool");
+        let body = requests[1].to_string();
+        assert!(!body.contains(&audio), "the audio never reaches the Model");
+        assert!(
+            !body.contains("token-1"),
+            "the credential never reaches the Model"
+        );
+        assert!(body.contains("carried its credential"), "{body}");
+    }
+    let messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    assert!(
+        messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| !message["card"].is_object())
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_app_card_refuses_a_credential_hidden_in_its_result() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    // The visible answer is redacted, but the raw result hides the
+    // credential in a base64 payload. The action's own result may stand;
+    // the Card that would carry the raw result must not.
+    let hidden = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+    let (_chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": "<html>the app</html>",
+            }],
+        }),
+        json!({
+            "content": [{"type": "text", "text": "the answer is token-1"}],
+            "structuredContent": {"payload": hidden},
+        }),
+        "token-1",
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "a Card that cannot keep the credential out stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "a Card that cannot keep the credential out records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "the refused Card leaves no orphaned app bytes"
+    );
+    let record = serde_json::to_string(
+        &events
+            .iter()
+            .map(|event| event.data.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        !record.contains(&hidden),
+        "the hidden payload never enters the record"
+    );
+    assert!(
+        !record.contains("token-1"),
+        "the credential never enters the record"
+    );
+    // The action result survives; the refused Card is reported separately.
+    assert_eq!(
+        finished_action_output(&events, run),
+        "the answer is [redacted]"
+    );
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("succeeded"));
+    assert!(
+        action["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("cannot keep its credential out of a Card")),
+        "the refused Card is reported separately: {}",
+        action["error"]
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_apps_policy_never_stores_the_credential() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    // The credential appears inside a declared hostname. The composed
+    // policy is stored in the record, so that origin must be dropped.
+    let (_chat, _run, events, _log, _recorded, server_task, provider_task) = mcp_app_run(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": "<html>the app</html>",
+                "_meta": {"ui": {"csp": {
+                    "connectDomains": [
+                        "https://token-1.example",
+                        "https://good.example",
+                    ],
+                }}},
+            }],
+        }),
+    )
+    .await;
+
+    let carded: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::MessageAdded && event.data.get("card").is_some())
+        .collect();
+    assert_eq!(carded.len(), 1, "the app is recorded");
+    let csp = carded[0].data["card"]["csp"]
+        .as_str()
+        .expect("the Card carries its policy");
+    assert!(csp.contains("https://good.example"), "{csp}");
+    assert!(!csp.contains("token-1"), "{csp}");
+    let record = serde_json::to_string(
+        &events
+            .iter()
+            .map(|event| event.data.clone())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    assert!(
+        !record.contains("token-1"),
+        "the record never holds the credential"
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_app_whose_redaction_outgrows_a_file_records_no_card() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let before = staged_blob_count(&running);
+    // A short credential repeated often enough grows past the File bound
+    // when it is redacted. The Space must bound the redacted bytes, not
+    // the server's: a File the record would refuse must never be staged.
+    let html = "xy".repeat(3_500_000);
+    let (_chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+        &running,
+        &mut socket,
+        json!({"ui": {"resourceUri": "ui://docs/search"}}),
+        json!({
+            "contents": [{
+                "uri": "ui://docs/search",
+                "mimeType": "text/html;profile=mcp-app",
+                "text": html,
+            }],
+        }),
+        json!({"content": [{"type": "text", "text": "the answer"}]}),
+        "xy",
+    )
+    .await;
+
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::FileAdded),
+        "an app whose redacted HTML outgrows a File stores no File"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+        }),
+        "an app whose redacted HTML outgrows a File records no Card"
+    );
+    assert_eq!(
+        staged_blob_count(&running),
+        before,
+        "the over-bound app is never stored"
+    );
+    // The action result survives, and the presentation failure is
+    // reported outside the Model's text.
+    assert_eq!(finished_action_output(&events, run), "the answer");
+    let action = finished_action(&events, run);
+    assert_eq!(action["status"], json!("succeeded"));
+    assert!(
+        action["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("too large")),
+        "the over-bound app is reported separately: {}",
+        action["error"]
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_resource_block_reaches_the_model_with_its_metadata() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, _log, server_task) = fake_mcp_server(|_call| {
+        json!({"content": [{
+            "type": "resource",
+            "resource": {
+                "uri": "file:///report.txt",
+                "mimeType": "text/plain",
+                "text": "report body",
+                "annotations": [{"audience": ["user"], "priority": 0.5}],
+                "_meta": {"ui": {"annotations": {"audience": ["user"]}}},
+            },
+        }]})
+    })
+    .await;
+    let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+    let (base, provider_task, recorded) = scripted_provider_recording(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+    let queued = submit(&mut socket, chat, "search", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+    // The Model reads the block the server sent, annotations and `_meta`
+    // included, rather than a reduced object this Space rebuilt.
+    {
+        let requests = recorded.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the Model is asked again after the tool");
+        let body = requests[1].to_string();
+        assert!(body.contains("report body"), "{body}");
+        assert!(
+            body.contains("annotations") && body.contains("priority"),
+            "the block's annotations reach the Model: {body}"
+        );
+        assert!(
+            body.contains("_meta"),
+            "the block's metadata reaches the Model: {body}"
+        );
+    }
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mcp_tool_without_a_credential_is_not_connected() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+    let server = add_mcp_server(&mut socket, "docs", &url, None).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    let queued = submit(&mut socket, chat, "search", None).await;
+    let run = run_of(&queued);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(
+        wait_run(&mut socket, run).await["status"],
+        "succeeded",
+        "the run answers that the server is not connected"
+    );
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .all(|message| message["method"] != "tools/call"),
+        "an unconnected server is sent no call"
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_always_allowed_mcp_call_writes_a_rule_for_that_server() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, log, server_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+    let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+    let run = run_of(&submit(&mut socket, chat, "search", None).await);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, true).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .any(|message| message["method"] == "tools/call")
+    );
+    // The lasting rule names the same server and tool the card named.
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100_000)
+        .await
+        .unwrap()
+        .events;
+    let added: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::RuleAdded)
+        .map(|event| &event.data)
+        .collect();
+    assert_eq!(added.len(), 1, "Always allow writes one rule");
+    assert_eq!(added[0]["server"], json!(server));
+    assert_eq!(added[0]["tool"], json!("search"));
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_server_disabled_before_the_answer_runs_nothing() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, log, server_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+    let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+    let run = run_of(&submit(&mut socket, chat, "search", None).await);
+    wait_status(&mut socket, run, "waiting").await;
+    // The owner disables the server while the card waits.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpDisable { bot, server },
+    )
+    .await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    let finished = wait_run(&mut socket, run).await;
+    assert_eq!(finished["status"], "succeeded");
+    assert!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .all(|message| message["method"] != "tools/call"),
+        "a disabled server is sent no call"
+    );
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100_000)
+        .await
+        .unwrap()
+        .events;
+    let finished: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::ActionFinished && event.data["run"] == json!(run))
+        .map(|event| &event.data)
+        .collect();
+    assert_eq!(finished.len(), 1);
+    let error = finished[0]["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("not offered to this run") || error.contains("no longer enabled"),
+        "{error}"
+    );
+    // The refusal names the tool the Model used, and the reply's calls
+    // keep that same name, so a replay reads one name for the action.
+    let started: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::ActionStarted && event.data["run"] == json!(run))
+        .map(|event| &event.data)
+        .collect();
+    let replies: Vec<&Value> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::RunReply && event.data["run"] == json!(run))
+        .map(|event| &event.data)
+        .collect();
+    assert_eq!(started.len(), 1, "{started:?}");
+    let carded = replies
+        .iter()
+        .find(|reply| reply["step"] == json!(1))
+        .expect("the waiting step's reply");
+    assert_eq!(started[0]["tool"], json!("mcp__docs__search"));
+    assert_eq!(
+        carded["calls"][0]["model_name"],
+        json!("mcp__docs__search"),
+        "the reply keeps the name the Model used"
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_mcp_call_asks_even_when_an_ask_rule_names_it() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, _log, server_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+    let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+    // An Allow-shaped rule may not answer for the first call.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleAdd {
+            bot,
+            effect: neha::record::RuleEffect::Allow,
+            tool: "search".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: None,
+            script: None,
+            server: Some("docs".to_owned()),
+        },
+    )
+    .await;
+    let run = run_of(&submit(&mut socket, chat, "search", None).await);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "first_mcp_call");
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_list_reports_whether_the_space_reaches_each_server() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, _log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+    let reachable = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+    let unreachable = add_mcp_server(
+        &mut socket,
+        "broken",
+        "http://127.0.0.1:9/mcp",
+        Some("token-2"),
+    )
+    .await;
+    let list = command(&mut socket, Id::new(), CommandCall::McpList).await;
+    let rows = list.as_array().unwrap();
+    let by_server = |server: Id| {
+        rows.iter()
+            .find(|row| row["server"] == json!(server))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(by_server(reachable)["connected"], json!(true));
+    assert_eq!(
+        by_server(unreachable)["connected"],
+        json!(false),
+        "a server the Space cannot reach is not connected"
+    );
+    socket.close(None).await.unwrap();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_token_leaves_the_server_unconnected() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (url, _log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+    let result = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpAdd(neha::surface::McpAdd {
+            name: "docs".to_owned(),
+            url,
+            scope: neha::record::McpScope::Space,
+            credential: Some(String::new()),
+        }),
+    )
+    .await;
+    assert_eq!(result["connected"], json!(false));
+    let list = command(&mut socket, Id::new(), CommandCall::McpList).await;
+    assert_eq!(list[0]["connected"], json!(false));
+    socket.close(None).await.unwrap();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wider_ask_rule_asks_for_another_servers_tool() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (docs_url, docs_log, docs_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+    let (other_url, other_log, other_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "ok"}]})).await;
+    let docs = add_mcp_server(&mut socket, "docs", &docs_url, Some("token-1")).await;
+    let other = add_mcp_server(&mut socket, "other", &other_url, Some("token-2")).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "a"})),
+        text("first done"),
+        tool("mcp__other__search", json!({"query": "b"})),
+        text("second done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    for server in [docs, other] {
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+    }
+    // The first call of the first server's tool asks, and Always allow
+    // writes a rule for that server alone.
+    let first = run_of(&submit(&mut socket, chat, "search docs", None).await);
+    wait_status(&mut socket, first, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "first_mcp_call");
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, true).await;
+    assert_eq!(wait_run(&mut socket, first).await["status"], "succeeded");
+    // A rule that names no server asks for every server's tool of that name.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleAdd {
+            bot,
+            effect: neha::record::RuleEffect::Ask,
+            tool: "search".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: None,
+            script: None,
+            server: None,
+        },
+    )
+    .await;
+    let second = run_of(&submit(&mut socket, chat, "search other", None).await);
+    wait_status(&mut socket, second, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(
+        approvals[0]["reason"], "rule",
+        "the wider Ask rule asks for another server's tool"
+    );
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, second).await["status"], "succeeded");
+    assert!(
+        other_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message["method"] == "tools/call")
+    );
+    assert!(
+        docs_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|message| message["method"] == "tools/call")
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    docs_task.abort();
+    other_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replacement_server_never_runs_a_pending_call() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (old_url, _old_log, old_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "old"}]})).await;
+    let old = add_mcp_server(&mut socket, "docs", &old_url, Some("token-1")).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server: old },
+    )
+    .await;
+    let run = run_of(&submit(&mut socket, chat, "search", None).await);
+    wait_status(&mut socket, run, "waiting").await;
+    // The server the card was made for leaves, and a new one takes its name.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpRemove { server: old },
+    )
+    .await;
+    let (new_url, new_log, new_task) =
+        fake_mcp_server(|_call| json!({"content": [{"type": "text", "text": "new"}]})).await;
+    let new = add_mcp_server(&mut socket, "docs", &new_url, Some("token-2")).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server: new },
+    )
+    .await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["server"], json!(old));
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    assert!(
+        new_log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|message| message["method"] != "tools/call"),
+        "a replacement server is sent no call the answer was not made for"
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    old_task.abort();
+    new_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_admin_installs_a_package_and_its_bot_uses_it() {
+    let (mcp_url, mcp_headers, mcp_task) = fake_mcp_server_with_headers().await;
+    // A repository archive rather than a directory, so the package path is
+    // the same on every platform a Space runs on.
+    let commit = "3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b";
+    let mcp_json = json!({
+        "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+        "mcpServers": {
+            "docs": {
+                "type": "streamable-http",
+                "url": mcp_url,
+                "headers": {"X-Tenant": "acme"},
+            },
+        },
+    })
+    .to_string();
+    let tarball = plugin_tarball(&[
+        (
+            "reports-plugin/plugin.json",
+            "{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json\",\"name\":\"reports\",\"version\":\"1.2.0\",\"description\":\"Weekly reports\"}",
+        ),
+        (
+            "reports-plugin/skills/weekly-report/SKILL.md",
+            "---\nname: weekly-report\ndescription: Write the weekly report.\n---\nCollect and summarize.",
+        ),
+        (
+            "reports-plugin/skills/weekly-report/scripts/collect.sh",
+            "printf collected",
+        ),
+        ("reports-plugin/mcp.json", &mcp_json),
+    ]);
+    let (archive, archive_task) = serve_plugin_archive(tarball).await;
+    let config = format!("[plugins]\nsources = [\"{archive}/\"]\n");
+    let (_home, running, invite) = running_with_config(&config).await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+
+    let installed = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::PluginInstall {
+            source: format!("{archive}/repo@{commit}"),
+        },
+    )
+    .await;
+    let plugin: Id = serde_json::from_value(installed["plugin"].clone()).unwrap();
+    assert_eq!(installed["name"], json!("reports"));
+    assert_eq!(installed["version"], json!("1.2.0"));
+    assert_eq!(installed["commit"], json!(commit));
+    assert_eq!(installed["servers"].as_array().unwrap().len(), 1);
+    assert_eq!(installed["servers"][0]["name"], json!("reports-docs"));
+    assert_eq!(installed["skills"][0]["name"], json!("weekly-report"));
+    let server: Id = serde_json::from_value(installed["servers"][0]["server"].clone()).unwrap();
+    let skill: Id = serde_json::from_value(installed["skills"][0]["skill"].clone()).unwrap();
+    assert!(
+        installed["digest"].as_str().unwrap().len() == 64,
+        "{installed}"
+    );
+
+    // The package's entries are in the Space's libraries.
+    let skills = command(&mut socket, Id::new(), CommandCall::SkillList { bot: None }).await;
+    assert!(
+        skills
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == json!(skill)),
+        "{skills}"
+    );
+    let servers = command(&mut socket, Id::new(), CommandCall::McpList).await;
+    assert!(
+        servers
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["server"] == json!(server)),
+        "{servers}"
+    );
+    let listed = command(&mut socket, Id::new(), CommandCall::PluginList).await;
+    assert_eq!(listed[0]["plugin"], json!(plugin));
+    assert_eq!(listed[0]["enabled"], json!(true));
+
+    // The Admin attaches a Space credential, so the package's header reaches
+    // the server with the call.
+    let attached = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpAdd(neha::surface::McpAdd {
+            name: "reports-docs".to_owned(),
+            url: installed["servers"][0]["url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("token-1".to_owned()),
+        }),
+    )
+    .await;
+    assert_eq!(attached["connected"], json!(true));
+
+    // A Bot uses both: the skill loads, and the server's tool asks first.
+    let (base, provider_task) = scripted_provider(vec![
+        tool("skill", json!({"name": "weekly-report"})),
+        tool("mcp__reports-docs__search", json!({"query": "hi"})),
+        text("done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+    let run = run_of(&submit(&mut socket, chat, "use it", None).await);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "first_mcp_call");
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+    // The package's configured header reached the server together with the
+    // Vault credential the Admin attached.
+    let saw_header = {
+        let headers = mcp_headers.lock().unwrap();
+        headers.iter().any(|headers| {
+            headers
+                .get("x-tenant")
+                .and_then(|value| value.to_str().ok())
+                == Some("acme")
+        })
+    };
+    assert!(saw_header, "the package's header reached the server");
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+
+    // A disabled package offers neither its skill nor its server.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::PluginDisable { plugin },
+    )
+    .await;
+    let listed = command(&mut socket, Id::new(), CommandCall::PluginList).await;
+    assert_eq!(listed[0]["enabled"], json!(false));
+
+    // Removing it removes its entries and keeps the record replayable.
+    command(&mut socket, Id::new(), CommandCall::PluginRemove { plugin }).await;
+    assert!(
+        command(&mut socket, Id::new(), CommandCall::PluginList)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        command(&mut socket, Id::new(), CommandCall::SkillList { bot: None })
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["id"] != json!(skill))
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    mcp_task.abort();
+    archive_task.abort();
+    running.shutdown().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_calls_a_package_stdio_server_and_records_its_card() {
+    let Some((_bwrap, _python)) = stdio_commands() else {
+        eprintln!("skipping the stdio end-to-end test: bubblewrap or python3 is not installed");
+        return;
+    };
+    let commit = "4d1e2a9b8c7f6e5d4c3b2a190817263544556677";
+    let (_dir, running, mut socket, archive_task, data, _plugin, local, broken) =
+        install_stdio_package(commit, stdio_plugin_tarball()).await;
+
+    // The list names the transport and the launch configuration, reports
+    // the launchable server as connected, and says why the unresolvable one
+    // is not; checking a launch starts nothing.
+    let list = command(&mut socket, Id::new(), CommandCall::McpList).await;
+    let rows = list.as_array().unwrap();
+    let row = |server: Id| {
+        rows.iter()
+            .find(|row| row["server"] == json!(server))
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(row(local)["transport"], json!("stdio"));
+    assert_eq!(row(local)["command"], json!("python3"));
+    assert_eq!(row(local)["args"], json!(["${PLUGIN_ROOT}/server.py"]));
+    assert_eq!(row(local)["cwd"], json!(null));
+    assert_eq!(row(local)["connected"], json!(true));
+    assert!(
+        row(local).get("reason").is_none(),
+        "a launchable server carries no reason"
+    );
+    assert_eq!(row(broken)["transport"], json!("stdio"));
+    assert_eq!(row(broken)["connected"], json!(false));
+    assert!(
+        row(broken)["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("PATH")),
+        "{:?}",
+        row(broken)["reason"]
+    );
+    assert!(
+        !data.join("started").exists(),
+        "listing a stdio server starts no process"
+    );
+
+    // The Bot uses the package's server: discovery offers its tool, the
+    // first call asks, and the call reaches the fixture without a Vault
+    // credential. A stdio process decides whether it wants a token, so the
+    // call is never answered "not connected".
+    let (base, provider_task) = scripted_provider(vec![
+        tool("mcp__stdio-tools-local__echo", json!({"text": "hello"})),
+        text("done"),
+        tool("mcp__stdio-tools-local__echo", json!({"text": "again"})),
+        text("second done"),
+    ])
+    .await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    // The broken server is enabled too: discovery leaves it out without
+    // failing the run.
+    for server in [local, broken] {
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+    }
+    let run = run_of(&submit(&mut socket, chat, "echo", None).await);
+    wait_status(&mut socket, run, "waiting").await;
+    let approvals = approvals_in(&mut socket, Some(chat)).await;
+    assert_eq!(approvals[0]["reason"], "first_mcp_call");
+    assert_eq!(approvals[0]["server"], json!(local));
+    let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+    decide_approval(&mut socket, approval, true, false).await;
+    let finished = wait_run(&mut socket, run).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+    let marker = std::fs::read_to_string(data.join("started")).expect("the fixture ran");
+    assert_eq!(marker, "", "a stdio call runs without a Vault credential");
+
+    // A browser sign-in names an address the server answers at; a stdio
+    // server has none, and the refusal is one fixed sentence.
+    let sign_in = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: Some(local),
+            name: None,
+            url: None,
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await
+    .expect_err("a stdio server has no address to sign in to");
+    assert_eq!(sign_in.0, ErrorCode::InvalidArgument, "{}", sign_in.1);
+    assert!(sign_in.1.contains("no address to sign in"), "{}", sign_in.1);
+
+    // A credential attaches to a stdio server without an address: the
+    // answer says the server is connected, and the next launch passes the
+    // Vault's credential as the sandbox's token.
+    let attached = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpConnect {
+            server: local,
+            credential: Some("token-1".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(attached["credential"], json!("user"));
+    assert_eq!(attached["connected"], json!(true));
+    let second = run_of(&submit(&mut socket, chat, "echo again", None).await);
+    let finished = wait_run(&mut socket, second).await;
+    assert_eq!(finished["status"], "succeeded", "{finished}");
+    assert_eq!(last_message(&mut socket, chat).await["text"], "second done");
+    let marker = std::fs::read_to_string(data.join("started")).expect("the fixture ran again");
+    assert_eq!(marker, "token-1");
+
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100_000)
+        .await
+        .unwrap()
+        .events;
+    // Each call ran the fixture's tool and answered with its text.
+    for (run, text) in [(run, "hello"), (second, "again")] {
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("succeeded"));
+        assert_eq!(action["output"], json!(text));
+    }
+
+    // The tool names an app, so each accepted answer recorded its Card and
+    // HTML.
+    let carded: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::MessageAdded && event.data.get("card").is_some())
+        .collect();
+    assert_eq!(carded.len(), 2, "one Card per call");
+    let mut htmls = Vec::new();
+    for event in &carded {
+        let card = &event.data["card"];
+        assert_eq!(card["kind"], "app");
+        let file: Id = serde_json::from_value(card["file"].clone()).unwrap();
+        let files: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::FileAdded && event.data["file"] == json!(file))
+            .collect();
+        assert_eq!(files.len(), 1, "the app's HTML is one File");
+        let sha256: String = serde_json::from_value(files[0].data["sha256"].clone()).unwrap();
+        htmls.push(
+            String::from_utf8(running.test_fields().blobs.get(&sha256).await.unwrap()).unwrap(),
+        );
+    }
+    assert!(
+        htmls.iter().all(|html| html.contains("stdio app")),
+        "{htmls:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    archive_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_install_from_a_source_the_admin_did_not_allow_is_refused() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let dir = tempfile::tempdir().unwrap();
+    let package = write_plugin_package(dir.path(), "https://example.com/mcp");
+    let error = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::PluginInstall {
+            source: package.display().to_string(),
+        },
+    )
+    .await
+    .expect_err("a Space allows no source by default");
+    assert_eq!(error.0, ErrorCode::Forbidden, "{}", error.1);
+    assert!(
+        command(&mut socket, Id::new(), CommandCall::PluginList)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalid_manifest_rejects_the_package() {
+    // A repository archive keeps this the same on every platform.
+    let tarball = plugin_tarball(&[("broken/plugin.json", "{not json")]);
+    let (archive, archive_task) = serve_plugin_archive(tarball).await;
+    let config = format!("[plugins]\nsources = [\"{archive}/\"]\n");
+    let (_home, running, invite) = running_with_config(&config).await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let error = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::PluginInstall {
+            source: format!("{archive}/repo@3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b"),
+        },
+    )
+    .await
+    .expect_err("an invalid manifest rejects the package");
+    assert_eq!(error.0, ErrorCode::InvalidArgument, "{}", error.1);
+    assert!(
+        command(&mut socket, Id::new(), CommandCall::PluginList)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    socket.close(None).await.unwrap();
+    archive_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_repository_package_is_fetched_at_its_commit() {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::header::CONTENT_TYPE;
+    use axum::response::{IntoResponse, Response};
+    use axum::routing::get;
+    use std::sync::{Arc, Mutex};
+
+    let tarball = plugin_tarball(&[(
+        "repo/plugin.json",
+        "{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json\",\"name\":\"pinned\",\"version\":\"0.1.0\"}",
+    )]);
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = asked.clone();
+    let app = Router::new().route(
+        "/repo/archive/{file}",
+        get(
+            move |axum::extract::Path(file): axum::extract::Path<String>| {
+                let seen = seen.clone();
+                let tarball = tarball.clone();
+                async move {
+                    let commit = file.strip_suffix(".tar.gz").unwrap_or(&file).to_owned();
+                    seen.lock().unwrap().push(commit);
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/gzip")
+                        .body(Body::from(tarball))
+                        .unwrap()
+                        .into_response()
+                }
+            },
+        ),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let archive_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    let config = format!("[plugins]\nsources = [\"http://{address}/\"]\n");
+    let (_home, running, invite) = running_with_config(&config).await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let installed = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::PluginInstall {
+            source: format!("http://{address}/repo@3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b"),
+        },
+    )
+    .await;
+    assert_eq!(
+        installed["commit"],
+        json!("3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b")
+    );
+    assert_eq!(installed["name"], json!("pinned"));
+    assert_eq!(
+        asked.lock().unwrap().as_slice(),
+        ["3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b"]
+    );
+    socket.close(None).await.unwrap();
+    archive_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_sign_in_connects_a_new_mcp_server() {
+    let (mcp_url, authorization_server, tokens, forms, calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let account: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+    let mut socket = open_socket(&running, token).await;
+    // The browser that starts a sign-in is signed in to this Space.
+    let session_cookie = browser_session(&running, "Ada").await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let callback = sign_in_callback(&running, &authorization_server);
+    let scope_callback = format!(
+        "{}/api/mcp/signin/{}/callback",
+        test_support::browser_origin(&running),
+        neha_space::oauth::issuer_key(&authorization_server)
+    );
+
+    // The Admin starts a sign-in for a new server; the default scope is the
+    // Space's. The answer names a first-party bind URL, never the provider.
+    let start = neha::surface::McpSignInStart {
+        server: None,
+        name: Some("docs".to_owned()),
+        url: Some(mcp_url.clone()),
+        scope: None,
+        redirect_uri: None,
+    };
+    let command_id = Id::new();
+    let started = command(
+        &mut socket,
+        command_id,
+        CommandCall::McpSignInStart(start.clone()),
+    )
+    .await;
+    let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    assert_eq!(
+        started["url"],
+        json!(format!(
+            "{}/api/mcp/signin/bind?sign_in={sign_in}",
+            test_support::browser_origin(&running)
+        )),
+        "the command answers the browser's first-party URL"
+    );
+
+    // A redelivered command is answered once: one pending sign-in, the
+    // same answer, no second discovery, and no event.
+    let discovered = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let last = running.test_fields().store.last_seq().await.unwrap();
+    let replayed = command(&mut socket, command_id, CommandCall::McpSignInStart(start)).await;
+    assert_eq!(replayed, started, "a redelivered start repeats its answer");
+    assert_eq!(
+        test_support::sign_in_count(&running).await,
+        1,
+        "one pending sign-in, not a second flow"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        discovered,
+        "a replay asks the MCP server nothing"
+    );
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        last,
+        "a replay appends no event"
+    );
+
+    // The bind route sets the browser's cookie and sends the browser to the
+    // provider with a state the callback must return.
+    let (cookie, nonce, authorize_url) =
+        bind_sign_in(&client, &running, sign_in, Some(&session_cookie)).await;
+    assert!(
+        authorize_url.starts_with(&format!("{authorization_server}/authorize")),
+        "{authorize_url}"
+    );
+    assert_eq!(
+        query_parameter(&authorize_url, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+    assert_eq!(
+        query_parameter(&authorize_url, "redirect_uri").as_deref(),
+        Some(scope_callback.as_str()),
+        "the browser flow comes back to the Space"
+    );
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    assert!(!state.is_empty());
+
+    // A callback without the cookie is refused and stores nothing, even
+    // with the right state: the state token alone does not say who is here.
+    let without = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(without.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = without.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains(&state) && !body.contains("fake-code"),
+        "the page echoes neither the state nor the code: {body}"
+    );
+    assert!(
+        !running
+            .test_fields()
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::McpServerAdded),
+        "a callback without its cookie stores nothing"
+    );
+    let still_pending = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(still_pending["state"], json!("pending"));
+
+    // A callback with another browser's cookie is refused the same way,
+    // and leaves the flow usable. The flow's cookie name is exact: even its
+    // own nonce under another flow's name is no binding at all.
+    let wrong = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .header(
+            "cookie",
+            format!(
+                "{}=a-different-nonce",
+                test_support::sign_in_cookie_name(sign_in)
+            ),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), reqwest::StatusCode::BAD_REQUEST);
+    let borrowed = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .header(
+            "cookie",
+            format!("{}={nonce}", test_support::sign_in_cookie_name(Id::new())),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(borrowed.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // A token endpoint's error never reaches the page or the poll: the
+    // callback spends the flow, the exchange is refused, and both read one
+    // fixed sentence.
+    let failed = client
+        .get(&callback)
+        .query(&[
+            ("code", "wrong-code"),
+            ("state", state.as_str()),
+            ("iss", authorization_server.as_str()),
+        ])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        failed
+            .headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"),
+        "the callback clears the binding cookie"
+    );
+    let body = failed.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains("the-provider-secret-code")
+            && !body.contains("invalid_grant")
+            && !body.contains(&state)
+            && !body.contains("wrong-code"),
+        "no provider text, state, or code reaches the page: {body}"
+    );
+    let failed_status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(failed_status["state"], json!("failed"));
+    assert_eq!(
+        failed_status["reason"],
+        json!("the sign-in could not be completed")
+    );
+    let text = failed_status.to_string();
+    assert!(
+        !text.contains("the-provider-secret-code") && !text.contains("invalid_grant"),
+        "no provider text reaches the poll: {text}"
+    );
+    assert!(
+        !running
+            .test_fields()
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::McpServerAdded),
+        "a refused exchange stores nothing"
+    );
+
+    // A refusal the person made reads one fixed sentence too: the
+    // authority's own error text never reaches the page or the poll.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let cancelled: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, cancelled, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let refused = client
+        .get(&callback)
+        .query(&[
+            ("error", "access_denied"),
+            ("error_description", "provider-secret"),
+            ("state", state.as_str()),
+        ])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains("provider-secret")
+            && !body.contains("access_denied")
+            && !body.contains(&state),
+        "no provider text or state reaches the page: {body}"
+    );
+    let cancelled_status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: cancelled },
+    )
+    .await;
+    assert_eq!(cancelled_status["state"], json!("failed"));
+    assert_eq!(
+        cancelled_status["reason"],
+        json!("the sign-in was cancelled or refused")
+    );
+
+    // An issuer another authorization server named is a mix-up: the
+    // callback spends the flow and reads one fixed sentence.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let mixed_up: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, mixed_up, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    // The callback path names the issuer the plan was discovered from. A
+    // callback under another issuer's key, a malformed key, and the old
+    // unkeyed path are refused before any code is exchanged, and none of
+    // them spends the flow.
+    let wrong_key = format!(
+        "{}/api/mcp/signin/{}/callback",
+        running.url(),
+        neha_space::oauth::issuer_key("https://another.example")
+    );
+    let malformed_key = format!("{}/api/mcp/signin/not-a-key/callback", running.url());
+    let unkeyed = format!("{}/api/mcp/signin/callback", running.url());
+    let exchanges_before = forms.lock().unwrap().len();
+    for refused_path in [&wrong_key, &malformed_key] {
+        let refused = client
+            .get(refused_path)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            refused.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{refused_path}"
+        );
+        let body = refused.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&state) && !body.contains("fake-code"),
+            "the page echoes neither the state nor the code: {body}"
+        );
+    }
+    let old_path = client
+        .get(&unkeyed)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        old_path.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "the old unkeyed callback path no longer exists"
+    );
+    assert_eq!(
+        forms.lock().unwrap().len(),
+        exchanges_before,
+        "a callback under the wrong key exchanges nothing"
+    );
+    let crossed = client
+        .get(&callback)
+        .query(&[
+            ("code", "fake-code"),
+            ("state", state.as_str()),
+            ("iss", "https://another.example"),
+        ])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(crossed.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = crossed.text().await.unwrap();
+    assert!(
+        !body.contains("another.example") && !body.contains(&state),
+        "the page echoes no issuer or state: {body}"
+    );
+    let crossed_status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: mixed_up },
+    )
+    .await;
+    assert_eq!(crossed_status["state"], json!("failed"));
+    assert_eq!(
+        crossed_status["reason"],
+        json!("the sign-in could not be completed")
+    );
+
+    // The successful flow begins with a bind request and completes in the
+    // browser that received the cookie.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, sign_in, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let page = client
+        .get(&callback)
+        .query(&[
+            ("code", "fake-code"),
+            ("state", state.as_str()),
+            ("iss", authorization_server.as_str()),
+        ])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
+    assert!(
+        page.headers()
+            .get("set-cookie")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0"),
+        "the callback clears the binding cookie"
+    );
+    assert!(
+        page.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html")
+    );
+    let body = page.text().await.unwrap();
+    assert!(body.contains("finished"), "{body}");
+    assert!(
+        !body.contains(&state) && !body.contains("fake-code"),
+        "the page echoes neither the state nor the code: {body}"
+    );
+
+    // The token exchange carried the PKCE verifier and the plan's binding.
+    {
+        let exchanged = forms.lock().unwrap();
+        assert_eq!(
+            exchanged.len(),
+            2,
+            "the refused exchange and the finished one"
+        );
+        let finished = &exchanged[1];
+        assert_eq!(finished.get("code").map(String::as_str), Some("fake-code"));
+        assert_eq!(
+            finished.get("resource").map(String::as_str),
+            Some(mcp_url.as_str()),
+            "the token is bound to the resource"
+        );
+        assert_eq!(
+            finished.get("redirect_uri").map(String::as_str),
+            Some(scope_callback.as_str()),
+            "the token is bound to the Space's callback"
+        );
+        assert!(
+            finished
+                .get("code_verifier")
+                .is_some_and(|value| !value.is_empty()),
+            "the exchange carries the PKCE verifier"
+        );
+    }
+
+    // The record holds the new server and the Vault holds the Space's
+    // credential, so the client that started the sign-in sees it connected.
+    let status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(status["state"], json!("finished"));
+    let server: Id = serde_json::from_value(status["server"].clone()).unwrap();
+    assert_eq!(status["connected"], json!(true));
+    assert_eq!(status["reason"], json!(null));
+    assert_eq!(
+        running
+            .test_fields()
+            .secrets
+            .mcp_credential(server, None)
+            .unwrap()
+            .as_deref(),
+        Some("token-1"),
+        "an Admin's Space sign-in stores the Space's credential"
+    );
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100)
+        .await
+        .unwrap()
+        .events;
+    let added = events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::McpServerAdded && event.data["server"] == json!(server)
+        })
+        .expect("the record holds the connection");
+    assert_eq!(added.data["name"], json!("docs"));
+    assert_eq!(added.data["url"], json!(mcp_url));
+    assert_eq!(added.data["scope"], json!("space"));
+    assert_eq!(added.data["user"], json!(null));
+    assert_eq!(added.data["by"], json!(account));
+    assert_eq!(added.data["plugin"], json!(null));
+    assert_eq!(added.data["headers"], json!({}));
+
+    let listed = command(&mut socket, Id::new(), CommandCall::McpList).await;
+    let row = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["server"] == json!(server))
+        .expect("the list holds the server");
+    assert_eq!(row["connected"], json!(true));
+    assert_eq!(row["credential"], json!("space"));
+    assert_eq!(row["by_name"], json!("Ada"));
+    assert!(
+        tokens
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|seen| seen == "Bearer token-1"),
+        "the list's probe sent the stored token"
+    );
+
+    // The state is single use: the same callback is refused and the page
+    // echoes neither it nor the code.
+    let replay = client
+        .get(&callback)
+        .query(&[("code", "another-code"), ("state", state.as_str())])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = replay.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains(&state) && !body.contains("another-code"),
+        "the page echoes nothing: {body}"
+    );
+
+    // A state no sign-in made renders the same generic failure.
+    for (code, state) in [("fake-code", "not-a-state"), ("", "")] {
+        let unknown = client
+            .get(&callback)
+            .query(&[("code", code), ("state", state)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = unknown.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+    }
+
+    // A bind for a sign-in no Space holds renders the same failure.
+    let missing = client
+        .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+        .query(&[("sign_in", Id::new().to_string())])
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(missing.headers().get("set-cookie").is_none());
+    let body = missing.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+
+    // The metadata does not advertise RFC 9207's parameter, so a response
+    // that omits `iss` is admitted: the flow is not refused for a promise
+    // this authorization server never made.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs-omitted-iss".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, sign_in, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let page = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let body = page.text().await.unwrap();
+    assert!(body.contains("finished"), "{body}");
+    let status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(status["state"], json!("finished"));
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_line_sign_in_finishes_with_the_loopback_code() {
+    let (mcp_url, authorization_server, _tokens, forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let account: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+    let mut socket = open_socket(&running, token).await;
+    // The browser that opens a command line flow's bind URL is a fresh
+    // browser profile: it holds no Space session at all. The command line
+    // is the authenticated initiator, and its finish is an authenticated
+    // command.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let loopback = "http://127.0.0.1:4711";
+    let loopback_callback = format!(
+        "{loopback}/{}/callback",
+        neha_space::oauth::issuer_key(&authorization_server)
+    );
+    // What the loopback receiver forwards as the callback's path.
+    let cli_path = url_path(&loopback_callback);
+    let start = neha::surface::McpSignInStart {
+        server: None,
+        name: Some("docs".to_owned()),
+        url: Some(mcp_url.clone()),
+        scope: None,
+        redirect_uri: Some(loopback.to_owned()),
+    };
+
+    // A remote or TLS redirect is no command line's receiver.
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            redirect_uri: Some("https://example.com/api/mcp/signin/callback".to_owned()),
+            ..start.clone()
+        }),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+        "a non-loopback redirect is refused: {refused:?}"
+    );
+
+    // The command answers the same first-party bind URL the browser flow
+    // does; the bind redirect names the command line's loopback receiver.
+    let started = command(&mut socket, Id::new(), CommandCall::McpSignInStart(start)).await;
+    let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    assert_eq!(
+        started["url"],
+        json!(format!(
+            "{}/api/mcp/signin/bind?sign_in={sign_in}",
+            test_support::browser_origin(&running)
+        ))
+    );
+    // The browser has no cookie jar and needs none: a command line flow
+    // binds without a session and without setting a browser cookie.
+    let authorize_url = bind_command_line_sign_in(&client, &running, sign_in).await;
+    assert!(
+        authorize_url.starts_with(&format!("{authorization_server}/authorize")),
+        "{authorize_url}"
+    );
+    assert_eq!(
+        query_parameter(&authorize_url, "redirect_uri").as_deref(),
+        Some(loopback_callback.as_str()),
+        "the command line's receiver is the redirect, keyed by the issuer"
+    );
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+
+    // The Space's keyed callback cannot finish a flow a command line owns.
+    let callback = sign_in_callback(&running, &authorization_server);
+    let crossed = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(crossed.status(), reqwest::StatusCode::BAD_REQUEST);
+    let pending = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(pending["state"], json!("pending"));
+
+    // An issuer that names another authorization server is a mix-up: the
+    // flow is spent and the answer never repeats the named issuer.
+    let probe_started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("other".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: Some(loopback.to_owned()),
+        }),
+    )
+    .await;
+    let probe: Id = serde_json::from_value(probe_started["sign_in"].clone()).unwrap();
+    let authorize_url = bind_command_line_sign_in(&client, &running, probe).await;
+    let probe_state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let mixed_up = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInFinish {
+            sign_in: probe,
+            code: "fake-code".to_owned(),
+            state: probe_state,
+            path: Some(cli_path.clone()),
+            iss: Some("https://another.example".to_owned()),
+        },
+    )
+    .await;
+    let mixed_up = match mixed_up {
+        Err((ErrorCode::InvalidArgument, message)) => message,
+        other => panic!("a mix-up must be refused: {other:?}"),
+    };
+    assert!(
+        !mixed_up.contains("another.example"),
+        "the refusal echoes no issuer: {mixed_up}"
+    );
+    let probe_status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: probe },
+    )
+    .await;
+    assert_eq!(probe_status["state"], json!("failed"));
+    assert_eq!(
+        probe_status["reason"],
+        json!("the sign-in could not be completed")
+    );
+
+    // The command line sends what its loopback receiver got. It received
+    // no issuer, which an authorization server may omit.
+    let finish_command = Id::new();
+    let finished = command(
+        &mut socket,
+        finish_command,
+        CommandCall::McpSignInFinish {
+            sign_in,
+            code: "fake-code".to_owned(),
+            state: state.clone(),
+            path: Some(cli_path.clone()),
+            iss: None,
+        },
+    )
+    .await;
+    assert_eq!(finished["sign_in"], json!(sign_in));
+    assert_eq!(finished["state"], json!("finished"));
+    assert_eq!(finished["reason"], json!(null));
+    let server: Id = serde_json::from_value(finished["server"].clone()).unwrap();
+    assert_eq!(finished["connected"], json!(true));
+    assert_eq!(
+        running
+            .test_fields()
+            .secrets
+            .mcp_credential(server, None)
+            .unwrap()
+            .as_deref(),
+        Some("token-1"),
+        "the command line's sign-in stores the Space's credential"
+    );
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100)
+        .await
+        .unwrap()
+        .events;
+    let added: Vec<&neha::record::Event> = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::McpServerAdded && event.data["server"] == json!(server)
+        })
+        .collect();
+    assert_eq!(added.len(), 1, "the flow records one connection");
+    assert_eq!(added[0].data["scope"], json!("space"));
+    assert_eq!(added[0].data["by"], json!(account));
+
+    // The exchange carried the loopback redirect the browser was sent to,
+    // keyed by the issuer the plan was discovered from.
+    {
+        let exchanged = forms.lock().unwrap();
+        assert_eq!(exchanged.len(), 1);
+        assert_eq!(
+            exchanged[0].get("redirect_uri").map(String::as_str),
+            Some(loopback_callback.as_str())
+        );
+        assert_eq!(
+            exchanged[0].get("resource").map(String::as_str),
+            Some(mcp_url.as_str())
+        );
+    }
+
+    // A redelivered finish is idempotent: the finished status is answered
+    // again, and neither the Vault nor the record changes. The same
+    // command id and a fresh id that names the same sign-in read the same
+    // answer.
+    let cursor = running.test_fields().store.last_seq().await.unwrap();
+    for (command_id, why) in [
+        (finish_command, "a redelivered finish repeats its answer"),
+        (Id::new(), "a fresh command id repeats the finished answer"),
+    ] {
+        let again = command(
+            &mut socket,
+            command_id,
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "fake-code".to_owned(),
+                state: state.clone(),
+                path: Some(cli_path.clone()),
+                iss: None,
+            },
+        )
+        .await;
+        assert_eq!(again, finished, "{why}");
+    }
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        cursor,
+        "a repeated finish appends no event"
+    );
+    assert_eq!(
+        running
+            .test_fields()
+            .secrets
+            .mcp_credential(server, None)
+            .unwrap()
+            .as_deref(),
+        Some("token-1"),
+        "a repeated finish rewrites no credential"
+    );
+    let polled = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(polled["state"], json!("finished"));
+    assert_eq!(polled["server"], json!(server));
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bind_url_belongs_to_the_account_that_started_the_sign_in() {
+    let (
+        mcp_url,
+        _authorization_server,
+        _tokens,
+        _forms,
+        _calls,
+        _registrations,
+        mcp_task,
+        as_task,
+    ) = fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let mut socket = open_socket(&running, token).await;
+    // The initiating browser's session; another account's browser on the
+    // same Space has its own.
+    let ada_cookie = browser_session(&running, "Ada").await;
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let grace_cookie = browser_session(&running, "Grace").await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+
+    // The bind URL is the only handle to a flow, but it is handed to a
+    // browser: an unauthenticated browser cannot carry it off.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    for cookie in [None, Some("neha_session_not-a-token")] {
+        let mut request = client
+            .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+            .query(&[("sign_in", sign_in.to_string())]);
+        if let Some(cookie) = cookie {
+            request = request.header("cookie", cookie);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "an unauthenticated bind sets nothing"
+        );
+        let body = response.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&sign_in.to_string()),
+            "the page echoes the sign-in id: {body}"
+        );
+    }
+
+    // Another account's browser cannot bind the flow either; the failure
+    // is the same generic page and the flow stays usable for its owner.
+    let foreign = client
+        .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+        .query(&[("sign_in", sign_in.to_string())])
+        .header("cookie", &grace_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(foreign.headers().get("set-cookie").is_none());
+    let body = foreign.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains(&sign_in.to_string()),
+        "the page echoes the sign-in id: {body}"
+    );
+    let pending = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in },
+    )
+    .await;
+    assert_eq!(pending["state"], json!("pending"));
+
+    // The initiating browser binds normally: the session cookie arrives on
+    // the first-party navigation and names the account that started it.
+    let (_cookie, nonce, authorize_url) =
+        bind_sign_in(&client, &running, sign_in, Some(&ada_cookie)).await;
+    assert_eq!(nonce.len(), 43);
+    assert!(
+        authorize_url.contains("state="),
+        "the redirect names the flow's state: {authorize_url}"
+    );
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_expired_command_line_flow_cannot_exchange_its_code() {
+    let (mcp_url, authorization_server, _tokens, forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    // A server the Space already holds, with a credential that a finished
+    // sign-in would replace.
+    let server = add_mcp_server(&mut socket, "docs", &mcp_url, Some("old-token")).await;
+    let loopback = "http://127.0.0.1:4712/api/mcp/signin/callback";
+    let cli_path = format!(
+        "/{}/callback",
+        neha_space::oauth::issuer_key(&authorization_server)
+    );
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: Some(server),
+            name: None,
+            url: None,
+            scope: Some(neha::record::McpScope::Space),
+            redirect_uri: Some(loopback.to_owned()),
+        }),
+    )
+    .await;
+    let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let authorize_url = bind_command_line_sign_in(&client, &running, sign_in).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+
+    // Age the flow past its usable life while it is still pending: the
+    // sweeper marks it failed on the next read and keeps its state token,
+    // so only the status and the age can stop a late exchange.
+    test_support::expire_sign_in(&running, sign_in).await;
+    let cursor = running.test_fields().store.last_seq().await.unwrap();
+
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInFinish {
+            sign_in,
+            code: "fake-code".to_owned(),
+            state,
+            path: Some(cli_path),
+            iss: None,
+        },
+    )
+    .await;
+    match refused {
+        Err((ErrorCode::InvalidArgument, message)) => {
+            assert_eq!(message, test_support::SIGN_IN_EXPIRED)
+        }
+        other => panic!("an expired flow must refuse its code: {other:?}"),
+    }
+    assert!(
+        forms.lock().unwrap().is_empty(),
+        "an expired flow exchanges no code"
+    );
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        cursor,
+        "an expired flow appends no event"
+    );
+    assert_eq!(
+        running
+            .test_fields()
+            .secrets
+            .mcp_credential(server, None)
+            .unwrap()
+            .as_deref(),
+        Some("old-token"),
+        "an expired flow leaves the Vault unchanged"
+    );
+    assert_eq!(
+        test_support::sign_in_failure(&running, sign_in)
+            .await
+            .as_deref(),
+        Some(test_support::SIGN_IN_EXPIRED)
+    );
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_callback_must_name_the_issuer_the_advertised_metadata_promises() {
+    let (mcp_url, authorization_server, _tokens, forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape_with(true).await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let mut socket = open_socket(&running, token).await;
+    let session_cookie = browser_session(&running, "Ada").await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let callback = sign_in_callback(&running, &authorization_server);
+
+    // The authorization server's metadata says every authorization
+    // response carries `iss`, so a response that omits it is a mix-up
+    // risk: the callback refuses it before the code is exchanged.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("omitted-iss".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let omitted: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, omitted, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let cursor = running.test_fields().store.last_seq().await.unwrap();
+    let refused = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", state.as_str())])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains(&state) && !body.contains("fake-code"),
+        "the page echoes neither the state nor the code: {body}"
+    );
+    assert!(
+        forms.lock().unwrap().is_empty(),
+        "a response promised an issuer exchanges nothing without it"
+    );
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        cursor,
+        "a refused response appends no event"
+    );
+    let status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: omitted },
+    )
+    .await;
+    assert_eq!(status["state"], json!("failed"));
+    assert_eq!(status["reason"], json!(test_support::SIGN_IN_INCOMPLETE));
+
+    // A named issuer that is not the plan's is a mix-up whether or not the
+    // metadata promised the parameter.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("crossed-iss".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let crossed: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, crossed, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let refused = client
+        .get(&callback)
+        .query(&[
+            ("code", "fake-code"),
+            ("state", state.as_str()),
+            ("iss", "https://another.example"),
+        ])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(forms.lock().unwrap().is_empty());
+
+    // The issuer the metadata named completes the flow.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("named-iss".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let named: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (cookie, _nonce, authorize_url) =
+        bind_sign_in(&client, &running, named, Some(&session_cookie)).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let page = client
+        .get(&callback)
+        .query(&[
+            ("code", "fake-code"),
+            ("state", state.as_str()),
+            ("iss", authorization_server.as_str()),
+        ])
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let body = page.text().await.unwrap();
+    assert!(body.contains("finished"), "{body}");
+    let status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: named },
+    )
+    .await;
+    assert_eq!(status["state"], json!("finished"));
+    assert_eq!(forms.lock().unwrap().len(), 1, "one code was exchanged");
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_line_finish_must_name_the_issuer_the_advertised_metadata_promises() {
+    let (mcp_url, authorization_server, _tokens, forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape_with(true).await;
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let loopback = "http://127.0.0.1:4713/api/mcp/signin/callback";
+    let cli_path = format!(
+        "/{}/callback",
+        neha_space::oauth::issuer_key(&authorization_server)
+    );
+
+    // The same requirement holds for the command line's finish: a response
+    // that omits the issuer the metadata promises is refused before the
+    // token exchange.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("cli-omitted".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: Some(loopback.to_owned()),
+        }),
+    )
+    .await;
+    let omitted: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let authorize_url = bind_command_line_sign_in(&client, &running, omitted).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let cursor = running.test_fields().store.last_seq().await.unwrap();
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInFinish {
+            sign_in: omitted,
+            code: "fake-code".to_owned(),
+            state,
+            path: Some(cli_path.clone()),
+            iss: None,
+        },
+    )
+    .await;
+    match refused {
+        Err((ErrorCode::InvalidArgument, message)) => {
+            assert_eq!(message, test_support::SIGN_IN_INCOMPLETE)
+        }
+        other => panic!("a missing issuer must be refused: {other:?}"),
+    }
+    assert!(forms.lock().unwrap().is_empty());
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        cursor
+    );
+
+    // A crossed issuer is refused the same way.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("cli-crossed".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: Some(loopback.to_owned()),
+        }),
+    )
+    .await;
+    let crossed: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let authorize_url = bind_command_line_sign_in(&client, &running, crossed).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInFinish {
+            sign_in: crossed,
+            code: "fake-code".to_owned(),
+            state,
+            path: Some(cli_path.clone()),
+            iss: Some("https://another.example".to_owned()),
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+        "a crossed issuer must be refused: {refused:?}"
+    );
+    assert!(forms.lock().unwrap().is_empty());
+
+    // The issuer the metadata named finishes the flow.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("cli-named".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: Some(loopback.to_owned()),
+        }),
+    )
+    .await;
+    let named: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let authorize_url = bind_command_line_sign_in(&client, &running, named).await;
+    let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+    let finished = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInFinish {
+            sign_in: named,
+            code: "fake-code".to_owned(),
+            state,
+            path: Some(cli_path),
+            iss: Some(authorization_server),
+        },
+    )
+    .await;
+    assert_eq!(finished["state"], json!("finished"));
+    assert_eq!(forms.lock().unwrap().len(), 1, "one code was exchanged");
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_start_deliveries_plan_one_sign_in() {
+    let (mcp_url, _authorization_server, _tokens, _forms, calls, registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let (mut first, token) = admin(&running, &invite).await;
+    let mut second = open_socket(&running, &token).await;
+    let start = neha::surface::McpSignInStart {
+        server: None,
+        name: Some("docs".to_owned()),
+        url: Some(mcp_url),
+        scope: None,
+        redirect_uri: None,
+    };
+    let command_id = Id::new();
+    let cursor = running.test_fields().store.last_seq().await.unwrap();
+
+    // Both sockets deliver the same command before either answer: one
+    // plans discovery and registration, the other waits and replays.
+    let (one, two) = tokio::join!(
+        command(
+            &mut first,
+            command_id,
+            CommandCall::McpSignInStart(start.clone())
+        ),
+        command(
+            &mut second,
+            command_id,
+            CommandCall::McpSignInStart(start.clone())
+        ),
+    );
+
+    assert_eq!(one, two, "both deliveries read the same recorded answer");
+    assert_eq!(
+        test_support::sign_in_count(&running).await,
+        1,
+        "one pending sign-in, not two flows"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one discovery request"
+    );
+    assert_eq!(
+        registrations.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one dynamic client registration"
+    );
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        cursor,
+        "a start writes no event"
+    );
+
+    first.close(None).await.unwrap();
+    second.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_package_servers_configured_headers_reach_discovery() {
+    let (mcp_url, _authorization_server, seen, _forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let directory = tempfile::tempdir().unwrap();
+    let home = test_home(directory.path());
+    let server = Id::new();
+    let by = Id::new();
+    let store = Store::open(&home).await.unwrap();
+    store
+        .append(AppendRequest::new(
+            Id::new(),
+            "seed",
+            vec![EventDraft::new(
+                EventKind::McpServerAdded,
+                Author::User(by),
+                json!({
+                    "server": server,
+                    "name": "packaged",
+                    "url": mcp_url,
+                    "scope": "space",
+                    "user": null,
+                    "by": by,
+                    "plugin": null,
+                    "headers": {"x-package": "yes"},
+                }),
+            )],
+        ))
+        .await
+        .unwrap();
+    store.close().await.unwrap();
+    let running = start(home, 0).await.unwrap();
+    let invite = running.invite.clone().expect("a fresh Space invites");
+    let mut socket = admin_socket(&running, &invite).await;
+
+    // A package's fixed headers are how the server admits the discovery
+    // request: the sign-in must carry them.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: Some(server),
+            name: None,
+            url: None,
+            scope: Some(neha::record::McpScope::Space),
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    serde_json::from_value::<Id>(started["sign_in"].clone()).unwrap();
+    assert!(
+        seen.lock().unwrap().contains(&"x-package:yes".to_owned()),
+        "the configured header reaches discovery: {:?}",
+        seen.lock().unwrap()
+    );
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_sees_space_library_changes_and_not_personal_ones() {
+    let (_dir, running, invite) = running().await;
+    let mut admin_socket = admin_socket(&running, &invite).await;
+    let admin = running
+        .test_fields()
+        .identity
+        .admin_account()
+        .await
+        .unwrap()
+        .expect("the Space has an Admin");
+    let member = running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let member_token = sign_in(&running, "Grace").await;
+    let mut member_socket = open_socket(&running, &member_token).await;
+    // Both sockets read the stream live from here on.
+    snapshot_events(&mut admin_socket).await;
+    snapshot_events(&mut member_socket).await;
+
+    // The member's own events stay theirs and arrive.
+    let created = command(&mut member_socket, Id::new(), add_bot("Reader", None)).await;
+    let _member_bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+    let (url, _log, mcp_task) = fake_mcp_server(|_| json!({"content": []})).await;
+    // The Admin adds a server for the whole Space and one of their own.
+    let space_server = add_mcp_server(&mut admin_socket, "space-docs", &url, Some("token-1")).await;
+    let personal = command(
+        &mut admin_socket,
+        Id::new(),
+        CommandCall::McpAdd(neha::surface::McpAdd {
+            name: "personal-docs".to_owned(),
+            url: url.clone(),
+            scope: neha::record::McpScope::User,
+            credential: Some("token-2".to_owned()),
+        }),
+    )
+    .await;
+    let personal: Id = serde_json::from_value(personal["server"].clone()).unwrap();
+    // Attaching a credential updates the server. A Space credential's
+    // change is the Space's and every member sees it; a personal
+    // credential's change records the User scope even on the Space's
+    // server, so the member never learns who attached it.
+    command(
+        &mut admin_socket,
+        Id::new(),
+        CommandCall::McpAdd(neha::surface::McpAdd {
+            name: "space-docs".to_owned(),
+            url: url.clone(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("attached-token".to_owned()),
+        }),
+    )
+    .await;
+    command(
+        &mut admin_socket,
+        Id::new(),
+        CommandCall::McpConnect {
+            server: personal,
+            credential: Some("attached-token".to_owned()),
+        },
+    )
+    .await;
+    // A Space skill enters and leaves the Space's library.
+    let added = command(
+        &mut admin_socket,
+        Id::new(),
+        add_skill(None, "---\nname: shared\ndescription: d\n---\nBody.", &[]),
+    )
+    .await;
+    let space_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut admin_socket,
+        Id::new(),
+        CommandCall::SkillRemove { skill: space_skill },
+    )
+    .await;
+    // A Bot's skill enters and leaves that Bot's own library.
+    let created = command(&mut admin_socket, Id::new(), add_bot("Writer", None)).await;
+    let writer: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let added = command(
+        &mut admin_socket,
+        Id::new(),
+        add_skill(
+            Some(writer),
+            "---\nname: private\ndescription: d\n---\nBody.",
+            &[],
+        ),
+    )
+    .await;
+    let bot_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut admin_socket,
+        Id::new(),
+        CommandCall::SkillRemove { skill: bot_skill },
+    )
+    .await;
+    // Both servers leave: a Space server's removal is every member's, a
+    // personal one's stays its owner's.
+    for server in [space_server, personal] {
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::McpRemove { server },
+        )
+        .await;
+    }
+    // A package's installation and enablement name what the Admin
+    // installed: the command surface offers them to no member, so the
+    // stream keeps them the Admin's. A removal carries only the package
+    // id and is every member's (its visibility has its own test). Dispatch
+    // it the way the socket's command path does.
+    let plugin = Id::new();
+    let appended = running
+        .test_fields()
+        .store
+        .append(AppendRequest::new(
+            Id::new(),
+            "plugin-enabled".to_owned(),
+            vec![EventDraft::new(
+                EventKind::PluginEnabled,
+                Author::User(admin.id),
+                json!({"plugin": plugin}),
+            )],
+        ))
+        .await
+        .unwrap();
+    test_support::broadcast(&running, &appended.events);
+
+    let events = live_events(&mut member_socket).await;
+    assert!(
+        events.iter().any(|event| {
+            event.kind == EventKind::McpServerUpdated
+                && event.data["server"] == json!(space_server)
+                && event.data["scope"] == json!("space")
+        }),
+        "a member sees a Space server's update"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.kind == EventKind::McpServerRemoved
+                && event.data["server"] == json!(space_server)
+                && event.data["scope"] == json!("space")
+        }),
+        "a member sees a Space server's removal"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.kind == EventKind::SkillRemoved
+                && event.data["skill"] == json!(space_skill)
+                && event.data["library"] == json!("space")
+        }),
+        "a member sees a Space skill leave"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event.kind == EventKind::SkillAdded
+                && event.data["skill"] == json!(space_skill)
+                && event.data["library"] == json!("space")
+        }),
+        "a member sees the Space's skill enter"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.data.get("server") != Some(&json!(personal))),
+        "the Admin's personal server's changes stay the Admin's"
+    );
+    assert!(
+        events.iter().all(|event| {
+            !(event.kind == EventKind::SkillRemoved && event.data["skill"] == json!(bot_skill))
+        }),
+        "a Bot's skill stays its owner's"
+    );
+    assert!(
+        events.iter().all(|event| !matches!(
+            event.kind,
+            EventKind::PluginInstalled | EventKind::PluginEnabled | EventKind::PluginDisabled
+        )),
+        "a member receives no installation or enablement event"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event.kind == EventKind::BotCreated
+                && event.author == Author::User(member.id)),
+        "the member's own events still arrive"
+    );
+
+    // The Admin is the author of every filtered event, so the record the
+    // Admin reads proves those events exist and only the member's stream
+    // was narrowed. They are read from the catch-up path: the commands
+    // above already consumed the live frames queued for the Admin.
+    let (_cursor, admin_events) = snapshot_events(&mut admin_socket).await;
+    for expected in [
+        (EventKind::McpServerUpdated, json!(personal)),
+        (EventKind::McpServerRemoved, json!(personal)),
+        (EventKind::SkillRemoved, json!(bot_skill)),
+        (EventKind::PluginEnabled, json!(plugin)),
+    ] {
+        let (kind, named) = expected;
+        assert!(
+            admin_events.iter().any(|event| {
+                event.kind == kind
+                    && (event.data.get("server") == Some(&named)
+                        || event.data.get("skill") == Some(&named)
+                        || event.data.get("plugin") == Some(&named))
+            }),
+            "the Admin sees their own {kind:?}"
+        );
+    }
+
+    member_socket.close(None).await.unwrap();
+    admin_socket.close(None).await.unwrap();
+    mcp_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_personal_credential_attachment_stays_the_members_own() {
+    let (_dir, running, invite) = running().await;
+    let mut admin_socket = admin_socket(&running, &invite).await;
+    let grace = running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Lin", "correct horse battery")
+        .await
+        .unwrap();
+    let grace_token = sign_in(&running, "Grace").await;
+    let lin_token = sign_in(&running, "Lin").await;
+    let mut grace_socket = open_socket(&running, &grace_token).await;
+    let mut lin_socket = open_socket(&running, &lin_token).await;
+
+    let (url, _log, mcp_task) = fake_mcp_server(|_| json!({"content": []})).await;
+    let server = add_mcp_server(&mut admin_socket, "space-docs", &url, Some("token-1")).await;
+    // Both members read the stream live from here on.
+    snapshot_events(&mut grace_socket).await;
+    snapshot_events(&mut lin_socket).await;
+
+    // Grace attaches her own credential to the Space's server. The event
+    // names her credential change, not the server's scope, so only she
+    // receives it: the other member cannot learn who attached what.
+    command(
+        &mut grace_socket,
+        Id::new(),
+        CommandCall::McpConnect {
+            server,
+            credential: Some("grace-token".to_owned()),
+        },
+    )
+    .await;
+    let grace_events = live_events(&mut grace_socket).await;
+    let lin_events = live_events(&mut lin_socket).await;
+    assert!(
+        grace_events.iter().any(|event| {
+            event.kind == EventKind::McpServerUpdated
+                && event.data["server"] == json!(server)
+                && event.data["scope"] == json!("user")
+                && event.data["by"] == json!(grace.id)
+        }),
+        "the attaching member sees their own credential's change"
+    );
+    assert!(
+        lin_events
+            .iter()
+            .all(|event| event.data.get("server") != Some(&json!(server))),
+        "the other member receives no event for the personal attach"
+    );
+
+    // The Admin attaching the Space's credential records a Space change,
+    // which every member receives.
+    command(
+        &mut admin_socket,
+        Id::new(),
+        CommandCall::McpAdd(neha::surface::McpAdd {
+            name: "space-docs".to_owned(),
+            url: url.clone(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("space-token".to_owned()),
+        }),
+    )
+    .await;
+    let lin_events = live_events(&mut lin_socket).await;
+    assert!(
+        lin_events.iter().any(|event| {
+            event.kind == EventKind::McpServerUpdated
+                && event.data["server"] == json!(server)
+                && event.data["scope"] == json!("space")
+        }),
+        "the Admin's Space credential change broadcasts to the member"
+    );
+
+    // Neither change touched the server the Space connected: the event's
+    // scope describes the credential change, and the projection ignores
+    // it for the server's own scope and user.
+    {
+        let state = running.test_fields().state.lock().unwrap();
+        let view = state.mcp(server).expect("the server stays connected");
+        assert_eq!(
+            view.scope,
+            neha::record::McpScope::Space,
+            "an attachment never changes the server's scope"
+        );
+        assert_eq!(view.user, None, "a Space server has no User");
+    }
+
+    grace_socket.close(None).await.unwrap();
+    lin_socket.close(None).await.unwrap();
+    admin_socket.close(None).await.unwrap();
+    mcp_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_refreshes_when_a_package_is_removed() {
+    let (_dir, running, invite) = running().await;
+    let mut admin_socket = admin_socket(&running, &invite).await;
+    let admin = running
+        .test_fields()
+        .identity
+        .admin_account()
+        .await
+        .unwrap()
+        .expect("the Space has an Admin");
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let member_token = sign_in(&running, "Grace").await;
+    let mut member_socket = open_socket(&running, &member_token).await;
+    snapshot_events(&mut admin_socket).await;
+    snapshot_events(&mut member_socket).await;
+
+    // The Admin installs a package and then removes it. The installation
+    // names the package, its source, and its digest and stays the Admin's;
+    // the removal carries only the id, so every account learns the package
+    // left and can refresh what it offered.
+    let plugin = Id::new();
+    for (name, draft) in [
+        (
+            "plugin-installed",
+            EventDraft::new(
+                EventKind::PluginInstalled,
+                Author::User(admin.id),
+                json!({
+                    "plugin": plugin,
+                    "name": "reports",
+                    "digest": "a".repeat(64),
+                    "source": "https://example.com/reports",
+                }),
+            ),
+        ),
+        (
+            "plugin-removed",
+            EventDraft::new(
+                EventKind::PluginRemoved,
+                Author::User(admin.id),
+                json!({"plugin": plugin}),
+            ),
+        ),
+    ] {
+        let appended = running
+            .test_fields()
+            .store
+            .append(AppendRequest::new(Id::new(), name.to_owned(), vec![draft]))
+            .await
+            .unwrap();
+        test_support::broadcast(&running, &appended.events);
+    }
+
+    let events = live_events(&mut member_socket).await;
+    assert!(
+        events.iter().any(|event| {
+            event.kind == EventKind::PluginRemoved && event.data["plugin"] == json!(plugin)
+        }),
+        "a member receives the package removal and refreshes"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind != EventKind::PluginInstalled),
+        "the installation's source, commit, and digest stay the Admin's"
+    );
+
+    // The catch-up path applies the same rule: a member that subscribes
+    // after the removal reads it from the record, and still not the
+    // installation.
+    let mut late_socket = open_socket(&running, &member_token).await;
+    let (_cursor, caught_up) = snapshot_events(&mut late_socket).await;
+    assert!(
+        caught_up.iter().any(|event| {
+            event.kind == EventKind::PluginRemoved && event.data["plugin"] == json!(plugin)
+        }),
+        "the catch-up path delivers the package removal"
+    );
+    assert!(
+        caught_up
+            .iter()
+            .all(|event| event.kind != EventKind::PluginInstalled),
+        "the catch-up path withholds the installation"
+    );
+
+    late_socket.close(None).await.unwrap();
+    member_socket.close(None).await.unwrap();
+    admin_socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_browser_flow_leaves_the_newer_flows_cookie_alone() {
+    let (mcp_url, authorization_server, _tokens, forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let mut socket = open_socket(&running, token).await;
+    let session_cookie = browser_session(&running, "Ada").await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let callback = sign_in_callback(&running, &authorization_server);
+    let bind_url = format!("{}/api/mcp/signin/bind", running.browser_url());
+
+    // The account starts one browser flow and binds it, then a command
+    // line flow (which owns no browser cookie and stays pending), then a
+    // second browser flow. The Space keeps one pending browser flow per
+    // account, so the second replaces the first; each flow's binding
+    // cookie has its own name.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("first".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let first: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (first_cookie, _first_nonce, first_authorize) =
+        bind_sign_in(&client, &running, first, Some(&session_cookie)).await;
+    let first_state = query_parameter(&first_authorize, "state").expect("the URL carries a state");
+
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("command-line".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: Some("http://127.0.0.1:4714".to_owned()),
+        }),
+    )
+    .await;
+    let command_line: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("second".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let second: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+
+    let replaced = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: first },
+    )
+    .await;
+    assert_eq!(replaced["state"], json!("failed"));
+    assert_eq!(
+        replaced["reason"],
+        json!(test_support::SIGN_IN_REPLACED),
+        "the replaced flow reads the fixed sentence"
+    );
+    let untouched = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus {
+            sign_in: command_line,
+        },
+    )
+    .await;
+    assert_eq!(
+        untouched["state"],
+        json!("pending"),
+        "a command line flow is not replaced"
+    );
+
+    // A replaced flow cannot bind again: a terminal flow's bind reads the
+    // fixed failure and writes no cookie, so it cannot overwrite the newer
+    // flow's binding.
+    let stale_bind = client
+        .get(&bind_url)
+        .query(&[("sign_in", first.to_string())])
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_bind.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        stale_bind.headers().get("set-cookie").is_none(),
+        "a terminal flow's bind sets no cookie"
+    );
+    let body = stale_bind.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains(&first.to_string()),
+        "the page echoes no sign-in id: {body}"
+    );
+
+    // The newer flow binds under its own cookie name, so both answers can
+    // reach one browser without either overwriting the other's binding.
+    let (second_cookie, _second_nonce, second_authorize) =
+        bind_sign_in(&client, &running, second, Some(&session_cookie)).await;
+    assert_ne!(
+        first_cookie.split('=').next(),
+        second_cookie.split('=').next(),
+        "each flow's binding has its own cookie name"
+    );
+    let second_state =
+        query_parameter(&second_authorize, "state").expect("the URL carries a state");
+
+    // The browser holds both binding cookies now. The older flow's
+    // callback arrives after the newer bind; its state names no flow any
+    // more, so the fixed failure must clear neither cookie.
+    let stale = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", first_state.as_str())])
+        .header("cookie", format!("{first_cookie}; {second_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        stale.headers().get("set-cookie").is_none(),
+        "a spent state's failure must not clear the newer flow's cookie"
+    );
+    let body = stale.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert!(
+        !body.contains(&first_state) && !body.contains("fake-code"),
+        "the page echoes neither the state nor the code: {body}"
+    );
+    assert!(
+        forms.lock().unwrap().is_empty(),
+        "a spent state's callback exchanges no code"
+    );
+
+    // The newer flow still finishes with both cookies in the browser, and
+    // its answer clears only its own binding.
+    let page = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+        .header("cookie", format!("{first_cookie}; {second_cookie}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let cleared = page
+        .headers()
+        .get("set-cookie")
+        .expect("the finished flow clears its binding")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        cleared.starts_with(&format!("{}=", test_support::sign_in_cookie_name(second))),
+        "the flow that finished clears its own binding cookie: {cleared}"
+    );
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    assert!(
+        !cleared.contains(&test_support::sign_in_cookie_name(first)),
+        "the answer clears no other flow's cookie: {cleared}"
+    );
+    let body = page.text().await.unwrap();
+    assert!(body.contains("finished"), "{body}");
+    let finished = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: second },
+    )
+    .await;
+    assert_eq!(finished["state"], json!("finished"));
+    assert_eq!(forms.lock().unwrap().len(), 1, "one code was exchanged");
+
+    // A finished flow cannot bind: it already has its browser.
+    let finished_bind = client
+        .get(&bind_url)
+        .query(&[("sign_in", second.to_string())])
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(finished_bind.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        finished_bind.headers().get("set-cookie").is_none(),
+        "a finished flow's bind sets no cookie"
+    );
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_browsers_bind_cannot_overwrite_the_newer_flows_cookie() {
+    let (mcp_url, authorization_server, _tokens, _forms, _calls, _registrations, mcp_task, as_task) =
+        fake_sign_in_landscape().await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let mut socket = open_socket(&running, token).await;
+    let session_cookie = browser_session(&running, "Ada").await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let callback = sign_in_callback(&running, &authorization_server);
+    let bind_url = format!("{}/api/mcp/signin/bind", running.browser_url());
+
+    // Flow A starts and binds. Its bind answer is the one an in-progress
+    // request would write; the browser receives it only after B's answer.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("first".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let first: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (first_cookie, _first_nonce, first_authorize) =
+        bind_sign_in(&client, &running, first, Some(&session_cookie)).await;
+    let first_state = query_parameter(&first_authorize, "state").expect("the URL carries a state");
+
+    // Flow B for the same account replaces A and binds. Both answers write
+    // their own cookie names, so the older one cannot overwrite B's.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("second".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let second: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (second_cookie, _second_nonce, second_authorize) =
+        bind_sign_in(&client, &running, second, Some(&session_cookie)).await;
+    let second_state =
+        query_parameter(&second_authorize, "state").expect("the URL carries a state");
+    assert_ne!(
+        first_cookie.split('=').next(),
+        second_cookie.split('=').next(),
+        "each flow's binding has its own cookie name"
+    );
+
+    // A's bind request that was in flight when B replaced A completes: the
+    // handler re-checks the replaced flow under the lock and refuses it,
+    // setting no cookie, so B's binding is untouched.
+    let stale_bind = client
+        .get(&bind_url)
+        .query(&[("sign_in", first.to_string())])
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale_bind.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        stale_bind.headers().get("set-cookie").is_none(),
+        "a replaced flow's bind sets no cookie"
+    );
+
+    // The callback reads the cookie its matched flow names: B's state with
+    // only A's cookie is no binding, and its refusal clears nothing.
+    let crossed = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+        .header("cookie", &first_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(crossed.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        crossed.headers().get("set-cookie").is_none(),
+        "another flow's cookie completes nothing and clears nothing"
+    );
+
+    // The browser holds both binding cookies now. A's state names no flow
+    // any more, so its callback clears neither.
+    let both = format!("{first_cookie}; {second_cookie}");
+    let stale = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", first_state.as_str())])
+        .header("cookie", &both)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        stale.headers().get("set-cookie").is_none(),
+        "a spent state's failure clears no binding"
+    );
+
+    // B's callback succeeds although A's cookie is in the browser too, and
+    // it clears only its own binding.
+    let page = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+        .header("cookie", &both)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    let cleared = page
+        .headers()
+        .get("set-cookie")
+        .expect("the finished flow clears its binding")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert!(
+        cleared.starts_with(&format!("{}=", test_support::sign_in_cookie_name(second))),
+        "the flow that finished clears its own binding cookie: {cleared}"
+    );
+    assert!(cleared.contains("Max-Age=0"), "{cleared}");
+    assert!(
+        !cleared.contains(&test_support::sign_in_cookie_name(first)),
+        "the answer clears no other flow's cookie: {cleared}"
+    );
+    let body = page.text().await.unwrap();
+    assert!(body.contains("finished"), "{body}");
+    let finished = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: second },
+    )
+    .await;
+    assert_eq!(finished["state"], json!("finished"));
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_flow_discards_the_token_its_exchange_returns() {
+    let (
+        (mcp_url, authorization_server, _tokens, forms, _calls, _registrations, mcp_task, as_task),
+        delay,
+    ) = fake_sign_in_landscape_delayed().await;
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap();
+    let mut socket = open_socket(&running, token).await;
+    let session_cookie = browser_session(&running, "Ada").await;
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let callback = sign_in_callback(&running, &authorization_server);
+
+    // Flow A starts and binds, then its callback claims the flow and its
+    // token request stops inside the fake authorization server.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("first".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let first: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let (first_cookie, _first_nonce, first_authorize) =
+        bind_sign_in(&client, &running, first, Some(&session_cookie)).await;
+    let first_state = query_parameter(&first_authorize, "state").expect("the URL carries a state");
+    let first_callback = tokio::spawn({
+        let client = client.clone();
+        let callback = callback.clone();
+        let state = first_state.clone();
+        let cookie = first_cookie.clone();
+        async move {
+            client
+                .get(&callback)
+                .query(&[("code", "fake-code"), ("state", state.as_str())])
+                .header("cookie", cookie)
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    // The exchange is in flight: the flow is admitted but not yet
+    // committed, so a poll still reads pending.
+    delay.arrived.notified().await;
+    let during = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: first },
+    )
+    .await;
+    assert_eq!(during["state"], json!("pending"));
+
+    // Flow B for the same account replaces A. Its start finds A
+    // executing and writes the terminal sentence A's delivery must not
+    // overwrite.
+    let started = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+            server: None,
+            name: Some("second".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        }),
+    )
+    .await;
+    let second: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+    let replaced = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: first },
+    )
+    .await;
+    assert_eq!(replaced["state"], json!("failed"));
+    assert_eq!(replaced["reason"], json!(test_support::SIGN_IN_REPLACED));
+
+    // Flow B binds and finishes while A's token request is still held.
+    let (second_cookie, _second_nonce, second_authorize) =
+        bind_sign_in(&client, &running, second, Some(&session_cookie)).await;
+    let second_state =
+        query_parameter(&second_authorize, "state").expect("the URL carries a state");
+    let page = client
+        .get(&callback)
+        .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+        .header("cookie", &second_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(page.status(), reqwest::StatusCode::OK);
+    assert!(page.text().await.unwrap().contains("finished"));
+    let finished = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: second },
+    )
+    .await;
+    assert_eq!(finished["state"], json!("finished"));
+    let server: Id = serde_json::from_value(finished["server"].clone()).unwrap();
+    // B's exchange was the second one: its numbered token is the newer
+    // credential, and the Vault holds it now.
+    assert_eq!(
+        running
+            .test_fields()
+            .secrets
+            .mcp_credential(server, None)
+            .unwrap()
+            .as_deref(),
+        Some("token-2"),
+        "the winning flow's credential is in the Vault"
+    );
+    let cursor = running.test_fields().store.last_seq().await.unwrap();
+
+    // Release A's token. Its flow was replaced, so the token is discarded:
+    // no Vault write, no event, and the terminal sentence stays.
+    delay.release.notify_one();
+    let stale = first_callback.await.unwrap();
+    assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(
+        stale.headers().get("set-cookie").is_none(),
+        "a replaced flow's answer clears no newer binding"
+    );
+    let body = stale.text().await.unwrap();
+    assert!(body.contains("failed"), "{body}");
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        cursor,
+        "a replaced flow's late exchange appends no event"
+    );
+    assert_eq!(
+        running
+            .test_fields()
+            .secrets
+            .mcp_credential(server, None)
+            .unwrap()
+            .as_deref(),
+        Some("token-2"),
+        "a replaced flow's late token does not overwrite the newer credential"
+    );
+    let stale_status = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::McpSignInStatus { sign_in: first },
+    )
+    .await;
+    assert_eq!(stale_status["state"], json!("failed"));
+    assert_eq!(
+        stale_status["reason"],
+        json!(test_support::SIGN_IN_REPLACED),
+        "the replacement's terminal sentence stays"
+    );
+    let events = running
+        .test_fields()
+        .store
+        .events_from(Seq::ZERO, 100)
+        .await
+        .unwrap()
+        .events;
+    let added: Vec<_> = events
+        .iter()
+        .filter(|event| event.kind == EventKind::McpServerAdded)
+        .collect();
+    assert_eq!(added.len(), 1, "only the winning flow records a connection");
+    assert_eq!(added[0].data["server"], json!(server));
+    assert_eq!(
+        forms.lock().unwrap().len(),
+        2,
+        "both exchanges reached the authority"
+    );
+
+    socket.close(None).await.unwrap();
+    mcp_task.abort();
+    as_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn historical_events_without_a_scope_stay_their_authors() {
+    let (_dir, running, invite) = running().await;
+    let mut admin_socket = admin_socket(&running, &invite).await;
+    let admin = running
+        .test_fields()
+        .identity
+        .admin_account()
+        .await
+        .unwrap()
+        .expect("the Space has an Admin");
+    running
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let member_token = sign_in(&running, "Grace").await;
+    let mut member_socket = open_socket(&running, &member_token).await;
+
+    // A record written before the events carried a scope or a library: it
+    // says nothing about the Space, so a member must not read it.
+    let server = Id::new();
+    let skill = Id::new();
+    let plugin = Id::new();
+    running
+        .test_fields()
+        .store
+        .append(AppendRequest::new(
+            Id::new(),
+            "old-record".to_owned(),
+            vec![
+                EventDraft::new(
+                    EventKind::McpServerUpdated,
+                    Author::User(admin.id),
+                    json!({
+                        "server": server,
+                        "url": null,
+                        "credential": true,
+                        "by": admin.id,
+                    }),
+                ),
+                EventDraft::new(
+                    EventKind::McpServerRemoved,
+                    Author::User(admin.id),
+                    json!({"server": server}),
+                ),
+                EventDraft::new(
+                    EventKind::SkillRemoved,
+                    Author::User(admin.id),
+                    json!({"skill": skill}),
+                ),
+                EventDraft::new(
+                    EventKind::PluginInstalled,
+                    Author::User(admin.id),
+                    json!({
+                        "plugin": plugin,
+                        "name": "reports",
+                        "digest": "a".repeat(64),
+                        "source": "https://example.com/reports",
+                    }),
+                ),
+            ],
+        ))
+        .await
+        .unwrap();
+
+    // The author reads the old shaped events back.
+    let (_cursor, admin_events) = snapshot_events(&mut admin_socket).await;
+    assert!(admin_events.iter().any(|event| {
+        event.kind == EventKind::McpServerUpdated
+            && event.data.get("scope").is_none()
+            && event.data["server"] == json!(server)
+    }));
+    assert!(admin_events.iter().any(|event| {
+        event.kind == EventKind::McpServerRemoved
+            && event.data.get("scope").is_none()
+            && event.data["server"] == json!(server)
+    }));
+    assert!(admin_events.iter().any(|event| {
+        event.kind == EventKind::SkillRemoved
+            && event.data.get("library").is_none()
+            && event.data["skill"] == json!(skill)
+    }));
+    assert!(
+        admin_events
+            .iter()
+            .any(|event| event.kind == EventKind::PluginInstalled)
+    );
+
+    // A member receives none of them, and still receives what belongs to
+    // the Space itself.
+    let (_cursor, member_events) = snapshot_events(&mut member_socket).await;
+    assert!(
+        member_events.iter().all(|event| {
+            event.data.get("server") != Some(&json!(server))
+                && event.data.get("skill") != Some(&json!(skill))
+                && event.data.get("plugin") != Some(&json!(plugin))
+        }),
+        "the historical events stay their author's"
+    );
+    assert!(
+        member_events
+            .iter()
+            .any(|event| event.kind == EventKind::UserJoined),
+        "a Space-wide event still reaches a member"
+    );
+
+    member_socket.close(None).await.unwrap();
+    admin_socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_about_a_misspelt_server_tool_is_refused() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    // The Bot may call a server, but the server does not answer: a tool name
+    // no reachable server lists is a misspelling, and recording it would make
+    // a rule that can never match.
+    let url = unreachable_mcp_url().await;
+    let server = add_mcp_server(&mut socket, "docs", &url, None).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    let before = running.test_fields().store.last_seq().await.unwrap();
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        add_rule(bot, neha::record::RuleEffect::Ask, "reed_file", None, None),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "there is no tool named reed_file"),
+        "a server that cannot be reached offers no tool: {refused:?}"
+    );
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        before,
+        "the refused rule appends nothing"
+    );
+    let rules = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleList { bot: Some(bot) },
+    )
+    .await;
+    assert!(rules.as_array().unwrap().is_empty());
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_about_a_named_unreachable_server_tool_is_refused() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    // A rule that names its server matches only that server's tool: a server
+    // that cannot be reached lists nothing, so a name it never offered is
+    // refused as unknown rather than recorded as a rule that cannot match.
+    let url = unreachable_mcp_url().await;
+    let server = add_mcp_server(&mut socket, "review", &url, None).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    let before = running.test_fields().store.last_seq().await.unwrap();
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        add_rule_to_server(bot, neha::record::RuleEffect::Ask, "reed_file", "review"),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "there is no tool named reed_file on that server"),
+        "a named server that cannot be reached offers no tool: {refused:?}"
+    );
+    assert_eq!(
+        running.test_fields().store.last_seq().await.unwrap(),
+        before,
+        "the refused rule appends nothing"
+    );
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_never_records_while_its_named_server_becomes_enabled() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let mut rule_socket = open_socket(&running, &token).await;
+    let (url, _log, server_task) =
+        fake_mcp_server_tool("get_weather", |_call| json!({"content": []})).await;
+    let server = add_mcp_server(&mut socket, "review", &url, Some("token-1")).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+    // The name is not one the server lists, so however the pending command and
+    // the enable interleave, no rule may be recorded: it is either refused
+    // because the Bot cannot call the server yet, or because discovery says
+    // the server does not list that tool.
+    let rule = tokio::spawn(async move {
+        try_command(
+            &mut rule_socket,
+            Id::new(),
+            add_rule_to_server(bot, neha::record::RuleEffect::Ask, "reed_file", "review"),
+        )
+        .await
+    });
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+    let refused = rule.await.unwrap();
+    assert!(
+        refused.is_err(),
+        "the pending rule must be refused: {refused:?}"
+    );
+
+    let rules = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleList { bot: Some(bot) },
+    )
+    .await;
+    assert!(
+        rules.as_array().unwrap().is_empty(),
+        "no rule is recorded against the server: {rules}"
+    );
+
+    socket.close(None).await.unwrap();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_naming_a_server_accepts_its_discovered_tool() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (url, _log, server_task) =
+        fake_mcp_server_tool("get_weather", |_call| json!({"content": []})).await;
+    let server = add_mcp_server(&mut socket, "weather", &url, Some("token-1")).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    // The named server's discovery lists the tool, so the rule may name it.
+    let made = command(
+        &mut socket,
+        Id::new(),
+        add_rule_to_server(bot, neha::record::RuleEffect::Ask, "get_weather", "weather"),
+    )
+    .await;
+    assert!(made["rule"].is_string(), "{made}");
+    let rules = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleList { bot: Some(bot) },
+    )
+    .await;
+    let rules = rules.as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["server"], json!(server));
+    assert_eq!(rules[0]["tool"], "get_weather");
+
+    socket.close(None).await.unwrap();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+/// A rule is recorded against the server whose tool list it was validated on.
+///
+/// The old server can be removed and another enabled under the same name while
+/// discovery holds the command before its write; the replacement lists a
+/// different tool, so it must not inherit the rule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_is_refused_when_its_server_is_replaced_during_discovery() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    // The old server answers its handshake but holds its tool list, so the
+    // Space is still discovering it when the replacement arrives.
+    let old = fake_mcp_server_tool_gated("old_tool").await;
+    let old_server = add_mcp_server(&mut socket, "review", &old.url, None).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable {
+            bot,
+            server: old_server,
+        },
+    )
+    .await;
+
+    // The replacement lists a different tool. A rule for the old tool must
+    // never be recorded against the replacement.
+    let (new_url, _new_log, new_task) =
+        fake_mcp_server_tool("new_tool", |_call| json!({"content": []})).await;
+    let mut other = open_socket(&running, &token).await;
+
+    let rule = tokio::spawn(async move {
+        try_command(
+            &mut socket,
+            Id::new(),
+            add_rule_to_server(bot, neha::record::RuleEffect::Ask, "old_tool", "review"),
+        )
+        .await
+    });
+    wait_for_logged_method(&old.log, "tools/list").await;
+
+    command(
+        &mut other,
+        Id::new(),
+        CommandCall::McpRemove { server: old_server },
+    )
+    .await;
+    let new_server = add_mcp_server(&mut other, "review", &new_url, None).await;
+    command(
+        &mut other,
+        Id::new(),
+        CommandCall::BotMcpEnable {
+            bot,
+            server: new_server,
+        },
+    )
+    .await;
+    old.release.notify_one();
+
+    let refused = rule.await.unwrap();
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "the MCP server changed while the rule was being checked"),
+        "a rule validated against the replaced server is refused: {refused:?}"
+    );
+    let rules = approvals_of(&mut other, bot).await;
+    assert!(
+        rules.is_empty(),
+        "the refused rule appends nothing: {rules:?}"
+    );
+    assert!(
+        rules.iter().all(|view| view["server"] != json!(new_server)),
+        "the replacement server has no rule: {rules:?}"
+    );
+
+    other.close(None).await.unwrap();
+    old.task.abort();
+    new_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_about_a_server_the_bot_cannot_call_is_refused() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    // The Space holds an unreachable server, but this Bot was not given it:
+    // the tool name is not one the Bot can ever call.
+    let url = unreachable_mcp_url().await;
+    add_mcp_server(&mut socket, "docs", &url, None).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        add_rule(
+            bot,
+            neha::record::RuleEffect::Allow,
+            "reed_file",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message == "there is no tool named reed_file"),
+        "a server the Bot may not call offers it nothing: {refused:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_naming_no_server_is_accepted_for_a_discovered_tool() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (url, _log, server_task) =
+        fake_mcp_server_tool("get_weather", |_call| json!({"content": []})).await;
+    let server = add_mcp_server(&mut socket, "weather", &url, Some("token-1")).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    // Discovery lists the tool, so a server-less rule may name it.
+    let made = command(
+        &mut socket,
+        Id::new(),
+        add_rule(
+            bot,
+            neha::record::RuleEffect::Ask,
+            "get_weather",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(made["rule"].is_string(), "{made}");
+    let rules = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleList { bot: Some(bot) },
+    )
+    .await;
+    let rules = rules.as_array().unwrap();
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["tool"], "get_weather");
+    assert!(
+        rules[0].get("server").is_none_or(Value::is_null),
+        "a rule that names no server covers every server offering it: {rules:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    server_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_builtin_rule_needs_no_discovery_on_either_computer() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    // A Local Computer's built-in rule is valid however unreachable the
+    // Space's MCP servers are.
+    let url = unreachable_mcp_url().await;
+    let server = add_mcp_server(&mut socket, "docs", &url, None).await;
+    let (computer, _machine) =
+        paired_computer_with_token(&mut socket, &running, &machine_token_n(72)).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let local: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot: local, server },
+    )
+    .await;
+    let made = command(
+        &mut socket,
+        Id::new(),
+        add_rule(
+            local,
+            neha::record::RuleEffect::Ask,
+            "read_file",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(made["rule"].is_string(), "{made}");
+
+    // The one built-in a Hosted Computer can never ask for is a Computer
+    // action; a Space-served built-in, a skill's script, is accepted there,
+    // and the refusal of the Computer action says so.
+    let (hosted, _chat, _computer) =
+        tool_bot(&mut socket, "http://127.0.0.1:1/v1".to_owned()).await;
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot: hosted, skill },
+    )
+    .await;
+    let made = command(
+        &mut socket,
+        Id::new(),
+        add_script_rule(hosted, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
+    )
+    .await;
+    assert!(made["rule"].is_string(), "{made}");
+
+    let refused = try_command(
+        &mut socket,
+        Id::new(),
+        add_rule(
+            hosted,
+            neha::record::RuleEffect::Ask,
+            "read_file",
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::InvalidArgument, ref message))
+                if message.contains("Hosted Computer never asks")
+                    && message.contains("Space-served")),
+        "the refusal names the rule a Hosted Computer can have: {refused:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_list_names_the_identity_each_rule_covers() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (mcp_url, _log, server_task) = fake_mcp_server(|_call| json!({"content": []})).await;
+    let server = add_mcp_server(&mut socket, "docs", &mcp_url, Some("token-1")).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotMcpEnable { bot, server },
+    )
+    .await;
+
+    // A server's tool rule answers with the server it names, by id and name,
+    // so two servers that offer one tool name are different rules.
+    let made = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleAdd {
+            bot,
+            effect: neha::record::RuleEffect::Ask,
+            tool: "search".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: None,
+            script: None,
+            server: Some("docs".to_owned()),
+        },
+    )
+    .await;
+    assert_eq!(made["server"], json!(server));
+    assert_eq!(made["server_name"], json!("docs"));
+    assert_eq!(made["tool"], json!("search"));
+
+    // A skill's script rule answers with the skill and the script it matches,
+    // so it cannot read as covering every script.
+    let added = command(
+        &mut socket,
+        Id::new(),
+        add_skill(
+            None,
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+            &[("hello.sh", "printf 'hello'")],
+        ),
+    )
+    .await;
+    let skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::BotSkillEnable { bot, skill },
+    )
+    .await;
+    let made = command(
+        &mut socket,
+        Id::new(),
+        add_script_rule(bot, neha::record::RuleEffect::Ask, "hello", "hello.sh"),
+    )
+    .await;
+    assert_eq!(made["skill"], json!(skill));
+    assert_eq!(made["skill_name"], json!("hello"));
+    assert_eq!(made["script"], json!("hello.sh"));
+
+    // The listing carries that same identity for both rows.
+    let listed = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::RuleList { bot: Some(bot) },
+    )
+    .await;
+    let rows = listed.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{listed}");
+    let server_rule = rows
+        .iter()
+        .find(|row| row["tool"] == "search")
+        .expect("the server's tool rule is listed");
+    assert_eq!(server_rule["server"], json!(server));
+    assert_eq!(server_rule["server_name"], json!("docs"));
+    assert!(server_rule["skill"].is_null());
+    let script_rule = rows
+        .iter()
+        .find(|row| row["tool"] == "run_skill_script")
+        .expect("the script rule is listed");
+    assert_eq!(script_rule["skill"], json!(skill));
+    assert_eq!(script_rule["skill_name"], json!("hello"));
+    assert_eq!(script_rule["script"], json!("hello.sh"));
+    assert!(script_rule["server"].is_null());
+
+    socket.close(None).await.unwrap();
+    server_task.abort();
     running.shutdown().await;
 }

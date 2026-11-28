@@ -103,3 +103,23 @@ async fn cancelling_a_long_shell_ends_it() {
         .unwrap();
     assert_ne!(result.status, ActionStatus::Succeeded, "{result:?}");
 }
+
+/// A managed Computer refuses a skill script before it stages anything.
+#[tokio::test]
+async fn windows_refuses_skill_scripts_before_staging() {
+    let directory = tempfile::tempdir().unwrap();
+    let runtime = LocalRuntime::new(directory.path().join("workspace")).unwrap();
+    let result = runtime
+        .execute(Action::RunScript {
+            name: "test.cmd".to_owned(),
+            content: "echo yes".to_owned(),
+            arguments: Vec::new(),
+        })
+        .await;
+    assert_eq!(result.status, ActionStatus::Failed);
+    assert_eq!(
+        result.output.text,
+        "a skill script cannot run on a Windows Computer yet"
+    );
+    assert!(!runtime.workspace().join(".neha").exists());
+}

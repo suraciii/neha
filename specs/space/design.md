@@ -45,7 +45,9 @@ A Space makes no backup of its home before it migrates. [Storage](#storage) cove
 
 ## Events
 
-An event has a kind, a version, an author, and data. A kind belongs to one Plugin and declares the schema of its data, and Neha rejects data that does not match it.
+An event has a kind, a version, an author, and data. A kind belongs to the Kernel, which declares the schema of its data, and Neha rejects data that does not match it.
+
+An installed Plugin declares no kind. [Plugin](../plugin/design.md#record) states what one can write.
 
 A reader keeps every event. A kind it does not know that decides who can read or act makes it stop and ask for an upgrade.
 
@@ -56,7 +58,7 @@ The record holds these kinds for approvals and rules:
 | Kind | What it records |
 | --- | --- |
 | `neha.run.reply` | A step's reply: its content, calls, and usage |
-| `neha.approval.requested` | The Computer, the call's index, the action, its arguments, the summary, the reason, the rule that asked when one did, whether an ambiguous form raised it, the lasting scope, and whether the action can be undone |
+| `neha.approval.requested` | The Computer when the action runs on one and otherwise the MCP server, the call's index, the action, its arguments, the summary, the reason, the rule that asked when one did, whether an ambiguous form raised it, the lasting scope, and whether the action can be undone |
 | `neha.approval.decided` | The answer, and the rule a lasting answer added |
 | `neha.rule.added` | A lasting Ask or Allow rule |
 | `neha.rule.removed` | A lasting rule removed |

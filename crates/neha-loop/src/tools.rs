@@ -18,11 +18,24 @@ pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
 /// The list files tool.
 pub const LIST_FILES: &str = "list_files";
+/// The tool that loads a skill's body.
+pub const SKILL: &str = "skill";
+/// The action that runs a skill's script on the Computer.
+pub const RUN_SKILL_SCRIPT: &str = "run_skill_script";
 
 /// Every built-in tool, by its wire name.
-pub const NAMES: [&str; 4] = [SHELL, READ_FILE, WRITE_FILE, LIST_FILES];
+pub const NAMES: [&str; 6] = [
+    SHELL,
+    READ_FILE,
+    WRITE_FILE,
+    LIST_FILES,
+    SKILL,
+    RUN_SKILL_SCRIPT,
+];
 
-/// Returns whether a tool name is one every Bot has.
+/// Returns whether a tool name is one the loop declares itself.
+///
+/// A server's tool is named by the server, so it is never built in.
 #[must_use]
 pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
@@ -83,6 +96,40 @@ pub fn specs() -> Vec<ToolSpec> {
                 "additionalProperties": false
             }),
         },
+        ToolSpec {
+            name: SKILL.to_owned(),
+            description: "Load the body of a skill the Bot has, by name. Call it when the \
+                          task matches the skill's description, then follow the body."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The skill's name."}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: RUN_SKILL_SCRIPT.to_owned(),
+            description: "Run a script a skill carries on the Bot's Computer, inside the \
+                          Workspace, and return its output."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string", "description": "The skill's name."},
+                    "script": {"type": "string", "description": "The script's file name within the skill."},
+                    "arguments": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The arguments passed after the script."
+                    }
+                },
+                "required": ["skill", "script"],
+                "additionalProperties": false
+            }),
+        },
     ]
 }
 
@@ -91,11 +138,90 @@ pub fn specs() -> Vec<ToolSpec> {
 pub enum Call {
     /// An action for the Computer.
     Computer(Action),
+    /// A tool the Space serves itself.
+    Space(SpaceCall),
 }
+
+/// A tool call the Space serves without its Computer running it as a plain
+/// action: it reads what the Space holds, or runs a script it delivers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpaceCall {
+    /// Loads the body of a skill the Bot has.
+    Skill { name: String },
+    /// Runs a skill's script on the Computer under the Bot's approvals.
+    Script {
+        skill: String,
+        script: String,
+        arguments: Vec<String>,
+    },
+    /// Calls a tool an MCP server gives the Bot, under its approvals.
+    Mcp {
+        /// The name the Model sees; the Space resolves the server and the
+        /// tool's original name before it calls anything.
+        name: String,
+        /// The arguments the server receives.
+        arguments: serde_json::Value,
+    },
+}
+
+/// Parses the arguments of a `skill` call.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillArguments {
+    name: String,
+}
+
+/// Parses the arguments of a `run_skill_script` call.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptArguments {
+    skill: String,
+    script: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+}
+
+/// The largest script call: a skill name, a script name, and 64 arguments of
+/// 4 KiB each fit well under this.
+const MAX_SCRIPT_CALL_BYTES: usize = 300 * 1024;
 
 /// Turns one raw tool call into what it asks for.
 pub fn parse(name: &str, arguments: &str) -> Result<Call, String> {
-    action(name, arguments).map(Call::Computer)
+    match name {
+        SKILL => {
+            let arguments: SkillArguments =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            Ok(Call::Space(SpaceCall::Skill {
+                name: arguments.name,
+            }))
+        }
+        RUN_SKILL_SCRIPT => {
+            if arguments.len() > MAX_SCRIPT_CALL_BYTES {
+                return Err(format!(
+                    "the script call is larger than {MAX_SCRIPT_CALL_BYTES} bytes"
+                ));
+            }
+            let arguments: ScriptArguments =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            if arguments.arguments.len() > 64 {
+                return Err("a script takes at most 64 arguments".to_owned());
+            }
+            Ok(Call::Space(SpaceCall::Script {
+                skill: arguments.skill,
+                script: arguments.script,
+                arguments: arguments.arguments,
+            }))
+        }
+        _ if name.starts_with("mcp__") => {
+            let arguments: serde_json::Value =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            Ok(Call::Space(SpaceCall::Mcp {
+                name: name.to_owned(),
+                arguments,
+            }))
+        }
+        _ => action(name, arguments).map(Call::Computer),
+    }
 }
 
 /// Turns one raw tool call into a Computer action.
@@ -180,7 +306,7 @@ struct WriteArguments {
 mod tests {
     use neha_computer::Action;
 
-    use super::{NAMES, action, is_builtin, specs};
+    use super::{Call, NAMES, SpaceCall, action, is_builtin, parse, specs};
 
     #[test]
     fn every_builtin_name_is_a_declared_tool() {
@@ -191,6 +317,10 @@ mod tests {
             assert!(is_builtin(name), "{name} is a built-in tool");
         }
         assert!(!is_builtin("reed_file"), "a misspelt tool is not one");
+        assert!(
+            !is_builtin("mcp__server__tool"),
+            "a server's tool is not built in"
+        );
         assert!(!is_builtin(""), "an empty name is not a tool");
     }
 
@@ -198,11 +328,35 @@ mod tests {
     fn every_tool_has_a_strict_schema() {
         let specs = specs();
 
-        assert_eq!(specs.len(), 4);
+        assert_eq!(specs.len(), 6);
         for spec in &specs {
             assert_eq!(spec.parameters["additionalProperties"], false);
             assert!(spec.description.len() < 300);
         }
+    }
+
+    #[test]
+    fn the_skill_tools_become_space_calls() {
+        assert_eq!(
+            parse("skill", r#"{"name":"weekly-report"}"#).unwrap(),
+            Call::Space(SpaceCall::Skill {
+                name: "weekly-report".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(
+                "run_skill_script",
+                r#"{"skill":"weekly-report","script":"collect.sh","arguments":["q4"]}"#
+            )
+            .unwrap(),
+            Call::Space(SpaceCall::Script {
+                skill: "weekly-report".to_owned(),
+                script: "collect.sh".to_owned(),
+                arguments: vec!["q4".to_owned()],
+            })
+        );
+        assert!(parse("skill", r#"{"name":1}"#).is_err());
+        assert!(parse("run_skill_script", r#"{"skill":"x"}"#).is_err());
     }
 
     #[test]

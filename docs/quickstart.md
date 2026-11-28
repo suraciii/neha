@@ -306,5 +306,5 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, or search. Notifications are available in an installed browser client on a public HTTPS origin; see [Notifications](notifications.md).
 - The browser client downloads a File and opens no preview of it. Choosing a file card downloads the File.
 - The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
-- A Bot on a Hosted Computer does not ask before an action yet, so its page offers no Ask or Allow rule to add or remove.
+- A Bot on a Hosted Computer does not ask before the actions its Computer runs, so its page offers no rule for those. It still lists and removes its rules for a skill's script or an MCP server's tool, which ask on either Computer.
 - The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

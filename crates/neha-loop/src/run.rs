@@ -16,8 +16,8 @@ use neha_computer::{ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Continuation, Message, Model, ModelFailure, ModelRequest, ToolCall};
-use crate::tools;
+use crate::model::{Continuation, Message, Model, ModelFailure, ModelRequest, ToolCall, ToolSpec};
+use crate::tools::{self, SpaceCall};
 
 /// The largest raw tool-call arguments string a step event keeps whole.
 const MAX_RECORDED_ARGUMENTS: usize = 128 * 1024;
@@ -42,10 +42,13 @@ pub struct RunRequest {
     /// The step a run without a recorded reply starts at, when the Space
     /// recovers it after an interruption.
     pub start_step: u32,
+    /// The tools the Model may call; the built-in tools unless the Space
+    /// names others.
+    pub tools: Vec<ToolSpec>,
 }
 
 impl RunRequest {
-    /// Builds a request with the default step limit.
+    /// Builds a request with the default step limit and the built-in tools.
     #[must_use]
     pub fn new(system: impl Into<String>, history: Vec<Message>, max_output: u32) -> Self {
         Self {
@@ -57,7 +60,15 @@ impl RunRequest {
             max_steps: 8,
             resume: None,
             start_step: 1,
+            tools: tools::specs(),
         }
+    }
+
+    /// Names the tools the Model may call, in place of the built-in tools.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<ToolSpec>) -> Self {
+        self.tools = tools;
+        self
     }
 
     /// Changes the step limit.
@@ -122,12 +133,19 @@ pub struct Resume {
 }
 
 /// A tool call as the record keeps it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RecordedCall {
     /// The identifier the call's tool result answers under; see [`call_id`].
     pub call: String,
     /// The tool's name.
     pub tool: String,
+    /// The MCP server the call names, when the record kept one.
+    ///
+    /// A replay pins the server: a replacement registered under the same name
+    /// must never run a call the answer was made for another server.
+    pub server: Option<Id>,
+    /// The tool's original name in that server.
+    pub tool_name: Option<String>,
     /// The Model's arguments as JSON; a refused call too large to keep is
     /// summarized instead.
     pub arguments: Value,
@@ -202,21 +220,35 @@ pub trait Recorder {
 
     /// Asks whether one action may start under `action`. A call the loop
     /// refused runs nothing and is not asked; every call that can run asks, a
-    /// File move included.
+    /// File move included. An action the User already answered is allowed
+    /// under its recorded identifier without a second card.
     fn approve(
         &mut self,
         step: u32,
         call: &RecordedCall,
         action: Id,
-    ) -> impl Future<Output = Result<Decision, LoopError>> + Send;
+    ) -> impl Future<Output = Result<Authorization, LoopError>> + Send;
 
-    /// Records an action before it runs.
+    /// Returns what an action the User already answered may do.
+    ///
+    /// The action runs under its recorded identifier, so the Space resolves
+    /// the identity from the record instead of asking again; the answer is
+    /// refused when the offer no longer names that identity.
+    fn authorized_action(
+        &mut self,
+        action: Id,
+        call: &RecordedCall,
+    ) -> impl Future<Output = Result<Authorization, LoopError>> + Send;
+
+    /// Records an action before it runs, with the identities the Space
+    /// resolved for it.
     fn action_started(
         &mut self,
         step: u32,
         action: Id,
         tool: String,
         arguments: Value,
+        dispatched: &Dispatched,
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 
     /// Records an action's result.
@@ -231,7 +263,67 @@ pub trait Recorder {
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
 }
 
-/// Runs one Bot run to its end, or until a Computer action waits for an approval.
+/// The skill and script one action runs, resolved before the action starts.
+///
+/// A record names a script's skill by its identifier and the script's bytes by
+/// their digest, so a replay credits the exact code that ran and never a
+/// replacement under the same names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptIdentity {
+    /// The installed skill.
+    pub skill: Id,
+    /// The script's file name within the skill.
+    pub name: String,
+    /// The digest of the script's bytes.
+    pub sha256: String,
+}
+
+/// The identity a server-given tool call runs under.
+///
+/// A record names such a call by its server's id and the tool's original name,
+/// never by the name the Model sees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct McpIdentity {
+    /// The server.
+    pub server: Id,
+    /// The tool's original name, as the server spells it.
+    pub tool: String,
+}
+
+/// What the Space resolved for one action before it starts.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Dispatched {
+    /// The skill and script the action runs, when it runs one.
+    pub script: Option<ScriptIdentity>,
+    /// The server and tool the action calls, when it calls one.
+    pub mcp: Option<McpIdentity>,
+}
+
+/// What the Space decided about one action before it starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Authorization {
+    /// The action may start, with the identities the Space resolved for it.
+    Allow(Dispatched),
+    /// The User must answer first.
+    Wait(Dispatched),
+    /// The action cannot run at all, and its failed result says why.
+    Refuse(String),
+}
+
+/// What a run works with: its Computer, and the tools the Space serves itself.
+pub trait Runtime: ComputerRuntime {
+    /// Serves one tool call the Space runs itself: a skill's body, or a
+    /// script it delivers to the Computer. The action is the identity the
+    /// record gave it, so the Space can check what the answer covered. A
+    /// refusal is a failed action, never a lost one.
+    fn serve(
+        &self,
+        action: Id,
+        call: SpaceCall,
+    ) -> impl Future<Output = Result<ActionResult, LoopError>> + Send;
+}
+
+/// Runs one Bot run to its end, or until an action waits for an approval.
 pub async fn run<R, M, Rec>(
     runtime: &R,
     model: &M,
@@ -239,7 +331,7 @@ pub async fn run<R, M, Rec>(
     request: RunRequest,
 ) -> Result<RunOutcome, LoopError>
 where
-    R: ComputerRuntime + Sync,
+    R: Runtime + Sync,
     M: Model + Sync,
     Rec: Recorder + Send,
 {
@@ -252,6 +344,7 @@ where
         max_steps,
         resume,
         start_step,
+        tools,
     } = request;
     let mut messages = Vec::with_capacity(history.len() + 8);
     messages.push(Message::system(system));
@@ -285,7 +378,7 @@ where
                     ..
                 } = resume;
                 continuation = step_continuation.or(continuation);
-                let calls = resumed_calls(calls)?;
+                let calls = resumed_calls(calls, &tools)?;
                 // The results of the done calls end the history, and the
                 // reply's calls come before them.
                 let at = messages.len() - done.min(messages.len() - 1);
@@ -300,7 +393,7 @@ where
                 let reply = match model
                     .complete(ModelRequest {
                         messages: messages.clone(),
-                        tools: tools::specs(),
+                        tools: tools.clone(),
                         max_output,
                         thinking,
                         continuation: continuation.clone(),
@@ -328,7 +421,7 @@ where
                     recorder.step(step, reply.usage, 0).await?;
                     return Ok(final_reply(reply.content, usage));
                 }
-                let calls = step_calls(step, &reply.tool_calls)?;
+                let calls = step_calls(step, &reply.tool_calls, &tools)?;
                 recorder
                     .reply(
                         step,
@@ -352,23 +445,49 @@ where
         if !(all_done && from >= calls.len()) {
             for (index, call) in calls.into_iter().enumerate().skip(from) {
                 // The action the User approved runs under its recorded identifier
-                // and is not asked for again. A refused call cannot have been
-                // approved, so it never takes that identifier.
-                let action = if index == from && call.parsed.is_ok() {
+                // and is not asked for again, even when a tool it needed is no
+                // longer offered: the card, the action's start, and its result
+                // must name one action. A call the record itself refused was
+                // never approved, so it takes no identifier.
+                let action = if index == from && call.recorded.refused.is_none() {
                     approved
                 } else {
                     None
                 };
-                let action = match action {
-                    Some(action) => action,
-                    None => {
-                        let action = Id::new();
-                        // A refused call runs nothing and asks nobody; every call
-                        // that can run asks, a File move included.
-                        if call.parsed.is_ok()
-                            && recorder.approve(step, &call.recorded, action).await?
-                                == Decision::Wait
-                        {
+                let approved_here = action.is_some();
+                let action = action.unwrap_or_else(Id::new);
+                // A refused call runs nothing and asks nobody; every call that
+                // can run asks, a File move included. An action the User
+                // already answered runs under its identifier without a second
+                // card, and the Space resolves the identity it recorded, but
+                // only while the run still offers its tool.
+                let mut dispatched = Dispatched::default();
+                let mut refused = None;
+                if approved_here {
+                    // The answer is a decision about this call; a tool the run
+                    // no longer offers cannot run under it, and recording a
+                    // refused call credits no first run.
+                    if tools.iter().any(|tool| tool.name == call.recorded.tool) {
+                        match recorder.authorized_action(action, &call.recorded).await? {
+                            Authorization::Allow(answered) => dispatched = answered,
+                            Authorization::Refuse(reason) => refused = Some(reason),
+                            // An answered call cannot ask again: a record that
+                            // says otherwise is not one this loop can replay.
+                            Authorization::Wait(_) => {
+                                return Err(LoopError::Record(
+                                    "an answered call asked again".to_owned(),
+                                ));
+                            }
+                        }
+                    } else {
+                        refused = Some(format!(
+                            "the tool {:?} is not offered to this run",
+                            call.recorded.tool
+                        ));
+                    }
+                } else if call.parsed.is_ok() {
+                    match recorder.approve(step, &call.recorded, action).await? {
+                        Authorization::Wait(_) => {
                             let recorded = call.recorded;
                             return Ok(RunOutcome::Waiting {
                                 approval: WaitingApproval {
@@ -381,22 +500,45 @@ where
                                 },
                             });
                         }
-                        action
+                        Authorization::Refuse(reason) => refused = Some(reason),
+                        Authorization::Allow(identity) => dispatched = identity,
                     }
-                };
+                }
                 recorder
                     .action_started(
                         step,
                         action,
                         call.recorded.tool.clone(),
                         call.recorded.arguments.clone(),
+                        &dispatched,
                     )
                     .await?;
-                let result = match call.parsed {
-                    Ok(tools::Call::Computer(computer_action)) => {
+                // An answer names one kind of action. If the record's call is
+                // not that kind, nothing runs: a built-in tool must never run
+                // under a server's or a script's answer.
+                let mismatch = match (dispatched.script.is_some(), dispatched.mcp.is_some()) {
+                    (true, _) => !matches!(
+                        call.parsed,
+                        Ok(tools::Call::Space(tools::SpaceCall::Script { .. }))
+                    ),
+                    (_, true) => !matches!(
+                        call.parsed,
+                        Ok(tools::Call::Space(tools::SpaceCall::Mcp { .. }))
+                    ),
+                    (false, false) => false,
+                };
+                let result = match (refused, mismatch, call.parsed) {
+                    (Some(reason), _, _) => ActionResult::failed(reason),
+                    (None, true, _) => ActionResult::failed(
+                        "the recorded action is not the one the answer names, so it did not run",
+                    ),
+                    (None, false, Ok(tools::Call::Computer(computer_action))) => {
                         runtime.execute(computer_action).await
                     }
-                    Err(error) => ActionResult::failed(error),
+                    (None, false, Ok(tools::Call::Space(space_call))) => {
+                        runtime.serve(action, space_call).await?
+                    }
+                    (None, false, Err(error)) => ActionResult::failed(error),
                 };
                 recorder
                     .action_finished(
@@ -443,16 +585,31 @@ struct StepCall {
 }
 
 /// The calls of a Model reply as the step runs them.
-fn step_calls(step: u32, calls: &[ToolCall]) -> Result<Vec<StepCall>, LoopError> {
+fn step_calls(
+    step: u32,
+    calls: &[ToolCall],
+    offered: &[ToolSpec],
+) -> Result<Vec<StepCall>, LoopError> {
     let calls: Vec<StepCall> = calls
         .iter()
         .enumerate()
         .map(|(index, call)| {
-            let parsed = tools::parse(&call.name, &call.arguments);
+            // A Model cannot call a tool the run did not offer it, whatever
+            // its reply names: the offer is the Space's decision. An unknown
+            // name keeps the parser's own refusal.
+            let parsed = match tools::parse(&call.name, &call.arguments) {
+                Ok(_) if !offered.iter().any(|tool| tool.name == call.name) => Err(format!(
+                    "the tool {:?} is not offered to this run",
+                    call.name
+                )),
+                parsed => parsed,
+            };
             StepCall {
                 recorded: RecordedCall {
                     call: call_id(&call.id, step, index),
                     tool: call.name.clone(),
+                    server: None,
+                    tool_name: None,
                     arguments: recorded_arguments(&parsed, &call.arguments),
                     refused: parsed.as_ref().err().cloned(),
                 },
@@ -465,7 +622,10 @@ fn step_calls(step: u32, calls: &[ToolCall]) -> Result<Vec<StepCall>, LoopError>
 }
 
 /// The recorded calls of a resumed step as the step runs them.
-fn resumed_calls(calls: Vec<RecordedCall>) -> Result<Vec<StepCall>, LoopError> {
+fn resumed_calls(
+    calls: Vec<RecordedCall>,
+    offered: &[ToolSpec],
+) -> Result<Vec<StepCall>, LoopError> {
     let calls: Vec<StepCall> = calls
         .into_iter()
         .map(|recorded| {
@@ -474,6 +634,12 @@ fn resumed_calls(calls: Vec<RecordedCall>) -> Result<Vec<StepCall>, LoopError> {
             // parsing them again could let the call run.
             let parsed = match &recorded.refused {
                 Some(refusal) => Err(refusal.clone()),
+                // A tool the run offers no longer cannot run, whatever the
+                // record of the reply says: the Space's decision now wins.
+                None if !offered.iter().any(|tool| tool.name == recorded.tool) => Err(format!(
+                    "the tool {:?} is not offered to this run",
+                    recorded.tool
+                )),
                 None => tools::parse(&recorded.tool, &recorded.arguments.to_string()),
             };
             StepCall { parsed, recorded }
@@ -604,12 +770,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Decision, LoopError, RecordedCall, Recorder, Resume, RunOutcome, RunRequest,
-        WaitingApproval, call_id, run,
+        Authorization, Dispatched, LoopError, RecordedCall, Recorder, Resume, RunOutcome,
+        RunRequest, Runtime, WaitingApproval, call_id, run,
     };
     use crate::model::{
         Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
+        ToolSpec,
     };
+    use crate::tools::SpaceCall;
 
     #[derive(Default)]
     struct FakeModel {
@@ -642,6 +810,7 @@ mod tests {
     struct FakeRuntime {
         actions: Mutex<Vec<Action>>,
         files: Mutex<Vec<(String, Vec<u8>)>>,
+        served: Mutex<Vec<SpaceCall>>,
         fail_writes: bool,
         lost: bool,
         slow_writes: bool,
@@ -717,14 +886,26 @@ mod tests {
         }
     }
 
+    impl Runtime for FakeRuntime {
+        #[allow(clippy::manual_async_fn)]
+        fn serve(
+            &self,
+            _action: Id,
+            call: SpaceCall,
+        ) -> impl Future<Output = Result<ActionResult, LoopError>> + Send {
+            self.served.lock().unwrap().push(call);
+            async move { Ok(ActionResult::succeeded(ToolOutput::full("the skill body"))) }
+        }
+    }
+
     /// The record, in the order the loop wrote it.
     #[derive(Default)]
     struct TestRecorder {
         steps: Vec<(u32, Usage, u32)>,
         replies: Vec<(u32, Option<String>, Vec<RecordedCall>, Usage)>,
         approvals: Vec<(u32, String, Id)>,
-        /// The decisions `approve` returns in order; Allow once it runs out.
-        decisions: VecDeque<Decision>,
+        /// The answers `approve` returns in order; Allow once it runs out.
+        decisions: VecDeque<Authorization>,
         started: Vec<(u32, String, Id)>,
         finished: Vec<(u32, ActionStatus)>,
         /// The method that fails, named by its entry in `order`.
@@ -736,7 +917,7 @@ mod tests {
         /// A record that refuses the first action it is asked about.
         fn that_waits() -> Self {
             Self {
-                decisions: VecDeque::from([Decision::Wait]),
+                decisions: VecDeque::from([Authorization::Wait(Dispatched::default())]),
                 ..Self::default()
             }
         }
@@ -775,10 +956,21 @@ mod tests {
             step: u32,
             call: &RecordedCall,
             action: Id,
-        ) -> Result<Decision, LoopError> {
+        ) -> Result<Authorization, LoopError> {
             self.record("approve")?;
             self.approvals.push((step, call.tool.clone(), action));
-            Ok(self.decisions.pop_front().unwrap_or(Decision::Allow))
+            Ok(self
+                .decisions
+                .pop_front()
+                .unwrap_or(Authorization::Allow(Dispatched::default())))
+        }
+
+        async fn authorized_action(
+            &mut self,
+            _action: Id,
+            _call: &RecordedCall,
+        ) -> Result<Authorization, LoopError> {
+            Ok(Authorization::Allow(Dispatched::default()))
         }
 
         async fn action_started(
@@ -787,6 +979,7 @@ mod tests {
             action: Id,
             tool: String,
             _arguments: Value,
+            _dispatched: &Dispatched,
         ) -> Result<(), LoopError> {
             self.record("action_started")?;
             self.started.push((step, tool, action));
@@ -869,7 +1062,7 @@ mod tests {
             call: id.to_owned(),
             tool: tool.to_owned(),
             arguments,
-            refused: None,
+            ..RecordedCall::default()
         }
     }
 
@@ -993,6 +1186,104 @@ mod tests {
         let second = requests[1].messages.last().unwrap();
         assert_eq!(second.role, crate::model::Role::Tool);
         assert_eq!(second.content.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn a_space_call_is_served_by_the_space_and_returns_to_the_model() {
+        let model = FakeModel::with(vec![
+            call_reply("skill", json!({"name": "weekly-report"})),
+            call_reply(
+                "run_skill_script",
+                json!({"skill": "weekly-report", "script": "collect.sh", "arguments": ["q4"]}),
+            ),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(
+            recorder
+                .started
+                .iter()
+                .map(|(_, tool, _)| tool.as_str())
+                .collect::<Vec<_>>(),
+            ["skill", "run_skill_script"]
+        );
+        assert!(
+            recorder
+                .finished
+                .iter()
+                .all(|(_, status)| *status == ActionStatus::Succeeded)
+        );
+        // The Computer ran nothing: both calls went to the Space.
+        assert!(runtime.actions.lock().unwrap().is_empty());
+        let served = runtime.served.lock().unwrap();
+        assert_eq!(
+            served.as_slice(),
+            [
+                SpaceCall::Skill {
+                    name: "weekly-report".to_owned(),
+                },
+                SpaceCall::Script {
+                    skill: "weekly-report".to_owned(),
+                    script: "collect.sh".to_owned(),
+                    arguments: vec!["q4".to_owned()],
+                },
+            ]
+        );
+        let requests = model.requests.lock().unwrap();
+        for request in &requests[..2] {
+            let names: Vec<&str> = request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect();
+            assert!(names.contains(&"skill") && names.contains(&"run_skill_script"));
+        }
+        assert_eq!(
+            requests[2].messages.last().unwrap().content.as_deref(),
+            Some("the skill body")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_space_names_the_tools_the_model_sees() {
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+        let extra = ToolSpec {
+            name: "mcp__docs__search".to_owned(),
+            description: "Search the docs.".to_owned(),
+            parameters: json!({"type": "object"}),
+        };
+
+        let _ = run(
+            &runtime,
+            &model,
+            &mut recorder,
+            RunRequest::new("system", Vec::new(), 100).with_tools(vec![extra]),
+        )
+        .await;
+
+        let requests = model.requests.lock().unwrap();
+        let names: Vec<&str> = requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert_eq!(names, ["mcp__docs__search"]);
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ A Message carries text, and it can carry a File or a Card.
 | Text with a File | The text and the file | The text and the File's id, name, type, and size |
 | Card | A rendered card | The Card's data, valid against its schema |
 
-A Card has a kind. Neha provides four kinds, and a Plugin can add more.
+A Card has a kind. Neha provides five kinds, and a Plugin can add more.
 
 | Kind | What it holds | What the user does with it |
 | --- | --- | --- |
@@ -28,16 +28,17 @@ A Card has a kind. Neha provides four kinds, and a Plugin can add more.
 | Question | A question and its options | Answers |
 | Page | A document or report | Opens it |
 | Dashboard | Live figures | Reads them |
+| App | An interactive tool from an MCP server | Uses it |
 
-An Approval card names one action of one run. It shows the action's tool, a summary, why the Bot asks, and whether the action can be undone: `shell` or `write_file` is not undoable, and every other action is unknown.
+An Approval card names one action of one run. It shows the action's tool and its server when it calls one, a summary, why the Bot asks, and whether the action can be undone: `shell` or `write_file` is not undoable, and every other action is unknown.
 
 An ambiguous form gives the reason `a form no rule can judge`, not a rule the User set.
 
 The summary escapes control characters and says how many bytes it leaves out when it is longer than 4096 bytes.
 
-When a rule asks and the action can make a lasting rule, the card shows what Always allow covers: the shell prefix, the file directory, the Workspace root, or the whole tool.
+When a rule asks and the action can make a lasting rule, the card shows what Always allow covers: the shell prefix, the file directory, the Workspace root, the whole tool, or the one script.
 
-It offers Allow, Always allow, and Deny; the first use of a Local Computer shows no Always allow.
+It offers Allow, Always allow, and Deny. The first use of a Local Computer shows no Always allow.
 
 After first use, an approval for a folder the owner has not granted offers Always allow, which grants that folder for later runs, only when a grant can store the folder. [Bot design](../../bot/design.md#approvals) states which folders a grant can store. That reason also names the first action of a Local Computer, whose card shows no Always allow.
 

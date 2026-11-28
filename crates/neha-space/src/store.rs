@@ -1160,6 +1160,81 @@ mod tests {
                 serde_json::json!({"rule": Id::new(), "bot": Id::new(), "user": user}),
             )
             .acting(user),
+            EventKind::SkillAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "skill": Id::new(),
+                    "library": "space",
+                    "name": "weekly-report",
+                    "description": "Write the weekly report.",
+                    "body": "1. Collect.",
+                    "scripts": [],
+                }),
+            ),
+            EventKind::SkillRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"skill": Id::new()}),
+            ),
+            EventKind::BotSkillEnabled | EventKind::BotSkillDisabled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"bot": Id::new(), "skill": Id::new()}),
+            ),
+            EventKind::McpServerAdded => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "server": Id::new(),
+                    "name": "docs",
+                    "url": "https://example.com/mcp",
+                    "scope": "space",
+                    "by": user,
+                }),
+            ),
+            EventKind::McpServerUpdated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "server": Id::new(),
+                    "url": null,
+                    "credential": true,
+                    "by": user,
+                }),
+            ),
+            EventKind::McpServerRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"server": Id::new()}),
+            ),
+            EventKind::BotMcpEnabled | EventKind::BotMcpDisabled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"bot": Id::new(), "server": Id::new()}),
+            ),
+            EventKind::PluginInstalled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "plugin": Id::new(),
+                    "name": "reports",
+                    "digest": "a".repeat(64),
+                    "source": "https://example.com/acme/reports@abc1234",
+                    "servers": [],
+                    "skills": [],
+                }),
+            ),
+            EventKind::PluginRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"plugin": Id::new()}),
+            ),
+            EventKind::PluginEnabled | EventKind::PluginDisabled => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"plugin": Id::new()}),
+            ),
         }
     }
 

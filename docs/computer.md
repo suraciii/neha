@@ -173,7 +173,7 @@ The old Computer may be offline when you move the Bot. If the new Computer is of
 
 A Computer is online while its daemon holds the channel to the Space. If the daemon stops, the Computer shows as offline in `neha computer list`, and a Message sent to one of its Bots waits in the record.
 
-The Space and the daemon must come from the same release. The channel speaks version 2, and the Space refuses a daemon whose channel version does not match. A daemon left on an older release connects and is refused; restart it with the `neha computer run` of this release.
+The Space and the daemon must come from the same release. The channel speaks version 3, and the Space refuses a daemon whose channel version does not match. A daemon left on an older release connects and is refused; restart it with the `neha computer run` of this release.
 
 `neha chat send` waits up to 180 seconds for the run to end. If the run is still queued, the command stops with `the run did not end within 180s`, and the Message and its run stay in the record.
 

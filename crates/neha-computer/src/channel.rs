@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{Action, ActionStatus, ToolOutput};
 
 /// The protocol version both ends speak.
-pub const CHANNEL_VERSION: u32 = 2;
+pub const CHANNEL_VERSION: u32 = 3;
 
 /// The largest frame either end accepts, 64 MiB.
 pub const MAX_CHANNEL_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -181,6 +181,18 @@ pub enum WireAction {
         /// The path, relative to the Bot's folder or absolute.
         path: String,
     },
+    /// Runs a script the Space delivered.
+    ///
+    /// A fenced Computer mounts the exact bytes read-only inside its sandbox
+    /// and runs them; the script never lives in the Bot's folder.
+    RunScript {
+        /// The file name the script runs under: one path component.
+        name: String,
+        /// The script's bytes.
+        content: String,
+        /// The arguments passed after the script path.
+        arguments: Vec<String>,
+    },
 }
 
 impl From<Action> for WireAction {
@@ -190,6 +202,15 @@ impl From<Action> for WireAction {
             Action::ReadFile { path } => Self::ReadFile { path },
             Action::WriteFile { path, content } => Self::WriteFile { path, content },
             Action::ListFiles { path } => Self::ListFiles { path },
+            Action::RunScript {
+                name,
+                content,
+                arguments,
+            } => Self::RunScript {
+                name,
+                content,
+                arguments,
+            },
         }
     }
 }
@@ -201,6 +222,15 @@ impl From<WireAction> for Action {
             WireAction::ReadFile { path } => Self::ReadFile { path },
             WireAction::WriteFile { path, content } => Self::WriteFile { path, content },
             WireAction::ListFiles { path } => Self::ListFiles { path },
+            WireAction::RunScript {
+                name,
+                content,
+                arguments,
+            } => Self::RunScript {
+                name,
+                content,
+                arguments,
+            },
         }
     }
 }
@@ -217,8 +247,8 @@ mod tests {
     }
 
     #[test]
-    fn both_ends_are_pinned_to_version_two_and_a_64_mib_frame() {
-        assert_eq!(CHANNEL_VERSION, 2);
+    fn both_ends_are_pinned_to_version_three_and_a_64_mib_frame() {
+        assert_eq!(CHANNEL_VERSION, 3);
         assert_eq!(MAX_CHANNEL_FRAME_BYTES, 64 * 1024 * 1024);
     }
 
@@ -296,6 +326,31 @@ mod tests {
                     "id": 10,
                     "bot": "bot-1",
                     "action": { "kind": "list_files", "path": "." },
+                }),
+            ),
+            (
+                HostFrame::Action {
+                    id: 15,
+                    bot: "bot-1".to_owned(),
+                    action: WireAction::RunScript {
+                        name: "summarize.sh".to_owned(),
+                        content: "#!/bin/sh\n".to_owned(),
+                        arguments: vec!["one".to_owned(), "two words".to_owned()],
+                    },
+                    working_dir: None,
+                    access: super::AccessFrame::default(),
+                    env: Vec::new(),
+                },
+                json!({
+                    "type": "action",
+                    "id": 15,
+                    "bot": "bot-1",
+                    "action": {
+                        "kind": "run_script",
+                        "name": "summarize.sh",
+                        "content": "#!/bin/sh\n",
+                        "arguments": ["one", "two words"],
+                    },
                 }),
             ),
             (
@@ -385,7 +440,7 @@ mod tests {
         let cases = [
             (
                 DeviceFrame::Hello {
-                    version: 2,
+                    version: 3,
                     computer: "computer-1".to_owned(),
                     workspace: "/home/me/.neha/workspace".to_owned(),
                     sandbox: true,
@@ -394,7 +449,7 @@ mod tests {
                 },
                 json!({
                     "type": "hello",
-                    "version": 2,
+                    "version": 3,
                     "computer": "computer-1",
                     "workspace": "/home/me/.neha/workspace",
                     "sandbox": true,
@@ -534,6 +589,11 @@ mod tests {
             },
             Action::ListFiles {
                 path: ".".to_owned(),
+            },
+            Action::RunScript {
+                name: "summarize.sh".to_owned(),
+                content: "#!/bin/sh\n".to_owned(),
+                arguments: vec!["one".to_owned(), "two words".to_owned()],
             },
         ];
 

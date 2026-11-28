@@ -247,7 +247,9 @@ fn key(sha256: &str) -> Result<String, BlobsError> {
     Ok(format!("{}/{}", &sha256[..2], sha256))
 }
 
-fn digest(bytes: &[u8]) -> String {
+/// Returns the digest the File store names one byte sequence by.
+#[must_use]
+pub fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))

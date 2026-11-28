@@ -14,8 +14,8 @@ use rand::RngExt as _;
 
 use neha::id::Id;
 use neha::record::{
-    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
-    RuleEffect, RunReply, Undoability,
+    ActionStatus, ApprovalReason, Author, CardData, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
+    McpScope, McpTransport, RuleEffect, RunReply, SkillLibrary, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -128,6 +128,156 @@ pub struct BotView {
     /// Its Model; absent uses the Space's default.
     #[serde(default)]
     pub model: Option<Id>,
+    /// The skills its owner enabled for it.
+    #[serde(default)]
+    pub skills: Vec<Id>,
+    /// The MCP servers its owner enabled for it.
+    #[serde(default)]
+    pub mcps: Vec<Id>,
+}
+
+/// An MCP server a Space or a User connected.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct McpServerView {
+    /// The server.
+    pub server: Id,
+    /// Its name, unique in the Space.
+    pub name: String,
+    /// The address it speaks Streamable HTTP at, when it is an HTTP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The executable it launches, when it is a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// A stdio server's arguments, with `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`
+    /// left for the launch to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// A stdio server's environment, with the placeholders left for the launch
+    /// to expand.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// A stdio server's working directory under its root, `/`-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether a stdio server's working directory hangs from the plugin data
+    /// directory rather than the plugin root.
+    #[serde(default)]
+    pub data_cwd: bool,
+    /// Where its credential belongs.
+    pub scope: McpScope,
+    /// The User it belongs to, when its scope is one User's.
+    pub user: Option<Id>,
+    /// The account that connected it.
+    pub by: Id,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
+    /// The fixed headers the package configures.
+    #[serde(default)]
+    pub headers: std::collections::BTreeMap<String, String>,
+    /// The cursor of `mcp.server.added`.
+    pub seq: Seq,
+}
+
+impl McpServerView {
+    /// Returns how the Space reaches this server: over Streamable HTTP, or by
+    /// launching the package's executable as a subprocess.
+    #[must_use]
+    pub fn transport(&self) -> McpTransport {
+        if self.command.is_some() {
+            McpTransport::Stdio
+        } else {
+            McpTransport::StreamableHttp
+        }
+    }
+
+    /// Returns the launch configuration, when this is a stdio server.
+    #[must_use]
+    pub fn stdio(&self) -> Option<neha::record::StdioServer> {
+        self.command
+            .as_ref()
+            .map(|command| neha::record::StdioServer {
+                command: command.clone(),
+                args: self.args.clone(),
+                env: self.env.clone(),
+                cwd: self.cwd.clone(),
+                data_cwd: self.data_cwd,
+            })
+    }
+}
+
+/// The most MCP servers one Space connects.
+pub const MAX_MCP_SERVERS: usize = 64;
+
+/// What a removed MCP server was, for finishing its cleanup by server id.
+///
+/// The record keeps the event that removed the server, but a retry can name
+/// only the server: it carries a new command id, so it cannot replay the
+/// command that removed it. This is what the projection keeps about the server
+/// that left, so finishing its cleanup reads no page of the record.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RemovedMcpView {
+    /// The name its removal answered with.
+    pub name: String,
+    /// The scope the server was connected under.
+    pub scope: McpScope,
+    /// The User the server belonged to, when it was one User's.
+    pub user: Option<Id>,
+}
+
+/// An installed package.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PluginView {
+    /// The package.
+    pub plugin: Id,
+    /// Its name from `plugin.json`.
+    pub name: String,
+    /// Its version from `plugin.json`, when it names one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    /// The digest of the package's bytes.
+    pub digest: String,
+    /// The commit it was fetched at, when it came from a repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    /// The source it came from.
+    pub source: String,
+    /// Whether the Space offers it.
+    pub enabled: bool,
+    /// The MCP servers it brought.
+    pub servers: Vec<Id>,
+    /// The skills it brought.
+    pub skills: Vec<Id>,
+    /// The cursor of `plugin.installed`.
+    pub seq: Seq,
+}
+
+/// A skill in a library.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SkillView {
+    /// The skill.
+    pub id: Id,
+    /// The library that holds it.
+    pub library: SkillLibrary,
+    /// The Bot whose library holds it, when it is a Bot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<Id>,
+    /// Its name, as the Agent Skills frontmatter spells it.
+    pub name: String,
+    /// What it does and when to use it.
+    pub description: String,
+    /// The body of its `SKILL.md`, without the frontmatter.
+    pub body: String,
+    /// The scripts it carries, each stored in the File store by digest.
+    pub scripts: Vec<neha::record::SkillScript>,
+    /// The User who added it.
+    pub by: Id,
+    /// The package that brought it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<Id>,
+    /// The cursor of `skill.added`.
+    pub seq: Seq,
 }
 
 /// A Computer.
@@ -265,6 +415,9 @@ pub struct MessageView {
     pub text: String,
     /// The File it carries.
     pub file: Option<Id>,
+    /// The Card it shows after its text, when a tool's answer carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardData>,
     /// When the Space recorded it.
     pub at: Timestamp,
     /// Its cursor.
@@ -299,6 +452,18 @@ pub struct ActionView {
     /// is not always an object.
     #[ts(type = "unknown")]
     pub arguments: serde_json::Value,
+    /// The MCP server the action called, when its tool belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The skill a `run_skill_script` action ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+    /// The digest of the script's bytes the action ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_sha256: Option<String>,
     /// Whether an `ActionFinished` event recorded this action.
     #[serde(skip)]
     pub finished: bool,
@@ -433,6 +598,14 @@ pub struct ApprovalView {
     pub rule: Option<Id>,
     /// What an "Always allow" would allow, in words the User reads.
     pub lasting_scope: Option<String>,
+    /// The MCP server the action calls, when its tool belongs to one.
+    pub server: Option<Id>,
+    /// The skill the action runs when its tool is `run_skill_script`.
+    pub skill: Option<Id>,
+    /// The script's file name within that skill.
+    pub script: Option<String>,
+    /// The digest of the skill's script the card was made for.
+    pub script_sha256: Option<String>,
     /// The folder a grant answer covers, when the reason is a grant.
     pub grant_folder: Option<String>,
     /// The directory the run works in, when it named one.
@@ -463,6 +636,15 @@ pub struct RuleView {
     pub command_prefix: Option<String>,
     /// The path prefix a matching file action's path starts with.
     pub path_prefix: Option<String>,
+    /// The MCP server whose tool a matching call names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The skill whose script a matching `run_skill_script` action runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Id>,
+    /// The script a matching `run_skill_script` action runs, within that skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     /// The cursor of `rule.added`.
     pub seq: Seq,
 }
@@ -538,9 +720,25 @@ pub struct State {
     pub approvals: Vec<ApprovalView>,
     /// The lasting rules in the order the record added them.
     pub rules: Vec<RuleView>,
+    /// The skills in both libraries, in the order the record added them.
+    pub skills: Vec<SkillView>,
+    /// The MCP servers in the order the record connected them.
+    pub mcps: Vec<McpServerView>,
+    /// The installed packages, in the order the record installed them.
+    pub plugins: Vec<PluginView>,
+    /// What removed MCP servers were, by id, so finishing a cleanup that names
+    /// the server needs no scan of the record. Only a removal fills it, and a
+    /// server id is never reused, so a later add never clears an entry.
+    removed_mcps: HashMap<Id, RemovedMcpView>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
+    /// The (Bot, acting User, skill, script name) that already ran a skill's
+    /// script; the first run of each asks.
+    pub script_runs: HashSet<(Id, Id, Id, String)>,
+    /// The (Bot, acting User, server, tool) that already called a server's
+    /// tool; the first call of each asks.
+    pub mcp_calls: HashSet<(Id, Id, Id, String)>,
     /// The Model's replies per run, in the order the record holds them.
     pub replies: HashMap<Id, Vec<RunReply>>,
     /// Runs a Space start found interrupted and may recover. It is not part of
@@ -600,6 +798,112 @@ impl State {
     #[must_use]
     pub fn rules_of(&self, bot: Id) -> Vec<&RuleView> {
         self.rules.iter().filter(|rule| rule.bot == bot).collect()
+    }
+
+    /// Returns a skill by identifier.
+    #[must_use]
+    pub fn skill(&self, skill: Id) -> Option<&SkillView> {
+        self.skills.iter().find(|view| view.id == skill)
+    }
+
+    /// Returns the skills a Bot may use: the Space's, when enabled for it,
+    /// and those in its own library when enabled for it.
+    #[must_use]
+    pub fn skills_of(&self, bot: Id) -> Vec<&SkillView> {
+        let Some(view) = self.bots.get(&bot) else {
+            return Vec::new();
+        };
+        view.skills
+            .iter()
+            .filter_map(|skill| self.skill(*skill))
+            .filter(|skill| {
+                skill.library == SkillLibrary::Space
+                    || matches!(skill.bot, Some(owner) if owner == bot)
+            })
+            .filter(|skill| self.plugin_offers(skill.plugin))
+            .collect()
+    }
+
+    /// Returns whether the Space offers a package, or everything not from one.
+    #[must_use]
+    pub fn plugin_offers(&self, plugin: Option<Id>) -> bool {
+        plugin.is_none_or(|plugin| {
+            self.plugins
+                .iter()
+                .any(|view| view.plugin == plugin && view.enabled)
+        })
+    }
+
+    /// Returns the enabled skill a Bot has under a name.
+    #[must_use]
+    pub fn skill_named(&self, bot: Id, name: &str) -> Option<&SkillView> {
+        self.skills_of(bot)
+            .into_iter()
+            .find(|skill| skill.name == name)
+    }
+
+    /// Whether a skill a User adds to a library is theirs to add.
+    #[must_use]
+    pub fn skill_library_allowed(&self, library: SkillLibrary, bot: Option<Id>, user: Id) -> bool {
+        match library {
+            SkillLibrary::Space => bot.is_none(),
+            SkillLibrary::Bot => bot.is_some_and(|bot| self.owned_bot(bot, user).is_some()),
+        }
+    }
+
+    /// Whether the Bot and the acting User already ran one skill's script.
+    #[must_use]
+    pub fn script_run_allowed(&self, bot: Id, acting: Id, skill: Id, script: &str) -> bool {
+        self.script_runs
+            .contains(&(bot, acting, skill, script.to_owned()))
+    }
+
+    /// Returns one MCP server.
+    #[must_use]
+    pub fn mcp(&self, server: Id) -> Option<&McpServerView> {
+        self.mcps.iter().find(|view| view.server == server)
+    }
+
+    /// Returns the server with one name.
+    #[must_use]
+    pub fn mcp_named(&self, name: &str) -> Option<&McpServerView> {
+        self.mcps.iter().find(|view| view.name == name)
+    }
+
+    /// Returns what a removed MCP server was, when the record removed it.
+    ///
+    /// The entry exists only to finish a cleanup that names the server; it is
+    /// never how a server that is still connected is read.
+    #[must_use]
+    pub fn removed_mcp(&self, server: Id) -> Option<&RemovedMcpView> {
+        self.removed_mcps.get(&server)
+    }
+
+    /// Returns the MCP servers a Bot may call for this acting User.
+    ///
+    /// A server the Space connected is every Bot's; a server a User connected
+    /// is offered only while the Bot acts for that User.
+    #[must_use]
+    pub fn mcps_of(&self, bot: Id, acting: Id) -> Vec<&McpServerView> {
+        let Some(view) = self.bots.get(&bot) else {
+            return Vec::new();
+        };
+        view.mcps
+            .iter()
+            .filter_map(|server| self.mcp(*server))
+            .filter(|server| match server.scope {
+                McpScope::Space => true,
+                McpScope::User => server.user == Some(acting),
+            })
+            .filter(|server| self.plugin_offers(server.plugin))
+            .collect()
+    }
+
+    /// Whether the Bot and the acting User already called one server's tool.
+    #[must_use]
+    pub fn mcp_call_allowed(&self, bot: Id, acting: Id, server: Id, tool: &str) -> bool {
+        self.mcp_calls
+            .contains(&(bot, acting, server, tool.to_owned()))
     }
 
     /// Returns the replies the record holds for one run.
@@ -817,6 +1121,7 @@ impl State {
         self.messages
             .iter()
             .filter(|message| message.chat == chat && message.seq <= until)
+            .filter(|message| speaks_to_the_model(message))
             .map(|message| (message.author, self.model_text(message)))
             .collect()
     }
@@ -824,12 +1129,14 @@ impl State {
     /// Builds the Model history for a Chat, oldest first.
     ///
     /// A Message that carries a File ends with a line that names the File, so
-    /// the Model can take it into its Workspace.
+    /// the Model can take it into its Workspace. A Message that carries only
+    /// a Card says nothing the Model could read, so it is left out.
     #[must_use]
     pub fn history(&self, chat: Id) -> Vec<(Author, String)> {
         self.messages
             .iter()
             .filter(|message| message.chat == chat)
+            .filter(|message| speaks_to_the_model(message))
             .map(|message| (message.author, self.model_text(message)))
             .collect()
     }
@@ -852,6 +1159,15 @@ impl State {
             format!("{}\n\n{line}", message.text)
         }
     }
+}
+
+/// Whether a Message says anything the Model could read.
+///
+/// A Card is presentation. A Message that carries only a Card would become an
+/// empty turn in the Model's history, so the history leaves it out; a Message
+/// with text or a File beside its Card is kept.
+fn speaks_to_the_model(message: &MessageView) -> bool {
+    message.file.is_some() || !message.text.trim().is_empty() || message.card.is_none()
 }
 
 impl Projection for State {
@@ -921,6 +1237,8 @@ impl Projection for State {
                         grants: Vec::new(),
                         thinking: data.thinking,
                         model: data.model,
+                        skills: Vec::new(),
+                        mcps: Vec::new(),
                     },
                 );
             }
@@ -1082,6 +1400,14 @@ impl Projection for State {
                 {
                     return Err("a Message's File must belong to its Chat".to_owned());
                 }
+                if data
+                    .card
+                    .as_ref()
+                    .and_then(|card| card.file)
+                    .is_some_and(|file| self.file_of(data.chat, file).is_none())
+                {
+                    return Err("a Card's File must belong to its Message's Chat".to_owned());
+                }
                 self.messages.push(MessageView {
                     id: data.message,
                     chat: data.chat,
@@ -1089,6 +1415,7 @@ impl Projection for State {
                     acting: event.acting,
                     text: data.text,
                     file: data.file,
+                    card: data.card,
                     at: event.at,
                     seq: event.seq,
                     run: data.run,
@@ -1223,16 +1550,34 @@ impl Projection for State {
                 });
             }
             EventData::ActionStarted(data) => {
+                // A script action carries the identity the Space dispatched,
+                // resolved before it started. A call that never runs has none,
+                // so it never consumes the first-run consent; a record written
+                // before identities existed has none either.
+                let acting = event.acting;
                 let run = self
                     .runs
                     .get_mut(&data.run)
                     .ok_or("an action must belong to a started run")?;
                 run.once_grant = None;
+                if let (Some(skill), Some(script), Some(acting)) =
+                    (data.skill, data.script.clone(), acting)
+                {
+                    self.script_runs.insert((run.bot, acting, skill, script));
+                }
+                if let (Some(server), Some(acting)) = (data.server, acting) {
+                    self.mcp_calls
+                        .insert((run.bot, acting, server, data.tool.clone()));
+                }
                 run.actions.push(ActionView {
                     id: data.action,
                     step: data.step,
                     tool: data.tool,
-                    arguments: data.arguments,
+                    arguments: data.arguments.clone(),
+                    server: data.server,
+                    skill: data.skill,
+                    script: data.script,
+                    script_sha256: data.script_sha256,
                     finished: false,
                     status: ActionStatus::Unknown,
                     output: String::new(),
@@ -1265,6 +1610,14 @@ impl Projection for State {
                 self.replies.entry(data.run).or_default().push(data);
             }
             EventData::ApprovalRequested(data) => {
+                // A server-served call names its server in the Computer field,
+                // because no Computer runs it; every other card names the one
+                // the action runs on.
+                if let Some(server) = data.server
+                    && self.mcp(server).is_none()
+                {
+                    return Err("an approval must name a connected server".to_owned());
+                }
                 let run = self
                     .runs
                     .get_mut(&data.run)
@@ -1272,10 +1625,11 @@ impl Projection for State {
                 if !matches!(run.status, RunStatus::Queued | RunStatus::Running) {
                     return Err("an approval must belong to a working run".to_owned());
                 }
+                let target = data.server.is_some() || run.computer == Some(data.computer);
                 if data.bot != run.bot
                     || data.chat != run.chat
                     || data.acting != run.acting
-                    || run.computer != Some(data.computer)
+                    || !target
                 {
                     return Err(
                         "an approval must name its run's Bot, Chat, Computer, and User".to_owned(),
@@ -1318,6 +1672,10 @@ impl Projection for State {
                     ambiguous: data.ambiguous,
                     rule: data.rule,
                     lasting_scope: data.lasting_scope,
+                    server: data.server,
+                    skill: data.skill,
+                    script: data.script,
+                    script_sha256: data.script_sha256,
                     grant_folder: data.grant_folder,
                     cwd,
                     undoable: data.undoable,
@@ -1403,6 +1761,9 @@ impl Projection for State {
                     tool: data.tool,
                     command_prefix: data.command_prefix,
                     path_prefix: data.path_prefix,
+                    server: data.server,
+                    skill: data.skill,
+                    script: data.script,
                     seq: event.seq,
                 });
             }
@@ -1424,6 +1785,246 @@ impl Projection for State {
                 }
                 self.rules.remove(position);
             }
+            EventData::SkillAdded(data) => {
+                let Author::User(by) = event.author else {
+                    return Err("a skill is added by a User".to_owned());
+                };
+                match data.library {
+                    SkillLibrary::Bot if !self.bots.contains_key(&data.bot.unwrap_or_default()) => {
+                        return Err("a Bot's skill belongs to an existing Bot".to_owned());
+                    }
+                    SkillLibrary::Space if data.bot.is_some() => {
+                        return Err("the Space's skill belongs to no Bot".to_owned());
+                    }
+                    _ => {}
+                }
+                let library = data.bot.unwrap_or_default();
+                if self.skills.iter().any(|view| {
+                    view.library == data.library
+                        && view.bot.unwrap_or_default() == library
+                        && view.name == data.name
+                }) {
+                    return Err("a library holds one skill under each name".to_owned());
+                }
+                self.skills.push(SkillView {
+                    id: data.skill,
+                    plugin: data.plugin,
+                    library: data.library,
+                    bot: data.bot,
+                    name: data.name,
+                    description: data.description,
+                    body: data.body,
+                    scripts: data.scripts,
+                    by,
+                    seq: event.seq,
+                });
+            }
+            EventData::SkillRemoved(data) => {
+                let position = self
+                    .skills
+                    .iter()
+                    .position(|view| view.id == data.skill)
+                    .ok_or("a removed skill must exist")?;
+                self.skills.remove(position);
+                for bot in self.bots.values_mut() {
+                    bot.skills.retain(|skill| *skill != data.skill);
+                }
+            }
+            EventData::BotSkillEnabled(data) => {
+                if !self.bots.contains_key(&data.bot) {
+                    return Err("an enabled skill belongs to an existing Bot".to_owned());
+                }
+                let Some(skill) = self.skill(data.skill) else {
+                    return Err("an enabled skill must exist".to_owned());
+                };
+                if skill.library == SkillLibrary::Bot && skill.bot != Some(data.bot) {
+                    return Err("a Bot enables only its own skills and the Space's".to_owned());
+                }
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("an enabled skill belongs to an existing Bot")?;
+                if !bot.skills.contains(&data.skill) {
+                    bot.skills.push(data.skill);
+                }
+            }
+            EventData::BotSkillDisabled(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("a disabled skill belongs to an existing Bot")?;
+                let position = bot
+                    .skills
+                    .iter()
+                    .position(|skill| *skill == data.skill)
+                    .ok_or("a disabled skill must be enabled")?;
+                bot.skills.remove(position);
+            }
+            EventData::McpServerAdded(data) => {
+                let Author::User(by) = event.author else {
+                    return Err("an MCP server is connected by a User".to_owned());
+                };
+                if by != data.by {
+                    return Err("an MCP server is connected by its account".to_owned());
+                }
+                if self.mcps.len() >= MAX_MCP_SERVERS {
+                    return Err(format!(
+                        "a Space connects at most {MAX_MCP_SERVERS} MCP servers"
+                    ));
+                }
+                if self.mcps.iter().any(|view| view.name == data.name) {
+                    return Err("a Space holds one MCP server under each name".to_owned());
+                }
+                match data.scope {
+                    McpScope::User if data.user != Some(data.by) => {
+                        return Err("a User connects a server for themselves".to_owned());
+                    }
+                    // Who may connect a Space's server is the command's rule;
+                    // the projection only keeps what the record says.
+                    _ => {}
+                }
+                self.mcps.push(McpServerView {
+                    server: data.server,
+                    plugin: data.plugin,
+                    headers: data.headers,
+                    name: data.name,
+                    url: data.url,
+                    command: data.command,
+                    args: data.args,
+                    env: data.env,
+                    cwd: data.cwd,
+                    data_cwd: data.data_cwd,
+                    scope: data.scope,
+                    user: data.user,
+                    by,
+                    seq: event.seq,
+                });
+            }
+            EventData::McpServerUpdated(data) => {
+                let Author::User(by) = event.author else {
+                    return Err("an MCP server is updated by a User".to_owned());
+                };
+                let position = self
+                    .mcps
+                    .iter()
+                    .position(|view| view.server == data.server)
+                    .ok_or("an updated server must exist")?;
+                // The event's `scope` describes the credential change for the
+                // event stream's visibility only: it is never the server's own
+                // scope. The server's scope and user are decided by the
+                // `neha.mcp.server.added` event that put this view here, so
+                // this arm must not (and cannot) change either of them: a
+                // member's personal credential attaching to a Space server
+                // leaves both untouched.
+                if let Some(url) = data.url {
+                    // Only the account that connected a server changes where
+                    // it points. Any User may attach their own credential to
+                    // the Space's server, which records this update without a
+                    // URL.
+                    if self.mcps[position].by != by {
+                        return Err(
+                            "only the account that connected a server changes its address"
+                                .to_owned(),
+                        );
+                    }
+                    self.mcps[position].url = Some(url);
+                }
+            }
+            EventData::McpServerRemoved(data) => {
+                // Keep what a cleanup that names only the server needs before
+                // the view leaves. A removal of a server the projection does
+                // not hold leaves the index alone: a replay of the same removal
+                // is then idempotent, and a historical record's odd shape does
+                // not fail the whole projection.
+                if let Some(position) = self.mcps.iter().position(|view| view.server == data.server)
+                {
+                    let name = self.mcps[position].name.clone();
+                    let scope = self.mcps[position].scope;
+                    let user = self.mcps[position].user;
+                    self.removed_mcps
+                        .insert(data.server, RemovedMcpView { name, scope, user });
+                    self.mcps.remove(position);
+                    for bot in self.bots.values_mut() {
+                        bot.mcps.retain(|server| *server != data.server);
+                    }
+                }
+            }
+            EventData::BotMcpEnabled(data) => {
+                if !self.bots.contains_key(&data.bot) {
+                    return Err("an enabled server belongs to an existing Bot".to_owned());
+                }
+                if self.mcp(data.server).is_none() {
+                    return Err("an enabled server must exist".to_owned());
+                }
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("an enabled server belongs to an existing Bot")?;
+                if !bot.mcps.contains(&data.server) {
+                    bot.mcps.push(data.server);
+                }
+            }
+            EventData::BotMcpDisabled(data) => {
+                let bot = self
+                    .bots
+                    .get_mut(&data.bot)
+                    .ok_or("a disabled server belongs to an existing Bot")?;
+                let position = bot
+                    .mcps
+                    .iter()
+                    .position(|server| *server == data.server)
+                    .ok_or("a disabled server must be enabled")?;
+                bot.mcps.remove(position);
+            }
+            EventData::PluginInstalled(data) => {
+                if self.plugins.iter().any(|view| view.name == data.name) {
+                    return Err("a Space holds one package under each name".to_owned());
+                }
+                self.plugins.push(PluginView {
+                    plugin: data.plugin,
+                    name: data.name,
+                    version: data.version,
+                    digest: data.digest,
+                    commit: data.commit,
+                    source: data.source,
+                    enabled: true,
+                    servers: data.servers,
+                    skills: data.skills,
+                    seq: event.seq,
+                });
+            }
+            EventData::PluginRemoved(data) => {
+                let position = self
+                    .plugins
+                    .iter()
+                    .position(|view| view.plugin == data.plugin)
+                    .ok_or("a removed package must exist")?;
+                let removed = self.plugins.remove(position);
+                self.mcps
+                    .retain(|server| !removed.servers.contains(&server.server));
+                self.skills
+                    .retain(|skill| !removed.skills.contains(&skill.id));
+                for bot in self.bots.values_mut() {
+                    bot.mcps.retain(|server| !removed.servers.contains(server));
+                    bot.skills.retain(|skill| !removed.skills.contains(skill));
+                }
+            }
+            EventData::PluginEnabled(data) => {
+                let plugin = self
+                    .plugins
+                    .iter_mut()
+                    .find(|view| view.plugin == data.plugin)
+                    .ok_or("an enabled package must exist")?;
+                plugin.enabled = true;
+            }
+            EventData::PluginDisabled(data) => {
+                let plugin = self
+                    .plugins
+                    .iter_mut()
+                    .find(|view| view.plugin == data.plugin)
+                    .ok_or("a disabled package must exist")?;
+                plugin.enabled = false;
+            }
         }
 
         Ok(())
@@ -1433,7 +2034,9 @@ impl Projection for State {
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
-    use neha::record::{ActionStatus, Author, Event, EventKind, KIND_VERSION};
+    use neha::record::{
+        ActionStatus, Author, Event, EventKind, KIND_VERSION, McpScope, McpTransport,
+    };
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
@@ -1493,6 +2096,131 @@ mod tests {
 
     fn message_added(chat: Id, text: &str, file: Option<Id>) -> serde_json::Value {
         serde_json::json!({"message": Id::new(), "chat": chat, "text": text, "file": file})
+    }
+
+    #[test]
+    fn an_older_rule_shape_projects_and_grants_no_script_authority() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let mut state = State::default();
+        let created = |kind, data, seq| event(kind, Author::User(owner), data, seq);
+        state
+            .apply(&created(
+                EventKind::ComputerCreated,
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::BotCreated,
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                2,
+            ))
+            .unwrap();
+        state
+            .apply(&created(
+                EventKind::ChatCreated,
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                3,
+            ))
+            .unwrap();
+
+        // A record written before skill rules named a script may hold a rule
+        // for the whole tool. It must still project, and it must match no
+        // script call: an upgrade never makes a Space unreadable.
+        let legacy = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::RuleAdded,
+                Author::User(owner),
+                owner,
+                serde_json::json!({
+                    "rule": legacy,
+                    "bot": bot,
+                    "user": owner,
+                    "effect": "allow",
+                    "tool": "run_skill_script",
+                    "command_prefix": null,
+                    "path_prefix": null,
+                }),
+                4,
+            ))
+            .unwrap();
+        assert_eq!(state.rules.len(), 1);
+        assert!(state.rules[0].skill.is_none());
+
+        // A call the Model got wrong, and a call to a skill the Bot does not
+        // have, are recorded as actions without failing the projection and
+        // without counting as a run.
+        let run = Id::new();
+        let run_data = serde_json::json!({
+            "run": run,
+            "chat": chat,
+            "bot": bot,
+            "command": Id::new(),
+            "message": Id::new(),
+        });
+        state
+            .apply(&acted_event(
+                EventKind::RunQueued,
+                Author::Bot(bot),
+                owner,
+                run_data.clone(),
+                5,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::RunStarted,
+                Author::Bot(bot),
+                owner,
+                run_data,
+                6,
+            ))
+            .unwrap();
+        let start = |action, arguments, seq| {
+            acted_event(
+                EventKind::ActionStarted,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({
+                    "run": run,
+                    "step": 1,
+                    "action": action,
+                    "tool": "run_skill_script",
+                    "arguments": arguments,
+                }),
+                seq,
+            )
+        };
+        state
+            .apply(&start(Id::new(), serde_json::json!({"surprise": true}), 7))
+            .unwrap();
+        state
+            .apply(&start(
+                Id::new(),
+                serde_json::json!({"skill": "missing", "script": "s.sh"}),
+                8,
+            ))
+            .unwrap();
+        assert!(
+            state.script_runs.is_empty(),
+            "a call that never runs marks no first run"
+        );
     }
 
     #[test]
@@ -1976,6 +2704,74 @@ mod tests {
     }
 
     #[test]
+    fn a_card_file_belongs_to_the_message_chat() {
+        let owner = Id::new();
+        let user = Author::User(owner);
+        let (first, second) = (Id::new(), Id::new());
+        let file = Id::new();
+        let mut state = State::default();
+        for (seq, chat) in [(1, first), (2, second)] {
+            state
+                .apply(&event(
+                    EventKind::ChatCreated,
+                    user,
+                    chat_created(chat, owner),
+                    seq,
+                ))
+                .unwrap();
+        }
+        state
+            .apply(&event(
+                EventKind::FileAdded,
+                user,
+                file_added(file, first),
+                3,
+            ))
+            .unwrap();
+        let carded = |seq, chat, card: serde_json::Value| {
+            event(
+                EventKind::MessageAdded,
+                user,
+                serde_json::json!({
+                    "message": Id::new(),
+                    "chat": chat,
+                    "text": "",
+                    "card": card,
+                }),
+                seq,
+            )
+        };
+        let app = |file: Id| serde_json::json!({"kind": "app", "file": file});
+
+        // The File a Card shows belongs to the Chat the Message is in.
+        assert!(state.apply(&carded(4, second, app(file))).is_err());
+        assert!(state.apply(&carded(4, first, app(Id::new()))).is_err());
+        // A kind this build does not know replays with its fields as they
+        // were: the projection renders nothing for it, and a client shows a
+        // placeholder.
+        let future = serde_json::json!({
+            "kind": "future",
+            "file": file,
+            "input": {"query": "hi"},
+            "result": [1, 2],
+            "csp": "default-src 'none'",
+        });
+        state.apply(&carded(4, first, future)).unwrap();
+        state.apply(&carded(5, first, app(file))).unwrap();
+
+        let messages = state.messages_of(first, None);
+        assert_eq!(messages.len(), 2);
+        let future = messages[0].card.as_ref().unwrap();
+        assert_eq!(future.kind, "future");
+        assert_eq!(future.file, Some(file));
+        assert_eq!(future.input, Some(serde_json::json!({"query": "hi"})));
+        assert_eq!(future.result, Some(serde_json::json!([1, 2])));
+        assert_eq!(future.csp.as_deref(), Some("default-src 'none'"));
+        assert_eq!(messages[1].card.as_ref().unwrap().kind, "app");
+        assert_eq!(messages[1].card.as_ref().unwrap().file, Some(file));
+    }
+
+    #[test]
     fn a_file_message_names_the_file_for_the_model() {
         let owner = Id::new();
         let user = Author::User(owner);
@@ -2025,6 +2821,51 @@ mod tests {
                 ),
                 (user, "plain".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_card_only_message_is_no_model_turn() {
+        let owner = Id::new();
+        let user = Author::User(owner);
+        let bot = Author::Bot(Id::new());
+        let chat = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                user,
+                chat_created(chat, owner),
+                1,
+            ))
+            .unwrap();
+        let carded = |seq, text: &str| {
+            event(
+                EventKind::MessageAdded,
+                bot,
+                serde_json::json!({
+                    "message": Id::new(),
+                    "chat": chat,
+                    "text": text,
+                    "card": {"kind": "future"},
+                }),
+                seq,
+            )
+        };
+        // The Bot's Card Message is presentation: it would be an empty turn.
+        state.apply(&carded(2, "")).unwrap();
+        // A Message with text beside its Card is a turn like any other.
+        state.apply(&carded(3, "here it is")).unwrap();
+
+        assert_eq!(
+            state.history(chat),
+            vec![(bot, "here it is".to_owned())],
+            "a Card-only Message is no turn the Model reads"
+        );
+        assert_eq!(
+            state.history_until(chat, Seq::from_i64(2).unwrap()),
+            Vec::new(),
+            "a resumed run's history leaves the Card-only Message out too"
         );
     }
 
@@ -3450,6 +4291,148 @@ mod tests {
             !state.bots[&bot].full_access,
             "turning it off needs no consent"
         );
+    }
+
+    #[test]
+    fn a_removal_keeps_what_finishing_its_cleanup_needs() {
+        let owner = Id::new();
+        let space_server = Id::new();
+        let user_server = Id::new();
+        // The events the record holds: two servers connect, then both leave.
+        let record = [
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": space_server,
+                    "name": "docs",
+                    "url": "https://example.com/mcp",
+                    "scope": "space",
+                    "by": owner,
+                }),
+                1,
+            ),
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": user_server,
+                    "name": "mine",
+                    "url": "https://example.com/mine",
+                    "scope": "user",
+                    "user": owner,
+                    "by": owner,
+                }),
+                2,
+            ),
+            event(
+                EventKind::McpServerRemoved,
+                Author::User(owner),
+                serde_json::json!({"server": space_server}),
+                3,
+            ),
+            event(
+                EventKind::McpServerRemoved,
+                Author::User(owner),
+                serde_json::json!({"server": user_server}),
+                4,
+            ),
+        ];
+        // A Space start rebuilds the projection by replaying the record.
+        let mut state = State::default();
+        for event in &record {
+            state.apply(event).unwrap();
+        }
+
+        assert!(state.mcp(space_server).is_none());
+        let space_removed = state
+            .removed_mcp(space_server)
+            .expect("a replay keeps the Space's server that left");
+        assert_eq!(space_removed.name, "docs");
+        assert_eq!(space_removed.scope, McpScope::Space);
+        assert_eq!(space_removed.user, None);
+
+        let user_removed = state
+            .removed_mcp(user_server)
+            .expect("a replay keeps the User's server that left");
+        assert_eq!(user_removed.name, "mine");
+        assert_eq!(user_removed.scope, McpScope::User);
+        assert_eq!(user_removed.user, Some(owner));
+
+        // A removal applied twice changes nothing: the second finds no server
+        // to remove and leaves the index as it was.
+        for event in &record[2..] {
+            state.apply(event).unwrap();
+        }
+        assert_eq!(
+            state
+                .removed_mcp(space_server)
+                .map(|view| view.name.as_str()),
+            Some("docs")
+        );
+    }
+
+    #[test]
+    fn a_stdio_server_projects_its_launch_configuration() {
+        let owner = Id::new();
+        let http = Id::new();
+        let stdio = Id::new();
+        let mut state = State::default();
+        for event in [
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": http,
+                    "name": "docs",
+                    "url": "https://example.com/mcp",
+                    "headers": {"X-Tenant": "public"},
+                    "scope": "space",
+                    "by": owner,
+                }),
+                1,
+            ),
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": stdio,
+                    "name": "local",
+                    "command": "./bin/server",
+                    "args": ["--data", "${PLUGIN_DATA}/docs"],
+                    "env": {"CONFIG": "${PLUGIN_ROOT}/config.json"},
+                    "cwd": "work",
+                    "data_cwd": true,
+                    "scope": "space",
+                    "by": owner,
+                }),
+                2,
+            ),
+        ] {
+            state.apply(&event).unwrap();
+        }
+
+        let view = state.mcp(http).expect("the HTTP server is connected");
+        assert_eq!(view.transport(), McpTransport::StreamableHttp);
+        assert_eq!(view.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(view.command, None);
+        assert_eq!(view.stdio(), None);
+
+        let view = state.mcp(stdio).expect("the stdio server is connected");
+        assert_eq!(view.transport(), McpTransport::Stdio);
+        assert_eq!(view.url, None);
+        assert_eq!(view.command.as_deref(), Some("./bin/server"));
+        assert_eq!(view.args, ["--data", "${PLUGIN_DATA}/docs"]);
+        assert_eq!(
+            view.env.get("CONFIG").map(String::as_str),
+            Some("${PLUGIN_ROOT}/config.json")
+        );
+        assert_eq!(view.cwd.as_deref(), Some("work"));
+        assert!(view.data_cwd);
+        let stdio = view.stdio().expect("the launch configuration is kept");
+        assert_eq!(stdio.command, "./bin/server");
+        assert_eq!(stdio.cwd.as_deref(), Some("work"));
+        assert!(stdio.data_cwd);
     }
 
     #[test]
