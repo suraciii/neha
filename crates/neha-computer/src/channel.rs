@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::action::{Action, ActionStatus, ToolOutput};
 
 /// The protocol version both ends speak.
-pub const CHANNEL_VERSION: u32 = 3;
+pub const CHANNEL_VERSION: u32 = 4;
 
 /// The largest frame either end accepts, 64 MiB.
 pub const MAX_CHANNEL_FRAME_BYTES: usize = 64 * 1024 * 1024;
@@ -44,6 +44,11 @@ impl AccessFrame {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HostFrame {
+    /// Acknowledges the greeting.
+    ///
+    /// The Space sends it only after it accepted the Hello and registered the
+    /// channel, so a daemon that receives it knows the connection is usable.
+    Welcome,
     /// Runs one tool action in the Bot's folder.
     Action {
         /// The id the Space assigned this request.
@@ -131,6 +136,13 @@ pub enum DeviceFrame {
         /// the Space then derives it from `sandbox`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         supports_full_access: Option<bool>,
+        /// The Space origin this daemon reaches, so the Space can give a Bot's
+        /// shell commands that origin when the Computer is not on its machine.
+        ///
+        /// Absent in a greeting written before the field existed; the Space
+        /// then uses its own listener origin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     /// Returns the result of an action.
     Result {
@@ -251,14 +263,15 @@ mod tests {
     }
 
     #[test]
-    fn both_ends_are_pinned_to_version_three_and_a_64_mib_frame() {
-        assert_eq!(CHANNEL_VERSION, 3);
+    fn both_ends_are_pinned_to_version_four_and_a_64_mib_frame() {
+        assert_eq!(CHANNEL_VERSION, 4);
         assert_eq!(MAX_CHANNEL_FRAME_BYTES, 64 * 1024 * 1024);
     }
 
     #[test]
     fn every_host_frame_round_trips_as_its_pinned_json() {
         let cases = [
+            (HostFrame::Welcome, json!({"type": "welcome"})),
             (
                 HostFrame::Action {
                     id: 7,
@@ -449,16 +462,17 @@ mod tests {
         let cases = [
             (
                 DeviceFrame::Hello {
-                    version: 3,
+                    version: 4,
                     computer: "computer-1".to_owned(),
                     workspace: "/home/me/.neha/workspace".to_owned(),
                     sandbox: true,
                     supports_grants: Some(true),
                     supports_full_access: Some(false),
+                    origin: None,
                 },
                 json!({
                     "type": "hello",
-                    "version": 3,
+                    "version": 4,
                     "computer": "computer-1",
                     "workspace": "/home/me/.neha/workspace",
                     "sandbox": true,

@@ -14,7 +14,7 @@ use crate::seq::Seq;
 use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The largest frame a client or the Space accepts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -24,6 +24,9 @@ pub const MEMORY_CAPABILITY: &str = "memory";
 
 /// The capability a caller names to receive the compaction event kind.
 pub const COMPACTION_CAPABILITY: &str = "compaction";
+
+/// The capability a caller names to receive the plan event kind.
+pub const PLAN_CAPABILITY: &str = "plan";
 
 /// Returns the capability a caller must name to read one event kind the
 /// protocol version does not already carry.
@@ -38,6 +41,7 @@ pub const fn event_capability(kind: crate::record::EventKind) -> Option<&'static
         | crate::record::EventKind::MemoryRemoved
         | crate::record::EventKind::MemoryAnswered => Some(MEMORY_CAPABILITY),
         crate::record::EventKind::ChatCompacted => Some(COMPACTION_CAPABILITY),
+        crate::record::EventKind::RunPlanned => Some(PLAN_CAPABILITY),
         _ => None,
     }
 }
@@ -119,6 +123,16 @@ pub enum CommandCall {
     ComputerReset {
         /// The Hosted Computer to reset.
         computer: Id,
+    },
+    /// Revokes a Local Computer's credential and disconnects its daemon.
+    ComputerRevoke {
+        /// The Local Computer to revoke.
+        computer: Id,
+    },
+    /// Approves a CLI's device code as the signed-in User.
+    DeviceApprove {
+        /// The device code the CLI showed.
+        code: String,
     },
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
@@ -330,6 +344,29 @@ pub enum CommandCall {
         bot: Id,
         /// The entry.
         memory: Id,
+    },
+    /// Lists the Space's Users and their roles.
+    UserList,
+    /// Makes an invitation link that admits one new User as a Member.
+    InvitationCreate,
+    /// Lists the invitations that still admit one User.
+    InvitationList,
+    /// Revokes a pending invitation.
+    InvitationRevoke {
+        /// The invitation.
+        invitation: Id,
+    },
+    /// Changes a User's role.
+    UserSetRole {
+        /// The User.
+        user: Id,
+        /// The role it takes: an Admin or a Member.
+        role: crate::role::Role,
+    },
+    /// Transfers the Space to another User.
+    UserTransfer {
+        /// The User who becomes the Owner.
+        user: Id,
     },
 }
 
@@ -759,8 +796,9 @@ pub enum ServerFrame {
 mod tests {
     use super::{
         BotComputer, BotCreate, BotUpdate, COMPACTION_CAPABILITY, ClientFrame, CommandCall,
-        MEMORY_CAPABILITY, McpSignInStart, MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd,
-        ProviderConnect, ProviderProtocol, ServerFrame, ThinkingLevel, event_capability,
+        MEMORY_CAPABILITY, McpSignInStart, MessageSend, ModelSpec, PLAN_CAPABILITY,
+        PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol, ServerFrame,
+        ThinkingLevel, event_capability,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -880,6 +918,25 @@ mod tests {
         let command = CommandCall::ComputerReset { computer };
         let text = serde_json::to_string(&command).unwrap();
         assert!(text.contains("\"computer_reset\""));
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn a_device_approval_round_trips() {
+        let command = CommandCall::DeviceApprove {
+            code: "ABCD2345".to_owned(),
+        };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"device_approve\""));
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn a_computer_revocation_round_trips() {
+        let computer = Id::new();
+        let command = CommandCall::ComputerRevoke { computer };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"computer_revoke\""));
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 
@@ -1172,7 +1229,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
-            "{\"type\":\"hello\",\"version\":3}"
+            "{\"type\":\"hello\",\"version\":4}"
         );
 
         let error = ServerFrame::Error {
@@ -1415,6 +1472,10 @@ mod tests {
         assert_eq!(
             event_capability(crate::record::EventKind::ChatCompacted),
             Some(COMPACTION_CAPABILITY)
+        );
+        assert_eq!(
+            event_capability(crate::record::EventKind::RunPlanned),
+            Some(PLAN_CAPABILITY)
         );
         for kind in [
             crate::record::EventKind::MessageAdded,

@@ -31,7 +31,7 @@ just ci
 
 ## Quick start
 
-[Quick start: chat with a Bot](docs/quickstart.md) runs a Space, joins as the Admin, connects a Provider, and chats with a Bot. [Let a Bot work on its Computer](docs/tools.md) shows the shell and file tools in the Bot's workspace.
+[Quick start: chat with a Bot](docs/quickstart.md) runs a Space, joins as the Space Owner, connects a Provider, and chats with a Bot. [Let a Bot work on its Computer](docs/tools.md) shows the shell and file tools in the Bot's workspace.
 
 ## Documentation
 

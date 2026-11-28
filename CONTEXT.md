@@ -10,7 +10,7 @@ A term enters this file when a specification needs it. Each entry is one paragra
 
 **User**:
 A human actor who owns Bots and Computers and grants authority. An OS account is never a User.
-_Avoid_: person, principal, member
+_Avoid_: person, principal
 
 **Account**:
 A User's identity on a Space: a display name, a picture, and one or more ways to sign in.
@@ -36,9 +36,21 @@ _Avoid_: sandbox, pod, container Computer
 The internal control process that creates, starts, and stops worker containers through the Docker API in a containerized Hosted Space. It is not a Computer and publishes no port.
 _Avoid_: agent, orchestrator, daemon
 
+**Space Owner**:
+The User who owns a Space: makes Admins, changes any other User's role, and transfers the Space. A Space has one Space Owner.
+_Avoid_: owner (of a Space), creator, founder
+
 **Admin**:
-The User who runs a Space: invites its Users, connects its Providers, and configures the Space.
-_Avoid_: operator, owner (of a Space), manager
+A User who administers a Space: invites Users, connects its Providers, installs Plugins, and changes its settings. The Space Owner is an Admin, and a Space has any number of Admins.
+_Avoid_: operator, manager
+
+**Member**:
+A User who belongs to a Space without administering it: uses the Space, reads its Settings, and owns their own Bots, Chats, and Computers.
+_Avoid_: regular user, participant, non-admin
+
+**Invitation**:
+A link the Space Owner or an Admin gives a new User to join a Space as a Member. The Space shows it once, keeps only a hash of its secret, admits one User, and expires.
+_Avoid_: invite, invite link, referral
 
 **Bot**:
 Neha's own agent: a persistent identity with memory and a Computer that takes work and returns results. The vision calls it a teammate.
@@ -79,6 +91,14 @@ _Avoid_: turn, job, execution
 **Step**:
 A checkpoint in a run: one Model call and the actions that call requests. A run resumes from a completed step.
 _Avoid_: iteration, cycle, phase
+
+**Plan**:
+The flat list of lines a Bot keeps for one Run, each naming a piece of the request's work. A Plan is not a Task and does not outlive its Run.
+_Avoid_: todo, task list, checklist, roadmap
+
+**Plan entry**:
+One line of a Plan: a title and a state, `pending`, `doing`, or `done`.
+_Avoid_: item, subtask
 
 **Action**:
 A Computer action: one thing a Bot does on its Computer. The record holds an action before it runs. A memory operation is not an Action.
@@ -125,7 +145,7 @@ The conversation between one User and one Bot. Each User allowed to use a Bot ha
 _Avoid_: home, DM, 1:1, main chat, private chat
 
 **Group**:
-A conversation among any number of Users and Bots, created by a User. Users and Bots are members alike, and the Group is the shared record in which they coordinate: Tasks, handoffs, and approvals happen in it.
+A conversation among any number of Users and Bots, created by a User. Users and Bots take part alike, and the Group is the shared record in which they coordinate: Tasks, handoffs, and approvals happen in it.
 _Avoid_: channel, room, chat (unqualified), thread (as a container)
 
 **Message**:

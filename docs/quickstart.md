@@ -1,6 +1,6 @@
 # Quick start: chat with a Bot
 
-This guide starts a Space on one machine, joins it as the Admin, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User and can work in its own directory inside its Computer's Workspace with tools.
+This guide starts a Space on one machine, joins it as the Space Owner, connects an OpenAI-compatible Provider, and chats with a Bot. The result is one Chat where a Bot answers a User and can work in its own directory inside its Computer's Workspace with tools.
 
 Everything runs on the local machine. The Space listens on loopback and stores its record in `NEHA_HOME`. To reach it from a phone or another computer, [serve it on a domain](deploying.md).
 
@@ -30,7 +30,7 @@ export NEHA_HOME="$HOME/.local/share/neha/demo"
 target/debug/neha serve
 ```
 
-The CLI prints the address and, for a Space with no Admin, one invitation link:
+The CLI prints the address and, for a Space with no User, one invitation link:
 
 ```text
 Neha is listening on http://127.0.0.1:7337
@@ -43,17 +43,17 @@ The browser hostname is stable for this Space and keeps its cookie off shared lo
 
 The invitation is valid once and only while this Space runs. Keep the terminal open.
 
-## Join as the Admin in the browser
+## Join as the Space Owner in the browser
 
 Open the `Open in a browser` invitation link. The client asks for a display name and a password of at least eight characters; the Space checks at least eight bytes.
 
-The first User is the Admin. The browser keeps the session in an HttpOnly cookie; no token appears in the page or its URL.
+The first User is the Space Owner. The browser keeps the session in an HttpOnly cookie; no token appears in the page or its URL.
 
 The browser client is served from `ui/dist`. `neha serve` finds it automatically, or takes `--ui <directory>` or `NEHA_UI_DIR`.
 
 The sign-in card has a language switch for English and Simplified Chinese. The signed-in client keeps the switch in the Chat list footer; the first-run setup header carries it at narrow widths, where the sidebar is hidden. The choice persists in the browser and does not change the record.
 
-## Join as the Admin from the CLI
+## Join as the Space Owner from the CLI
 
 In a second terminal, join with the same invitation link:
 
@@ -183,6 +183,14 @@ target/debug/neha run show "$RUN_ID"
 
 `neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
 
+A Run can keep a plan of the work the Bot means to do for the request. Print it with:
+
+```bash
+target/debug/neha run plan "$RUN_ID"
+```
+
+The command prints `Plan for run <id>: 1 of 3 done`, then one line per entry with its state in brackets, such as `  [doing] Buy the ticket`. It changes nothing. A Run with no plan prints `Plan for run <id>: no plan`.
+
 ## Put a Bot on a Local Computer
 
 A Local Computer is the machine where Neha runs: a Neha process that connects out to the Space and runs each Bot's actions in the Bot's own directory inside that Computer's Workspace on the machine. This milestone pairs the machine that runs the Space, because the Space listens on loopback only.
@@ -249,6 +257,34 @@ target/debug/neha model default "$MODEL_ID"
 
 [Approvals](approvals.md) covers the rules and the answers, and [Computers](computer.md#file-access-and-a-runs-directory) covers the folders and full access.
 
+## Invite someone else
+
+An Admin creates an invitation in Settings → People in the browser, or from the CLI. The browser shows the link and its QR code once, when the invitation is made; share either with the person you invite.
+
+```bash
+target/debug/neha invitation create
+```
+
+The command prints the link once. The invitation admits one new User as a Member and expires after seven days. A new link replaces the earlier one.
+
+List the pending invitations and when each expires, or revoke one before it is used:
+
+```bash
+target/debug/neha invitation list
+target/debug/neha invitation revoke <invitation-id>
+```
+
+The invited person opens the link in an app or a browser, sets a display name and a password, and joins as a Member. A used or revoked invitation admits no one. In a Local Space, the link works only from a device that can reach the machine that runs the Space.
+
+The Space Owner can make the new Member an Admin in Settings → People, or from the CLI:
+
+```bash
+target/debug/neha user list
+target/debug/neha user role <name> admin
+```
+
+`neha user list` prints each User's role and display name. The role command takes a display name or an identifier.
+
 ## Send a file
 
 A Message can carry one file of up to 32 MiB. Send one and ask the Bot to work on it. This Space now has two Chats, so name the Bot:
@@ -281,7 +317,7 @@ The printed invitation uses that public origin. The Space accepts the proxy's
 Host and `https` Origin, issues a `Secure` session cookie, and redirects a
 loopback browser request to the public origin. Do not expose the loopback
 listener directly; terminate TLS at the proxy. A desktop client connects with
-the Space URL, or with the invitation link for a Space that has no Admin yet.
+the Space URL, or with the invitation link for a Space that has no User yet.
 
 For the same origin from a host, `neha serve --domain space.example.com` works
 too. [Serve a Space on a domain](deploying.md) covers the proxy, phone
@@ -303,15 +339,24 @@ target/debug/neha login --name Ada
 
 When the Space has a new address, or the saved credential is gone, pass `--server` with the API address the Space prints. Then read the old Chat again; it contains every recorded Message.
 
+On a terminal with no password prompt, sign in with a device code instead. Run `neha login --device-code --server <origin>` there, then approve the code it prints with `neha device approve <code>` on this machine, or under Settings, Devices in the browser:
+
+```bash
+target/debug/neha login --device-code --server http://127.0.0.1:7337
+```
+
+The terminal's session lasts until it signs out; closing the terminal does not end it. This milestone has no device list for removing one terminal, so keep its credential private.
+
 ## What this milestone does not do
 
 - The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Computer's Workspace root as the only place where files persist; the run starts in the Bot's own directory inside it, and Bots on the same Computer can reach each other's directories. It has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
 - Hosted Computers run only in the Space process in this milestone. Starting, stopping, or deleting one on demand, and worker containers or a Supervisor, are not available.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
-- One human joins a Space. Group Chats, Boards, and search arrive in later milestones.
+- Group Chats, Boards, and search arrive in later milestones.
+- Removing a User or leaving a Space, resetting a forgotten password, sharing a Bot with another User, and managing devices and sessions come later.
 - The browser client covers joining, first-run setup, and one-to-one Chat with its live state, tool activity, and the Approvals that wait, plus the Bot page, Settings, and the Computers list. It does not show Groups, Tasks, or search. Notifications are available in an installed browser client on a public HTTPS origin; see [Notifications](notifications.md).
 - The browser client downloads a File and opens no preview of it. Choosing a file card downloads the File.
 - The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
 - A Bot on a Hosted Computer does not ask before the actions its Computer runs, so its page offers no rule for those. It still lists and removes its rules for a skill's script or an MCP server's tool, which ask on either Computer.
-- The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.
+- The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed. A Run with a plan shows a progress bar and the count of done lines in its title row, and the plan appears when the card expands. A Run without a plan keeps the state, the step, and the tools in use in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

@@ -46,6 +46,27 @@ describe("i18n", () => {
     expect(t("bot.memory.scope.owner")).toBe("所有者");
   });
 
+  it("names the Space's People and the role each holds", () => {
+    expect(t("sidebar.settings.people")).toBe("People");
+    expect(t("settings.people.role.owner")).toBe("Owner");
+    expect(t("settings.people.role.admin")).toBe("Admin");
+    expect(t("settings.people.role.member")).toBe("Member");
+    flush(() => setLocale("zh-CN"));
+    expect(t("sidebar.settings.people")).toBe("成员");
+    expect(t("settings.people.role.owner")).toBe("所有者");
+    expect(t("settings.people.role.admin")).toBe("管理员");
+    expect(t("settings.people.role.member")).toBe("成员");
+    // The invitation copy says the link is one-time and admits a Member.
+    expect(t("settings.people.invite.once")).toContain("一次");
+    expect(t("settings.people.invite.member")).toContain("成员");
+  });
+
+  it("invites a User to join as a Member, never as the Admin", () => {
+    expect(t("auth.join.hint")).not.toContain("Admin");
+    flush(() => setLocale("zh-CN"));
+    expect(t("auth.join.hint")).not.toContain("管理员");
+  });
+
   it("names what a Chat waits for, in the reader's language", () => {
     expect(t("attention.title")).toBe("Needs attention");
     expect(t("attention.count.one")).toBe("1 approval waiting");

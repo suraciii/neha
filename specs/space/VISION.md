@@ -14,7 +14,7 @@ The desktop app can start its own Local Space or connect to a Hosted Space.
 
 A phone connects to a Space; it reaches a Hosted Space over the network and a Local Space when that Space's origin is reachable.
 
-The Admin of a Space invites Users and configures the model providers everyone on it uses.
+An Admin of a Space invites Users and configures the model providers everyone on it uses.
 
 Each User signs in to a Space and sees their own Bots, Chats, and Groups from any client.
 
@@ -26,14 +26,14 @@ A Local Space lets a user start with nothing to install but the app; a Hosted Sp
 
 One model for both keeps a Local Space's Users and a Hosted Space's Users on the same product; connecting to a Hosted Space changes nothing but where the Space runs.
 
-The Admin configures providers because someone has to, and a model is a choice about the whole Space; a Bot can still pick its own.
+An Admin configures providers because someone has to, and a model is a choice about the whole Space; a Bot can still pick its own.
 
 Notifications belong to the Space because they cross every Chat and Group and reach the user outside the app.
 
 ## Principles
 
 - **Local or Hosted, the same product.** The desktop app starts its own Local Space or connects to a Hosted Space; a phone connects to either when it can reach the origin.
-- **The Admin invites Users.** The Admin of a Space decides who uses it and configures the model providers it offers.
+- **An Admin invites Users.** An Admin of a Space decides who uses it and configures the model providers it offers.
 - **One model for one user or many.** A Space serves its Users with the same record, Bots, and Groups, whether there is one User or several.
 - **Notifications reach the User outside the app.** A Space notifies a User when a Bot finishes or waits for them.
 

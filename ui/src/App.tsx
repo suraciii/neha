@@ -39,14 +39,19 @@ import type {
   Chat,
   ChatStatus,
   Computer,
+  CreatedInvitation,
   Decision,
   FileSummary,
   InstalledPackage,
+  Invitation,
   McpServer,
   McpSignInState,
   MemoryList,
   Message,
   Model,
+  PlanEntry,
+  PlanProgress,
+  PlanRead,
   Preview,
   Provider,
   RecordEvent,
@@ -58,6 +63,7 @@ import type {
   Skill,
   ThinkingLevel,
   ToolAction,
+  User,
 } from "./types";
 
 type AuthMode = "join" | "login" | "missing-invite";
@@ -124,6 +130,22 @@ function actionStatusOf(status: unknown): ToolAction["status"] {
   return "unknown";
 }
 
+// The plan entries a `neha.run.planned` event carries. The record writes the
+// whole list each time, so the caller replaces what it held; each entry the page
+// cannot read is left out rather than guessed at.
+function planEntriesOf(data: Record<string, unknown>): PlanEntry[] | null {
+  if (!Array.isArray(data.entries)) return null;
+  const entries: PlanEntry[] = [];
+  for (const entry of data.entries) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const row = entry as Record<string, unknown>;
+    if (typeof row.title !== "string") continue;
+    if (row.state !== "pending" && row.state !== "doing" && row.state !== "done") continue;
+    entries.push({ title: row.title, state: row.state });
+  }
+  return entries;
+}
+
 // Whether an action's status says it is over, so a later word may replace it.
 function ended(status: ToolAction["status"]): boolean {
   return status === "succeeded" || status === "failed";
@@ -144,13 +166,19 @@ function toolOf(data: Record<string, unknown>): string {
   return typeof data.tool === "string" ? data.tool : "";
 }
 
-// The failed Run's activity: what it did, and why it failed.
-function failActivity(current: RunActivity | null, run: string, error: string | null): RunActivity {
+// The failed Run's activity: what it did, the plan it held, and why it failed.
+function failActivity(
+  current: RunActivity | null,
+  run: string,
+  error: string | null,
+  plan: PlanEntry[] = [],
+): RunActivity {
   const mine = current && current.run === run ? current : null;
   return {
     run,
     step: mine?.step ?? 0,
     actions: mine ? mine.actions.map((action) => ({ ...action })) : [],
+    plan: (mine ? mine.plan : plan).map((entry) => ({ ...entry })),
     files: mine ? [...mine.files] : [],
     error,
   };
@@ -203,6 +231,10 @@ interface State {
   // The Settings surface: every vendor the catalog knows, and the cache state.
   vendors: CatalogVendor[];
   catalog: CatalogStatus | null;
+  // The People section: every User who signed in, and the one invitation that
+  // still admits a User. A Member reads the Users and no invitation.
+  users: User[];
+  invitation: Invitation | null;
   // A management read or write is in flight.
   managing: boolean;
   // What the last failed management command said.
@@ -240,6 +272,8 @@ function emptyState(): State {
     memories: emptyMemories(),
     vendors: [],
     catalog: null,
+    users: [],
+    invitation: null,
     managing: false,
     manageError: null,
   };
@@ -518,6 +552,10 @@ export default function App() {
   let calibrateEvents: RecordEvent[] | null = null;
   // The followed Run's tool activity, while it has any.
   const [activity, setActivity] = createSignal<RunActivity | null>(null);
+  // The newest plan the record named for each Run, by Run. A plan belongs to one
+  // Run and a Chat's row shows how much of its plan is done, so the page keeps
+  // it for every Run it hears about, not only the one it follows.
+  const [plans, setPlans] = createSignal<Record<string, PlanEntry[]>>({});
 
   // The ChatViews the page renders: the Chat on screen, and the one it just left
   // while its apps answer the host's teardown request. Entries are kept by
@@ -757,6 +795,57 @@ export default function App() {
     });
   }
 
+  // The plan the page knows for one Run, when it knows one.
+  function planOf(run: string): PlanEntry[] {
+    return plans()[run] ?? [];
+  }
+
+  // The Run replaced its plan. The record writes the whole list, so the newest
+  // word replaces what the page held; an empty list is a plan the Bot cleared.
+  function notePlan(run: string, entries: PlanEntry[]) {
+    planWords[run] = (planWords[run] ?? 0) + 1;
+    setPlans((current) => (current[run] === entries ? current : { ...current, [run]: entries }));
+    // The card shows the plan of the Run the page follows.
+    setActivity((current) =>
+      current && current.run === run ? { ...current, plan: entries } : current,
+    );
+  }
+
+  // How many plan words the record gave one Run, and the newest read the page
+  // sent about it. A read's answer adopts its plan only when no newer word and
+  // no newer read landed while it was on its way, so a list the record already
+  // replaced never comes back.
+  const planWords: Record<string, number> = {};
+  const planReads: Record<string, number> = {};
+
+  // Marks the start of one read about a Run's plan.
+  function beginPlanRead(run: string): PlanRead {
+    const read = (planReads[run] ?? 0) + 1;
+    planReads[run] = read;
+    return { run, read, word: planWords[run] ?? 0 };
+  }
+
+  // Takes a read's plan unless a newer word or read has landed since the read
+  // was sent.
+  function applyPlanRead(entries: PlanEntry[], sent: PlanRead) {
+    if (planReads[sent.run] !== sent.read) return;
+    if ((planWords[sent.run] ?? 0) !== sent.word) return;
+    setPlans((current) => ({ ...current, [sent.run]: entries }));
+  }
+
+  // A Run that ended takes its plan with it, so the map holds only Runs the page
+  // can still show.
+  function forgetPlan(run: string) {
+    delete planWords[run];
+    delete planReads[run];
+    setPlans((current) => {
+      if (!(run in current)) return current;
+      const next = { ...current };
+      delete next[run];
+      return next;
+    });
+  }
+
   // The Run asked a tool to do something.
   function startAction(run: string, step: number, action: string, tool: string) {
     setActivity((current) => {
@@ -920,8 +1009,11 @@ export default function App() {
     // The Chat works on this Run now, whatever else it holds.
     const chat = state.activeChat;
     if (chat) holdRun(chat.id, run, step);
+    // A plan the page already heard about belongs to the card from its first
+    // render, so reopening a Run on screen does not flash an empty plan.
+    const plan = planOf(run);
     setActivity((current) =>
-      current?.run === run ? current : { run, step: 0, actions: [], files: [], error: null },
+      current?.run === run ? current : { run, step: 0, actions: [], plan, files: [], error: null },
     );
   }
 
@@ -1005,21 +1097,18 @@ export default function App() {
     const chat = state.activeChat;
     endRun(chat?.id, run, outcome);
     forgetRunAttention(run);
+    // The plan belongs to the Run and goes with it. A failed card keeps the copy
+    // it already showed, so the page reads the map's last word before forgetting
+    // the entry.
+    const plan = planOf(run);
+    forgetPlan(run);
     if (!wasFollowing) return;
     update({ queue: null });
     // A failed Run keeps one line in the stream, with its reason behind it; a
     // Run that answered leaves its reply Message in place.
-    setActivity((current) => {
-      if (!outcome.failed) return null;
-      const mine = current && current.run === run ? current : null;
-      return {
-        run,
-        step: mine?.step ?? 0,
-        actions: mine ? mine.actions.map((action) => ({ ...action })) : [],
-        files: mine ? [...mine.files] : [],
-        error: outcome.error,
-      };
-    });
+    setActivity((current) =>
+      outcome.failed ? failActivity(current, run, outcome.error, plan) : null,
+    );
   }
 
   function isUnfinished(status: RunView["status"]): status is RunStep {
@@ -1028,7 +1117,7 @@ export default function App() {
 
   // Applies one record answer about the followed Run. The caller always asks
   // about that Run, so a finished answer settles the Chat.
-  function applyRunView(view: RunView) {
+  function applyRunView(view: RunView, sent?: PlanRead) {
     if (view.status === "queued") advanceRun(view.id, "queued", view.position);
     else if (view.status === "running") advanceRun(view.id, "running");
     else if (view.status === "waiting") advanceRun(view.id, "waiting");
@@ -1037,11 +1126,11 @@ export default function App() {
     // actions, which the events of a Run the page never saw cannot tell. A Run
     // that answered leaves its reply in the stream instead.
     if (view.status !== "succeeded")
-      restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
+      restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null, sent);
   }
 
-  // Puts the recorded steps and actions of one Run into its activity card.
-  function restoreActivity(view: RunView, error: string | null = null) {
+  // Puts the recorded steps, actions, and plan of one Run into its activity card.
+  function restoreActivity(view: RunView, error: string | null = null, sent?: PlanRead) {
     const steps = view.steps ?? [];
     const actions = (view.actions ?? []).map((action) => ({
       action: action.id,
@@ -1050,9 +1139,14 @@ export default function App() {
       status: actionStatusOf(action.status),
       error: action.error ?? null,
     }));
+    // An unfinished Run's plan also fills the Chat list badge, so its read
+    // adopts the list unless a newer word or read landed in the meantime. A
+    // finished Run's card reads this answer itself.
+    if (sent && isUnfinished(view.status)) applyPlanRead(view.plan ?? [], sent);
+    const plan = plans()[view.id] ?? view.plan ?? [];
     // A Run that failed before its first step has no steps and no actions to
-    // restore, but it still has its reason to show.
-    if (steps.length === 0 && actions.length === 0 && !error) return;
+    // restore, but it still has its plan and its reason to show.
+    if (steps.length === 0 && actions.length === 0 && !error && plan.length === 0) return;
     setActivity((current) => {
       if (current && current.run !== view.id) return current;
       const mine = current?.run === view.id ? current : null;
@@ -1071,6 +1165,7 @@ export default function App() {
         run: view.id,
         step: steps.reduce((highest, step) => Math.max(highest, step.index), mine?.step ?? 0),
         actions: merged,
+        plan: plan.map((entry) => ({ ...entry })),
         files: mine ? mine.files : [],
         error: error ?? mine?.error ?? null,
       };
@@ -1099,11 +1194,16 @@ export default function App() {
 
     const secret = location.hash.replace(/^#/, "");
     if (location.pathname === "/invite") {
+      // The invitation page joins a new User, so it wins over the account this
+      // browser already has: opening a link never hides it behind the
+      // signed-in workspace.
       setAuthSecret(secret);
       setAuthMode(secret ? "join" : "missing-invite");
-    } else {
-      setAuthMode("login");
+      setReady(true);
+
+      return;
     }
+    setAuthMode("login");
 
     void boot();
   });
@@ -1293,6 +1393,22 @@ export default function App() {
       if (event.kind === "neha.computer.created") void refreshComputers();
       return;
     }
+    // A User joined or a role moved: the People section reads the Users again,
+    // and the signed-in account takes its own role from the same answer.
+    if (
+      event.kind === "neha.user.joined" ||
+      event.kind === "neha.user.updated" ||
+      event.kind === "neha.user.transferred"
+    ) {
+      void refreshPeople();
+      return;
+    }
+    // Another Admin made, rotated, or revoked the pending invitation: the
+    // People section reads it again, so a stale link leaves the screen.
+    if (event.kind === "neha.invitation.changed") {
+      void refreshPeople();
+      return;
+    }
     // Another client changed who may use a Computer: the Settings list and an
     // open Bot's page both show its sharing.
     if (event.kind === "neha.computer.updated") {
@@ -1425,6 +1541,15 @@ export default function App() {
     if (event.kind === "neha.run.step" && run && isFollowing(run)) {
       noteStep(run, typeof data.step === "number" ? data.step : 0);
     }
+    if (event.kind === "neha.run.planned") {
+      // The event names no Chat: the page keys the plan by Run, and a Chat's row
+      // reads it from the Run that Chat works on.
+      if (!run) return;
+      const entries = planEntriesOf(data);
+      if (!entries) return;
+      notePlan(run, entries);
+      return;
+    }
     if (event.kind === "neha.action.started" && run && isFollowing(run)) {
       startAction(run, stepOf(data), actionOf(data), toolOf(data));
     }
@@ -1444,6 +1569,8 @@ export default function App() {
       }
       settledRuns.add(run);
       settleChat(runChats.get(run), run, outcome);
+      // The Run's plan belongs to it and does not outlive it.
+      forgetPlan(run);
       // A Run of this Bot ahead of ours may have ended and left a better place.
       if (followed?.step === "queued") void refreshRunPlace(followed.run);
       else if (run === newestRequestRun(state.messages)) queueRefresh();
@@ -1535,7 +1662,7 @@ export default function App() {
       !followed &&
       projectRuns(chat) === "failed"
     ) {
-      setActivity((current) => failActivity(current, run, outcome.error));
+      setActivity((current) => failActivity(current, run, outcome.error, planOf(run)));
     }
   }
 
@@ -1589,10 +1716,11 @@ export default function App() {
   async function refreshRunPlace(run: string) {
     if (!isFollowing(run) || settledRuns.has(run)) return;
     const generation = runGeneration;
+    const sent = beginPlanRead(run);
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (generation !== runGeneration || !isFollowing(run)) return;
-      applyRunView(view);
+      applyRunView(view, sent);
       if (view.status !== "queued" && view.status !== "running") queueRefresh();
     } catch {
       // A Run that is gone leaves the finish event to settle the Chat.
@@ -2196,6 +2324,7 @@ export default function App() {
     // moved on from does not.
     expectRun(run);
     const sent = followVersion;
+    const planRead = beginPlanRead(run);
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
@@ -2203,8 +2332,8 @@ export default function App() {
       if (followVersion !== sent) return;
       if (expectedRun !== run) return;
       if (followed && followed.run !== run) return;
-      if (holds) applyRunView(view);
-      else restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null);
+      if (holds) applyRunView(view, planRead);
+      else restoreActivity(view, view.status === "failed" ? (view.error ?? null) : null, planRead);
       // A Run that answered is over: the Chat reads the record again for the
       // reply and the Files it produced.
       if (!isUnfinished(view.status)) await refreshActive(chat, generation);
@@ -2225,6 +2354,7 @@ export default function App() {
     // The page expects the Run it is about to read.
     expectRun(run);
     const sent = followVersion;
+    const planRead = beginPlanRead(run);
     try {
       const view = await commands.command<RunView>("run_show", { run }, 10_000);
       if (!isCurrentChat(chat, generation)) return;
@@ -2232,7 +2362,7 @@ export default function App() {
       if (followVersion !== sent) return;
       if (expectedRun !== run) return;
       if (followed && followed.run !== run) return;
-      applyRunView(view);
+      applyRunView(view, planRead);
     } catch {
       // A late answer for a Chat the reader left must not touch the new one.
       if (!isCurrentChat(chat, generation)) return;
@@ -2826,6 +2956,51 @@ export default function App() {
     }
   }
 
+  // Adds a Local Computer whose machine printed a pairing code. The code is
+  // entered on any signed-in client; the machine keeps polling until this
+  // answer records its Computer.
+  async function addComputer(code: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command<Computer>("computer_add", { code });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Approves a terminal's device code, signing it in as this account.
+  async function approveDevice(code: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("device_approve", { code });
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Revokes a Local Computer's credential. The machine's daemon stops on its
+  // Revokes a Local Computer's credential. The machine's daemon stops on its
+  // next answer, and the record stays listed offline until it pairs again.
+  async function revokeComputer(computer: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("computer_revoke", { computer });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
   // Opens one Bot's page from a Computer in the Settings surface, leaving the
   // Settings where Back returns to.
   function openBotPage(bot: Bot) {
@@ -2955,18 +3130,71 @@ export default function App() {
   }
 
   // Reads the catalog's vendors and its cache state, which is what the Settings
-  // surface connects from and shows.
+  // surface connects from and shows, and the People section's Users and pending
+  // invitation.
   async function loadSettings() {
     update({ managing: true, manageError: null });
     try {
-      const [vendors, catalog, computers] = await Promise.all([
+      const [vendors, catalog, computers, users] = await Promise.all([
         commands.command<CatalogVendor[]>("catalog_list"),
         commands.command<CatalogStatus>("catalog_status"),
         commands.command<Computer[]>("computer_list"),
+        commands.command<User[]>("user_list"),
       ]);
+      // The directory decides whether this account still administers the
+      // Space; an invitation read belongs to the Space Owner and the Admins.
+      adoptUsers(users);
       update({ vendors, catalog, computers, managing: false });
+      if (state.account?.is_admin) {
+        try {
+          const invitations = await commands.command<Invitation[]>("invitation_list");
+          update({ invitation: invitations[0] ?? null });
+        } catch {
+          // A role that changed between the two reads leaves no invitation to
+          // show; the directory answer above still stands.
+        }
+      } else {
+        update({ invitation: null });
+      }
     } catch (reason) {
       update({ manageError: reason, managing: false });
+    }
+  }
+
+  // Takes the Space's Users as the record lists them. The signed-in account
+  // takes its own role from the same answer, because the Space Owner may have
+  // changed it while this client was open.
+  function adoptUsers(users: User[]): void {
+    const me = state.account;
+    const self = me ? users.find((known) => known.id === me.id) : undefined;
+    if (me && self && (me.role !== self.role || me.is_admin !== (self.role !== "member"))) {
+      update({
+        account: {
+          ...me,
+          role: self.role,
+          is_admin: self.role === "owner" || self.role === "admin",
+        },
+      });
+    }
+    update({ users });
+  }
+
+  // Reads the People the Settings surface shows again, after the record says
+  // they changed. A Member reads the Users list alone.
+  async function refreshPeople(): Promise<void> {
+    try {
+      const users = await commands.command<User[]>("user_list");
+      adoptUsers(users);
+      // The account's own role may have just changed, so the invitation read
+      // follows the role the Users list gave.
+      if (state.account?.is_admin) {
+        const invitations = await commands.command<Invitation[]>("invitation_list");
+        update({ invitation: invitations[0] ?? null });
+      } else {
+        update({ invitation: null });
+      }
+    } catch {
+      // A failed read keeps the list the page already shows.
     }
   }
 
@@ -3040,6 +3268,79 @@ export default function App() {
       return true;
     } catch (reason) {
       update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // A People command the Space refuses says what the reader can do instead. The
+  // generic permission line does not tell a former Owner why a role change
+  // failed, or a stale Member which role an invitation needs.
+  function peopleRefusal(reason: unknown, what: "role" | "invitation"): unknown {
+    if (reason instanceof ProtocolError && reason.code === "forbidden") {
+      return {
+        key: what === "role" ? "settings.people.error.role" : "settings.people.error.invitation",
+      };
+    }
+    return reason;
+  }
+
+  // Makes an invitation and answers it once, so its panel can show the link and
+  // its QR code. The Space keeps only a hash of the secret afterwards.
+  async function createInvitation(): Promise<CreatedInvitation | null> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<CreatedInvitation>("invitation_create");
+      update({ invitation: answer.invitation, managing: false });
+      return answer;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "invitation"), managing: false });
+      return null;
+    }
+  }
+
+  async function revokeInvitation(invitation: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("invitation_revoke", { invitation });
+      update({ invitation: null, managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "invitation"), managing: false });
+      return false;
+    }
+  }
+
+  // Changes another User's role. The answer carries the Users in their new
+  // order, so the list moves with the Space's word.
+  async function setUserRole(user: string, role: "admin" | "member"): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<{ user: string; users: User[] }>("user_set_role", {
+        user,
+        role,
+      });
+      adoptUsers(answer.users);
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "role"), managing: false });
+      return false;
+    }
+  }
+
+  // Gives the Space to another User. The outgoing Owner becomes an Admin, so
+  // the answer's Users also move the signed-in account's own role.
+  async function transferSpace(user: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<{ user: string; users: User[] }>("user_transfer", {
+        user,
+      });
+      adoptUsers(answer.users);
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "role"), managing: false });
       return false;
     }
   }
@@ -3146,6 +3447,38 @@ export default function App() {
     return states;
   });
 
+  // How far the plan of each Chat's working Run has come, for the list's Working
+  // badge. The page keeps plans for every Run it hears about, so a Chat it is not
+  // reading still names the done count; a Run with no plan the page knows leaves
+  // the mark as it was.
+  const chatProgress = createMemo<Record<string, PlanProgress>>(() => {
+    const known = plans();
+    const progress: Record<string, PlanProgress> = {};
+    for (const chat of state.chats) {
+      const runs = state.runs[chat.id];
+      if (!runs) continue;
+      const working = Object.keys(runs.active).find((run) => runs.active[run] === "running");
+      if (working === undefined) continue;
+      // The record's own words are newer than the Space's cold answer; a Chat
+      // the page never opened takes the progress its list answer carries.
+      const plan = known[working];
+      if (plan !== undefined) {
+        // The record named this Run's plan: a cleared one carries no count,
+        // whatever the cold answer said before.
+        if (plan.length === 0) continue;
+        progress[chat.id] = {
+          done: plan.filter((entry) => entry.state === "done").length,
+          total: plan.length,
+        };
+      } else if (chat.active_run === working && chat.plan) {
+        // The saved count names the run the Chat follows, so it stays with that
+        // run even when the saved status is older than the live one.
+        progress[chat.id] = { done: chat.plan.done, total: chat.plan.total };
+      }
+    }
+    return progress;
+  });
+
   // Every approval that waits for the User, one entry each. Opening its Chat
   // does not answer it, so a Chat the User is reading stays listed until its
   // answer is sent.
@@ -3240,6 +3573,7 @@ export default function App() {
                 activeChat={state.activeChat}
                 previews={state.previews}
                 statuses={chatStates()}
+                progress={chatProgress()}
                 unread={state.unread}
                 attention={attentionEntries()}
                 attentionOpen={view() === "attention"}
@@ -3375,6 +3709,8 @@ export default function App() {
                       bots={state.bots}
                       vendors={state.vendors}
                       catalog={state.catalog}
+                      users={state.users}
+                      invitation={state.invitation}
                       section={section()}
                       busy={state.managing}
                       error={manageErrorText()}
@@ -3382,11 +3718,18 @@ export default function App() {
                       onCreate={(input) => createComputer(input)}
                       onShare={(computer) => shareComputer(computer)}
                       onReset={(computer) => resetComputer(computer)}
+                      onAdd={(code) => addComputer(code)}
+                      onRevoke={(computer) => revokeComputer(computer)}
+                      onApproveDevice={(code) => approveDevice(code)}
                       onOpenBot={(bot) => openBotPage(bot)}
                       onConnect={(input) => connectVendor(input)}
                       onRefresh={(provider) => refreshProviderModels(provider)}
                       onDefault={(model) => makeDefaultModel(model)}
                       onCatalog={() => refreshCatalog()}
+                      onInvite={() => createInvitation()}
+                      onRevokeInvitation={(invitation) => revokeInvitation(invitation)}
+                      onSetRole={(user, role) => setUserRole(user, role)}
+                      onTransfer={(user) => transferSpace(user)}
                     />
                   </Show>
                 </Show>

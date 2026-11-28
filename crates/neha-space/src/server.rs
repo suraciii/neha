@@ -5,7 +5,7 @@
 //! HTTP. The server listens on loopback until a remote Space is configured.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,13 @@ use crate::diagnostics::{sanitize_value, scrub_error, storage_kind};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError, PairingState};
 use crate::model::{ModelClient, ModelError};
+use crate::proxy::{self, TrustedProxies};
+
+/// How many anonymous pairing requests may wait on the record at once.
+///
+/// Starts are rare and polls are cheap; the bound protects the record's
+/// connections from an unauthenticated queue while allowing normal polling.
+const ANONYMOUS_PAIR_PERMITS: usize = 8;
 use crate::runs::RunQueue;
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
@@ -177,6 +184,7 @@ pub struct SpaceServer {
     storage: Storage,
     invite: Mutex<Option<Invite>>,
     login: Mutex<LoginLimiter>,
+    joins: Mutex<LoginLimiter>,
     pub(crate) state: Mutex<SpaceState>,
     pub(crate) secrets: Secrets,
     /// The models.dev catalog and its cache.
@@ -200,12 +208,19 @@ pub struct SpaceServer {
     pub(crate) provider_writes: tokio::sync::Mutex<()>,
     /// Serializes changes to the skills of both libraries.
     pub(crate) library: tokio::sync::Mutex<()>,
+    /// Serializes role changes and the transfer (see the command context).
+    pub(crate) roles: tokio::sync::Mutex<()>,
     /// Whether this Space treats skills as instructions only.
     pub(crate) instructions_only: bool,
     /// Where this Space may install a package from.
     pub(crate) plugins: crate::config::PluginsConfig,
-    /// Local-ticket pair attempts, counted per source address.
+    /// Local-ticket and device-code starts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
+    /// Device-code polls, counted per source address at polling pace.
+    pub(crate) device_polls: Mutex<PairLimiter>,
+    /// Bounds anonymous pairing database work so a flood cannot queue ahead
+    /// of signed-in callers for the record's connections.
+    pub(crate) pair_work: tokio::sync::Semaphore,
     /// The ticket file this start wrote for its Admin, with its digest.
     start_ticket: Mutex<Option<crate::ticket::StartTicket>>,
     /// Set once the Space stops: no command may then start new work.
@@ -221,6 +236,8 @@ pub struct SpaceServer {
     browser_authority: Mutex<Option<String>>,
     /// The public https origin a trusted TLS proxy forwards to this Space.
     public_url: Option<String>,
+    /// The peers whose forwarded client address this Space reads.
+    trusted_proxies: Option<TrustedProxies>,
     /// The installed browser clients' push subscriptions.
     pub(crate) push: std::sync::Arc<crate::push::Push>,
     /// The browser sign-ins the Space is waiting on, by sign-in.
@@ -394,14 +411,16 @@ impl SpaceServer {
                 });
             }
         }
+        let mut state = SpaceState::default();
+        store.replay(&mut state).await?;
+        reconcile_identity(&identity, &state).await?;
+        flush_invitation_notices(&store, &identity).await?;
+        migrate_legacy_hosted_workspaces(&home, &mut state)?;
         let invite = if identity.has_accounts().await? {
             None
         } else {
             Some(Invite::generate())
         };
-        let mut state = SpaceState::default();
-        store.replay(&mut state).await?;
-        migrate_legacy_hosted_workspaces(&home, &mut state)?;
         let secrets = Secrets::load(&home)?;
         let push_contact = public_url
             .clone()
@@ -418,6 +437,7 @@ impl SpaceServer {
             storage,
             invite: Mutex::new(invite),
             login: Mutex::new(LoginLimiter::default()),
+            joins: Mutex::new(LoginLimiter::default()),
             state: Mutex::new(state),
             secrets,
             catalog,
@@ -434,9 +454,12 @@ impl SpaceServer {
             computer_assignments: tokio::sync::Mutex::new(()),
             provider_writes: tokio::sync::Mutex::new(()),
             library: tokio::sync::Mutex::new(()),
+            roles: tokio::sync::Mutex::new(()),
             instructions_only,
             plugins,
             pairs: Mutex::new(PairLimiter::default()),
+            device_polls: Mutex::new(PairLimiter::default()),
+            pair_work: tokio::sync::Semaphore::new(ANONYMOUS_PAIR_PERMITS),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
             worker_config,
@@ -447,6 +470,7 @@ impl SpaceServer {
             browser_host,
             browser_authority: Mutex::new(None),
             public_url,
+            trusted_proxies: None,
             push,
             signins: tokio::sync::Mutex::new(HashMap::new()),
             signin_start: tokio::sync::Mutex::new(()),
@@ -526,6 +550,8 @@ impl SpaceServer {
             .route("/api/computer/pair", post(computer_pair))
             .route("/api/computers/pair", post(computer_pair_start))
             .route("/api/computers/pair/{device}", post(computer_pair_poll))
+            .route("/api/devices/login", post(device_login_start))
+            .route("/api/devices/login/{device}", post(device_login_poll))
             .route(
                 "/api/chats/{chat}/files",
                 post(file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
@@ -763,6 +789,92 @@ pub async fn start_with_worker_config(
     .await
 }
 
+/// A validated start with its listener already bound.
+///
+/// Prepare it before opening a home: an invalid public origin, proxy list, or
+/// plaintext listener must fail without clearing a home or touching a record.
+/// The prepared listener is the one the start uses, so the address that was
+/// checked is the address that serves.
+pub struct Startup {
+    listener: TcpListener,
+    addr: SocketAddr,
+    public_url: Option<String>,
+    trusted_proxies: Option<TrustedProxies>,
+    worker_config: Option<crate::workers::WorkerConfig>,
+}
+
+/// Validates the startup configuration and binds its listener.
+///
+/// Resolve the configuration in one place before the caller opens its home.
+/// A hostname is resolved once here and every address is checked; the bound
+/// address is checked again so a wildcard listener cannot pass by name. This
+/// is the production entry, so it also reads the deployment's worker
+/// configuration.
+pub async fn prepare_start(port: u16, public_url: Option<String>) -> Result<Startup, ServerError> {
+    prepare_start_with(port, public_url, crate::workers::WorkerConfig::from_env()).await
+}
+
+async fn prepare_start_with(
+    port: u16,
+    public_url: Option<String>,
+    worker_config: Option<crate::workers::WorkerConfig>,
+) -> Result<Startup, ServerError> {
+    let public_url = normalize_public_url(public_url)?;
+    let trusted_proxies = TrustedProxies::from_env().map_err(ServerError::TrustedProxies)?;
+    // A containerized Space listens on its private network so Caddy and its
+    // workers can reach it; a Local Space keeps the loopback default. A
+    // listener beyond this machine needs the TLS proxy its public origin names.
+    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let addresses = (bind.as_str(), port)
+        .to_socket_addrs()
+        .map_err(ServerError::Io)?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("{bind}:{port} resolves to no address"),
+        )));
+    }
+    for address in &addresses {
+        refuse_unencrypted_listener(*address, public_url.as_deref())?;
+    }
+    let mut last_error = None;
+    let mut listener = None;
+    for address in addresses {
+        match TcpListener::bind(address).await {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let listener = listener.ok_or_else(|| {
+        ServerError::Io(last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address to bind")
+        }))
+    })?;
+    let addr = listener.local_addr()?;
+    refuse_unencrypted_listener(addr, public_url.as_deref())?;
+
+    Ok(Startup {
+        listener,
+        addr,
+        public_url,
+        trusted_proxies,
+        worker_config,
+    })
+}
+
+/// Starts a UI-serving Space from a prepared start.
+pub async fn start_with_ui_prepared(
+    home: Home,
+    ui: Option<PathBuf>,
+    startup: Startup,
+) -> Result<Running, ServerError> {
+    start_prepared(home, ui, neha_computer::local::DEFAULT_TIMEOUT, startup).await
+}
+
 async fn start_with_workers(
     home: Home,
     port: u16,
@@ -771,6 +883,16 @@ async fn start_with_workers(
     public_url: Option<String>,
     worker_config: Option<crate::workers::WorkerConfig>,
 ) -> Result<Running, ServerError> {
+    let startup = prepare_start_with(port, public_url, worker_config).await?;
+    start_prepared(home, ui, tool_timeout, startup).await
+}
+
+async fn start_prepared(
+    home: Home,
+    ui: Option<PathBuf>,
+    tool_timeout: Duration,
+    startup: Startup,
+) -> Result<Running, ServerError> {
     crate::diagnostics::install_propagator();
     let ui_enabled = ui.is_some();
     if let Some(dir) = &ui
@@ -778,18 +900,19 @@ async fn start_with_workers(
     {
         return Err(ServerError::Ui(dir.clone()));
     }
-    let server = Arc::new(
+    let Startup {
+        listener,
+        addr,
+        public_url,
+        trusted_proxies,
+        worker_config,
+    } = startup;
+    let mut server =
         SpaceServer::open_with_ui_workers(home, ui, tool_timeout, public_url, worker_config)
-            .await?,
-    );
+            .await?;
+    server.trusted_proxies = trusted_proxies;
+    let server = Arc::new(server);
     validate_client_directory(&server).await?;
-    // The port is bound before anything is written or woken: a start that
-    // cannot listen must not make a run, reach a Provider, or record a failure.
-    // A containerized Space listens on its private network so Caddy and its
-    // workers can reach it; a Local Space keeps the loopback default.
-    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let listener = TcpListener::bind((bind.as_str(), port)).await?;
-    let addr = listener.local_addr()?;
     let browser_authority = match &server.public_url {
         Some(public) => public.strip_prefix("https://").unwrap_or(public).to_owned(),
         None => format!("{}:{}", server.browser_host, addr.port()),
@@ -836,7 +959,7 @@ async fn start_with_workers(
     if let Some(path) = &ticket_path {
         ticket::remove_file(path).await?;
     }
-    let start_ticket = match (server.identity.admin_account().await?, ticket_path) {
+    let start_ticket = match (server.identity.owner_account().await?, ticket_path) {
         (Some(admin), Some(path)) => {
             let url = format!("http://{addr}");
             let start = ticket::issue_for_start(&server.identity, &path, admin.id, &url).await?;
@@ -1200,37 +1323,24 @@ fn loopback_host(value: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// Returns the client address, trusting a forwarded one only from loopback.
+/// Refuses a listener beyond this machine without a public origin.
 ///
-/// A TLS proxy on the Space's machine connects from loopback and appends the
-/// client to `X-Forwarded-For`; a proxy on another machine does not get to
-/// name the client. Only the final appended value counts.
-fn client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
-    if !peer.is_loopback() {
-        return peer;
+/// A TLS proxy terminates the public connection and forwards to a Space that
+/// listens on a private address. Without a configured public origin there is
+/// no such proxy, so serving the private address would offer the Space in
+/// plaintext to everything that can reach it.
+fn refuse_unencrypted_listener(
+    addr: SocketAddr,
+    public_url: Option<&str>,
+) -> Result<(), ServerError> {
+    if addr.ip().is_loopback() || public_url.is_some() {
+        return Ok(());
     }
-    // Select the final raw field first. A malformed field must fail closed to
-    // the peer, not expose an earlier client-supplied field.
-    let Some(value) = headers.get_all("x-forwarded-for").iter().next_back() else {
-        return peer;
-    };
-    let Some(value) = value.to_str().ok() else {
-        return peer;
-    };
-    forwarded_ip(value)
-        .filter(|address| !address.is_loopback())
-        .unwrap_or(peer)
-}
 
-/// Returns the final address in one forwarded field, or `None` when it is not
-/// an address. Earlier values are the client's claim, not the proxy's.
-fn forwarded_ip(value: &str) -> Option<IpAddr> {
-    let last = value.split(',').next_back()?.trim().trim_matches('"');
-    let last = last
-        .strip_prefix('[')
-        .and_then(|last| last.strip_suffix(']'))
-        .unwrap_or(last);
-    last.parse().ok()
+    Err(ServerError::UnencryptedListener(format!(
+        "a Space that listens beyond this machine needs a TLS proxy: pass --domain or set \
+         NEHA_PUBLIC_URL, or keep NEHA_BIND on loopback (it names {addr})"
+    )))
 }
 
 fn split_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -2203,7 +2313,9 @@ fn content_type(path: &Path) -> &'static str {
 async fn invite_page() -> Html<&'static str> {
     Html(
         "<!doctype html><title>Neha invitation</title>\
-         <p>Run <code>neha join &lt;this URL&gt;</code> in a terminal to become the Admin.",
+         <p>This link admits one User to the Space. Open it in the browser client,\
+         or run <code>neha join &lt;this URL&gt;</code> in a terminal; the Space's\
+         first User becomes its Space Owner and an invited User joins as a Member.",
     )
 }
 
@@ -2226,26 +2338,11 @@ struct SessionResponse {
     account: Account,
 }
 
-async fn join(
-    State(server): State<Arc<SpaceServer>>,
-    headers: HeaderMap,
-    Json(request): Json<JoinRequest>,
-) -> Result<Response, ApiError> {
-    let accepted = server
-        .invite
-        .lock()
-        .expect("invite lock")
-        .as_ref()
-        .is_some_and(|invite| invite.accepts(&request.secret));
-    if !accepted {
-        return Err(ApiError::not_found("this invitation is not usable"));
-    }
-
-    let (account, token) = server
-        .identity
-        .create_admin(&request.display_name, &request.password)
-        .await
-        .map_err(identity_error)?;
+/// The event that admits a new User, and the state it projects.
+///
+/// The join records who joined before the invitation is finished; a crash
+/// after this append is settled by the start-up repair.
+async fn append_join(server: &Arc<SpaceServer>, account: &Account) -> Result<(), ApiError> {
     let joined = EventDraft::new(
         EventKind::UserJoined,
         Author::User(account.id),
@@ -2277,9 +2374,114 @@ async fn join(
                 .map_err(|error| ApiError::internal(error.to_string()))?;
         }
     }
-    server.consume_invite();
+    // A join is a space-level event: open clients must see the new User
+    // without a reload, exactly as a command's events reach them.
+    broadcast(server, &appended.events);
 
-    let browser = browser_request(&server, &headers);
+    Ok(())
+}
+
+async fn join(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<JoinRequest>,
+) -> Result<Response, ApiError> {
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    let display_name = request.display_name.clone();
+    {
+        // Count the attempt before the asynchronous work: two starts that both
+        // pass the check would otherwise both run before either records.
+        let mut joins = server.joins.lock().expect("join lock");
+        if !joins.allows(&display_name, source) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::RateLimited,
+                "too many join attempts",
+            ));
+        }
+        joins.record(&display_name, source);
+    }
+    match join_invited(&server, &headers, request).await {
+        Ok(response) => {
+            // A successful join is not a failed attempt.
+            server
+                .joins
+                .lock()
+                .expect("join lock")
+                .release(&display_name, source);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates the account a join admits, as the Owner or as an invited Member.
+async fn join_invited(
+    server: &Arc<SpaceServer>,
+    headers: &HeaderMap,
+    request: JoinRequest,
+) -> Result<Response, ApiError> {
+    let startup = server
+        .invite
+        .lock()
+        .expect("invite lock")
+        .as_ref()
+        .is_some_and(|invite| invite.accepts(&request.secret));
+
+    let (account, token) = if startup {
+        let (account, token) = server
+            .identity
+            .create_owner(&request.display_name, &request.password)
+            .await
+            .map_err(identity_error)?;
+        if let Err(error) = append_join(server, &account).await {
+            // The invitation was not consumed and the record took nothing, so
+            // the account is rolled back and the link admits the User again.
+            let _ = server.identity.forget_account(account.id).await;
+            return Err(error);
+        }
+        server.consume_invite();
+        (account, token)
+    } else {
+        // An invitation admits one User as a Member. The claim names the
+        // account before it exists, so two joins that present one secret
+        // cannot both take it.
+        let id = Id::new();
+        let claimed = server
+            .identity
+            .reserve_invitation(&request.secret, id)
+            .await
+            .map_err(identity_error)?;
+        if !claimed {
+            return Err(ApiError::not_found("this invitation is not usable"));
+        }
+        let created = server
+            .identity
+            .create_invited(id, &request.display_name, &request.password)
+            .await;
+        let (account, token) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = server.identity.release_invitation(id).await;
+                return Err(identity_error(error));
+            }
+        };
+        if let Err(error) = append_join(server, &account).await {
+            let _ = server.identity.forget_account(account.id).await;
+            let _ = server.identity.release_invitation(account.id).await;
+            return Err(error);
+        }
+        if let Err(error) = server.identity.finalize_invitation(account.id).await {
+            // The account and the record agree, so the join succeeded; the
+            // pending row still names the account, and the next start drops
+            // it. A link that cannot be finished now admits no one else.
+            eprintln!("neha: cannot finish a used invitation: {error}");
+        }
+        (account, token)
+    };
+
+    let browser = browser_request(server, headers);
     let cookie = browser.then(|| server.session_headers(&token));
     let response = if browser {
         Json(account).into_response()
@@ -2298,7 +2500,7 @@ async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let source = client_ip(source.ip(), &headers);
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
     if !server
         .login
         .lock()
@@ -2784,8 +2986,23 @@ struct PairStartRequest {
 /// polls by and the code a User enters.
 async fn computer_pair_start(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<PairStartRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    // The start is unauthenticated, so its per-source bound must count the
+    // browser or machine a trusted proxy forwards for, not the proxy.
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    // A Space with only a loopback listener has no origin another machine can
+    // reach; a local caller may still exercise the flow, but a peer beyond the
+    // machine is refused. A listener beyond the machine already needs a public
+    // origin, so this refusal states the rule rather than closing a reachable
+    // path.
+    if server.public_url.is_none() && !source.is_loopback() {
+        return Err(ApiError::forbidden(
+            "pairing another machine needs a public origin on this Space",
+        ));
+    }
     let machine = request.machine.trim();
     if !is_pairing_text(machine) {
         return Err(ApiError::invalid_argument(
@@ -2793,7 +3010,7 @@ async fn computer_pair_start(
         ));
     }
     let workspace = request.workspace.trim();
-    if !Path::new(workspace).is_absolute() || !is_pairing_text(workspace) {
+    if !is_absolute_path(workspace) || !is_pairing_text(workspace) {
         return Err(ApiError::invalid_argument(
             "the workspace is not usable: it must be an absolute path of at most 256 bytes with no control characters",
         ));
@@ -2803,15 +3020,52 @@ async fn computer_pair_start(
             "the token and poll_secret must be 32 bytes of URL-safe base64",
         ));
     }
+    // The admission check runs before a database connection is taken.
+    if !server.pairs.lock().expect("pair lock").allows(source) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing starts; wait a minute",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
     let start = server
         .identity
-        .begin_pairing(machine, workspace, &request.token, &request.poll_secret)
+        .begin_pairing_from(
+            &source.to_string(),
+            machine,
+            workspace,
+            &request.token,
+            &request.poll_secret,
+        )
         .await
         .map_err(identity_error)?;
 
-    Ok(Json(
-        serde_json::json!({"device": start.device, "code": start.code}),
-    ))
+    Ok(Json(serde_json::json!({
+        "device": start.device,
+        "code": start.code,
+        "expires_in": crate::identity::PAIRING_TTL_SECS,
+        "interval": crate::identity::PAIRING_POLL_SECS,
+    })))
+}
+
+/// Returns whether a path is absolute on the machine that sent it.
+///
+/// The Space checks a path from a machine whose platform may differ from its
+/// own: a Linux Space pairs a Windows Computer, whose Workspace starts with a
+/// drive letter or a UNC share.
+fn is_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with(r"\\") {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 /// Returns whether a pairing field is usable: bounded, non-empty, no controls.
@@ -2827,9 +3081,84 @@ fn is_pairing_text(value: &str) -> bool {
 
 /// Returns whether a value is a 32-byte URL-safe base64 secret.
 fn is_pairing_secret(value: &str) -> bool {
-    URL_SAFE_NO_PAD
-        .decode(value)
-        .is_ok_and(|bytes| bytes.len() == 32)
+    value.len() == 43
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == 32)
+}
+
+/// Decodes one base64url SHA-256 digest a CLI sent at device-login start.
+fn pairing_hash(value: &str) -> Option<Vec<u8>> {
+    if !is_pairing_secret(value) {
+        return None;
+    }
+    URL_SAFE_NO_PAD.decode(value).ok()
+}
+
+/// Returns the canonical origin a Computer says it reaches, or `None` when
+/// the value is not an origin with no credentials or path.
+fn computer_origin(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+
+    Some(url.origin().ascii_serialization())
+}
+
+/// Refuses a local-ticket route reached through a proxy.
+///
+/// The ticket is the Space machine's own shorthand for pairing a Computer
+/// with no code. On a public origin it must not become another unauthenticated
+/// entry: a direct loopback peer must also name a local authority and carry no
+/// forwarding marker. A same-host proxy that preserves the public Host is
+/// refused even when it forgets to add a forwarded header.
+fn local_ticket_only(
+    server: &SpaceServer,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let local_authority = host.is_some_and(|host| {
+        loopback_host(host) || (server.public_url.is_none() && is_browser_authority(server, host))
+    });
+    let direct = peer.ip().is_loopback() && local_authority && !has_forwarding_marker(headers);
+    if direct {
+        return Ok(());
+    }
+
+    Err(ApiError::forbidden(
+        "the local Computer ticket is available only on the Space's machine",
+    ))
+}
+
+/// Returns whether a request carries a header a proxy adds.
+fn has_forwarding_marker(headers: &HeaderMap) -> bool {
+    [
+        "forwarded",
+        "via",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+}
+
+/// Returns whether a value has the shape of a device identifier this Space
+/// issues: 16 random bytes in URL-safe base64.
+fn is_pairing_device(value: &str) -> bool {
+    value.len() == 22
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == 16)
 }
 
 #[derive(Deserialize)]
@@ -2856,9 +3185,34 @@ enum PairingReply {
 /// up in proxy logs and browser history. A poll never changes the pairing.
 async fn computer_pair_poll(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     PathParams(device): PathParams<String>,
     Json(request): Json<PairPollRequest>,
 ) -> Result<Json<PairingReply>, ApiError> {
+    // An unauthenticated poll reaches the database only when both values have
+    // the shape this Space issued; a cheap refusal keeps junk from taking a
+    // connection or a read.
+    if !is_pairing_device(&device) || !is_pairing_secret(&request.secret) {
+        return Err(ApiError::not_found("no such pairing"));
+    }
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    if !server
+        .device_polls
+        .lock()
+        .expect("device polls lock")
+        .allows_poll(source)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing polls; slow down",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
     match server
         .identity
         .pairing(&device, &request.secret)
@@ -2881,6 +3235,131 @@ async fn computer_pair_poll(
     }
 }
 
+#[derive(Deserialize)]
+struct DeviceLoginStartRequest {
+    client: String,
+    /// The CLI token's SHA-256 digest, base64url encoded.
+    token_hash: String,
+    /// The polling secret's SHA-256 digest, base64url encoded.
+    poll_hash: String,
+}
+
+/// Starts a CLI device login.
+///
+/// The CLI generated its token and polling secret and keeps them; the Space
+/// stores only their digests and answers with the device identifier it polls
+/// by and the code a signed-in User enters.
+async fn device_login_start(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<DeviceLoginStartRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    let client = request.client.trim();
+    if !is_pairing_text(client) {
+        return Err(ApiError::invalid_argument(
+            "the client name is not usable: it must be at most 256 bytes and carry no control characters",
+        ));
+    }
+    let Some(token_hash) = pairing_hash(&request.token_hash) else {
+        return Err(ApiError::invalid_argument(
+            "token_hash must be the base64url SHA-256 digest of the CLI token",
+        ));
+    };
+    let Some(poll_hash) = pairing_hash(&request.poll_hash) else {
+        return Err(ApiError::invalid_argument(
+            "poll_hash must be the base64url SHA-256 digest of the polling secret",
+        ));
+    };
+    if !server.pairs.lock().expect("pair lock").allows(source) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing starts; wait a minute",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
+    let start = server
+        .identity
+        .begin_device_login(&source.to_string(), client, &token_hash, &poll_hash)
+        .await
+        .map_err(identity_error)?;
+
+    Ok(Json(serde_json::json!({
+        "device": start.device,
+        "code": start.code,
+        "expires_in": crate::identity::PAIRING_TTL_SECS,
+        "interval": crate::identity::PAIRING_POLL_SECS,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DeviceLoginPollRequest {
+    secret: String,
+}
+
+/// What a CLI learns when it polls its device login.
+#[derive(Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum DeviceLoginReply {
+    /// No User approved this CLI yet.
+    Pending,
+    /// A User approved it; the CLI's own token is now a session.
+    Approved {
+        /// The account that approved the terminal.
+        account: crate::identity::Account,
+    },
+}
+
+/// Answers a CLI's device-login poll.
+///
+/// The poll is a POST: the polling secret is a secret, and a request line ends
+/// up in proxy logs and browser history. A poll never changes the login.
+async fn device_login_poll(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    PathParams(device): PathParams<String>,
+    Json(request): Json<DeviceLoginPollRequest>,
+) -> Result<Json<DeviceLoginReply>, ApiError> {
+    if !is_pairing_device(&device) || !is_pairing_secret(&request.secret) {
+        return Err(ApiError::not_found("no such device login"));
+    }
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    if !server
+        .device_polls
+        .lock()
+        .expect("device polls lock")
+        .allows_poll(source)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many device-login polls; slow down",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
+    match server
+        .identity
+        .device_login(&device, &request.secret)
+        .await
+        .map_err(identity_error)?
+    {
+        Some(crate::identity::DeviceLoginState::Pending) => Ok(Json(DeviceLoginReply::Pending)),
+        Some(crate::identity::DeviceLoginState::Approved { account }) => {
+            Ok(Json(DeviceLoginReply::Approved { account }))
+        }
+        None => Err(ApiError::not_found("no such device login")),
+    }
+}
+
 #[derive(Serialize)]
 struct LocalTicketBody {
     ticket: String,
@@ -2892,8 +3371,11 @@ struct LocalTicketBody {
 /// stays in the response and is never written to the Space's home.
 async fn computer_ticket(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Authed { account }: Authed,
 ) -> Result<Json<LocalTicketBody>, ApiError> {
+    local_ticket_only(&server, peer, &headers)?;
     let ticket = ticket::issue(&server.identity, account.id)
         .await
         .map_err(ticket_error)?;
@@ -2920,8 +3402,12 @@ struct PairedComputerBody {
 async fn computer_pair(
     State(server): State<Arc<SpaceServer>>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<PairTicketRequest>,
 ) -> Result<Json<PairedComputerBody>, ApiError> {
+    // The ticket belongs to the Space's own machine: this route counts its
+    // attempts by the direct TCP peer and never reads a forwarded header.
+    local_ticket_only(&server, source, &headers)?;
     if !server.pairs.lock().expect("pair lock").allows(source.ip()) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -3038,10 +3524,12 @@ async fn computer_socket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let token = bearer(&headers).ok_or_else(unauthorized_computer)?;
+    let token = bearer(&headers)
+        .ok_or_else(unauthorized_computer)?
+        .to_owned();
     let computer = server
         .identity
-        .authenticate_computer(token)
+        .authenticate_computer(&token)
         .await
         .map_err(identity_error)?
         .ok_or_else(unauthorized_computer)?;
@@ -3064,11 +3552,12 @@ async fn computer_socket(
         .max_frame_size(MAX_CHANNEL_FRAME_BYTES)
         .on_upgrade(move |socket| {
             let span = span.clone();
+            let token = token.to_owned();
             async move {
                 span.in_scope(|| {
                     tracing::debug!(target: "neha::computer", event = "computer.connected", computer_id = %computer, "a Computer connected");
                 });
-                handle_computer_socket(socket, server, computer)
+                handle_computer_socket(socket, server, computer, token)
                     .instrument(span.clone())
                     .await;
                 span.in_scope(|| {
@@ -3124,7 +3613,12 @@ fn hello_access(
     }
 }
 
-async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>, computer: Id) {
+async fn handle_computer_socket(
+    mut socket: WebSocket,
+    server: Arc<SpaceServer>,
+    computer: Id,
+    token: String,
+) {
     // A connection that never greets is not the Computer we paired: it must
     // not hold a task open while waiting for a frame that may never come.
     let hello = match tokio::time::timeout(COMPUTER_HELLO, socket.recv()).await {
@@ -3137,11 +3631,13 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
                     sandbox,
                     supports_grants,
                     supports_full_access,
+                    origin,
                 }) => Some((
                     version,
                     named,
                     sandbox,
                     hello_access(sandbox, supports_grants, supports_full_access),
+                    origin,
                 )),
                 _ => None,
             }
@@ -3151,7 +3647,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
     // A daemon that cannot fence its machine never runs unless the Space
     // operator explicitly opted in to unsandboxed Local Computers. A connection
     // that names another Computer would act as that Computer: both are refused.
-    let Some((version, named, sandbox, access)) = hello else {
+    let Some((version, named, sandbox, access, origin)) = hello else {
         return;
     };
     if version != CHANNEL_VERSION
@@ -3178,10 +3674,47 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         );
         return;
     }
+    // The origin reaches a Bot's shell environment; a malformed one would put
+    // a different host in front of the run token, so the handshake is refused.
+    let origin = match origin {
+        Some(value) => match computer_origin(&value) {
+            Some(origin) => Some(origin),
+            None => {
+                eprintln!("computer handshake rejected: the reported origin is not an origin");
+                return;
+            }
+        },
+        None => None,
+    };
+
+    // A revoke may have deleted the token after the HTTP check and before this
+    // Hello passed its checks. The gate makes the final authentication and the
+    // link publication one step: a revoked token cannot register a channel.
+    let revoking = server.links.lock_revocations().await;
+    let still_allowed = match server.identity.authenticate_computer(&token).await {
+        Ok(Some(found)) => {
+            found == computer && computer_is_recorded(&server, computer).unwrap_or(false)
+        }
+        Ok(None) | Err(_) => false,
+    };
+    if !still_allowed {
+        return;
+    }
 
     let (sink, mut stream) = socket.split();
     let (frames, mut outgoing) = mpsc::channel::<HostFrame>(computer_link::FRAME_QUEUE);
-    let link = server.links.connect(computer, frames.clone(), access);
+    // The daemon waits for this acknowledgement before it calls the channel
+    // connected and resets its retry delay. Queue it before the link is
+    // published, so a request that obtains the link cannot put an Action ahead
+    // of the greeting answer.
+    frames
+        .send(HostFrame::Welcome)
+        .await
+        .expect("the fresh channel queue accepts its first frame");
+    let link = server
+        .links
+        .connect_with_origin(computer, frames.clone(), access, origin);
+    drop(revoking);
     // When a Computer reconnects, it replaces its old link and this handler
     // must stop: the Space already failed the old link's requests, and two
     // readers acting as one Computer would race each other.
@@ -3195,34 +3728,94 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         let mut closing = link.closed_signal();
         let mut sink = sink;
         async move {
+            let mut cancelled_mid_send = false;
             loop {
+                // A revoke can land between publishing the link and this
+                // writer subscribing; the close signal already recorded then
+                // would not wake `changed`, so read the current value too.
+                if *closing.borrow() {
+                    break;
+                }
                 tokio::select! {
                     biased;
                     _ = closing.changed() => break,
                     frame = outgoing.recv() => {
                         let Some(frame) = frame else { break; };
+                        #[cfg(feature = "test-support")]
+                        let is_action = matches!(frame, HostFrame::Action { .. });
+                        #[cfg(feature = "test-support")]
+                        if is_action {
+                            crate::computer_link::pause_writer(link.computer).await;
+                        }
                         let Ok(text) = serde_json::to_string(&frame) else { break; };
-                        let sent = tokio::time::timeout(
-                            computer_link::FRAME_TIMEOUT,
-                            sink.send(Message::Text(text.into())),
-                        )
-                        .await;
-                        if !matches!(sent, Ok(Ok(()))) {
+                        let deadline =
+                            tokio::time::Instant::now() + computer_link::FRAME_TIMEOUT;
+                        // `feed` accepts the frame into the sink's buffer but
+                        // does not flush it. A close arriving while it waits
+                        // must drop the socket without flushing: a buffered
+                        // Action must not leave after a revoke reports success.
+                        let fed = {
+                            let feed = sink.feed(Message::Text(text.into()));
+                            tokio::pin!(feed);
+                            tokio::select! {
+                                biased;
+                                _ = closing.changed() => {
+                                    cancelled_mid_send = true;
+                                    break;
+                                }
+                                fed = tokio::time::timeout_at(deadline, &mut feed) => fed,
+                            }
+                        };
+                        if !matches!(fed, Ok(Ok(()))) {
+                            cancelled_mid_send = true;
+                            link.close();
+                            break;
+                        }
+                        #[cfg(feature = "test-support")]
+                        if is_action {
+                            crate::computer_link::pause_writer_after_feed(link.computer).await;
+                            crate::computer_link::stall_writer_after_feed(link.computer).await;
+                        }
+                        if *closing.borrow() {
+                            cancelled_mid_send = true;
+                            break;
+                        }
+                        let flushed = tokio::select! {
+                            biased;
+                            _ = closing.changed() => {
+                                cancelled_mid_send = true;
+                                break;
+                            }
+                            flushed = tokio::time::timeout_at(deadline, sink.flush()) => flushed,
+                        };
+                        if !matches!(flushed, Ok(Ok(()))) {
+                            cancelled_mid_send = true;
                             link.close();
                             break;
                         }
                     }
                 }
             }
-            // Close from our side so a replaced Computer learns its channel
-            // moved instead of discovering it on its next write.
-            let _ = tokio::time::timeout(
-                computer_link::FRAME_TIMEOUT,
-                sink.send(Message::Close(None)),
-            )
-            .await;
+            if cancelled_mid_send {
+                // The sink may hold a partially sent or buffered frame. Drop
+                // it without flushing, then tell the revoke it can answer.
+                drop(sink);
+                link.mark_writer_stopped();
+            } else {
+                // Every earlier frame was flushed, so no Action is buffered:
+                // the revoke can answer before the courtesy Close is sent.
+                link.mark_writer_stopped();
+                // Close from our side so a replaced Computer learns its
+                // channel moved instead of discovering it on its next write.
+                let _ = tokio::time::timeout(
+                    computer_link::FRAME_TIMEOUT,
+                    sink.send(Message::Close(None)),
+                )
+                .await;
+            }
         }
     });
+    link.set_writer_abort(writer.abort_handle());
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + COMPUTER_PING, COMPUTER_PING);
     let mut last_pong = Instant::now();
@@ -3274,7 +3867,8 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
     server.links.disconnect(&link);
     server.runs.wake_all(&server);
     // The writer stops on the link's close signal; give it its deadline, then
-    // drop it if the socket refuses to finish.
+    // abort it if the socket refuses to finish. A revoke may already have
+    // aborted it, but this handler alone joins it and publishes completion.
     if tokio::time::timeout(computer_link::FRAME_TIMEOUT, &mut writer)
         .await
         .is_err()
@@ -3282,6 +3876,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         writer.abort();
         let _ = writer.await;
     }
+    link.mark_writer_stopped();
 }
 
 /// Returns the value of an RFC 8187 `filename*`: every byte that is not an
@@ -3421,7 +4016,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         let receiver = server.events.subscribe();
                         forwarder = Some(spawn_forwarder(
                             receiver,
-                            server.store.reader(),
+                            server.clone(),
                             out.clone(),
                             cursor.unwrap_or(neha::seq::Seq::ZERO),
                             limit,
@@ -3511,6 +4106,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             provider_writes: &server.provider_writes,
                             workers: server.worker_config.is_some(),
                             library: &server.library,
+                            roles: &server.roles,
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
@@ -3617,7 +4213,7 @@ fn broadcast(server: &SpaceServer, events: &[neha::record::Event]) {
 
 fn spawn_forwarder(
     mut receiver: broadcast::Receiver<neha::record::Event>,
-    reader: StoreReader,
+    server: Arc<SpaceServer>,
     out: mpsc::Sender<ServerFrame>,
     cursor: neha::seq::Seq,
     limit: Option<usize>,
@@ -3626,7 +4222,18 @@ fn spawn_forwarder(
 ) -> JoinHandle<()> {
     let capabilities = Arc::new(capabilities);
     tokio::spawn(async move {
-        let mut cursor = match catch_up(&reader, &out, cursor, limit, account, &capabilities).await
+        let reader = server.store.reader();
+        let allows = || administers(&server, account);
+        let mut cursor = match catch_up(
+            &reader,
+            &out,
+            cursor,
+            limit,
+            account,
+            &capabilities,
+            &allows,
+        )
+        .await
         {
             Ok(cursor) => cursor,
             Err(StreamError::Oversized(event)) => {
@@ -3659,7 +4266,9 @@ fn spawn_forwarder(
                     // and a later kind only when it named the capability that
                     // admits it. A skipped event still advances the cursor, so
                     // a later reconnect neither repeats nor misses it.
-                    if !visible_to(account, &event) || !admits(&capabilities, event.kind) {
+                    if !visible_to(account, &event, administers(&server, account))
+                        || !admits(&capabilities, event.kind)
+                    {
                         cursor = seq;
                         continue;
                     }
@@ -3678,7 +4287,18 @@ fn spawn_forwarder(
                     cursor = seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    match catch_up(&reader, &out, cursor, limit, account, &capabilities).await {
+                    let allows = || administers(&server, account);
+                    match catch_up(
+                        &reader,
+                        &out,
+                        cursor,
+                        limit,
+                        account,
+                        &capabilities,
+                        &allows,
+                    )
+                    .await
+                    {
                         Ok(next) => cursor = next,
                         Err(StreamError::Oversized(event)) => {
                             let _ = out
@@ -3718,11 +4338,13 @@ async fn catch_up(
     limit: Option<usize>,
     account: Id,
     capabilities: &HashSet<String>,
+    administers: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<neha::seq::Seq, StreamError> {
     let page_size = limit.unwrap_or(256).clamp(1, 256);
     let mut cursor = cursor;
     let mut sent = false;
     loop {
+        let administers = administers();
         let page = reader
             .events_from(cursor, page_size)
             .await
@@ -3761,7 +4383,9 @@ async fn catch_up(
         let mut events: Vec<neha::record::Event> = page
             .events
             .into_iter()
-            .filter(|event| visible_to(account, event) && admits(capabilities, event.kind))
+            .filter(|event| {
+                visible_to(account, event, administers) && admits(capabilities, event.kind)
+            })
             .collect();
         if events.is_empty() {
             cursor = page_next;
@@ -3846,9 +4470,31 @@ fn admits(capabilities: &HashSet<String>, kind: neha::record::EventKind) -> bool
 /// The record is what decides: an event that names no scope is a historical
 /// one, and a reader treats it the way the command surface treats a personal
 /// resource, so it never widens what an older record lets a member read.
-fn visible_to(account: Id, event: &neha::record::Event) -> bool {
+/// Whether one account currently administers the Space.
+fn administers(server: &SpaceServer, account: Id) -> bool {
+    server
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .users
+                .get(&account)
+                .map(|user| user.role.administers())
+        })
+        .unwrap_or(false)
+}
+
+/// Whether one account may see an event, given whether it administers the
+/// Space now.
+fn visible_to(account: Id, event: &neha::record::Event, administers: bool) -> bool {
     use neha::record::EventKind;
 
+    // The invitation change belongs to the account's current role, not to the
+    // author: a demoted Admin stops seeing it, including changes it made.
+    if event.kind == EventKind::InvitationChanged {
+        return administers;
+    }
     if matches!(event.author, neha::record::Author::User(author) if author == account) {
         return true;
     }
@@ -3857,7 +4503,14 @@ fn visible_to(account: Id, event: &neha::record::Event) -> bool {
     }
 
     match event.kind {
-        EventKind::UserJoined | EventKind::ProviderAdded | EventKind::ProviderModelsUpdated => true,
+        EventKind::UserJoined
+        | EventKind::UserUpdated
+        | EventKind::UserTransferred
+        | EventKind::ProviderAdded
+        | EventKind::ProviderModelsUpdated => true,
+        // The pending invitation belongs to the Space Owner and the Admins, so
+        // only they learn that another Admin changed it.
+        EventKind::InvitationChanged => administers,
         // A Space server is every member's; a personal one is its owner's.
         EventKind::McpServerAdded => {
             event.data.get("scope").and_then(Value::as_str) == Some("space")
@@ -3930,6 +4583,85 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
 
         Ok(Self { account })
     }
+}
+
+/// Heals a join a crash left between the account, the record, and the
+/// invitation it claimed.
+///
+/// A join claims the invitation, writes the account, appends
+/// `neha.user.joined`, and finishes the claim. A crash between any two steps
+/// leaves one of these states, and this settles each before the Space accepts
+/// connections:
+///
+/// - the claim names a User the record holds: finish the claim, so the link
+///   admits no one else;
+/// - the claim names no recorded User: release it, so the link admits one
+///   Person again; the account, when it exists, is dropped below;
+/// - an account the record never saw: drop it and its tokens.
+///
+/// The record decides every role, so the stored roles are brought in step
+/// here too. A record whose User has no account cannot sign in and is refused
+/// rather than served broken.
+async fn reconcile_identity(identity: &Identity, state: &SpaceState) -> Result<(), ServerError> {
+    let recorded: std::collections::HashMap<Id, neha::role::Role> = state
+        .users
+        .iter()
+        .map(|(id, user)| (*id, user.role))
+        .collect();
+    let accounts = identity.account_ids().await?;
+    for claim in identity.invitation_claims().await? {
+        if recorded.contains_key(&claim) {
+            identity.finalize_invitation(claim).await?;
+        } else {
+            identity.release_invitation(claim).await?;
+        }
+    }
+    for account in &accounts {
+        if !recorded.contains_key(account) {
+            identity.forget_account(*account).await?;
+        }
+    }
+    for account in recorded.keys() {
+        if !accounts.contains(account) {
+            return Err(ServerError::IdentityOutOfStep(format!(
+                "the record names the User {account} but no account signs it in"
+            )));
+        }
+    }
+    let roles: Vec<(Id, neha::role::Role)> = recorded
+        .iter()
+        .map(|(account, role)| (*account, *role))
+        .collect();
+    identity.sync_roles(&roles).await?;
+
+    Ok(())
+}
+
+/// Appends the invitation-change events a crash left unappended.
+///
+/// A create or revoke records its event command in the transaction that made
+/// the change. A crash before the append leaves that notice behind; the start
+/// appends the same event and forgets the notice, so no open client keeps a
+/// stale pending invitation.
+async fn flush_invitation_notices(store: &Store, identity: &Identity) -> Result<(), ServerError> {
+    for (command, event_command, author) in identity.pending_notices().await? {
+        store
+            .append(AppendRequest::new(
+                event_command,
+                format!("invitation-notice:{command}"),
+                vec![EventDraft::new(
+                    EventKind::InvitationChanged,
+                    Author::User(author),
+                    serde_json::json!({}),
+                )],
+            ))
+            .await?;
+        // The projection holds nothing for this Presentation event, so the
+        // record's readers get it from the subscription they open next.
+        identity.clear_notice(command).await?;
+    }
+
+    Ok(())
 }
 
 /// Heals a pairing a crash left between its claim and its Computer's record.
@@ -4232,10 +4964,26 @@ pub(crate) fn identity_error(error: IdentityError) -> ApiError {
         IdentityError::NameTaken | IdentityError::AlreadyInitialized => {
             ApiError::new(StatusCode::CONFLICT, ErrorCode::Conflict, error.to_string())
         }
+        IdentityError::Forbidden => {
+            ApiError::forbidden("only the Space Owner or an Admin changes an invitation")
+        }
+        IdentityError::CommandConflict => ApiError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "the command was used for a different request",
+        ),
         IdentityError::InvalidCredentials => ApiError::new(
             StatusCode::UNAUTHORIZED,
             ErrorCode::Unauthorized,
             "invalid credentials",
+        ),
+        IdentityError::InvalidDeviceCode => {
+            ApiError::invalid_argument("the device code is not usable")
+        }
+        IdentityError::TooManyPending => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairings are waiting; try again later",
         ),
         other => ApiError::internal(other.to_string()),
     }
@@ -4295,6 +5043,22 @@ impl LoginLimiter {
             .or_default()
             .push(now);
         self.sources.entry(source).or_default().push(now);
+    }
+
+    /// Takes back an attempt that succeeded.
+    fn release(&mut self, display_name: &str, source: IpAddr) {
+        if let Some(failures) = self.failures.get_mut(display_name) {
+            failures.pop();
+            if failures.is_empty() {
+                self.failures.remove(display_name);
+            }
+        }
+        if let Some(failures) = self.sources.get_mut(&source) {
+            failures.pop();
+            if failures.is_empty() {
+                self.sources.remove(&source);
+            }
+        }
     }
 
     fn prune(&mut self) {
@@ -4391,6 +5155,9 @@ pub enum ServerError {
     /// Identity failed.
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+    /// The record and the accounts disagree about who joined.
+    #[error("the record and the accounts disagree: {0}")]
+    IdentityOutOfStep(String),
     /// The listener failed.
     #[error("listener error: {0}")]
     Io(#[from] std::io::Error),
@@ -4435,6 +5202,12 @@ pub enum ServerError {
     /// The public URL for a Space behind a trusted TLS proxy is invalid.
     #[error("public URL error: {0}")]
     PublicUrl(String),
+    /// The trusted proxy list cannot be used.
+    #[error("trusted proxy error: {0}")]
+    TrustedProxies(String),
+    /// A listener beyond this machine has no TLS proxy in front.
+    #[error("listener error: {0}")]
+    UnencryptedListener(String),
 }
 
 /// What the integration tests need from inside this module.
@@ -4554,8 +5327,10 @@ pub mod test_support {
         limit: Option<usize>,
         account: neha::id::Id,
         capabilities: &std::collections::HashSet<String>,
+        administers: bool,
     ) -> Result<neha::seq::Seq, CatchUpError> {
-        super::catch_up(reader, out, cursor, limit, account, capabilities)
+        let allows = || administers;
+        super::catch_up(reader, out, cursor, limit, account, capabilities, &allows)
             .await
             .map_err(|error| match error {
                 StreamError::Store => CatchUpError::Store,
@@ -4608,6 +5383,21 @@ pub mod test_support {
     /// Installs a pause for one Bot's next run start; returns (reached, release).
     pub fn pause_start_for_test(bot: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
         crate::runs::pause_start_for_test(bot)
+    }
+
+    /// Installs a pause before the Computer's next Action is written.
+    pub fn pause_writer_for_test(computer: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
+        crate::computer_link::pause_writer_for_test(computer)
+    }
+
+    /// Installs a pause after the sink buffers an Action but before its flush.
+    pub fn pause_writer_after_feed_for_test(computer: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
+        crate::computer_link::pause_writer_after_feed_for_test(computer)
+    }
+
+    /// Blocks the writer after it buffers an Action, until the duration ends.
+    pub fn stall_writer_after_feed_for_test(computer: neha::id::Id, duration: std::time::Duration) {
+        crate::computer_link::stall_writer_after_feed_for_test(computer, duration);
     }
 
     /// Returns how many callers wait for one Bot's admit lock.
@@ -4718,6 +5508,7 @@ impl Running {
             provider_writes: &server.provider_writes,
             workers: server.worker_config.is_some(),
             library: &server.library,
+            roles: &server.roles,
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
@@ -4736,6 +5527,71 @@ mod tests {
     use neha::surface::{ClientFrame, CommandCall};
 
     use crate::computer_link::AccessCapabilities;
+
+    /// A demotion between two catch-up pages hides the later invitation
+    /// changes, because each page asks for the account's current role.
+    #[tokio::test]
+    async fn a_demotion_between_catch_up_pages_hides_later_invitation_changes() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::open(directory.path()).unwrap();
+        let store = crate::store::Store::open(&home).await.unwrap();
+        let user = Id::new();
+        let other = Id::new();
+        let invitation = || {
+            neha::record::EventDraft::new(
+                neha::record::EventKind::InvitationChanged,
+                neha::record::Author::User(user),
+                serde_json::json!({}),
+            )
+        };
+        store
+            .append(crate::store::AppendRequest::new(
+                Id::new(),
+                "seed",
+                vec![
+                    invitation(),
+                    neha::record::EventDraft::new(
+                        neha::record::EventKind::UserUpdated,
+                        neha::record::Author::User(user),
+                        serde_json::json!({"user": other, "role": "member"}),
+                    ),
+                    invitation(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let reader = store.reader();
+        let (out, mut frames) = tokio::sync::mpsc::channel(8);
+        let admin = AtomicBool::new(true);
+        let allows = || admin.swap(false, Ordering::SeqCst);
+        super::catch_up(
+            &reader,
+            &out,
+            neha::seq::Seq::ZERO,
+            Some(1),
+            user,
+            &HashSet::new(),
+            &allows,
+        )
+        .await
+        .unwrap();
+        drop(out);
+        let mut changes = 0;
+        while let Ok(neha::surface::ServerFrame::Snapshot { events, .. }) = frames.try_recv() {
+            changes += events
+                .iter()
+                .filter(|event| event.kind == neha::record::EventKind::InvitationChanged)
+                .count();
+        }
+        assert_eq!(
+            changes, 1,
+            "only the page read while the account administered"
+        );
+        store.close().await.unwrap();
+    }
 
     #[test]
     fn a_greeting_written_before_access_fields_derives_them_from_sandbox() {
@@ -4849,43 +5705,17 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_address_is_used_only_from_a_loopback_proxy() {
-        use axum::http::{HeaderMap, HeaderValue};
+    fn a_listener_beyond_the_machine_needs_a_public_origin() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:7337".parse().unwrap();
+        let ipv6_loopback: std::net::SocketAddr = "[::1]:7337".parse().unwrap();
+        let beyond: std::net::SocketAddr = "0.0.0.0:7337".parse().unwrap();
+        let public = "https://space.example.com";
 
-        let headers = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
-            headers
-        };
-        let proxy = std::net::IpAddr::from([127, 0, 0, 1]);
-        let client = std::net::IpAddr::from([203, 0, 113, 7]);
-        let remote = std::net::IpAddr::from([192, 0, 2, 1]);
-        assert_eq!(
-            super::client_ip(proxy, &headers("10.0.0.4, 203.0.113.7")),
-            client
-        );
-        assert_eq!(super::client_ip(remote, &headers("203.0.113.7")), remote);
-        assert_eq!(super::client_ip(proxy, &headers("garbage")), proxy);
-        assert_eq!(
-            super::client_ip(proxy, &headers("203.0.113.7, 127.0.0.1")),
-            proxy
-        );
-        assert_eq!(super::forwarded_ip("10.0.0.4, 203.0.113.7"), Some(client));
-        assert_eq!(super::forwarded_ip("203.0.113.7, garbage"), None);
-        assert_eq!(super::forwarded_ip("127.0.0.1"), Some(proxy));
-
-        let mut fields = HeaderMap::new();
-        fields.append("x-forwarded-for", HeaderValue::from_static("198.51.100.9"));
-        fields.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
-        assert_eq!(super::client_ip(proxy, &fields), client);
-
-        let mut invalid = HeaderMap::new();
-        invalid.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
-        invalid.append(
-            "x-forwarded-for",
-            HeaderValue::from_bytes(&[0xFF]).expect("obs-text is a header value"),
-        );
-        assert_eq!(super::client_ip(proxy, &invalid), proxy);
+        assert!(super::refuse_unencrypted_listener(loopback, None).is_ok());
+        assert!(super::refuse_unencrypted_listener(ipv6_loopback, None).is_ok());
+        assert!(super::refuse_unencrypted_listener(beyond, Some(public)).is_ok());
+        let error = super::refuse_unencrypted_listener(beyond, None).unwrap_err();
+        assert!(error.to_string().contains("TLS proxy"));
     }
 
     #[test]
@@ -5106,5 +5936,14 @@ mod tests {
                 .iter()
                 .any(|field| field == "error_kind=unavailable")
         );
+    }
+
+    #[test]
+    fn a_workspace_path_may_come_from_another_platform() {
+        assert!(super::is_absolute_path("/home/ada/.neha/workspace"));
+        assert!(super::is_absolute_path(r"C:\Users\ada\neha\workspace"));
+        assert!(super::is_absolute_path(r"\\server\share\workspace"));
+        assert!(!super::is_absolute_path("relative/workspace"));
+        assert!(!super::is_absolute_path("C:relative"));
     }
 }

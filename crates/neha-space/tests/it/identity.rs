@@ -9,10 +9,12 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
+use neha::role::Role;
 use neha_space::home::Home;
 use neha_space::identity::{
-    Account, Identity, IdentityError, MAX_CODE_TRIES, MAX_LOCAL_TICKETS_PER_OWNER,
-    MAX_PENDING_PAIRINGS, PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState,
+    Account, DeviceLoginStart, DeviceLoginState, INVITATION_TTL_SECS, Identity, IdentityError,
+    MAX_CODE_TRIES, MAX_LOCAL_TICKETS_PER_OWNER, MAX_PENDING_PAIRINGS, MAX_PENDING_PER_SOURCE,
+    PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState,
 };
 use neha_space::test_support::identity::{
     CODE_ALPHABET, VERSION_ONE_STATEMENTS, VERSION_TWO_STATEMENTS, digest, pool,
@@ -26,6 +28,22 @@ async fn identity() -> (tempfile::TempDir, Home, Identity) {
     let identity = Identity::open(&home).await.unwrap();
 
     (dir, home, identity)
+}
+
+/// Starts a device login with the digests the CLI would send.
+async fn start_device_login(
+    identity: &Identity,
+    source: &str,
+    client: &str,
+    token: &str,
+    poll: &str,
+) -> DeviceLoginStart {
+    let token_hash = neha_space::test_support::identity::digest(token);
+    let poll_hash = neha_space::test_support::identity::digest(poll);
+    identity
+        .begin_device_login(source, client, &token_hash, &poll_hash)
+        .await
+        .unwrap()
 }
 
 /// Claims and finishes a pairing the way the command does, for tests that
@@ -83,7 +101,7 @@ impl ClaimPairing for Identity {
 async fn creates_the_admin_and_authenticates_its_token() {
     let (_dir, _home, identity) = identity().await;
     let (account, token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -97,7 +115,7 @@ async fn creates_the_admin_and_authenticates_its_token() {
 async fn logs_in_with_the_password() {
     let (_dir, _home, identity) = identity().await;
     identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -114,7 +132,7 @@ async fn logs_in_with_the_password() {
 async fn rejects_a_wrong_password() {
     let (_dir, _home, identity) = identity().await;
     identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -127,12 +145,12 @@ async fn rejects_a_wrong_password() {
 async fn rejects_a_second_admin_and_a_taken_name() {
     let (_dir, _home, identity) = identity().await;
     identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
     let second = identity
-        .create_admin("Grace", "correct horse battery")
+        .create_owner("Grace", "correct horse battery")
         .await;
 
     assert!(matches!(second, Err(IdentityError::AlreadyInitialized)));
@@ -143,7 +161,7 @@ async fn rejects_a_second_admin_and_a_taken_name() {
 async fn stores_only_the_token_digest() {
     let (_dir, _home, identity) = identity().await;
     let (_account, token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -169,11 +187,11 @@ async fn validates_the_name_and_password() {
     let (_dir, _home, identity) = identity().await;
 
     assert!(matches!(
-        identity.create_admin("   ", "correct horse battery").await,
+        identity.create_owner("   ", "correct horse battery").await,
         Err(IdentityError::InvalidName)
     ));
     assert!(matches!(
-        identity.create_admin("Ada", "short").await,
+        identity.create_owner("Ada", "short").await,
         Err(IdentityError::WeakPassword)
     ));
 }
@@ -340,10 +358,20 @@ async fn a_typed_code_ignores_case_and_surrounding_space() {
         .await
         .unwrap();
     let typed = format!(" {} ", start.code.to_lowercase());
-
     let request = identity.pairing_request(&typed).await.unwrap();
-
     assert!(request.is_some());
+
+    // The code is shown as XXXX-XXXX, so the dash is part of what a User may
+    // type; the hash names the eight letters alone.
+    let dashed = format!(
+        " {}-{} ",
+        start.code[..4].to_lowercase(),
+        start.code[4..].to_lowercase()
+    );
+    assert!(
+        identity.pairing_request(&dashed).await.unwrap().is_some(),
+        "a code typed with its displayed dash must work"
+    );
 }
 
 #[tokio::test]
@@ -424,71 +452,116 @@ async fn an_approved_pairing_expires_with_its_code() {
 }
 
 #[tokio::test]
-async fn a_new_pairing_evicts_the_oldest_waiting_one() {
+async fn a_full_quota_refuses_another_pairing() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
-    // Distinct starts so the oldest waiting pairing is well defined.
+    // One source may not fill the queue, so fill it one source at a time.
     let mut starts = Vec::new();
     for index in 0..MAX_PENDING_PAIRINGS {
         starts.push(
             identity
-                .test_begin_pairing_at(now + index, "laptop", "/ws", "token", "poll")
+                .test_begin_pairing_from_at(
+                    now + index,
+                    &format!("source-{index}"),
+                    "laptop",
+                    "/ws",
+                    "token",
+                    "poll",
+                )
                 .await
                 .unwrap(),
         );
     }
 
-    // A caller who never approves anything must not lock a User out: the
-    // oldest waiting pairing gives way to the new one.
-    let newest = identity
-        .test_begin_pairing_at(now + MAX_PENDING_PAIRINGS, "laptop", "/ws", "token", "poll")
+    let error = identity
+        .test_begin_pairing_from_at(
+            now + MAX_PENDING_PAIRINGS,
+            "one-more-source",
+            "laptop",
+            "/ws",
+            "token",
+            "poll",
+        )
         .await
-        .expect("a full quota evicts instead of refusing");
+        .unwrap_err();
+    assert!(
+        matches!(error, IdentityError::TooManyPending),
+        "a full queue refuses instead of evicting a waiting User"
+    );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
         .fetch_one(pool(&identity))
         .await
         .unwrap();
     assert_eq!(rows, MAX_PENDING_PAIRINGS, "the store stays bounded");
-
     assert_eq!(
         identity
             .test_pairing_at(now, &starts[0].device, "poll")
             .await
             .unwrap(),
-        None,
-        "the oldest waiting pairing is gone"
-    );
-    assert_eq!(
-        identity
-            .test_pairing_at(now, &starts[1].device, "poll")
-            .await
-            .unwrap(),
-        Some(PairingState::Pending)
-    );
-    assert_eq!(
-        identity
-            .test_pairing_at(now, &newest.device, "poll")
-            .await
-            .unwrap(),
-        Some(PairingState::Pending)
+        Some(PairingState::Pending),
+        "a refused start leaves the waiting pairings alone"
     );
 }
 
 #[tokio::test]
-async fn claimed_pairings_are_never_evicted() {
+async fn one_source_cannot_fill_the_waiting_queue() {
+    let (_dir, _home, identity) = identity().await;
+    let now = 1_000_000_i64;
+    for index in 0..MAX_PENDING_PER_SOURCE {
+        identity
+            .test_begin_pairing_from_at(
+                now + index,
+                "one-machine",
+                "laptop",
+                "/ws",
+                "token",
+                "poll",
+            )
+            .await
+            .unwrap();
+    }
+
+    let error = identity
+        .test_begin_pairing_from_at(
+            now + MAX_PENDING_PER_SOURCE,
+            "one-machine",
+            "laptop",
+            "/ws",
+            "token",
+            "poll",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, IdentityError::TooManyPending));
+    // Another source still has room: the cap is per source, not global yet.
+    identity
+        .test_begin_pairing_from_at(now, "another-machine", "laptop", "/ws", "token", "poll")
+        .await
+        .expect("a different source is not affected by the first source's cap");
+}
+
+#[tokio::test]
+async fn a_claimed_pairing_does_not_take_a_waiting_slot() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
     let mut starts = Vec::new();
     for index in 0..MAX_PENDING_PAIRINGS {
         starts.push(
             identity
-                .test_begin_pairing_at(now + index, "laptop", "/ws", "token", "poll")
+                .test_begin_pairing_from_at(
+                    now + index,
+                    &format!("source-{index}"),
+                    "laptop",
+                    "/ws",
+                    "token",
+                    "poll",
+                )
                 .await
                 .unwrap(),
         );
     }
     // One pairing is claimed and finished: it leaves the waiting count and
-    // must survive any eviction.
+    // must survive a full queue.
     let owner = Id::new();
     let computer = Id::new();
     assert!(
@@ -497,24 +570,19 @@ async fn claimed_pairings_are_never_evicted() {
             .await
             .unwrap()
     );
-    let oldest_waiting = starts[1].device.clone();
-    // Bring the waiting count back to the cap, then one more start evicts
-    // the oldest waiting pairing; the claim is never a candidate.
-    for offset in [MAX_PENDING_PAIRINGS, MAX_PENDING_PAIRINGS + 1] {
-        identity
-            .test_begin_pairing_at(now + offset, "laptop", "/ws", "token", "poll")
-            .await
-            .unwrap();
-    }
+    // The queue has room for one more waiting pairing now.
+    identity
+        .test_begin_pairing_from_at(
+            now + MAX_PENDING_PAIRINGS,
+            "one-more-source",
+            "laptop",
+            "/ws",
+            "token",
+            "poll",
+        )
+        .await
+        .expect("a claimed pairing frees a waiting slot");
 
-    assert_eq!(
-        identity
-            .test_pairing_at(now, &oldest_waiting, "poll")
-            .await
-            .unwrap(),
-        None,
-        "an unclaimed pairing is the one evicted"
-    );
     assert_eq!(
         identity.authenticate_computer("token").await.unwrap(),
         Some(computer),
@@ -534,16 +602,23 @@ async fn claimed_pairings_are_never_evicted() {
 async fn starting_a_pairing_clears_expired_unclaimed_rows() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
-    for _ in 0..MAX_PENDING_PAIRINGS {
+    for index in 0..MAX_PENDING_PAIRINGS {
         identity
-            .test_begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .test_begin_pairing_from_at(
+                now,
+                &format!("source-{index}"),
+                "laptop",
+                "/ws",
+                "token",
+                "poll",
+            )
             .await
             .unwrap();
     }
     let later = now + PAIRING_TTL_SECS * 1_000_000;
 
     let start = identity
-        .test_begin_pairing_at(later, "laptop", "/ws", "token", "poll")
+        .test_begin_pairing_from_at(later, "new-source", "laptop", "/ws", "token", "poll")
         .await
         .expect("expired pairings stop holding the quota");
 
@@ -753,19 +828,34 @@ async fn finishing_a_claim_twice_is_idempotent() {
 async fn two_machines_starting_at_once_keep_the_store_bounded() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
-    for _ in 0..MAX_PENDING_PAIRINGS - 1 {
+    for index in 0..MAX_PENDING_PAIRINGS - 1 {
         identity
-            .test_begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .test_begin_pairing_from_at(
+                now,
+                &format!("source-{index}"),
+                "laptop",
+                "/ws",
+                "token",
+                "poll",
+            )
             .await
             .unwrap();
     }
 
     let (first, second) = tokio::join!(
-        identity.test_begin_pairing_at(now, "one", "/ws", "token", "poll"),
-        identity.test_begin_pairing_at(now, "two", "/ws", "token", "poll"),
+        identity.test_begin_pairing_from_at(now, "one", "one", "/ws", "token", "poll"),
+        identity.test_begin_pairing_from_at(now, "two", "two", "/ws", "token", "poll"),
     );
-    assert!(first.is_ok(), "{first:?}");
-    assert!(second.is_ok(), "{second:?}");
+    let accepted = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(
+        accepted, 1,
+        "one start fills the last slot and the other is refused: {first:?} {second:?}"
+    );
+    let refused = if first.is_err() { first } else { second };
+    assert!(
+        matches!(refused, Err(IdentityError::TooManyPending)),
+        "the queue refuses instead of growing: {refused:?}"
+    );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
         .fetch_one(pool(&identity))
         .await
@@ -848,22 +938,32 @@ async fn only_one_of_two_concurrent_claims_wins() {
         .begin_pairing("laptop", "/ws", "token", "poll")
         .await
         .unwrap();
-    let owner = Id::new();
+    let ada = Id::new();
+    let grace = Id::new();
     let first = Id::new();
     let second = Id::new();
 
     let (one, two) = tokio::join!(
-        identity.claim_pairing(&start.code, owner, first),
-        identity.claim_pairing(&start.code, owner, second),
+        identity.claim_pairing(&start.code, ada, first),
+        identity.claim_pairing(&start.code, grace, second),
     );
     let one = one.unwrap();
     let two = two.unwrap();
 
     assert_ne!(one, two, "one claim must lose");
-    let winner = if one { first } else { second };
+    let (winner_owner, winner) = if one { (ada, first) } else { (grace, second) };
     assert_eq!(
         identity.pairing(&start.device, "poll").await.unwrap(),
         Some(PairingState::Approved { computer: winner })
+    );
+    assert_eq!(
+        identity.pairing_claims().await.unwrap(),
+        vec![PairingClaim {
+            owner: winner_owner,
+            computer: winner,
+            finalized: true,
+        }],
+        "the code admits one User, not both"
     );
     assert_eq!(
         identity.authenticate_computer("token").await.unwrap(),
@@ -941,7 +1041,7 @@ async fn a_computer_authenticates_with_the_token_the_machine_keeps() {
         None
     );
     let (_account, account_token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
     assert_eq!(
@@ -989,6 +1089,7 @@ async fn version_one_database(path: &std::path::Path, token: &str) -> Account {
         id: Id::new(),
         display_name: "Legacy Ada".to_owned(),
         is_admin: true,
+        role: neha::role::Role::Owner,
     };
     sqlx::query(
         "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
@@ -1120,9 +1221,13 @@ async fn concurrent_writers_wait_for_the_database_instead_of_erroring() {
         let polls: Vec<String> = (0..8)
             .map(|index| format!("poll-{round}-{index}"))
             .collect();
+        let sources: Vec<String> = (0..8)
+            .map(|index| format!("source-{round}-{index}"))
+            .collect();
         let starts = futures_util::future::join_all((0..8).map(|index| {
-            identity.test_begin_pairing_at(
+            identity.test_begin_pairing_from_at(
                 now,
+                &sources[index],
                 &machines[index],
                 "/ws",
                 &tokens[index],
@@ -1158,6 +1263,12 @@ async fn concurrent_writers_wait_for_the_database_instead_of_erroring() {
                     .expect("a concurrent release must wait, not fail")
             );
         }
+        // Released rows become waiting again; clear the queue so the next
+        // round exercises the same six writers, not the global cap.
+        sqlx::query("DELETE FROM computer_codes")
+            .execute(pool(&identity))
+            .await
+            .unwrap();
     }
 
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
@@ -1252,14 +1363,14 @@ async fn clearing_tickets_forgets_them_and_a_recorded_token_authenticates() {
 #[tokio::test]
 async fn the_admin_is_known_once_it_joins() {
     let (_dir, _home, identity) = identity().await;
-    assert_eq!(identity.admin_account().await.unwrap(), None);
+    assert_eq!(identity.owner_account().await.unwrap(), None);
 
     let (account, _token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
-    assert_eq!(identity.admin_account().await.unwrap(), Some(account));
+    assert_eq!(identity.owner_account().await.unwrap(), Some(account));
 }
 #[tokio::test]
 async fn issuing_keeps_at_most_eight_unused_tickets_per_owner() {
@@ -1323,4 +1434,363 @@ async fn issuing_and_claiming_drop_expired_tickets() {
         identity.claim_local_ticket("stale-ticket").await.unwrap(),
         None
     );
+}
+
+#[tokio::test]
+async fn revoking_forgets_claims_and_waiting_rows_for_its_token() {
+    let (_dir, _home, identity) = identity().await;
+    let first = identity
+        .begin_pairing("laptop", "/ws", "shared-token", "poll-one")
+        .await
+        .unwrap();
+    let owner = Id::new();
+    let computer = Id::new();
+    assert!(
+        identity
+            .reserve_pairing(&first.code, owner, computer)
+            .await
+            .unwrap()
+    );
+    assert!(identity.finalize_pairing(owner, computer).await.unwrap());
+
+    // The same machine starts another pairing with the token it already
+    // holds; approving it after revocation must not restore the old token.
+    let waiting = identity
+        .begin_pairing("laptop", "/ws", "shared-token", "poll-two")
+        .await
+        .unwrap();
+
+    assert!(identity.revoke_computer(computer).await.unwrap());
+    assert_eq!(
+        identity
+            .authenticate_computer("shared-token")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(identity.pairing_claims().await.unwrap(), Vec::new());
+    assert_eq!(
+        identity.pairing_request(&waiting.code).await.unwrap(),
+        None,
+        "a waiting row carrying the revoked token is gone"
+    );
+    assert!(
+        !identity.revoke_computer(computer).await.unwrap(),
+        "a second revoke is idempotent"
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_becomes_the_approvers_session_once() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _session) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let started = start_device_login(&identity, "", "laptop", "cli-token", "poll-secret").await;
+    assert_eq!(
+        identity
+            .device_login(&started.device, "poll-secret")
+            .await
+            .unwrap(),
+        Some(DeviceLoginState::Pending)
+    );
+
+    let command = Id::new();
+    let approved = identity
+        .approve_device_login(&started.code, owner.id, command)
+        .await
+        .unwrap();
+    assert_eq!(approved, owner);
+    assert_eq!(
+        identity
+            .device_login(&started.device, "poll-secret")
+            .await
+            .unwrap(),
+        Some(DeviceLoginState::Approved {
+            account: owner.clone()
+        })
+    );
+    assert_eq!(
+        identity.authenticate("cli-token").await.unwrap(),
+        Some(owner.clone()),
+        "the CLI now holds an ordinary session token"
+    );
+    assert_eq!(
+        identity.device_login_by_command(command).await.unwrap(),
+        Some(owner.clone()),
+        "a retry can find the account its command already bound"
+    );
+
+    // The code and the command are single-use; the token is never rebound.
+    assert!(matches!(
+        identity
+            .approve_device_login(&started.code, owner.id, Id::new())
+            .await,
+        Err(IdentityError::InvalidDeviceCode)
+    ));
+    assert!(matches!(
+        identity
+            .approve_device_login("ZZZZ-ZZZZ", owner.id, Id::new())
+            .await,
+        Err(IdentityError::InvalidDeviceCode)
+    ));
+    assert_eq!(
+        identity
+            .device_login(&started.device, "wrong-secret")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_token_already_in_use_does_not_claim_its_code() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _session) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let first = start_device_login(&identity, "", "laptop", "shared-token", "poll-one").await;
+    let second = start_device_login(&identity, "", "desktop", "shared-token", "poll-two").await;
+    identity
+        .approve_device_login(&first.code, owner.id, Id::new())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        identity
+            .approve_device_login(&second.code, owner.id, Id::new())
+            .await,
+        Err(IdentityError::TokenTaken)
+    ));
+    assert_eq!(
+        identity
+            .device_login(&second.device, "poll-two")
+            .await
+            .unwrap(),
+        Some(DeviceLoginState::Pending),
+        "a refused token leaves the second code usable"
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_start_drops_expired_rows_and_bounds_the_queue() {
+    let (_dir, _home, identity) = identity().await;
+    let first = start_device_login(&identity, "", "laptop", "token-one", "poll-one").await;
+    // Expire the only waiting row, then start enough to reach the cap: the
+    // expired row must not count and must not answer a poll.
+    sqlx::query("UPDATE device_logins SET expires_at = 0 WHERE device_id = ?")
+        .bind(&first.device)
+        .execute(pool(&identity))
+        .await
+        .unwrap();
+    for index in 0..MAX_PENDING_PAIRINGS {
+        start_device_login(
+            &identity,
+            &format!("source-{index}"),
+            "laptop",
+            &format!("token-{index}"),
+            &format!("poll-{index}"),
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            identity
+                .begin_device_login(
+                    "final-source",
+                    "desktop",
+                    &neha_space::test_support::identity::digest("one-too-many"),
+                    &neha_space::test_support::identity::digest("poll-too-many"),
+                )
+                .await,
+            Err(IdentityError::TooManyPending)
+        ),
+        "the waiting queue is bounded"
+    );
+    assert_eq!(
+        identity
+            .device_login(&first.device, "poll-one")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_invitation_is_claimed_once_and_released_when_a_join_fails() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _token) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let (invitation, secret) = identity
+        .create_invitation(Id::new(), owner.id)
+        .await
+        .unwrap();
+    assert_eq!(identity.invitations().await.unwrap(), vec![invitation]);
+
+    let first = Id::new();
+    assert!(
+        identity
+            .reserve_invitation(&secret.clone().unwrap(), first)
+            .await
+            .unwrap(),
+        "one join claims the link"
+    );
+    assert!(
+        !identity
+            .reserve_invitation(&secret.clone().unwrap(), Id::new())
+            .await
+            .unwrap(),
+        "a second join cannot claim the same link"
+    );
+    assert_eq!(identity.invitation_claims().await.unwrap(), vec![first]);
+
+    // A join that fails before the account exists releases the claim.
+    identity.release_invitation(first).await.unwrap();
+    assert!(identity.invitation_claims().await.unwrap().is_empty());
+    let second = Id::new();
+    assert!(
+        identity
+            .reserve_invitation(&secret.clone().unwrap(), second)
+            .await
+            .unwrap(),
+        "a released link admits one User again"
+    );
+    identity.finalize_invitation(second).await.unwrap();
+    assert!(
+        identity.invitations().await.unwrap().is_empty(),
+        "a finished join leaves no pending invitation"
+    );
+    assert!(
+        !identity
+            .reserve_invitation(&secret.clone().unwrap(), Id::new())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_source_waits_with_at_most_two_rows() {
+    let (_dir, _home, identity) = identity().await;
+    for index in 0..MAX_PENDING_PER_SOURCE {
+        start_device_login(
+            &identity,
+            "one-source",
+            "laptop",
+            &format!("token-{index}"),
+            &format!("poll-{index}"),
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            identity
+                .begin_device_login(
+                    "one-source",
+                    "laptop",
+                    &digest("one-too-many"),
+                    &digest("poll-too-many"),
+                )
+                .await,
+            Err(IdentityError::TooManyPending)
+        ),
+        "one source cannot fill the waiting queue"
+    );
+    // Another source still has room.
+    start_device_login(&identity, "other-source", "desktop", "token-ok", "poll-ok").await;
+}
+
+#[tokio::test]
+async fn an_expired_invitation_admits_no_one() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _token) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let created_at = now_microseconds() - (INVITATION_TTL_SECS + 1) * 1_000_000;
+    let (_invitation, secret) = identity
+        .test_create_invitation_at(Id::new(), created_at, owner.id)
+        .await
+        .unwrap();
+
+    assert!(
+        !identity
+            .reserve_invitation(&secret.clone().unwrap(), Id::new())
+            .await
+            .unwrap()
+    );
+    assert!(identity.invitations().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_role_is_kept_in_the_account_row_and_brought_in_step_with_the_record() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, token) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    assert_eq!(owner.role, Role::Owner);
+    assert!(owner.is_admin);
+
+    let member_id = Id::new();
+    let (member, _member_token) = identity
+        .create_invited(member_id, "Eve", "correct horse battery")
+        .await
+        .unwrap();
+    assert_eq!(member.role, Role::Member);
+    assert!(!member.is_admin);
+
+    assert!(identity.set_role(member_id, Role::Admin).await.unwrap());
+    let signed_in = identity
+        .authenticate(
+            &identity
+                .login("Eve", "correct horse battery")
+                .await
+                .unwrap()
+                .1,
+        )
+        .await
+        .unwrap()
+        .expect("the Member signs in");
+    assert_eq!(signed_in.role, Role::Admin);
+    assert!(signed_in.is_admin);
+
+    // The record decides; a start syncs an account that fell behind.
+    assert_eq!(
+        identity
+            .sync_roles(&[(owner.id, Role::Owner), (member_id, Role::Member)])
+            .await
+            .unwrap(),
+        1,
+        "only the changed account is written"
+    );
+    let synced = identity
+        .authenticate(
+            &identity
+                .login("Eve", "correct horse battery")
+                .await
+                .unwrap()
+                .1,
+        )
+        .await
+        .unwrap()
+        .expect("the Member still signs in");
+    assert_eq!(synced.role, Role::Member);
+
+    // A forgotten account is no longer a way to sign in.
+    identity.forget_account(member_id).await.unwrap();
+    assert!(
+        identity
+            .login("Eve", "correct horse battery")
+            .await
+            .is_err()
+    );
+    assert!(identity.authenticate(&token).await.unwrap().is_some());
+}
+
+fn now_microseconds() -> i64 {
+    neha::time::Timestamp::now().as_microseconds()
 }

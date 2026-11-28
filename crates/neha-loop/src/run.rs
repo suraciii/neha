@@ -302,6 +302,29 @@ pub trait Recorder {
         answer: String,
     ) -> impl Future<Output = Result<ToolOutput, LoopError>> + Send;
 
+    /// Runs one plan call and returns the answer the Model reads.
+    ///
+    /// A plan write is a record operation, not an action on the Computer: it
+    /// asks no approval, records no started or finished action, and never
+    /// reaches the Computer. The record keeps the whole list, and the answer
+    /// is derived from it, so a replay returns the same answer instead of
+    /// writing the plan again.
+    fn plan(
+        &mut self,
+        step: u32,
+        call: &RecordedCall,
+        request: &tools::PlanCall,
+    ) -> impl Future<Output = Result<ToolOutput, LoopError>> + Send;
+
+    /// Returns the instruction the next ordinary request reads, rebuilt from
+    /// the record, or `None` when the request keeps the one it carries.
+    ///
+    /// The Space sends a prompt rebuilt for every request: a plan write, a
+    /// memory write, or a per-step section changes what the next step reads.
+    fn instruction(&mut self) -> impl Future<Output = Result<Option<String>, LoopError>> + Send {
+        std::future::ready(Ok(None))
+    }
+
     /// Compacts the conversation into a projection the next request sends.
     ///
     /// The record keeps every Message; the returned projection is a summary of
@@ -469,6 +492,11 @@ where
                 (calls, usage, from, approved_action, all_done)
             }
             None => {
+                // The instruction is rebuilt for every request: a record
+                // operation between two steps changes what the next one reads.
+                if let Some(system) = recorder.instruction().await? {
+                    messages[0] = Message::system(system);
+                }
                 // The request is a projection: old tool results become
                 // placeholders, and a conversation that still does not fit is
                 // compacted once. The loop's own Messages keep the original
@@ -577,8 +605,18 @@ where
             for (index, call) in calls.into_iter().enumerate().skip(from) {
                 // A memory call never asks, starts no action, and never
                 // reaches the Computer: its entry is what the record keeps.
-                if tools::is_memory(&call.recorded.tool) {
+                // A server's tool may share a built-in name, and the record
+                // keeps its server, so only a call with no server is the
+                // loop's own.
+                if call.recorded.server.is_none() && tools::is_memory(&call.recorded.tool) {
                     let output = memory_result(recorder, step, &call).await?;
+                    messages.push(Message::tool_result(call.recorded.call, output.text));
+                    continue;
+                }
+                // A plan write is a record operation too: it asks nothing,
+                // starts no action, and records the whole list.
+                if call.recorded.server.is_none() && tools::is_plan(&call.recorded.tool) {
+                    let output = plan_result(recorder, step, &call).await?;
                     messages.push(Message::tool_result(call.recorded.call, output.text));
                     continue;
                 }
@@ -678,6 +716,9 @@ where
                     }
                     (None, false, Ok(tools::Call::Memory(_))) => {
                         ActionResult::failed("a memory tool is not a Computer action")
+                    }
+                    (None, false, Ok(tools::Call::Plan(_))) => {
+                        ActionResult::failed("a plan tool is not a Computer action")
                     }
                     (None, false, Err(error)) => ActionResult::failed(error),
                 };
@@ -1013,6 +1054,9 @@ where
         Ok(tools::Call::Space(_)) => Err(LoopError::Resume(
             "a Space tool was given to the memory recorder".to_owned(),
         )),
+        Ok(tools::Call::Plan(_)) => Err(LoopError::Resume(
+            "a plan call was given to the memory recorder".to_owned(),
+        )),
         // A refusal is a memory tool result: the record keeps it, and a replay
         // returns it instead of refusing again.
         Err(refusal) => {
@@ -1020,6 +1064,27 @@ where
                 .memory_refused(step, &call.recorded, refusal.clone())
                 .await
         }
+    }
+}
+
+/// Answers one plan tool call.
+///
+/// A refused plan call records no plan: the refusal is the tool result the
+/// Model reads, and a replay returns the refusal the reply kept.
+async fn plan_result<Rec>(
+    recorder: &mut Rec,
+    step: u32,
+    call: &StepCall,
+) -> Result<ToolOutput, LoopError>
+where
+    Rec: Recorder + Send,
+{
+    match &call.parsed {
+        Ok(tools::Call::Plan(request)) => recorder.plan(step, &call.recorded, request).await,
+        Ok(_) => Err(LoopError::Resume(
+            "a plan call asked for something else".to_owned(),
+        )),
+        Err(refusal) => Ok(ToolOutput::full(refusal.clone())),
     }
 }
 
@@ -1363,11 +1428,15 @@ mod tests {
         started: Vec<(u32, String, Id)>,
         finished: Vec<(u32, ActionStatus)>,
         memories: Vec<(u32, tools::MemoryCall)>,
+        plans: Vec<(u32, tools::PlanCall)>,
         refusals: Vec<(u32, String, String)>,
         /// The compactions `compact` returns, in order; `None` once it runs out.
         compactions: VecDeque<Option<Compaction>>,
         /// The steps and Messages `compact` was asked about.
         compacted: Vec<(u32, Vec<Message>)>,
+        /// The instructions `instruction` returns, in order; `None` once it
+        /// runs out.
+        instructions: VecDeque<Option<String>>,
         /// The method that fails, named by its entry in `order`.
         fail_at: Option<&'static str>,
         order: Vec<&'static str>,
@@ -1392,6 +1461,10 @@ mod tests {
     }
 
     impl Recorder for TestRecorder {
+        async fn instruction(&mut self) -> Result<Option<String>, LoopError> {
+            Ok(self.instructions.pop_front().flatten())
+        }
+
         async fn step(&mut self, step: u32, usage: Usage, calls: u32) -> Result<(), LoopError> {
             self.record("step")?;
             self.steps.push((step, usage, calls));
@@ -1483,6 +1556,18 @@ mod tests {
                 .push((step, call.call.clone(), answer.clone()));
 
             Ok(ToolOutput::full(answer))
+        }
+
+        async fn plan(
+            &mut self,
+            step: u32,
+            _call: &RecordedCall,
+            request: &tools::PlanCall,
+        ) -> Result<ToolOutput, LoopError> {
+            self.record("plan")?;
+            self.plans.push((step, request.clone()));
+
+            Ok(ToolOutput::full(tools::plan_output(&request.entries)))
         }
 
         async fn compact(
@@ -2767,6 +2852,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_plan_call_never_asks_and_returns_its_answer_to_the_model() {
+        let model = FakeModel::with(vec![
+            call_reply(
+                "plan",
+                json!({"entries": [
+                    {"title": "Read the receipts", "state": "done"},
+                    {"title": "Buy the pass", "state": "doing"},
+                ]}),
+            ),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(
+            recorder.order,
+            ["reply", "plan", "step", "reply", "step"],
+            "a plan call asks for no approval and starts no action"
+        );
+        assert!(recorder.approvals.is_empty());
+        assert!(recorder.started.is_empty());
+        assert!(recorder.finished.is_empty());
+        assert!(runtime.actions.lock().unwrap().is_empty());
+        assert_eq!(recorder.plans.len(), 1);
+        assert_eq!(recorder.plans[0].0, 1);
+        assert_eq!(recorder.plans[0].1.entries.len(), 2);
+        // The Model reads the result under the call's own identifier.
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [("call-1".to_owned(), "Plan updated: 1 of 2 done.".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_plan_call_asks_nothing_and_records_no_plan() {
+        let model = FakeModel::with(vec![
+            call_reply(
+                "plan",
+                json!({"entries": [{"title": "x", "state": "blocked"}]}),
+            ),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(recorder.plans.is_empty(), "a refusal records no plan");
+        assert!(recorder.approvals.is_empty());
+        assert!(recorder.started.is_empty());
+        let requests = model.requests.lock().unwrap();
+        let refusal = &tool_messages(&requests[1])[0].1;
+        assert!(
+            refusal.contains("blocked"),
+            "the Model reads the refusal: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_that_clears_the_list_answers_as_cleared() {
+        let model = FakeModel::with(vec![
+            call_reply("plan", json!({"entries": []})),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (_, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(recorder.plans.len(), 1);
+        assert!(recorder.plans[0].1.entries.is_empty());
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [("call-1".to_owned(), "Plan cleared.".to_owned())]
+        );
+    }
+
+    #[tokio::test]
     async fn a_refused_memory_call_asks_nothing_and_returns_the_refusal() {
         let model = FakeModel::with(vec![
             call_reply(
@@ -2918,6 +3112,68 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn every_request_reads_the_instruction_the_recorder_rebuilds() {
+        let model = FakeModel::with(vec![
+            call_reply("plan", json!({"entries": []})),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+        recorder
+            .instructions
+            .push_back(Some("the first instruction".to_owned()));
+        recorder
+            .instructions
+            .push_back(Some("the second instruction".to_owned()));
+
+        let (_, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("the request's instruction", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].messages[0].content.as_deref(),
+            Some("the first instruction"),
+            "the first request reads the rebuilt instruction"
+        );
+        assert_eq!(
+            requests[1].messages[0].content.as_deref(),
+            Some("the second instruction"),
+            "the step after a record operation reads the rebuilt instruction"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_keeps_its_instruction_when_the_recorder_has_none() {
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (_, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("the request's instruction", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].messages[0].content.as_deref(),
+            Some("the request's instruction")
+        );
+    }
+
     #[test]
     fn the_context_threshold_keeps_the_output_and_reserve_it_needs() {
         // A large window compacts at 80% or at the window minus its output and
@@ -2967,7 +3223,10 @@ mod tests {
         let mut recorder = TestRecorder::default();
         let request = RunRequest::new("system", history, 100)
             .with_context_window(4_000)
-            .with_max_steps(1);
+            .with_max_steps(1)
+            // The test measures the tool results, not the schema cost: a small
+            // window would otherwise count the built-in schemas.
+            .with_tools(Vec::new());
 
         let _ = run(&runtime, &model, &mut recorder, request).await;
 

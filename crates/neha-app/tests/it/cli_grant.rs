@@ -1,61 +1,63 @@
 //! The CLI's grant arguments: naming a folder to grant and to revoke.
 //!
-//! These drive `checked_grant` and `revocable_grant` against real folders, so
-//! they live with the other integration tests; the parser tests stay in the
-//! module they parse.
+//! These drive `checked_grant` and `revocable_grant`; the parser tests stay in
+//! the module they parse.
 
 use std::path::PathBuf;
 
 use neha_app::test_support::{checked_grant, revocable_grant};
 
 #[test]
-fn a_grant_folder_must_exist_and_be_a_folder() {
+fn a_grant_checks_only_the_path_syntax() {
     let directory = tempfile::tempdir().unwrap();
     let folder = directory.path().join("shared");
     std::fs::create_dir(&folder).unwrap();
     assert_eq!(
         checked_grant(&folder).unwrap(),
-        std::fs::canonicalize(&folder)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
+        folder.to_string_lossy().into_owned()
     );
 
-    let error = checked_grant(&directory.path().join("missing"))
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("does not exist"), "{error}");
+    // The folder may be on another machine: this client cannot see it, and
+    // the Computer resolves it when it opens the write root.
+    let missing = directory.path().join("missing");
+    assert_eq!(
+        checked_grant(&missing).unwrap(),
+        missing.to_string_lossy().into_owned()
+    );
+    // A file path is syntactically a grant; the Computer refuses it at use.
     let file = directory.path().join("notes.txt");
     std::fs::write(&file, "notes").unwrap();
-    let error = checked_grant(&file).unwrap_err().to_string();
-    assert!(error.contains("must be a folder"), "{error}");
+    assert_eq!(
+        checked_grant(&file).unwrap(),
+        file.to_string_lossy().into_owned()
+    );
+
+    // The syntax rules still refuse values the Space could not record.
+    let relative = checked_grant(std::path::Path::new("relative/folder"))
+        .unwrap_err()
+        .to_string();
+    assert!(relative.contains("absolute"), "{relative}");
 }
 
 #[test]
-fn a_revoke_reads_a_live_folder_like_a_grant() {
+fn a_revoke_reads_the_grant_as_recorded() {
     let directory = tempfile::tempdir().unwrap();
     let real = directory.path().join("shared");
     std::fs::create_dir(&real).unwrap();
     let link = directory.path().join("link");
     std::os::unix::fs::symlink(&real, &link).unwrap();
 
-    // A grant stores the folder a symlink names; the same argument must
-    // find that folder again when it is revoked.
+    // A raw spelling is recorded as typed: the client does not resolve a
+    // symlink on this machine, because the folder is on the Computer.
     let granted = checked_grant(&link).unwrap();
-    assert_eq!(
-        granted,
-        std::fs::canonicalize(&real)
-            .unwrap()
-            .to_string_lossy()
-            .into_owned()
-    );
+    assert_eq!(granted, link.to_string_lossy().into_owned());
     assert_eq!(
         revocable_grant(&link, std::slice::from_ref(&granted)).unwrap(),
         granted
     );
 
-    // A folder that is gone has no target to read, so the recorded value
-    // is what a revoke names.
+    // A folder that is gone no longer exists on this machine either; the
+    // recorded value still names it.
     std::fs::remove_file(&link).unwrap();
     std::fs::remove_dir(&real).unwrap();
     assert_eq!(
@@ -134,14 +136,15 @@ fn a_revoke_removes_the_recorded_grant_a_later_link_points_elsewhere() {
         "a link above the granted folder does not change what was recorded"
     );
 
-    // A path no grant shows is read as an alias while it exists, so the
-    // grant a symlink path added is still reachable.
+    // A path no grant shows stays the path the User named: this client does
+    // not resolve it against its own filesystem, because the folder is on the
+    // Computer. The Space refuses a value it did not record.
     let alias = directory.path().join("alias");
     std::os::unix::fs::symlink(&second, &alias).unwrap();
     assert_eq!(
         revocable_grant(&alias, &shown).unwrap(),
-        second_grant,
-        "an alias resolves to the recorded folder"
+        alias.to_string_lossy().into_owned(),
+        "an unrecorded alias is not resolved on the client"
     );
     // A path no grant shows and no folder names is sent as the User
     // spelled it, so the Space refuses it with the name the User used.

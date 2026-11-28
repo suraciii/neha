@@ -276,6 +276,21 @@ pub fn startup_failure(error: &neha_space::ServerError) -> (&'static str, &'stat
             "model",
             "the model client cannot be built".to_owned(),
         ),
+        ServerError::IdentityOutOfStep(_) => (
+            "identity",
+            "identity",
+            "the identity data is out of step".to_owned(),
+        ),
+        ServerError::TrustedProxies(_) => (
+            "config",
+            "trusted_proxies",
+            "the trusted proxy list is invalid".to_owned(),
+        ),
+        ServerError::UnencryptedListener(_) => (
+            "bind",
+            "public_url",
+            "a listener beyond this machine needs a TLS proxy".to_owned(),
+        ),
     }
 }
 

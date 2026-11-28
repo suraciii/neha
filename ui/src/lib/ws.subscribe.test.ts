@@ -7,7 +7,7 @@ type Listener = (event: { data?: string }) => void;
 // The protocol version the Space speaks, as `PROTOCOL_VERSION` in
 // `crates/neha/src/surface.rs` states it. The fake Space refuses a hello that
 // greets with any other version, so a stale browser version fails these tests.
-const SERVER_PROTOCOL_VERSION = 3;
+const SERVER_PROTOCOL_VERSION = 4;
 
 class FakeSocket {
   static readonly CONNECTING = 0;
@@ -102,7 +102,7 @@ describe("record subscription", () => {
     expect(socket.sent.find((frame) => frame.type === "hello")).toEqual({
       type: "hello",
       version: SERVER_PROTOCOL_VERSION,
-      capabilities: ["memory", "compaction"],
+      capabilities: ["memory", "compaction", "plan"],
     });
     await commands.close();
   });
@@ -134,11 +134,11 @@ describe("record subscription", () => {
     await Promise.resolve();
     const socket = FakeSocket.instances[0]!;
     // The client declares the Presentation kinds it reads, so the Space sends
-    // it the memory and compaction events; an older client that stays silent
-    // receives none.
+    // it the memory, compaction, and plan events; an older client that stays
+    // silent receives none.
     expect(socket.sent.find((frame) => frame.type === "hello")).toMatchObject({
       version: SERVER_PROTOCOL_VERSION,
-      capabilities: ["memory", "compaction"],
+      capabilities: ["memory", "compaction", "plan"],
     });
     expect(socket.sent.find((frame) => frame.type === "subscribe")).toMatchObject({
       cursor: "4",

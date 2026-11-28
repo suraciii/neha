@@ -1402,6 +1402,9 @@ code,
 }
 
 .activity__title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-size: var(--text-md);
   font-weight: 500;
   color: var(--ink-2);
@@ -1422,6 +1425,35 @@ code,
   color: var(--ink-4);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
+}
+
+/* A Run with a plan states how much of it is done: the bar shows the share and
+   the count beside it says the numbers, so progress never rests on color. */
+.activity__progress {
+  display: block;
+  flex: 1;
+  min-width: 24px;
+  max-width: 180px;
+  height: 3px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--line);
+}
+
+.activity__progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-2);
+  transition: width 160ms var(--ease-soft);
+}
+
+.activity__count {
+  flex: none;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .activity__chev {
@@ -1500,6 +1532,87 @@ code,
   margin-left: auto;
   color: var(--ink-4);
   font-size: var(--text-2xs);
+}
+
+/* The plan's entries, shown before the action rows: each line and how far it
+   stands. The state's word carries the meaning so no one reads the shape or the
+   color alone. */
+.activity__plan {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 2px 12px 8px;
+  list-style: none;
+}
+
+.activity__plan-entry {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+}
+
+.activity__plan-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+  align-self: center;
+  width: 16px;
+  height: 16px;
+  color: var(--ink-4);
+}
+
+.activity__plan-entry--done .activity__plan-mark {
+  color: var(--success);
+}
+
+.activity__plan-entry--doing .activity__plan-mark {
+  color: var(--accent-2);
+}
+
+.activity__plan-dot {
+  display: block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* A pending line's marker is hollow, so its shape tells it from a working one
+   even where color does not. */
+.activity__plan-entry--pending .activity__plan-dot {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--line-strong);
+  background: transparent;
+}
+
+.activity__plan-title {
+  min-width: 0;
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+.activity__plan-entry--done .activity__plan-title {
+  color: var(--ink-2);
+}
+
+.activity__plan-state {
+  flex: none;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+
+/* The label above the action rows, when the plan shares the card with them. */
+.activity__label {
+  margin: 0;
+  padding: 2px 12px 4px;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+  font-weight: 500;
 }
 
 .activity__files {
@@ -2063,6 +2176,62 @@ code,
   font-size: var(--text-2xs);
 }
 
+/* The one-time invitation answer: the link, the way to copy it, and the QR code
+   a phone scans. The code keeps its own light ground and quiet zone so it reads
+   from the screen. */
+.invite {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  align-items: flex-start;
+  padding: 14px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  background: var(--accent-wash);
+}
+
+.invite__details {
+  display: grid;
+  gap: 8px;
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.invite__link {
+  display: block;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--r-sm);
+  background: var(--raised);
+  color: var(--ink);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+  user-select: all;
+}
+
+.invite__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.invite__qr {
+  flex: none;
+  width: 200px;
+  height: 200px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+}
+
+.invite__qr-ground {
+  fill: var(--raised);
+}
+
+.invite__qr-modules {
+  fill: var(--ink);
+}
+
 /* One kind of memory on a Bot's page: the entries it holds, and the room it has
    left. The rules come first, then the notes the Bot keeps for itself. */
 .memory {
@@ -2285,6 +2454,12 @@ code,
 .panel__note {
   color: var(--ink-4);
   font-size: var(--text-2xs);
+}
+
+.panel__subtitle {
+  font-size: var(--text-sm);
+  font-weight: 500;
+  letter-spacing: -0.01em;
 }
 
 .facts {

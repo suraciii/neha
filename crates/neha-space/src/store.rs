@@ -440,7 +440,12 @@ async fn record_command(
     fingerprint: String,
     result: serde_json::Value,
 ) -> Result<(), StoreError> {
-    let mut transaction = connection.begin().await?;
+    // Take the write reservation before the first read: another writer (a
+    // join's account write, a pairing) may commit between a read and the
+    // insert, and SQLite refuses to upgrade a snapshot it has read from.
+    let mut transaction = connection
+        .begin_with(sqlx::AssertSqlSafe("BEGIN IMMEDIATE"))
+        .await?;
     let existing = sqlx::query("SELECT fingerprint, result FROM commands WHERE command_id = ?")
         .bind(command.to_string())
         .fetch_optional(&mut *transaction)
@@ -500,7 +505,12 @@ async fn claim_command(
     command: Id,
     fingerprint: String,
 ) -> Result<Option<CommandRecord>, StoreError> {
-    let mut transaction = connection.begin().await?;
+    // Take the write reservation before the first read: another writer (a
+    // join's account write, a pairing) may commit between a read and the
+    // insert, and SQLite refuses to upgrade a snapshot it has read from.
+    let mut transaction = connection
+        .begin_with(sqlx::AssertSqlSafe("BEGIN IMMEDIATE"))
+        .await?;
     if let Some(record) = read_command(&mut transaction, command).await? {
         if record.fingerprint != fingerprint {
             return Err(StoreError::IdempotencyConflict(command));
@@ -527,7 +537,12 @@ async fn settle_command(
     result: serde_json::Value,
 ) -> Result<(), StoreError> {
     let stored = serde_json::to_string(&result).map_err(|_| corrupt("command result"))?;
-    let mut transaction = connection.begin().await?;
+    // Take the write reservation before the first read: another writer (a
+    // join's account write, a pairing) may commit between a read and the
+    // insert, and SQLite refuses to upgrade a snapshot it has read from.
+    let mut transaction = connection
+        .begin_with(sqlx::AssertSqlSafe("BEGIN IMMEDIATE"))
+        .await?;
     let updated =
         sqlx::query("UPDATE commands SET result = ? WHERE command_id = ? AND result IS NULL")
             .bind(stored)
@@ -562,7 +577,12 @@ async fn append(
             .map_err(|error| StoreError::InvalidEvent(error.to_string()))?;
     }
 
-    let mut transaction = connection.begin().await?;
+    // Take the write reservation before the first read: another writer (a
+    // join's account write, a pairing) may commit between a read and the
+    // insert, and SQLite refuses to upgrade a snapshot it has read from.
+    let mut transaction = connection
+        .begin_with(sqlx::AssertSqlSafe("BEGIN IMMEDIATE"))
+        .await?;
     let existing = sqlx::query(
         "SELECT fingerprint, first_seq, last_seq, result FROM commands WHERE command_id = ?",
     )
@@ -910,6 +930,21 @@ mod tests {
                 kind,
                 Author::User(user),
                 serde_json::json!({"display_name": "Ada", "is_admin": true}),
+            ),
+            EventKind::UserUpdated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"user": user, "role": "admin"}),
+            ),
+            EventKind::UserTransferred => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"to": Id::new()}),
+            ),
+            EventKind::InvitationChanged => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({}),
             ),
             EventKind::ProviderAdded => {
                 let provider = Id::new();
@@ -1289,6 +1324,17 @@ mod tests {
                     "bot": Id::new(),
                     "up_to_seq": 1,
                     "summary": "earlier messages",
+                }),
+            )
+            .acting(user),
+            EventKind::RunPlanned => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "call": "call-1",
+                    "entries": [{"title": "a line", "state": "done"}],
                 }),
             )
             .acting(user),

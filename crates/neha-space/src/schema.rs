@@ -8,7 +8,7 @@ use sqlx::{Connection, SqliteConnection};
 use thiserror::Error;
 
 /// The schema version this build writes.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// The statements that create the tables of schema version 1.
 ///
@@ -81,6 +81,55 @@ const VERSION_FIVE_STATEMENTS: [&str; 1] = [
 /// instead of stopping on an event it cannot decode.
 const VERSION_SIX_STATEMENTS: [&str; 0] = [];
 
+/// The statements schema version 7 adds.
+///
+/// Remote pairing counts waiting requests per source address and gives each
+/// active code one hash. The source of an old row is the empty string: it was
+/// never recorded, and it only matters while that row waits.
+const VERSION_SEVEN_STATEMENTS: [&str; 2] = [
+    "ALTER TABLE computer_codes ADD COLUMN source TEXT NOT NULL DEFAULT ''",
+    "CREATE UNIQUE INDEX computer_codes_unclaimed_code \
+     ON computer_codes(code_hash) WHERE owner IS NULL",
+];
+
+/// The statements schema version 8 adds.
+///
+/// A CLI signs in from a machine without a session: it starts a device login,
+/// shows a code, and a signed-in User approves it. The token is stored only by
+/// hash, and the approving command is kept so a retry can answer the same
+/// account without claiming a second row.
+const VERSION_EIGHT_STATEMENTS: [&str; 3] = [
+    "CREATE TABLE IF NOT EXISTS device_logins (\
+        device_id TEXT PRIMARY KEY, code_hash BLOB NOT NULL, \
+        poll_hash BLOB NOT NULL, token_hash BLOB NOT NULL, \
+        client TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', \
+        created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, \
+        tries INTEGER NOT NULL, owner TEXT, command TEXT)",
+    "CREATE UNIQUE INDEX device_logins_unclaimed_code \
+     ON device_logins(code_hash) WHERE owner IS NULL",
+    "CREATE UNIQUE INDEX device_logins_command ON device_logins(command) \
+     WHERE command IS NOT NULL",
+];
+
+/// Version 9 gives a User a role and lets an Admin invite one. A Space's first
+/// account becomes its Owner; every other account starts as a Member. An
+/// invitation keeps only the digest of its secret, so a leaked database yields
+/// no usable link, and a notice table makes a change's event recoverable.
+const VERSION_NINE_STATEMENTS: [&str; 6] = [
+    "ALTER TABLE accounts ADD COLUMN role TEXT NOT NULL DEFAULT 'member'",
+    "UPDATE accounts SET role = 'owner' WHERE id = \
+        (SELECT id FROM accounts ORDER BY created_at ASC, id ASC LIMIT 1)",
+    "UPDATE accounts SET is_admin = CASE WHEN role = 'member' THEN 0 ELSE 1 END",
+    "CREATE TABLE IF NOT EXISTS invitations (\
+        id TEXT PRIMARY KEY, secret_hash BLOB NOT NULL UNIQUE, \
+        created_by TEXT NOT NULL, created_at INTEGER NOT NULL, \
+        expires_at INTEGER NOT NULL, claimed_by TEXT)",
+    "CREATE INDEX IF NOT EXISTS invitations_expires_at ON invitations(expires_at)",
+    "CREATE TABLE IF NOT EXISTS invitation_notices (\
+        command_id TEXT PRIMARY KEY, event_command TEXT NOT NULL, \
+        author TEXT NOT NULL, created_at INTEGER NOT NULL)",
+];
+
 /// Creates or upgrades the Space database.
 pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaError> {
     let version: i64 = sqlx::query_scalar("PRAGMA user_version")
@@ -117,6 +166,15 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SIX_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         1 => {
             // A version 1 database has the record and the account tables;
@@ -136,6 +194,15 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SIX_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         2 => {
             // Version 2 paired Computers: their token rows were final, which
@@ -152,6 +219,15 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SIX_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         3 => {
             // Version 3 pairings are final tokens; local tickets are new and
@@ -165,6 +241,15 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SIX_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         4 => {
             // Version 4 has every table but the continuation cache.
@@ -174,10 +259,58 @@ pub async fn migrate(connection: &mut SqliteConnection) -> Result<(), SchemaErro
             for statement in VERSION_SIX_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
         }
         5 => {
             // Version 5 has every table; version 6 adds record vocabulary.
             for statement in VERSION_SIX_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+        }
+        6 => {
+            // Version 6 has every table; version 7 adds pairing
+            // bookkeeping, and version 8 the User role and invitations.
+            for statement in VERSION_SEVEN_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+        }
+        7 => {
+            // Version 7 has every table; version 8 adds device logins, and
+            // version 9 the User role and invitations.
+            for statement in VERSION_EIGHT_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+            for statement in VERSION_NINE_STATEMENTS {
+                sqlx::query(statement).execute(&mut *transaction).await?;
+            }
+        }
+        8 => {
+            // Version 8 signs CLI sessions in with a device code; version 9
+            // adds the User role and invitations.
+            for statement in VERSION_NINE_STATEMENTS {
                 sqlx::query(statement).execute(&mut *transaction).await?;
             }
         }
@@ -217,23 +350,27 @@ pub enum SchemaError {
 #[cfg(test)]
 mod tests {
     use super::{
-        SCHEMA_VERSION, SchemaError, VERSION_FIVE_STATEMENTS, VERSION_FOUR_STATEMENTS,
-        VERSION_ONE_STATEMENTS, VERSION_SIX_STATEMENTS, VERSION_THREE_STATEMENTS,
+        SCHEMA_VERSION, SchemaError, VERSION_EIGHT_STATEMENTS, VERSION_FIVE_STATEMENTS,
+        VERSION_FOUR_STATEMENTS, VERSION_NINE_STATEMENTS, VERSION_ONE_STATEMENTS,
+        VERSION_SEVEN_STATEMENTS, VERSION_SIX_STATEMENTS, VERSION_THREE_STATEMENTS,
         VERSION_TWO_STATEMENTS, migrate,
     };
     use sqlx::sqlite::SqliteConnectOptions;
     use sqlx::{Connection, SqliteConnection};
 
-    const TABLES: [&str; 9] = [
+    const TABLES: [&str; 12] = [
         "meta",
         "events",
         "commands",
         "accounts",
         "tokens",
+        "invitations",
+        "invitation_notices",
         "computer_codes",
         "computer_tokens",
         "computer_tickets",
         "run_continuations",
+        "device_logins",
     ];
 
     async fn connection() -> SqliteConnection {
@@ -285,6 +422,38 @@ mod tests {
                 .unwrap();
         }
         sqlx::query("PRAGMA user_version = 3")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        connection
+    }
+
+    async fn connection_at_version_seven() -> SqliteConnection {
+        let mut connection = connection_at_version_six().await;
+        for statement in VERSION_SEVEN_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 7")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+
+        connection
+    }
+
+    async fn connection_at_version_six() -> SqliteConnection {
+        let mut connection = connection_at_version_five().await;
+        for statement in VERSION_SIX_STATEMENTS {
+            sqlx::query(statement)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        sqlx::query("PRAGMA user_version = 6")
             .execute(&mut connection)
             .await
             .unwrap();
@@ -445,6 +614,89 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(accounts, 1);
+        let role: String = sqlx::query_scalar("SELECT role FROM accounts")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(
+            role, "owner",
+            "the account without a role becomes the Owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_six_database_with_roles_and_invitations() {
+        let mut connection = connection_at_version_six().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
+             VALUES ('first', 'Ada', 'unused', 1, 1), \
+             ('second', 'Eve', 'unused', 0, 2), \
+             ('third', 'Linus', 'unused', 1, 3)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        assert!(table_exists(&mut connection, "invitations").await);
+        assert_eq!(VERSION_NINE_STATEMENTS.len(), 6);
+        let first: String = sqlx::query_scalar("SELECT role FROM accounts WHERE id = 'first'")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        let second: String = sqlx::query_scalar("SELECT role FROM accounts WHERE id = 'second'")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        assert_eq!(first, "owner", "the first account is the Space Owner");
+        assert_eq!(second, "member", "every later account starts as a Member");
+
+        // A row that predates roles keeps its Admin flag and gains the role
+        // that matches it. A stale Admin flag on a Member is healed: the role
+        // is what authorizes.
+        let flags: Vec<(String, i64)> =
+            sqlx::query_as("SELECT role, is_admin FROM accounts ORDER BY id")
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(
+            flags,
+            vec![
+                ("owner".to_owned(), 1),
+                ("member".to_owned(), 0),
+                ("member".to_owned(), 0),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_seven_database_with_roles_and_invitations() {
+        let mut connection = connection_at_version_seven().await;
+        sqlx::query(
+            "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
+             VALUES ('first', 'Ada', 'unused', 1, 1), \
+             ('second', 'Eve', 'unused', 0, 2)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        assert!(table_exists(&mut connection, "invitations").await);
+        let roles: Vec<(String, i64)> =
+            sqlx::query_as("SELECT role, is_admin FROM accounts ORDER BY id")
+                .fetch_all(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(
+            roles,
+            vec![("owner".to_owned(), 1), ("member".to_owned(), 0)],
+            "a pairing home upgrades to the roles the record will hold"
+        );
     }
 
     #[tokio::test]
@@ -486,6 +738,71 @@ mod tests {
         assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
         assert!(table_exists(&mut connection, "run_continuations").await);
         assert!(VERSION_FIVE_STATEMENTS.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_six_database_with_pairing_bookkeeping() {
+        let mut connection = connection_at_version_six().await;
+        sqlx::query(
+            "INSERT INTO computer_codes (\
+             device_id, code_hash, poll_hash, token_hash, machine, workspace, \
+             owner, computer, created_at, expires_at, tries) \
+             VALUES ('device', x'01', x'02', x'03', 'laptop', '/ws', NULL, NULL, 0, 1000, 0)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        let source: String =
+            sqlx::query_scalar("SELECT source FROM computer_codes WHERE device_id = 'device'")
+                .fetch_one(&mut connection)
+                .await
+                .unwrap();
+        assert_eq!(source, "", "an old waiting row never recorded a source");
+        // Two waiting rows cannot share one code hash, so a collision cannot
+        // make one code approve two machines.
+        let duplicate = sqlx::query(
+            "INSERT INTO computer_codes (\
+             device_id, code_hash, poll_hash, token_hash, machine, workspace, \
+             owner, computer, created_at, expires_at, tries, source) \
+             VALUES ('other', x'01', x'04', x'05', 'desktop', '/ws', NULL, NULL, 0, 1000, 0, '')",
+        )
+        .execute(&mut connection)
+        .await;
+        assert!(duplicate.is_err(), "a waiting code hash must be unique");
+        assert!(!VERSION_SEVEN_STATEMENTS.is_empty());
+    }
+
+    #[tokio::test]
+    async fn upgrades_a_version_seven_database_with_device_logins() {
+        let mut connection = connection_at_version_seven().await;
+
+        migrate(&mut connection).await.unwrap();
+
+        assert_eq!(user_version(&mut connection).await, SCHEMA_VERSION);
+        assert!(table_exists(&mut connection, "device_logins").await);
+        sqlx::query(
+            "INSERT INTO device_logins (\
+             device_id, code_hash, poll_hash, token_hash, client, \
+             created_at, expires_at, tries) \
+             VALUES ('device', x'01', x'02', x'03', 'laptop', 0, 1000, 0)",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let duplicate = sqlx::query(
+            "INSERT INTO device_logins (\
+             device_id, code_hash, poll_hash, token_hash, client, \
+             created_at, expires_at, tries) \
+             VALUES ('other', x'01', x'04', x'05', 'desktop', 0, 1000, 0)",
+        )
+        .execute(&mut connection)
+        .await;
+        assert!(duplicate.is_err(), "a waiting device code is unique");
+        assert!(!VERSION_EIGHT_STATEMENTS.is_empty());
     }
 
     #[tokio::test]
