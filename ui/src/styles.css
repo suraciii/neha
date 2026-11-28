@@ -1322,6 +1322,24 @@ code,
   background: var(--line-soft);
 }
 
+/* The boundary a Chat's compaction left: every Message above it still shows,
+   and the summary the Model reads in their place stays out of the stream. */
+.chat__compacted {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 18px auto;
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+}
+.chat__compacted::before,
+.chat__compacted::after {
+  content: "";
+  height: 1px;
+  flex: 1;
+  background: var(--line-soft);
+}
+
 .msg {
   display: flex;
   align-items: flex-start;

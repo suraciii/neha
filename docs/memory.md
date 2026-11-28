@@ -1,6 +1,6 @@
 # Memory
 
-A Bot keeps what it learns as memory. This guide shows the two kinds of memory entry, the scope each one applies in, how to read and clear them, and how memory differs from approval rules. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
+A Bot keeps what it learns as memory. This guide shows the two kinds of memory entry, the scope each one applies in, how to read and clear them, and how memory differs from approval rules. It also shows what happens when a Chat grows long. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
 
 ## What memory is
 
@@ -45,6 +45,18 @@ A Bot's memory holds at most 4 KiB of `rule` text and 16 KiB of `note` text, cou
 A write that passes a limit changes nothing, and the Bot says that its memory is full. To keep something when a kind is full, the Bot can remove or replace entries of that kind in the same request. A request that still passes the limit changes nothing. Clear an entry on the Bot's page or from the CLI to make room.
 
 The same text written again for the same Bot, kind, scope, and acting User changes nothing; a retry adds no second entry. Two Users who write the same text keep one entry each.
+
+## Long conversations
+
+As a Chat grows long, the Bot summarizes its older Messages, so it can keep working on the same conversation. The summary is not a Message in the Chat.
+
+The Chat keeps every Message, including the ones the summary covers. Where a compacted part of the Chat ends, it shows the marker **Earlier Messages were compacted**. The marker has no action and the summary is not shown. The marker comes from the record, so a reload shows it in the same place.
+
+`neha chat read <chat>` prints the Chat's Messages oldest first. Where the compacted part ends, it prints a marker that says earlier Messages were compacted, and it prints no summary.
+
+Compaction does not remove memory. The Bot's rules and notes stay, and a lasting rule still applies after its Chat is compacted. Before it compacts, the Bot can write notes for what it has not written down yet.
+
+The Bot compacts when its conversation needs it, and you take no step for it.
 
 ## Read and clear memory
 

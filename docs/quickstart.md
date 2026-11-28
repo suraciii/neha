@@ -144,6 +144,8 @@ target/debug/neha chat read "$CHAT_ID"
 
 Give the Bot its job first: ask it in the Chat to remember what its job is, then ask for the lasting preferences it should follow. [Memory](memory.md) covers the rules and notes it keeps, and how to read or clear them.
 
+A long Chat is summarized as it grows: the Chat keeps every Message and shows the marker **Earlier Messages were compacted** where a compacted part ends. [Memory](memory.md#long-conversations) covers it.
+
 A Bot can also write files, read them back, and run shell commands in its own directory inside its Computer's Workspace. [Let a Bot work on its Computer](tools.md) shows how.
 
 ## A Bot does one thing at a time

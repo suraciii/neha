@@ -1389,6 +1389,14 @@ export default function App() {
       }
       if (event.author.kind === "bot" && !readsChat(chat)) markUnread(chat);
     }
+    if (event.kind === "neha.chat.compacted") {
+      // A compaction moves the boundary Message the Chat marks, and only a read
+      // of the record answers with the new mark; the summary the event carries
+      // is the Model's, never the stream's. The open Chat reads its record
+      // again, and a read that lands after the reader moved on is dropped.
+      if (chat && state.activeChat?.id === chat) queueRefresh();
+      return;
+    }
     if (event.kind === "neha.run.queued") {
       if (run && chat) {
         noteRun(run, chat);
