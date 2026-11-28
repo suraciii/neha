@@ -583,12 +583,14 @@ fn model_calls(calls: &[StepCall]) -> Vec<ToolCall> {
 
 /// Returns the identifier a tool result answers under.
 ///
-/// The Model's own identifier when it gave one, and `call-<step>-<index>`
-/// otherwise. The rule depends on nothing else, so the Space rebuilds a
-/// run's Messages from the record with the same identifiers.
+/// The Model's own identifier when it gave a usable one, and
+/// `call-<step>-<index>` otherwise. A provider may send a blank identifier;
+/// tracing treats blank as absent, so the record and every tool result use
+/// the same stable fallback. The rule depends on nothing else, so the Space
+/// rebuilds a run's Messages from the record with the same identifiers.
 #[must_use]
 pub fn call_id(id: &str, step: u32, index: usize) -> String {
-    if id.is_empty() {
+    if id.trim().is_empty() {
         format!("call-{step}-{index}")
     } else {
         id.to_owned()
@@ -1674,10 +1676,17 @@ mod tests {
         assert_eq!(call_id("call-3-0", 3, 0), "call-3-0");
     }
 
+    #[test]
+    fn a_blank_call_id_gets_the_stable_fallback() {
+        assert_eq!(call_id("", 1, 0), "call-1-0");
+        assert_eq!(call_id("   ", 2, 3), "call-2-3");
+        assert_eq!(call_id("call-abc", 1, 0), "call-abc");
+    }
+
     #[tokio::test]
     async fn the_space_can_rebuild_the_id_of_an_id_less_call() {
         let model = FakeModel::with(vec![
-            calls_reply(vec![call("", "list_files", json!({"path": "."}))]),
+            calls_reply(vec![call("   ", "list_files", json!({"path": "."}))]),
             reply("done"),
         ]);
         let runtime = FakeRuntime::default();

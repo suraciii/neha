@@ -5390,13 +5390,20 @@ pub(crate) fn prepare_recovery(
         .iter()
         .filter(|action| action.step == next_step)
         .collect();
-    // Exactly the Computer calls before the first call the run did not finish
-    // have results; a memory call in that prefix left no action and runs
-    // again when the loop rebuilds the step.
+    // The step continues at the first call without evidence that it finished.
+    // A Computer call has its action's result; a memory call has its recorded
+    // answer. Calls before that point replay from the record, and the call at
+    // it runs for real, so a memory write that never happened happens once
+    // and a write that happened is not repeated.
     let mut action_iter = actions.iter();
     let mut from = 0;
     for (index, call) in reply.calls.iter().enumerate() {
         if is_memory_call(call) {
+            if state.memory_answer(run.id, next_step, &call.call).is_none() {
+                from = index;
+                break;
+            }
+            from = index + 1;
             continue;
         }
         let Some(action) = action_iter.next() else {
@@ -5421,7 +5428,9 @@ pub(crate) fn prepare_recovery(
         from = index + 1;
     }
     if action_iter.next().is_some() {
-        return Err(format!("step {next_step} has more actions than calls"));
+        return Err(format!(
+            "step {next_step} has actions after a call without a recorded result"
+        ));
     }
     if let Some(position) = actions
         .iter()
@@ -5458,8 +5467,8 @@ pub(crate) fn prepare_recovery(
         })));
     }
     // The loop inserts the assistant Message itself when it rebuilds a
-    // resumed step; the history ends with the Computer results the calls
-    // before `from` gave back.
+    // resumed step; the history ends with the results the calls before `from`
+    // gave back: a Computer result or a recorded memory answer.
     append_results(
         &state,
         run.id,
@@ -6322,6 +6331,10 @@ impl Recorder for RunRecorder<'_> {
         };
         drafts.push(self.memory_answered(step, call, &output)?);
         self.log.append(drafts).await?;
+        // A test can stop the Space after the write committed but before the
+        // step finished, so a restart must replay the answer it recorded.
+        #[cfg(feature = "test-support")]
+        memory_pause::after_append(self.log.bot).await;
 
         Ok(ToolOutput::full(output))
     }
@@ -8173,6 +8186,26 @@ mod tests {
         (state, run)
     }
 
+    /// Applies one memory answer to a recovering record.
+    fn answer(
+        state: &mut State,
+        run: &crate::state::RunView,
+        step: u32,
+        call: &str,
+        answer: &str,
+        seq: i64,
+    ) {
+        state
+            .apply(&event(
+                EventKind::MemoryAnswered,
+                Author::Bot(run.bot),
+                Some(run.acting),
+                json!({"run": run.id, "step": step, "call": call, "answer": answer}),
+                seq,
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn a_resume_starts_at_the_approved_index() {
         let (state, run, _approved_action) = waiting_state(
@@ -8216,16 +8249,8 @@ mod tests {
             json!({"command": "b"}),
             &[],
         );
-        let answer = "{\"memory\":\"recorded\"}";
-        state
-            .apply(&event(
-                EventKind::MemoryAnswered,
-                Author::Bot(run.bot),
-                Some(run.acting),
-                json!({"run": run.id, "step": 1, "call": "call-1", "answer": answer}),
-                100,
-            ))
-            .unwrap();
+        let recorded = "{\"memory\":\"recorded\"}";
+        answer(&mut state, &run, 1, "call-1", recorded, 100);
         let (messages, resume, _usage) =
             prepare_resume(&std::sync::Mutex::new(state), &run).expect("the record resumes");
 
@@ -8233,7 +8258,7 @@ mod tests {
         assert_eq!(resume.calls.len(), 2);
         assert_eq!(resume.approved_action, Some(approved_action));
         assert_eq!(messages.len(), 1, "the memory answer ends the history");
-        assert_eq!(messages[0].content.as_deref(), Some(answer));
+        assert_eq!(messages[0].content.as_deref(), Some(recorded));
     }
 
     #[test]
@@ -8317,9 +8342,8 @@ mod tests {
     #[test]
     fn a_recovery_replays_a_completed_step_with_a_memory_call() {
         // A completed step asked to remember something and then wrote a File.
-        // The memory call has no action to replay, so its result is a
-        // stand-in and the action's result is the record's.
-        let (state, run) = recovering_state(
+        // The memory call's recorded answer and the action's result replay.
+        let (mut state, run) = recovering_state(
             json!([
                 {"call": "call-1", "tool": "remember",
                  "arguments": {"kind": "note", "scope": "owner", "text": "n"}, "refused": null},
@@ -8333,6 +8357,8 @@ mod tests {
             )],
             None,
         );
+        let recorded = "{\"memory\":\"recorded\"}";
+        answer(&mut state, &run, 1, "call-1", recorded, 100);
         let RecoveryPlan::Continue(plan) =
             prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
         else {
@@ -8344,15 +8370,20 @@ mod tests {
             4,
             "the user Message, the assistant Message, and two results"
         );
+        assert_eq!(
+            plan.history[2].content.as_deref(),
+            Some(recorded),
+            "the recorded answer replays, not a stand-in"
+        );
         assert!(plan.resume.is_none());
     }
 
     #[test]
     fn a_recovery_resumes_after_a_memory_call_before_a_recorded_action() {
         // The step asked to remember something, then wrote a File, and the
-        // Space stopped before recording the step. The memory call runs again
-        // and the write's result replays.
-        let (state, run) = recovering_state(
+        // Space stopped before recording the step. The memory call's answer
+        // replays and the write's result replays.
+        let (mut state, run) = recovering_state(
             json!([
                 {"call": "call-1", "tool": "write_file",
                  "arguments": {"path": "a", "content": "a"}, "refused": null},
@@ -8377,6 +8408,8 @@ mod tests {
                 )],
             )),
         );
+        let recorded = "{\"memory\":\"recorded\"}";
+        answer(&mut state, &run, 2, "call-2", recorded, 200);
         let RecoveryPlan::Continue(plan) =
             prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
         else {
@@ -8384,7 +8417,7 @@ mod tests {
         };
         let resume = plan.resume.expect("the step resumes");
         assert_eq!(resume.from, 2);
-        assert!(resume.recovered, "both calls already ran");
+        assert!(resume.recovered, "every call already has its evidence");
         assert_eq!(
             plan.history.len(),
             5,
@@ -8392,8 +8425,96 @@ mod tests {
         );
         assert_eq!(
             plan.history[3].content.as_deref(),
-            Some(REPLAYED_MEMORY_RESULT),
-            "an old record keeps no memory answer"
+            Some(recorded),
+            "the memory answer replays from the record"
+        );
+    }
+
+    #[test]
+    fn a_recovery_restarts_at_a_memory_call_that_never_ran() {
+        // The reply was recorded, then the Space stopped before the first
+        // call ran: the scan stops at the memory call and the resumed step
+        // runs it, so its entry is written once and its answer is real.
+        let (state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(
+                Id::new(),
+                "write_file",
+                json!({"path": "a", "content": "a"}),
+            )],
+            Some((
+                json!([
+                    {"call": "call-2", "tool": "remember",
+                     "arguments": {"kind": "note", "scope": "owner", "text": "A"}, "refused": null},
+                    {"call": "call-3", "tool": "write_file",
+                     "arguments": {"path": "b", "content": "b"}, "refused": null},
+                ]),
+                Vec::new(),
+            )),
+        );
+        let RecoveryPlan::Continue(plan) =
+            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
+        else {
+            panic!("expected a continuation");
+        };
+        let resume = plan.resume.expect("the step resumes");
+        assert_eq!(resume.from, 0);
+        assert!(!resume.recovered, "the step runs its calls again");
+        assert_eq!(resume.calls[0].tool, "remember");
+        assert_eq!(resume.calls[1].tool, "write_file");
+        assert_eq!(
+            plan.history.len(),
+            3,
+            "the first step replays and no result stands in for the memory call"
+        );
+        assert!(
+            !plan.history.iter().any(|message| message
+                .content
+                .as_deref()
+                .is_some_and(|text| text == REPLAYED_MEMORY_RESULT)),
+            "the resumed step does not read a stand-in"
+        );
+    }
+
+    #[test]
+    fn a_recovery_resumes_after_a_recorded_memory_answer() {
+        // The memory call answered, then the Space stopped before the shell
+        // call ran: the scan stops at the shell call, and the memory answer
+        // replays from the record instead of running the call again.
+        let (mut state, run) = recovering_state(
+            json!([{"call": "call-1", "tool": "write_file", "arguments": {"path": "a", "content": "a"}, "refused": null}]),
+            &[(
+                Id::new(),
+                "write_file",
+                json!({"path": "a", "content": "a"}),
+            )],
+            Some((
+                json!([
+                    {"call": "call-2", "tool": "remember",
+                     "arguments": {"kind": "note", "scope": "owner", "text": "A"}, "refused": null},
+                    {"call": "call-3", "tool": "shell",
+                     "arguments": {"command": "true"}, "refused": null},
+                ]),
+                Vec::new(),
+            )),
+        );
+        let recorded = "{\"memory\":\"recorded\"}";
+        answer(&mut state, &run, 2, "call-2", recorded, 200);
+        let RecoveryPlan::Continue(plan) =
+            prepare_recovery(&std::sync::Mutex::new(state), &run).expect("the record recovers")
+        else {
+            panic!("expected a continuation");
+        };
+        let resume = plan.resume.expect("the step resumes");
+        assert_eq!(resume.from, 1);
+        assert!(!resume.recovered);
+        assert_eq!(resume.calls[1].tool, "shell");
+        assert_eq!(
+            plan.history
+                .last()
+                .and_then(|message| message.content.as_deref()),
+            Some(recorded),
+            "the history ends with the recorded memory answer"
         );
     }
 
@@ -10292,6 +10413,33 @@ mod memory_pause {
         pause
     }
 
+    static MEMORY_AFTER_PAUSES: Mutex<Option<HashMap<Id, MemoryPause>>> = Mutex::new(None);
+
+    /// Installs a pause after one Bot's next memory write commits; returns
+    /// (reached, release).
+    pub(crate) fn pause_after_for_test(bot: Id) -> MemoryPause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        MEMORY_AFTER_PAUSES
+            .lock()
+            .expect("memory pause lock")
+            .get_or_insert_with(HashMap::new)
+            .insert(bot, pause.clone());
+
+        pause
+    }
+
+    /// Waits for the test to release a write that already committed.
+    pub(crate) async fn after_append(bot: Id) {
+        let pause = MEMORY_AFTER_PAUSES
+            .lock()
+            .ok()
+            .and_then(|mut pauses| pauses.as_mut().and_then(|pauses| pauses.remove(&bot)));
+        if let Some((reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
+    }
+
     /// Waits for the test to release the paused write.
     pub(crate) async fn before_append(bot: Id) {
         let pause = MEMORY_PAUSES
@@ -10405,6 +10553,17 @@ pub mod test_support {
         std::sync::Arc<tokio::sync::Notify>,
     ) {
         super::memory_pause::pause_for_test(bot)
+    }
+
+    /// Installs a pause after one Bot's next memory write commits; returns
+    /// (reached, release).
+    pub fn pause_after_memory_write_for_test(
+        bot: Id,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        super::memory_pause::pause_after_for_test(bot)
     }
 
     /// Loads the provider-native state a resumed step needs.

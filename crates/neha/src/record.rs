@@ -1130,6 +1130,21 @@ mod tests {
     }
 
     #[test]
+    fn a_memory_answer_rejects_a_blank_call() {
+        let value = serde_json::json!({
+            "run": Id::new(),
+            "step": 1,
+            "call": "   ",
+            "answer": "{}",
+        });
+
+        assert!(
+            EventKind::MemoryAnswered.decode(&value).is_err(),
+            "a blank call names no tool result"
+        );
+    }
+
+    #[test]
     fn memory_events_take_their_authors() {
         let bot = Author::Bot(Id::new());
         let user = Author::User(Id::new());
@@ -1334,7 +1349,12 @@ impl EventKind {
                 EventData::MemoryAdded(data)
             }
             Self::MemoryRemoved => EventData::MemoryRemoved(decode(data)?),
-            Self::MemoryAnswered => EventData::MemoryAnswered(decode(data)?),
+            Self::MemoryAnswered => {
+                let data: MemoryAnswered = decode(data)?;
+                data.validate()?;
+
+                EventData::MemoryAnswered(data)
+            }
         };
 
         Ok(decoded)
@@ -2295,4 +2315,21 @@ pub struct MemoryAnswered {
     pub call: String,
     /// The exact text the Model read.
     pub answer: String,
+}
+
+impl MemoryAnswered {
+    /// Checks the parts of one answer that its fields alone decide.
+    ///
+    /// A call identifier is never blank: the loop gives a blank provider
+    /// identifier its own stable one before the record holds the call, and the
+    /// projection answers under that same identifier.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if self.call.trim().is_empty() {
+            return Err(EventDataError::Data(
+                "a memory answer names its call".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
 }
