@@ -35,6 +35,12 @@ A change that adds more than 30 seconds to `just ci` reports the measured cost i
   with integration tests has one binary, `tests/it/main.rs`, and its tests are
   modules of that binary: one hundred test files would otherwise be one
   hundred binaries to link.
+- A crate whose integration tests need an internal fixture or field exposes it
+  from a `test-support` feature-gated module (for example a runtime built by
+  hand, or the write roots a fence test inspects). The integration target
+  declares `required-features = ["test-support"]`, and the gate runs
+  `cargo test --all-features`, so the tests run with the feature while a
+  production build never compiles it.
 - A doc test is for a public example that a reader will copy.
 
 ## Fixtures
