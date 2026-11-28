@@ -1075,7 +1075,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Authorization, Decision, Dispatched, LoopError, RecordedCall, Recorder, Resume, RunOutcome,
+        Authorization, Dispatched, LoopError, RecordedCall, Recorder, Resume, RunOutcome,
         RunRequest, Runtime, WaitingApproval, call_id, context_threshold, estimate_tokens, run,
     };
     use crate::model::{
