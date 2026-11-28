@@ -175,7 +175,7 @@ impl Push {
             // below; the Space talks to the push service directly.
             .no_proxy()
             .dns_resolver(std::sync::Arc::new(PublicResolver {
-                allow_loopback: cfg!(test),
+                allow_loopback: cfg!(any(test, feature = "test-support")),
             }))
             .build()
             .expect("a push client");
@@ -382,7 +382,8 @@ impl Push {
         );
         // A unit test's fake device is plain HTTP on loopback; the subscription
         // route and the production resolver refuse that outside tests.
-        let insecure = cfg!(test) && subscription.endpoint.starts_with("http://");
+        let insecure = cfg!(any(test, feature = "test-support"))
+            && subscription.endpoint.starts_with("http://");
         let mut vapid = match VapidSignatureBuilder::from_base64(&private, &info) {
             Ok(vapid) => vapid,
             Err(_) => return Delivery::Failed(0),
@@ -619,7 +620,7 @@ fn validate_subscription(endpoint: &str, p256dh: &str, auth: &str) -> Result<(),
         .unwrap_or(host);
     let address = bare.parse::<std::net::IpAddr>().ok();
     let loopback = bare == "localhost" || address.is_some_and(|address| address.is_loopback());
-    let testing = cfg!(test) && url.scheme() == "http" && loopback;
+    let testing = cfg!(any(test, feature = "test-support")) && url.scheme() == "http" && loopback;
     // Push services are HTTPS. Loopback HTTP exists only so a unit test can
     // stand a delivery endpoint beside the Space.
     if url.scheme() != "https" && !testing {

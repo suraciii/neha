@@ -6,6 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# What the integration tests need from inside the crate. `cargo test --all-features`
+# turns it on; a production build does not compile it.
+test-support = []
+
 [dependencies]
 neha = { path = "../neha" }
 serde = { workspace = true, features = ["derive"] }
@@ -22,6 +27,11 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# The integration tests live in one binary and need the `test-support` feature.
+[[test]]
+name = "it"
+required-features = ["test-support"]
 
 # The workspace forbids unsafe code; this crate narrows that to the libc calls
 # a Computer needs: killing a shell's whole process group, writing through

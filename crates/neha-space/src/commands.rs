@@ -6319,21 +6319,16 @@ fn store_error(error: crate::store::StoreError) -> ApiError {
 mod tests {
     use serde_json::json;
 
-    use neha_computer::ComputerRuntime as _;
-
     use super::{
-        LoopCall, RecoveryPlan, RedactingRuntime, RunRuntime, ambiguous_path, ambiguous_path_at,
-        grant_folder, grants_with, lasting_rule_path_at, load_resume_continuation,
-        normalized_grants, path_covers, path_matches, path_matches_at, path_parent,
-        persistable_grant, pinned_access, prepare_recovery, prepare_resume, resolve_action_path,
-        resumed_access, rule_covers, rule_matches, run_access, under_root, verify_recovered_action,
+        LoopCall, RecoveryPlan, ambiguous_path, ambiguous_path_at, grant_folder, grants_with,
+        lasting_rule_path_at, normalized_grants, path_covers, path_matches, path_matches_at,
+        path_parent, persistable_grant, pinned_access, prepare_recovery, prepare_resume,
+        resolve_action_path, resumed_access, rule_covers, rule_matches, run_access, under_root,
     };
-    use crate::home::Home;
     use crate::state::{AccessView, BotView, RuleView};
-    use crate::store::{AppendRequest, ContinuationWrite, Store};
     use neha::error::ErrorCode;
     use neha::id::Id;
-    use neha::record::{EventDraft, RuleEffect};
+    use neha::record::RuleEffect;
     use neha::seq::Seq;
 
     fn ask(tool: &str, command_prefix: Option<&str>, path_prefix: Option<&str>) -> RuleView {
@@ -6538,91 +6533,6 @@ mod tests {
             vec!["/data/one".to_owned()],
             "a folder already granted is not recorded twice"
         );
-    }
-
-    #[tokio::test]
-    async fn a_resumed_step_loads_only_its_own_continuation() {
-        let directory = tempfile::tempdir().unwrap();
-        let home = Home::open(directory.path()).unwrap();
-        let store = Store::open(&home).await.unwrap();
-        let run = Id::new();
-        let bot = Id::new();
-        let user = Id::new();
-        let first = neha_loop::Continuation {
-            protocol: "openai_responses".to_owned(),
-            provider: "provider".to_owned(),
-            model: "model".to_owned(),
-            state: json!({"items": [{"type": "reasoning", "id": "rs_first"}]}),
-        };
-        let second = neha_loop::Continuation {
-            protocol: "openai_responses".to_owned(),
-            provider: "provider".to_owned(),
-            model: "model".to_owned(),
-            state: json!({"items": [{"type": "reasoning", "id": "rs_second"}]}),
-        };
-        for (step, continuation) in [(1, first), (2, second.clone())] {
-            let reply = EventDraft::new(
-                EventKind::RunReply,
-                Author::Bot(bot),
-                json!({
-                    "run": run,
-                    "step": step,
-                    "content": null,
-                    "calls": [{"call": format!("call-{step}"), "tool": "shell",
-                        "arguments": {"command": "true"}}],
-                    "usage": null,
-                }),
-            )
-            .acting(user);
-            store
-                .append(
-                    AppendRequest::new(Id::new(), format!("reply-{step}"), vec![reply])
-                        .with_continuation(ContinuationWrite {
-                            run,
-                            step,
-                            continuation: Some(continuation),
-                        }),
-                )
-                .await
-                .unwrap();
-        }
-        let mut resume = Some(neha_loop::Resume {
-            step: 2,
-            content: None,
-            calls: Vec::new(),
-            done: 0,
-            approved_action: None,
-            usage: neha::usage::Usage::default(),
-            recovered: false,
-            continuation: None,
-        });
-
-        load_resume_continuation(&store, run, &mut resume)
-            .await
-            .unwrap();
-
-        assert_eq!(resume.unwrap().continuation, Some(second));
-
-        let mut missing = Some(neha_loop::Resume {
-            step: 3,
-            content: None,
-            calls: Vec::new(),
-            done: 0,
-            approved_action: None,
-            usage: neha::usage::Usage::default(),
-            recovered: false,
-            continuation: Some(neha_loop::Continuation {
-                protocol: "openai_responses".to_owned(),
-                provider: "provider".to_owned(),
-                model: "model".to_owned(),
-                state: json!({"items": []}),
-            }),
-        });
-        load_resume_continuation(&store, run, &mut missing)
-            .await
-            .unwrap();
-        assert_eq!(missing.unwrap().continuation, None);
-        store.close().await.unwrap();
     }
 
     #[test]
@@ -7204,75 +7114,6 @@ mod tests {
         assert!(plan.unknown.is_none());
     }
 
-    #[tokio::test]
-    async fn a_run_token_never_enters_an_action_result() {
-        let directory = tempfile::tempdir().unwrap();
-        let inner = RunRuntime::Managed(
-            neha_computer::LocalRuntime::new(directory.path())
-                .unwrap()
-                .with_env(vec![(
-                    "NEHA_BOT_TOKEN".to_owned(),
-                    "run-token-123".to_owned(),
-                )]),
-        );
-        let runtime = RedactingRuntime {
-            inner,
-            secret: Some("run-token-123".to_owned()),
-        };
-        let result = runtime
-            .execute(neha_computer::Action::Shell {
-                command: "printf %s \"$NEHA_BOT_TOKEN\"".to_owned(),
-            })
-            .await;
-        assert!(
-            result.output.text.contains("[redacted]"),
-            "{}",
-            result.output.text
-        );
-        assert!(!result.output.text.contains("run-token-123"));
-        assert!(result.error.is_none());
-    }
-
-    #[tokio::test]
-    async fn a_recovered_write_is_checked_from_its_effect() {
-        let directory = tempfile::tempdir().unwrap();
-        std::fs::write(directory.path().join("note.txt"), "asked").unwrap();
-        let runtime =
-            RunRuntime::Managed(neha_computer::LocalRuntime::new(directory.path()).unwrap());
-        let action = crate::state::ActionView {
-            id: Id::new(),
-            step: 1,
-            tool: "write_file".to_owned(),
-            arguments: json!({"path": "note.txt", "content": "asked"}),
-            finished: false,
-            status: neha::record::ActionStatus::Unknown,
-            output: String::new(),
-            truncated: false,
-            omitted_bytes: 0,
-            error: None,
-        };
-        assert!(
-            verify_recovered_action(&runtime, &action).await.is_ok(),
-            "the file holds the asked content"
-        );
-
-        std::fs::write(directory.path().join("note.txt"), "different").unwrap();
-        let error = verify_recovered_action(&runtime, &action)
-            .await
-            .expect_err("different content is unknown, not success");
-        assert!(error.contains("does not hold"), "{error}");
-
-        let shell = crate::state::ActionView {
-            tool: "shell".to_owned(),
-            arguments: json!({"command": "true"}),
-            ..action
-        };
-        let error = verify_recovered_action(&runtime, &shell)
-            .await
-            .expect_err("a shell has no verifiable effect");
-        assert!(error.contains("no verifiable effect"), "{error}");
-    }
-
     #[test]
     fn a_recovery_finishes_from_a_recorded_final_step() {
         let (state, run) = recovering_state(json!([]), &[], None);
@@ -7767,5 +7608,114 @@ mod tests {
             &ask("shell", None, None),
             &call("shell", json!({"command": "anything"}))
         ));
+    }
+}
+
+/// What the integration tests need from inside this module.
+///
+/// Integration tests live in `tests/` and see only the crate's public
+/// interface. The runtime fixtures and recovery helpers live here, behind the
+/// `test-support` feature, so a production build keeps them out.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    use neha::id::Id;
+
+    use super::RunRuntime as InnerRunRuntime;
+    use crate::server::ApiError;
+    use crate::state::ActionView;
+    use crate::store::Store;
+
+    /// The runtime a run works on, for tests that build one by hand.
+    pub struct RunRuntime(InnerRunRuntime);
+
+    impl RunRuntime {
+        /// A workspace managed inside the Space.
+        pub fn managed(runtime: neha_computer::LocalRuntime) -> Self {
+            Self(InnerRunRuntime::Managed(runtime))
+        }
+    }
+
+    impl neha_computer::ComputerRuntime for RunRuntime {
+        fn execute(
+            &self,
+            action: neha_computer::Action,
+        ) -> impl std::future::Future<Output = neha_computer::ActionResult> + Send {
+            self.0.execute(action)
+        }
+
+        fn read_bytes(
+            &self,
+            path: &str,
+        ) -> impl std::future::Future<Output = Result<Vec<u8>, neha_computer::ByteError>> + Send
+        {
+            self.0.read_bytes(path)
+        }
+
+        fn write_bytes(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> impl std::future::Future<Output = Result<(), neha_computer::ByteError>> + Send
+        {
+            self.0.write_bytes(path, bytes)
+        }
+    }
+
+    /// Wraps a run's runtime so the run token never reaches the Model or the
+    /// record, even when a shell command prints its environment.
+    pub struct RedactingRuntime(super::RedactingRuntime);
+
+    impl RedactingRuntime {
+        /// Wraps a runtime with one secret to redact.
+        pub fn new(inner: RunRuntime, secret: Option<String>) -> Self {
+            Self(super::RedactingRuntime {
+                inner: inner.0,
+                secret,
+            })
+        }
+    }
+
+    impl neha_computer::ComputerRuntime for RedactingRuntime {
+        fn execute(
+            &self,
+            action: neha_computer::Action,
+        ) -> impl std::future::Future<Output = neha_computer::ActionResult> + Send {
+            self.0.execute(action)
+        }
+
+        fn read_bytes(
+            &self,
+            path: &str,
+        ) -> impl std::future::Future<Output = Result<Vec<u8>, neha_computer::ByteError>> + Send
+        {
+            self.0.read_bytes(path)
+        }
+
+        fn write_bytes(
+            &self,
+            path: &str,
+            bytes: Vec<u8>,
+        ) -> impl std::future::Future<Output = Result<(), neha_computer::ByteError>> + Send
+        {
+            self.0.write_bytes(path, bytes)
+        }
+    }
+
+    /// Loads the provider-native state a resumed step needs.
+    pub async fn load_resume_continuation(
+        store: &Store,
+        run: Id,
+        resume: &mut Option<neha_loop::Resume>,
+    ) -> Result<(), ApiError> {
+        super::load_resume_continuation(store, run, resume).await
+    }
+
+    /// Verifies one action that started before the Space stopped.
+    pub async fn verify_recovered_action<R: neha_computer::ComputerRuntime>(
+        runtime: &R,
+        action: &ActionView,
+    ) -> Result<(String, Option<String>), String> {
+        super::verify_recovered_action(runtime, action).await
     }
 }

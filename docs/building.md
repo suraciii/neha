@@ -16,7 +16,7 @@ The workspace has no system-library dependencies. SQLite and aws-lc-sys compile 
 
 ```bash
 cargo build --locked --workspace
-cargo test --locked --workspace
+cargo test --locked --workspace --all-features
 pnpm --dir ui install --frozen-lockfile
 pnpm --dir ui build
 ```
