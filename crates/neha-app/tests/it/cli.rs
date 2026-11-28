@@ -430,6 +430,9 @@ enum ScriptedReply {
     /// One assistant message with several tool calls, in order.
     Tools(Vec<(String, serde_json::Value)>),
     Fail,
+    /// Refuses the next request as larger than the Model's context, so the run
+    /// compacts the Chat and retries.
+    TooLarge,
 }
 
 /// The SSE body that answers a request with one text.
@@ -524,6 +527,11 @@ impl Script {
         self.push(ScriptedReply::Fail);
     }
 
+    /// Refuses the next request as larger than the Model's context.
+    fn too_large(&self) {
+        self.push(ScriptedReply::TooLarge);
+    }
+
     /// Answers the next request with this text, once the test releases it.
     fn hold(&self, text: &str) {
         self.push(ScriptedReply::Hold(text.to_owned()));
@@ -573,6 +581,17 @@ async fn scripted_provider() -> (String, Script, tokio::task::JoinHandle<()>) {
                         return Response::builder()
                             .status(400)
                             .body(axum::body::Body::from("the fake Provider refused"))
+                            .unwrap();
+                    }
+                    ScriptedReply::TooLarge => {
+                        // The model client reads a 413 as "the input is too
+                        // large", which makes the run compact and retry.
+                        return Response::builder()
+                            .status(413)
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                "{\"error\":\"context length exceeded\"}",
+                            ))
                             .unwrap();
                     }
                     ScriptedReply::Tool { name, arguments } => {
@@ -5608,6 +5627,106 @@ async fn a_bot_owner_reads_and_removes_memory_from_the_cli() {
     assert!(!refused.status.success(), "a removed entry is gone");
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(stderr.contains("no such memory entry"), "{stderr}");
+
+    provider_task.abort();
+    drop(server);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_read_marks_a_compacted_chat_without_its_summary() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let (base, script, provider_task) = scripted_provider().await;
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let chat = field(&created, "Chat:");
+
+    // Two Messages build the Chat's history; the third request is refused as
+    // larger than the context, so the run compacts the span, writes its
+    // summary, and retries.
+    let summary = "an earlier summary standing in for the first notes";
+    // Long Messages make a short summary strictly shorter than the span it
+    // replaces, so the refused request is retried.
+    let long = |prefix: &str| format!("{prefix}{}", "x".repeat(200));
+    for (text, reply) in [
+        (long("first "), "first done".to_owned()),
+        (long("second "), "second done".to_owned()),
+    ] {
+        script.say(&reply);
+        let sent = run(
+            &home,
+            &credential,
+            &["chat", "send", "--chat", &chat, &text],
+        );
+        assert!(sent.contains(&reply), "{sent}");
+    }
+    script.too_large();
+    script.say(r#"[{"text": "the owner sent two notes"}]"#);
+    script.say(summary);
+    script.say("done after the retry");
+    let third = run(
+        &home,
+        &credential,
+        &["chat", "send", "--chat", &chat, "third"],
+    );
+    // `chat send` still echoes the run's reply after a compaction.
+    assert!(third.contains("done after the retry"), "{third}");
+
+    let read = run(&home, &credential, &["chat", "read", &chat]);
+    let lines: Vec<&str> = read.lines().collect();
+    let position = |line: &str| -> usize {
+        lines
+            .iter()
+            .position(|shown| shown.contains(line))
+            .unwrap_or_else(|| panic!("no `{line}` Message in:\n{read}"))
+    };
+    let first = position("User: first");
+    let (second, third) = (position("User: second"), position("User: third"));
+    let marker = lines
+        .iter()
+        .position(|line| line == &"  (earlier Messages were compacted)")
+        .unwrap_or_else(|| panic!("no compaction marker in:\n{read}"));
+    // The boundary is inside the first dialogue, so the marker follows one of
+    // its Messages and the third Message stays after the summary's span.
+    assert!(
+        first < marker && marker < second && second < third,
+        "the marker follows a compacted Message:\n{read}"
+    );
+    assert_eq!(
+        read.matches("(earlier Messages were compacted)").count(),
+        1,
+        "one Message ends the compacted span:\n{read}"
+    );
+    assert!(
+        !read.contains(summary),
+        "the summary text is never printed:\n{read}"
+    );
+    // Every original Message stays in the listing, the compacted span included.
+    for expected in [
+        "User: first",
+        "Bot: first done",
+        "User: second",
+        "Bot: second done",
+        "User: third",
+        "Bot: done after the retry",
+    ] {
+        assert!(read.contains(expected), "`{expected}` is missing:\n{read}");
+    }
 
     provider_task.abort();
     drop(server);

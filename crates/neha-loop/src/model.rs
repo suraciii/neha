@@ -165,6 +165,8 @@ pub struct ModelFailure {
     pub detail: String,
     /// The usage the Provider reported for the failed call.
     pub usage: Usage,
+    /// Whether the Provider said the request was larger than its context.
+    pub context_too_large: bool,
 }
 
 /// The Model seam the loop calls.

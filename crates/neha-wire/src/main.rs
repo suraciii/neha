@@ -37,6 +37,7 @@ fn main() {
         neha::record::BotUpdated,
         neha::record::CardData,
         neha::record::ChatCreated,
+        neha::record::Compacted,
         neha::record::ComputerCreated,
         neha::record::ComputerSharing,
         neha::record::ComputerUpdated,

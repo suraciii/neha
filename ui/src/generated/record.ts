@@ -392,6 +392,32 @@ owner: string,
 bot: string, };
 
 /**
+ * The data of `neha.chat.compacted`.
+ *
+ * One span of a Chat's Messages, replaced in the Model's projection by a
+ * summary. The record keeps every original Message; `up_to_seq` is the
+ * cursor of the last Message the summary covers, and only a later compaction
+ * may advance it.
+ */
+export type Compacted = { 
+/**
+ * The Chat the span belongs to.
+ */
+chat: string, 
+/**
+ * The Bot that wrote the summary.
+ */
+bot: string, 
+/**
+ * The cursor of the last Message the summary covers.
+ */
+up_to_seq: string, 
+/**
+ * The summary the Model reads in place of the span.
+ */
+summary: string, };
+
+/**
  * The data of `neha.computer.created`.
  */
 export type ComputerCreated = { 
@@ -485,7 +511,7 @@ data: Record<string, unknown>, };
 /**
  * The kinds of event the record carries.
  */
-export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.skill.added" | "neha.skill.removed" | "neha.bot.skill.enabled" | "neha.bot.skill.disabled" | "neha.mcp.server.added" | "neha.mcp.server.updated" | "neha.mcp.server.removed" | "neha.bot.mcp.enabled" | "neha.bot.mcp.disabled" | "neha.plugin.installed" | "neha.plugin.removed" | "neha.plugin.enabled" | "neha.plugin.disabled" | "neha.memory.added" | "neha.memory.removed" | "neha.memory.answered";
+export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.skill.added" | "neha.skill.removed" | "neha.bot.skill.enabled" | "neha.bot.skill.disabled" | "neha.mcp.server.added" | "neha.mcp.server.updated" | "neha.mcp.server.removed" | "neha.bot.mcp.enabled" | "neha.bot.mcp.disabled" | "neha.plugin.installed" | "neha.plugin.removed" | "neha.plugin.enabled" | "neha.plugin.disabled" | "neha.memory.added" | "neha.memory.removed" | "neha.memory.answered" | "neha.chat.compacted";
 
 /**
  * The data of `neha.file.added`.

@@ -465,6 +465,14 @@ export default function ChatView(props: ChatViewProps) {
                       </Show>
                     </div>
                   </article>
+                  {/* The boundary the Chat's compaction left. The summary is
+                      the Model's; the stream only marks where it starts and
+                      still shows every Message above it. */}
+                  <Show when={message.compacted}>
+                    <p class="chat__compacted" role="note">
+                      {t("chat.compacted")}
+                    </p>
+                  </Show>
                 </div>
               );
             }}

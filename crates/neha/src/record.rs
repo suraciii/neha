@@ -155,6 +155,9 @@ pub enum EventKind {
     /// A memory tool call answered its Bot.
     #[serde(rename = "neha.memory.answered")]
     MemoryAnswered,
+    /// A Bot compacted a span of a Chat's Messages into a summary.
+    #[serde(rename = "neha.chat.compacted")]
+    ChatCompacted,
 }
 
 impl EventKind {
@@ -203,6 +206,7 @@ impl EventKind {
             Self::MemoryAdded => "neha.memory.added",
             Self::MemoryRemoved => "neha.memory.removed",
             Self::MemoryAnswered => "neha.memory.answered",
+            Self::ChatCompacted => "neha.chat.compacted",
         }
     }
 
@@ -223,6 +227,9 @@ impl EventKind {
             Self::MemoryAdded | Self::MemoryRemoved | Self::MemoryAnswered => {
                 EventClass::Presentation
             }
+            // A summary decides nothing about access or work: a reader that
+            // does not know it reads the original Messages and reads on.
+            Self::ChatCompacted => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunContext
@@ -307,6 +314,7 @@ impl FromStr for EventKind {
             "neha.memory.added" => Ok(Self::MemoryAdded),
             "neha.memory.removed" => Ok(Self::MemoryRemoved),
             "neha.memory.answered" => Ok(Self::MemoryAnswered),
+            "neha.chat.compacted" => Ok(Self::ChatCompacted),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -381,7 +389,7 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        APP_CARD_KIND, Author, BotMoved, BotRenamed, BotUpdated, CardData, ComputerKind,
+        APP_CARD_KIND, Author, BotMoved, BotRenamed, BotUpdated, CardData, Compacted, ComputerKind,
         ComputerSharing, ComputerUpdated, EventData, EventDataError, EventDraft, EventKind,
         FileAdded, FileError, MAX_CARD_CSP_BYTES, MAX_CARD_VALUE_BYTES, MAX_MCP_ARG_BYTES,
         MAX_MCP_ARGS, MAX_MCP_ARGS_BYTES, MAX_MCP_COMMAND_BYTES, MAX_MCP_ENV,
@@ -820,6 +828,7 @@ mod tests {
             EventKind::MemoryAdded,
             EventKind::MemoryRemoved,
             EventKind::MemoryAnswered,
+            EventKind::ChatCompacted,
         ];
 
         for kind in kinds {
@@ -854,6 +863,7 @@ mod tests {
         assert_eq!(EventKind::MemoryAdded.class(), EventClass::Presentation);
         assert_eq!(EventKind::MemoryRemoved.class(), EventClass::Presentation);
         assert_eq!(EventKind::MemoryAnswered.class(), EventClass::Presentation);
+        assert_eq!(EventKind::ChatCompacted.class(), EventClass::Presentation);
     }
     #[test]
     fn a_skill_round_trips_and_rejects_what_it_cannot_hold() {
@@ -1927,6 +1937,55 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_compacted_round_trips() {
+        let data = Compacted {
+            chat: Id::new(),
+            bot: Id::new(),
+            up_to_seq: crate::seq::Seq::from_i64(7).unwrap(),
+            summary: "The deploy notes live in eng/deploy.md.".to_owned(),
+        };
+        let value = serde_json::json!({
+            "chat": data.chat,
+            "bot": data.bot,
+            "up_to_seq": data.up_to_seq,
+            "summary": data.summary,
+        });
+
+        assert_eq!(
+            EventKind::ChatCompacted.decode(&value).unwrap(),
+            EventData::ChatCompacted(data.clone())
+        );
+        assert_eq!(
+            serde_json::from_value::<Compacted>(value.clone()).unwrap(),
+            data
+        );
+
+        let mut unknown = value;
+        unknown["messages"] = serde_json::json!([]);
+        assert!(
+            EventKind::ChatCompacted.decode(&unknown).is_err(),
+            "a compaction carries exactly its fields"
+        );
+    }
+
+    #[test]
+    fn a_compaction_takes_a_bot_author_and_its_acting_user() {
+        let bot = Author::Bot(Id::new());
+        let user = Author::User(Id::new());
+        assert!(
+            EventKind::ChatCompacted
+                .validate_author(bot, Some(Id::new()))
+                .is_ok()
+        );
+        assert!(EventKind::ChatCompacted.validate_author(bot, None).is_err());
+        assert!(
+            EventKind::ChatCompacted
+                .validate_author(user, Some(Id::new()))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn memory_events_take_their_authors() {
         let bot = Author::Bot(Id::new());
         let user = Author::User(Id::new());
@@ -2083,6 +2142,8 @@ pub enum EventData {
     MemoryRemoved(MemoryRemoved),
     /// A memory tool call answered its Bot.
     MemoryAnswered(MemoryAnswered),
+    /// A Bot compacted a span of a Chat's Messages into a summary.
+    ChatCompacted(Compacted),
 }
 
 /// The first version of every event kind.
@@ -2188,6 +2249,7 @@ impl EventKind {
 
                 EventData::MemoryAnswered(data)
             }
+            Self::ChatCompacted => EventData::ChatCompacted(decode(data)?),
         };
 
         Ok(decoded)
@@ -2262,6 +2324,12 @@ impl EventKind {
                 (Author::Bot(_), Some(_)) => {}
                 _ => return Err(EventDataError::Author),
             },
+            // A compaction is the Bot's record operation, acting for a User.
+            Self::ChatCompacted => {
+                if !matches!(author, Author::Bot(_)) || acting.is_none() {
+                    return Err(EventDataError::Author);
+                }
+            }
         }
 
         Ok(())
@@ -4070,6 +4138,26 @@ pub struct PluginEnabled {
 pub struct PluginDisabled {
     /// The package.
     pub plugin: Id,
+}
+
+/// The data of `neha.chat.compacted`.
+///
+/// One span of a Chat's Messages, replaced in the Model's projection by a
+/// summary. The record keeps every original Message; `up_to_seq` is the
+/// cursor of the last Message the summary covers, and only a later compaction
+/// may advance it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct Compacted {
+    /// The Chat the span belongs to.
+    pub chat: Id,
+    /// The Bot that wrote the summary.
+    pub bot: Id,
+    /// The cursor of the last Message the summary covers.
+    pub up_to_seq: Seq,
+    /// The summary the Model reads in place of the span.
+    pub summary: String,
 }
 
 /// The data of `neha.memory.added`.

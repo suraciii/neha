@@ -287,10 +287,15 @@ export class Commands {
         }
         if (this.following) this.following.frameSent = false;
         // The client states the Presentation kinds it reads. A Space sends the
-        // memory events only to a client that names the capability, so an older
-        // client that stays silent never receives them.
+        // memory and compaction events only to a client that names their
+        // capabilities, so an older client that stays silent never receives
+        // them.
         socket.send(
-          JSON.stringify({ type: "hello", version: PROTOCOL_VERSION, capabilities: ["memory"] }),
+          JSON.stringify({
+            type: "hello",
+            version: PROTOCOL_VERSION,
+            capabilities: ["memory", "compaction"],
+          }),
         );
         this.hello = new Promise<void>((helloResolve, helloReject) => {
           const onHello = (event: MessageEvent) => {

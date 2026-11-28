@@ -726,6 +726,20 @@ export const space = {
     space.messages = [...space.messages, message];
     return message;
   },
+  // The record compacts a Chat: the Message whose cursor is `upToSeq` carries
+  // the boundary mark a read answers with, and the summary stays the Model's,
+  // never the stream's. The record keeps every Message.
+  compact(upToSeq: string, summary = "Earlier Messages were summarized.") {
+    space.messages = space.messages.map((message) =>
+      message.seq === upToSeq ? { ...message, compacted: true } : { ...message },
+    );
+    emit("neha.chat.compacted", {
+      chat: space.chat.id,
+      bot: bot.id,
+      up_to_seq: upToSeq,
+      summary,
+    });
+  },
   // Tells the page that the record added a Message, with the Card it carries.
   announceCard(message: Message) {
     emit("neha.message.added", {

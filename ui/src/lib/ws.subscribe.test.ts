@@ -102,7 +102,7 @@ describe("record subscription", () => {
     expect(socket.sent.find((frame) => frame.type === "hello")).toEqual({
       type: "hello",
       version: SERVER_PROTOCOL_VERSION,
-      capabilities: ["memory"],
+      capabilities: ["memory", "compaction"],
     });
     await commands.close();
   });
@@ -134,10 +134,11 @@ describe("record subscription", () => {
     await Promise.resolve();
     const socket = FakeSocket.instances[0]!;
     // The client declares the Presentation kinds it reads, so the Space sends
-    // it the memory events; an older client that stays silent receives none.
+    // it the memory and compaction events; an older client that stays silent
+    // receives none.
     expect(socket.sent.find((frame) => frame.type === "hello")).toMatchObject({
       version: SERVER_PROTOCOL_VERSION,
-      capabilities: ["memory"],
+      capabilities: ["memory", "compaction"],
     });
     expect(socket.sent.find((frame) => frame.type === "subscribe")).toMatchObject({
       cursor: "4",

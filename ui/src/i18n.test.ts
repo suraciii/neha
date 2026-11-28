@@ -15,8 +15,11 @@ describe("i18n", () => {
     expect(t("bots.new.computer")).toBe("Computer");
     expect(t("bots.new.computer.offline")).toContain("offline Computer");
     expect(t("bots.new.noProvider")).toContain("Provider");
+    // A compaction marks where the summary starts, without showing it.
+    expect(t("chat.compacted")).toBe("Earlier Messages were compacted");
     flush(() => setLocale("zh-CN"));
     expect(t("auth.headline")).toBe("把工作交给一支你看得见的团队。");
+    expect(t("chat.compacted")).toBe("更早的消息已压缩");
   });
 
   it("interpolates names", () => {

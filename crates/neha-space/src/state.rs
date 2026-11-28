@@ -432,6 +432,34 @@ pub struct MessageView {
     pub seq: Seq,
     /// The run it belongs to, when it is part of one.
     pub run: Option<Id>,
+    /// Whether this is the Message the Chat's current compaction ends at.
+    ///
+    /// A Chat reads every Message; only the one at the boundary is marked, so
+    /// a client can show where the summary starts. It is optional in the
+    /// generated client type so an older client's fixture reads it as absent,
+    /// which means false.
+    #[serde(default)]
+    #[ts(optional)]
+    pub compacted: Option<bool>,
+}
+
+/// The current compaction boundary of one Chat.
+///
+/// The record keeps every Message; the boundary says which span a Bot's
+/// summary stands in for, so a later request projects the summary and the
+/// text after the cut instead of the whole conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompactionView {
+    /// The Chat the boundary belongs to.
+    pub chat: Id,
+    /// The Bot that wrote the summary.
+    pub bot: Id,
+    /// The cursor of the last Message the summary covers.
+    pub up_to_seq: Seq,
+    /// The summary the Model reads in place of the span.
+    pub summary: String,
+    /// The cursor of the event that set the boundary.
+    pub seq: Seq,
 }
 
 /// One completed step of a run.
@@ -786,6 +814,9 @@ pub struct State {
     /// The memory entries in the order the record added them; a removed entry
     /// is gone and a replaced one keeps its record but no longer applies.
     pub memories: Vec<MemoryView>,
+    /// Each Chat's current compaction boundary. A later compaction replaces
+    /// the entry; the events it replaced stay in the record.
+    pub compactions: HashMap<Id, CompactionView>,
     /// The answers memory tool calls gave, by run, step, and call. A replay
     /// returns the answer instead of running the call again.
     pub memory_answers: HashMap<(Id, u32, String), String>,
@@ -1145,13 +1176,27 @@ impl State {
     }
 
     /// Returns a Chat's Messages after a cursor.
+    ///
+    /// Every Message stays in the array; the one a compaction ends at carries
+    /// `compacted: true` so a reader sees where the summary starts.
     #[must_use]
-    pub fn messages_of(&self, chat: Id, from: Option<Seq>) -> Vec<&MessageView> {
+    pub fn messages_of(&self, chat: Id, from: Option<Seq>) -> Vec<MessageView> {
         let after = from.unwrap_or(Seq::ZERO);
+        let boundary = self.compaction(chat).map(|view| view.up_to_seq);
         self.messages
             .iter()
             .filter(|message| message.chat == chat && message.seq > after)
+            .map(|message| MessageView {
+                compacted: Some(boundary == Some(message.seq)),
+                ..message.clone()
+            })
             .collect()
+    }
+
+    /// Returns a Chat's current compaction boundary, when it has one.
+    #[must_use]
+    pub fn compaction(&self, chat: Id) -> Option<&CompactionView> {
+        self.compactions.get(&chat)
     }
 
     /// Returns a Chat's Files after a cursor.
@@ -1236,15 +1281,17 @@ impl State {
         self.project_chat_view(chat);
     }
 
-    /// Builds the Model history for a Chat up to a cursor.
+    /// Builds the Model history for a Chat between two cursors.
     ///
-    /// A resumed run rebuilds the history it saw when it started, not the
-    /// Conversation that continued while it waited.
+    /// The span starts after `after` and ends at `until`, both inclusive of
+    /// the text a request already projects: a compaction replaces everything
+    /// up to its boundary with one summary, so the Messages after it are the
+    /// ones a request reads.
     #[must_use]
-    pub fn history_until(&self, chat: Id, until: Seq) -> Vec<(Author, String)> {
+    pub fn history_between(&self, chat: Id, after: Seq, until: Seq) -> Vec<(Author, String)> {
         self.messages
             .iter()
-            .filter(|message| message.chat == chat && message.seq <= until)
+            .filter(|message| message.chat == chat && message.seq > after && message.seq <= until)
             .filter(|message| speaks_to_the_model(message))
             .map(|message| (message.author, self.model_text(message)))
             .collect()
@@ -1266,7 +1313,7 @@ impl State {
     }
 
     /// Returns what the Model reads for one Message.
-    fn model_text(&self, message: &MessageView) -> String {
+    pub(crate) fn model_text(&self, message: &MessageView) -> String {
         let Some(file) = message
             .file
             .and_then(|file| self.files.iter().find(|view| view.id == file))
@@ -1290,7 +1337,7 @@ impl State {
 /// A Card is presentation. A Message that carries only a Card would become an
 /// empty turn in the Model's history, so the history leaves it out; a Message
 /// with text or a File beside its Card is kept.
-fn speaks_to_the_model(message: &MessageView) -> bool {
+pub(crate) fn speaks_to_the_model(message: &MessageView) -> bool {
     message.file.is_some() || !message.text.trim().is_empty() || message.card.is_none()
 }
 
@@ -1619,6 +1666,7 @@ impl Projection for State {
                     at: event.at,
                     seq: event.seq,
                     run: data.run,
+                    compacted: Some(false),
                 });
             }
             EventData::RunQueued(data) => {
@@ -2377,6 +2425,46 @@ impl Projection for State {
                 {
                     return Err("a memory answer is recorded once".to_owned());
                 }
+            }
+            EventData::ChatCompacted(data) => {
+                let chat = self
+                    .chats
+                    .get(&data.chat)
+                    .ok_or("a compaction must belong to an existing Chat")?;
+                if chat.bot != data.bot {
+                    return Err("a compaction names the Chat's Bot".to_owned());
+                }
+                let acting = event
+                    .acting
+                    .ok_or("a compaction names the User the Bot acts for")?;
+                if chat.owner != acting {
+                    return Err("a compaction is written for the Chat's owner".to_owned());
+                }
+                if !matches!(event.author, Author::Bot(author) if author == data.bot) {
+                    return Err("a compaction is written by the Chat's Bot".to_owned());
+                }
+                if !self
+                    .messages
+                    .iter()
+                    .any(|message| message.chat == data.chat && message.seq == data.up_to_seq)
+                {
+                    return Err("a compaction ends at one of the Chat's Messages".to_owned());
+                }
+                if let Some(current) = self.compactions.get(&data.chat)
+                    && data.up_to_seq <= current.up_to_seq
+                {
+                    return Err("a compaction advances the Chat's boundary".to_owned());
+                }
+                self.compactions.insert(
+                    data.chat,
+                    CompactionView {
+                        chat: data.chat,
+                        bot: data.bot,
+                        up_to_seq: data.up_to_seq,
+                        summary: data.summary,
+                        seq: event.seq,
+                    },
+                );
             }
         }
 
@@ -3218,7 +3306,7 @@ mod tests {
             "a Card-only Message is no turn the Model reads"
         );
         assert_eq!(
-            state.history_until(chat, Seq::from_i64(2).unwrap()),
+            state.history_between(chat, Seq::ZERO, Seq::from_i64(2).unwrap()),
             Vec::new(),
             "a resumed run's history leaves the Card-only Message out too"
         );
@@ -3291,6 +3379,196 @@ mod tests {
         let view = state.runs.get(&run).unwrap();
         assert_eq!(view.actions[0].status, ActionStatus::Succeeded);
         assert_eq!(view.actions[0].output, "ok");
+    }
+
+    fn compaction(chat: Id, bot: Id, up_to_seq: i64, summary: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chat": chat,
+            "bot": bot,
+            "up_to_seq": Seq::from_i64(up_to_seq).unwrap(),
+            "summary": summary,
+        })
+    }
+
+    #[test]
+    fn a_compaction_marks_the_message_its_span_ends_at() {
+        let owner = Id::new();
+        let bot = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        for (seq, (author, text)) in [
+            (4, (Author::User(owner), "first")),
+            (5, (Author::Bot(bot), "second")),
+            (6, (Author::User(owner), "third")),
+        ] {
+            state
+                .apply(&acted_event(
+                    EventKind::MessageAdded,
+                    author,
+                    owner,
+                    message_added(chat, text, None),
+                    seq,
+                ))
+                .unwrap();
+        }
+        assert!(state.compaction(chat).is_none());
+        state
+            .apply(&acted_event(
+                EventKind::ChatCompacted,
+                Author::Bot(bot),
+                owner,
+                compaction(chat, bot, 5, "the first two"),
+                7,
+            ))
+            .unwrap();
+
+        let messages = state.messages_of(chat, None);
+        assert_eq!(messages.len(), 3, "the record keeps every Message");
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.compacted)
+                .collect::<Vec<_>>(),
+            [Some(false), Some(true), Some(false)],
+            "the boundary Message is the one the summary ends at"
+        );
+        assert_eq!(
+            state.compaction(chat).unwrap().up_to_seq,
+            Seq::from_i64(5).unwrap()
+        );
+
+        // A later compaction advances the boundary; the earlier one stays in
+        // the record but no longer marks a Message.
+        state
+            .apply(&acted_event(
+                EventKind::ChatCompacted,
+                Author::Bot(bot),
+                owner,
+                compaction(chat, bot, 6, "the first three"),
+                8,
+            ))
+            .unwrap();
+        assert_eq!(
+            state.compaction(chat).unwrap().up_to_seq,
+            Seq::from_i64(6).unwrap()
+        );
+        assert_eq!(
+            state
+                .messages_of(chat, None)
+                .iter()
+                .map(|message| message.compacted)
+                .collect::<Vec<_>>(),
+            [Some(false), Some(false), Some(true)]
+        );
+
+        // A replay of the same events projects the same state.
+        let mut replayed = State::default();
+        bot_chat(&mut replayed, owner, bot, chat, computer);
+        for (seq, (author, text)) in [
+            (4, (Author::User(owner), "first")),
+            (5, (Author::Bot(bot), "second")),
+            (6, (Author::User(owner), "third")),
+        ] {
+            replayed
+                .apply(&acted_event(
+                    EventKind::MessageAdded,
+                    author,
+                    owner,
+                    message_added(chat, text, None),
+                    seq,
+                ))
+                .unwrap();
+        }
+        for (seq, up_to_seq, summary) in [(7, 5, "the first two"), (8, 6, "the first three")] {
+            replayed
+                .apply(&acted_event(
+                    EventKind::ChatCompacted,
+                    Author::Bot(bot),
+                    owner,
+                    compaction(chat, bot, up_to_seq, summary),
+                    seq,
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            replayed
+                .messages_of(chat, None)
+                .iter()
+                .map(|message| (message.seq, message.compacted))
+                .collect::<Vec<_>>(),
+            state
+                .messages_of(chat, None)
+                .iter()
+                .map(|message| (message.seq, message.compacted))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(replayed.compaction(chat), state.compaction(chat));
+    }
+
+    #[test]
+    fn a_compaction_must_advance_the_chat_boundary() {
+        let owner = Id::new();
+        let bot = Id::new();
+        let (computer, chat) = (Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        for (seq, text) in [(4, "first"), (5, "second")] {
+            state
+                .apply(&acted_event(
+                    EventKind::MessageAdded,
+                    Author::User(owner),
+                    owner,
+                    message_added(chat, text, None),
+                    seq,
+                ))
+                .unwrap();
+        }
+        let applied = |state: &mut State, data: serde_json::Value| {
+            state
+                .apply(&acted_event(
+                    EventKind::ChatCompacted,
+                    Author::Bot(bot),
+                    owner,
+                    data,
+                    6,
+                ))
+                .is_ok()
+        };
+
+        // The Chat must exist, name its own Bot, and end at one of its
+        // Messages.
+        assert!(!applied(&mut state, compaction(chat, Id::new(), 5, "x")));
+        assert!(!applied(&mut state, compaction(chat, bot, 99, "x")));
+        assert!(!applied(&mut state, compaction(Id::new(), bot, 5, "x")));
+        // The Bot's own author and the Chat's owner acting for it are what
+        // make a compaction: a User, or another acting User, writes none.
+        assert!(
+            !state
+                .apply(&acted_event(
+                    EventKind::ChatCompacted,
+                    Author::User(owner),
+                    owner,
+                    compaction(chat, bot, 5, "x"),
+                    6,
+                ))
+                .is_ok()
+        );
+        assert!(
+            !state
+                .apply(&acted_event(
+                    EventKind::ChatCompacted,
+                    Author::Bot(bot),
+                    Id::new(),
+                    compaction(chat, bot, 5, "x"),
+                    6,
+                ))
+                .is_ok()
+        );
+        assert!(applied(&mut state, compaction(chat, bot, 5, "x")));
+        // A boundary only moves forward.
+        assert!(!applied(&mut state, compaction(chat, bot, 5, "again")));
+        assert!(!applied(&mut state, compaction(chat, bot, 4, "back")));
     }
 
     /// Builds a Bot and its Chat so a run has a place to be queued.

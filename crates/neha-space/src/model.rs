@@ -305,6 +305,11 @@ impl ModelClient {
         while let Some(event) = events.next().await {
             let event = event.map_err(|_| ModelError::Transport)?;
             if event.event == "error" {
+                if serde_json::from_str::<Value>(event.data.trim())
+                    .is_ok_and(|value| says_input_too_long(&value))
+                {
+                    return Err(ModelError::ContextTooLarge);
+                }
                 return Err(ModelError::Provider(event.data));
             }
             let data = event.data.trim();
@@ -316,6 +321,15 @@ impl ModelClient {
                 break;
             }
             let chunk: Chunk = serde_json::from_str(data).map_err(|_| ModelError::Protocol)?;
+            if let Some(error) = &chunk.error {
+                // Only the error's own protocol fields decide what a frame
+                // means; an over-long input asks for a compaction, anything
+                // else is the Provider's final answer for this step.
+                if error.names_too_long() {
+                    return Err(ModelError::ContextTooLarge);
+                }
+                return Err(ModelError::Provider(error.message(data)));
+            }
             if let Some(choice) = chunk.choices.first() {
                 if let Some(reason) = choice.finish_reason.as_deref() {
                     match reason {
@@ -741,6 +755,12 @@ async fn read_responses_stream(
                 }
             }
             "response.failed" | "error" => {
+                let message = provider_error(&value, data);
+                // A failed response whose own error fields name an over-long
+                // input is the context limit, not a Provider fault.
+                if says_input_too_long(&value) {
+                    return Err(ModelError::ContextTooLarge);
+                }
                 let usage = value
                     .pointer("/response/usage")
                     .and_then(|reported| {
@@ -748,7 +768,7 @@ async fn read_responses_stream(
                     })
                     .map_or(usage, ResponsesUsage::normalize);
                 return Err(ModelError::ProviderStream {
-                    message: provider_error(&value, data),
+                    message,
                     usage,
                     retryable: responses_error_retryable(&value),
                 });
@@ -1304,6 +1324,11 @@ async fn read_anthropic_stream(
             }
             "message_stop" => finished = true,
             "error" => {
+                // An Anthropic error names an over-long prompt in its own
+                // `error.message`; that is the context limit, not a fault.
+                if says_input_too_long(&value) {
+                    return Err(ModelError::ContextTooLarge);
+                }
                 return Err(ModelError::ProviderStream {
                     message: provider_error(&value, data),
                     usage,
@@ -1459,6 +1484,7 @@ impl neha_loop::Model for SpaceModel<'_> {
                     code: error.code(),
                     detail: error.to_string(),
                     usage: error.usage().unwrap_or_default(),
+                    context_too_large: error.context_too_large(),
                 })?;
 
             Ok(neha_loop::ModelReply {
@@ -1493,9 +1519,66 @@ fn map_status(
         429 => ModelError::RateLimited { retry_after },
         413 => ModelError::ContextTooLarge,
         500..=599 => ModelError::Server { retry_after },
-        _ if body.to_lowercase().contains("context") => ModelError::ContextTooLarge,
+        _ if body_says_input_too_long(body) => ModelError::ContextTooLarge,
         _ => ModelError::Request(body.to_owned()),
     }
+}
+
+/// The phrases a Provider uses for an input larger than its context.
+///
+/// Only these mean the request was too long. A rejected parameter that merely
+/// mentions the context (`unsupported context parameter`) is a request error
+/// and must not compact the conversation.
+const INPUT_TOO_LONG_MARKERS: [&str; 6] = [
+    "context_length_exceeded",
+    "context length exceeded",
+    "context_window_exceeded",
+    "prompt is too long",
+    "input is too long",
+    "maximum context length",
+];
+
+/// Returns whether one error text names an input that is too long.
+fn text_says_input_too_long(text: &str) -> bool {
+    let text = text.to_lowercase();
+
+    INPUT_TOO_LONG_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+/// Returns the protocol-defined error strings of one error object.
+///
+/// A Provider error carries its meaning in `code`, `type`, and `message`.
+/// Nothing else in the payload is read: unrelated data that happens to
+/// contain one of the phrases must not change a run.
+fn error_strings<'a>(value: &'a Value, base: &str) -> Vec<&'a str> {
+    let Some(error) = value.pointer(base) else {
+        return Vec::new();
+    };
+
+    ["code", "type", "message"]
+        .iter()
+        .filter_map(|field| error.get(*field).and_then(Value::as_str))
+        .collect()
+}
+
+/// Returns whether one parsed Provider error names an input that is too long.
+///
+/// The fields read are the protocol's own: an HTTP error body's `error`
+/// object, a Responses failure's `response.error`, and the zero-level error
+/// object some protocols put the fields on.
+fn says_input_too_long(value: &Value) -> bool {
+    ["/error", "/response/error", ""].iter().any(|base| {
+        error_strings(value, base)
+            .iter()
+            .any(|text| text_says_input_too_long(text))
+    })
+}
+
+/// Parses one raw HTTP error body and reads only its protocol error fields.
+fn body_says_input_too_long(body: &str) -> bool {
+    serde_json::from_str::<Value>(body).is_ok_and(|value| says_input_too_long(&value))
 }
 
 #[derive(Serialize)]
@@ -1574,6 +1657,42 @@ struct Chunk {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<ReportedUsage>,
+    /// A plain data frame can carry an error object instead of a chunk.
+    #[serde(default)]
+    error: Option<ChunkError>,
+}
+
+/// An error one Chat Completions data frame carries instead of a chunk.
+#[derive(Deserialize, Default)]
+struct ChunkError {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl ChunkError {
+    /// Whether the error's own protocol fields name an over-long input.
+    fn names_too_long(&self) -> bool {
+        [
+            self.code.as_deref(),
+            self.kind.as_deref(),
+            self.message.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(text_says_input_too_long)
+    }
+
+    /// The error's readable message, falling back to its code and the frame.
+    fn message(&self, fallback: &str) -> String {
+        self.message
+            .clone()
+            .or_else(|| self.code.clone())
+            .unwrap_or_else(|| fallback.to_owned())
+    }
 }
 
 #[derive(Deserialize)]
@@ -1762,6 +1881,17 @@ impl ModelError {
         }
     }
 
+    /// Returns whether the Provider said the request was larger than the
+    /// Model's context.
+    #[must_use]
+    pub fn context_too_large(&self) -> bool {
+        match self {
+            Self::ContextTooLarge => true,
+            Self::Retried { source, .. } => source.context_too_large(),
+            _ => false,
+        }
+    }
+
     /// Returns the command-surface code for this failure.
     #[must_use]
     pub fn code(&self) -> ErrorCode {
@@ -1798,7 +1928,7 @@ mod tests {
 
     use super::{
         ChatMessage, ChatRequest, ChatRole, ChatTool, ChatToolCall, ModelClient, ModelError,
-        ProviderProtocol, ThinkingLevel, Usage,
+        ProviderProtocol, ThinkingLevel, Usage, map_status, says_input_too_long,
     };
 
     async fn provider(app: Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -3476,6 +3606,219 @@ mod tests {
             bodies[5].get("reasoning_effort").is_none(),
             "thinking None sends no reasoning_effort"
         );
+        task.abort();
+    }
+
+    #[test]
+    fn only_an_input_too_long_error_compacts() {
+        let too_large = |body: &str| {
+            matches!(
+                map_status(reqwest::StatusCode::BAD_REQUEST, None, body),
+                ModelError::ContextTooLarge
+            )
+        };
+        // An explicit too-long status or code is the context limit.
+        assert!(matches!(
+            map_status(reqwest::StatusCode::PAYLOAD_TOO_LARGE, None, ""),
+            ModelError::ContextTooLarge
+        ));
+        assert!(too_large(r#"{"error":{"code":"context_length_exceeded"}}"#));
+        assert!(too_large(
+            r#"{"error":{"message":"the prompt is too long"}}"#
+        ));
+        assert!(too_large(
+            r#"{"error":{"message":"input is too long for this model"}}"#
+        ));
+        assert!(too_large(
+            r#"{"error":{"message":"maximum context length is 128000 tokens"}}"#
+        ));
+        // A rejected parameter that merely mentions the context is a request
+        // error: it must not compact the conversation.
+        assert!(!too_large(
+            r#"{"error":{"message":"unsupported context parameter"}}"#
+        ));
+        assert!(matches!(
+            map_status(
+                reqwest::StatusCode::BAD_REQUEST,
+                None,
+                r#"{"error":{"message":"unsupported context parameter"}}"#
+            ),
+            ModelError::Request(_)
+        ));
+        assert!(!says_input_too_long(
+            &json!({"error": {"message": "the request is fine"}})
+        ));
+        // Unrelated data that mentions the phrase is not an error field.
+        assert!(!says_input_too_long(&json!({
+            "error": {"code": "invalid_api_key", "message": "invalid API key"},
+            "metadata": {"test_case": "context_length_exceeded"},
+        })));
+        assert!(says_input_too_long(&json!({
+            "error": {"code": "context_length_exceeded"},
+        })));
+    }
+
+    /// One SSE reply for a scripted Provider.
+    fn sse_reply(app: Router, protocol: ProviderProtocol, body: String) -> Router {
+        let route = match protocol {
+            ProviderProtocol::ChatCompletions => "/v1/chat/completions",
+            ProviderProtocol::OpenAiResponses => "/v1/responses",
+            ProviderProtocol::AnthropicMessages => "/v1/messages",
+        };
+        let body = Arc::new(body);
+        app.route(
+            route,
+            post(move || {
+                let body = Arc::clone(&body);
+                async move { event_stream((*body).clone()) }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_responses_failure_reads_only_its_error_fields() {
+        // The failed response's own error is an invalid key; a fixture value
+        // elsewhere in the payload mentions the context limit.
+        let body = sse(&[json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": "invalid_api_key", "message": "invalid API key"},
+                "metadata": {"test_case": "context_length_exceeded"},
+            },
+        })]);
+        let app = sse_reply(Router::new(), ProviderProtocol::OpenAiResponses, body);
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(responses_request(&base)).await.unwrap_err();
+
+        assert!(
+            !matches!(error, ModelError::ContextTooLarge),
+            "an unrelated error is not the context limit: {error:?}"
+        );
+        match error {
+            ModelError::ProviderStream { message, .. } => {
+                assert_eq!(message, "invalid API key");
+            }
+            other => panic!("expected the Provider's own error, got {other:?}"),
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_responses_error_code_that_names_too_long_compacts() {
+        let body = sse(&[json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {"code": "context_length_exceeded", "message": "too long"},
+            },
+        })]);
+        let app = sse_reply(Router::new(), ProviderProtocol::OpenAiResponses, body);
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(responses_request(&base)).await.unwrap_err();
+
+        assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_error_message_that_names_too_long_compacts() {
+        let body = named_sse(&[(
+            "error",
+            json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt is too long: 300000 tokens > 280000 maximum",
+                },
+            }),
+        )]);
+        let app = sse_reply(Router::new(), ProviderProtocol::AnthropicMessages, body);
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(anthropic_request(&base)).await.unwrap_err();
+
+        assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_plain_data_error_that_names_too_long_compacts() {
+        // A Chat Completions stream can carry the error as a plain data frame
+        // instead of a chunk; its protocol fields still name the context limit.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                event_stream(
+                    "data: {\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long\"}}\n\n",
+                )
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_named_error_frame_that_names_too_long_compacts() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                event_stream(
+                    "event: error\ndata: {\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long\"}}\n\n",
+                )
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_plain_data_error_that_is_not_too_long_ends_the_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    event_stream(
+                        "data: {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"the request is malformed\"}}\n\n",
+                    )
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a Provider error is returned without a retry"
+        );
+        match error {
+            ModelError::Provider(message) => assert_eq!(message, "the request is malformed"),
+            other => panic!("expected the Provider's own error, got {other:?}"),
+        }
         task.abort();
     }
 }

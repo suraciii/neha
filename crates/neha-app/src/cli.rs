@@ -1906,30 +1906,50 @@ async fn chat(command: ChatCommand) -> Result<()> {
         }
         ChatCommand::Read { chat, from } => {
             let result = client::command(&credential, CommandCall::ChatRead { chat, from }).await?;
-            for message in result.as_array().context("no Messages in the answer")? {
-                let author = match message["author"]["kind"].as_str().unwrap_or_default() {
-                    "bot" => "Bot",
-                    _ => "User",
-                };
-                let text = text_of(message, "text")?;
-                let seq = message["seq"].as_str().unwrap_or_default();
-                // A File alone is a Message, so the line can end at the colon.
-                println!(
-                    "{}",
-                    if text.is_empty() {
-                        format!("[{seq}] {author}:")
-                    } else {
-                        format!("[{seq}] {author}: {text}")
-                    }
-                );
-                if let Some(file) = message["file"].as_str() {
-                    println!("  file {file}");
-                }
+            for row in chat_read_rows(&result)? {
+                println!("{row}");
             }
         }
     }
 
     Ok(())
+}
+
+/// The line that says a later request reads the Chat's earlier span through a
+/// summary.
+const COMPACTED_MARKER: &str = "  (earlier Messages were compacted)";
+
+/// Formats `chat read`: one line per Message, its File, and its compaction
+/// marker.
+///
+/// The record keeps every Message; a compaction's summary is not one of them,
+/// so the marker only says where the summarized span ends. The summary text is
+/// never printed.
+fn chat_read_rows(result: &Value) -> Result<Vec<String>> {
+    let messages = result.as_array().context("no Messages in the answer")?;
+    let mut rows = Vec::with_capacity(messages.len());
+    for message in messages {
+        let author = match message["author"]["kind"].as_str().unwrap_or_default() {
+            "bot" => "Bot",
+            _ => "User",
+        };
+        let text = text_of(message, "text")?;
+        let seq = message["seq"].as_str().unwrap_or_default();
+        // A File alone is a Message, so the line can end at the colon.
+        rows.push(if text.is_empty() {
+            format!("[{seq}] {author}:")
+        } else {
+            format!("[{seq}] {author}: {text}")
+        });
+        if let Some(file) = message["file"].as_str() {
+            rows.push(format!("  file {file}"));
+        }
+        if message["compacted"].as_bool().unwrap_or(false) {
+            rows.push(COMPACTED_MARKER.to_owned());
+        }
+    }
+
+    Ok(rows)
 }
 
 /// Returns the Chat a command acts on: the one named, the Bot's, or the only one.
@@ -4615,8 +4635,8 @@ mod tests {
     };
 
     use super::{
-        BotCommand, MemoryCommand, byte_size, confirm_full_access, memory_rows, normalized_grant,
-        visible_text, write_access,
+        BotCommand, MemoryCommand, byte_size, chat_read_rows, confirm_full_access, memory_rows,
+        normalized_grant, visible_text, write_access,
     };
 
     /// Parses a CLI command line.
@@ -7661,6 +7681,61 @@ mod tests {
             vec![format!(
                 "{rule}  {bot}  allow  get_weather  server {server}"
             )]
+        );
+    }
+
+    #[test]
+    fn chat_read_marks_the_compacted_span_and_never_shows_a_summary() {
+        let chat = Id::new();
+        let file = Id::new();
+        let messages = json!([
+            {
+                "id": Id::new(),
+                "chat": chat,
+                "seq": "1",
+                "author": {"kind": "user"},
+                "text": "the first note",
+                "file": null,
+                "compacted": false,
+            },
+            {
+                "id": Id::new(),
+                "chat": chat,
+                "seq": "2",
+                "author": {"kind": "bot"},
+                "text": "the second note",
+                "file": file,
+                "compacted": true,
+                // A summary is not a Message; a fixture that carries one must
+                // not make the CLI print it.
+                "summary": "an earlier summary standing in for the span",
+            },
+            {
+                "id": Id::new(),
+                "chat": chat,
+                "seq": "3",
+                "author": {"kind": "user"},
+                "text": "a later note",
+                "file": null,
+                "compacted": false,
+            },
+        ]);
+
+        let rows = chat_read_rows(&messages).unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                "[1] User: the first note".to_owned(),
+                "[2] Bot: the second note".to_owned(),
+                format!("  file {file}"),
+                "  (earlier Messages were compacted)".to_owned(),
+                "[3] User: a later note".to_owned(),
+            ]
+        );
+        let rendered = rows.join("\n");
+        assert!(
+            !rendered.contains("an earlier summary"),
+            "the summary text is never printed:\n{rendered}"
         );
     }
 

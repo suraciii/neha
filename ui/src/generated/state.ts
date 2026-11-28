@@ -419,7 +419,16 @@ seq: string,
 /**
  * The run it belongs to, when it is part of one.
  */
-run: string | null, };
+run: string | null, 
+/**
+ * Whether this is the Message the Chat's current compaction ends at.
+ *
+ * A Chat reads every Message; only the one at the boundary is marked, so
+ * a client can show where the summary starts. It is optional in the
+ * generated client type so an older client's fixture reads it as absent,
+ * which means false.
+ */
+compacted?: boolean, };
 
 /**
  * A Model the Space offers.
