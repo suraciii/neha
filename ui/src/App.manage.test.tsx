@@ -340,15 +340,31 @@ describe("App management", () => {
     await waitFor(() => expect(space.resets).toEqual(["p1"]));
   });
 
-  it("moves a Bot to another paired Computer", async () => {
+  it("distinguishes two move targets with the same name", async () => {
+    space.otherComputer.name = "Twin";
+    space.hostedComputer.name = "Twin";
     const view = await openBots();
-    expect(factValue(view, "Computer", "Workspace")).toBe("/w");
-
-    // The other paired Local Computer is where a Bot may move, named by the
-    // identifier the Space gave it rather than by its workspace alone.
     const target = field<HTMLSelectElement>(view, "move_target");
-    expect(target.options).toHaveLength(2);
-    expect(target.options[1]?.textContent).toBe("Local Computer p9 · /other · Offline");
+    const labels = Array.from(target.options).map((option) => option.textContent ?? "");
+    expect(labels[1]).toBe(`Twin · ${space.otherComputer.id}`);
+    expect(labels[2]).toBe(`Twin · ${space.hostedComputer.id}`);
+  });
+
+  it("moves a Bot to another Computer", async () => {
+    const view = await openBots();
+    // The page names the Computer by its name, and says who may use it.
+    expect(factValue(view, "Computer", "Name")).toBe("Workstation");
+    expect(factValue(view, "Computer", "Sharing")).toBe("Shared");
+
+    // Both the other Local Computer and the Hosted Space Computer are targets:
+    // a Bot may move between Hosted and Local Computers in either direction.
+    const target = field<HTMLSelectElement>(view, "move_target");
+    expect(target.options).toHaveLength(3);
+    expect(Array.from(target.options).map((option) => option.textContent)).toEqual([
+      "Choose a Computer",
+      "Laptop",
+      "Space Computer",
+    ]);
 
     choose(view, "move_target", "p9");
     press(view, "Move to another Computer");
@@ -359,9 +375,25 @@ describe("App management", () => {
     press(view, "Press again to move");
     await waitFor(() => expect(space.moves).toEqual([{ bot: "b1", computer: "p9" }]));
     // The page reads the Bot again, so it names the Computer it moved to.
-    await waitFor(() => expect(factValue(view, "Computer", "Workspace")).toBe("/other"));
+    await waitFor(() => expect(factValue(view, "Computer", "Name")).toBe("Laptop"));
+    expect(factValue(view, "Computer", "Workspace")).toBe("/other");
     // The new Computer is offline, as the Space knows it.
     expect(factValue(view, "Computer", "Online")).toBe("Offline");
+  });
+
+  it("moves a Bot from a Hosted Computer", async () => {
+    space.computer.kind = "hosted";
+    const view = await openBots();
+    // A Hosted Bot moves like any other: the control is here, and the copy says
+    // a move carries no files.
+    await waitFor(() => expect(field<HTMLSelectElement>(view, "move_target")).toBeTruthy());
+    expect(panelText(view, "Computer")).toContain("Moving does not carry files");
+
+    choose(view, "move_target", "p9");
+    press(view, "Move to another Computer");
+    await waitFor(() => expect(button(view, "Press again to move")).toBeTruthy());
+    press(view, "Press again to move");
+    await waitFor(() => expect(space.moves).toEqual([{ bot: "b1", computer: "p9" }]));
   });
 
   it("adds a rule and takes it away", async () => {
@@ -783,44 +815,107 @@ describe("App management", () => {
 
     const rows = view.container.querySelectorAll(".rows .row");
     // Both paired Local Computers and the Hosted one are listed, including the
-    // one no Bot works on.
+    // one no Bot works on. The name leads each row; the kind, sharing, and state
+    // follow it, and the Workspace stays machine data further down.
     expect(rows).toHaveLength(3);
-    expect(rows[0]?.textContent).toContain("/w");
+    expect(rows[0]?.querySelector(".row__name")?.textContent).toBe("Workstation");
     expect(rows[0]?.textContent).toContain("Local Computer");
+    expect(rows[0]?.textContent).toContain("Shared");
     expect(rows[0]?.textContent).toContain("Online");
+    expect(rows[0]?.textContent).toContain("/w");
     // A Computer's Bots and what each may write are on its row.
     expect(rows[0]?.textContent).toContain("Scout");
     expect(rows[0]?.textContent).toContain("Only its Workspace");
     expect(rows[1]?.textContent).toContain("No Bot works here");
+    // The Space Computer says that it is the one the User received.
+    expect(rows[2]?.querySelector(".row__name")?.textContent).toBe("Space Computer");
+    expect(rows[2]?.textContent).toContain("Hosted Computer");
+    expect(rows[2]?.querySelector(".chip--default")?.textContent).toBe("Space Computer");
 
     // The Bot chip opens that Bot's page.
     flush(() => fireEvent.click(button(view, "Scout · Only its Workspace")));
     await waitFor(() => expect(element(view, ".page__titles h1").textContent).toBe("Scout"));
     // Coming back returns to the Computers list, not to the Chats.
     flush(() => fireEvent.click(element(view, ".page__back")));
-    await waitFor(() => expect(panelText(view, "Computers")).toContain("/w"));
+    await waitFor(() => expect(panelText(view, "Computers")).toContain("Workstation"));
+  });
+
+  it("creates a shared Hosted Computer from the Computers list", async () => {
+    const view = await openSettings("Computers");
+
+    // The form asks for a name and who may use it, and waits for the name.
+    await waitFor(() => expect(button(view, "Create Computer").disabled).toBe(true));
+
+    type(view, "computer_name", "Build Box");
+    choose(view, "computer_sharing", "shared");
+    await waitFor(() => expect(button(view, "Create Computer").disabled).toBe(false));
+
+    press(view, "Create Computer");
+    await waitFor(() =>
+      expect(space.computerCreates).toEqual([{ name: "Build Box", sharing: "shared" }]),
+    );
+    // The new Computer is listed with the name and sharing it was given.
+    await waitFor(() => {
+      const rows = view.container.querySelectorAll(".rows .row");
+      const created = rows[rows.length - 1];
+      expect(created?.querySelector(".row__name")?.textContent).toBe("Build Box");
+      expect(created?.textContent).toContain("Hosted Computer");
+      expect(created?.textContent).toContain("Shared");
+    });
+    await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Computer created"));
+    // The form starts over, so a second Computer needs a name of its own.
+    expect(field<HTMLInputElement>(view, "computer_name").value).toBe("");
+  });
+
+  it("makes an exclusive Hosted Computer shared", async () => {
+    space.hostedComputer.sharing = "exclusive";
+    const view = await openSettings("Computers");
+
+    const row = () => view.container.querySelectorAll(".rows .row")[2];
+    expect(row()?.textContent).toContain("Exclusive");
+    // Only an exclusive Hosted Computer offers the change.
+    await waitFor(() => expect(button(view, "Make shared")).toBeTruthy());
+
+    press(view, "Make shared");
+    await waitFor(() =>
+      expect(space.computerUpdates).toEqual([{ computer: "p5", sharing: "shared" }]),
+    );
+    await waitFor(() =>
+      expect(element(view, ".page__note").textContent).toBe("Computer is shared"),
+    );
+    // The row and the action follow the sharing the Space now holds.
+    await waitFor(() => {
+      expect(row()?.textContent).toContain("Shared");
+      expect(row()?.textContent).not.toContain("Exclusive");
+    });
+    expect(
+      Array.from(view.container.querySelectorAll("button")).some(
+        (button) => button.textContent?.trim() === "Make shared",
+      ),
+    ).toBe(false);
   });
 
   it("names every Computer it lists, even one with no workspace", async () => {
-    // A Computer the User paired does not always name a workspace, and the
-    // leading part of a time-ordered identifier is the time it was made: two
-    // machines paired within one window begin it alike. The row is named by the
-    // whole identifier, so neither of them is a blank the other matches.
-    space.computer.id = "019a3f2c-1111-7aaa-8bbb-000000000001";
-    space.otherComputer.id = "019a3f2c-2222-7aaa-8bbb-000000000002";
+    // A Computer the User paired does not always name a workspace. The row is
+    // named by the name the Space gave it rather than by that path, so no row
+    // is a blank, and its kind and sharing still say what it is.
     space.computer.workspace = "";
     space.otherComputer.workspace = "";
     const view = await openSettings("Computers");
 
-    const names = Array.from(view.container.querySelectorAll(".rows .row__name")).map(
-      (row) => row.textContent,
-    );
-    expect(names).toEqual([
-      "Local Computer 019a3f2c-1111-7aaa-8bbb-000000000001",
-      // The label also says this one is offline, which is the row's own line too.
-      "Local Computer 019a3f2c-2222-7aaa-8bbb-000000000002 · Offline",
-      "Hosted Computer p5 · /hosted",
+    const rows = Array.from(view.container.querySelectorAll(".rows .row"));
+    expect(rows.map((row) => row.querySelector(".row__name")?.textContent)).toEqual([
+      "Workstation",
+      "Laptop",
+      "Space Computer",
     ]);
+    // With no Workspace to say it either, the row still says what the Computer
+    // is and whether it is here.
+    expect(rows[0]?.textContent).toContain("Local Computer");
+    expect(rows[0]?.textContent).toContain("Shared");
+    expect(rows[0]?.textContent).toContain("Online");
+    expect(rows[1]?.textContent).toContain("Offline");
+    expect(rows[2]?.textContent).toContain("Hosted Computer");
   });
 
   it("resets a Hosted Computer from the Computers list", async () => {

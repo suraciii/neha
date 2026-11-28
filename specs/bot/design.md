@@ -9,9 +9,9 @@ Owned by bot. A Bot's work depends on [Computer](../computer/product.md) for whe
 ## Laws
 
 1. A Bot's loop acts as the Bot and holds no record.
-2. Every action a Bot takes runs on its Computer or through an MCP server.
+2. Every action a Bot takes runs on its Computer or through an MCP server; a memory tool is a record operation.
 3. What a Bot has seen is reconstructible from the record.
-4. A Bot does only what Neha can enforce on its Computer or at an MCP server.
+4. A Bot does only what Neha can enforce on its Computer, at an MCP server, or in the record.
 5. A run stops between two of its actions and never inside one.
 
 ## Where work runs
@@ -31,10 +31,6 @@ The Bot's Computer can change, and a move changes only where its actions run.
 ## State
 
 The record holds a run: its requests, its steps, the actions the Bot took, and what the Bot saw. A demonstration holds what the User did and saw while in control, and never holds a credential.
-
-A summary the Bot writes is a record event. The history a Model sees is a projection of the record, and the record keeps every original Message.
-
-A Bot's memory is a set of entries in the record that belong to the Bot. Each entry records its author, where it came from, and the scope it applies to. The system prompt is rebuilt for every request from the entries that apply to the acting User and the conversation.
 
 ## Steps and actions
 
@@ -82,7 +78,9 @@ An Always allow on that approval grants the action's folder for later runs. The 
 
 A card whose folder no grant can store — a `..` climb, a relative form, or a NUL — also shows no Always allow, and the Space refuses `--always` for it; the action itself still runs once when allowed.
 
-A rule names one tool, with a command prefix for a shell, a path prefix for a file tool, or a skill and a script for `run_skill_script`. A command prefix matches a command when its text, after leading whitespace, starts with the prefix. A rule for a server's tool names the server and the tool and carries no prefix.
+An Ask or Allow rule names one tool. On a Computer it names `shell`, `read_file`, `write_file`, or `list_files`, with a command prefix for a shell and a path prefix for a file tool. A command prefix matches a command when its text, after leading whitespace, starts with the prefix.
+
+A rule for `run_skill_script` names a skill and a script, and a rule for a server's tool names the server and the tool; neither carries a prefix.
 
 `RuleAdd` trims and normalizes a path prefix once and stores it; matching does not trim the stored prefix again. A raw action path is trimmed once, then compared after collapsing repeated `/` and removing `.` components, while keeping the absolute or relative form; `./logs/x`, `logs//x`, and `logs/./x` match a `logs` rule.
 
@@ -118,7 +116,7 @@ A run that waits for an approval keeps no place in the Bot's queue, so a later r
 
 ## Instructions and data
 
-A lasting rule is an instruction to the Bot within the authority of the User who gave it.
+An instruction to the Bot carries the authority of the User who gave it.
 
 Everything else a Bot reads is data: tool results, a server's tool descriptions, files, web pages, messages, and what the Bot noticed itself. Data enters the context with a label that names where it came from.
 
@@ -127,6 +125,68 @@ A message from another surface, a bridge, or another agent carries no authority,
 A skill that the Bot's owner enabled is an instruction. A skill adds no authority, and a script it carries runs only as one of the Bot's actions. A skill the Bot wrote itself becomes an instruction only when its owner approves it.
 
 A skill's script runs as the `run_skill_script` action, whose approval names the skill and the script. Its first run for the Bot and the acting User waits for an Allow, and an Always allow covers that script alone.
+
+## Memory and context
+
+A Bot's memory is a set of entries in the record. An entry has an id, its Bot, its kind, its scope, its author, its source, its text, its creation, and whether it is superseded. Its source names the Message, run, or command that wrote it.
+
+An entry has kind `rule` or `note`. A `rule` is a lasting instruction, and only a User's words start one. A `note` is data the Bot noticed and wrote for itself; the Bot extracts no `note` in the background.
+
+A `rule` entry's author is the User whose words gave it, and a `note` entry's author is the Bot. An entry applies only in its scope: an `owner` entry in every Chat of the Bot's owner, a `user` entry in the Chat where it was written, and a `group` entry in the Group where it was written.
+
+The Bot's job is the earliest `rule` among the entries in `owner` scope that still apply. A superseded entry is not a candidate, and a Bot whose owner holds no such rule gets no job section.
+
+The same text written again in the same Bot, kind, scope, and acting User changes nothing, so a replay adds no entry. Two Users who write the same text keep one entry each.
+
+An entry that a write replaces is superseded: it applies to nothing and enters no prompt. A `remember` MAY replace several entries, and its replacement and write commit together.
+
+The built-in loop offers `remember`, `forget`, and `list_memories`. `remember` writes one entry from `kind`, `scope`, and `text`, and MAY name one or more entries it replaces. `forget` removes the entries an id or a text names, and `list_memories` reads the entries that apply to the request.
+
+`forget` by text matches only an entry the caller reads and MAY remove; the owner removes another User's entry by the id its metadata names.
+
+`remember` names its targets by id, and each target is an entry of the same Bot that still applies and that the acting User can remove. A call with a target that is absent, superseded, or not removable changes no memory entry.
+
+A memory write is a record event and needs no approval. It records `neha.memory.added`, a removal records `neha.memory.removed`, and [Space](../space/design.md#memory-events) owns those kinds. A memory read records no entry change; its answer is still a record event.
+
+A memory tool is a record operation and not an Action: it never reaches the Computer, no unknown-action recovery applies to it, and no approval or Ask or Allow rule covers it.
+
+A memory tool call's answer is a record event: it is appended with the entry changes the call makes, or alone when the call changes no memory entry. It covers a no-op, a refusal, and an error alike. A replay returns the recorded answer and does not run the call again; [Space](../space/design.md#memory-events) owns its kind `neha.memory.answered`.
+
+For one Bot, a memory read, a tool write, and a management removal form one serial order: each is planned and recorded without another of them in flight, and a second removal of one id sees the first one committed. A write and its answer commit together or not at all.
+
+The Bot merges or removes its own `note` entries. A Bot never removes a `rule` on its own. The owner removes any entry, and a User removes the entries that User's words gave and the `note` entries the Bot wrote while acting for that User.
+
+The byte limit of each kind, the refusal of a write that passes it, and the all-or-nothing write follow [product](product.md#memory).
+
+A `remember` result names the entry's id, kind, and scope, and the capacity left for that kind. A `forget` result names the entries it removed.
+
+The system prompt is rebuilt for every request from the entries that apply to the acting User and the conversation. The same record and request give the same prompt.
+
+The prompt states the Bot's job first when the Bot has one, then the other `rule` entries, then the `note` entries under a label that marks them as data, then the skills, then the tool instructions. A Chat where the owner's entries do not apply, and a Group, get no job section.
+
+The Model sees a projection of the record, and the record keeps every original Message. The projection prunes and compacts, and neither writes a Message.
+
+Pruning is a projection step separate from compaction. It treats a tool result as one unit and removes the oldest results from the context first, but the three most recent always stay.
+
+A result beyond the budget becomes a placeholder that names the tool call's id; the body stays in the record, and no File is created for it. A conversation that fits after pruning gets no summary.
+
+Neha compacts a conversation on one path of its own and does not use a Provider's native compaction. A conversation compacts when its estimate reaches its threshold.
+
+When `window <= max_output + 65536`, the window holds no headroom and the threshold is `window − max_output`, at least 0. A window that cannot hold its own maximum output leaves no room to compact.
+
+Otherwise, the threshold is the smaller of 0.8 × the Model's context window and the window minus its maximum output minus 65536 tokens. A Model MAY carry its own threshold.
+
+The estimate starts at the usage the Provider last reported, or at 0 when it reported none. It counts the projection the request will send, so text that pruning or compaction leaves out does not count.
+
+A Provider error that says the input is too long compacts at most once and retries the request at most once. A conversation with no span to compact is not compacted. A retry that reports the same error ends the run with that error and makes no further attempt.
+
+One silent turn comes before a compaction and writes what the Bot has not written down as `note` entries. The turn uses a private copy of the conversation, writes only `note` entries, posts nothing in the conversation, and is skipped when it fails. A compaction makes at most one such turn.
+
+The cut falls on the oldest balanced span that keeps the most recent 16% of the original text raw, and every tool call stays paired with its result. A conversation with no such cut, or one whose Bot has not replied since the previous summary, does not compact.
+
+The compaction state belongs to one Chat or Group and one Bot. The summary is one separate request to the same Model, with a handoff prompt that adds no instruction to the summary and an output cap of 8192 tokens.
+
+The summary becomes the record event `neha.chat.compacted`, whose data [Space](../space/design.md#chat-events) owns. It is no Message in the conversation, and the Model sees it and the original text after the cut.
 
 ## Authority for an action
 
@@ -153,3 +213,4 @@ A handoff from one Bot to another carries the authority of the User the first Bo
 - The Model does not ask for an approval on its own; only a built-in trigger or a lasting Ask rule asks.
 - Cancelling an approval and an unattended approval's expiry are not yet available.
 - An independent reviewer of approvals is not yet specified.
+- A Group conversation does not compact yet.

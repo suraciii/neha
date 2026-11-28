@@ -904,19 +904,35 @@ impl LocalRuntime {
         match &self.mode {
             Mode::Managed => {
                 let path = self.resolve_managed(input).map_err(ByteError::Failed)?;
-                if let Some(parent) = path.parent()
-                    && let Err(error) = std::fs::create_dir_all(parent)
+                #[cfg(unix)]
+                let relative = path
+                    .strip_prefix(&self.root)
+                    .map_err(|_| ByteError::Failed("the path escapes the workspace".to_owned()))?;
+                #[cfg(unix)]
                 {
-                    return Err(ByteError::Failed(format!(
-                        "cannot create {}: {error}",
-                        parent.display()
-                    )));
+                    // Walk from the Workspace root descriptor and refuse every
+                    // symlink on the way: no path is checked and then opened.
+                    let root = std::fs::File::open(&self.root).map_err(|error| {
+                        ByteError::Failed(format!("cannot open {}: {error}", self.root.display()))
+                    })?;
+                    write_machine_file(&root, &relative.to_string_lossy(), bytes, mode)?;
                 }
-                std::fs::write(&path, bytes).map_err(|error| {
-                    ByteError::Failed(format!("cannot write {}: {error}", path.display()))
-                })?;
-                if let Some(mode) = mode {
-                    set_file_mode(&path, mode)?;
+                #[cfg(not(unix))]
+                {
+                    if let Some(parent) = path.parent()
+                        && let Err(error) = std::fs::create_dir_all(parent)
+                    {
+                        return Err(ByteError::Failed(format!(
+                            "cannot create {}: {error}",
+                            parent.display()
+                        )));
+                    }
+                    std::fs::write(&path, bytes).map_err(|error| {
+                        ByteError::Failed(format!("cannot write {}: {error}", path.display()))
+                    })?;
+                    if let Some(mode) = mode {
+                        set_file_mode(&path, mode)?;
+                    }
                 }
 
                 Ok(self.relative(&path))
@@ -1012,16 +1028,87 @@ impl LocalRuntime {
     /// resolves under a hidden root.
     fn open_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
         match &self.mode {
-            Mode::Managed => {
-                let file = std::fs::File::open(path)
-                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-                let metadata = file
-                    .metadata()
-                    .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
-                Ok((file, metadata))
-            }
+            Mode::Managed => self.open_managed_read(path),
             Mode::Machine { .. } => self.open_machine_read(path),
         }
+    }
+
+    /// Opens a managed file by walking from the Workspace root through
+    /// directory descriptors with `O_NOFOLLOW`, so another Bot that swaps a
+    /// path component between the check and the open cannot move the read
+    /// outside the Computer.
+    #[cfg(unix)]
+    fn open_managed_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| "the path escapes the workspace".to_owned())?;
+        let mut directory = std::fs::File::open(&self.root)
+            .map_err(|error| format!("cannot open {}: {error}", self.root.display()))?;
+        let mut components: Vec<_> = relative
+            .components()
+            .filter_map(|component| match component {
+                Component::Normal(part) => Some(part.to_os_string()),
+                _ => None,
+            })
+            .collect();
+        let name = components
+            .pop()
+            .ok_or_else(|| "the path does not name a file".to_owned())?;
+        for component in components {
+            directory = open_directory_at(&directory, &component)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        }
+        let name = c_name(&name)?;
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        // SAFETY: `directory` is a live directory descriptor and `name` is
+        // NUL-terminated; a successful return is a fresh descriptor owned here.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(libc::ELOOP) => {
+                    format!(
+                        "the path uses a symlink, which is not followed: {}",
+                        path.display()
+                    )
+                }
+                Some(libc::ENXIO) => format!("{} is not a regular file", path.display()),
+                _ => format!("cannot read {}: {error}", path.display()),
+            });
+        }
+        // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a file", path.display()));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if metadata.nlink() > 1 {
+                return Err(format!(
+                    "the path uses a hard link, which is not followed: {}",
+                    path.display()
+                ));
+            }
+        }
+        Ok((file, metadata))
+    }
+
+    /// Managed reads are Unix's descriptor walk; another platform keeps the
+    /// check-then-open path because it has no Hosted worker.
+    #[cfg(not(unix))]
+    fn open_managed_read(&self, path: &Path) -> Result<(std::fs::File, std::fs::Metadata), String> {
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        Ok((file, metadata))
     }
 
     /// A real-machine read of one opened regular file.
@@ -1151,14 +1238,9 @@ impl LocalRuntime {
             Err(error) => return ActionResult::failed(error),
         };
         let lines = match &self.mode {
-            Mode::Managed => match std::fs::read_dir(&path) {
-                Ok(entries) => list_entries(entries),
-                Err(error) => {
-                    return ActionResult::failed(format!(
-                        "cannot list {}: {error}",
-                        self.relative(&path)
-                    ));
-                }
+            Mode::Managed => match self.list_managed_directory(&path) {
+                Ok(lines) => lines,
+                Err(error) => return ActionResult::failed(error),
             },
             Mode::Machine { .. } => match self.list_machine_directory(&path) {
                 Ok(lines) => lines,
@@ -1343,6 +1425,35 @@ impl LocalRuntime {
         }
     }
 
+    /// Lists one open directory, so an entry's kind and the listing come from
+    /// the same descriptor.
+    #[cfg(unix)]
+    fn list_managed_directory(&self, path: &Path) -> Result<Vec<String>, String> {
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| "the path escapes the workspace".to_owned())?;
+        let mut directory = std::fs::File::open(&self.root)
+            .map_err(|error| format!("cannot open {}: {error}", self.root.display()))?;
+        for component in relative.components() {
+            let Component::Normal(part) = component else {
+                continue;
+            };
+            directory = open_directory_at(&directory, part)
+                .map_err(|error| format!("cannot list {}: {error}", self.relative(path)))?;
+        }
+        list_opened_directory(&directory, &self.relative(path))
+    }
+
+    /// Managed listings use the descriptor walk; another platform keeps the
+    /// path check because it has no Hosted worker.
+    #[cfg(not(unix))]
+    fn list_managed_directory(&self, path: &Path) -> Result<Vec<String>, String> {
+        match std::fs::read_dir(path) {
+            Ok(entries) => Ok(list_entries(entries)),
+            Err(error) => Err(format!("cannot list {}: {error}", self.relative(path))),
+        }
+    }
+
     /// Lists one directory of a real machine through the descriptor it opened.
     ///
     /// The directory is opened once with `O_DIRECTORY | O_NOFOLLOW`, checked
@@ -1351,7 +1462,7 @@ impl LocalRuntime {
     /// listed.
     #[cfg(unix)]
     fn list_machine_directory(&self, path: &Path) -> Result<Vec<String>, String> {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        use std::os::fd::FromRawFd as _;
 
         let shown = self.relative(path);
         let name = c_name(path.as_os_str())
@@ -1372,49 +1483,7 @@ impl LocalRuntime {
         // SAFETY: `fd` is a fresh descriptor from `openat` and is owned here.
         let directory = unsafe { std::fs::File::from_raw_fd(fd) };
         self.refuse_hidden(&directory, path)?;
-        let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
-        if duplicate < 0 {
-            return Err(format!(
-                "cannot list {shown}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        let stream = unsafe { libc::fdopendir(duplicate) };
-        if stream.is_null() {
-            let error = std::io::Error::last_os_error();
-            // SAFETY: `duplicate` is still ours when `fdopendir` fails.
-            unsafe { libc::close(duplicate) };
-            return Err(format!("cannot list {shown}: {error}"));
-        }
-        let mut lines = Vec::new();
-        let result = (|| -> std::io::Result<()> {
-            while let Some(name) = next_directory_entry(stream)? {
-                if lines.len() == MAX_LIST_ENTRIES {
-                    break;
-                }
-                let kind = match fstatat(&directory, &name) {
-                    Ok(metadata) => match metadata.st_mode & libc::S_IFMT {
-                        libc::S_IFDIR => "dir ",
-                        libc::S_IFLNK => "link",
-                        libc::S_IFREG => "file",
-                        _ => "?   ",
-                    },
-                    Err(_) => "?   ",
-                };
-                lines.push(format!("{kind} {}", name.to_string_lossy()));
-            }
-
-            Ok(())
-        })();
-        // SAFETY: `stream` is the open directory stream created above.
-        unsafe { libc::closedir(stream) };
-        result.map_err(|error| format!("cannot list {shown}: {error}"))?;
-        lines.sort();
-        if lines.is_empty() {
-            lines.push("(empty)".to_owned());
-        }
-
-        Ok(lines)
+        list_opened_directory(&directory, &self.relative(path))
     }
 
     /// Lists a directory on a system without real-drive descriptors.
@@ -1447,7 +1516,12 @@ impl LocalRuntime {
         script: Option<&SealedScript>,
     ) -> Result<Command, ActionResult> {
         let mut process = if let Some(bwrap) = &self.hosted {
-            let mut arguments = hosted_sandbox_args(bwrap, &self.root, self.cli_dir.as_deref());
+            let mut arguments = hosted_sandbox_args(
+                bwrap,
+                &self.root,
+                self.cwd.as_deref(),
+                self.cli_dir.as_deref(),
+            );
             mount_script(&mut arguments, script);
             #[cfg(target_os = "linux")]
             let command = match script {
@@ -1636,13 +1710,23 @@ impl LocalRuntime {
             }
         };
         let (home, temporary) = if self.hosted.is_some() {
-            (Path::new(HOSTED_WORKSPACE), PathBuf::from(SANDBOX_TMPDIR))
+            let home = self
+                .cwd
+                .as_deref()
+                .and_then(|cwd| cwd.strip_prefix(&self.root).ok())
+                .map(|relative| {
+                    let mut path = PathBuf::from(HOSTED_WORKSPACE);
+                    path.push(relative);
+                    path
+                })
+                .unwrap_or_else(|| PathBuf::from(HOSTED_WORKSPACE));
+            (home, PathBuf::from(SANDBOX_TMPDIR))
         } else {
             let temporary = match &self.mode {
                 Mode::Managed => self.root.join(".tmp"),
                 Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
             };
-            (self.root.as_path(), temporary)
+            (self.root.clone(), temporary)
         };
         #[cfg(windows)]
         let path = {
@@ -1705,8 +1789,8 @@ impl LocalRuntime {
                 }
             }
             process
-                .env("HOME", home)
-                .env("USERPROFILE", home)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
                 .env("TMP", &temporary)
                 .env("TEMP", &temporary)
                 .env("PATH", path);
@@ -1959,7 +2043,7 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
 pub fn probe_hosted(bwrap: &Path, workspace: &Path) -> Result<(), RuntimeError> {
     check_bwrap_version(bwrap).map_err(RuntimeError::NoSandbox)?;
     let output = std::process::Command::new(bwrap)
-        .args(hosted_sandbox_args(bwrap, workspace, None))
+        .args(hosted_sandbox_args(bwrap, workspace, None, None))
         .arg("/usr/bin/sh")
         .arg("-c")
         .arg("true")
@@ -2113,7 +2197,12 @@ fn validate_hosted_mounts(hidden: &[PathBuf], cli_dir: Option<&Path>) -> Result<
 /// skill's `neha` commands work in the shell; the mount is skipped when the
 /// caller has no CLI directory. `_bwrap` is the binary that will run these
 /// arguments; they are the same for every bwrap path.
-fn hosted_sandbox_args(_bwrap: &Path, workspace: &Path, cli_dir: Option<&Path>) -> Vec<OsString> {
+fn hosted_sandbox_args(
+    _bwrap: &Path,
+    workspace: &Path,
+    cwd: Option<&Path>,
+    cli_dir: Option<&Path>,
+) -> Vec<OsString> {
     let mut arguments = Vec::new();
     // A system directory that does not exist is skipped, so the same rootfs
     // works on a distribution where it is missing.
@@ -2150,8 +2239,17 @@ fn hosted_sandbox_args(_bwrap: &Path, workspace: &Path, cli_dir: Option<&Path>) 
     arguments.push(OsString::from("--bind"));
     arguments.push(workspace.as_os_str().to_owned());
     arguments.push(OsString::from(HOSTED_WORKSPACE));
+    // The Computer's Workspace is mounted whole, so Bots on it can see each
+    // other's files. The run starts in its Bot's directory when the caller
+    // named one; a probe starts at the root.
+    let mut start = PathBuf::from(HOSTED_WORKSPACE);
+    if let Some(relative) = cwd.and_then(|cwd| cwd.strip_prefix(workspace).ok())
+        && !relative.as_os_str().is_empty()
+    {
+        start.push(relative);
+    }
     arguments.push(OsString::from("--chdir"));
-    arguments.push(OsString::from(HOSTED_WORKSPACE));
+    arguments.push(start.into_os_string());
     arguments.push(OsString::from("--"));
 
     arguments
@@ -2475,7 +2573,58 @@ fn without_deleted_suffix(path: PathBuf) -> PathBuf {
     path.with_file_name(name)
 }
 
+/// Lists one open directory through its descriptor.
+#[cfg(unix)]
+fn list_opened_directory(directory: &std::fs::File, shown: &str) -> Result<Vec<String>, String> {
+    use std::os::fd::AsRawFd as _;
+
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(format!(
+            "cannot list {shown}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        // SAFETY: `duplicate` is still ours when `fdopendir` fails.
+        unsafe { libc::close(duplicate) };
+        return Err(format!("cannot list {shown}: {error}"));
+    }
+    let mut lines = Vec::new();
+    let result = (|| -> std::io::Result<()> {
+        while let Some(name) = next_directory_entry(stream)? {
+            if lines.len() == MAX_LIST_ENTRIES {
+                break;
+            }
+            let kind = match fstatat(directory, &name) {
+                Ok(metadata) => match metadata.st_mode & libc::S_IFMT {
+                    libc::S_IFDIR => "dir ",
+                    libc::S_IFLNK => "link",
+                    libc::S_IFREG => "file",
+                    _ => "?   ",
+                },
+                Err(_) => "?   ",
+            };
+            lines.push(format!("{kind} {}", name.to_string_lossy()));
+        }
+
+        Ok(())
+    })();
+    // SAFETY: `stream` is the open directory stream created above.
+    unsafe { libc::closedir(stream) };
+    result.map_err(|error| format!("cannot list {shown}: {error}"))?;
+    lines.sort();
+    if lines.is_empty() {
+        lines.push("(empty)".to_owned());
+    }
+
+    Ok(lines)
+}
+
 /// Renders the entries of a managed directory, one per line.
+#[cfg(not(unix))]
 fn list_entries(entries: std::fs::ReadDir) -> Vec<String> {
     let mut lines = Vec::new();
     for entry in entries.take(MAX_LIST_ENTRIES) {
@@ -3168,24 +3317,15 @@ fn set_descriptor_mode(file: &std::fs::File, mode: u32, shown: &str) -> Result<(
     Ok(())
 }
 
-/// Applies the mode one written file keeps.
+/// Applies the mode one written file keeps on a platform with no descriptor
+/// to change.
 ///
-/// Windows has no execute bit, so only a POSIX write asks for a mode; its
-/// shell decides what it can run.
-fn set_file_mode(path: &Path, mode: u32) -> Result<(), ByteError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
-            .map_err(|error| ByteError::Failed(format!("cannot write {}: {error}", path.display())))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, mode);
-
-        Ok(())
-    }
+/// Unix changes the written descriptor's mode inside [`write_machine_file`],
+/// before a name can be swapped. Windows has no execute bit, so only a POSIX
+/// write asks for a mode; this fallback keeps no mode.
+#[cfg(not(unix))]
+fn set_file_mode(_path: &Path, _mode: u32) -> Result<(), ByteError> {
+    Ok(())
 }
 
 /// Splits a real machine's write path into safe components.

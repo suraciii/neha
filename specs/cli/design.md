@@ -23,9 +23,9 @@ The browser client reads and writes through the command surface, as the CLI does
 
 ## Management
 
-Management is what a signed-in User changes on the Space: its Providers and Models, a Bot, the access and Workspace of that Bot's Computer, and the rules. An authenticated browser session and the CLI reach the same management commands.
+Management is what a signed-in User changes on the Space: its Providers and Models, a Bot and its memory, the access and Workspace of that Bot's Computer, and the rules. An authenticated browser session and the CLI reach the same management commands.
 
-The browser's Bot page, Settings, and Computers list issue the same commands the CLI issues for a Bot, a Model, and a Computer. Turning full access on means the same consent in both.
+The browser's Bot page, Settings, and Computers list issue the same commands the CLI issues for a Bot, its memory, a Model, and a Computer. Turning full access on means the same consent in both.
 
 ## A Bot's shell
 
@@ -52,6 +52,12 @@ A command is accepted when the Space holds it, committed when the record holds i
 Within one major version, a newer Space accepts an older caller.
 
 A caller and a Space tell each other what they can do. A missing capability that is optional fails only the command that needs it. A missing capability that protects data or authority ends the connection and names the upgrade.
+
+A caller that names no Presentation kinds reads every kind its protocol version already carries; a later Presentation kind reaches only a caller that names it.
+
+A caller that does not name a later kind receives no frame for it, and its cursor advances past it. An older handshake still receives `neha.message.added` and the other kinds its version carries, and it skips only the new ones.
+
+A caller declares the Presentation event kinds it reads as a capability, and the command surface defines the capability names and the fixed set of kinds each one admits. A capability admits no kind added after it was published; a later kind needs a new capability name.
 
 Turning full access on needs the consent version the Space states. An older caller that sends none is refused, and nothing is recorded.
 

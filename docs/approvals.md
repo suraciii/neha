@@ -1,6 +1,6 @@
 # Approvals
 
-This guide shows when a Bot asks before an action, how to answer, and how to make lasting Ask and Allow rules. It follows [Add a Local Computer](computer.md), so a Local Computer is paired and a Bot works on it.
+This guide shows when a Bot asks before an action, how to answer, and how to make lasting Ask and Allow rules. It follows [Computers](computer.md), so a Local Computer is paired and a Bot works on it.
 
 ## When a Bot asks
 
@@ -10,7 +10,7 @@ A Bot also asks before the first run of a skill's script, on a Hosted or a Local
 
 Files move through the Bot's shell (`neha file get` and `neha chat send --file`), so they wait on the shell action's approval; there is no separate File action.
 
-In granted mode a `write_file` that would write outside the Bot's Workspace, its granted folders, and the run's `--cwd` directory asks as well, when the Space can locate the target path. Allow runs it once, Always allow grants the folder for later runs, and Deny ends the run. A shell that writes outside that range is refused by the fence rather than turned into a request, and a Bot with full access never gets a folder card. [Add a Local Computer](computer.md#file-access-and-a-runs-directory) covers the fence and the commands that widen it.
+In granted mode a `write_file` that would write outside the Bot's own directory inside its Computer's Workspace, its granted folders, and the run's `--cwd` directory asks as well, when the Space can locate the target path. Allow runs it once, Always allow grants the folder for later runs, and Deny ends the run. A shell that writes outside that range is refused by the fence rather than turned into a request, and a Bot with full access never gets a folder card. [Computers](computer.md#file-access-and-a-runs-directory) covers the fence and the commands that widen it.
 
 Only the User the Bot acts for can answer. An Allow runs the action once; an Always allow also covers later actions of that kind.
 

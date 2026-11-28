@@ -76,6 +76,10 @@ const computer = {
   kind: "local",
   online: true,
   workspace: "/w",
+  // Its name for its owner, which is what the client shows beside its kind.
+  name: "Workstation",
+  sharing: "shared" as Computer["sharing"],
+  space: false,
   supports_grants: true,
   supports_full_access: true,
   // The daemon fences this machine's commands, and it has said so. A test may
@@ -89,19 +93,26 @@ const otherComputer = {
   kind: "local",
   online: false,
   workspace: "/other",
+  name: "Laptop",
+  sharing: "shared" as Computer["sharing"],
+  space: false,
   supports_grants: true,
   supports_full_access: true,
   sandboxed: true as boolean | null,
 };
-// A Computer the Space runs itself, which only a reset can clear.
+// The Computer the Space runs itself, which every User gets when they first
+// create a Bot. A Hosted Computer's sharing may change.
 const hostedComputer = {
   id: "p5",
   owner: "u1",
   kind: "hosted",
   online: true,
   workspace: "/hosted",
-  supports_grants: true,
-  supports_full_access: true,
+  name: "Space Computer",
+  sharing: "shared" as Computer["sharing"],
+  space: true,
+  supports_grants: false,
+  supports_full_access: false,
   sandboxed: true,
 };
 // A fresh Chat carries only what its creation events name: a test that wants
@@ -427,6 +438,10 @@ export const space = {
   // The Bots a test created, with what each was asked for.
   creates: [] as { name: string; computer?: string }[],
   resets: [] as string[],
+  // The Hosted Computers the Space was asked to create, and the sharing
+  // changes it was asked to make.
+  computerCreates: [] as { name: string; sharing: Computer["sharing"] }[],
+  computerUpdates: [] as { computer: string; sharing: Computer["sharing"] }[],
   // The rules the Space was asked to add and to remove.
   ruleAdds: [] as unknown[],
   ruleRemoves: [] as string[],
@@ -450,10 +465,16 @@ export const space = {
     space.releaseLists();
     space.computer.kind = "local";
     space.computer.online = true;
+    space.computer.name = "Workstation";
+    space.computer.sharing = "shared";
+    space.computer.space = false;
     space.computer.workspace = "/w";
     space.computer.id = "p1";
     space.otherComputer.kind = "local";
     space.otherComputer.online = false;
+    space.otherComputer.name = "Laptop";
+    space.otherComputer.sharing = "shared";
+    space.otherComputer.space = false;
     space.otherComputer.workspace = "/other";
     space.otherComputer.id = "p9";
     space.computer.supports_grants = true;
@@ -464,6 +485,11 @@ export const space = {
     space.otherComputer.sandboxed = true;
     space.hostedComputer.sandboxed = true;
     space.hostedComputer.kind = "hosted";
+    space.hostedComputer.name = "Space Computer";
+    space.hostedComputer.sharing = "shared";
+    space.hostedComputer.space = true;
+    // A test that created a Computer leaves the first three in place.
+    space.computers = computers;
     space.bot.name = "Scout";
     space.bot.computer = "p1";
     space.bot.full_access = false;
@@ -516,11 +542,9 @@ export const space = {
     space.creates = [];
     for (const key of Object.keys(made)) delete made[key];
     madeBots = 0;
-    // The Computers a test's creates made go with them.
-    for (let index = computers.length - 1; index >= 0; index -= 1) {
-      if (computers[index]?.id.startsWith("p-made-")) computers.splice(index, 1);
-    }
     space.resets = [];
+    space.computerCreates = [];
+    space.computerUpdates = [];
     space.ruleAdds = [];
     space.ruleRemoves = [];
     space.connects = [];
@@ -774,6 +798,47 @@ export class FakeCommands {
       }
       case "computer_list":
         return space.computers.map((known) => ({ ...known })) as T;
+      case "computer_create": {
+        // A Space names the Hosted Computer it now holds and writes it to the
+        // record, so the page hears about its own write.
+        const asked = args as { name: string; sharing: Computer["sharing"] };
+        space.computerCreates.push(asked);
+        const created: Computer = {
+          // An id the paired Computers do not carry, so a created Computer is
+          // never mistaken for one the machine paired.
+          id: `p${space.computers.length + 10}`,
+          owner: "u1",
+          kind: "hosted",
+          online: true,
+          workspace: `/hosted/${asked.name}`,
+          name: asked.name,
+          sharing: asked.sharing,
+          space: false,
+          supports_grants: false,
+          supports_full_access: false,
+          sandboxed: true,
+        };
+        space.computers = [...space.computers, created];
+        emit("neha.computer.created", {
+          computer: created.id,
+          owner: created.owner,
+          kind: created.kind,
+          workspace: created.workspace,
+          name: created.name,
+          sharing: created.sharing,
+          space: created.space,
+        });
+        return { ...created } as T;
+      }
+      case "computer_update": {
+        const asked = args as { computer: string; sharing: Computer["sharing"] };
+        const known = space.computers.find((entry) => entry.id === asked.computer);
+        if (!known) throw new Error("the fake Space has no such Computer");
+        space.computerUpdates.push(asked);
+        known.sharing = asked.sharing;
+        emit("neha.computer.updated", { computer: known.id, sharing: known.sharing });
+        return { ...known } as T;
+      }
       case "bot_show": {
         const asked = args as { bot: string };
         const known = botFor(asked.bot);
@@ -786,8 +851,8 @@ export class FakeCommands {
       }
       case "bot_create": {
         // A Bot answers with itself, its Computer, and its Chat, and the Space
-        // records the create as three events of its own, so the client hears
-        // about its own write and reads the workspace again.
+        // records the create as its own two events, so the client hears about
+        // its own write and reads the workspace again.
         const asked = args as { name?: string; computer?: string };
         const name = (asked.name ?? "").trim();
         if (name === "") throw new Error("a Bot needs a name");
@@ -799,27 +864,12 @@ export class FakeCommands {
         madeBots += 1;
         const id = `b-made-${madeBots}`;
         const chatId = `h-made-${madeBots}`;
-        // Without a named Computer the Bot gets one of its own, which the Space
-        // makes for it; a named one is the Computer the User picked, and "local"
-        // is the paired one.
-        let target: Computer;
-        if (asked.computer === undefined || asked.computer === "hosted") {
-          target = {
-            id: `p-made-${madeBots}`,
-            owner: "u1",
-            kind: "hosted",
-            online: true,
-            workspace: `/hosted-${madeBots}`,
-            supports_grants: true,
-            supports_full_access: true,
-            sandboxed: true,
-          };
-          computers.push(target);
-        } else if (asked.computer === "local") {
-          target = computer;
-        } else {
-          target = computers.find((known) => known.id === asked.computer) ?? hostedComputer;
-        }
+        // A Bot that names no Computer joins the owner's Space Computer, which
+        // every User receives; a named one is a Computer the User owns.
+        const target =
+          asked.computer === undefined
+            ? hostedComputer
+            : (computers.find((known) => known.id === asked.computer) ?? hostedComputer);
         const created: Bot = {
           id,
           owner: "u1",
@@ -839,16 +889,6 @@ export class FakeCommands {
         // alone until a run event does.
         const opened = { id: chatId, owner: "u1", bot: id } as unknown as Chat;
         space.chats = [...space.chats, opened];
-        // A Bot that got a Computer of its own is a Computer the Space made, so
-        // that is the one event of the three; a named one already existed.
-        if (asked.computer === undefined || asked.computer === "hosted") {
-          emit("neha.computer.created", {
-            computer: target.id,
-            owner: "u1",
-            kind: target.kind,
-            workspace: target.workspace,
-          });
-        }
         emit("neha.bot.created", {
           bot: id,
           owner: "u1",

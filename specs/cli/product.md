@@ -75,27 +75,33 @@ The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the
 
 ## Computers
 
-A Local Computer runs the CLI. `neha computer pair` joins the Local Computer on the machine where Neha runs.
+A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space. On the Space's own machine it uses the ticket the Space wrote; on another machine it uses a pairing code a signed-in User enters.
 
-It finds the startup ticket the Space wrote under the machine's Neha configuration directory, or asks the Space for one as the signed-in User; either way it pairs the Space the ticket names. `--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
+In this milestone the Space listens only on loopback, so `neha computer pair` accepts only loopback; the code path arrives with public deployment.
 
-`neha computer list` shows the Computers the User owns, Local and Hosted. `neha computer reset <computer>` clears a Hosted Computer's Workspace: every file and folder inside it is deleted, and the Workspace folder stays.
+On the Space's own machine it finds the startup ticket under Neha's configuration directory; on another machine the signed-in User's code names the Space. Either way it pairs the Space the ticket or code names.
 
-Only the Computer's owner resets it, and only a Hosted Computer is reset. A Computer with a queued, running, or waiting run refuses a reset until that run ends, and a second reset of an empty Workspace succeeds.
+`--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
+
+`neha computer list` shows the Computers the User owns, Local and Hosted. `neha computer reset <computer>` clears a Hosted Computer's Workspace: every Bot's directory and every file inside it are deleted, and the Workspace root stays.
+
+Only the Computer's owner resets it, and only a Hosted Computer is reset. A Computer with a Bot whose run is queued, running, or waiting refuses a reset until that run ends, and a second reset of an empty Workspace succeeds.
+
+`neha computer create` makes a Hosted Computer. `--name` names it, and `--shared` or `--exclusive` chooses who MAY use it; exclusive is the default. `neha computer update <computer> --shared` makes an exclusive Computer shared; `--exclusive` is refused while more than one Bot uses it.
 
 `neha bot create --computer` takes one of these:
 
 | Value | What happens |
 | --- | --- |
 | `local` | The owner's Local Computer; with several, the earliest one recorded |
-| `hosted` | A new Hosted Computer, one for the Bot |
-| A Local Computer id | The Computer with that id |
+| `hosted` | A new exclusive Hosted Computer, one for the Bot |
+| A Computer id | The Computer with that id, when the owner owns it |
 
-Without the option, a new Bot starts on a Hosted Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Local Computer.
+Without the option, a new Bot starts on its owner's Space Computer. A machine where a Hosted Computer cannot start fails the command and names `--computer local` as the alternative. `neha bot move` moves a Bot to another Computer its owner owns.
 
 `neha bot access <bot>` shows a Bot's file access: `full access: on` or `full access: off`, then one `grant <path>` line per granted folder, or `grants: none`. `neha bot show` prints the same lines and the Bot's own Model and thinking level when set.
 
-A Hosted Bot has no file access to change: its Workspace is the only place where its shell writes persistent files.
+A Hosted Bot has no file access to change: it starts in its own directory inside its Computer's Workspace, and that Workspace is the place where its shell writes persistent files.
 
 `neha bot create --model <model>` chooses the Bot's Model, and `--thinking minimal|low|medium|high|max` its level. Without them the Bot uses the Space's default. `neha model list` shows the Models and their levels.
 
@@ -117,11 +123,21 @@ Only the Bot's owner can change a Bot's access. A run uses the access recorded w
 
 `on` prints the risk, which names the configuration directory the Bot can then read, and asks for confirmation at a terminal. Without a terminal it needs `--yes`, and `off` asks for no confirmation.
 
-`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's Workspace. A Hosted Computer runs only in the Bot's own Workspace, and a run that names another directory fails.
+`neha chat send --cwd <path>` starts that run's actions in the named directory on a Local Computer. Without it they start in the Bot's own directory inside its Computer's Workspace. A Hosted Computer starts the run in that directory and refuses `--cwd`; its shell can reach the rest of the Computer's Workspace.
 
 The directory is that run's write root, is recorded with the run and shown on an approval card, and grants nothing to a later run. A path that is not absolute is refused.
 
 The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
+
+## Memory
+
+The Bot's owner and a User allowed to use the Bot read its memory from the CLI. [Bot](../bot/product.md#memory) owns what a memory entry is, its kinds and scopes, and who reads and clears one.
+
+`neha bot memory <bot>` prints the memory entries the User reads. Each entry prints its id, kind, scope, author, source, size, and content. The owner also sees every entry the owner does not read, with its metadata only.
+
+The command prints each kind's total used size and its limit. With no entry, it says to ask the Bot in a Chat to remember something.
+
+`neha bot memory remove <bot> <entry>` removes the entry with that id when the User can clear it, and refuses one the User cannot clear. The memory commands read and remove entries; a User adds and changes memory in a Chat.
 
 ## Approvals
 
@@ -131,7 +147,7 @@ The directory MUST exist and be a folder. In granted mode a directory inside a h
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in tool, a skill's script, or an MCP server's tool.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — a skill's script, or an MCP server's tool. A rule that names a memory tool or an unknown tool is refused.
 
 A rule that names a tool the loop does not offer MUST be offered by an MCP server enabled for the Bot and reachable by the acting User (the named server, when the rule names one). A name no such server lists is refused as unknown, so a misspelling is never recorded.
 
@@ -144,8 +160,6 @@ A shell rule can name how the command starts. A file tool with a path, such as `
 A `run_skill_script` rule names the skill and the script it matches. An MCP server's tool rule names the server with `--server` and the tool with `--tool`, or names the tool alone to match every server that offers it.
 
 `neha rule list` and the line `neha rule add` prints distinguish those identities. A server's tool rule shows the server's name. A skill's script rule shows the skill's name and the script's file name.
-
-A rule that names no server matches that tool on every server that offers it.
 
 At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, when the card offers it, for a rule, what Always allow covers.
 

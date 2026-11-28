@@ -38,6 +38,8 @@ fn main() {
         neha::record::CardData,
         neha::record::ChatCreated,
         neha::record::ComputerCreated,
+        neha::record::ComputerSharing,
+        neha::record::ComputerUpdated,
         neha::record::Event,
         neha::record::EventKind,
         neha::record::FileAdded,
@@ -64,6 +66,8 @@ fn main() {
         // The command surface.
         neha::surface::BotCreate,
         neha::surface::BotUpdate,
+        neha::surface::ComputerCreate,
+        neha::surface::ComputerUpdate,
         neha::surface::ClientFrame,
         neha::surface::CommandCall,
         neha::surface::FileSummary,

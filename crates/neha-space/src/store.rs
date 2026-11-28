@@ -987,6 +987,14 @@ mod tests {
                     "workspace": "/tmp/workspace",
                 }),
             ),
+            EventKind::ComputerUpdated => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({
+                    "computer": Id::new(),
+                    "sharing": "shared",
+                }),
+            ),
             EventKind::ChatCreated => EventDraft::new(
                 kind,
                 Author::User(user),

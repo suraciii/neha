@@ -6,7 +6,7 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 
 ## Laws
 
-1. A new Bot starts on a Hosted Computer, unless its owner creates it on a Local Computer.
+1. A new Bot starts on its owner's Space Computer, unless its owner creates it on another Computer.
 2. A Local Computer runs Neha and connects out to the Space.
 3. A Bot does what its Computer can do.
 4. Where Neha cannot set up an isolated environment, a Space has no Hosted Computer.
@@ -15,34 +15,47 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 
 | Kind | Who provides it | What it has |
 | --- | --- | --- |
-| Local | The User, on the machine where Neha runs | The machine's own files, logins, and software |
+| Local | The User, on a machine they control | The machine's own files, logins, and software |
 | Hosted | Neha, on the Space's own machine | An isolated environment Neha sets up, with files of its own, a terminal, and a browser |
+
+A User owns each Hosted Computer they create or receive. The Space Computer is the Hosted Computer every User receives by default.
+
+A Bot's loop and record live in its Space; its actions run on its Computer.
 
 ## Keeping files
 
-A Hosted Computer keeps its Bot's Workspace in the Space, and a restart of the Space keeps it.
+A Computer keeps one Workspace. A Hosted Computer keeps its Workspace in the Space, and a restart of the Space keeps it.
 
-Resetting a Hosted Computer clears its Bot's Workspace: every file and folder inside it is deleted, and the Workspace folder stays.
+Each Bot works in its own directory inside its Computer's Workspace. A Bot on a Hosted Computer starts in that directory; the sandbox mounts the whole Computer Workspace, so Bots on the same Hosted Computer can read and write each other's files.
+
+Resetting a Hosted Computer clears every Bot's directory in its Workspace: every file and folder inside it is deleted, and the Workspace root stays.
 
 Only the Computer's owner resets it.
 
-A Local Computer keeps each Bot's Workspace on the machine, and the Space keeps no copy.
+A Local Computer keeps its Workspace on the machine, and the Space keeps no copy. Each Bot works in its own directory there, as it does on a Hosted Computer.
 
 ## Assigning a Computer
 
-A Bot's page shows its Computer. The owner picks a Hosted Computer, or creates the Bot on the Local Computer where Neha runs.
+A Bot's page shows its Computer. A new Bot starts on its owner's Space Computer unless its owner names another Computer they own.
 
-Only a Bot's owner can move it from one of their Local Computers to another Local Computer they own. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
+A User owns the Hosted Computers they create or receive. They can create a Hosted Computer that is shared or exclusive:
 
-Several Bots can be assigned the same Computer, and then share its files and logins. The Bots on one Computer are not isolated from each other.
+| Sharing | Who MAY use it |
+| --- | --- |
+| Shared | Any of the owner's Bots |
+| Exclusive | One Bot; another Bot MAY use it only after the owner makes it shared |
+
+The owner creates a Bot on a Computer they own, and can move a Bot between their Computers. Moving works between Hosted and Local Computers in either direction. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
+
+Several Bots can be assigned the same shared Computer, and then share its files and logins. On a Local Computer they also share the machine's processes; on a Hosted Computer each run's shell has its own process namespace, while the Computer Workspace is shared. The Bots on one Computer are not isolated from each other.
 
 ## Adding a Local Computer
 
-A User adds the Local Computer of the machine where Neha runs. Joining needs no code: the Space issues a local ticket, and the User starts the pairing there and confirms it.
+A User adds a Local Computer they control. A signed-in client makes that machine available, and the Space pairs it with that User; [Identity](../identity/product.md#devices) covers the code.
 
-A Local Computer on the machine where Neha runs is the only Local Computer this contract covers. [Identity](../identity/design.md#codes) covers the ticket, and [CLI](../cli/product.md) covers the commands.
+A Local Computer MAY run on the machine that runs the Space or on another machine that can reach the Space. It connects out to the Space and listens on no network port.
 
-The Computer belongs to the User the ticket names; that owner sees it among their Local Computers and can assign their Bots to it, and other Users do not see it.
+The Computer belongs to the User the pairing names; that owner sees it among their Local Computers and can assign their Bots to it, and other Users do not see it.
 
 The machine serves the Space while it runs; after a stop, the User starts it again.
 
@@ -70,9 +83,9 @@ A Bot can ask the User to take control, for example to sign in.
 
 A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a Hosted Computer, a Bot operates the browser. Programs with windows of their own run only on a Local Computer.
 
-A Bot on a Hosted Computer works only in its Workspace.
+A Bot on a Hosted Computer starts in its own directory inside its Computer's Workspace, and its shell can reach the rest of that Workspace.
 
-On a Local Computer, a Bot starts in its own Workspace on that machine, and its default write range is that Workspace. It reads what the machine's user can read. [Design](design.md#isolation) hides the Computer's own configuration directory from a Bot with granted folders.
+On a Local Computer, a Bot starts in its own directory inside its Computer's Workspace, and its default write range is that directory. It reads what the machine's user can read. [Design](design.md#isolation) hides the Computer's own configuration directory from a Bot with granted folders.
 
 A Windows Local Computer is an explicitly unsandboxed mode. Its commands run with the machine user's rights, not only in the Bot's folder; the owner accepts a warning before Neha starts it, and the Space operator opts in on the wire. Grants, full access, and a run directory are unavailable in this mode.
 
@@ -109,10 +122,8 @@ A credential never appears in a Chat or a Group.
 
 ## Gaps
 
-- A provider-backed Hosted Computer is not yet specified, including its start, stop, recovery, and destruction.
+- Starting, stopping, and waking a Hosted Computer are not yet available.
+- Deleting a Hosted Computer is not yet specified.
 - Saving a Workspace and restoring one are not yet specified.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
-- Waking a sleeping Computer is not yet specified and is low in priority.
 - Revoking a Computer's credential is not yet specified.
-- Adding a Computer on another machine is not yet specified.
-- Moving a Bot to or from a Hosted Computer is not yet specified, including how its Workspace is carried.

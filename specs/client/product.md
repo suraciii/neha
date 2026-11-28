@@ -31,7 +31,7 @@ adds only the choice of where the Space lives.
 
 On first launch the shell shows **Choose a Space**:
 
-- **This computer** starts a private bundled Space and opens that Space's
+- **This computer** starts a Local Space and opens that Space's
   invitation or sign-in page. The shell never creates the Admin or signs in for
   the User.
 - **Existing Space** connects to an `https://` address, or a loopback `http://`
@@ -41,7 +41,7 @@ The chosen Space is remembered. Later launches open it directly; a missing
 session shows its sign-in page. **Change Space** forgets the choice, stops the
 local Space, and returns to the chooser.
 
-A remote Space starts no local Space and no Local Computer daemon. **This
+A Hosted Space starts no Local Space and no Local Computer daemon. **This
 computer** MAY start a Local Computer only when the User selects the explicit
 Local Computer checkbox in the launcher.
 
@@ -93,7 +93,7 @@ A new Space has no Provider and no Bot. The main area then shows two steps.
 The shell remains during first run. On a viewport 900 CSS pixels or narrower, the steps fill the main area.
 
 1. The Admin connects an OpenAI-compatible Provider with a base URL, an API key, and one Model name. The API key is never displayed again.
-2. The User creates a Bot with a name. A new Bot has one owned Chat and one Hosted Computer.
+2. The User creates a Bot with a name. A new Bot has one owned Chat and starts on its owner's Space Computer.
 
 A User who is not the Admin sees that an Admin MUST connect the Provider. The client creates no Bot before a Provider exists.
 
@@ -108,6 +108,8 @@ Unread is the client's own memory of a Message that landed while the User was no
 ## A Chat
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
+
+Every User who reads the Chat sees a marker where a compacted part ends, and it says that earlier Messages were compacted. The marker has no action, the Chat still shows every Message, and no summary appears to the User.
 
 A Message that carries a File shows a file card with the File's name and size. Choosing the card downloads the File, and the browser opens no File itself. [Message](../messaging/message/product.md#files) owns what a File is and where its bytes live.
 
@@ -139,7 +141,7 @@ The Needs attention entry opens the [Needs attention view](../messaging/notifica
 
 The Bots entry lists the User's Bots. Selecting one opens that Bot's page.
 
-The list offers **New Bot**: the User names the Bot and picks its Computer. The choice lists the Local Computers the User owns, and one that is offline cannot be picked. Without a choice the Bot starts on a new Hosted Computer.
+The list offers **New Bot**: the User names the Bot and picks its Computer. The choice lists the Local Computers the User owns, and one that is offline cannot be picked. Without a choice the Bot starts on the User's Space Computer.
 
 The client opens the new Bot's Chat. [Bot](../bot/product.md#creating-a-bot) owns what a new Bot starts with, and [Computer](../computer/product.md#adding-a-local-computer) owns when a paired Computer is online.
 
@@ -147,7 +149,7 @@ A Bots list with no Bot shows the same action.
 
 The page shows the Bot's name, its picture, its Computer, its Model, and its access. [Bot](../bot/product.md#the-bots-page) owns each field and who changes it.
 
-The owner changes the Bot's name on the page. The page shows the Computer's kind and whether it is online, and the owner moves a Local Bot to another Local Computer they own. A Hosted Bot does not move.
+The owner changes the Bot's name on the page. The page shows the Computer's kind and whether it is online, and the owner moves the Bot to another Computer they own. A Hosted Computer is not special.
 
 The owner chooses the Bot's Model and thinking level on the page, and clears each back to the Space's default. Without one of its own, the Bot uses the Space's default, which the Admin sets in Settings. [Model](../model/product.md#choosing) covers the choice.
 
@@ -160,6 +162,20 @@ The Bot's page lists its Ask and Allow rules, and the owner removes them there. 
 A Hosted Bot's page still lists and removes the rules it holds for calls the Space answers — a skill's script or an MCP server's tool — which apply on either Computer. [Bot](../bot/product.md#asking-before-an-action) owns what a rule covers.
 
 The page shows who can use the Bot, and changing that is not yet available.
+
+### Memory
+
+The Bot's page lists the memory entries the User reads, grouped by kind and scope. Each entry names its author, source, and size and shows its content. [Bot](../bot/product.md#memory) owns what a memory entry is, its kinds and scopes, and who reads and clears one.
+
+The owner also sees every entry the owner does not read, with only its scope, author, source, and size.
+
+Each row offers removal to the User who can clear that entry.
+
+The page shows each kind's total used size and its limit.
+
+With no entry, the page says to ask the Bot in a Chat to remember something.
+
+The page offers no control that adds or changes an entry. A User adds and changes memory in a Chat.
 
 ## Integrations
 
@@ -185,11 +201,13 @@ A Space with no Provider shows that empty state with the action that connects on
 
 ## Computers
 
-The settings list every Computer the User owns, Local and Hosted, with its kind and whether it is online. Each Computer says what a Bot's shell runs as on it, and one that has not answered the Space yet says it waits. [Computer](../computer/product.md) owns what a Computer is.
+The settings list every Computer the User owns, Local and Hosted, with its name, kind, sharing, and whether it is online. Each Computer says what a Bot's shell runs as on it, and one that has not answered the Space yet says it waits. [Computer](../computer/product.md) owns what a Computer is.
+
+The owner creates a Hosted Computer from that list, choosing a name and whether it is shared or exclusive. The owner makes an exclusive Computer shared there.
 
 The owner resets a Hosted Computer from that list. The reset asks for confirmation and names what it deletes. [Computer](../computer/product.md#keeping-files) covers the reset.
 
-A Bot moves on its own page, between the Local Computers its owner owns.
+A Bot moves on its own page, between the Computers its owner owns.
 
 ## Language
 

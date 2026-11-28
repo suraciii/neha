@@ -10,13 +10,13 @@ Identity has to disappear for a user alone, work on whatever the Space runs on, 
 
 A User's identity is an account on the Space: a display name and a way to sign in.
 
-The built-in Space signs its first user in without a prompt; that user is its Admin.
+A Local Space signs its first user in without a prompt; that user is its Admin.
 
-A remote Space signs a User in with a passkey, with a password, or with an external provider added as a Plugin.
+A Space reached over the network signs a User in with a passkey, with a password, or with an external provider added as a Plugin.
 
 The Admin invites a User with a link. The invited User sets a name and a way to sign in, and joins.
 
-A device joins by showing a code that a signed-in User enters in an app, except a Local Computer on the Space's own machine, which joins without one.
+A device joins by showing a code that a signed-in User enters in an app. A Local Computer on the Space's own machine joins without one, through a local ticket.
 
 ## Why this way
 
@@ -26,17 +26,17 @@ A passkey is offered when the Space has a domain and HTTPS, and a password is al
 
 Invitations are links because email is the one thing a self-hoster does not want to configure.
 
-A device shows a code because a terminal or a headless machine cannot receive a sign-in, and a user already signed in can vouch for it. A Local Computer on the Space's own machine needs no code because the User who pairs it starts the pairing there.
+A device shows a code because a terminal or a headless machine cannot receive a sign-in, and a user already signed in can vouch for it. A Local Computer on another machine joins the same way; one on the Space's own machine needs no code because the User starts the pairing there.
 
 Sign-in methods are Plugins because a Space that already has an identity provider can use it, and one that does not sees nothing about it.
 
 ## Principles
 
 - **Accounts live on the Space.** A User is known to a Space by an account on it, with a display name and a way to sign in.
-- **No sign-in step when alone.** The built-in Space signs its first user in without a prompt, and that user is its Admin.
-- **Passkey when the Space can, password always.** A Space with a domain and HTTPS offers a passkey; every remote Space offers a password.
+- **No sign-in step when alone.** A Local Space signs its first user in without a prompt, and that user is its Admin.
+- **Passkey when the Space can, password always.** A Space with a domain and HTTPS offers a passkey; every Space reached over the network offers a password.
 - **Invite by link.** The Admin makes an invitation link; the invited User sets up their own account.
-- **Devices join by code, except the Local Computer.** A CLI shows a code, and a signed-in User enters it; a Local Computer on the Space's own machine joins without one.
+- **Devices join by code; a same-machine Computer by ticket.** A CLI shows a code, and a signed-in User enters it; a Local Computer on the Space's own machine joins through a local ticket.
 - **Sign-in methods are Plugins.** An external provider is added to a Space as a Plugin and shows up on its sign-in page.
 
 ## What this enables

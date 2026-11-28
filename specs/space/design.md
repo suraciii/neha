@@ -41,6 +41,8 @@ A Space migrates the record of an older version in place, in one transaction, an
 
 A Space refuses to start when the record's version is newer than its build's, and the refusal names both versions. An older build refuses a record a newer build migrated, so a downgrade needs the operator's own copy of the home.
 
+Adding a Presentation event kind changes no table, so the record's schema version does not change.
+
 A Space makes no backup of its home before it migrates. [Storage](#storage) covers what a backup holds.
 
 ## Events
@@ -50,6 +52,14 @@ An event has a kind, a version, an author, and data. A kind belongs to the Kerne
 An installed Plugin declares no kind. [Plugin](../plugin/design.md#record) states what one can write.
 
 A reader keeps every event. A kind it does not know that decides who can read or act makes it stop and ask for an upgrade.
+
+A caller that names no Presentation kinds reads every kind its protocol version already carries; a later Presentation kind reaches only a caller that names it.
+
+A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory and compaction kinds change no right to read, write, act, or approve.
+
+A caller names the capability that admits a later kind, such as `memory`; the command surface defines the capability names and the fixed set of kinds each one admits, as [CLI](../cli/design.md#versions) states. A capability admits no kind added after it was published; a later kind needs a new capability name.
+
+A capable caller still receives only the events its account can see.
 
 ## Approval events
 
@@ -84,9 +94,47 @@ A rename changes no authority, so the Bot's owner, its access, and its rules sta
 
 A `bot_update` that clears the Bot's Model or thinking level records the clear on the same `neha.bot.updated` event; a replay leaves the field empty and the Bot uses the Space's default. A record written before that flag replays as no clear. The Space refuses a clear and a choice for the same field together, so no event holds both.
 
+## Memory events
+
+The record holds these kinds for a Bot's memory:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.memory.added` | The entry: its id, Bot, kind, scope, author, source, text, and `replaces: [id]`, the entries it replaces |
+| `neha.memory.removed` | The entry's id |
+| `neha.memory.answered` | The run, step, call, and the answer a memory tool gave |
+
+The `replaces` list names every entry the write replaces, so a replay applies the whole write or none.
+
+For each memory tool result the Bot receives, the Space records the exact answer, including a no-op, a refusal, or an error. The answer is appended in the same commit as the entry changes the call makes, or alone when the call changes no memory entry. A replay takes the recorded answer and does not run the memory call again.
+
+Each memory kind is a Presentation event: a reader that does not know the kind skips it and asks for no upgrade.
+
+A `neha.memory.added` event and a `neha.memory.answered` event are authored by the Bot, with the acting User. A `neha.memory.removed` event is authored by the User who removes the entry; the Bot authors it, acting for that User, when it removes a `note`.
+
+A memory event goes only to its author or acting User, so the owner never receives a `user` entry's text.
+
+The owner reads an entry's metadata through the command surface.
+
+## Chat events
+
+The record holds this kind for a compacted conversation:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.chat.compacted` | The Chat or Group, `up_to_seq`, the summary, and the Bot that wrote it |
+
+It is a Presentation event: a reader that does not know the kind skips it and asks for no upgrade.
+
+The event is authored by the Bot with the acting User.
+
+The event marks the span up to `up_to_seq` as compacted, and the record keeps every original Message.
+
 ## Event visibility
 
 Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.provider.added`, `neha.provider.models_updated`) go to every account, because each one's data is already readable through `provider list` or `model list`. An event the account cannot see still advances its cursor.
+
+A `neha.chat.compacted` frame goes to every User who reads its Chat, because the compacted span belongs to the Chat.
 
 ## Projections
 

@@ -8,13 +8,17 @@ Neha is one Rust codebase assembled by deliverable. The Space is the server: it 
 
 | Deliverable | Processes | How it reaches the Space |
 | --- | --- | --- |
-| Server, `neha serve` | The Space | Listens on the network from its first start |
-| Desktop app | An Electron shell, a `neha serve` child, and a `neha computer` child once the User turns this machine on | The window loads a Space's address, its own or a remote one; closing the window hides the app, and the built-in Space keeps running unless the User set the app to exit |
+| Server, `neha serve` | The Space | Listens on loopback; a TLS proxy presents its origin |
+| Desktop app | An Electron shell, a `neha serve` child for a Local Space, and a `neha computer` child for a Local Computer | The window loads the Local Space or a Hosted Space; closing the window hides the app, and a Local Space keeps running unless the User set the app to exit |
 | Web | None | Any browser; the Space serves the complete client |
-| Android app | A Capacitor shell | Connects to a remote Space; the same UI runs in the system WebView |
+| Android app | A Capacitor shell | Connects to a Space; the same UI runs in the system WebView |
 | CLI, `neha <command>` | A client | The command surface |
-| Real Computer | `neha computer`, a resident process | An outbound connection it initiates |
-| Hosted Space | The Space, run by Neha | The same as a server |
+| Local Computer | `neha computer`, a resident process on a machine a User controls | An outbound connection it initiates |
+| Hosted Computer worker | One worker process in a container on the Space's machine, in the container deployment | An outbound Computer channel it initiates |
+| Hosted Space | The Space on a server, run by the User or Neha | The same as a server |
+| Supervisor | A container-deployment control process | Internal HTTP from the Space; never public |
+
+A Space runs as a Local Space or a Hosted Space; the contract is the same. [Space](../specs/space/product.md) states the deployment behavior. A Hosted Computer runs in the Space process when the Space is local or the deployment is not containerized, and in a worker container for the container deployment. [Container deployment](container-deployment.md) states that shape.
 
 ```text
   CLI, Web, desktop window, Android
@@ -27,13 +31,13 @@ Neha is one Rust codebase assembled by deliverable. The Space is the server: it 
         │                     ▲
         │ bytes of Files      │ outbound HTTPS,
         ▼                     │ one WebSocket per screen
-   local directory or         neha computer on a real machine
-   one S3 bucket prefix
+   local directory or         a Local Computer, or a Hosted Computer worker
+   one S3 bucket prefix       in the container deployment
 ```
 
-The built-in Bot loop runs inside the Space and acts as a Bot through the command surface. [Bot](../specs/bot/design.md) states where work runs.
+The built-in Bot loop runs inside the Space and acts as a Bot through the command surface. [Bot](../specs/bot/design.md) states where work runs. A containerized Hosted Space uses the same Computer channel for a worker; [Container deployment](container-deployment.md) states that topology.
 
-A built-in Space signs its first User in through a secret that the desktop shell creates for one launch and hands to the `neha serve` child over a pipe. A Space on a server prints an invitation link for its first Admin. [Identity](../specs/identity/product.md) covers both.
+A Local Space signs its first User in through a secret that the desktop shell creates for one launch and hands to the `neha serve` child over a pipe. A Hosted Space prints an invitation link for its first Admin. [Identity](../specs/identity/product.md) covers both.
 
 ## Four planes
 
@@ -59,7 +63,11 @@ Calls to an MCP server leave from the Space too, with a credential from the Vaul
 
 ## Record and storage
 
-SQLite is the source of truth. The record is an append-only log plus projections, and each Space has one local home directory. File bytes live in a store the operator configures: a directory in that home, or one prefix of an S3-compatible bucket. [Space](../specs/space/design.md) states the invariants.
+SQLite is the source of truth. The record is an append-only log plus projections, and each Space has one local home directory. File bytes live in a store the operator configures: a directory in that home, or one prefix of an S3-compatible bucket.
+
+Each Hosted Computer keeps one Workspace root in the home at `workspaces/<computer-id>`, and each Bot works in its own directory at `workspaces/<computer-id>/<bot-id>`. Several Bots may share one Hosted Computer, each in its own directory.
+
+A containerized Hosted Space mounts that home from the host. Each Hosted Computer worker mounts only the Workspace root it serves, and the Bots that share the Computer share that root. [Space](../specs/space/design.md) states the invariants and [Container deployment](container-deployment.md) states the mount layout.
 
 ## Plugin kernel
 
@@ -104,13 +112,17 @@ Shared dependency versions are declared once in the root `[workspace.dependencie
 - Every dependency's license must be compatible with GPL-3.0-only.
 - A configuration file or manifest Neha owns is TOML. A file a standard defines keeps that standard's format.
 
+## Container deployment
+
+A Hosted Space can run in a container instead of directly on its machine. The Space container keeps no bwrap and no Docker socket; a Supervisor creates one worker container per Hosted Computer; each worker connects out over the Computer channel. [Container deployment](container-deployment.md) states the topology, trust boundaries, storage, and lifecycle. A Local Space and a Local Computer stay outside this shape.
+
 ## Cross-cutting conventions
 
 - Every long-lived connection carries an application-level heartbeat, because proxies drop idle connections.
 - Diagnostics do not leave the Space's machine by default.
-- Design scale is one machine, one process, and hundreds of Users and Bots.
+- Design scale is one machine, one Space process, and the Hosted Computer workers on it; a Space serves hundreds of Users and Bots.
 - An upgrade runs versioned migrations after an automatic backup and promises an upgrade from the previous release only.
-- A backup copies the Space home and the objects of its File store, starting from a consistent database snapshot. A restore on another machine also takes the Vault's master key.
+- A backup copies the Space home, including each Hosted Computer's Workspace root under `workspaces/<computer-id>`, and the objects of its File store, starting from a consistent database snapshot. A restore on another machine also takes the Vault's master key.
 
 ## Where a rule lives
 

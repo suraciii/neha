@@ -61,12 +61,12 @@ As a user with a multi-stage job, I want to assign one Bot to each stage in a Gr
 
 As a user with several machines, I want a Bot that lives on each one and learns it, so that I can get things done on any of them from anywhere.
 
-This is what sets Neha apart. A Bot runs on a Hosted Computer or on the Local Computer where Neha runs; on the Local one, its files, logins, and software are the machine's own. The user reaches it from any client, its screen is a panel in the Chat, and it keeps working when the client is closed.
+This is what sets Neha apart. A Bot's actions run on a Hosted Computer or on a Local Computer a User controls; on the Local one, its files, logins, and software are the machine's own. The user reaches it from any client, its screen is a panel in the Chat, and it keeps working when the client is closed.
 
 - Exercises:
   - Bot
   - Computer
-  - remote Space
+  - Hosted Space
   - phone client
   - memory
   - File

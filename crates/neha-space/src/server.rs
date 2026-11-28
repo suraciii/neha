@@ -188,6 +188,9 @@ pub struct SpaceServer {
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
     /// Serializes approval answers and rule changes.
     pub(crate) approvals: tokio::sync::Mutex<()>,
+    /// Serializes Computer creation and Bot assignment, so an exclusive
+    /// Computer cannot take two Bots and a create cannot race a move.
+    pub(crate) computer_assignments: tokio::sync::Mutex<()>,
     /// Serializes Provider writes, so a refresh and a default change cannot
     /// each build their Model list from a read the other replaced.
     pub(crate) provider_writes: tokio::sync::Mutex<()>,
@@ -228,6 +231,101 @@ pub struct SpaceServer {
     pub(crate) signin_start: tokio::sync::Mutex<()>,
     /// The OAuth client that plans and finishes a browser sign-in.
     pub(crate) oauth: crate::oauth::OAuthClient,
+}
+
+/// Moves a Hosted Workspace written before one root per Computer into the
+/// current layout.
+///
+/// An old record names `<home>/computers/<computer>/workspace`; its Hosted
+/// Computer held one Bot. The new layout is
+/// `<home>/workspaces/<computer>/<bot>`. The move is idempotent: the old path
+/// is absent after the first start, and an existing new directory is never
+/// overwritten. Hosted views always name the derived root, even when no old
+/// directory exists.
+fn migrate_legacy_hosted_workspaces(
+    home: &Home,
+    state: &mut SpaceState,
+) -> Result<(), ServerError> {
+    for computer in state.computers.values_mut() {
+        if computer.kind != "hosted" {
+            continue;
+        }
+        computer.workspace = home
+            .workspace_dir(computer.id)
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    let home_root = std::fs::canonicalize(home.root())?;
+    let legacy_root = home_root.join("computers");
+    let workspaces_root = home_root.join("workspaces");
+    // The migration only touches the exact directories the old layout names.
+    // A symlink anywhere on the path would make that name resolve elsewhere,
+    // so every existing level must be a real directory under the home.
+    if !is_real_directory(&legacy_root) || !is_real_directory(&workspaces_root) {
+        return Ok(());
+    }
+    let computers: Vec<Id> = state
+        .computers
+        .values()
+        .filter(|computer| computer.kind == "hosted")
+        .map(|computer| computer.id)
+        .collect();
+    for computer in computers {
+        let source = legacy_root.join(computer.to_string());
+        if !is_real_directory(&source) {
+            continue;
+        }
+        let legacy = source.join("workspace");
+        if !is_real_directory(&legacy) {
+            continue;
+        }
+        let bots: Vec<Id> = state
+            .bots
+            .values()
+            .filter(|bot| bot.computer == computer)
+            .map(|bot| bot.id)
+            .collect();
+        // The old layout held one Bot per Hosted Computer. Anything else is
+        // not ours to guess at; leave the files where they are.
+        if bots.len() != 1 {
+            continue;
+        }
+        let target_root = workspaces_root.join(computer.to_string());
+        match std::fs::symlink_metadata(&target_root) {
+            Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_dir() => {}
+            Ok(_) => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // The parent is a verified real directory, so this creates the
+                // exact Computer root, not an alias to another one.
+                std::fs::create_dir(&target_root)?;
+            }
+            Err(error) => return Err(ServerError::Io(error)),
+        }
+        let target = target_root.join(bots[0].to_string());
+        if std::fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        std::fs::rename(&legacy, &target)?;
+        let _ = std::fs::remove_dir(&source);
+    }
+
+    if is_real_directory(&legacy_root)
+        && std::fs::read_dir(&legacy_root)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(&legacy_root);
+    }
+
+    Ok(())
+}
+
+/// Returns whether `path` is a directory and not a symlink.
+fn is_real_directory(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+        .unwrap_or(false)
 }
 
 impl SpaceServer {
@@ -280,6 +378,7 @@ impl SpaceServer {
         };
         let mut state = SpaceState::default();
         store.replay(&mut state).await?;
+        migrate_legacy_hosted_workspaces(&home, &mut state)?;
         let secrets = Secrets::load(&home)?;
         let push_contact = public_url
             .clone()
@@ -305,6 +404,7 @@ impl SpaceServer {
             links: ComputerLinks::new(),
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
             approvals: tokio::sync::Mutex::new(()),
+            computer_assignments: tokio::sync::Mutex::new(()),
             provider_writes: tokio::sync::Mutex::new(()),
             library: tokio::sync::Mutex::new(()),
             instructions_only,
@@ -3109,6 +3209,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             links: &server.links,
                             pairings: &server.pairings,
                             approvals: &server.approvals,
+                            computer_assignments: &server.computer_assignments,
                             provider_writes: &server.provider_writes,
                             library: &server.library,
                             runs: &server.runs,
@@ -3977,7 +4078,7 @@ pub mod test_support {
 
     use tokio::sync::Notify;
 
-    use super::{ApiError, PairingAttempts, Running, StreamError};
+    use super::{ApiError, PairingAttempts, Running, ServerError, StreamError};
     use crate::catalog::CatalogStore;
     use crate::computer_link::ComputerLinks;
     use crate::home::{Home, HomeError};
@@ -4019,6 +4120,8 @@ pub mod test_support {
         pub pairings: &'a tokio::sync::Mutex<PairingAttempts>,
         /// Serializes approval answers and rule changes.
         pub approvals: &'a tokio::sync::Mutex<()>,
+        /// Serializes Computer creation and Bot assignment.
+        pub computer_assignments: &'a tokio::sync::Mutex<()>,
         /// Serializes Provider writes.
         pub provider_writes: &'a tokio::sync::Mutex<()>,
         /// The run queue.
@@ -4045,6 +4148,7 @@ pub mod test_support {
                 links: &server.links,
                 pairings: &server.pairings,
                 approvals: &server.approvals,
+                computer_assignments: &server.computer_assignments,
                 provider_writes: &server.provider_writes,
                 runs: &server.runs,
                 events: &server.events,
@@ -4081,6 +4185,15 @@ pub mod test_support {
                 StreamError::Oversized(cursor) => CatchUpError::Oversized(cursor),
                 StreamError::Closed => CatchUpError::Closed,
             })
+    }
+
+    /// Migrates the old one-workspace-per-Hosted-Computer layout, as startup
+    /// does, so a test can inspect the result.
+    pub fn migrate_legacy_hosted_workspaces(
+        home: &Home,
+        state: &mut State,
+    ) -> Result<(), ServerError> {
+        super::migrate_legacy_hosted_workspaces(home, state)
     }
 
     /// Stores or updates one browser push subscription.
@@ -4224,6 +4337,7 @@ impl Running {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            computer_assignments: &server.computer_assignments,
             provider_writes: &server.provider_writes,
             library: &server.library,
             runs: &server.runs,

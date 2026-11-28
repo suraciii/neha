@@ -40,13 +40,13 @@ The first launch shows **Choose a Space**:
 
 The choice is saved in `desktop-space.json` under the app's user data. Later
 launches open that Space directly. A missing or expired session shows the
-Space's own sign-in page; the shell never signs in for the User. A remote Space
+Space's own sign-in page; the shell never signs in for the User. A Hosted Space
 must be served over `https`, normally by a trusted TLS proxy in front of its
-loopback listener with `NEHA_PUBLIC_URL` set; see [Quick start](../../docs/quickstart.md#connect-a-remote-client). **Neha →
+loopback listener with `NEHA_PUBLIC_URL` set; see [Quick start](../../docs/quickstart.md#connect-a-client-over-the-network). **Neha →
 Change Space…** (`Ctrl/Cmd+Shift+K`) clears the choice, stops the local Space,
 and returns to the chooser.
 
-A remote Space never starts the bundled Space or the local Computer daemon.
+A Hosted Space never starts the bundled Space or the local Computer daemon.
 
 ## Local Computer
 
