@@ -6751,6 +6751,70 @@ fn a_cancelled_device_sign_in_keeps_the_saved_credential() {
 }
 
 #[test]
+fn the_cli_refuses_an_ambiguous_user_and_takes_an_identifier() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let member_credential = directory.path().join("member").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let ada_id = field(&run(&home, &credential, &["whoami"]), "Id: ");
+
+    let created = run(&home, &credential, &["invitation", "create"]);
+    let link = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no invitation link:\n{created}"))
+        .to_owned();
+    // Eve's display name is Ada's identifier, so naming that identifier is
+    // ambiguous: it is a display name and another User's identifier at once.
+    run(
+        &home,
+        &member_credential,
+        &["join", &link, "--name", &ada_id],
+    );
+    let eve_id = field(&run(&home, &member_credential, &["whoami"]), "Id: ");
+    assert_ne!(ada_id, eve_id);
+
+    // The command refuses to guess.
+    let refused = cli(&home, &credential, &["user", "role", &ada_id, "admin"]);
+    assert!(!refused.status.success(), "an ambiguous name is refused");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("the identifier") && stderr.contains("--id"),
+        "{stderr}"
+    );
+
+    // A plain name still resolves, and --id reads an identifier.
+    let changed = run(&home, &credential, &["user", "role", &eve_id, "admin"]);
+    assert!(changed.contains("admin"), "{changed}");
+    let changed = run(
+        &home,
+        &credential,
+        &["user", "role", &eve_id, "member", "--id"],
+    );
+    assert!(changed.contains("member"), "{changed}");
+    let list = run(&home, &credential, &["user", "list"]);
+    assert!(list.contains("member"), "{list}");
+
+    // Ada's credential still saves the Owner account, but the Space moved the
+    // Space to Eve; whoami asks the Space instead of the saved answer.
+    let moved = run(&home, &credential, &["user", "transfer", &eve_id, "--id"]);
+    assert!(moved.contains("owner"), "{moved}");
+    assert!(
+        run(&home, &member_credential, &["whoami"]).contains("Role: owner"),
+        "the new Owner reads its live role"
+    );
+    assert!(
+        run(&home, &credential, &["whoami"]).contains("Role: admin"),
+        "the former Owner reads its live role"
+    );
+
+    drop(server);
+}
+
+#[test]
 fn a_device_code_sign_in_requires_a_server_when_none_is_saved() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");
@@ -6762,4 +6826,123 @@ fn a_device_code_sign_in_requires_a_server_when_none_is_saved() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn the_cli_invites_a_member_and_shows_roles() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let member_credential = directory.path().join("member").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    let who = run(&home, &credential, &["whoami"]);
+    assert!(who.contains("Role: owner"), "{who}");
+    let list = run(&home, &credential, &["user", "list"]);
+    assert!(list.contains("owner") && list.contains("Ada"), "{list}");
+
+    let created = run(&home, &credential, &["invitation", "create"]);
+    let link = created
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no invitation link:\n{created}"))
+        .to_owned();
+    assert!(created.contains("Expires:"), "{created}");
+    assert!(link.contains("/invite#"), "{link}");
+
+    // The invited person joins from the same machine but its own credential.
+    run(&home, &member_credential, &["join", &link, "--name", "Eve"]);
+    let who = run(&home, &member_credential, &["whoami"]);
+    assert!(who.contains("Role: member"), "{who}");
+    let list = run(&home, &credential, &["user", "list"]);
+    assert!(list.contains("member") && list.contains("Eve"), "{list}");
+
+    // A Member cannot invite.
+    let refused = cli(&home, &member_credential, &["invitation", "create"]);
+    assert!(!refused.status.success(), "a Member invites no one");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Owner or an Admin"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // The Owner makes the Member an Admin, and the invite works from there.
+    let changed = run(&home, &credential, &["user", "role", "Eve", "admin"]);
+    assert!(
+        changed.contains("admin") && changed.contains("Eve"),
+        "{changed}"
+    );
+    let created = run(&home, &member_credential, &["invitation", "create"]);
+    assert!(created.contains("Invitation: "), "{created}");
+
+    drop(server);
+}
+
+#[test]
+fn the_cli_lists_revokes_and_replaces_invitations() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let member_credential = directory.path().join("member").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+
+    let first = run(&home, &credential, &["invitation", "create"]);
+    let first_link = first
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no invitation link:\n{first}"))
+        .to_owned();
+    let pending = run(&home, &credential, &["invitation", "list"]);
+    assert!(pending.contains("expires"), "{pending}");
+    let invitation_id = first_word(&pending);
+    assert!(!invitation_id.is_empty(), "{pending}");
+
+    // A new link replaces the pending one: the older secret stops working.
+    let second = run(&home, &credential, &["invitation", "create"]);
+    let second_link = second
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no replacement link:\n{second}"))
+        .to_owned();
+    let refused = cli(
+        &home,
+        &member_credential,
+        &["join", &first_link, "--name", "Mallory"],
+    );
+    assert!(!refused.status.success(), "a replaced link admits no one");
+    run(
+        &home,
+        &member_credential,
+        &["join", &second_link, "--name", "Eve"],
+    );
+
+    // A link made after the two Users' joins can be revoked; it then admits
+    // no one.
+    let third = run(&home, &credential, &["invitation", "create"]);
+    let third_link = third
+        .lines()
+        .find_map(|line| line.strip_prefix("Invitation: "))
+        .unwrap_or_else(|| panic!("no third link:\n{third}"))
+        .to_owned();
+    let pending = run(&home, &credential, &["invitation", "list"]);
+    let revoke_id = first_word(&pending);
+    run(&home, &credential, &["invitation", "revoke", &revoke_id]);
+    assert!(
+        run(&home, &credential, &["invitation", "list"])
+            .trim()
+            .is_empty(),
+        "the revoked invitation is not pending"
+    );
+    let refused = cli(
+        &home,
+        &member_credential,
+        &["join", &third_link, "--name", "Mallory"],
+    );
+    assert!(!refused.status.success(), "a revoked link admits no one");
+
+    drop(server);
 }

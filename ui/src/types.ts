@@ -11,7 +11,7 @@
 
 import type { CatalogRefresh, CatalogStatus } from "./generated/catalog";
 import type { ErrorCode } from "./generated/error";
-import type { Account } from "./generated/identity";
+import type { Account, Role } from "./generated/identity";
 import type {
   ActionStatus,
   Author,
@@ -34,12 +34,15 @@ import type {
   ChatStatus,
   ChatView,
   ComputerView,
+  InvitationView,
   MemoryView,
   MessageView,
   ModelView,
   ProviderView,
   RuleView,
   StepView,
+  UserView,
+  CreatedInvitation as WireCreatedInvitation,
 } from "./generated/state";
 import type {
   ClientFrame,
@@ -64,6 +67,7 @@ export type {
   ComputerView as Computer,
   ErrorCode,
   FileSummary,
+  InvitationView as Invitation,
   MemoryKind,
   MemoryScope,
   MemorySourceKind,
@@ -72,18 +76,25 @@ export type {
   PlanEntry,
   PlanState,
   ProviderView as Provider,
+  Role,
   RunStatus,
   ServerFrame,
   StepView as RunStepView,
   ThinkingLevel,
   Undoability as Undoable,
   Usage,
+  UserView as User,
 };
 
 // What the Space's record now says beyond the generated shapes above. The
 // fields travel on the wire the same way the generated ones do; the generated
 // files are rebuilt from the Rust definitions with `just wire-types`, and until
 // then the client states the additions here, beside the shapes they extend.
+
+// The answer of `invitation_create`: the generated invitation and the one-time
+// secret its link carries, plus the account that made it. The Space builds the
+// answer as JSON, so the addition is stated here.
+export type CreatedInvitation = WireCreatedInvitation & { user: string };
 
 // One lasting rule as `rule_list` answers it. The generated view carries the
 // identifiers a rule stores; the read adds the names behind them — the skill's

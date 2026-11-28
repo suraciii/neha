@@ -80,15 +80,15 @@ docker compose up -d
 docker compose logs -f space
 ```
 
-The Space prints its invitation link when it has no Admin yet:
+The Space prints its invitation link when it has no User yet:
 
 ```text
 Open in a browser: https://neha.example.com/invite#<secret>
 ```
 
-Open it, create the Admin account, and connect a Provider. A Provider is needed before a Bot can answer. [Quick start](quickstart.md) covers the first Chat.
+Open it, create the Space Owner account, and connect a Provider. A Provider is needed before a Bot can answer. [Quick start](quickstart.md) covers the first Chat.
 
-If the Space has an Admin already, the log prints the sign-in address instead. The first start can take a few seconds while SQLite and the browser client are prepared.
+If the Space has a User already, the log prints the sign-in address instead. The first start can take a few seconds while SQLite and the browser client are prepared.
 
 Check the public origin:
 

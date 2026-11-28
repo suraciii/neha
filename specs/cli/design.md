@@ -23,9 +23,9 @@ The browser client reads and writes through the command surface, as the CLI does
 
 ## Management
 
-Management is what a signed-in User changes on the Space: its Providers and Models, a Bot and its memory, the access and Workspace of that Bot's Computer, and the rules. An authenticated browser session and the CLI reach the same management commands.
+Management is what a signed-in User changes on the Space: its Providers and Models, a Bot and its memory, the access and Workspace of that Bot's Computer, the rules, and its Users' roles and invitations. An authenticated browser session and the CLI reach the same management commands.
 
-The browser's Bot page, Settings, and Computers list issue the same commands the CLI issues for a Bot, its memory, a Model, and a Computer. Turning full access on means the same consent in both.
+The browser's Bot page, Settings, and Computers list issue the same commands the CLI issues for a Bot, its memory, a Model, and a Computer, and Settings' People section issues the invitation, role, and transfer commands. Turning full access on means the same consent in both.
 
 ## A Bot's shell
 

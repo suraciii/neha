@@ -14,7 +14,7 @@ use neha_space::blobs::test_s3;
 use neha_space::config::S3Storage;
 use neha_space::home::Home;
 use neha_space::secrets::Secrets;
-use neha_space::store::{AppendRequest, ContinuationWrite, Store};
+use neha_space::store::{AppendRequest, ContinuationWrite, Projection as _, Store};
 use neha_space::test_support::server::{CatchUpError, catch_up};
 use neha_space::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
 
@@ -1509,6 +1509,61 @@ async fn admin(running: &Running, invite: &str) -> (Socket, String) {
     (socket, token)
 }
 
+/// Adds an account with its recorded User, as an invitation join does, and
+/// returns the account's token.
+///
+/// The integration tests need more than one account; the product makes the
+/// second one by joining an invitation, so the fixture writes both the account
+/// and the `neha.user.joined` event the join would write.
+async fn add_joined_account(running: &Running, name: &str) -> String {
+    add_joined_member(running, name).await.1
+}
+
+/// Adds an account with its recorded User and returns its identifier and
+/// token, as an invitation join does.
+async fn add_joined_member(running: &Running, name: &str) -> (Id, String) {
+    let fields = running.test_fields();
+    let id = Id::new();
+    let (_account, token) = fields
+        .identity
+        .create_invited(id, name, "correct horse battery")
+        .await
+        .unwrap();
+    let appended = fields
+        .store
+        .append(AppendRequest::new(
+            Id::new(),
+            format!("join:{id}"),
+            vec![EventDraft::new(
+                EventKind::UserJoined,
+                Author::User(id),
+                json!({"display_name": name, "is_admin": false}),
+            )],
+        ))
+        .await
+        .unwrap();
+    {
+        let mut state = fields.state.lock().unwrap();
+        for event in &appended.events {
+            state.apply(event).unwrap();
+        }
+    }
+
+    (id, token)
+}
+
+/// Seeds the account a prebuilt record names, so the Space can serve it.
+///
+/// Fixtures that start a Space on a record they wrote themselves need the
+/// account row too; the start-up repair refuses a record without it.
+async fn seed_account(home: &Home, id: Id, name: &str) {
+    let identity = neha_space::identity::Identity::open(home).await.unwrap();
+    identity
+        .create_invited(id, name, "correct horse battery")
+        .await
+        .unwrap();
+}
+
 async fn admin_socket(running: &Running, invite: &str) -> Socket {
     admin(running, invite).await.0
 }
@@ -2084,6 +2139,7 @@ async fn a_restart_answers_an_interrupted_run() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let bot = Id::new();
     let computer = Id::new();
     let chat = Id::new();
@@ -2182,6 +2238,7 @@ async fn a_restart_notifies_about_the_run_it_fails() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let bot = Id::new();
     let computer = Id::new();
     let chat = Id::new();
@@ -2573,13 +2630,7 @@ async fn an_old_bot_create_replays_for_its_creator() {
     let replay = command(&mut socket, command_id, call.clone()).await;
     assert_eq!(replay, legacy);
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call).await;
     assert!(
@@ -2604,13 +2655,7 @@ async fn a_recorded_bot_create_answers_only_its_creator() {
         "the result names the User it belongs to"
     );
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call).await;
     assert!(
@@ -3224,13 +3269,7 @@ async fn a_provider_models_update_reaches_every_account() {
 
     // A second account opens its Settings: the snapshot holds the
     // Provider but no Model update yet.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
     let (cursor, events) = snapshot_events(&mut grace_socket).await;
     assert!(
@@ -3296,6 +3335,7 @@ async fn an_event_larger_than_one_frame_is_reported() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     store
         .append(AppendRequest::new(
             Id::new(),
@@ -3330,6 +3370,7 @@ async fn an_event_larger_than_one_frame_is_reported() {
         None,
         user,
         &std::collections::HashSet::new(),
+        true,
     )
     .await;
 
@@ -4007,6 +4048,7 @@ async fn a_recovered_unknown_write_reloads_its_own_continuation() {
     .await;
 
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let provider = Id::new();
     let model = Id::new();
     let computer = Id::new();
@@ -5343,13 +5385,7 @@ async fn a_provider_refresh_checks_a_kept_models_capabilities() {
     .await;
 
     // Grace owns the Bot that keeps `high`; a refusal must not name it.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let created = command(
         &mut grace_socket,
@@ -7910,13 +7946,8 @@ async fn an_old_record_without_a_queued_event_replays() {
 
     let directory = tempfile::tempdir().unwrap();
     let home = Home::open(directory.path()).unwrap();
-    let identity = neha_space::identity::Identity::open(&home).await.unwrap();
-    let account = identity
-        .test_add_account_for_test("Ada", "correct horse battery")
-        .await
-        .unwrap();
-    drop(identity);
-    let user = account.id;
+    let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let (bot, computer, chat) = (Id::new(), Id::new(), Id::new());
     let (message, run, command) = (Id::new(), Id::new(), Id::new());
     let store = Store::open(&home).await.unwrap();
@@ -8165,6 +8196,7 @@ async fn a_long_record_of_large_events_catches_up_across_frames() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let bot = Id::new();
     let chat = Id::new();
     let run = Id::new();
@@ -8249,6 +8281,7 @@ async fn a_long_record_of_large_events_catches_up_across_frames() {
         None,
         user,
         &std::collections::HashSet::new(),
+        true,
     )
     .await;
     assert!(result.is_ok());
@@ -8745,15 +8778,7 @@ async fn a_file_stays_with_the_account_of_its_chat() {
     assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
     // Another account may neither write to the Chat nor read its Files.
-    let identity =
-        neha_space::identity::Identity::open(&Home::open(running.server_home()).unwrap())
-            .await
-            .unwrap();
-    identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let foreign = upload(
         &running,
         &grace,
@@ -10982,13 +11007,7 @@ async fn revoking_a_local_computer_disconnects_it_and_survives_a_restart() {
     assert_eq!(again["online"], false);
 
     // Another User cannot revoke someone else's Computer.
-    first
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&first, "Grace").await;
+    let grace = add_joined_account(&first, "Grace").await;
     let mut grace_socket = open_socket(&first, &grace).await;
     let refused = try_command(
         &mut grace_socket,
@@ -12410,13 +12429,7 @@ async fn a_recorded_move_answers_only_the_bots_owner() {
 
     // Another account that knows the identifier and parameters reads
     // nothing, and the move happens once.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
     assert!(
@@ -12526,15 +12539,7 @@ async fn a_move_checks_the_bot_and_both_computers() {
 
     // Another User's Bot and Computer are not found, exactly like missing
     // ones: the caller learns nothing about them.
-    let identity =
-        neha_space::identity::Identity::open(&Home::open(running.server_home()).unwrap())
-            .await
-            .unwrap();
-    identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace = open_socket(&running, &grace_token).await;
     let (grace_computer, _grace_machine) =
         paired_computer_with_token(&mut grace, &running, &machine_token_n(5)).await;
@@ -13445,6 +13450,7 @@ async fn a_legacy_hosted_workspace_moves_to_the_current_layout() {
     let home = Home::open(directory.path()).unwrap();
     let store = Store::open(&home).await.unwrap();
     let user = Id::new();
+    seed_account(&home, user, "Ada").await;
     let computer = Id::new();
     let bot = Id::new();
     let chat = Id::new();
@@ -15227,10 +15233,12 @@ async fn only_the_acting_user_answers_once() {
 
     // Only the User the Bot acts for answers.
     let context = running.command_context();
+    let (stranger_id, _stranger_token) = add_joined_member(&running, "Eve").await;
     let stranger = neha_space::identity::Account {
-        id: Id::new(),
+        id: stranger_id,
         display_name: "Eve".to_owned(),
         is_admin: false,
+        role: neha::role::Role::Member,
     };
     let error = neha_space::commands::execute(
         &context,
@@ -15335,11 +15343,6 @@ async fn only_the_acting_user_answers_once() {
     // A rule that does not exist answers exactly the same way, so the
     // answer cannot tell whether the Space holds it.
     let unknown_rule = command_context(&running);
-    let stranger = neha_space::identity::Account {
-        id: Id::new(),
-        display_name: "Eve".to_owned(),
-        is_admin: false,
-    };
     let missing = neha_space::commands::execute(
         &unknown_rule,
         &stranger,
@@ -16707,13 +16710,7 @@ async fn a_subscription_shows_only_the_accounts_own_events() {
     );
 
     // A second account signs in through the test-only account path.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let b_token = sign_in(&running, "Grace").await;
+    let b_token = add_joined_account(&running, "Grace").await;
     let mut b_socket = open_socket(&running, &b_token).await;
     let b_created = command(&mut b_socket, Id::new(), add_bot("Reader", None)).await;
     let _b_bot: Id = serde_json::from_value(b_created["bot"]["id"].clone()).unwrap();
@@ -17621,13 +17618,7 @@ async fn a_recorded_computer_add_answers_only_its_pairer() {
     let added = command(&mut socket, command_id, call.clone()).await;
     assert!(added["owner"].is_string(), "the answer names its owner");
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace = sign_in(&running, "Grace").await;
+    let grace = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace).await;
     let refused = try_command(&mut grace_socket, command_id, call.clone()).await;
     assert!(
@@ -17671,13 +17662,7 @@ async fn a_recorded_command_answers_only_its_owner() {
     let admin: Id = serde_json::from_value(made["user"].clone()).unwrap();
     let rule: Id = serde_json::from_value(made["rule"].clone()).unwrap();
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
     let call = CommandCall::RuleRemove { rule };
     let fingerprint = command_fingerprint(&call);
@@ -19633,13 +19618,7 @@ async fn only_a_bots_owner_renames_it() {
     let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
     let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
 
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
 
     // Another account cannot rename a Bot it does not own, and nothing is
@@ -20258,14 +20237,11 @@ async fn the_admin_makes_one_model_the_space_default() {
     );
 
     // Only the Admin sets the Space's default Model.
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
+    // The fixture's join wrote an event; refused commands write nothing after
+    // it.
+    let before = running.test_fields().store.last_seq().await.unwrap();
     let refused = try_command(
         &mut grace_socket,
         Id::new(),
@@ -23376,13 +23352,7 @@ async fn a_second_account_cannot_add_a_skill_to_another_library() {
     let (mut admin_socket, _token) = admin(&running, &invite).await;
     let created = command(&mut admin_socket, Id::new(), add_bot("Scout", None)).await;
     let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
+    let grace_token = add_joined_account(&running, "Grace").await;
     let mut grace = open_socket(&running, &grace_token).await;
 
     let before = staged_blob_count(&running);
@@ -26125,12 +26095,7 @@ async fn a_bind_url_belongs_to_the_account_that_started_the_sign_in() {
     // The initiating browser's session; another account's browser on the
     // same Space has its own.
     let ada_cookie = browser_session(&running, "Ada").await;
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
+    add_joined_account(&running, "Grace").await;
     let grace_cookie = browser_session(&running, "Grace").await;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -26709,17 +26674,11 @@ async fn a_member_sees_space_library_changes_and_not_personal_ones() {
     let admin = running
         .test_fields()
         .identity
-        .admin_account()
+        .owner_account()
         .await
         .unwrap()
         .expect("the Space has an Admin");
-    let member = running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let member_token = sign_in(&running, "Grace").await;
+    let (member, member_token) = add_joined_member(&running, "Grace").await;
     let mut member_socket = open_socket(&running, &member_token).await;
     // Both sockets read the stream live from here on.
     snapshot_events(&mut admin_socket).await;
@@ -26887,10 +26846,9 @@ async fn a_member_sees_space_library_changes_and_not_personal_ones() {
         "a member receives no installation or enablement event"
     );
     assert!(
-        events
-            .iter()
-            .any(|event| event.kind == EventKind::BotCreated
-                && event.author == Author::User(member.id)),
+        events.iter().any(
+            |event| event.kind == EventKind::BotCreated && event.author == Author::User(member)
+        ),
         "the member's own events still arrive"
     );
 
@@ -26927,20 +26885,8 @@ async fn a_member_sees_space_library_changes_and_not_personal_ones() {
 async fn a_personal_credential_attachment_stays_the_members_own() {
     let (_dir, running, invite) = running().await;
     let mut admin_socket = admin_socket(&running, &invite).await;
-    let grace = running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Lin", "correct horse battery")
-        .await
-        .unwrap();
-    let grace_token = sign_in(&running, "Grace").await;
-    let lin_token = sign_in(&running, "Lin").await;
+    let (grace, grace_token) = add_joined_member(&running, "Grace").await;
+    let (_lin, lin_token) = add_joined_member(&running, "Lin").await;
     let mut grace_socket = open_socket(&running, &grace_token).await;
     let mut lin_socket = open_socket(&running, &lin_token).await;
 
@@ -26969,7 +26915,7 @@ async fn a_personal_credential_attachment_stays_the_members_own() {
             event.kind == EventKind::McpServerUpdated
                 && event.data["server"] == json!(server)
                 && event.data["scope"] == json!("user")
-                && event.data["by"] == json!(grace.id)
+                && event.data["by"] == json!(grace)
         }),
         "the attaching member sees their own credential's change"
     );
@@ -27031,17 +26977,11 @@ async fn a_member_refreshes_when_a_package_is_removed() {
     let admin = running
         .test_fields()
         .identity
-        .admin_account()
+        .owner_account()
         .await
         .unwrap()
         .expect("the Space has an Admin");
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let member_token = sign_in(&running, "Grace").await;
+    let member_token = add_joined_account(&running, "Grace").await;
     let mut member_socket = open_socket(&running, &member_token).await;
     snapshot_events(&mut admin_socket).await;
     snapshot_events(&mut member_socket).await;
@@ -27670,17 +27610,11 @@ async fn historical_events_without_a_scope_stay_their_authors() {
     let admin = running
         .test_fields()
         .identity
-        .admin_account()
+        .owner_account()
         .await
         .unwrap()
         .expect("the Space has an Admin");
-    running
-        .test_fields()
-        .identity
-        .test_add_account_for_test("Grace", "correct horse battery")
-        .await
-        .unwrap();
-    let member_token = sign_in(&running, "Grace").await;
+    let member_token = add_joined_account(&running, "Grace").await;
     let mut member_socket = open_socket(&running, &member_token).await;
 
     // A record written before the events carried a scope or a library: it

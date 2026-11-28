@@ -79,6 +79,31 @@ A caller names the capability that admits a later kind; the command surface defi
 
 A capable caller still receives only the events its account can see.
 
+## User events
+
+The record holds these kinds for a User's role:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.user.updated` | The User and the role it now holds |
+| `neha.user.transferred` | The User who receives the Space |
+
+Each is an Authority event, so a reader that does not know one stops and asks for an upgrade.
+
+A role change names an Admin or Member role, never the Space Owner. The Space Owner authors a role change and a transfer; a transfer makes the receiving User the Space Owner and the transferring User an Admin.
+
+## Invitation events
+
+The record holds one kind for a change to the invitation the Space offers:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.invitation.changed` | That the pending invitation moved: it was made, replaced, or revoked |
+
+The event is a Presentation event and carries no invitation, digest, or secret. The invitation lives in the identity tables, and the event only tells an authorized client to read the pending invitation again.
+
+A reader that does not know the kind skips it, as it skips any Presentation event, so an older client still reads the record.
+
 ## Approval events
 
 The record holds these kinds for approvals and rules:
@@ -156,7 +181,9 @@ A full read, a reload, and a live update show the one mark after the current bou
 
 ## Event visibility
 
-Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.provider.added`, `neha.provider.models_updated`) go to every account, because each one's data is already readable through `provider list` or `model list`. An event the account cannot see still advances its cursor.
+Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.user.updated`, `neha.user.transferred`, `neha.provider.added`, `neha.provider.models_updated`) go to every account, because each one's data is already readable through the user list, `provider list`, or `model list`.
+
+A `neha.invitation.changed` event goes only to the Space Owner and the Admins, the accounts that can read the pending invitation. An event the account cannot see still advances its cursor.
 
 A `neha.chat.compacted` frame goes to every User who reads its Chat, because the compacted span belongs to the Chat.
 

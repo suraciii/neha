@@ -10,7 +10,7 @@ A Bot thinks with a model, and Neha provides none. Connecting a provider has to 
 
 A Provider is a source of Models: a known vendor reached with an API key, or an OpenAI-compatible server reached with its address.
 
-The Admin of a Space connects its Providers. Every Bot on the Space can use their Models.
+An Admin of a Space connects its Providers. Every Bot on the Space can use their Models.
 
 A Model has capabilities: its context and output limits, whether it reads images, whether it calls tools, and whether and how it thinks.
 

@@ -9,11 +9,12 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
+use neha::role::Role;
 use neha_space::home::Home;
 use neha_space::identity::{
-    Account, DeviceLoginStart, DeviceLoginState, Identity, IdentityError, MAX_CODE_TRIES,
-    MAX_LOCAL_TICKETS_PER_OWNER, MAX_PENDING_PAIRINGS, MAX_PENDING_PER_SOURCE, PAIRING_TTL_SECS,
-    PairingClaim, PairingRequest, PairingState,
+    Account, DeviceLoginStart, DeviceLoginState, INVITATION_TTL_SECS, Identity, IdentityError,
+    MAX_CODE_TRIES, MAX_LOCAL_TICKETS_PER_OWNER, MAX_PENDING_PAIRINGS, MAX_PENDING_PER_SOURCE,
+    PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState,
 };
 use neha_space::test_support::identity::{
     CODE_ALPHABET, VERSION_ONE_STATEMENTS, VERSION_TWO_STATEMENTS, digest, pool,
@@ -100,7 +101,7 @@ impl ClaimPairing for Identity {
 async fn creates_the_admin_and_authenticates_its_token() {
     let (_dir, _home, identity) = identity().await;
     let (account, token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -114,7 +115,7 @@ async fn creates_the_admin_and_authenticates_its_token() {
 async fn logs_in_with_the_password() {
     let (_dir, _home, identity) = identity().await;
     identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -131,7 +132,7 @@ async fn logs_in_with_the_password() {
 async fn rejects_a_wrong_password() {
     let (_dir, _home, identity) = identity().await;
     identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -144,12 +145,12 @@ async fn rejects_a_wrong_password() {
 async fn rejects_a_second_admin_and_a_taken_name() {
     let (_dir, _home, identity) = identity().await;
     identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
     let second = identity
-        .create_admin("Grace", "correct horse battery")
+        .create_owner("Grace", "correct horse battery")
         .await;
 
     assert!(matches!(second, Err(IdentityError::AlreadyInitialized)));
@@ -160,7 +161,7 @@ async fn rejects_a_second_admin_and_a_taken_name() {
 async fn stores_only_the_token_digest() {
     let (_dir, _home, identity) = identity().await;
     let (_account, token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
@@ -186,11 +187,11 @@ async fn validates_the_name_and_password() {
     let (_dir, _home, identity) = identity().await;
 
     assert!(matches!(
-        identity.create_admin("   ", "correct horse battery").await,
+        identity.create_owner("   ", "correct horse battery").await,
         Err(IdentityError::InvalidName)
     ));
     assert!(matches!(
-        identity.create_admin("Ada", "short").await,
+        identity.create_owner("Ada", "short").await,
         Err(IdentityError::WeakPassword)
     ));
 }
@@ -1040,7 +1041,7 @@ async fn a_computer_authenticates_with_the_token_the_machine_keeps() {
         None
     );
     let (_account, account_token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
     assert_eq!(
@@ -1088,6 +1089,7 @@ async fn version_one_database(path: &std::path::Path, token: &str) -> Account {
         id: Id::new(),
         display_name: "Legacy Ada".to_owned(),
         is_admin: true,
+        role: neha::role::Role::Owner,
     };
     sqlx::query(
         "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
@@ -1361,14 +1363,14 @@ async fn clearing_tickets_forgets_them_and_a_recorded_token_authenticates() {
 #[tokio::test]
 async fn the_admin_is_known_once_it_joins() {
     let (_dir, _home, identity) = identity().await;
-    assert_eq!(identity.admin_account().await.unwrap(), None);
+    assert_eq!(identity.owner_account().await.unwrap(), None);
 
     let (account, _token) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
 
-    assert_eq!(identity.admin_account().await.unwrap(), Some(account));
+    assert_eq!(identity.owner_account().await.unwrap(), Some(account));
 }
 #[tokio::test]
 async fn issuing_keeps_at_most_eight_unused_tickets_per_owner() {
@@ -1482,7 +1484,7 @@ async fn revoking_forgets_claims_and_waiting_rows_for_its_token() {
 async fn a_device_login_becomes_the_approvers_session_once() {
     let (_dir, _home, identity) = identity().await;
     let (owner, _session) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
     let started = start_device_login(&identity, "", "laptop", "cli-token", "poll-secret").await;
@@ -1546,7 +1548,7 @@ async fn a_device_login_becomes_the_approvers_session_once() {
 async fn a_device_login_token_already_in_use_does_not_claim_its_code() {
     let (_dir, _home, identity) = identity().await;
     let (owner, _session) = identity
-        .create_admin("Ada", "correct horse battery")
+        .create_owner("Ada", "correct horse battery")
         .await
         .unwrap();
     let first = start_device_login(&identity, "", "laptop", "shared-token", "poll-one").await;
@@ -1617,6 +1619,60 @@ async fn a_device_login_start_drops_expired_rows_and_bounds_the_queue() {
 }
 
 #[tokio::test]
+async fn an_invitation_is_claimed_once_and_released_when_a_join_fails() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _token) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let (invitation, secret) = identity
+        .create_invitation(Id::new(), owner.id)
+        .await
+        .unwrap();
+    assert_eq!(identity.invitations().await.unwrap(), vec![invitation]);
+
+    let first = Id::new();
+    assert!(
+        identity
+            .reserve_invitation(&secret.clone().unwrap(), first)
+            .await
+            .unwrap(),
+        "one join claims the link"
+    );
+    assert!(
+        !identity
+            .reserve_invitation(&secret.clone().unwrap(), Id::new())
+            .await
+            .unwrap(),
+        "a second join cannot claim the same link"
+    );
+    assert_eq!(identity.invitation_claims().await.unwrap(), vec![first]);
+
+    // A join that fails before the account exists releases the claim.
+    identity.release_invitation(first).await.unwrap();
+    assert!(identity.invitation_claims().await.unwrap().is_empty());
+    let second = Id::new();
+    assert!(
+        identity
+            .reserve_invitation(&secret.clone().unwrap(), second)
+            .await
+            .unwrap(),
+        "a released link admits one User again"
+    );
+    identity.finalize_invitation(second).await.unwrap();
+    assert!(
+        identity.invitations().await.unwrap().is_empty(),
+        "a finished join leaves no pending invitation"
+    );
+    assert!(
+        !identity
+            .reserve_invitation(&secret.clone().unwrap(), Id::new())
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
 async fn a_device_login_source_waits_with_at_most_two_rows() {
     let (_dir, _home, identity) = identity().await;
     for index in 0..MAX_PENDING_PER_SOURCE {
@@ -1645,4 +1701,96 @@ async fn a_device_login_source_waits_with_at_most_two_rows() {
     );
     // Another source still has room.
     start_device_login(&identity, "other-source", "desktop", "token-ok", "poll-ok").await;
+}
+
+#[tokio::test]
+async fn an_expired_invitation_admits_no_one() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _token) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let created_at = now_microseconds() - (INVITATION_TTL_SECS + 1) * 1_000_000;
+    let (_invitation, secret) = identity
+        .test_create_invitation_at(Id::new(), created_at, owner.id)
+        .await
+        .unwrap();
+
+    assert!(
+        !identity
+            .reserve_invitation(&secret.clone().unwrap(), Id::new())
+            .await
+            .unwrap()
+    );
+    assert!(identity.invitations().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_role_is_kept_in_the_account_row_and_brought_in_step_with_the_record() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, token) = identity
+        .create_owner("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    assert_eq!(owner.role, Role::Owner);
+    assert!(owner.is_admin);
+
+    let member_id = Id::new();
+    let (member, _member_token) = identity
+        .create_invited(member_id, "Eve", "correct horse battery")
+        .await
+        .unwrap();
+    assert_eq!(member.role, Role::Member);
+    assert!(!member.is_admin);
+
+    assert!(identity.set_role(member_id, Role::Admin).await.unwrap());
+    let signed_in = identity
+        .authenticate(
+            &identity
+                .login("Eve", "correct horse battery")
+                .await
+                .unwrap()
+                .1,
+        )
+        .await
+        .unwrap()
+        .expect("the Member signs in");
+    assert_eq!(signed_in.role, Role::Admin);
+    assert!(signed_in.is_admin);
+
+    // The record decides; a start syncs an account that fell behind.
+    assert_eq!(
+        identity
+            .sync_roles(&[(owner.id, Role::Owner), (member_id, Role::Member)])
+            .await
+            .unwrap(),
+        1,
+        "only the changed account is written"
+    );
+    let synced = identity
+        .authenticate(
+            &identity
+                .login("Eve", "correct horse battery")
+                .await
+                .unwrap()
+                .1,
+        )
+        .await
+        .unwrap()
+        .expect("the Member still signs in");
+    assert_eq!(synced.role, Role::Member);
+
+    // A forgotten account is no longer a way to sign in.
+    identity.forget_account(member_id).await.unwrap();
+    assert!(
+        identity
+            .login("Eve", "correct horse battery")
+            .await
+            .is_err()
+    );
+    assert!(identity.authenticate(&token).await.unwrap().is_some());
+}
+
+fn now_microseconds() -> i64 {
+    neha::time::Timestamp::now().as_microseconds()
 }

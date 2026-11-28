@@ -19,9 +19,15 @@ import LocaleSwitch from "./LocaleSwitch";
 import NotificationSetting from "./NotificationSetting";
 import type { RailView } from "./Rail";
 
-// What the Settings surface opens: the Providers, the Models, the Computers, or
-// the catalog.
-export type SettingsSection = "providers" | "models" | "computers" | "devices" | "catalog";
+// What the Settings surface opens: the Providers, the Models, the Computers,
+// the People, the Devices, or the catalog.
+export type SettingsSection =
+  | "providers"
+  | "models"
+  | "computers"
+  | "people"
+  | "devices"
+  | "catalog";
 
 interface SidebarProps {
   account: Account;
@@ -236,6 +242,7 @@ export default function Sidebar(props: SidebarProps) {
     { section: "providers", icon: "server" },
     { section: "models", icon: "cpu" },
     { section: "computers", icon: "monitor" },
+    { section: "people", icon: "users" },
     { section: "devices", icon: "key" },
     { section: "catalog", icon: "book" },
   ];
@@ -429,9 +436,11 @@ export default function Sidebar(props: SidebarProps) {
                           ? "sidebar.settings.models"
                           : entry.section === "computers"
                             ? "sidebar.settings.computers"
-                            : entry.section === "devices"
-                              ? "sidebar.settings.devices"
-                              : "sidebar.settings.catalog",
+                            : entry.section === "people"
+                              ? "sidebar.settings.people"
+                              : entry.section === "devices"
+                                ? "sidebar.settings.devices"
+                                : "sidebar.settings.catalog",
                     )}
                     active={props.section === entry.section}
                     onSelect={() => props.onSection(entry.section)}

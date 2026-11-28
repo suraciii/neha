@@ -35,6 +35,16 @@ pub enum EventKind {
     /// A User joined the Space.
     #[serde(rename = "neha.user.joined")]
     UserJoined,
+    /// A User's role changed.
+    #[serde(rename = "neha.user.updated")]
+    UserUpdated,
+    /// The Owner transferred the Space to another User.
+    #[serde(rename = "neha.user.transferred")]
+    UserTransferred,
+    /// An Admin changed which invitation can admit a User. It carries no
+    /// secret: authorized clients refresh the pending invitation from it.
+    #[serde(rename = "neha.invitation.changed")]
+    InvitationChanged,
     /// The Admin connected a Provider.
     #[serde(rename = "neha.provider.added")]
     ProviderAdded,
@@ -169,6 +179,9 @@ impl EventKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::UserJoined => "neha.user.joined",
+            Self::UserUpdated => "neha.user.updated",
+            Self::UserTransferred => "neha.user.transferred",
+            Self::InvitationChanged => "neha.invitation.changed",
             Self::ProviderAdded => "neha.provider.added",
             Self::ProviderModelsUpdated => "neha.provider.models_updated",
             Self::BotCreated => "neha.bot.created",
@@ -233,7 +246,7 @@ impl EventKind {
             }
             // A summary decides nothing about access or work: a reader that
             // does not know it reads the original Messages and reads on.
-            Self::ChatCompacted => EventClass::Presentation,
+            Self::ChatCompacted | Self::InvitationChanged => EventClass::Presentation,
             // A plan decides nothing about access or work either: a reader
             // that does not know it shows no progress and reads on.
             Self::RunPlanned => EventClass::Presentation,
@@ -263,6 +276,8 @@ impl EventKind {
             | Self::PluginEnabled
             | Self::PluginDisabled => EventClass::Authority,
             Self::UserJoined
+            | Self::UserUpdated
+            | Self::UserTransferred
             | Self::ProviderAdded
             | Self::ProviderModelsUpdated
             | Self::BotCreated
@@ -281,6 +296,9 @@ impl FromStr for EventKind {
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         match text {
             "neha.user.joined" => Ok(Self::UserJoined),
+            "neha.user.updated" => Ok(Self::UserUpdated),
+            "neha.user.transferred" => Ok(Self::UserTransferred),
+            "neha.invitation.changed" => Ok(Self::InvitationChanged),
             "neha.provider.added" => Ok(Self::ProviderAdded),
             "neha.provider.models_updated" => Ok(Self::ProviderModelsUpdated),
             "neha.bot.created" => Ok(Self::BotCreated),
@@ -798,6 +816,9 @@ mod tests {
     fn wire_names_round_trip() {
         let kinds = [
             EventKind::UserJoined,
+            EventKind::UserUpdated,
+            EventKind::UserTransferred,
+            EventKind::InvitationChanged,
             EventKind::ProviderAdded,
             EventKind::ProviderModelsUpdated,
             EventKind::BotCreated,
@@ -861,6 +882,13 @@ mod tests {
         assert_eq!(EventKind::BotCreated.class(), EventClass::Authority);
         assert_eq!(EventKind::BotMoved.class(), EventClass::Authority);
         assert_eq!(EventKind::RunReply.class(), EventClass::Authority);
+        assert_eq!(EventKind::UserJoined.class(), EventClass::Authority);
+        assert_eq!(EventKind::UserUpdated.class(), EventClass::Authority);
+        assert_eq!(EventKind::UserTransferred.class(), EventClass::Authority);
+        assert_eq!(
+            EventKind::InvitationChanged.class(),
+            EventClass::Presentation
+        );
         assert_eq!(EventKind::ApprovalRequested.class(), EventClass::Authority);
         assert_eq!(EventKind::ApprovalDecided.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleAdded.class(), EventClass::Authority);
@@ -2215,6 +2243,12 @@ pub enum RunStatus {
 pub enum EventData {
     /// A User joined the Space.
     UserJoined(UserJoined),
+    /// A User's role changed.
+    UserUpdated(UserUpdated),
+    /// The Owner transferred the Space.
+    UserTransferred(UserTransferred),
+    /// An Admin changed the pending invitation.
+    InvitationChanged(InvitationChanged),
     /// A Provider was connected.
     ProviderAdded(ProviderAdded),
     /// A Provider's Models were refreshed.
@@ -2318,6 +2352,13 @@ impl EventKind {
     pub fn decode(self, data: &serde_json::Value) -> Result<EventData, EventDataError> {
         let decoded = match self {
             Self::UserJoined => EventData::UserJoined(decode(data)?),
+            Self::UserUpdated => {
+                let data: UserUpdated = decode(data)?;
+                data.validate()?;
+                EventData::UserUpdated(data)
+            }
+            Self::UserTransferred => EventData::UserTransferred(decode(data)?),
+            Self::InvitationChanged => EventData::InvitationChanged(decode(data)?),
             Self::ProviderAdded => EventData::ProviderAdded(decode(data)?),
             Self::ProviderModelsUpdated => EventData::ProviderModelsUpdated(decode(data)?),
             Self::BotCreated => EventData::BotCreated(decode(data)?),
@@ -2416,6 +2457,9 @@ impl EventKind {
     pub fn validate_author(self, author: Author, acting: Option<Id>) -> Result<(), EventDataError> {
         match self {
             Self::UserJoined
+            | Self::UserUpdated
+            | Self::UserTransferred
+            | Self::InvitationChanged
             | Self::ProviderAdded
             | Self::ProviderModelsUpdated
             | Self::BotCreated
@@ -2534,6 +2578,67 @@ pub struct UserJoined {
     /// Whether the account is the Admin.
     pub is_admin: bool,
 }
+
+impl UserJoined {
+    /// Returns the role this join records.
+    ///
+    /// The first User is the Space's Owner; every other User is a Member. The
+    /// record wrote a boolean before roles existed, so a later role change
+    /// arrives as a `neha.user.updated` event.
+    #[must_use]
+    pub const fn role(&self) -> crate::role::Role {
+        if self.is_admin {
+            crate::role::Role::Owner
+        } else {
+            crate::role::Role::Member
+        }
+    }
+}
+
+/// The data of `neha.user.updated`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct UserUpdated {
+    /// The User whose role changed.
+    pub user: Id,
+    /// The role it now holds.
+    pub role: crate::role::Role,
+}
+
+impl UserUpdated {
+    /// Checks the data fits the kind.
+    ///
+    /// Ownership moves only through `neha.user.transferred`, so a role change
+    /// never names the Owner role.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if self.role == crate::role::Role::Owner {
+            return Err(EventDataError::Data(
+                "ownership moves only by transfer".to_owned(),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.user.transferred`.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct UserTransferred {
+    /// The User who receives the Space.
+    pub to: Id,
+}
+
+/// The data of `neha.invitation.changed`.
+///
+/// The event says the pending invitation moved; the invitation itself stays
+/// out of the record, so no secret or digest reaches an event.
+#[derive(Clone, Debug, PartialEq, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct InvitationChanged {}
 
 /// The data of `neha.provider.added`.
 #[derive(Clone, Debug, PartialEq, Deserialize, TS)]

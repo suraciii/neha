@@ -90,7 +90,7 @@ The answer is `ok`.
 
 ## Join and install
 
-Open the invitation link on the phone. The first User joins as the Admin.
+Open the invitation link on the phone. The first User joins as the Space Owner.
 
 Then install the client from the same URL:
 

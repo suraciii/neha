@@ -13,6 +13,21 @@ id: string,
  */
 display_name: string, 
 /**
- * Whether the account is the Space's Admin.
+ * Whether the account administers the Space: its Owner or an Admin.
+ *
+ * Kept beside `role` because the wire type existed before roles did and
+ * older clients read it.
  */
-is_admin: boolean, };
+is_admin: boolean, 
+/**
+ * The role the account holds in this Space.
+ */
+role: Role, };
+
+/**
+ * What a User may do in a Space.
+ *
+ * The Space has one Owner, who may make Admins. The Owner and the Admins
+ * administer the Space; a Member uses it without administering it.
+ */
+export type Role = "owner" | "admin" | "member";

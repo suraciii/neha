@@ -182,6 +182,7 @@ pub struct SpaceServer {
     storage: Storage,
     invite: Mutex<Option<Invite>>,
     login: Mutex<LoginLimiter>,
+    joins: Mutex<LoginLimiter>,
     pub(crate) state: Mutex<SpaceState>,
     pub(crate) secrets: Secrets,
     /// The models.dev catalog and its cache.
@@ -205,6 +206,8 @@ pub struct SpaceServer {
     pub(crate) provider_writes: tokio::sync::Mutex<()>,
     /// Serializes changes to the skills of both libraries.
     pub(crate) library: tokio::sync::Mutex<()>,
+    /// Serializes role changes and the transfer (see the command context).
+    pub(crate) roles: tokio::sync::Mutex<()>,
     /// Whether this Space treats skills as instructions only.
     pub(crate) instructions_only: bool,
     /// Where this Space may install a package from.
@@ -406,14 +409,16 @@ impl SpaceServer {
                 });
             }
         }
+        let mut state = SpaceState::default();
+        store.replay(&mut state).await?;
+        reconcile_identity(&identity, &state).await?;
+        flush_invitation_notices(&store, &identity).await?;
+        migrate_legacy_hosted_workspaces(&home, &mut state)?;
         let invite = if identity.has_accounts().await? {
             None
         } else {
             Some(Invite::generate())
         };
-        let mut state = SpaceState::default();
-        store.replay(&mut state).await?;
-        migrate_legacy_hosted_workspaces(&home, &mut state)?;
         let secrets = Secrets::load(&home)?;
         let push_contact = public_url
             .clone()
@@ -430,6 +435,7 @@ impl SpaceServer {
             storage,
             invite: Mutex::new(invite),
             login: Mutex::new(LoginLimiter::default()),
+            joins: Mutex::new(LoginLimiter::default()),
             state: Mutex::new(state),
             secrets,
             catalog,
@@ -446,6 +452,7 @@ impl SpaceServer {
             computer_assignments: tokio::sync::Mutex::new(()),
             provider_writes: tokio::sync::Mutex::new(()),
             library: tokio::sync::Mutex::new(()),
+            roles: tokio::sync::Mutex::new(()),
             instructions_only,
             plugins,
             pairs: Mutex::new(PairLimiter::default()),
@@ -946,7 +953,7 @@ async fn start_prepared(
     if let Some(path) = &ticket_path {
         ticket::remove_file(path).await?;
     }
-    let start_ticket = match (server.identity.admin_account().await?, ticket_path) {
+    let start_ticket = match (server.identity.owner_account().await?, ticket_path) {
         (Some(admin), Some(path)) => {
             let url = format!("http://{addr}");
             let start = ticket::issue_for_start(&server.identity, &path, admin.id, &url).await?;
@@ -2171,7 +2178,9 @@ fn content_type(path: &Path) -> &'static str {
 async fn invite_page() -> Html<&'static str> {
     Html(
         "<!doctype html><title>Neha invitation</title>\
-         <p>Run <code>neha join &lt;this URL&gt;</code> in a terminal to become the Admin.",
+         <p>This link admits one User to the Space. Open it in the browser client,\
+         or run <code>neha join &lt;this URL&gt;</code> in a terminal; the Space's\
+         first User becomes its Space Owner and an invited User joins as a Member.",
     )
 }
 
@@ -2194,26 +2203,11 @@ struct SessionResponse {
     account: Account,
 }
 
-async fn join(
-    State(server): State<Arc<SpaceServer>>,
-    headers: HeaderMap,
-    Json(request): Json<JoinRequest>,
-) -> Result<Response, ApiError> {
-    let accepted = server
-        .invite
-        .lock()
-        .expect("invite lock")
-        .as_ref()
-        .is_some_and(|invite| invite.accepts(&request.secret));
-    if !accepted {
-        return Err(ApiError::not_found("this invitation is not usable"));
-    }
-
-    let (account, token) = server
-        .identity
-        .create_admin(&request.display_name, &request.password)
-        .await
-        .map_err(identity_error)?;
+/// The event that admits a new User, and the state it projects.
+///
+/// The join records who joined before the invitation is finished; a crash
+/// after this append is settled by the start-up repair.
+async fn append_join(server: &Arc<SpaceServer>, account: &Account) -> Result<(), ApiError> {
     let joined = EventDraft::new(
         EventKind::UserJoined,
         Author::User(account.id),
@@ -2245,9 +2239,114 @@ async fn join(
                 .map_err(|error| ApiError::internal(error.to_string()))?;
         }
     }
-    server.consume_invite();
+    // A join is a space-level event: open clients must see the new User
+    // without a reload, exactly as a command's events reach them.
+    broadcast(server, &appended.events);
 
-    let browser = browser_request(&server, &headers);
+    Ok(())
+}
+
+async fn join(
+    State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(request): Json<JoinRequest>,
+) -> Result<Response, ApiError> {
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    let display_name = request.display_name.clone();
+    {
+        // Count the attempt before the asynchronous work: two starts that both
+        // pass the check would otherwise both run before either records.
+        let mut joins = server.joins.lock().expect("join lock");
+        if !joins.allows(&display_name, source) {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                ErrorCode::RateLimited,
+                "too many join attempts",
+            ));
+        }
+        joins.record(&display_name, source);
+    }
+    match join_invited(&server, &headers, request).await {
+        Ok(response) => {
+            // A successful join is not a failed attempt.
+            server
+                .joins
+                .lock()
+                .expect("join lock")
+                .release(&display_name, source);
+            Ok(response)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates the account a join admits, as the Owner or as an invited Member.
+async fn join_invited(
+    server: &Arc<SpaceServer>,
+    headers: &HeaderMap,
+    request: JoinRequest,
+) -> Result<Response, ApiError> {
+    let startup = server
+        .invite
+        .lock()
+        .expect("invite lock")
+        .as_ref()
+        .is_some_and(|invite| invite.accepts(&request.secret));
+
+    let (account, token) = if startup {
+        let (account, token) = server
+            .identity
+            .create_owner(&request.display_name, &request.password)
+            .await
+            .map_err(identity_error)?;
+        if let Err(error) = append_join(server, &account).await {
+            // The invitation was not consumed and the record took nothing, so
+            // the account is rolled back and the link admits the User again.
+            let _ = server.identity.forget_account(account.id).await;
+            return Err(error);
+        }
+        server.consume_invite();
+        (account, token)
+    } else {
+        // An invitation admits one User as a Member. The claim names the
+        // account before it exists, so two joins that present one secret
+        // cannot both take it.
+        let id = Id::new();
+        let claimed = server
+            .identity
+            .reserve_invitation(&request.secret, id)
+            .await
+            .map_err(identity_error)?;
+        if !claimed {
+            return Err(ApiError::not_found("this invitation is not usable"));
+        }
+        let created = server
+            .identity
+            .create_invited(id, &request.display_name, &request.password)
+            .await;
+        let (account, token) = match created {
+            Ok(created) => created,
+            Err(error) => {
+                let _ = server.identity.release_invitation(id).await;
+                return Err(identity_error(error));
+            }
+        };
+        if let Err(error) = append_join(server, &account).await {
+            let _ = server.identity.forget_account(account.id).await;
+            let _ = server.identity.release_invitation(account.id).await;
+            return Err(error);
+        }
+        if let Err(error) = server.identity.finalize_invitation(account.id).await {
+            // The account and the record agree, so the join succeeded; the
+            // pending row still names the account, and the next start drops
+            // it. A link that cannot be finished now admits no one else.
+            eprintln!("neha: cannot finish a used invitation: {error}");
+        }
+        (account, token)
+    };
+
+    let browser = browser_request(server, headers);
     let cookie = browser.then(|| server.session_headers(&token));
     let response = if browser {
         Json(account).into_response()
@@ -3709,7 +3808,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                         let receiver = server.events.subscribe();
                         forwarder = Some(spawn_forwarder(
                             receiver,
-                            server.store.reader(),
+                            server.clone(),
                             out.clone(),
                             cursor.unwrap_or(neha::seq::Seq::ZERO),
                             limit,
@@ -3799,6 +3898,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             provider_writes: &server.provider_writes,
                             workers: server.worker_config.is_some(),
                             library: &server.library,
+                            roles: &server.roles,
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
@@ -3885,7 +3985,7 @@ fn broadcast(server: &SpaceServer, events: &[neha::record::Event]) {
 
 fn spawn_forwarder(
     mut receiver: broadcast::Receiver<neha::record::Event>,
-    reader: StoreReader,
+    server: Arc<SpaceServer>,
     out: mpsc::Sender<ServerFrame>,
     cursor: neha::seq::Seq,
     limit: Option<usize>,
@@ -3894,7 +3994,18 @@ fn spawn_forwarder(
 ) -> JoinHandle<()> {
     let capabilities = Arc::new(capabilities);
     tokio::spawn(async move {
-        let mut cursor = match catch_up(&reader, &out, cursor, limit, account, &capabilities).await
+        let reader = server.store.reader();
+        let allows = || administers(&server, account);
+        let mut cursor = match catch_up(
+            &reader,
+            &out,
+            cursor,
+            limit,
+            account,
+            &capabilities,
+            &allows,
+        )
+        .await
         {
             Ok(cursor) => cursor,
             Err(StreamError::Oversized(event)) => {
@@ -3927,7 +4038,9 @@ fn spawn_forwarder(
                     // and a later kind only when it named the capability that
                     // admits it. A skipped event still advances the cursor, so
                     // a later reconnect neither repeats nor misses it.
-                    if !visible_to(account, &event) || !admits(&capabilities, event.kind) {
+                    if !visible_to(account, &event, administers(&server, account))
+                        || !admits(&capabilities, event.kind)
+                    {
                         cursor = seq;
                         continue;
                     }
@@ -3946,7 +4059,18 @@ fn spawn_forwarder(
                     cursor = seq;
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    match catch_up(&reader, &out, cursor, limit, account, &capabilities).await {
+                    let allows = || administers(&server, account);
+                    match catch_up(
+                        &reader,
+                        &out,
+                        cursor,
+                        limit,
+                        account,
+                        &capabilities,
+                        &allows,
+                    )
+                    .await
+                    {
                         Ok(next) => cursor = next,
                         Err(StreamError::Oversized(event)) => {
                             let _ = out
@@ -3986,11 +4110,13 @@ async fn catch_up(
     limit: Option<usize>,
     account: Id,
     capabilities: &HashSet<String>,
+    administers: &(dyn Fn() -> bool + Send + Sync),
 ) -> Result<neha::seq::Seq, StreamError> {
     let page_size = limit.unwrap_or(256).clamp(1, 256);
     let mut cursor = cursor;
     let mut sent = false;
     loop {
+        let administers = administers();
         let page = reader
             .events_from(cursor, page_size)
             .await
@@ -4023,7 +4149,9 @@ async fn catch_up(
         let mut events: Vec<neha::record::Event> = page
             .events
             .into_iter()
-            .filter(|event| visible_to(account, event) && admits(capabilities, event.kind))
+            .filter(|event| {
+                visible_to(account, event, administers) && admits(capabilities, event.kind)
+            })
             .collect();
         if events.is_empty() {
             cursor = page_next;
@@ -4108,9 +4236,31 @@ fn admits(capabilities: &HashSet<String>, kind: neha::record::EventKind) -> bool
 /// The record is what decides: an event that names no scope is a historical
 /// one, and a reader treats it the way the command surface treats a personal
 /// resource, so it never widens what an older record lets a member read.
-fn visible_to(account: Id, event: &neha::record::Event) -> bool {
+/// Whether one account currently administers the Space.
+fn administers(server: &SpaceServer, account: Id) -> bool {
+    server
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| {
+            state
+                .users
+                .get(&account)
+                .map(|user| user.role.administers())
+        })
+        .unwrap_or(false)
+}
+
+/// Whether one account may see an event, given whether it administers the
+/// Space now.
+fn visible_to(account: Id, event: &neha::record::Event, administers: bool) -> bool {
     use neha::record::EventKind;
 
+    // The invitation change belongs to the account's current role, not to the
+    // author: a demoted Admin stops seeing it, including changes it made.
+    if event.kind == EventKind::InvitationChanged {
+        return administers;
+    }
     if matches!(event.author, neha::record::Author::User(author) if author == account) {
         return true;
     }
@@ -4119,7 +4269,14 @@ fn visible_to(account: Id, event: &neha::record::Event) -> bool {
     }
 
     match event.kind {
-        EventKind::UserJoined | EventKind::ProviderAdded | EventKind::ProviderModelsUpdated => true,
+        EventKind::UserJoined
+        | EventKind::UserUpdated
+        | EventKind::UserTransferred
+        | EventKind::ProviderAdded
+        | EventKind::ProviderModelsUpdated => true,
+        // The pending invitation belongs to the Space Owner and the Admins, so
+        // only they learn that another Admin changed it.
+        EventKind::InvitationChanged => administers,
         // A Space server is every member's; a personal one is its owner's.
         EventKind::McpServerAdded => {
             event.data.get("scope").and_then(Value::as_str) == Some("space")
@@ -4192,6 +4349,85 @@ impl FromRequestParts<Arc<SpaceServer>> for Authed {
 
         Ok(Self { account })
     }
+}
+
+/// Heals a join a crash left between the account, the record, and the
+/// invitation it claimed.
+///
+/// A join claims the invitation, writes the account, appends
+/// `neha.user.joined`, and finishes the claim. A crash between any two steps
+/// leaves one of these states, and this settles each before the Space accepts
+/// connections:
+///
+/// - the claim names a User the record holds: finish the claim, so the link
+///   admits no one else;
+/// - the claim names no recorded User: release it, so the link admits one
+///   Person again; the account, when it exists, is dropped below;
+/// - an account the record never saw: drop it and its tokens.
+///
+/// The record decides every role, so the stored roles are brought in step
+/// here too. A record whose User has no account cannot sign in and is refused
+/// rather than served broken.
+async fn reconcile_identity(identity: &Identity, state: &SpaceState) -> Result<(), ServerError> {
+    let recorded: std::collections::HashMap<Id, neha::role::Role> = state
+        .users
+        .iter()
+        .map(|(id, user)| (*id, user.role))
+        .collect();
+    let accounts = identity.account_ids().await?;
+    for claim in identity.invitation_claims().await? {
+        if recorded.contains_key(&claim) {
+            identity.finalize_invitation(claim).await?;
+        } else {
+            identity.release_invitation(claim).await?;
+        }
+    }
+    for account in &accounts {
+        if !recorded.contains_key(account) {
+            identity.forget_account(*account).await?;
+        }
+    }
+    for account in recorded.keys() {
+        if !accounts.contains(account) {
+            return Err(ServerError::IdentityOutOfStep(format!(
+                "the record names the User {account} but no account signs it in"
+            )));
+        }
+    }
+    let roles: Vec<(Id, neha::role::Role)> = recorded
+        .iter()
+        .map(|(account, role)| (*account, *role))
+        .collect();
+    identity.sync_roles(&roles).await?;
+
+    Ok(())
+}
+
+/// Appends the invitation-change events a crash left unappended.
+///
+/// A create or revoke records its event command in the transaction that made
+/// the change. A crash before the append leaves that notice behind; the start
+/// appends the same event and forgets the notice, so no open client keeps a
+/// stale pending invitation.
+async fn flush_invitation_notices(store: &Store, identity: &Identity) -> Result<(), ServerError> {
+    for (command, event_command, author) in identity.pending_notices().await? {
+        store
+            .append(AppendRequest::new(
+                event_command,
+                format!("invitation-notice:{command}"),
+                vec![EventDraft::new(
+                    EventKind::InvitationChanged,
+                    Author::User(author),
+                    serde_json::json!({}),
+                )],
+            ))
+            .await?;
+        // The projection holds nothing for this Presentation event, so the
+        // record's readers get it from the subscription they open next.
+        identity.clear_notice(command).await?;
+    }
+
+    Ok(())
 }
 
 /// Heals a pairing a crash left between its claim and its Computer's record.
@@ -4461,6 +4697,14 @@ pub(crate) fn identity_error(error: IdentityError) -> ApiError {
         IdentityError::NameTaken | IdentityError::AlreadyInitialized => {
             ApiError::new(StatusCode::CONFLICT, ErrorCode::Conflict, error.to_string())
         }
+        IdentityError::Forbidden => {
+            ApiError::forbidden("only the Space Owner or an Admin changes an invitation")
+        }
+        IdentityError::CommandConflict => ApiError::new(
+            StatusCode::CONFLICT,
+            ErrorCode::Conflict,
+            "the command was used for a different request",
+        ),
         IdentityError::InvalidCredentials => ApiError::new(
             StatusCode::UNAUTHORIZED,
             ErrorCode::Unauthorized,
@@ -4532,6 +4776,22 @@ impl LoginLimiter {
             .or_default()
             .push(now);
         self.sources.entry(source).or_default().push(now);
+    }
+
+    /// Takes back an attempt that succeeded.
+    fn release(&mut self, display_name: &str, source: IpAddr) {
+        if let Some(failures) = self.failures.get_mut(display_name) {
+            failures.pop();
+            if failures.is_empty() {
+                self.failures.remove(display_name);
+            }
+        }
+        if let Some(failures) = self.sources.get_mut(&source) {
+            failures.pop();
+            if failures.is_empty() {
+                self.sources.remove(&source);
+            }
+        }
     }
 
     fn prune(&mut self) {
@@ -4628,6 +4888,9 @@ pub enum ServerError {
     /// Identity failed.
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+    /// The record and the accounts disagree about who joined.
+    #[error("the record and the accounts disagree: {0}")]
+    IdentityOutOfStep(String),
     /// The listener failed.
     #[error("listener error: {0}")]
     Io(#[from] std::io::Error),
@@ -4797,8 +5060,10 @@ pub mod test_support {
         limit: Option<usize>,
         account: neha::id::Id,
         capabilities: &std::collections::HashSet<String>,
+        administers: bool,
     ) -> Result<neha::seq::Seq, CatchUpError> {
-        super::catch_up(reader, out, cursor, limit, account, capabilities)
+        let allows = || administers;
+        super::catch_up(reader, out, cursor, limit, account, capabilities, &allows)
             .await
             .map_err(|error| match error {
                 StreamError::Store => CatchUpError::Store,
@@ -4976,6 +5241,7 @@ impl Running {
             provider_writes: &server.provider_writes,
             workers: server.worker_config.is_some(),
             library: &server.library,
+            roles: &server.roles,
             runs: &server.runs,
             events: &server.events,
             catalog: &server.catalog,
@@ -4994,6 +5260,71 @@ mod tests {
     use neha::surface::{ClientFrame, CommandCall};
 
     use crate::computer_link::AccessCapabilities;
+
+    /// A demotion between two catch-up pages hides the later invitation
+    /// changes, because each page asks for the account's current role.
+    #[tokio::test]
+    async fn a_demotion_between_catch_up_pages_hides_later_invitation_changes() {
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let directory = tempfile::tempdir().unwrap();
+        let home = crate::home::Home::open(directory.path()).unwrap();
+        let store = crate::store::Store::open(&home).await.unwrap();
+        let user = Id::new();
+        let other = Id::new();
+        let invitation = || {
+            neha::record::EventDraft::new(
+                neha::record::EventKind::InvitationChanged,
+                neha::record::Author::User(user),
+                serde_json::json!({}),
+            )
+        };
+        store
+            .append(crate::store::AppendRequest::new(
+                Id::new(),
+                "seed",
+                vec![
+                    invitation(),
+                    neha::record::EventDraft::new(
+                        neha::record::EventKind::UserUpdated,
+                        neha::record::Author::User(user),
+                        serde_json::json!({"user": other, "role": "member"}),
+                    ),
+                    invitation(),
+                ],
+            ))
+            .await
+            .unwrap();
+        let reader = store.reader();
+        let (out, mut frames) = tokio::sync::mpsc::channel(8);
+        let admin = AtomicBool::new(true);
+        let allows = || admin.swap(false, Ordering::SeqCst);
+        super::catch_up(
+            &reader,
+            &out,
+            neha::seq::Seq::ZERO,
+            Some(1),
+            user,
+            &HashSet::new(),
+            &allows,
+        )
+        .await
+        .unwrap();
+        drop(out);
+        let mut changes = 0;
+        while let Ok(neha::surface::ServerFrame::Snapshot { events, .. }) = frames.try_recv() {
+            changes += events
+                .iter()
+                .filter(|event| event.kind == neha::record::EventKind::InvitationChanged)
+                .count();
+        }
+        assert_eq!(
+            changes, 1,
+            "only the page read while the account administered"
+        );
+        store.close().await.unwrap();
+    }
 
     #[test]
     fn a_greeting_written_before_access_fields_derives_them_from_sandbox() {

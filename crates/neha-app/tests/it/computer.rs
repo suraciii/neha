@@ -214,6 +214,7 @@ fn session_at(url: &str) -> Credential {
             id: Id::new(),
             display_name: "Ada".to_owned(),
             is_admin: false,
+            role: Some(neha::role::Role::Member),
         },
     }
 }

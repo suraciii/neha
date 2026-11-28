@@ -18,7 +18,7 @@ These Laws bind the built-in loop. A Bot whose loop is an outside harness waits 
 
 ## Protocols
 
-An adapter exists for OpenAI Chat Completions, for OpenAI Responses, and for Anthropic Messages. An OpenAI-compatible Provider is given the protocol it speaks, Chat Completions unless the Admin names another, and an adapter applies its vendor's dialect.
+An adapter exists for OpenAI Chat Completions, for OpenAI Responses, and for Anthropic Messages. An OpenAI-compatible Provider is given the protocol it speaks, Chat Completions unless an Admin names another, and an adapter applies its vendor's dialect.
 
 A thinking level maps to the protocol's own reasoning control. The adapter sends one only when the Model is marked as thinking; a Model that cannot think refuses a Bot that asks for a level.
 
@@ -36,7 +36,7 @@ A Model that cannot call tools never enters the loop. The loop's tool schemas ar
 
 The record names one default Model for the whole Space, and an event that names one clears the mark on every other Model.
 
-The Admin's choice arrives as a `neha.provider.models_updated` event on the chosen Model's Provider, which re-states that Provider's Models and names the default one. The event changes no thinking level; the Space's default level comes from a Provider connection.
+An Admin's choice arrives as a `neha.provider.models_updated` event on the chosen Model's Provider, which re-states that Provider's Models and names the default one. The event changes no thinking level; the Space's default level comes from a Provider connection.
 
 ## Catalog
 

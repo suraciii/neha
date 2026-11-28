@@ -150,7 +150,7 @@ async function openSettings(section = "Providers"): Promise<View> {
   await waitFor(() => expect(element(view, ".rail__item:nth-of-type(4)")).toBeTruthy());
   flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
   // The sidebar lists every section the Settings surface opens.
-  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(5));
+  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
   flush(() => fireEvent.click(button(view, section)));
   await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
   return view;
@@ -1582,7 +1582,7 @@ describe("App management", () => {
       // reads to hide the sidebar is not on the shell, so the section buttons
       // are the ones on screen.
       flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(5));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
       expect(element(view, ".app").className).not.toContain("app--detail");
 
       // A section opens its detail, and Back returns to the list.
@@ -1591,7 +1591,7 @@ describe("App management", () => {
       expect(panelText(view, "Computers")).toBeTruthy();
       flush(() => fireEvent.click(element(view, ".page__back")));
       await waitFor(() => expect(element(view, ".app").className).not.toContain("app--detail"));
-      expect(view.container.querySelectorAll(".conv")).toHaveLength(5);
+      expect(view.container.querySelectorAll(".conv")).toHaveLength(6);
 
       // The stylesheet the class is read from hides the sidebar beside a detail,
       // so the class is what decides which of the two a narrow viewport shows.
@@ -1627,7 +1627,7 @@ describe("App management", () => {
       // The rail opens the Settings surface, and its list of sections is the
       // surface on screen.
       flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(5));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
       expect(element(view, ".app").className).not.toContain("app--setup");
       expect(element(view, ".app").className).not.toContain("app--detail");
     } finally {
@@ -1639,7 +1639,7 @@ describe("App management", () => {
     // A narrow viewport shows one surface at a time, and the Chat left open
     // behind the Settings surface must not be the one that decides: the rail
     // view does. Otherwise the list of sections is the hidden surface and three
-    // of the four sections cannot be reached.
+    // of the five sections cannot be reached.
     const wide = window.matchMedia;
     try {
       Object.defineProperty(window, "matchMedia", {
@@ -1661,7 +1661,7 @@ describe("App management", () => {
       // The rail opens the Settings surface, and its list of sections is the
       // surface on screen.
       flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(5));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
       expect(element(view, ".app").className).not.toContain("app--detail");
 
       // The Bots surface is reachable the same way.

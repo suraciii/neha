@@ -11,11 +11,11 @@ This guide pairs the machine that runs the Space through its local ticket, and a
 - A Linux machine with the Neha CLI. [Building and verification](building.md) covers the build; the examples use `target/debug/neha`.
 - `bubblewrap` on that machine. A Local Computer runs each shell command in a sandbox it starts, unless the Bot has full access, and a Local Space needs it for a process-local Hosted Computer too; the file tools check their own paths. A containerized Hosted Space uses its worker containers instead. [Building and verification](building.md#a-computer-sandbox) covers the install.
 - A Space the machine can reach: `http://127.0.0.1:7337` when the Space runs on the same machine, or the Space's public `https://` origin when it runs elsewhere.
-- A CLI signed in to the Space for commands such as `computer list`, `computer create`, and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
+- A CLI signed in to the Space for commands such as `computer list`, `computer create`, and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-space-owner-from-the-cli) covers `neha join`.
 
 ## Pair the machine
 
-Start the Space with `neha serve` and keep it running. A Space that had an Admin when it started also prints the command that pairs this machine:
+Start the Space with `neha serve` and keep it running. A Space that has a Space Owner already prints the command that pairs this machine:
 
 ```text
 Pair this PC: neha computer pair
@@ -47,11 +47,11 @@ target/debug/neha computer run
 
 Keep that terminal open. The Space shows the Computer as online while the daemon runs, and the run prints the Workspace root it serves.
 
-The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, which granted mode hides from Bots.
+The ticket admits one pairing for one Space start and expires after 10 minutes. A Space with a Space Owner writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, which granted mode hides from Bots.
 
 Each Space's ticket sits at `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`, or `~/.config/neha/spaces/<space-key>/local-computer.ticket` when `XDG_CONFIG_HOME` is not set; on Windows it is under `%LOCALAPPDATA%\Neha\spaces`. `computer pair` scans `spaces/` and pairs the Space whose URL its ticket names; `--ticket-file` names another file. When no ticket file exists, a signed-in CLI asks the Space that saved its session for one, so only that fallback needs a signed-in CLI.
 
-The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one.
+The Computer belongs to the User the ticket names: the Space Owner for a startup ticket, or the signed-in User who asked for one.
 
 Run `neha computer pair` again if the ticket expired or was used, and restart the Space first if it wrote the old one. Pass `--yes` to skip the confirmation, `--space <url>` to name the Space address, and `--ticket-file <path>` to name another ticket file. A local ticket names this machine's Space, and the fallback calls only the Space that saved the CLI session.
 

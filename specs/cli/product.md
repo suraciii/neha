@@ -24,7 +24,19 @@ A Bot's shell runs the same CLI with a short-lived run token instead of a sign-i
 
 ## Running a Space
 
-`neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
+`neha serve` starts a Space on the machine and prints its address. A Space that has no User prints an invitation link too, and the first User opens the link in an app or a browser to become the Space Owner.
+
+## Users and invitations
+
+`neha user list` prints each User's role and display name. Every signed-in User MAY run it.
+
+`neha whoami` asks the Space which account the saved credential signs in as, so it shows the role the Space holds now, not the one the credential saved when it signed in.
+
+A command that names a `<user>` reads a display name first. If the argument is also another listed User's identifier, the command refuses and asks for `--id`; otherwise a name no User has is read as an identifier.
+
+`neha user role <user> admin|member` changes a User's role, and `neha user transfer <user>` makes that User the Space Owner and the caller an Admin. Only the Space Owner MAY run either, and a role change never names `owner`. Both read `<user>` as a display name, or as an identifier with `--id`.
+
+`neha invitation create` prints an invitation link once; `neha invitation list` prints each pending invitation and its expiry, and `neha invitation revoke <invitation>` revokes one. Only the Space Owner and Admins MAY run these commands.
 
 `neha login --name <name>` signs in with a password.
 
@@ -57,7 +69,7 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 `neha provider list` prints each Provider's vendor, protocol, and address. `neha model list` prints each Model's context, output, image, thinking levels, tools, and default state.
 
-`neha model default <model>` sets the Space's default Model, as [Settings](../client/product.md#settings) does in the browser. Only the Admin sets it, and every Bot without its own Model uses it.
+`neha model default <model>` sets the Space's default Model, as [Settings](../client/product.md#settings) does in the browser. Only an Admin sets it, and every Bot without its own Model uses it.
 
 ## Catalog
 
@@ -65,17 +77,17 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 `neha catalog status` prints whether the built-in snapshot or the cache is in use, its age, and whether it is stale. `neha catalog refresh` fetches the catalog again; a failed fetch keeps the last known good copy.
 
-Only the Admin refreshes the catalog. The other catalog commands are reads.
+Only an Admin refreshes the catalog. The other catalog commands are reads.
 
 ## Plugins and tools
 
-`neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only the Admin MAY do.
+`neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only an Admin MAY do.
 
-`neha mcp add <name>` without an address attaches the Space's credential to an existing package `stdio` server of that name, which only the Admin MAY do.
+`neha mcp add <name>` without an address attaches the Space's credential to an existing package `stdio` server of that name, which only an Admin MAY do.
 
 The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the browser, never from the command line. `neha mcp list` prints each server, its scope, who connected it, and whether it is connected.
 
-`neha plugin install <source>[@<commit>]` installs a package from a source the Admin allows. `neha plugin list` prints each package, its commit, and what it brought.
+`neha plugin install <source>[@<commit>]` installs a package from a source an Admin allows. `neha plugin list` prints each package, its commit, and what it brought.
 
 `neha skill add <path> [--bot <bot>]` adds a skill to the Space's library or to a Bot's. `neha bot mcp enable <bot> <server>` and `neha bot skill enable <bot> <skill>` give a Bot a server or a skill; `disable` takes it away.
 

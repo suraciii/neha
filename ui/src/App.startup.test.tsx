@@ -2,10 +2,11 @@
 // travels in a frame the Space's own decoder accepts. The fake Space refuses a
 // frame whose args shape the real decoder would refuse, so a call site that
 // names the wrong shape cannot reach its first Chat.
+import { waitFor } from "@solidjs/testing-library";
 import { describe, expect, it, vi } from "vitest";
 
 import { space } from "./test/fakeSpace";
-import { openChat, useView } from "./test/view";
+import { openChat, renderApp, useView } from "./test/view";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/ws")>()),
@@ -15,6 +16,20 @@ vi.mock("./lib/ws", async (importOriginal) => ({
 useView();
 
 describe("App startup", () => {
+  it("shows an invitation even when the browser is already signed in", async () => {
+    history.replaceState({}, "", "/invite#secret1");
+    const view = renderApp();
+    try {
+      // The Space answers `/api/me` with an account, and the invitation page
+      // still opens: it joins a new User, not the signed-in one.
+      await waitFor(() => expect(view.container.querySelector(".auth")).toBeTruthy());
+      expect(view.container.textContent).toContain("Join this Space");
+      expect(view.container.querySelector(".rail")).toBeNull();
+    } finally {
+      history.replaceState({}, "", "/");
+    }
+  });
+
   it("loads the workspace through frames the Space's decoder accepts", async () => {
     const view = await openChat();
 

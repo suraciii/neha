@@ -39,8 +39,40 @@ pub struct UserView {
     pub id: Id,
     /// The display name.
     pub display_name: String,
-    /// Whether the account is the Admin.
-    pub is_admin: bool,
+    /// The role the User holds in this Space.
+    pub role: neha::role::Role,
+}
+
+impl UserView {
+    /// Whether this User administers the Space.
+    #[must_use]
+    pub const fn is_admin(&self) -> bool {
+        self.role.administers()
+    }
+}
+
+/// An invitation that still admits one User.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
+pub struct InvitationView {
+    /// The invitation identifier.
+    pub id: Id,
+    /// When it was made.
+    pub created_at: neha::time::Timestamp,
+    /// When it stops working.
+    pub expires_at: neha::time::Timestamp,
+}
+
+/// The invitation a create answered with, and the secret it showed once.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
+pub struct CreatedInvitation {
+    /// The invitation.
+    pub invitation: InvitationView,
+    /// The secret its link carries; present only in the answer that made the
+    /// invitation, never in a recorded retry.
+    #[ts(optional)]
+    pub secret: Option<String>,
 }
 
 /// A Provider connected to the Space.
@@ -815,6 +847,8 @@ impl State {
 pub struct State {
     /// The Users, by identifier.
     pub users: HashMap<Id, UserView>,
+    /// The Users in the order the record joined them.
+    pub user_order: Vec<Id>,
     /// The Providers, by identifier.
     pub providers: HashMap<Id, ProviderView>,
     /// The Models, by identifier.
@@ -1425,14 +1459,67 @@ impl Projection for State {
                 let Author::User(id) = event.author else {
                     return Err("a joined User must author the event".to_owned());
                 };
-                self.users.insert(
+                let role = data.role();
+                if self.users.contains_key(&id) {
+                    return Err("a User joined the record twice".to_owned());
+                }
+                if role.owns() && self.users.values().any(|user| user.role.owns()) {
+                    return Err("the record already has a Space Owner".to_owned());
+                }
+                let joined = UserView {
                     id,
-                    UserView {
-                        id,
-                        display_name: data.display_name,
-                        is_admin: data.is_admin,
-                    },
-                );
+                    display_name: data.display_name,
+                    role,
+                };
+                self.users.insert(id, joined);
+                self.user_order.push(id);
+            }
+            EventData::UserUpdated(data) => {
+                let Author::User(actor) = event.author else {
+                    return Err("a role change must be authored by a User".to_owned());
+                };
+                if !self
+                    .users
+                    .get(&actor)
+                    .is_some_and(|actor| actor.role.owns())
+                {
+                    return Err("only the Space Owner changes a role".to_owned());
+                }
+                let Some(user) = self.users.get_mut(&data.user) else {
+                    return Err("no such User".to_owned());
+                };
+                if user.role == neha::role::Role::Owner {
+                    return Err("the Space Owner's role changes only by transfer".to_owned());
+                }
+                user.role = data.role;
+            }
+            // An invitation lives in the identity tables, not the record; the
+            // event only says the pending invitation moved. An Admin's clients
+            // refresh it, and the projection holds nothing to change.
+            EventData::InvitationChanged(_) => {}
+            EventData::UserTransferred(data) => {
+                let Author::User(owner) = event.author else {
+                    return Err("a transfer must be authored by a User".to_owned());
+                };
+                if !self.users.get(&owner).is_some_and(|user| user.role.owns()) {
+                    return Err("only the Space Owner transfers the Space".to_owned());
+                }
+                if data.to == owner {
+                    return Err("the Space cannot transfer to its Owner".to_owned());
+                }
+                if !self.users.contains_key(&data.to) {
+                    return Err("no such User".to_owned());
+                }
+                // The target becomes the Owner before the outgoing Owner
+                // becomes an Admin, so the projection never holds no Owner.
+                self.users
+                    .get_mut(&data.to)
+                    .expect("the target was just checked")
+                    .role = neha::role::Role::Owner;
+                self.users
+                    .get_mut(&owner)
+                    .expect("the author was just checked")
+                    .role = neha::role::Role::Admin;
             }
             EventData::ProviderAdded(data) => {
                 self.providers.insert(

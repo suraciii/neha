@@ -34,7 +34,7 @@ target/debug/neha skill add ./weekly-report
 target/debug/neha skill add ./weekly-report --bot <bot-id>
 ```
 
-Without `--bot` the skill joins the Space's library, which only the Admin may add to. With `--bot` it joins that Bot's library, and only the Bot's owner may add it there. A library holds one skill under each name; remove the old one before adding another under the same name.
+Without `--bot` the skill joins the Space's library, which only an Admin may add to. With `--bot` it joins that Bot's library, and only the Bot's owner may add it there. A library holds one skill under each name; remove the old one before adding another under the same name.
 
 Adding a skill from a directory needs the CLI on a Unix machine; that machine may run the CLI against any Space. A Windows build refuses the command instead of reading a path a racing writer could change.
 
@@ -58,7 +58,7 @@ Removing a skill takes it away from every Bot that enabled it.
 
 The Skills view lists the Space's library and the library of each Bot you own. A
 row shows the skill's name, its description, the scripts it carries, and the
-package that brought it when one did. The Admin adds a skill to the Space's
+package that brought it when one did. An Admin adds a skill to the Space's
 library; a Bot's owner adds one to that Bot's library and turns skills on or off
 for it. The browser takes a name, a description, the instructions, and optional
 scripts, and the Space records them as one `SKILL.md`.
@@ -91,7 +91,7 @@ The body says which script to run and what to pass. The Bot names the script by 
 - `neha skill add` refuses a symlink and a file that is not a regular file, at every level, so a skill's files come from the directory the User named.
 - A script name is one path component of letters, digits, dots, hyphens, or underscores, so a name cannot leave the staging directory.
 - The Space parses `SKILL.md` as YAML before it records anything, and it reports the frontmatter rule a rejected document broke.
-- The Admin can set the Space to treat skills as instructions only. Add `[skills] instructions_only = true` to `config.toml` in the Space home and restart the Space; then no skill's script is offered to a Bot or reaches a Computer, and a call to one fails.
+- An Admin can set the Space to treat skills as instructions only. Add `[skills] instructions_only = true` to `config.toml` in the Space home and restart the Space; then no skill's script is offered to a Bot or reaches a Computer, and a call to one fails.
 
 ## What this milestone does not do
 

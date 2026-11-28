@@ -7,7 +7,7 @@ type Listener = (event: { data?: string }) => void;
 // The protocol version the Space speaks, as `PROTOCOL_VERSION` in
 // `crates/neha/src/surface.rs` states it. The fake Space refuses a hello that
 // greets with any other version, so a stale browser version fails these tests.
-const SERVER_PROTOCOL_VERSION = 3;
+const SERVER_PROTOCOL_VERSION = 4;
 
 class FakeSocket {
   static readonly CONNECTING = 0;
