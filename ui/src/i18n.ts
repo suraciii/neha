@@ -482,6 +482,11 @@ const en = {
   "settings.computers.add.action": "Add Computer",
   "settings.computers.add.adding": "Adding…",
   "settings.computers.add.done": "Computer added",
+  "settings.computers.revoke": "Revoke access",
+  "settings.computers.revoke.armed": "Revoke {name}?",
+  "settings.computers.revoke.done": "Access revoked",
+  "settings.computers.revoke.hint":
+    "Revoking disconnects the machine's daemon. The Computer stays listed offline, and pairing it again creates a new Computer.",
   "settings.computers.share": "Make shared",
   "settings.computers.share.done": "Computer is shared",
   "settings.computers.access.none": "Only its Workspace",
@@ -970,6 +975,11 @@ const zh: Record<MessageKey, string> = {
   "settings.computers.add.action": "添加 Computer",
   "settings.computers.add.adding": "添加中…",
   "settings.computers.add.done": "Computer 已添加",
+  "settings.computers.revoke": "撤销访问",
+  "settings.computers.revoke.armed": "确认撤销 {name}？",
+  "settings.computers.revoke.done": "访问已撤销",
+  "settings.computers.revoke.hint":
+    "撤销会断开该机器上的 daemon。Computer 会保留并显示为离线，重新配对会创建新的 Computer。",
   "settings.computers.share": "改为共享",
   "settings.computers.share.done": "Computer 已改为共享",
   "settings.computers.access.none": "仅自己的 Workspace",

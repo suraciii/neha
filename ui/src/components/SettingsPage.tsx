@@ -52,6 +52,8 @@ interface SettingsPageProps {
   onReset: (computer: string) => Promise<boolean>;
   // Adds a Local Computer whose machine printed a pairing code.
   onAdd: (code: string) => Promise<boolean>;
+  // Revokes a Local Computer's credential and disconnects its daemon.
+  onRevoke: (computer: string) => Promise<boolean>;
   // Opens one Bot's page from a Computer that has Bots on it.
   onOpenBot: (bot: Bot) => void;
   onConnect: (input: {
@@ -248,6 +250,8 @@ export default function SettingsPage(props: SettingsPageProps) {
   // The code a machine on another machine showed. It is entered on any
   // signed-in client, which approves and records that machine.
   const [pairingCode, setPairingCode] = createSignal("");
+  // Revoking access disconnects a machine, so it asks twice.
+  const [armedRevoke, setArmedRevoke] = createSignal<string | null>(null);
 
   async function createComputer() {
     const name = computerName().trim();
@@ -276,6 +280,17 @@ export default function SettingsPage(props: SettingsPageProps) {
       setPairingCode("");
       setNote(t("settings.computers.add.done"));
     }
+  }
+
+  async function revoke(computer: string) {
+    if (props.busy) return;
+    if (armedRevoke() !== computer) {
+      setArmedRevoke(computer);
+      return;
+    }
+    setArmedRevoke(null);
+    setNote(null);
+    if (await props.onRevoke(computer)) setNote(t("settings.computers.revoke.done"));
   }
 
   async function reset(computer: string) {
@@ -668,6 +683,26 @@ export default function SettingsPage(props: SettingsPageProps) {
                           >
                             {t("settings.computers.share")}
                           </button>
+                        </Show>
+                        {/* Revoking access disconnects a machine; only a
+                            Local Computer holds a credential to revoke. */}
+                        <Show when={computer.kind === "local"}>
+                          <button
+                            class={`btn ${
+                              armedRevoke() === computer.id ? "btn--danger" : "btn--quiet"
+                            }`}
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() => void revoke(computer.id)}
+                          >
+                            <Icon name="x" size="sm" />
+                            {armedRevoke() === computer.id
+                              ? t("settings.computers.revoke.armed", { name: computer.name })
+                              : t("settings.computers.revoke")}
+                          </button>
+                          <Show when={armedRevoke() === computer.id}>
+                            <span class="field__hint">{t("settings.computers.revoke.hint")}</span>
+                          </Show>
                         </Show>
                         {/* A reset clears a Hosted Workspace's files, and only a
                             Hosted Computer can be reset. */}

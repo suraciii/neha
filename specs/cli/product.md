@@ -87,6 +87,8 @@ On the Space's own machine it finds the startup ticket under Neha's configuratio
 
 Only the Computer's owner resets it, and only a Hosted Computer is reset. A Computer with a Bot whose run is queued, running, or waiting refuses a reset until that run ends, and a second reset of an empty Workspace succeeds.
 
+`neha computer revoke <computer>` withdraws a Local Computer's credential and disconnects its daemon. Only the Computer's owner revokes it, and a Hosted Computer is withdrawn by its worker instead. The record stays listed offline, and pairing the machine again creates a new Computer.
+
 `neha computer create` makes a Hosted Computer. `--name` names it, and `--shared` or `--exclusive` chooses who MAY use it; exclusive is the default. `neha computer update <computer> --shared` makes an exclusive Computer shared; `--exclusive` is refused while more than one Bot uses it.
 
 `neha bot create --computer` takes one of these:

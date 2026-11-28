@@ -295,6 +295,9 @@ pub async fn execute(
         CommandCall::ComputerReset { computer } => {
             computer_reset(context, account, command_id, fingerprint, computer).await
         }
+        CommandCall::ComputerRevoke { computer } => {
+            computer_revoke(context, account, computer).await
+        }
         CommandCall::BotCreate(arguments) => {
             bot_create(context, account, command_id, fingerprint, arguments).await
         }
@@ -8101,6 +8104,59 @@ async fn computer_reset(
         }),
         Err(error) => Err(store_error(error)),
     }
+}
+
+/// Revokes a Local Computer's credential and disconnects its daemon.
+///
+/// The Computer record stays: its Bots wait for it like any offline Computer.
+/// Only the owner may revoke, and only a Local Computer; a Hosted worker's
+/// credential is provisioned and withdrawn by the worker manager.
+async fn computer_revoke(
+    context: &CommandContext<'_>,
+    account: &Account,
+    computer: Id,
+) -> Result<Outcome, ApiError> {
+    let view = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let view = state
+            .computers
+            .get(&computer)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("no such Computer"))?;
+        if view.owner != account.id {
+            return Err(ApiError::not_found("no such Computer"));
+        }
+        if view.kind != "local" {
+            return Err(ApiError::invalid_argument(
+                "only a Local Computer can be revoked; a Hosted Computer is withdrawn by its worker",
+            ));
+        }
+        view
+    };
+    // A Hello that passed authentication may still be about to publish its
+    // link. The same gate orders that handshake's final check with this
+    // revocation, so no channel survives behind the answer.
+    let _revoking = context.links.lock_revocations().await;
+    context
+        .identity
+        .revoke_computer(computer)
+        .await
+        .map_err(identity_error)?;
+    if !context.links.forget(computer).await {
+        return Err(ApiError::internal(
+            "the Computer's channel did not stop; try revoking it again",
+        ));
+    }
+
+    Ok(Outcome {
+        committed: None,
+        result: json!(viewed_computer(&view, context.links)),
+        queued: None,
+        events: Vec::new(),
+    })
 }
 
 /// Drops the in-memory reset mark after a command's effect finished or failed.

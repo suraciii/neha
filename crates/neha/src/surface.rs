@@ -120,6 +120,11 @@ pub enum CommandCall {
         /// The Hosted Computer to reset.
         computer: Id,
     },
+    /// Revokes a Local Computer's credential and disconnects its daemon.
+    ComputerRevoke {
+        /// The Local Computer to revoke.
+        computer: Id,
+    },
     /// Creates a Bot with its Computer and Chat.
     BotCreate(BotCreate),
     /// Changes a Bot's file access.
@@ -880,6 +885,15 @@ mod tests {
         let command = CommandCall::ComputerReset { computer };
         let text = serde_json::to_string(&command).unwrap();
         assert!(text.contains("\"computer_reset\""));
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
+    }
+
+    #[test]
+    fn a_computer_revocation_round_trips() {
+        let computer = Id::new();
+        let command = CommandCall::ComputerRevoke { computer };
+        let text = serde_json::to_string(&command).unwrap();
+        assert!(text.contains("\"computer_revoke\""));
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), command);
     }
 

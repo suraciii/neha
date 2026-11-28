@@ -1417,3 +1417,47 @@ async fn issuing_and_claiming_drop_expired_tickets() {
         None
     );
 }
+
+#[tokio::test]
+async fn revoking_forgets_claims_and_waiting_rows_for_its_token() {
+    let (_dir, _home, identity) = identity().await;
+    let first = identity
+        .begin_pairing("laptop", "/ws", "shared-token", "poll-one")
+        .await
+        .unwrap();
+    let owner = Id::new();
+    let computer = Id::new();
+    assert!(
+        identity
+            .reserve_pairing(&first.code, owner, computer)
+            .await
+            .unwrap()
+    );
+    assert!(identity.finalize_pairing(owner, computer).await.unwrap());
+
+    // The same machine starts another pairing with the token it already
+    // holds; approving it after revocation must not restore the old token.
+    let waiting = identity
+        .begin_pairing("laptop", "/ws", "shared-token", "poll-two")
+        .await
+        .unwrap();
+
+    assert!(identity.revoke_computer(computer).await.unwrap());
+    assert_eq!(
+        identity
+            .authenticate_computer("shared-token")
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(identity.pairing_claims().await.unwrap(), Vec::new());
+    assert_eq!(
+        identity.pairing_request(&waiting.code).await.unwrap(),
+        None,
+        "a waiting row carrying the revoked token is gone"
+    );
+    assert!(
+        !identity.revoke_computer(computer).await.unwrap(),
+        "a second revoke is idempotent"
+    );
+}

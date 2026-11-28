@@ -635,6 +635,61 @@ impl Identity {
         Ok(())
     }
 
+    /// Forgets a Local Computer's token and every pairing row that could
+    /// restore it.
+    ///
+    /// A revoke must survive a restart: the start-up reconciliation rebuilds a
+    /// token from any claim that names a recorded Computer, so the token row,
+    /// its claims, and an unclaimed row carrying the same token hash are all
+    /// removed in one transaction. The Computer record itself stays; its Bots
+    /// wait for it like any offline Computer. Idempotent: revoking again
+    /// removes what is already gone and reports no token.
+    pub async fn revoke_computer(&self, computer: Id) -> Result<bool, IdentityError> {
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result = async {
+            let hashes: Vec<Vec<u8>> =
+                sqlx::query_scalar("SELECT token_hash FROM computer_tokens WHERE computer_id = ?")
+                    .bind(computer.to_string())
+                    .fetch_all(&mut *connection)
+                    .await?;
+            let removed_token = sqlx::query("DELETE FROM computer_tokens WHERE computer_id = ?")
+                .bind(computer.to_string())
+                .execute(&mut *connection)
+                .await?
+                .rows_affected()
+                > 0;
+            sqlx::query("DELETE FROM computer_codes WHERE computer = ?")
+                .bind(computer.to_string())
+                .execute(&mut *connection)
+                .await?;
+            // A pairing started by the same machine but not approved yet
+            // holds the same token hash; approving it after the revoke would
+            // mint a fresh token the old daemon could use. Forget it too.
+            for hash in hashes {
+                sqlx::query("DELETE FROM computer_codes WHERE token_hash = ?")
+                    .bind(hash)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+
+            Ok(removed_token)
+        }
+        .await;
+        match result {
+            Ok(removed) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(removed)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
     /// Returns the Computer a machine token belongs to.
     pub async fn authenticate_computer(&self, token: &str) -> Result<Option<Id>, IdentityError> {
         let digest = digest(token);

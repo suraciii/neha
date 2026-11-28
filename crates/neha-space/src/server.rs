@@ -3136,10 +3136,12 @@ async fn computer_socket(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    let token = bearer(&headers).ok_or_else(unauthorized_computer)?;
+    let token = bearer(&headers)
+        .ok_or_else(unauthorized_computer)?
+        .to_owned();
     let computer = server
         .identity
-        .authenticate_computer(token)
+        .authenticate_computer(&token)
         .await
         .map_err(identity_error)?
         .ok_or_else(unauthorized_computer)?;
@@ -3154,7 +3156,9 @@ async fn computer_socket(
     Ok(ws
         .max_message_size(MAX_CHANNEL_FRAME_BYTES)
         .max_frame_size(MAX_CHANNEL_FRAME_BYTES)
-        .on_upgrade(move |socket| handle_computer_socket(socket, server, computer)))
+        .on_upgrade(move |socket| {
+            handle_computer_socket(socket, server, computer, token.to_owned())
+        }))
 }
 
 fn unauthorized_computer() -> ApiError {
@@ -3203,7 +3207,12 @@ fn hello_access(
     }
 }
 
-async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>, computer: Id) {
+async fn handle_computer_socket(
+    mut socket: WebSocket,
+    server: Arc<SpaceServer>,
+    computer: Id,
+    token: String,
+) {
     // A connection that never greets is not the Computer we paired: it must
     // not hold a task open while waiting for a frame that may never come.
     let hello = match tokio::time::timeout(COMPUTER_HELLO, socket.recv()).await {
@@ -3258,6 +3267,20 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         None => None,
     };
 
+    // A revoke may have deleted the token after the HTTP check and before this
+    // Hello passed its checks. The gate makes the final authentication and the
+    // link publication one step: a revoked token cannot register a channel.
+    let revoking = server.links.lock_revocations().await;
+    let still_allowed = match server.identity.authenticate_computer(&token).await {
+        Ok(Some(found)) => {
+            found == computer && computer_is_recorded(&server, computer).unwrap_or(false)
+        }
+        Ok(None) | Err(_) => false,
+    };
+    if !still_allowed {
+        return;
+    }
+
     let (sink, mut stream) = socket.split();
     let (frames, mut outgoing) = mpsc::channel::<HostFrame>(computer_link::FRAME_QUEUE);
     // The daemon waits for this acknowledgement before it calls the channel
@@ -3271,6 +3294,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
     let link = server
         .links
         .connect_with_origin(computer, frames.clone(), access, origin);
+    drop(revoking);
     // When a Computer reconnects, it replaces its old link and this handler
     // must stop: the Space already failed the old link's requests, and two
     // readers acting as one Computer would race each other.
@@ -3284,34 +3308,94 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         let mut closing = link.closed_signal();
         let mut sink = sink;
         async move {
+            let mut cancelled_mid_send = false;
             loop {
+                // A revoke can land between publishing the link and this
+                // writer subscribing; the close signal already recorded then
+                // would not wake `changed`, so read the current value too.
+                if *closing.borrow() {
+                    break;
+                }
                 tokio::select! {
                     biased;
                     _ = closing.changed() => break,
                     frame = outgoing.recv() => {
                         let Some(frame) = frame else { break; };
+                        #[cfg(feature = "test-support")]
+                        let is_action = matches!(frame, HostFrame::Action { .. });
+                        #[cfg(feature = "test-support")]
+                        if is_action {
+                            crate::computer_link::pause_writer(link.computer).await;
+                        }
                         let Ok(text) = serde_json::to_string(&frame) else { break; };
-                        let sent = tokio::time::timeout(
-                            computer_link::FRAME_TIMEOUT,
-                            sink.send(Message::Text(text.into())),
-                        )
-                        .await;
-                        if !matches!(sent, Ok(Ok(()))) {
+                        let deadline =
+                            tokio::time::Instant::now() + computer_link::FRAME_TIMEOUT;
+                        // `feed` accepts the frame into the sink's buffer but
+                        // does not flush it. A close arriving while it waits
+                        // must drop the socket without flushing: a buffered
+                        // Action must not leave after a revoke reports success.
+                        let fed = {
+                            let feed = sink.feed(Message::Text(text.into()));
+                            tokio::pin!(feed);
+                            tokio::select! {
+                                biased;
+                                _ = closing.changed() => {
+                                    cancelled_mid_send = true;
+                                    break;
+                                }
+                                fed = tokio::time::timeout_at(deadline, &mut feed) => fed,
+                            }
+                        };
+                        if !matches!(fed, Ok(Ok(()))) {
+                            cancelled_mid_send = true;
+                            link.close();
+                            break;
+                        }
+                        #[cfg(feature = "test-support")]
+                        if is_action {
+                            crate::computer_link::pause_writer_after_feed(link.computer).await;
+                            crate::computer_link::stall_writer_after_feed(link.computer).await;
+                        }
+                        if *closing.borrow() {
+                            cancelled_mid_send = true;
+                            break;
+                        }
+                        let flushed = tokio::select! {
+                            biased;
+                            _ = closing.changed() => {
+                                cancelled_mid_send = true;
+                                break;
+                            }
+                            flushed = tokio::time::timeout_at(deadline, sink.flush()) => flushed,
+                        };
+                        if !matches!(flushed, Ok(Ok(()))) {
+                            cancelled_mid_send = true;
                             link.close();
                             break;
                         }
                     }
                 }
             }
-            // Close from our side so a replaced Computer learns its channel
-            // moved instead of discovering it on its next write.
-            let _ = tokio::time::timeout(
-                computer_link::FRAME_TIMEOUT,
-                sink.send(Message::Close(None)),
-            )
-            .await;
+            if cancelled_mid_send {
+                // The sink may hold a partially sent or buffered frame. Drop
+                // it without flushing, then tell the revoke it can answer.
+                drop(sink);
+                link.mark_writer_stopped();
+            } else {
+                // Every earlier frame was flushed, so no Action is buffered:
+                // the revoke can answer before the courtesy Close is sent.
+                link.mark_writer_stopped();
+                // Close from our side so a replaced Computer learns its
+                // channel moved instead of discovering it on its next write.
+                let _ = tokio::time::timeout(
+                    computer_link::FRAME_TIMEOUT,
+                    sink.send(Message::Close(None)),
+                )
+                .await;
+            }
         }
     });
+    link.set_writer_abort(writer.abort_handle());
     let mut ping =
         tokio::time::interval_at(tokio::time::Instant::now() + COMPUTER_PING, COMPUTER_PING);
     let mut last_pong = Instant::now();
@@ -3363,7 +3447,8 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
     server.links.disconnect(&link);
     server.runs.wake_all(&server);
     // The writer stops on the link's close signal; give it its deadline, then
-    // drop it if the socket refuses to finish.
+    // abort it if the socket refuses to finish. A revoke may already have
+    // aborted it, but this handler alone joins it and publishes completion.
     if tokio::time::timeout(computer_link::FRAME_TIMEOUT, &mut writer)
         .await
         .is_err()
@@ -3371,6 +3456,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         writer.abort();
         let _ = writer.await;
     }
+    link.mark_writer_stopped();
 }
 
 /// Returns the value of an RFC 8187 `filename*`: every byte that is not an
@@ -4627,6 +4713,21 @@ pub mod test_support {
     /// Installs a pause for one Bot's next run start; returns (reached, release).
     pub fn pause_start_for_test(bot: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
         crate::runs::pause_start_for_test(bot)
+    }
+
+    /// Installs a pause before the Computer's next Action is written.
+    pub fn pause_writer_for_test(computer: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
+        crate::computer_link::pause_writer_for_test(computer)
+    }
+
+    /// Installs a pause after the sink buffers an Action but before its flush.
+    pub fn pause_writer_after_feed_for_test(computer: neha::id::Id) -> (Arc<Notify>, Arc<Notify>) {
+        crate::computer_link::pause_writer_after_feed_for_test(computer)
+    }
+
+    /// Blocks the writer after it buffers an Action, until the duration ends.
+    pub fn stall_writer_after_feed_for_test(computer: neha::id::Id, duration: std::time::Duration) {
+        crate::computer_link::stall_writer_after_feed_for_test(computer, duration);
     }
 
     /// Returns how many callers wait for one Bot's admit lock.

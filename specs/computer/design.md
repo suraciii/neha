@@ -71,6 +71,12 @@ A move reaches any Computer the Bot's owner owns; a Hosted Computer is not speci
 
 Working files do not migrate. The old Computer keeps them, and the new Computer gives the Bot a directory of its own inside its Workspace.
 
+## Credentials and revocation
+
+A Local Computer's token is reserved with its pairing claim and becomes final before the Space publishes the Computer; a crash between the two is reconciled on the next start. Its owner MAY revoke that credential; revocation deletes the token and every pairing row that could restore it, so a restart cannot rebuild it.
+
+The revoke closes the machine's channel and serializes with a channel registration, so a handshake racing it either completes before the revoke or cannot publish a link. The Computer record stays, its Bots wait, and a later pairing creates a new Computer.
+
 ## Isolation
 
 A Computer is the unit of isolation.

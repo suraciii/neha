@@ -2630,6 +2630,64 @@ async fn a_full_access_writes_outside_the_workspace_until_it_is_turned_off() {
     provider_task.abort();
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_revokes_a_local_computer_and_its_daemon_stops() {
+    if !local_computer_ready() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let mut computer = bare_local_computer(directory, "http://127.0.0.1:1");
+    let id = computer.computer.clone();
+
+    let revoked = run(
+        &computer.home,
+        &computer.credential,
+        &["computer", "revoke", &id],
+    );
+    assert!(
+        revoked.contains(&format!("Revoked Computer {id}")),
+        "{revoked}"
+    );
+
+    let listed = run(&computer.home, &computer.credential, &["computer", "list"]);
+    let listed_line = listed
+        .lines()
+        .find(|line| line.starts_with(&format!("{id}  ")))
+        .unwrap_or_else(|| panic!("the record stays listed: {listed}"));
+    assert!(listed_line.contains("  offline  "), "{listed}");
+    assert!(listed_line.contains("  local  "), "{listed}");
+
+    // The daemon's next reconnect is refused with 401, so it exits rather
+    // than retrying forever.
+    let daemon = &mut computer.daemon;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if daemon
+            .child
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .expect("the daemon's status")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the daemon must stop after a revoke"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Revoking again is idempotent.
+    let again = run(
+        &computer.home,
+        &computer.credential,
+        &["computer", "revoke", &id],
+    );
+    assert!(again.contains(&format!("Revoked Computer {id}")), "{again}");
+}
+
 #[test]
 fn a_bot_owner_manages_file_access_from_the_cli() {
     if !local_computer_ready() {

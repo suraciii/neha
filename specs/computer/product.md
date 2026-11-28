@@ -125,6 +125,12 @@ On a Hosted Computer, a Bot gets credentials in one of two ways.
 
 A credential never appears in a Chat or a Group.
 
+## Revoking a Local Computer
+
+The owner of a Local Computer MAY revoke its access to the Space. Revocation deletes the machine's credential and disconnects its running daemon; the machine MUST pair again to serve the Space.
+
+The Computer record stays. It is shown offline, its Bots stay assigned and wait, and a later pairing creates a new Computer rather than restoring the old credential.
+
 ## Gaps
 
 - There is no User control to start, stop, or wake a Hosted Computer. A containerized deployment wakes a worker from work and stops it when idle; a process-local Hosted Computer is always awake.
@@ -132,4 +138,4 @@ A credential never appears in a Chat or a Group.
 - Removing the last Bot from a Hosted Computer does not remove its worker or Workspace root.
 - Saving a Workspace and restoring one are not yet specified.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
-- Revoking a Computer's credential is not yet specified.
+- Revoking a Hosted Computer's credential is not yet specified.

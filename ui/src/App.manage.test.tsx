@@ -1213,6 +1213,24 @@ describe("App management", () => {
     await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Workspace cleared"));
   });
 
+  it("revokes a Local Computer from the Computers list, asking twice", async () => {
+    const view = await openSettings("Computers");
+
+    const rows = view.container.querySelectorAll(".rows .row");
+    // Only a Local Computer has a credential to revoke.
+    expect(rows[0]?.textContent).toContain("Revoke access");
+    expect(rows[1]?.textContent).toContain("Revoke access");
+    expect(rows[2]?.textContent).not.toContain("Revoke access");
+
+    flush(() => fireEvent.click(button(view, "Revoke access")));
+    expect(space.revoked).toHaveLength(0);
+    await waitFor(() => expect(button(view, "Revoke Workstation?")).toBeTruthy());
+
+    press(view, "Revoke Workstation?");
+    await waitFor(() => expect(space.revoked).toEqual(["p1"]));
+    await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Access revoked"));
+  });
+
   it("says when one Provider offers no Models", async () => {
     space.providers = [
       { id: "v1", protocol: "chat_completions", base_url: "http://one", vendor: null },

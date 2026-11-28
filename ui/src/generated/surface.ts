@@ -144,6 +144,10 @@ code: string, } } | { "name": "computer_list" } | { "name": "computer_create", "
 /**
  * The Hosted Computer to reset.
  */
+computer: string, } } | { "name": "computer_revoke", "args": { 
+/**
+ * The Local Computer to revoke.
+ */
 computer: string, } } | { "name": "bot_create", "args": BotCreate } | { "name": "bot_update", "args": BotUpdate } | { "name": "bot_move", "args": { 
 /**
  * The Bot.

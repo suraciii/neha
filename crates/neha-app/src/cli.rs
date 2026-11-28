@@ -392,6 +392,11 @@ enum ComputerCommand {
         /// The Hosted Computer identifier.
         computer: Id,
     },
+    /// Revoke a Local Computer's credential and disconnect its daemon.
+    Revoke {
+        /// The Local Computer identifier.
+        computer: Id,
+    },
     /// List the Computers you own.
     List,
 }
@@ -1769,6 +1774,15 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
                 client::command(&credential, CommandCall::ComputerReset { computer }).await?;
             let id = id_of(&result, "computer")?;
             println!("Reset Computer {id} ({}).", text_of(&result, "kind")?);
+        }
+        ComputerCommand::Revoke { computer } => {
+            let credential = Credential::load()?;
+            let result =
+                client::command(&credential, CommandCall::ComputerRevoke { computer }).await?;
+            let id = id_of(&result, "id")?;
+            println!(
+                "Revoked Computer {id}. Its daemon stops and the record stays offline; pair it again to use it."
+            );
         }
         ComputerCommand::List => {
             let credential = Credential::load()?;

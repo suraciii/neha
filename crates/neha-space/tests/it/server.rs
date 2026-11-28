@@ -10797,6 +10797,132 @@ async fn a_channel_that_never_greets_is_closed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn revoking_a_local_computer_disconnects_it_and_survives_a_restart() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = Home::open(directory.path()).unwrap();
+    let first = start(home.clone(), 0).await.unwrap();
+    let invite = first.invite.clone().expect("a fresh Space invites");
+    let mut socket = admin_socket(&first, &invite).await;
+    let (computer, machine) = paired_computer(&mut socket, &first).await;
+    let mut device = connect_computer(&first, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+    let Message::Text(welcome) = device.next().await.unwrap().unwrap() else {
+        panic!("the channel begins with its Welcome frame");
+    };
+    assert_eq!(
+        serde_json::from_str::<HostFrame>(&welcome).unwrap(),
+        HostFrame::Welcome
+    );
+
+    let revoked = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert_eq!(revoked["id"], json!(computer));
+    assert_eq!(revoked["kind"], "local");
+    assert_eq!(revoked["online"], false);
+    // The live daemon's channel is closed, not left to report success after
+    // the owner withdrew its access.
+    assert!(closed(&mut device).await, "a revoked channel must close");
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer), "the Computer is offline");
+    assert_eq!(
+        first
+            .test_fields()
+            .identity
+            .authenticate_computer(&machine)
+            .await
+            .unwrap(),
+        None,
+        "the old token no longer authenticates"
+    );
+
+    // A repeat is idempotent.
+    let again = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert_eq!(again["online"], false);
+
+    // Another User cannot revoke someone else's Computer.
+    first
+        .test_fields()
+        .identity
+        .test_add_account_for_test("Grace", "correct horse battery")
+        .await
+        .unwrap();
+    let grace = sign_in(&first, "Grace").await;
+    let mut grace_socket = open_socket(&first, &grace).await;
+    let refused = try_command(
+        &mut grace_socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err((ErrorCode::NotFound, _))),
+        "only the owner can revoke: {refused:?}"
+    );
+    grace_socket.close(None).await.unwrap();
+
+    socket.close(None).await.unwrap();
+    first.shutdown().await;
+
+    // Start-up reconciliation must not rebuild the token from a claim.
+    let second = start(home, 0).await.unwrap();
+    assert_eq!(
+        second
+            .test_fields()
+            .identity
+            .authenticate_computer(&machine)
+            .await
+            .unwrap(),
+        None,
+        "a restart must not restore a revoked credential"
+    );
+    assert!(
+        try_raw_computer(&second, &machine).await.is_err(),
+        "the revoked token cannot open a new channel"
+    );
+    let token = sign_in(&second, "Ada").await;
+    let mut socket = open_socket(&second, &token).await;
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer), "the record stays offline");
+    socket.close(None).await.unwrap();
+    second.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hello_racing_a_revoke_cannot_register_its_channel() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+
+    // The HTTP upgrade passed authentication, but this daemon has not sent
+    // Hello. The revoke lands first; the late Hello must not publish a link.
+    let mut delayed = raw_computer(&running, &machine).await;
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    send_hello(&mut delayed, CHANNEL_VERSION, &computer.to_string(), true).await;
+    assert!(
+        closed(&mut delayed).await,
+        "a channel registering after the revoke must close"
+    );
+    wait_offline(&mut socket, computer).await;
+
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_reconnect_closes_the_replaced_socket() {
     let (_dir, running, invite) = running().await;
     let mut socket = admin_socket(&running, &invite).await;
@@ -11023,6 +11149,357 @@ async fn a_disconnected_computer_leaves_its_action_unknown_and_goes_offline() {
     );
     let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
     assert_eq!(listed[0]["online"], false);
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_that_wins_keeps_a_queued_run_queued() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // Pause the pump after it selected the run and before RunStarted.
+    let (reached, release) = neha_space::test_support::server::pause_start_for_test(bot);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the pump reaches the pause");
+
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    release.notify_one();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let shown = show_run(&mut socket, run).await;
+    assert_eq!(
+        shown["status"], "queued",
+        "a run selected while the revoke wins stays queued: {shown}"
+    );
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer));
+
+    provider_task.abort();
+    device.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_waits_for_the_writer_and_cancels_its_action() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    let (reached, release) = neha_space::test_support::server::pause_writer_for_test(computer);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the writer dequeues the Action and pauses");
+    let _bot = bot;
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let revoke = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revoke answer waits for the writer to stop"
+    );
+    release.notify_one();
+    let revoked = tokio::time::timeout(std::time::Duration::from_secs(2), revoke)
+        .await
+        .expect("the revoke finishes")
+        .unwrap();
+    assert!(revoked.is_ok(), "revoke failed: {revoked:?}");
+
+    // The Action was already dequeued when the revoke began, but it must not
+    // reach the Computer after the owner saw success.
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("an Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_an_in_flight_action_leaves_it_unknown() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    let HostFrame::Action { .. } = next_host_frame(&mut device).await else {
+        panic!("expected an action frame");
+    };
+    // The owner revokes while the Space still owes the action an answer: the
+    // channel closes, so the action must not report a success afterwards.
+    command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+
+    let shown = wait_run(&mut socket, run).await;
+    assert_eq!(shown["status"], "failed");
+    assert_eq!(
+        shown["actions"][0]["status"], "unknown",
+        "an action whose channel a revoke closed is unknown"
+    );
+    let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
+    assert!(!online_of(&listed, computer));
+
+    provider_task.abort();
+    device.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_drops_an_action_buffered_for_flush() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // The sink has accepted the Action into its buffer; the flush has not
+    // started. Dropping the sink must discard it without a Close flushing it.
+    let (reached, release) =
+        neha_space::test_support::server::pause_writer_after_feed_for_test(computer);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the sink buffers the Action and pauses before the flush");
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let revoke = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !revoke.is_finished(),
+        "the revoke answer waits for the writer to stop"
+    );
+    release.notify_one();
+    let revoked = tokio::time::timeout(std::time::Duration::from_secs(2), revoke)
+        .await
+        .expect("the revoke finishes")
+        .unwrap();
+    assert!(revoked.is_ok(), "revoke failed: {revoked:?}");
+
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("a buffered Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_aborts_a_wedged_writer_and_waits_for_its_join() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // The writer never flushes: the revoke's first wait times out and it must
+    // abort the writer and wait for the handler's join before reporting.
+    let (reached, release) =
+        neha_space::test_support::server::pause_writer_after_feed_for_test(computer);
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the sink buffers the Action and pauses");
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let revoke = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    let revoked = tokio::time::timeout(std::time::Duration::from_secs(3), revoke)
+        .await
+        .expect("the revoke forces the stalled writer")
+        .unwrap();
+    release.notify_one();
+    assert!(revoked.is_ok(), "revoke failed: {revoked:?}");
+
+    // The buffered Action must not have been flushed during the forced stop.
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("a buffered Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
+
+    provider_task.abort();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retry_after_a_revoke_timeout_waits_for_the_same_writer() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task) =
+        scripted_provider(vec![tool("shell", json!({"command": "pwd"}))]).await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", Some(computer))).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let mut device = connect_computer(&running, &machine, computer).await;
+    wait_online(&mut socket, computer).await;
+
+    // After the sink buffers the Action, the writer blocks its worker thread
+    // longer than both shutdown waits. The first revoke times out and errors;
+    // a retry must await the same writer instead of finding no link.
+    let (reached, release) =
+        neha_space::test_support::server::pause_writer_after_feed_for_test(computer);
+    neha_space::test_support::server::stall_writer_after_feed_for_test(
+        computer,
+        std::time::Duration::from_millis(700),
+    );
+    let queued = submit(&mut socket, chat, "run pwd", None).await;
+    let run = run_of(&queued);
+    allow_first_use(&mut socket, chat).await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("the sink buffers the Action and pauses");
+
+    let mut revoke_socket = open_socket(&running, &token).await;
+    let first = tokio::spawn(async move {
+        try_command(
+            &mut revoke_socket,
+            Id::new(),
+            CommandCall::ComputerRevoke { computer },
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    release.notify_one();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(3), first)
+        .await
+        .expect("the first revoke times out")
+        .unwrap();
+    assert!(
+        matches!(first, Err((ErrorCode::Internal, _))),
+        "the first revoke reports that shutdown was not confirmed: {first:?}"
+    );
+
+    // The link is gone from the live table, but its completion is still
+    // discoverable by Computer id; the retry waits for the writer to stop.
+    let retry = try_command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ComputerRevoke { computer },
+    )
+    .await;
+    assert!(retry.is_ok(), "the retry awaits the writer: {retry:?}");
+
+    loop {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(300), device.next()).await;
+        let Ok(Some(Ok(message))) = next else {
+            break;
+        };
+        if let Message::Text(text) = message
+            && let Ok(HostFrame::Action { .. }) = serde_json::from_str::<HostFrame>(&text)
+        {
+            panic!("a buffered Action reached the Computer after the revoke: {text}");
+        }
+    }
+    let _ = wait_run(&mut socket, run).await;
 
     provider_task.abort();
     socket.close(None).await.unwrap();
