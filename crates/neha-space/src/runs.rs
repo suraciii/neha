@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use neha::id::Id;
 use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
+use tracing::Instrument as _;
 
 use crate::commands;
 use crate::diagnostics::scrub_error;
@@ -316,6 +317,27 @@ async fn work(
                 }
                 Work::Resume(run) => {
                     drop(admit);
+                    let started_at = std::time::Instant::now();
+                    let run_span = tracing::info_span!(
+                        target: "neha::runs",
+                        "run",
+                        run_id = %run.id,
+                        bot_id = %run.bot,
+                        chat_id = %run.chat,
+                        resumed = true,
+                        otel.kind = "internal",
+                    );
+                    run_span.in_scope(|| {
+                        tracing::info!(
+                            target: "neha::runs",
+                            event = "run.start",
+                            run_id = %run.id,
+                            bot_id = %run.bot,
+                            chat_id = %run.chat,
+                            resumed = true,
+                            "a run resumed"
+                        );
+                    });
                     match commands::resume_run(
                         &server.store,
                         &server.state,
@@ -330,24 +352,31 @@ async fn work(
                         &server.approvals,
                         &run,
                     )
+                    .instrument(run_span.clone())
                     .await
                     {
                         Ok(commands::Finished::Completed(events)) => {
+                            log_run_finish(&server, &run, started_at, &run_span);
                             for event in events {
                                 let _ = server.events.send(event);
                             }
                         }
                         // The run may wait again on a later action.
-                        Ok(commands::Finished::Waiting) => {}
+                        Ok(commands::Finished::Waiting) => {
+                            log_run_finish(&server, &run, started_at, &run_span);
+                        }
                         Err(error) => {
-                            tracing::error!(
-                                target: "neha::runs",
-                                event = "run.fail",
-                                run_id = %run.id,
-                                resumed = true,
-                                error_message = scrub_error(&error.to_string()).as_str(),
-                                "a resumed run could not finish"
-                            );
+                            run_span.in_scope(|| {
+                                tracing::error!(
+                                    target: "neha::runs",
+                                    event = "run.fail",
+                                    run_id = %run.id,
+                                    resumed = true,
+                                    error_kind = ?error.code(),
+                                    duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "a resumed run could not finish"
+                                );
+                            });
                             return;
                         }
                     }
@@ -412,7 +441,28 @@ async fn work(
                     }
                     drop(revoking);
                     drop(admit);
-                    match commands::finish_run(
+                    let started_at = std::time::Instant::now();
+                    let run_span = tracing::info_span!(
+                        target: "neha::runs",
+                        "run",
+                        run_id = %pending.run,
+                        bot_id = %pending.bot.id,
+                        chat_id = %pending.chat.id,
+                        resumed = false,
+                        otel.kind = "internal",
+                    );
+                    run_span.in_scope(|| {
+                        tracing::info!(
+                            target: "neha::runs",
+                            event = "run.start",
+                            run_id = %pending.run,
+                            bot_id = %pending.bot.id,
+                            chat_id = %pending.chat.id,
+                            resumed = false,
+                            "a run started"
+                        );
+                    });
+                    let outcome = commands::finish_run(
                         &server.store,
                         &server.state,
                         &server.home,
@@ -426,23 +476,30 @@ async fn work(
                         &server.approvals,
                         pending,
                     )
-                    .await
-                    {
+                    .instrument(run_span.clone())
+                    .await;
+                    match outcome {
                         Ok(commands::Finished::Completed(events)) => {
+                            log_run_finish(&server, &run, started_at, &run_span);
                             for event in events {
                                 let _ = server.events.send(event);
                             }
                         }
-                        Ok(commands::Finished::Waiting) => {}
+                        Ok(commands::Finished::Waiting) => {
+                            log_run_finish(&server, &run, started_at, &run_span);
+                        }
                         Err(error) => {
                             // The run stays in the record; the next start reports it.
-                            tracing::error!(
-                                target: "neha::runs",
-                                event = "run.fail",
-                                run_id = %run.id,
-                                error_message = scrub_error(&error.to_string()).as_str(),
-                                "a run could not finish"
-                            );
+                            run_span.in_scope(|| {
+                                tracing::error!(
+                                    target: "neha::runs",
+                                    event = "run.fail",
+                                    run_id = %run.id,
+                                    error_kind = ?error.code(),
+                                    duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "a run could not finish"
+                                );
+                            });
                             return;
                         }
                     }
@@ -450,6 +507,57 @@ async fn work(
             }
         }
     }
+}
+
+/// Records the end of a run, with the usage the record now holds.
+fn log_run_finish(
+    server: &SpaceServer,
+    run: &RunView,
+    started: std::time::Instant,
+    span: &tracing::Span,
+) {
+    let (outcome, usage) = server
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.runs.get(&run.id).cloned())
+        .map_or(("unknown", None), |record| {
+            let outcome = match record.status {
+                RunStatus::Succeeded => "succeeded",
+                RunStatus::Failed => "failed",
+                RunStatus::Waiting => "waiting",
+                RunStatus::Running => "running",
+                RunStatus::Queued => "queued",
+            };
+            (outcome, record.usage)
+        });
+    let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    span.in_scope(|| match usage {
+        Some(usage) => tracing::info!(
+            target: "neha::runs",
+            event = "run.finish",
+            run_id = %run.id,
+            bot_id = %run.bot,
+            chat_id = %run.chat,
+            outcome,
+            duration_ms,
+            input_tokens = usage.uncached_input,
+            cache_read_tokens = usage.cache_read,
+            output_tokens = usage.output,
+            reasoning_tokens = usage.reasoning,
+            "a run finished"
+        ),
+        None => tracing::info!(
+            target: "neha::runs",
+            event = "run.finish",
+            run_id = %run.id,
+            bot_id = %run.bot,
+            chat_id = %run.chat,
+            outcome,
+            duration_ms,
+            "a run finished"
+        ),
+    });
 }
 
 /// The work one turn of a pump does.

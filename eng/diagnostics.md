@@ -90,7 +90,12 @@ credential, a path, or an unbounded identity.
 | Target | Code |
 | --- | --- |
 | `neha::space` | Space lifecycle |
-| `neha::http` | HTTP requests and internal errors |
+| `neha::http` | HTTP requests, responses, and server errors |
+| `neha::ws` | client WebSocket connections |
+| `neha::command` | one client command |
+| `neha::model` | Provider Model calls |
+| `neha::mcp` | MCP server calls |
+| `neha::security` | refused requests and sign-in limits |
 | `neha::store` | record reads, appends, and recovery |
 | `neha::blob` | File bytes storage |
 | `neha::catalog` | model catalog refresh |
@@ -114,11 +119,28 @@ identifiers that connect it to the record, and no content.
 | `space.start` | info | `version`, `schema_version`, `protocol_version`, `addr`, `public_origin`, `storage_kind`, `worker_mode`, `ui` | the Space serves |
 | `space.stop` | info | `reason`, `uptime_s` | a stop signal arrives |
 | `space.start.failed` | error | `phase`, `error_kind`, `error_message`, and `file` when a report was saved, `write_error` when it could not be, or neither when the home is unknown | the Space cannot start |
-| `http.internal_error` | error | none | an internal HTTP error is built; the message is not logged because it can carry a remote body |
+| `http.request` | debug | `request_id`, `method`, `route`, `status`, `duration_ms` | one HTTP request finished |
+| `http.failed` | error | `request_id`, `status`, `error_kind` | one HTTP request answered 5xx |
+| `ws.connect` | debug | `connection_id` | a client WebSocket connected |
+| `ws.disconnect` | debug | `connection_id` | a client WebSocket disconnected |
+| `command.start` | debug | `command_id` | one command started |
+| `command.fail` | warn | `command_id`, `code` | one command was refused |
+| `run.start` | info | `run_id`, `bot_id`, `chat_id`, `resumed` | a run starts |
+| `run.finish` | info | `run_id`, `bot_id`, `chat_id`, `outcome`, `duration_ms`, and the usage fields when reported | a run ends |
+| `model.call` | info or warn | `outcome`, `duration_ms`, `error_kind` on failure, and the token fields on success | one Model call ends |
+| `mcp.call` | debug or warn | `method`, `transport`, `outcome`, `error_kind` on failure | one MCP call ends |
+| `computer.connected` | debug | `computer_id` | a Computer channel opened |
+| `computer.disconnected` | debug | `computer_id` | a Computer channel closed |
+| `computer.action` | debug | `bot_id`, `status` | a daemon finished one action |
+| `worker.operation` | debug or warn | `computer_id`, `operation`, `outcome` | one Supervisor request ends |
+| `push.delivery` | debug | `endpoint_host`, `status`, `outcome` | one push delivery ends |
+| `security.reject` | warn | `reason` | the Host/Origin guard refused a request |
+| `security.rate_limited` | warn | `operation`, `ip` | sign-in attempts were limited |
+| `security.login_failed` | warn | `ip` | a sign-in credential was wrong |
 | `store.fail` | error or warn | `operation`, `error_message`, and `run_id` when a run owns it | a record operation fails |
-| `blob.fail` | error or warn | `operation`, `error_kind` | a File store operation fails or is unavailable |
+| `blob.fail` | debug | `operation`, `error_kind` | a File store operation fails; the correlated `http.failed` carries the 5xx |
 | `catalog.refresh` | warn | `outcome`, `error_kind` | a background refresh fails |
-| `run.fail` | error | `run_id`, `error_message`, and `resumed` on a resumed run | a run cannot finish |
+| `run.fail` | error | `run_id`, `error_kind`, `duration_ms`, and `resumed` on a resumed run | a run cannot finish |
 | `run.resume.failed` | warn | `run_id`, `error_message`, or `reason` when it is not resumable | a resume cannot be prepared |
 | `run.recover.failed` | warn | `run_id`, `error_message` | a recovered run cannot be prepared |
 | `computer.reject` | warn | `computer_id`, `version`, `sandbox`, `unsandboxed_allowed`, `reason` | a Computer handshake is refused |
@@ -138,6 +160,36 @@ identifiers that connect it to the record, and no content.
 The run lifecycle, request correlation, metrics, and the support report add
 their events and fields in the pull request that implements them; this page
 grows with each capability and never lists an event the code does not emit.
+
+## Correlation
+
+Every HTTP response carries `x-request-id` and a W3C `traceparent`. A caller's
+`x-request-id` is kept when it is 1-64 characters of `[A-Za-z0-9._-]`; any
+other value is replaced. The `http.request` span takes its parent from an
+inbound `traceparent`; the response repeats the current span context.
+`traceparent` is lower-case hex and never carries content.
+
+`route` is the router's template (`/api/chats/{chat}/files`) and `unmatched`
+when no route matched; the raw path is client-controlled and never logged. An
+unusual HTTP method becomes `OTHER`. Exactly one `http.failed` error is
+recorded for a 5xx response, inside the request span, with the request id and
+the failing component's `error_kind`.
+
+`http.request` is the root of a server span tree. A WebSocket connection, one
+command, a run, one Model call, one MCP call, and a worker operation are child
+spans of the work that caused them. A run cross-process boundary carries
+`traceparent` in the Computer action frame; an MCP HTTP call carries the same
+value in the `traceparent` header and in JSON-RPC `params._meta.traceparent`;
+an MCP stdio call carries the `_meta` field only. Only `traceparent` crosses a
+boundary; a vendor `tracestate` is not forwarded. The receiver starts its span
+with that parent, so one trace id spans the Space, its Computer, and the MCP
+server. Events that belong to a span are emitted inside it, so their JSON lines
+name the same trace and span id as the boundary.
+
+Only boundary spans are created: one per request, connection, command, run,
+Model call, action, worker operation, MCP call, or push delivery, never inside
+a loop. Access `http.request` is debug; failures are one `http.failed` error
+per 5xx response, with the span's ids attached by the JSON formatter.
 
 ## Panics
 

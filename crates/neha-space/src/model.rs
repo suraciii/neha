@@ -205,10 +205,48 @@ impl ModelClient {
     /// jittered exponential backoff, honoring `Retry-After` when it is in
     /// range. A rejected or oversized request is not retried.
     pub async fn chat(&self, request: ChatRequest<'_>) -> Result<ChatReply, ModelError> {
+        use tracing::Instrument as _;
+
+        let span = tracing::info_span!(
+            target: "neha::model",
+            "model.call",
+            "gen_ai.operation.name" = "chat",
+            "gen_ai.provider.name" = %request.provider,
+            "gen_ai.request.model" = %request.model,
+            otel.kind = "client",
+        );
+        let started = std::time::Instant::now();
+        let result = self.chat_inner(&request).instrument(span.clone()).await;
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        span.in_scope(|| match &result {
+            Ok(reply) => tracing::info!(
+                target: "neha::model",
+                event = "model.call",
+                outcome = "ok",
+                duration_ms,
+                input_tokens = reply.usage.uncached_input,
+                cache_read_tokens = reply.usage.cache_read,
+                output_tokens = reply.usage.output,
+                reasoning_tokens = reply.usage.reasoning,
+                "the Model answered"
+            ),
+            Err(error) => tracing::warn!(
+                target: "neha::model",
+                event = "model.call",
+                outcome = "failed",
+                error_kind = model_error_kind(error),
+                duration_ms,
+                "the Model call failed"
+            ),
+        });
+        result
+    }
+
+    async fn chat_inner(&self, request: &ChatRequest<'_>) -> Result<ChatReply, ModelError> {
         let mut attempt = 0_u32;
         let mut reported = Usage::default();
         loop {
-            match self.attempt(&request).await {
+            match self.attempt(request).await {
                 Ok(mut reply) => {
                     reply.usage += reported;
                     return Ok(reply);
@@ -1767,6 +1805,27 @@ impl ReportedUsage {
 }
 
 /// A Model call failed.
+/// Names a Model failure without its display text, which can quote a
+/// Provider body.
+fn model_error_kind(error: &ModelError) -> &'static str {
+    match error {
+        ModelError::Unauthorized => "unauthorized",
+        ModelError::RateLimited { .. } => "rate_limited",
+        ModelError::ContextTooLarge => "context_too_large",
+        ModelError::Server { .. } => "server",
+        ModelError::Transport => "transport",
+        ModelError::Empty => "empty",
+        ModelError::StreamEnded { .. } => "stream_ended",
+        ModelError::Truncated { .. } => "truncated",
+        ModelError::Filtered { .. } => "filtered",
+        ModelError::ProviderStream { .. } => "provider_stream",
+        ModelError::Retried { .. } => "retried",
+        ModelError::Protocol => "protocol",
+        ModelError::Provider(_) => "provider",
+        ModelError::Request(_) => "request",
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ModelError {
     /// The Provider's credential is not accepted.

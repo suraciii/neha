@@ -1067,6 +1067,7 @@ async fn an_action_for_a_bot_that_is_not_an_identifier_is_refused() {
             working_dir: None,
             access: Default::default(),
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;
@@ -1105,6 +1106,7 @@ async fn fake_space(listener: tokio::net::TcpListener, folder: PathBuf, bot: Id)
         working_dir: None,
         access: Default::default(),
         env: Vec::new(),
+        traceparent: None,
     };
     let second = HostFrame::Action {
         id: 2,
@@ -1115,6 +1117,7 @@ async fn fake_space(listener: tokio::net::TcpListener, folder: PathBuf, bot: Id)
         working_dir: None,
         access: Default::default(),
         env: Vec::new(),
+        traceparent: None,
     };
     for frame in [first, second] {
         socket
@@ -1227,6 +1230,7 @@ async fn a_lost_channel_ends_a_full_access_actions_process_tree() {
                         write_roots: Vec::new(),
                     },
                     env: Vec::new(),
+                    traceparent: None,
                 },
             )
             .await;
@@ -1348,6 +1352,7 @@ async fn a_space_that_sends_faster_than_the_worker_is_disconnected() {
                     working_dir: None,
                     access: Default::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
             )
             .await;
@@ -1361,6 +1366,7 @@ async fn a_space_that_sends_faster_than_the_worker_is_disconnected() {
                     working_dir: None,
                     access: Default::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 };
                 if socket
                     .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -1417,6 +1423,7 @@ async fn a_space_that_sends_huge_frames_is_disconnected() {
                     working_dir: None,
                     access: Default::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 },
             )
             .await;
@@ -1433,6 +1440,7 @@ async fn a_space_that_sends_huge_frames_is_disconnected() {
                     working_dir: None,
                     access: Default::default(),
                     env: Vec::new(),
+                    traceparent: None,
                 };
                 send_space_frame(&mut socket, frame).await;
             }
@@ -1524,6 +1532,7 @@ async fn a_run_directory_is_a_write_root_through_the_channel() {
                 write_roots: vec![run_directory.path().to_string_lossy().into_owned()],
             },
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;
@@ -1570,6 +1579,7 @@ async fn a_full_access_action_opens_without_the_fence() {
                 write_roots: Vec::new(),
             },
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;
@@ -1615,6 +1625,7 @@ async fn a_granted_run_does_not_reuse_a_full_access_base() {
                 write_roots: Vec::new(),
             },
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;
@@ -1644,6 +1655,7 @@ async fn a_granted_run_does_not_reuse_a_full_access_base() {
             working_dir: None,
             access: AccessFrame::default(),
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;
@@ -1800,6 +1812,7 @@ async fn a_run_directory_keeps_the_trailing_space_of_its_name() {
             working_dir: Some(run_space.to_string_lossy().into_owned()),
             access: AccessFrame::default(),
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;
@@ -1917,6 +1930,7 @@ async fn a_skill_script_runs_through_the_channel() {
             working_dir: None,
             access: AccessFrame::default(),
             env: Vec::new(),
+            traceparent: None,
         },
     )
     .await;

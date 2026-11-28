@@ -15,6 +15,7 @@ use base64::engine::general_purpose::STANDARD_NO_PAD;
 use futures_util::StreamExt as _;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde_json::{Value, json};
+use tracing::Instrument as _;
 
 /// The MCP protocol revision this client speaks.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -441,6 +442,7 @@ impl McpClient {
         {
             headers.insert(AUTHORIZATION, value);
         }
+        crate::diagnostics::inject_headers(&mut headers);
         headers
     }
 
@@ -602,15 +604,31 @@ impl McpClient {
     async fn rpc(&mut self, method: &str, params: Option<Value>) -> Result<Reply, McpError> {
         let id = self.next_id;
         self.next_id = self.next_id.saturating_add(1);
+        let span = tracing::info_span!(
+            target: "neha::mcp",
+            "mcp.call",
+            method,
+            transport = "http",
+            otel.kind = "client",
+        );
         let mut message = json!({"jsonrpc": "2.0", "id": id, "method": method});
-        if let Some(params) = params {
+        if let Some(mut params) = params {
+            span.in_scope(|| crate::diagnostics::inject_json_meta(&mut params));
             message["params"] = params;
         }
 
-        match tokio::time::timeout(self.timeout, self.exchange(&message, id)).await {
+        let result = match tokio::time::timeout(self.timeout, self.exchange(&message, id))
+            .instrument(span.clone())
+            .await
+        {
             Ok(answer) => answer,
             Err(_) => Err(unreachable_error("the server did not answer in time")),
-        }
+        };
+        span.in_scope(|| match &result {
+            Ok(_) => tracing::debug!(target: "neha::mcp", event = "mcp.call", outcome = "ok", "an MCP call answered"),
+            Err(error) => tracing::warn!(target: "neha::mcp", event = "mcp.call", outcome = "failed", error_kind = mcp_error_kind(error), "an MCP call failed"),
+        });
+        result
     }
 
     /// Sends one JSON-RPC notification and accepts any success status.
@@ -753,6 +771,15 @@ struct Reply {
     session_id: Option<String>,
     /// The answer's `result`.
     result: Value,
+}
+
+/// Names an MCP failure without its display text.
+fn mcp_error_kind(error: &McpError) -> &'static str {
+    match error {
+        McpError::Unreachable(_) => "unreachable",
+        McpError::NotConnected { .. } => "not_connected",
+        McpError::Protocol(_) => "protocol",
+    }
 }
 
 /// An MCP call failed.
@@ -3140,5 +3167,33 @@ mod tests {
         assert!(super::matching_message(request, 1).is_none());
         let answer = serde_json::json!({"jsonrpc": "2.0", "id": 1, "result": {}});
         assert!(super::matching_message(answer, 1).is_some());
+    }
+
+    #[test]
+    fn one_call_carries_one_traceparent_in_header_and_meta() {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("mcp-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let client = McpClient::new("http://127.0.0.1:1", Some("secret-token")).unwrap();
+        let span = tracing::info_span!("mcp.call");
+        span.in_scope(|| {
+            // The header and the JSON-RPC field are built from the same
+            // current span, so a server sees one parent context.
+            let headers = client.request_headers();
+            let mut params = json!({});
+            crate::diagnostics::inject_json_meta(&mut params);
+            let header = header(&headers, "traceparent").expect("a traceparent header");
+            let meta = params["_meta"]["traceparent"]
+                .as_str()
+                .expect("a traceparent in _meta");
+            assert_eq!(header, meta, "one call has one parent context");
+            assert!(header.starts_with("00-") && header.len() == 55);
+        });
     }
 }
