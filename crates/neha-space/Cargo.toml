@@ -37,6 +37,7 @@ subtle = "2"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "process", "rt", "sync", "time"] }
 toml.workspace = true
+tracing.workspace = true
 sad-web-push = { version = "0.12", default-features = false }
 p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 

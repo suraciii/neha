@@ -40,6 +40,8 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::client::{self, Credential};
+use crate::signals;
+use neha_space::diagnostics::scrub_error;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -299,9 +301,11 @@ pub async fn pair(
         match std::fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!(
-                "warning: cannot delete the used ticket {}: {error}",
-                path.display()
+            Err(error) => tracing::warn!(
+                target: "neha::computer",
+                event = "computer.ticket.cleanup.failed",
+                error_message = scrub_error(&error.to_string()).as_str(),
+                "cannot delete the used pairing ticket"
             ),
         }
     }
@@ -372,20 +376,51 @@ async fn serve(config: Config, worker: bool) -> Result<()> {
     let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::new()));
     // One signal future spans the whole reconnect loop: a stop delivered while
     // a channel is closing must not be lost in the gap between two selects.
-    let mut shutdown = std::pin::pin!(shutdown_signal());
+    let mut shutdown = signals::Stop::install().context("cannot listen for a stop signal")?;
+    let mut wait = std::pin::pin!(shutdown.wait());
     loop {
         tokio::select! {
-            _ = &mut shutdown => return Ok(()),
+            reason = &mut wait => {
+                stop(reason);
+                return Ok(());
+            }
             served = connect_and_serve(&config, &hidden, &denied, worker, Arc::clone(&runtimes)) => {
                 if let Err(error) = served {
-                    eprintln!("{error:#}");
+                    tracing::warn!(
+                        target: "neha::computer",
+                        event = "computer.connect.failed",
+                        error_message = scrub_error(&format!("{error:#}")).as_str(),
+                        retry_ms = RECONNECT_DELAY.as_millis() as u64,
+                        "the Local Computer lost its channel and will reconnect"
+                    );
                 }
             }
         }
         tokio::select! {
-            _ = &mut shutdown => return Ok(()),
+            reason = &mut wait => {
+                stop(reason);
+                return Ok(());
+            }
             () = tokio::time::sleep(RECONNECT_DELAY) => {}
         }
+    }
+}
+
+/// Records why the daemon's stop future resolved.
+fn stop(reason: std::io::Result<signals::StopReason>) {
+    match reason {
+        Ok(reason) => tracing::info!(
+            target: "neha::computer",
+            event = "computer.stop",
+            reason = %reason,
+            "the Local Computer is stopping"
+        ),
+        Err(error) => tracing::warn!(
+            target: "neha::computer",
+            event = "computer.stop",
+            error_message = scrub_error(&error.to_string()).as_str(),
+            "the Local Computer cannot listen for a stop signal"
+        ),
     }
 }
 
@@ -396,8 +431,12 @@ async fn serve(config: Config, worker: bool) -> Result<()> {
 /// and file tools, and approvals remain the command authority.
 #[cfg(windows)]
 fn fence() -> Result<()> {
-    eprintln!(
-        "Windows Local Computer: commands run with the machine user's rights in the Bot's folder; this build has no sandbox"
+    tracing::warn!(
+        target: "neha::computer",
+        event = "computer.unsandboxed",
+        platform = "windows",
+        reason = "no_sandbox",
+        "commands run with the machine user's rights in the Bot's folder; this build has no sandbox"
     );
     Ok(())
 }
@@ -408,24 +447,6 @@ fn fence() -> Result<()> {
     LocalRuntime::probe_sandbox().context("this machine cannot fence Bot commands")?;
 
     Ok(())
-}
-
-/// Resolves on Ctrl-C, or on the termination signal a service manager sends.
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("the termination signal cannot be watched");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = terminate.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-    }
 }
 
 /// Holds the channel to the Space until it closes, then returns the failure.

@@ -37,6 +37,7 @@ use sha2::{Digest, Sha256};
 use crate::blobs::Blobs;
 use crate::catalog::CatalogStore;
 use crate::computer_link::{AccessCapabilities, ComputerLinks};
+use crate::diagnostics::scrub_error;
 use crate::home::Home;
 use crate::identity::{Account, Identity, PairingRequest};
 use crate::mcp::{HeaderClass, header_class};
@@ -7527,14 +7528,27 @@ async fn computer_add(
     {
         Ok(true) => {}
         Ok(false) => {
-            eprintln!("neha: a pairing claim vanished before it was finished");
+            tracing::warn!(
+                target: "neha::computer",
+                event = "computer.pairing.finish.failed",
+                computer_id = %computer,
+                reason = "claim_vanished",
+                "a pairing claim vanished before it was finished"
+            );
             let _ = context.identity.release_pairing(account.id, computer).await;
             return Err(ApiError::internal(
                 "the pairing claim could not be finished",
             ));
         }
         Err(error) => {
-            eprintln!("neha: cannot finish a pairing claim: {error}");
+            tracing::warn!(
+                target: "neha::computer",
+                event = "computer.pairing.finish.failed",
+                computer_id = %computer,
+                reason = "identity",
+                error_message = scrub_error(&error.to_string()).as_str(),
+                "cannot finish a pairing claim"
+            );
             let _ = context.identity.release_pairing(account.id, computer).await;
             return Err(identity_error(error));
         }
@@ -7589,7 +7603,13 @@ async fn computer_add(
             // next start's reconciliation, which rolls back claims with no
             // record.
             if let Err(release) = context.identity.release_pairing(account.id, computer).await {
-                eprintln!("neha: cannot release a pairing claim: {release}");
+                tracing::error!(
+                    target: "neha::computer",
+                    event = "computer.pairing.release.failed",
+                    computer_id = %computer,
+                    error_message = scrub_error(&release.to_string()).as_str(),
+                    "cannot release a pairing claim"
+                );
             }
             return Err(error);
         }
@@ -8707,7 +8727,13 @@ async fn compact_history(
         return history;
     };
     if let Err(error) = log.record_compaction(plan.up_to_seq, summary).await {
-        eprintln!("neha: cannot record a compaction: {error}");
+        tracing::warn!(
+            target: "neha::store",
+            event = "store.fail",
+            operation = "record_compaction",
+            error_message = scrub_error(&error.to_string()).as_str(),
+            "cannot record a compaction"
+        );
         return history;
     }
     let Ok(state) = state.lock() else {
@@ -8829,7 +8855,13 @@ pub async fn resume_run(
         let (history, resume, base_usage) = match prepare_resume(state, run, &offered.mcp) {
             Ok(plan) => plan,
             Err(error) => {
-                eprintln!("neha: cannot resume run {}: {error}", run.id);
+                tracing::warn!(
+                    target: "neha::runs",
+                    event = "run.resume.failed",
+                    run_id = %run.id,
+                    error_message = scrub_error(&error.to_string()).as_str(),
+                    "cannot resume run"
+                );
                 let events = fail_resume(store, state, events, run).await?;
                 return Ok(Finished::Completed(events));
             }
@@ -8878,7 +8910,13 @@ pub async fn resume_run(
         .await;
     }
     if !recovering {
-        eprintln!("neha: run {} is not resumable", run.id);
+        tracing::warn!(
+            target: "neha::runs",
+            event = "run.resume.failed",
+            run_id = %run.id,
+            reason = "not_resumable",
+            "run is not resumable"
+        );
         let events = fail_resume(store, state, events, run).await?;
         return Ok(Finished::Completed(events));
     }
@@ -8887,7 +8925,13 @@ pub async fn resume_run(
     let recovery = match prepare_recovery(state, run, &recovered_offered.mcp) {
         Ok(plan) => plan,
         Err(error) => {
-            eprintln!("neha: cannot recover run {}: {error}", run.id);
+            tracing::warn!(
+                target: "neha::runs",
+                event = "run.recover.failed",
+                run_id = %run.id,
+                error_message = scrub_error(&error.to_string()).as_str(),
+                "cannot recover run"
+            );
             let events = fail_run(
                 store,
                 state,
@@ -11777,7 +11821,13 @@ impl RunLog<'_> {
                 .append(vec![self.bot_draft(EventKind::MemoryAdded, data)])
                 .await
             {
-                eprintln!("neha: cannot record a compaction note: {error}");
+                tracing::warn!(
+                    target: "neha::store",
+                    event = "store.fail",
+                    operation = "record_compaction_note",
+                    error_message = scrub_error(&error.to_string()).as_str(),
+                    "cannot record a compaction note"
+                );
                 return;
             }
         }

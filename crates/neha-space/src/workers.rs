@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use neha::id::Id;
 use serde_json::json;
 
+use crate::diagnostics::scrub_error;
 use crate::server::SpaceServer;
 
 /// Returns the Supervisor's base URL when the deployment named a usable one.
@@ -97,7 +98,7 @@ impl SupervisorClient {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .build()
-            .map_err(|error| error.to_string())?;
+            .map_err(|_| "the worker Supervisor client cannot be built".to_owned())?;
 
         Ok(Self {
             client,
@@ -117,9 +118,9 @@ impl SupervisorClient {
             }))
             .send()
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| supervisor_failure("create", &error))?
             .error_for_status()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| supervisor_failure("create", &error))?;
         Ok(())
     }
 
@@ -137,11 +138,29 @@ impl SupervisorClient {
             .bearer_auth(&self.token)
             .send()
             .await
-            .map_err(|error| error.to_string())?
+            .map_err(|error| supervisor_failure(action, &error))?
             .error_for_status()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| supervisor_failure(action, &error))?;
         Ok(())
     }
+}
+
+/// A Supervisor failure without its display text.
+///
+/// Reqwest formats a custom HTTP reason phrase into its error, and a proxy or
+/// Supervisor controls that phrase. Only the fixed operation and a status
+/// code or transport class leave the Space.
+fn supervisor_failure(operation: &str, error: &reqwest::Error) -> String {
+    if let Some(status) = error.status() {
+        return format!("the Supervisor {operation} request answered {status}");
+    }
+    if error.is_timeout() {
+        return format!("the Supervisor {operation} request timed out");
+    }
+    if error.is_connect() {
+        return format!("the Supervisor {operation} request could not connect");
+    }
+    format!("the Supervisor {operation} request failed")
 }
 
 /// Starts the background lifecycle manager for one worker-backed Space.
@@ -149,8 +168,14 @@ pub fn spawn(server: Arc<SpaceServer>, config: WorkerConfig) -> tokio::task::Joi
     tokio::spawn(async move {
         let client = match SupervisorClient::new(&config) {
             Ok(client) => client,
-            Err(error) => {
-                eprintln!("neha: cannot build the worker Supervisor client: {error}");
+            Err(_) => {
+                tracing::error!(
+                    target: "neha::worker",
+                    event = "worker.disabled",
+                    reason = "supervisor_client",
+                    error_kind = "client",
+                    "cannot build the worker Supervisor client"
+                );
                 return;
             }
         };
@@ -248,7 +273,8 @@ fn snapshot(server: &SpaceServer) -> (Vec<(Id, String)>, HashSet<Id>) {
 /// Reads or creates the one Computer token a worker keeps.
 async fn token_for(server: &SpaceServer, computer: Id) -> Result<String, String> {
     let directory = server.home.root().join("state").join("workers");
-    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("cannot create the worker state directory: {}", error.kind()))?;
     let path = directory.join(format!("{computer}.token"));
     match std::fs::read_to_string(&path) {
         Ok(token) if !token.trim().is_empty() => {
@@ -256,7 +282,7 @@ async fn token_for(server: &SpaceServer, computer: Id) -> Result<String, String>
                 .identity
                 .ensure_computer_token(computer, token.trim())
                 .await
-                .map_err(|error| error.to_string())?;
+                .map_err(|_| "the worker identity cannot be saved".to_owned())?;
             Ok(token.trim().to_owned())
         }
         Ok(_) => {
@@ -268,10 +294,7 @@ async fn token_for(server: &SpaceServer, computer: Id) -> Result<String, String>
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             new_token(server, computer, &path).await
         }
-        Err(error) => Err(format!(
-            "cannot read the worker token {}: {error}",
-            path.display()
-        )),
+        Err(error) => Err(format!("cannot read the worker token: {}", error.kind())),
     }
 }
 
@@ -280,7 +303,7 @@ fn remove_unusable_token(path: &std::path::Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot replace the worker token: {error}")),
+        Err(error) => Err(format!("cannot replace the worker token: {}", error.kind())),
     }
 }
 
@@ -295,7 +318,7 @@ async fn new_token(
         .identity
         .ensure_computer_token(computer, &token)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| "the worker identity cannot be saved".to_owned())?;
     Ok(token)
 }
 
@@ -309,17 +332,26 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
             .write(true)
             .mode(0o600)
             .open(path)
-            .map_err(|error| error.to_string())?;
-        file.write_all(bytes).map_err(|error| error.to_string())
+            .map_err(|error| format!("cannot write the worker token: {}", error.kind()))?;
+        file.write_all(bytes)
+            .map_err(|error| format!("cannot write the worker token: {}", error.kind()))
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(path, bytes).map_err(|error| error.to_string())
+        std::fs::write(path, bytes)
+            .map_err(|error| format!("cannot write the worker token: {}", error.kind()))
     }
 }
 
 fn warn_once(warned: &mut HashSet<Id>, computer: Id, error: &str) {
     if warned.insert(computer) {
-        eprintln!("neha: worker for Computer {computer}: {error}");
+        tracing::warn!(
+            target: "neha::worker",
+            event = "worker.fail",
+            computer_id = %computer,
+            operation = "worker",
+            error_message = scrub_error(error).as_str(),
+            "a worker operation failed"
+        );
     }
 }

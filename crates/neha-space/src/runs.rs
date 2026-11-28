@@ -23,6 +23,7 @@ use tokio::sync::{Notify, watch};
 use tokio::task::JoinHandle;
 
 use crate::commands;
+use crate::diagnostics::scrub_error;
 use crate::server::SpaceServer;
 use crate::state::{RunStatus, RunView};
 
@@ -302,7 +303,14 @@ async fn work(
                     )
                     .await
                     {
-                        eprintln!("neha: cannot record a denied run {}: {error}", run.id);
+                        tracing::error!(
+                            target: "neha::store",
+                            event = "store.fail",
+                            operation = "fail_denied_run",
+                            run_id = %run.id,
+                            error_message = scrub_error(&error.to_string()).as_str(),
+                            "cannot record a denied run"
+                        );
                         return;
                     }
                 }
@@ -332,7 +340,14 @@ async fn work(
                         // The run may wait again on a later action.
                         Ok(commands::Finished::Waiting) => {}
                         Err(error) => {
-                            eprintln!("neha: a resumed run could not finish: {error}");
+                            tracing::error!(
+                                target: "neha::runs",
+                                event = "run.fail",
+                                run_id = %run.id,
+                                resumed = true,
+                                error_message = scrub_error(&error.to_string()).as_str(),
+                                "a resumed run could not finish"
+                            );
                             return;
                         }
                     }
@@ -358,7 +373,14 @@ async fn work(
                             )
                             .await
                             {
-                                eprintln!("neha: cannot fail queued run {}: {failure}", run.id);
+                                tracing::error!(
+                                    target: "neha::store",
+                                    event = "store.fail",
+                                    operation = "fail_queued_run",
+                                    run_id = %run.id,
+                                    error_message = scrub_error(&failure.to_string()).as_str(),
+                                    "cannot fail queued run"
+                                );
                                 return;
                             }
                             continue;
@@ -398,7 +420,13 @@ async fn work(
                         Ok(commands::Finished::Waiting) => {}
                         Err(error) => {
                             // The run stays in the record; the next start reports it.
-                            eprintln!("neha: a run could not finish: {error}");
+                            tracing::error!(
+                                target: "neha::runs",
+                                event = "run.fail",
+                                run_id = %run.id,
+                                error_message = scrub_error(&error.to_string()).as_str(),
+                                "a run could not finish"
+                            );
                             return;
                         }
                     }

@@ -204,7 +204,13 @@ impl CatalogStore {
                 return;
             }
             if let Err(error) = self.refresh().await {
-                eprintln!("neha: the model catalog did not refresh: {error}");
+                tracing::warn!(
+                    target: "neha::catalog",
+                    event = "catalog.refresh",
+                    outcome = "failed",
+                    error_kind = catalog_error_kind(&error),
+                    "the model catalog did not refresh"
+                );
             }
         });
     }
@@ -690,6 +696,15 @@ pub enum CatalogError {
         /// Why the write failed.
         message: String,
     },
+}
+
+/// Names the stage a catalog refresh failed in, for logs.
+fn catalog_error_kind(error: &CatalogError) -> &'static str {
+    match error {
+        CatalogError::Fetch { .. } => "fetch",
+        CatalogError::Invalid { .. } => "invalid",
+        CatalogError::Cache { .. } => "cache",
+    }
 }
 
 /// Returns the seed catalog, parsed once per process.

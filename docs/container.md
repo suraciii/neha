@@ -57,6 +57,9 @@ Edit `.env`:
 | `NEHA_WORKER_ALWAYS_ON` | `0` to wake a worker when it has work; `1` to keep every worker running |
 | `NEHA_WORKER_IDLE_SECONDS` | How long a worker with no work stays running; the default is 600 seconds |
 | `NEHA_WORKER_EGRESS` | `auto`, `restricted`, or `open`; [Worker egress](#worker-egress) explains the tradeoff |
+| `NEHA_LOG` | The JSON diagnostics level; `info` by default, `debug` for more detail |
+| `NEHA_LOG_FORMAT` | `json` by default; `text` for a person reading the container output |
+| `NEHA_ENV` | The `deployment_environment` value on each line; `production` by default |
 
 Change `deploy/Caddyfile` if the public host is not the `NEHA_DOMAIN` value; the file uses `{$NEHA_DOMAIN:localhost}`.
 
@@ -184,7 +187,7 @@ Back up the data directory before an upgrade. The schema migration runs when the
 | Symptom | What to check |
 | --- | --- |
 | The invitation link does not open | DNS points at the host, ports 80 and 443 are open, and `docker compose logs caddy` shows a certificate. |
-| The Space exits at start | `data` must be writable by UID 10001; check its ownership. The log names the failing path. |
+| The Space exits at start | `data` must be writable by UID 10001; check its ownership. A `space.start.failed` line names the failing phase and the private report under `data/logs`; [Diagnostics](diagnostics.md) covers the report. |
 | A Hosted Computer stays offline | `docker compose logs supervisor` shows the Docker API error. A missing worker image, an unavailable Docker socket, or a Workspace that does not resolve under `/workspaces` appears there. A wrong `NEHA_HOST_DATA_DIR` lets Docker create the missing host directory, so look for worker permission errors and check that the value is the absolute `deploy/data` path. |
 | A worker starts and immediately exits | `docker compose logs <worker container>`; check the Space URL and the public `Host` value the Supervisor injected. |
 | A Bot cannot install a system package | The worker root filesystem is read-only. The Workspace is writable; the operating system is not. |

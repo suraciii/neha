@@ -119,7 +119,7 @@ A Hosted Space can run in a container instead of directly on its machine. The Sp
 ## Cross-cutting conventions
 
 - Every long-lived connection carries an application-level heartbeat, because proxies drop idle connections.
-- Diagnostics do not leave the Space's machine by default.
+- Diagnostics do not leave the Space's machine by default; they are JSON events on stderr whose catalog and privacy rules live in [diagnostics](diagnostics.md).
 - Design scale is one machine, one Space process, and the Hosted Computer workers on it; a Space serves hundreds of Users and Bots.
 - An upgrade runs versioned migrations after an automatic backup and promises an upgrade from the previous release only.
 - A backup copies the Space home, including each Hosted Computer's Workspace root under `workspaces/<computer-id>`, and the objects of its File store, starting from a consistent database snapshot. A restore on another machine also takes the Vault's master key.

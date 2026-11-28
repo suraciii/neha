@@ -52,6 +52,7 @@ use crate::catalog::CatalogStore;
 use crate::commands;
 use crate::computer_link::{self, AccessCapabilities, ComputerLinks};
 use crate::config::{Config, ConfigError, Storage};
+use crate::diagnostics::{scrub_error, storage_kind};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError, PairingState};
 use crate::model::{ModelClient, ModelError};
@@ -767,6 +768,7 @@ async fn start_with_workers(
     public_url: Option<String>,
     worker_config: Option<crate::workers::WorkerConfig>,
 ) -> Result<Running, ServerError> {
+    let ui_enabled = ui.is_some();
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
     {
@@ -863,6 +865,20 @@ async fn start_with_workers(
         )
         .await;
     });
+
+    tracing::info!(
+        target: "neha::space",
+        event = "space.start",
+        version = env!("CARGO_PKG_VERSION"),
+        schema_version = crate::schema::SCHEMA_VERSION,
+        protocol_version = neha::surface::PROTOCOL_VERSION,
+        addr = %addr,
+        public_origin = server.public_url.as_deref().unwrap_or(""),
+        storage_kind = storage_kind(&server.storage),
+        worker_mode = server.worker_config.is_some(),
+        ui = ui_enabled,
+        "the Space is serving"
+    );
 
     Ok(Running {
         addr,
@@ -2831,7 +2847,13 @@ async fn computer_pair(
             if let Err(cleanup) = server.identity.forget_computer_token(&credential).await {
                 // The start-up reconciliation removes the orphan; report it
                 // now so a failure to roll back is visible.
-                eprintln!("neha: cannot roll back a pairing token: {cleanup}");
+                tracing::error!(
+                    target: "neha::computer",
+                    event = "computer.pairing.rollback.failed",
+                    computer_id = %computer,
+                    error_message = scrub_error(&cleanup.to_string()).as_str(),
+                    "cannot roll back a pairing token"
+                );
             }
             return Err(ApiError::internal(error.to_string()));
         }
@@ -2985,9 +3007,23 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         || named != computer.to_string()
         || (!sandbox && !unsandboxed_computers_allowed())
     {
-        eprintln!(
-            "computer handshake rejected: version={version} named={named} sandbox={sandbox} unsandboxed_allowed={}",
-            unsandboxed_computers_allowed()
+        let unsandboxed_allowed = unsandboxed_computers_allowed();
+        let reason = if version != CHANNEL_VERSION {
+            "version_mismatch"
+        } else if named != computer.to_string() {
+            "name_mismatch"
+        } else {
+            "sandbox_not_allowed"
+        };
+        tracing::warn!(
+            target: "neha::computer",
+            event = "computer.reject",
+            computer_id = %computer,
+            version,
+            sandbox,
+            unsandboxed_allowed,
+            reason,
+            "Computer handshake rejected"
         );
         return;
     }
@@ -3498,7 +3534,13 @@ async fn catch_up(
             .events_from(cursor, page_size)
             .await
             .map_err(|error| {
-                eprintln!("neha: subscription read failed: {error}");
+                tracing::error!(
+                    target: "neha::store",
+                    event = "store.fail",
+                    operation = "subscription_read",
+                    error_message = scrub_error(&error.to_string()).as_str(),
+                    "a subscription read failed"
+                );
                 StreamError::Store
             })?;
         if page.events.is_empty() {
@@ -3726,7 +3768,13 @@ async fn reconcile_pairings(server: &Arc<SpaceServer>) -> Result<(), ServerError
                     .finalize_pairing(claim.owner, claim.computer)
                     .await?
             {
-                eprintln!("neha: a recorded Computer's pairing claim vanished while reconciling");
+                tracing::warn!(
+                    target: "neha::computer",
+                    event = "computer.pairing.reconcile.failed",
+                    computer_id = %claim.computer,
+                    reason = "claim_vanished",
+                    "a recorded Computer's pairing claim vanished while reconciling"
+                );
             }
         } else {
             server
@@ -3907,8 +3955,14 @@ impl ApiError {
         )
     }
 
-    pub(crate) fn internal(message: impl Into<String>) -> Self {
-        eprintln!("neha: internal error: {}", message.into());
+    pub(crate) fn internal(_message: impl Into<String>) -> Self {
+        // The message can carry a remote response body or a path; only the
+        // fixed event leaves the Space.
+        tracing::error!(
+            target: "neha::http",
+            event = "http.internal_error",
+            "the Space hit an internal error"
+        );
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Internal,
@@ -3942,7 +3996,13 @@ impl From<BlobsError> for ApiError {
     fn from(error: BlobsError) -> Self {
         if error.is_unavailable() {
             // The store is down, not broken: a caller may retry.
-            eprintln!("neha: unavailable: {error}");
+            tracing::warn!(
+                target: "neha::blob",
+                event = "blob.fail",
+                operation = "unavailable",
+                error_kind = error.kind(),
+                "the File store is unavailable"
+            );
             return ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorCode::Unavailable,
@@ -3950,7 +4010,14 @@ impl From<BlobsError> for ApiError {
             );
         }
 
-        ApiError::internal(error.to_string())
+        tracing::error!(
+            target: "neha::blob",
+            event = "blob.fail",
+            operation = "internal",
+            error_kind = error.kind(),
+            "the File store failed"
+        );
+        ApiError::internal("")
     }
 }
 
