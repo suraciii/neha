@@ -43,6 +43,9 @@ fn main() {
         neha::record::Event,
         neha::record::EventKind,
         neha::record::FileAdded,
+        neha::record::MemoryAdded,
+        neha::record::MemoryAnswered,
+        neha::record::MemoryRemoved,
         neha::record::MessageAdded,
         neha::record::McpScope,
         neha::record::ModelData,
@@ -63,6 +66,10 @@ fn main() {
         neha::record::RunStep,
         neha::record::Undoability,
         neha::record::UserJoined,
+        // The memory vocabulary.
+        neha::memory::MemoryKind,
+        neha::memory::MemoryScope,
+        neha::memory::MemorySourceKind,
         // The command surface.
         neha::surface::BotCreate,
         neha::surface::BotUpdate,
@@ -95,6 +102,7 @@ fn main() {
         neha_space::state::ChatStatus,
         neha_space::state::ChatView,
         neha_space::state::ComputerView,
+        neha_space::state::MemoryView,
         neha_space::state::MessageView,
         neha_space::state::ModelView,
         neha_space::state::ProviderView,

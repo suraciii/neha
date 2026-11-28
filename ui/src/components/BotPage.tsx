@@ -1,7 +1,18 @@
 import { createSignal, createTrackedEffect, For, Show, untrack } from "solid-js";
 
 import { t } from "../i18n";
-import type { Bot, Computer, Model, Rule, ThinkingLevel } from "../types";
+import { formatBytes } from "../lib/files";
+import type {
+  Bot,
+  Computer,
+  MemoryEntry,
+  MemoryKind,
+  MemoryList,
+  MemoryScope,
+  Model,
+  Rule,
+  ThinkingLevel,
+} from "../types";
 import Avatar from "./Avatar";
 import Icon from "./Icon";
 
@@ -11,6 +22,14 @@ const LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "max"];
 // The tools every Bot has. A rule names one of these, so the page offers the
 // set the execution side runs rather than a name it would refuse.
 const TOOLS = ["shell", "read_file", "write_file", "list_files"];
+
+// The kinds of memory entry, in the order the page groups them: the lasting
+// rules first, then the notes the Bot keeps for itself.
+const KINDS: MemoryKind[] = ["rule", "note"];
+
+// The scopes a memory entry applies in, in the order the page groups them: the
+// owner's Chats, one User's Chat, and the Group where it was learned.
+const SCOPES: MemoryScope[] = ["owner", "user", "group"];
 
 // What the page holds while the User works on it. A draft only clears when
 // another Bot is opened, so a refresh never takes what the User typed.
@@ -119,6 +138,8 @@ interface BotPageProps {
   computers: Computer[];
   models: Model[];
   rules: Rule[];
+  // The entries the Bot keeps, and the room each kind has left.
+  memories: MemoryList;
   // A write is on its way to the Space.
   busy: boolean;
   error: string | null;
@@ -137,6 +158,7 @@ interface BotPageProps {
     path_prefix: string | null;
   }) => void | Promise<void>;
   onRuleRemove: (rule: string) => void | Promise<void>;
+  onMemoryRemove: (memory: string) => void | Promise<void>;
 }
 
 export default function BotPage(props: BotPageProps) {
@@ -316,6 +338,26 @@ export default function BotPage(props: BotPageProps) {
     if (rule.command_prefix || rule.path_prefix)
       return t("bot.rules.remove", { tool: scope(rule) });
     return t("bot.rules.remove", { tool: rule.tool });
+  }
+
+  // The entries of one kind and scope, and the bytes that kind holds against
+  // its limit: the limit belongs to the kind, not to a scope inside it.
+  const scopedOf = (kind: MemoryKind, scope: MemoryScope) =>
+    props.memories.entries.filter((entry) => entry.kind === kind && entry.scope === scope);
+  const usedOf = (kind: MemoryKind) => props.memories.used[kind] ?? 0;
+  const limitOf = (kind: MemoryKind) => props.memories.limits[kind] ?? 0;
+
+  // Who wrote one entry: the Bot for a note, and the owner or another User
+  // whose words gave a rule.
+  function authorOf(entry: MemoryEntry): string {
+    if (entry.author_bot) return t("bot.memory.author.bot");
+    if (entry.author === props.bot?.owner) return t("bot.memory.author.owner");
+    return t("bot.memory.author.user");
+  }
+
+  // What wrote one entry: the Message, run, or command the record names.
+  function sourceOf(entry: MemoryEntry): string {
+    return t(`bot.memory.source.${entry.source_kind}`, { source: entry.source });
   }
 
   return (
@@ -870,6 +912,81 @@ export default function BotPage(props: BotPageProps) {
                 >
                   <p class="panel__note">{t("bot.rules.hosted")}</p>
                 </Show>
+              </div>
+            </section>
+
+            <section class="panel">
+              <div class="panel__head">
+                <h2>{t("bot.section.memory")}</h2>
+              </div>
+              <div class="panel__body">
+                {/* An empty memory still shows how much each kind may hold, so
+                    the page names the room before the Bot keeps anything. */}
+                <Show when={props.memories.entries.length === 0}>
+                  <p class="rows__empty">{t("bot.memory.empty")}</p>
+                </Show>
+                <div class="memory">
+                  <For each={KINDS}>
+                    {(kind) => (
+                      <div class="memory__group">
+                        <div class="memory__head">
+                          <h3 class="memory__kind">{t(`bot.memory.${kind}s`)}</h3>
+                          <span class="memory__capacity">
+                            {t("bot.memory.capacity", {
+                              used: formatBytes(usedOf(kind)),
+                              limit: formatBytes(limitOf(kind)),
+                            })}
+                          </span>
+                        </div>
+                        {/* One group per scope the kind holds entries in;
+                              a scope with none stays off the page. */}
+                        <For each={SCOPES}>
+                          {(scope) => (
+                            <Show when={scopedOf(kind, scope).length > 0}>
+                              <div class="memory__scope">
+                                <h4 class="memory__scope-title">
+                                  {`${t(`bot.memory.${kind}s`)} · ${t(`bot.memory.scope.${scope}`)}`}
+                                </h4>
+                                <div class="rows">
+                                  <For each={scopedOf(kind, scope)}>
+                                    {(entry) => (
+                                      <div class="row">
+                                        <span class="chip">
+                                          {t(`bot.memory.scope.${entry.scope}`)}
+                                        </span>
+                                        <span class="row__text">
+                                          {/* A User who does not read an entry
+                                                sees its metadata only, the way
+                                                the Space answers it. */}
+                                          <Show when={entry.readable}>
+                                            <span class="row__name memory__text">{entry.text}</span>
+                                          </Show>
+                                          <span class="row__meta">
+                                            {`${authorOf(entry)} · ${sourceOf(entry)} · ${formatBytes(entry.size)}`}
+                                          </span>
+                                        </span>
+                                        <button
+                                          class="row__remove"
+                                          type="button"
+                                          aria-label={t("bot.memory.remove")}
+                                          title={t("bot.memory.remove")}
+                                          disabled={props.busy}
+                                          onClick={() => void props.onMemoryRemove(entry.memory)}
+                                        >
+                                          <Icon name="x" size="sm" />
+                                        </button>
+                                      </div>
+                                    )}
+                                  </For>
+                                </div>
+                              </div>
+                            </Show>
+                          )}
+                        </For>
+                      </div>
+                    )}
+                  </For>
+                </div>
               </div>
             </section>
           </div>

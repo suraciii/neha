@@ -326,7 +326,20 @@ plugin: string, } } | { "name": "plugin_disable", "args": {
 /**
  * The package.
  */
-plugin: string, } };
+plugin: string, } } | { "name": "memory_list", "args": { 
+/**
+ * The Bot.
+ */
+bot: string, } } | { "name": "memory_remove", "args": { 
+/**
+ * The Bot the entry must belong to; the removal is refused when the
+ * entry belongs to another Bot.
+ */
+bot: string, 
+/**
+ * The entry.
+ */
+memory: string, } };
 
 /**
  * The parameters of `computer_create`.

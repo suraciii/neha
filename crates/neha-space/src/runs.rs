@@ -319,6 +319,7 @@ async fn work(
                         &server.events,
                         server.tool_timeout,
                         &server.links,
+                        &server.approvals,
                         &run,
                     )
                     .await
@@ -384,6 +385,7 @@ async fn work(
                         &server.events,
                         server.tool_timeout,
                         &server.links,
+                        &server.approvals,
                         pending,
                     )
                     .await

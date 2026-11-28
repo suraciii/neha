@@ -1243,6 +1243,44 @@ mod tests {
                 Author::User(user),
                 serde_json::json!({"plugin": Id::new()}),
             ),
+            EventKind::MemoryAdded => {
+                let bot = Id::new();
+                EventDraft::new(
+                    kind,
+                    Author::Bot(bot),
+                    serde_json::json!({
+                        "memory": Id::new(),
+                        "bot": bot,
+                        "kind": "note",
+                        "scope": "owner",
+                        "author": bot,
+                        "author_bot": true,
+                        "acting": user,
+                        "source": Id::new(),
+                        "source_kind": "run",
+                        "text": "note",
+                        "replaces": [],
+                    }),
+                )
+                .acting(user)
+            }
+            EventKind::MemoryRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"memory": Id::new()}),
+            )
+            .acting(user),
+            EventKind::MemoryAnswered => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "call": "call-1",
+                    "answer": "{}",
+                }),
+            )
+            .acting(user),
         }
     }
 

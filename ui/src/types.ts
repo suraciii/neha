@@ -17,6 +17,9 @@ import type {
   Author,
   CardData,
   ComputerSharing,
+  MemoryKind,
+  MemoryScope,
+  MemorySourceKind,
   RunStatus,
   Undoability,
   ApprovalReason as WireApprovalReason,
@@ -29,6 +32,7 @@ import type {
   ChatStatus,
   ChatView,
   ComputerView,
+  MemoryView,
   MessageView,
   ModelView,
   ProviderView,
@@ -58,6 +62,10 @@ export type {
   ComputerView as Computer,
   ErrorCode,
   FileSummary,
+  MemoryKind,
+  MemoryScope,
+  MemorySourceKind,
+  MemoryView as Memory,
   ModelView as Model,
   ProviderView as Provider,
   RunStatus,
@@ -245,6 +253,37 @@ export interface BotMoveResult {
   bot: BotView;
   from: ComputerView;
   to: ComputerView;
+}
+
+// One entry of a Bot's memory as `memory_list` names it. The Space builds the
+// answer as JSON, so the shape is stated here. An entry the User does not read
+// carries no text: it names its metadata only.
+export interface MemoryEntry {
+  memory: string;
+  kind: MemoryKind;
+  scope: MemoryScope;
+  // The Chat or Group it applies in; null for an owner entry.
+  scope_id: string | null;
+  author: string;
+  // Whether the author is the Bot.
+  author_bot: boolean;
+  // The Message, run, or command that wrote it.
+  source: string;
+  source_kind: MemorySourceKind;
+  // The entry's text in UTF-8 bytes.
+  size: number;
+  // Whether the User reads the entry's text.
+  readable: boolean;
+  // The entry's text, present only when the User reads it.
+  text?: string;
+}
+
+// The answer of `memory_list`: one Bot's memory, and how many bytes each kind
+// holds against its limit.
+export interface MemoryList {
+  entries: MemoryEntry[];
+  used: Record<MemoryKind, number>;
+  limits: Record<MemoryKind, number>;
 }
 
 // One vendor the catalog knows, as `catalog_list` names it. The command builds
