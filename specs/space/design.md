@@ -19,7 +19,7 @@ Owned by space. Every other topic depends on a Space to hold its record.
 
 A Space listens on the loopback address of the machine that runs it, unless its operator binds it to a private address behind a TLS proxy. A listener beyond the machine requires a public https origin, and a Space refuses to start without one.
 
-An operator MAY name the proxies the Space believes. The Space reads a forwarded client address only from a named proxy, from the last value of the request's `X-Forwarded-For`, and counts sign-in and pairing limits for that address; a request from any other peer is counted by its own address.
+An operator MAY name the proxies the Space believes. The Space reads a forwarded client address only from a named proxy, and only from the last value of the request's `X-Forwarded-For`. It counts sign-in and pairing limits for that address; a request from any other peer is counted by its own address.
 
 ## Storage
 
