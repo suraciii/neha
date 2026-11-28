@@ -26,7 +26,7 @@ const MAX_RECORDED_ARGUMENTS: usize = 128 * 1024;
 pub struct RunRequest {
     /// The system instruction.
     pub system: String,
-    /// The history ends with the results of the [`Resume::done`] calls.
+    /// The history ends with the results of the calls [`Resume::from`] covers.
     pub history: Vec<Message>,
     /// The largest Model reply in tokens.
     pub max_output: u32,
@@ -106,11 +106,13 @@ pub struct Resume {
     pub content: Option<String>,
     /// The step's calls as the record keeps them.
     pub calls: Vec<RecordedCall>,
-    /// How many calls already have a recorded result, refused ones included.
-    /// Their results are the last `done` Messages of the history; the call at
-    /// `done` is the approved action.
-    pub done: usize,
-    /// The approved action's identifier, which the call at `done` keeps when it runs.
+    /// The position of the first call the run did not finish. The calls
+    /// before it replay from the record: a Computer action's result is the one
+    /// the record gives back, and a memory call's answer is the one it
+    /// recorded. The calls from it run again.
+    pub from: usize,
+    /// The approved action's identifier, which the call at `from` keeps when
+    /// it runs.
     pub approved_action: Option<Id>,
     /// The usage of the reply that made the step, which the run's usage starts from.
     pub usage: Usage,
@@ -229,6 +231,31 @@ pub trait Recorder {
         output: ToolOutput,
         error: Option<String>,
     ) -> impl Future<Output = Result<(), LoopError>> + Send;
+
+    /// Runs one memory tool call and returns the answer the Model reads.
+    ///
+    /// A memory write is a record operation, not an action on the Computer:
+    /// it asks no approval, records no started or finished action, and never
+    /// reaches the Computer. The answer is recorded, so the same call in a
+    /// replay returns it instead of running again.
+    fn memory(
+        &mut self,
+        step: u32,
+        call: &RecordedCall,
+        request: &tools::MemoryCall,
+    ) -> impl Future<Output = Result<ToolOutput, LoopError>> + Send;
+
+    /// Records, or replays, the answer to a memory call the loop refused
+    /// before running it.
+    ///
+    /// A refusal is a memory tool result too: the record keeps the exact text
+    /// the Model reads, and a replay returns it instead of refusing again.
+    fn memory_refused(
+        &mut self,
+        step: u32,
+        call: &RecordedCall,
+        answer: String,
+    ) -> impl Future<Output = Result<ToolOutput, LoopError>> + Send;
 }
 
 /// Runs one Bot run to its end, or until a Computer action waits for an approval.
@@ -272,12 +299,12 @@ where
     for step in first_step..=max_steps {
         let (calls, reply_usage, from, approved, all_done) = match resume.take() {
             // The reply was recorded before the run waited, so it is not
-            // recorded again; its done calls already have their results.
+            // recorded again; its finished calls already have their results.
             Some(resume) => {
                 let Resume {
                     content,
                     calls,
-                    done,
+                    from,
                     approved_action,
                     usage,
                     recovered,
@@ -286,15 +313,25 @@ where
                 } = resume;
                 continuation = step_continuation.or(continuation);
                 let calls = resumed_calls(calls)?;
-                // The results of the done calls end the history, and the
-                // reply's calls come before them.
-                let at = messages.len() - done.min(messages.len() - 1);
-                messages.insert(
-                    at,
-                    Message::assistant_with_calls(content, model_calls(&calls)),
-                );
-                let all_done = recovered && done >= calls.len();
-                (calls, usage, done, approved_action, all_done)
+                let from = from.min(calls.len());
+                // The history ends with one result per call before `from`: a
+                // Computer action's recorded result, or a memory call's
+                // recorded answer. Neither runs again in a replay.
+                if messages.len() < from + 1 {
+                    return Err(LoopError::Resume(
+                        "the history is shorter than the results it gave back".to_owned(),
+                    ));
+                }
+                let mut rebuilt = messages.split_off(messages.len() - from).into_iter();
+                messages.push(Message::assistant_with_calls(content, model_calls(&calls)));
+                for _ in calls.iter().take(from) {
+                    let result = rebuilt.next().ok_or_else(|| {
+                        LoopError::Resume("the record lost a replayed call's result".to_owned())
+                    })?;
+                    messages.push(result);
+                }
+                let all_done = recovered && from >= calls.len();
+                (calls, usage, from, approved_action, all_done)
             }
             None => {
                 let reply = match model
@@ -329,19 +366,29 @@ where
                     return Ok(final_reply(reply.content, usage));
                 }
                 let calls = step_calls(step, &reply.tool_calls)?;
+                // The assistant turn the Model sees must answer under the same
+                // tool-call identifiers the record keeps. A provider may send
+                // a blank identifier; the stable fallback replaces it, and a
+                // provider-native continuation that still holds the raw id
+                // cannot pair with the normalized turn, so it is dropped.
+                let normalized = calls
+                    .iter()
+                    .zip(&reply.tool_calls)
+                    .any(|(call, original)| call.recorded.call != original.id);
+                let reply_continuation = if normalized { None } else { reply.continuation };
                 recorder
                     .reply(
                         step,
                         reply.content.clone(),
                         calls.iter().map(|call| call.recorded.clone()).collect(),
                         reply.usage,
-                        reply.continuation.clone(),
+                        reply_continuation.clone(),
                     )
                     .await?;
-                continuation = reply.continuation;
+                continuation = reply_continuation;
                 messages.push(Message::assistant_with_calls(
                     reply.content,
-                    reply.tool_calls,
+                    model_calls(&calls),
                 ));
                 (calls, reply.usage, 0, None, false)
             }
@@ -351,6 +398,13 @@ where
         // action left to run; record the step and continue with the next one.
         if !(all_done && from >= calls.len()) {
             for (index, call) in calls.into_iter().enumerate().skip(from) {
+                // A memory call never asks, starts no action, and never
+                // reaches the Computer: its entry is what the record keeps.
+                if tools::is_memory(&call.recorded.tool) {
+                    let output = memory_result(recorder, step, &call).await?;
+                    messages.push(Message::tool_result(call.recorded.call, output.text));
+                    continue;
+                }
                 // The action the User approved runs under its recorded identifier
                 // and is not asked for again. A refused call cannot have been
                 // approved, so it never takes that identifier.
@@ -396,6 +450,9 @@ where
                     Ok(tools::Call::Computer(computer_action)) => {
                         runtime.execute(computer_action).await
                     }
+                    Ok(tools::Call::Memory(_)) => {
+                        ActionResult::failed("a memory tool is not a Computer action")
+                    }
                     Err(error) => ActionResult::failed(error),
                 };
                 recorder
@@ -432,6 +489,33 @@ where
         usage,
         succeeded: false,
     })
+}
+
+/// Runs one memory call and returns what the Model reads.
+///
+/// A call the loop refused never runs, but its refusal is still a memory tool
+/// result: the recorder keeps it, and a replay returns the recorded answer.
+async fn memory_result<Rec>(
+    recorder: &mut Rec,
+    step: u32,
+    call: &StepCall,
+) -> Result<ToolOutput, LoopError>
+where
+    Rec: Recorder + Send,
+{
+    match &call.parsed {
+        Ok(tools::Call::Memory(request)) => recorder.memory(step, &call.recorded, request).await,
+        Ok(tools::Call::Computer(_)) => Err(LoopError::Resume(
+            "a Computer action was given to the memory recorder".to_owned(),
+        )),
+        // A refusal is a memory tool result: the record keeps it, and a replay
+        // returns it instead of refusing again.
+        Err(refusal) => {
+            recorder
+                .memory_refused(step, &call.recorded, refusal.clone())
+                .await
+        }
+    }
 }
 
 /// One call of a step: whether it can run, and what the record keeps of it.
@@ -509,12 +593,14 @@ fn model_calls(calls: &[StepCall]) -> Vec<ToolCall> {
 
 /// Returns the identifier a tool result answers under.
 ///
-/// The Model's own identifier when it gave one, and `call-<step>-<index>`
-/// otherwise. The rule depends on nothing else, so the Space rebuilds a
-/// run's Messages from the record with the same identifiers.
+/// The Model's own identifier when it gave a usable one, and
+/// `call-<step>-<index>` otherwise. A provider may send a blank identifier;
+/// tracing treats blank as absent, so the record and every tool result use
+/// the same stable fallback. The rule depends on nothing else, so the Space
+/// rebuilds a run's Messages from the record with the same identifiers.
 #[must_use]
 pub fn call_id(id: &str, step: u32, index: usize) -> String {
-    if id.is_empty() {
+    if id.trim().is_empty() {
         format!("call-{step}-{index}")
     } else {
         id.to_owned()
@@ -588,6 +674,9 @@ pub enum LoopError {
     /// Two calls of a step answer under one tool-call identifier.
     #[error("two calls of the step share the tool-call identifier {0}")]
     RepeatedCall(String),
+    /// The record does not line up with the step it resumes.
+    #[error("the resumed step does not line up with the record: {0}")]
+    Resume(String),
 }
 
 #[cfg(test)]
@@ -610,6 +699,8 @@ mod tests {
     use crate::model::{
         Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
     };
+    use crate::tools::{self, MemoryCall};
+    use neha::memory::{MemoryKind, MemoryScope};
 
     #[derive(Default)]
     struct FakeModel {
@@ -727,6 +818,8 @@ mod tests {
         decisions: VecDeque<Decision>,
         started: Vec<(u32, String, Id)>,
         finished: Vec<(u32, ActionStatus)>,
+        memories: Vec<(u32, tools::MemoryCall)>,
+        refusals: Vec<(u32, String, String)>,
         /// The method that fails, named by its entry in `order`.
         fail_at: Option<&'static str>,
         order: Vec<&'static str>,
@@ -806,6 +899,31 @@ mod tests {
             self.finished.push((step, status));
             Ok(())
         }
+
+        async fn memory(
+            &mut self,
+            step: u32,
+            _call: &RecordedCall,
+            request: &tools::MemoryCall,
+        ) -> Result<ToolOutput, LoopError> {
+            self.record("memory")?;
+            self.memories.push((step, request.clone()));
+
+            Ok(ToolOutput::full("{\"memory\":\"remembered\"}"))
+        }
+
+        async fn memory_refused(
+            &mut self,
+            step: u32,
+            call: &RecordedCall,
+            answer: String,
+        ) -> Result<ToolOutput, LoopError> {
+            self.record("memory_refused")?;
+            self.refusals
+                .push((step, call.call.clone(), answer.clone()));
+
+            Ok(ToolOutput::full(answer))
+        }
     }
 
     /// The reply of a run that did not wait.
@@ -873,13 +991,13 @@ mod tests {
         }
     }
 
-    /// Resumes the second step, which waited on the call after `done`.
-    fn resume(calls: Vec<RecordedCall>, done: usize, approved_action: Id) -> Resume {
+    /// Resumes the second step, which waited on the call after `from`.
+    fn resume(calls: Vec<RecordedCall>, from: usize, approved_action: Id) -> Resume {
         Resume {
             step: 2,
             content: None,
             calls,
-            done,
+            from,
             approved_action: Some(approved_action),
             usage: Usage {
                 uncached_input: 3,
@@ -1067,6 +1185,58 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].continuation, None);
         assert_eq!(requests[1].continuation, Some(continuation));
+    }
+
+    #[tokio::test]
+    async fn a_normalized_call_id_drops_the_native_continuation() {
+        let continuation = Continuation {
+            protocol: "openai_responses".to_owned(),
+            provider: "provider".to_owned(),
+            model: "model".to_owned(),
+            state: json!({"items": [{"type": "reasoning", "id": "rs_1"}]}),
+        };
+        let model = FakeModel::with(vec![
+            Ok(ModelReply {
+                content: Some("let me look".to_owned()),
+                tool_calls: vec![call("   ", "read_file", json!({"path": "a.txt"}))],
+                usage: Usage::default(),
+                continuation: Some(continuation),
+            }),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        // The record keeps the normalized id.
+        assert_eq!(recorder.replies[0].2[0].call, "call-1-0");
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].continuation, None,
+            "a normalized call id drops the native continuation that pairs the raw id"
+        );
+        // The live assistant turn and the tool result answer under one id.
+        let assistant = requests[1]
+            .messages
+            .iter()
+            .find(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+            .expect("the assistant turn is in the next request");
+        assert_eq!(assistant.tool_calls[0].id, "call-1-0");
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [("call-1-0".to_owned(), "42".to_owned())]
+        );
     }
 
     #[tokio::test]
@@ -1515,7 +1685,7 @@ mod tests {
                     step: 2,
                     content: Some("working".to_owned()),
                     calls,
-                    done: 2,
+                    from: 2,
                     approved_action: None,
                     usage: usage_for_resume,
                     recovered: true,
@@ -1568,10 +1738,17 @@ mod tests {
         assert_eq!(call_id("call-3-0", 3, 0), "call-3-0");
     }
 
+    #[test]
+    fn a_blank_call_id_gets_the_stable_fallback() {
+        assert_eq!(call_id("", 1, 0), "call-1-0");
+        assert_eq!(call_id("   ", 2, 3), "call-2-3");
+        assert_eq!(call_id("call-abc", 1, 0), "call-abc");
+    }
+
     #[tokio::test]
     async fn the_space_can_rebuild_the_id_of_an_id_less_call() {
         let model = FakeModel::with(vec![
-            calls_reply(vec![call("", "list_files", json!({"path": "."}))]),
+            calls_reply(vec![call("   ", "list_files", json!({"path": "."}))]),
             reply("done"),
         ]);
         let runtime = FakeRuntime::default();
@@ -1861,5 +2038,197 @@ mod tests {
             &mut recorder,
             RunRequest::new("system", Vec::new(), 100),
         ));
+    }
+
+    #[tokio::test]
+    async fn a_memory_call_never_asks_and_returns_its_result_to_the_model() {
+        let model = FakeModel::with(vec![
+            call_reply(
+                "remember",
+                json!({"kind": "rule", "scope": "owner", "text": "keep notes"}),
+            ),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(
+            recorder.order,
+            ["reply", "memory", "step", "reply", "step"],
+            "a memory call asks for no approval and starts no action"
+        );
+        assert!(recorder.approvals.is_empty());
+        assert!(recorder.started.is_empty());
+        assert!(recorder.finished.is_empty());
+        assert!(runtime.actions.lock().unwrap().is_empty());
+        assert_eq!(
+            recorder.memories,
+            [(
+                1,
+                MemoryCall::Remember {
+                    kind: MemoryKind::Rule,
+                    scope: MemoryScope::Owner,
+                    text: "keep notes".to_owned(),
+                    replaces: Vec::new(),
+                }
+            )]
+        );
+        // The Model reads the result under the call's own identifier.
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [(
+                "call-1".to_owned(),
+                "{\"memory\":\"remembered\"}".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_memory_call_asks_nothing_and_returns_the_refusal() {
+        let model = FakeModel::with(vec![
+            call_reply(
+                "remember",
+                json!({"kind": "rule", "scope": "group", "text": "keep notes"}),
+            ),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, _) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(recorder.approvals.is_empty());
+        assert!(recorder.started.is_empty());
+        assert!(recorder.memories.is_empty(), "the call never runs");
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [(
+                "call-1".to_owned(),
+                "group memory is not available yet".to_owned()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_step_replays_a_memory_answer_before_the_approved_action() {
+        // The step asked to remember something, then to run a shell command,
+        // and waited on the shell command. The memory call's answer is in the
+        // record, so the resumed step replays it instead of running the call
+        // again.
+        let approved_action = Id::new();
+        let calls = vec![
+            recorded(
+                "call-1",
+                "remember",
+                json!({"kind": "note", "scope": "owner", "text": "the build uses nix"}),
+            ),
+            recorded("call-2", "shell", json!({"command": "nix build"})),
+        ];
+        // The history ends with the memory answer the record keeps.
+        let history = vec![
+            Message::user("go"),
+            Message::tool_result("call-1".to_owned(), "{\"memory\":\"recorded\"}".to_owned()),
+        ];
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", history, 100).with_resume(resume(
+                    calls,
+                    1,
+                    approved_action,
+                )),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert!(
+            recorder.memories.is_empty(),
+            "a replay reads the recorded answer and never runs the memory call again"
+        );
+        assert_eq!(
+            recorder.started,
+            [(2, "shell".to_owned(), approved_action)],
+            "the approved action keeps its id and is not asked again"
+        );
+        assert!(recorder.approvals.is_empty());
+        // The Model reads the recorded memory answer, then the action's result.
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            tool_messages(&requests[0]),
+            [
+                ("call-1".to_owned(), "{\"memory\":\"recorded\"}".to_owned()),
+                ("call-2".to_owned(), "42".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_memory_call_records_its_answer() {
+        // Bad arguments make the loop refuse a memory call before it runs; the
+        // refusal is still the memory tool's answer, so the record keeps it.
+        let model = FakeModel::with(vec![
+            calls_reply(vec![call("call-1", "remember", json!({"kind": "note"}))]),
+            reply("done"),
+        ]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+
+        let (text, _, succeeded) = reply_outcome(
+            run(
+                &runtime,
+                &model,
+                &mut recorder,
+                RunRequest::new("system", Vec::new(), 100),
+            )
+            .await,
+        );
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(recorder.refusals.len(), 1, "the refusal is recorded");
+        assert_eq!(recorder.refusals[0].0, 1);
+        assert_eq!(recorder.refusals[0].1, "call-1");
+        assert!(recorder.memories.is_empty());
+        // The Model reads the recorded answer, and the loop asked nothing and
+        // started no action for the refused call.
+        let refusal = recorder.refusals[0].2.clone();
+        assert!(recorder.approvals.is_empty());
+        assert!(recorder.started.is_empty());
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            tool_messages(&requests[1]),
+            [("call-1".to_owned(), refusal)]
+        );
     }
 }

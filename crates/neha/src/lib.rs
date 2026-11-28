@@ -12,6 +12,7 @@ pub mod event;
 pub mod file;
 pub mod folder;
 pub mod id;
+pub mod memory;
 pub mod record;
 pub mod seq;
 pub mod surface;

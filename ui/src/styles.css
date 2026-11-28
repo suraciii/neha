@@ -1940,6 +1940,54 @@ code,
   font-size: var(--text-2xs);
 }
 
+/* One kind of memory on a Bot's page: the entries it holds, and the room it has
+   left. The rules come first, then the notes the Bot keeps for itself. */
+.memory {
+  display: grid;
+  gap: 20px;
+}
+
+.memory__group {
+  display: grid;
+  gap: 12px;
+}
+
+.memory__head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.memory__kind {
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.memory__capacity {
+  color: var(--ink-4);
+  font-size: var(--text-2xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* One scope of a kind, titled with both so the two groupings read together. */
+.memory__scope {
+  display: grid;
+  gap: 8px;
+}
+
+.memory__scope-title {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: var(--text-2xs);
+  font-weight: 500;
+}
+
+/* An entry's text keeps the line breaks the Bot wrote. */
+.memory__text {
+  white-space: pre-wrap;
+}
+
 .chip--ask {
   border-color: var(--attention-line);
   background: var(--attention-soft);

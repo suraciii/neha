@@ -179,7 +179,10 @@ export class Commands {
           return;
         }
         if (this.following) this.following.frameSent = false;
-        socket.send(JSON.stringify({ type: "hello", version: 1 }));
+        // The client states the Presentation kinds it reads. A Space sends the
+        // memory events only to a client that names the capability, so an older
+        // client that stays silent never receives them.
+        socket.send(JSON.stringify({ type: "hello", version: 1, capabilities: ["memory"] }));
         this.hello = new Promise<void>((helloResolve, helloReject) => {
           const onHello = (event: MessageEvent) => {
             if (this.socket !== socket) return;

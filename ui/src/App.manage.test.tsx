@@ -5,6 +5,7 @@ import { fireEvent, waitFor } from "@solidjs/testing-library";
 import { flush } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 
+import { formatBytes } from "./lib/files";
 import { ProtocolError } from "./lib/ws";
 import { space } from "./test/fakeSpace";
 import {
@@ -17,7 +18,7 @@ import {
   renderApp,
   useView,
 } from "./test/view";
-import type { Model, Rule } from "./types";
+import type { MemoryEntry, Model, Rule } from "./types";
 
 vi.mock("./lib/ws", async (importOriginal) => ({
   ...(await importOriginal<typeof import("./lib/ws")>()),
@@ -122,6 +123,20 @@ async function openBots(which = 0): Promise<View> {
   return view;
 }
 
+// Opens the Bots surface and asks for the first Bot's page without waiting for
+// it to finish reading: a test holds one of the page's reads and acts while the
+// page is still opening.
+async function openBotLoading(): Promise<View> {
+  const view = renderApp();
+  await waitFor(() => expect(element(view, ".rail__item:nth-of-type(3)")).toBeTruthy());
+  await waitFor(() => expect(space.handlers).not.toBeNull());
+  flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(3)")));
+  const bots = () => view.container.querySelectorAll(".conv");
+  await waitFor(() => expect(bots().length).toBeGreaterThan(0));
+  flush(() => fireEvent.click(bots()[0]!));
+  return view;
+}
+
 // Opens the Settings surface on the section the test names: Providers, Models,
 // Computers, or the catalog.
 async function openSettings(section = "Providers"): Promise<View> {
@@ -165,6 +180,48 @@ function askRule(): Rule {
     command_prefix: "git",
     path_prefix: null,
   };
+}
+
+// One memory entry as memory_list names it. A test may set the entry's text,
+// which decides its size, or the size alone for an entry the User does not
+// read: the Space answers an unreadable entry with no text.
+function memoryOf(overrides: Partial<MemoryEntry> = {}): MemoryEntry {
+  const text = overrides.text ?? "";
+  const entry: MemoryEntry = {
+    memory: "mem1",
+    kind: "rule",
+    scope: "owner",
+    scope_id: null,
+    author: "u1",
+    author_bot: false,
+    source: "m1",
+    source_kind: "message",
+    size: new TextEncoder().encode(text).length,
+    readable: true,
+    text,
+    ...overrides,
+  };
+  if (!entry.readable) delete entry.text;
+  return entry;
+}
+
+// The Memory panel of the Bot page on screen.
+function memoryPanel(view: View): HTMLElement {
+  const panel = Array.from(view.container.querySelectorAll<HTMLElement>(".panel")).find(
+    (known) => known.querySelector("h2")?.textContent === "Memory",
+  );
+  if (!panel) throw new Error("no Memory panel in the view");
+  return panel;
+}
+
+// One row of the Memory panel, found by a word it holds, so a test reads the
+// entry it set rather than whichever row the list shows first.
+function memoryRow(view: View, text: string): HTMLElement {
+  const row = Array.from(memoryPanel(view).querySelectorAll<HTMLElement>(".row")).find((known) =>
+    known.textContent?.includes(text),
+  );
+  if (!row) throw new Error(`no memory row holds ${text}`);
+  return row;
 }
 
 describe("App management", () => {
@@ -424,6 +481,226 @@ describe("App management", () => {
     await waitFor(() => expect(element(view, ".rows .row__name").textContent).toBe("write_file"));
     expect(panelText(view, "Ask and Allow rules")).toContain("Ask");
     expect(element(view, ".rows .row__meta").textContent).toContain("/data");
+  });
+
+  it("lists a Bot's memory and clears an entry", async () => {
+    const rule = memoryOf({ memory: "mem1", text: "Always answer briefly." });
+    const note = memoryOf({
+      memory: "mem2",
+      kind: "note",
+      author: "b1",
+      author_bot: true,
+      source: "r7",
+      source_kind: "run",
+      text: "The project runs on Node 22.",
+      size: 4096,
+    });
+    space.memories = { b1: [rule, note] };
+    const view = await openBots();
+
+    const memory = () => memoryPanel(view).textContent ?? "";
+    // The two kinds sit in one list, rules first, each with the room it has
+    // left: what its entries use, against the kind's limit.
+    expect(memory().indexOf("Rules")).toBeLessThan(memory().indexOf("Notes"));
+    expect(memory()).toContain("Always answer briefly.");
+    expect(memory()).toContain("The project runs on Node 22.");
+    expect(memory()).toContain(
+      `${formatBytes(rule.size)} / ${formatBytes(space.memoryLimits.rule)}`,
+    );
+    expect(memory()).toContain(
+      `${formatBytes(note.size)} / ${formatBytes(space.memoryLimits.note)}`,
+    );
+
+    // A rule names the owner whose words gave it; a note names the Bot. Both
+    // name the Message or run that wrote them.
+    expect(memoryRow(view, "Always answer briefly.").textContent).toContain("Owner");
+    expect(memoryRow(view, "Always answer briefly.").textContent).toContain("From a message m1");
+    expect(memoryRow(view, "The project runs on Node 22.").textContent).toContain("Bot");
+    expect(memoryRow(view, "The project runs on Node 22.").textContent).toContain("From a run r7");
+
+    // The owner clears one entry; the list and the room its kind uses follow.
+    flush(() =>
+      fireEvent.click(memoryRow(view, "Always answer briefly.").querySelector(".row__remove")!),
+    );
+    // The removal names the Bot the entry belongs to, so the Space can refuse
+    // an entry that belongs to another Bot.
+    await waitFor(() => expect(space.memoryRemoves).toEqual([{ bot: "b1", memory: "mem1" }]));
+    await waitFor(() => expect(memory()).not.toContain("Always answer briefly."));
+    await waitFor(() =>
+      expect(memory()).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.rule)}`),
+    );
+
+    // The last entry goes too: the page keeps the room each kind has left, and
+    // the advice that returns once nothing is remembered.
+    flush(() =>
+      fireEvent.click(
+        memoryRow(view, "The project runs on Node 22.").querySelector(".row__remove")!,
+      ),
+    );
+    await waitFor(() =>
+      expect(space.memoryRemoves).toEqual([
+        { bot: "b1", memory: "mem1" },
+        { bot: "b1", memory: "mem2" },
+      ]),
+    );
+    await waitFor(() => expect(memory()).toContain("Ask the Bot in a Chat to remember something."));
+    expect(memory()).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.rule)}`);
+    expect(memory()).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.note)}`);
+  });
+
+  it("groups memory by kind and then by the scope it applies in", async () => {
+    space.memories = {
+      b1: [
+        // The Space lists a Chat's entry before the owner's here, so the page
+        // is what puts the scopes in their fixed order.
+        memoryOf({
+          memory: "mem5",
+          scope: "user",
+          scope_id: "h9",
+          text: "Keep replies short.",
+        }),
+        memoryOf({ memory: "mem6", text: "Always answer briefly." }),
+        memoryOf({
+          memory: "mem7",
+          kind: "note",
+          author: "b1",
+          author_bot: true,
+          text: "Project uses Node 22.",
+        }),
+      ],
+    };
+    const view = await openBots();
+
+    const memory = () => memoryPanel(view).textContent ?? "";
+    // Inside a kind, the owner's entries come before the ones that apply in one
+    // Chat.
+    expect(memory().indexOf("Rules · Owner")).toBeGreaterThanOrEqual(0);
+    expect(memory().indexOf("Rules · User")).toBeGreaterThanOrEqual(0);
+    expect(memory().indexOf("Rules · Owner")).toBeLessThan(memory().indexOf("Rules · User"));
+    // The Notes kind follows the Rules kind, and names its own scope.
+    expect(memory().indexOf("Rules · User")).toBeLessThan(memory().indexOf("Notes · Owner"));
+    // A scope the kind holds no entry in shows no group.
+    expect(memory()).not.toContain("Rules · Group");
+    expect(memory()).not.toContain("Notes · User");
+    // Each row still names its own scope too.
+    expect(memoryRow(view, "Always answer briefly.").textContent).toContain("Owner");
+    expect(memoryRow(view, "Keep replies short.").textContent).toContain("User");
+  });
+
+  it("shows a memory entry it does not read with its metadata only", async () => {
+    space.memories = {
+      b1: [
+        memoryOf({
+          memory: "mem3",
+          scope: "user",
+          scope_id: "h9",
+          author: "u2",
+          readable: false,
+          size: 777,
+        }),
+      ],
+    };
+    const view = await openBots();
+
+    // The owner audits the entry without reading it: its scope, author, source,
+    // and size, and no text.
+    const row = memoryRow(view, "777 B");
+    expect(row.querySelector(".row__name")).toBeNull();
+    expect(row.textContent).toContain("User");
+    expect(row.textContent).toContain("From a message m1");
+    // The owner still clears it.
+    flush(() => fireEvent.click(row.querySelector(".row__remove")!));
+    await waitFor(() => expect(space.memoryRemoves).toEqual([{ bot: "b1", memory: "mem3" }]));
+  });
+
+  it("says how to add the first memory entry and what each kind may hold", async () => {
+    const view = await openBots();
+
+    // With no entry, the page points the User at a Chat. It offers no control
+    // that adds or changes one: a User does that in a Chat.
+    const memory = memoryPanel(view).textContent ?? "";
+    expect(memory).toContain("Ask the Bot in a Chat to remember something.");
+    expect(memory).toContain("Rules");
+    expect(memory).toContain("Notes");
+    // An empty memory still names the room each kind has left.
+    expect(memory).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.rule)}`);
+    expect(memory).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.note)}`);
+    expect(memoryPanel(view).querySelector("form")).toBeNull();
+    expect(memoryPanel(view).querySelector("input")).toBeNull();
+  });
+
+  it("shows a memory entry another client wrote", async () => {
+    const view = await openBots();
+    const memory = () => memoryPanel(view).textContent ?? "";
+    expect(memory()).toContain("Ask the Bot in a Chat to remember something.");
+
+    space.memories = {
+      b1: [
+        memoryOf({
+          memory: "mem4",
+          kind: "note",
+          author: "b1",
+          author_bot: true,
+          source: "r8",
+          source_kind: "run",
+          text: "Deploys run from main.",
+        }),
+      ],
+    };
+    record("neha.memory.added", { memory: "mem4", bot: "b1" });
+    await waitFor(() => expect(memory()).toContain("Deploys run from main."));
+
+    space.memories = { b1: [] };
+    record("neha.memory.removed", { memory: "mem4" });
+    await waitFor(() => expect(memory()).toContain("Ask the Bot in a Chat to remember something."));
+  });
+
+  it("keeps the newest memory answer when two reads land out of order", async () => {
+    space.memories = { b1: [memoryOf({ memory: "mem1", text: "Old rule." })] };
+    // Every memory read waits until the test lets it answer.
+    space.holdMemories();
+    const view = await openBotLoading();
+    await waitFor(() => expect(space.memoryHolds).toHaveLength(1));
+
+    // The memory changes while the page is opening: a new entry replaces the old
+    // one, and the event's read answers about the newer record.
+    space.memories = { b1: [memoryOf({ memory: "mem2", text: "New rule." })] };
+    record("neha.memory.added", { memory: "mem2", bot: "b1" });
+    await waitFor(() => expect(space.memoryHolds).toHaveLength(2));
+
+    // The newer read answers first, the page-opening read after it. The older
+    // answer speaks about a record the page has already replaced, so it is
+    // dropped rather than taking the new entry away.
+    space.releaseMemoryRead(1);
+    await drain();
+    space.releaseMemoryRead(0);
+    await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+    await waitFor(() => expect(panelText(view, "Memory")).toContain("New rule."));
+    expect(panelText(view, "Memory")).not.toContain("Old rule.");
+  });
+
+  it("does not lose a memory entry that lands while the page is opening", async () => {
+    space.memories = { b1: [memoryOf({ memory: "mem1", text: "Old rule." })] };
+    // The page's memory answer lands, and the page still waits on its rules.
+    space.holdRules("b1");
+    const view = await openBotLoading();
+    await waitFor(() => expect(space.asked).toContain("memory_list"));
+    await drain();
+    expect(view.container.querySelector(".page__body")).toBeNull();
+
+    // The memory changes after that answer, while the page has no Bot yet.
+    space.memories = { b1: [memoryOf({ memory: "mem2", text: "New rule." })] };
+    record("neha.memory.added", { memory: "mem2", bot: "b1" });
+    await waitFor(() =>
+      expect(space.asked.filter((name) => name === "memory_list")).toHaveLength(2),
+    );
+
+    // The rules answer lets the page finish. The event's read fills memory in,
+    // so the entry is not lost with the page's first answer.
+    space.releaseRules();
+    await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
+    await waitFor(() => expect(panelText(view, "Memory")).toContain("New rule."));
+    expect(panelText(view, "Memory")).not.toContain("Old rule.");
   });
 
   it("says why the Space refused a change", async () => {
