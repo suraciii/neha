@@ -1,9 +1,11 @@
 //! The built-in tools and their schemas.
 //!
 //! A Bot's tools are its Computer tools — `shell`, `read_file`, `write_file`,
-//! and `list_files` — and its memory tools — `remember`, `forget`, and
+//! and `list_files` — the tools the Space serves itself — `skill` and
+//! `run_skill_script` — and its memory tools — `remember`, `forget`, and
 //! `list_memories`. A Computer tool becomes an Action the loop asks the Space
-//! about; a memory tool is a record operation the loop runs directly.
+//! about; a Space tool is a call the Space answers under the approvals the
+//! action names; a memory tool is a record operation the loop runs directly.
 
 use neha::id::Id;
 use neha::memory::{MemoryKind, MemoryScope};
@@ -25,6 +27,10 @@ pub const READ_FILE: &str = "read_file";
 pub const WRITE_FILE: &str = "write_file";
 /// The list files tool.
 pub const LIST_FILES: &str = "list_files";
+/// The tool that loads a skill's body.
+pub const SKILL: &str = "skill";
+/// The action that runs a skill's script on the Computer.
+pub const RUN_SKILL_SCRIPT: &str = "run_skill_script";
 /// The memory tool that writes an entry.
 pub const REMEMBER: &str = "remember";
 /// The memory tool that removes entries.
@@ -33,11 +39,13 @@ pub const FORGET: &str = "forget";
 pub const LIST_MEMORIES: &str = "list_memories";
 
 /// Every built-in tool, by its wire name.
-pub const NAMES: [&str; 7] = [
+pub const NAMES: [&str; 9] = [
     SHELL,
     READ_FILE,
     WRITE_FILE,
     LIST_FILES,
+    SKILL,
+    RUN_SKILL_SCRIPT,
     REMEMBER,
     FORGET,
     LIST_MEMORIES,
@@ -46,7 +54,9 @@ pub const NAMES: [&str; 7] = [
 /// The memory tools, which run as record operations.
 pub const MEMORY_NAMES: [&str; 3] = [REMEMBER, FORGET, LIST_MEMORIES];
 
-/// Returns whether a tool name is one every Bot has.
+/// Returns whether a tool name is one the loop declares itself.
+///
+/// A server's tool is named by the server, so it is never built in.
 #[must_use]
 pub fn is_builtin(name: &str) -> bool {
     NAMES.contains(&name)
@@ -116,6 +126,40 @@ pub fn specs() -> Vec<ToolSpec> {
                     "path": {"type": "string", "description": "The directory path inside the workspace."}
                 },
                 "required": ["path"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: SKILL.to_owned(),
+            description: "Load the body of a skill the Bot has, by name. Call it when the \
+                          task matches the skill's description, then follow the body."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The skill's name."}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }),
+        },
+        ToolSpec {
+            name: RUN_SKILL_SCRIPT.to_owned(),
+            description: "Run a script a skill carries on the Bot's Computer, inside the \
+                          Workspace, and return its output."
+                .to_owned(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "skill": {"type": "string", "description": "The skill's name."},
+                    "script": {"type": "string", "description": "The script's file name within the skill."},
+                    "arguments": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "The arguments passed after the script."
+                    }
+                },
+                "required": ["skill", "script"],
                 "additionalProperties": false
             }),
         },
@@ -195,6 +239,8 @@ pub fn specs() -> Vec<ToolSpec> {
 pub enum Call {
     /// An action for the Computer.
     Computer(Action),
+    /// A tool the Space serves itself.
+    Space(SpaceCall),
     /// A record operation on the Bot's memory.
     Memory(MemoryCall),
 }
@@ -224,9 +270,84 @@ pub enum MemoryCall {
     List,
 }
 
+/// A tool call the Space serves without its Computer running it as a plain
+/// action: it reads what the Space holds, or runs a script it delivers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SpaceCall {
+    /// Loads the body of a skill the Bot has.
+    Skill { name: String },
+    /// Runs a skill's script on the Computer under the Bot's approvals.
+    Script {
+        skill: String,
+        script: String,
+        arguments: Vec<String>,
+    },
+    /// Calls a tool an MCP server gives the Bot, under its approvals.
+    Mcp {
+        /// The name the Model sees; the Space resolves the server and the
+        /// tool's original name before it calls anything.
+        name: String,
+        /// The arguments the server receives.
+        arguments: serde_json::Value,
+    },
+}
+
+/// Parses the arguments of a `skill` call.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillArguments {
+    name: String,
+}
+
+/// Parses the arguments of a `run_skill_script` call.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptArguments {
+    skill: String,
+    script: String,
+    #[serde(default)]
+    arguments: Vec<String>,
+}
+
+/// The largest script call: a skill name, a script name, and 64 arguments of
+/// 4 KiB each fit well under this.
+const MAX_SCRIPT_CALL_BYTES: usize = 300 * 1024;
+
 /// Turns one raw tool call into what it asks for.
 pub fn parse(name: &str, arguments: &str) -> Result<Call, String> {
     match name {
+        SKILL => {
+            let arguments: SkillArguments =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            Ok(Call::Space(SpaceCall::Skill {
+                name: arguments.name,
+            }))
+        }
+        RUN_SKILL_SCRIPT => {
+            if arguments.len() > MAX_SCRIPT_CALL_BYTES {
+                return Err(format!(
+                    "the script call is larger than {MAX_SCRIPT_CALL_BYTES} bytes"
+                ));
+            }
+            let arguments: ScriptArguments =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            if arguments.arguments.len() > 64 {
+                return Err("a script takes at most 64 arguments".to_owned());
+            }
+            Ok(Call::Space(SpaceCall::Script {
+                skill: arguments.skill,
+                script: arguments.script,
+                arguments: arguments.arguments,
+            }))
+        }
+        _ if name.starts_with("mcp__") => {
+            let arguments: serde_json::Value =
+                serde_json::from_str(arguments).map_err(|error| error.to_string())?;
+            Ok(Call::Space(SpaceCall::Mcp {
+                name: name.to_owned(),
+                arguments,
+            }))
+        }
         REMEMBER => Ok(Call::Memory(remember(arguments)?)),
         FORGET => Ok(Call::Memory(forget(arguments)?)),
         LIST_MEMORIES => Ok(Call::Memory(list(arguments)?)),
@@ -385,7 +506,8 @@ mod tests {
     use neha_computer::Action;
 
     use super::{
-        Call, MemoryCall, NAMES, action, is_builtin, is_computer, is_memory, parse, specs,
+        Call, MemoryCall, NAMES, RUN_SKILL_SCRIPT, SKILL, SpaceCall, action, is_builtin,
+        is_computer, is_memory, parse, specs,
     };
 
     #[test]
@@ -397,15 +519,24 @@ mod tests {
             assert!(is_builtin(name), "{name} is a built-in tool");
         }
         assert!(!is_builtin("reed_file"), "a misspelt tool is not one");
+        assert!(
+            !is_builtin("mcp__server__tool"),
+            "a server's tool is not built in"
+        );
         assert!(!is_builtin(""), "an empty name is not a tool");
     }
 
     #[test]
     fn only_computer_tools_take_a_lasting_rule() {
         for name in NAMES {
-            assert_eq!(
+            let kinds = [
                 is_computer(name),
-                !is_memory(name),
+                is_memory(name),
+                matches!(name, SKILL | RUN_SKILL_SCRIPT),
+            ];
+            assert_eq!(
+                kinds.into_iter().filter(|kind| *kind).count(),
+                1,
                 "{name} is exactly one kind of tool"
             );
         }
@@ -414,17 +545,42 @@ mod tests {
         assert!(is_memory("list_memories"));
         assert!(is_computer("shell"));
         assert!(!is_computer("remember"), "a rule never names a memory tool");
+        assert!(!is_memory("skill"), "a skill is not a memory tool");
     }
 
     #[test]
     fn every_tool_has_a_strict_schema() {
         let specs = specs();
 
-        assert_eq!(specs.len(), 7);
+        assert_eq!(specs.len(), 9);
         for spec in &specs {
             assert_eq!(spec.parameters["additionalProperties"], false);
             assert!(spec.description.len() < 300, "{}", spec.name);
         }
+    }
+
+    #[test]
+    fn the_skill_tools_become_space_calls() {
+        assert_eq!(
+            parse("skill", r#"{"name":"weekly-report"}"#).unwrap(),
+            Call::Space(SpaceCall::Skill {
+                name: "weekly-report".to_owned(),
+            })
+        );
+        assert_eq!(
+            parse(
+                "run_skill_script",
+                r#"{"skill":"weekly-report","script":"collect.sh","arguments":["q4"]}"#
+            )
+            .unwrap(),
+            Call::Space(SpaceCall::Script {
+                skill: "weekly-report".to_owned(),
+                script: "collect.sh".to_owned(),
+                arguments: vec!["q4".to_owned()],
+            })
+        );
+        assert!(parse("skill", r#"{"name":1}"#).is_err());
+        assert!(parse("run_skill_script", r#"{"skill":"x"}"#).is_err());
     }
 
     #[test]

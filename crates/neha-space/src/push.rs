@@ -800,6 +800,8 @@ mod tests {
                 grants: Vec::new(),
                 thinking: None,
                 model: None,
+                skills: Vec::new(),
+                mcps: Vec::new(),
             },
         );
         state.chats.insert(

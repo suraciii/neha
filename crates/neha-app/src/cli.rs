@@ -2,19 +2,22 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal as _, Write};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
 use neha::memory::MemoryKind;
-use neha::record::{ComputerSharing, RuleEffect};
+use neha::record::{ComputerSharing, McpScope, RuleEffect, SkillLibrary};
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, BotUpdate, CommandCall, ComputerCreate, ComputerUpdate, MessageSend,
-    ModelSpec, ProviderAdd, ProviderConnect, ProviderProtocol, ThinkingLevel,
+    BotComputer, BotCreate, BotUpdate, CommandCall, ComputerCreate, ComputerUpdate, McpAdd,
+    McpSignInStart, MessageSend, ModelSpec, ProviderAdd, ProviderConnect, ProviderProtocol,
+    SkillAdd, SkillAddScript, ThinkingLevel,
 };
 use neha_space::Home;
 use serde_json::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::client::Credential;
 use crate::{client, computer};
@@ -111,6 +114,21 @@ enum Top {
     Rule {
         #[command(subcommand)]
         command: RuleCommand,
+    },
+    /// Manage the skills a Bot may load.
+    Skill {
+        #[command(subcommand)]
+        command: SkillCommand,
+    },
+    /// Connect an MCP server or list the servers you may see.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+    /// Install and manage Agent Plugins packages.
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
     },
 }
 
@@ -292,6 +310,16 @@ enum BotCommand {
     },
     /// List your Bots.
     List,
+    /// Give your Bot a skill, or take one away.
+    Skill {
+        #[command(subcommand)]
+        command: BotSkillCommand,
+    },
+    /// Give your Bot an MCP server, or take one away.
+    Mcp {
+        #[command(subcommand)]
+        command: BotMcpCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -469,6 +497,14 @@ enum RuleCommand {
         bot: Option<Id>,
     },
     /// Add a rule that asks before, or allows, matching actions.
+    ///
+    /// A Computer action is a built-in tool such as shell or write_file, which
+    /// only a Bot on a Local Computer can have a rule for. A Space-served call
+    /// is a skill's script (--tool run_skill_script with --skill and --script)
+    /// or an MCP server's tool (--tool with --server, or --tool alone for every
+    /// server that offers that tool name), and a Bot on either Computer can
+    /// have a rule for it. A rule names one of these kinds, and its prefixes
+    /// fit the tool it names.
     Add {
         /// The Bot the rule applies to.
         #[arg(long)]
@@ -476,7 +512,9 @@ enum RuleCommand {
         /// What the rule does: ask before the action, or allow it.
         #[arg(long, value_enum)]
         effect: RuleEffectChoice,
-        /// The tool the rule matches, such as shell or write_file.
+        /// The tool the rule matches: a built-in tool such as shell or
+        /// write_file, run_skill_script with --skill and --script, or the name
+        /// of a tool an MCP server lists.
         #[arg(long)]
         tool: String,
         /// Match shell commands that start with this text.
@@ -485,11 +523,159 @@ enum RuleCommand {
         /// Match file paths that start with this text.
         #[arg(long)]
         path_prefix: Option<String>,
+        /// Match a skill's script by the skill's name; with --script.
+        #[arg(long, requires = "script")]
+        skill: Option<String>,
+        /// Match one script of that skill by its file name; with --skill.
+        #[arg(long, requires = "skill")]
+        script: Option<String>,
+        /// Match a tool an MCP server gives, by the server's name; without it
+        /// an MCP tool name matches every enabled server that offers it.
+        #[arg(long)]
+        server: Option<String>,
     },
     /// Remove one rule.
     Remove {
         /// The rule identifier.
         rule: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Add a skill from a directory that holds a SKILL.md and its scripts.
+    Add {
+        /// The skill's directory: SKILL.md, and scripts directly in scripts/.
+        path: std::path::PathBuf,
+        /// The Bot whose library holds it; without it the Space's library
+        /// holds it, which only the Admin may add to.
+        #[arg(long)]
+        bot: Option<Id>,
+    },
+    /// List skills: the Space's and your Bots', or one Bot's enabled skills.
+    List {
+        /// Only the skills this Bot may use.
+        #[arg(long)]
+        bot: Option<Id>,
+    },
+    /// Remove a skill from its library.
+    Remove {
+        /// The skill identifier.
+        skill: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommand {
+    /// Install a package from a source the Admin allows.
+    ///
+    /// A repository source is <url>@<40-or-64-hex-commit>: the commit is the
+    /// 40- or 64-character lowercase hexadecimal object id of the commit to
+    /// read, and a branch or tag is not a commit. A directory source is a
+    /// plain path to a directory that holds plugin.json, read where it is; it
+    /// is supported only on Linux, and on any other platform, install from a
+    /// repository.
+    ///
+    /// The Admin lists the sources the Space allows under [plugins] sources
+    /// in the Space's config.toml; a source the list does not allow is
+    /// refused.
+    ///
+    /// A package is at most 200 files, 1024 entries in all (files and
+    /// directories), 100 KiB per file, and 4 MiB per package; a package above
+    /// one of those is refused with a report.
+    Install {
+        /// The source the package comes from.
+        source: String,
+    },
+    /// List the installed packages and what they brought.
+    List,
+    /// Remove a package and everything it brought.
+    Remove {
+        /// The package identifier.
+        plugin: Id,
+    },
+    /// Let the Space offer a package's servers and skills again.
+    Enable {
+        /// The package identifier.
+        plugin: Id,
+    },
+    /// Stop the Space offering a package's servers and skills.
+    Disable {
+        /// The package identifier.
+        plugin: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Connect an MCP server.
+    ///
+    /// The credential comes from NEHA_MCP_TOKEN, never from the command line.
+    /// With the token set, the Space connects the server at once; naming an
+    /// existing Space server again attaches the credential to it.
+    ///
+    /// Without an address, the command attaches the Space's credential to an
+    /// existing package's stdio server of that name; only the Admin may do
+    /// that, and the token is asked for when the environment carries none.
+    ///
+    /// Without the token, the command opens the browser to sign in. The
+    /// sign-in is bound to a loopback receiver this command runs, so the
+    /// browser brings the answer back to the terminal. Naming an existing
+    /// server of the same name and address attaches your own credential to it;
+    /// a new server enters the Space when the sign-in finishes.
+    Add {
+        /// The server's name, unique in the Space: letters, digits, or hyphens.
+        name: String,
+        /// The address it speaks Streamable HTTP at; omit it to attach the
+        /// Space credential to a package's existing stdio server of this name.
+        url: Option<String>,
+        /// Connect it for the signed-in User alone; without it the Space is
+        /// the scope, which only the Admin may add to.
+        #[arg(long, value_parser = parse_mcp_scope)]
+        scope: Option<McpScope>,
+    },
+    /// List the MCP servers you may see.
+    List,
+    /// Disconnect an MCP server.
+    Remove {
+        /// The server identifier.
+        server: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotSkillCommand {
+    /// Give a Bot a skill.
+    Enable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The skill identifier.
+        skill: Id,
+    },
+    /// Take a skill away from a Bot.
+    Disable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The skill identifier.
+        skill: Id,
+    },
+}
+
+#[derive(Subcommand)]
+enum BotMcpCommand {
+    /// Give a Bot the tools of an MCP server.
+    Enable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The MCP server identifier.
+        server: Id,
+    },
+    /// Take an MCP server's tools away from a Bot.
+    Disable {
+        /// The Bot identifier.
+        bot: Id,
+        /// The MCP server identifier.
+        server: Id,
     },
 }
 
@@ -543,6 +729,9 @@ pub async fn run() -> Result<()> {
         Top::Run { command } => run_command(command).await,
         Top::Approval { command } => approval(command).await,
         Top::Rule { command } => rule(command).await,
+        Top::Skill { command } => skill_command(command).await,
+        Top::Mcp { command } => mcp_command(command).await,
+        Top::Plugin { command } => plugin_command(command).await,
     }
 }
 
@@ -938,6 +1127,17 @@ fn parse_protocol(value: &str) -> Result<ProviderProtocol> {
         other => bail!(
             "unknown protocol {other:?}; use chat-completions, openai-responses, or anthropic-messages"
         ),
+    }
+}
+
+/// Parses an MCP server's scope.
+///
+/// A server added without `--scope user` belongs to the Space, so `user` is
+/// the only value the option spells.
+fn parse_mcp_scope(value: &str) -> Result<McpScope> {
+    match value {
+        "user" => Ok(McpScope::User),
+        other => bail!("unknown scope {other:?}; --scope takes user, and the Space is the default"),
     }
 }
 
@@ -1486,6 +1686,8 @@ async fn bot(command: BotCommand) -> Result<()> {
                 );
             }
         }
+        BotCommand::Skill { command } => bot_skill(command).await?,
+        BotCommand::Mcp { command } => bot_mcp(command).await?,
     }
 
     Ok(())
@@ -2012,11 +2214,14 @@ fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> 
     Ok(())
 }
 
-/// Escapes control characters so a card cannot hide or rewrite itself.
+/// Escapes control characters and the escape character so a card cannot hide
+/// or rewrite itself. A literal `\n` renders as `\\n`, so no raw control
+/// character and no ambiguous escape reaches the reader.
 fn escape_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
+            '\\' => escaped.push_str("\\\\"),
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
@@ -2061,8 +2266,18 @@ async fn rule(command: RuleCommand) -> Result<()> {
             tool,
             command_prefix,
             path_prefix,
+            skill,
+            script,
+            server,
         } => {
-            validate_rule_arguments(&tool, command_prefix.as_deref(), path_prefix.as_deref())?;
+            validate_rule_arguments(
+                &tool,
+                command_prefix.as_deref(),
+                path_prefix.as_deref(),
+                skill.as_deref(),
+                script.as_deref(),
+                server.as_deref(),
+            )?;
             let result = client::command(
                 &credential,
                 CommandCall::RuleAdd {
@@ -2071,6 +2286,9 @@ async fn rule(command: RuleCommand) -> Result<()> {
                     tool: tool.clone(),
                     command_prefix: command_prefix.clone(),
                     path_prefix: path_prefix.clone(),
+                    skill: skill.clone(),
+                    script: script.clone(),
+                    server: server.clone(),
                 },
             )
             .await?;
@@ -2082,7 +2300,10 @@ async fn rule(command: RuleCommand) -> Result<()> {
                     effect.wire(),
                     &tool,
                     command_prefix.as_deref(),
-                    path_prefix.as_deref()
+                    path_prefix.as_deref(),
+                    skill.as_deref(),
+                    script.as_deref(),
+                    server.as_deref()
                 )?
             );
         }
@@ -2094,6 +2315,1519 @@ async fn rule(command: RuleCommand) -> Result<()> {
                 .map_or_else(|| rule.to_string(), str::to_owned);
             println!("Removed rule {shown}.");
         }
+    }
+
+    Ok(())
+}
+
+/// Adds, lists, and removes skills.
+async fn skill_command(command: SkillCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        SkillCommand::Add { path, bot } => {
+            let (document, scripts) = read_skill_directory(&path)?;
+            let library = if bot.is_some() {
+                SkillLibrary::Bot
+            } else {
+                SkillLibrary::Space
+            };
+            let result = client::command(
+                &credential,
+                CommandCall::SkillAdd(SkillAdd {
+                    library,
+                    bot,
+                    document,
+                    scripts,
+                }),
+            )
+            .await?;
+            println!(
+                "Added skill {} ({}) with {} script(s).",
+                id_of(&result, "skill")?,
+                result["name"].as_str().unwrap_or_default(),
+                result["scripts"].as_array().map_or(0, std::vec::Vec::len)
+            );
+            if let Some(bot) = bot {
+                println!(
+                    "Give it to the Bot with: neha bot skill enable {} {}",
+                    bot,
+                    id_of(&result, "skill")?
+                );
+            }
+        }
+        SkillCommand::List { bot } => {
+            let list = client::command(&credential, CommandCall::SkillList { bot }).await?;
+            for row in skill_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        SkillCommand::Remove { skill } => {
+            let result = client::command(&credential, CommandCall::SkillRemove { skill }).await?;
+            let shown = result
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("the skill");
+            println!("Removed skill {shown}.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Installs and manages Agent Plugins packages.
+async fn plugin_command(command: PluginCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        PluginCommand::Install { source } => {
+            let result =
+                client::command(&credential, CommandCall::PluginInstall { source }).await?;
+            println!(
+                "Installed package {} ({}{}).",
+                id_of(&result, "plugin")?,
+                result["name"].as_str().unwrap_or_default(),
+                result["version"]
+                    .as_str()
+                    .map_or_else(String::new, |version| format!(" {version}"))
+            );
+            println!(
+                "  digest: {}; source: {}",
+                result["digest"].as_str().unwrap_or_default(),
+                result["source"].as_str().unwrap_or_default()
+            );
+            if let Some(commit) = result["commit"].as_str() {
+                println!("  commit: {commit}");
+            }
+            let servers = result["servers"]
+                .as_array()
+                .map_or(&[][..], std::vec::Vec::as_slice);
+            if servers.is_empty() {
+                println!("  servers: -");
+            }
+            for server in servers {
+                // A server row carries its transport's fields: an HTTP
+                // server's address, or a stdio server's command.
+                println!(
+                    "  server: {} ({})",
+                    server["name"].as_str().unwrap_or_default(),
+                    mcp_reach_label(server)
+                );
+            }
+            let skills = result["skills"]
+                .as_array()
+                .map_or(&[][..], std::vec::Vec::as_slice);
+            if skills.is_empty() {
+                println!("  skills: -");
+            }
+            for skill in skills {
+                println!("  skill: {}", skill["name"].as_str().unwrap_or_default());
+            }
+            for skipped in result["skipped"]
+                .as_array()
+                .map_or(&[][..], std::vec::Vec::as_slice)
+            {
+                println!("  skipped: {}", skipped.as_str().unwrap_or_default());
+            }
+            print_cleanup(&result, CleanupStyle::Detail);
+        }
+        PluginCommand::List => {
+            let list = client::command(&credential, CommandCall::PluginList).await?;
+            for row in plugin_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        PluginCommand::Remove { plugin } => {
+            let result = client::command(&credential, CommandCall::PluginRemove { plugin }).await?;
+            println!(
+                "Removed package {}.",
+                result["name"].as_str().unwrap_or_default()
+            );
+            print_cleanup(&result, CleanupStyle::Retry);
+        }
+        PluginCommand::Enable { plugin } | PluginCommand::Disable { plugin } => {
+            let enabled = matches!(command, PluginCommand::Enable { .. });
+            let call = if enabled {
+                CommandCall::PluginEnable { plugin }
+            } else {
+                CommandCall::PluginDisable { plugin }
+            };
+            let result = client::command(&credential, call).await?;
+            println!(
+                "Package {plugin} is {}.",
+                if enabled { "enabled" } else { "disabled" }
+            );
+            print_cleanup(&result, CleanupStyle::Retry);
+        }
+    }
+
+    Ok(())
+}
+
+/// How a command reports the cleanup warning its result may carry.
+#[derive(Clone, Copy)]
+enum CleanupStyle {
+    /// One detail line under the install's report.
+    Detail,
+    /// The sentence a package command prints, which names the retry that
+    /// finishes the cleanup.
+    Retry,
+}
+
+/// The value the Space uses for a cleanup a retried command just finished.
+const CLEANUP_FINISHED: &str = "finished";
+
+/// Formats the top-level `cleanup` field a result may carry, or `None` when it
+/// carries none.
+///
+/// The Space writes `incomplete: …` while it still owes a cleanup, and
+/// `finished` when a retried command completed one it had reported. The Space
+/// sanitizes that text and never puts a secret in it; escaping it here too
+/// keeps a hostile package's words from rewriting the terminal, and one line
+/// keeps the report a row.
+fn cleanup_notice(result: &Value, style: CleanupStyle) -> Option<String> {
+    let cleanup = result.get("cleanup")?.as_str()?.trim();
+    if cleanup.is_empty() {
+        return None;
+    }
+    Some(match style {
+        CleanupStyle::Detail => format!("  cleanup: {}", escape_text(cleanup)),
+        CleanupStyle::Retry if cleanup == CLEANUP_FINISHED => "Cleanup finished.".to_owned(),
+        CleanupStyle::Retry => {
+            // The Space's warning already begins `incomplete: `; naming the
+            // state once keeps the line short.
+            let warning = escape_text(cleanup.strip_prefix("incomplete: ").unwrap_or(cleanup));
+            format!("Cleanup incomplete: {warning}. Run the command again to finish it.")
+        }
+    })
+}
+
+/// Prints the cleanup warning a command's result carries, when it carries one.
+fn print_cleanup(result: &Value, style: CleanupStyle) {
+    if let Some(notice) = cleanup_notice(result, style) {
+        println!("{notice}");
+    }
+}
+
+/// One row per package: package, name, version, commit, digest, enabled, and
+/// what it brought.
+fn plugin_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no packages in the answer")?
+        .iter()
+        .map(|row| {
+            let names = |field: &str, key: &str| -> String {
+                let names: Vec<&str> = row[field]
+                    .as_array()
+                    .map_or(&[][..], std::vec::Vec::as_slice)
+                    .iter()
+                    .filter_map(|entry| entry[key].as_str())
+                    .collect();
+                if names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    names.join(", ")
+                }
+            };
+            Ok(format!(
+                "{}  {}  {}  {}  digest: {}  {}  servers: {}  skills: {}",
+                id_of(row, "plugin")?,
+                row["name"].as_str().unwrap_or_default(),
+                row["version"].as_str().unwrap_or("-"),
+                row["commit"].as_str().unwrap_or("-"),
+                row["digest"].as_str().unwrap_or("-"),
+                if row["enabled"].as_bool().unwrap_or(false) {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                names("servers", "name"),
+                names("skills", "name")
+            ))
+        })
+        .collect()
+}
+
+/// Connects, lists, and disconnects MCP servers.
+async fn mcp_command(command: McpCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        McpCommand::Add { name, url, scope } => {
+            let scope = scope.unwrap_or(McpScope::Space);
+            // An omitted address names a package's existing stdio server: no
+            // server is created, and only the Space's own credential can be
+            // attached to it.
+            let url = url.unwrap_or_default();
+            let token = match mcp_credential() {
+                Some(token) => Some(token),
+                // A stdio server has no address to sign in to, so the attach
+                // asks for the token instead of opening a browser.
+                None if url.trim().is_empty() => Some(read_mcp_credential()?),
+                None => None,
+            };
+            match mcp_add_plan(&name, &url, scope, token) {
+                McpAddPlan::Add(arguments) => {
+                    let result =
+                        client::command(&credential, CommandCall::McpAdd(arguments)).await?;
+                    if result["url"].as_str().is_none_or(str::is_empty) {
+                        println!(
+                            "Attached the Space credential to MCP server {} ({}).",
+                            id_of(&result, "server")?,
+                            result["name"].as_str().unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "Added MCP server {} ({}) at {}.",
+                            id_of(&result, "server")?,
+                            result["name"].as_str().unwrap_or_default(),
+                            result["url"].as_str().unwrap_or_default()
+                        );
+                    }
+                    println!(
+                        "  scope: {}; {}",
+                        mcp_scope_label(&result),
+                        mcp_connection_label(&result)
+                    );
+                }
+                McpAddPlan::SignIn => {
+                    // A tokenless add binds its own loopback receiver before it
+                    // starts the sign-in: the authorization server then brings
+                    // the browser back to this command, not to the Space.
+                    //
+                    // One deadline covers everything the tokenless add does:
+                    // listing the server it may attach to, starting the
+                    // sign-in, waiting for the browser, and finishing the
+                    // exchange. Each step gets only the time that is left, so
+                    // no step can hold the command past the sign-in budget.
+                    let deadline = tokio::time::Instant::now() + SIGN_IN_TIMEOUT;
+                    let existing = mcp_existing_server(&credential, &name, &url, deadline).await?;
+                    let receiver = SignInReceiver::bind().await?;
+                    let start =
+                        mcp_sign_in_start(&name, &url, scope, receiver.redirect_uri(), existing);
+                    // An existing server takes the caller's own credential; a
+                    // new server keeps the scope the command asked for.
+                    let reported_scope = if existing.is_some() {
+                        McpScope::User
+                    } else {
+                        scope
+                    };
+                    mcp_sign_in(
+                        &credential,
+                        deadline,
+                        start,
+                        &name,
+                        &url,
+                        reported_scope,
+                        receiver,
+                    )
+                    .await?;
+                }
+            }
+        }
+        McpCommand::List => {
+            let list = client::command(&credential, CommandCall::McpList).await?;
+            for row in mcp_rows(&list)? {
+                println!("{row}");
+            }
+        }
+        McpCommand::Remove { server } => {
+            let result = client::command(&credential, CommandCall::McpRemove { server }).await?;
+            for line in mcp_remove_lines(&result) {
+                println!("{line}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// The lines `neha mcp remove` prints: the removal, and the cleanup its answer
+/// still owes or has finished.
+///
+/// The cleanup sentence is the one the package commands print, so an operator
+/// reads the same words and the same retry instruction wherever a Space
+/// reports a cleanup.
+fn mcp_remove_lines(result: &Value) -> Vec<String> {
+    let shown = result
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("the server");
+    let mut lines = vec![format!("Removed MCP server {shown}.")];
+    if let Some(cleanup) = cleanup_notice(result, CleanupStyle::Retry) {
+        lines.push(cleanup);
+    }
+    lines
+}
+
+/// How often `neha mcp add` asks how a browser sign-in is doing.
+const SIGN_IN_POLL: Duration = Duration::from_secs(1);
+/// How long `neha mcp add` waits for a browser sign-in to finish.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the receiver waits for the browser to read its last page.
+///
+/// The page is a few hundred bytes on loopback and is written only once the
+/// sign-in has ended, so a browser that stopped reading must not hold the
+/// command: the outcome is already decided, and only the page is lost.
+const SIGN_IN_PAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most of one browser callback the loopback receiver reads.
+///
+/// The redirect carries one request line and a few headers; the bound keeps a
+/// local connection from growing the receiver's memory before the deadline.
+const MAX_CALLBACK_REQUEST_BYTES: usize = 8 * 1024;
+
+/// The program this platform opens an address with.
+#[cfg(target_os = "linux")]
+const BROWSER_OPEN: Option<&str> = Some("xdg-open");
+#[cfg(target_os = "macos")]
+const BROWSER_OPEN: Option<&str> = Some("open");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const BROWSER_OPEN: Option<&str> = None;
+
+/// Opens one address in the browser, and reports whether the browser launched.
+///
+/// The opener is detached: the browser may stay open while `neha mcp add` waits
+/// on its loopback receiver and finishes the sign-in, so the command never waits
+/// for the browser process. A missing command or a refused launch leaves the
+/// browser closed, and the caller prints the address for the User instead.
+fn open_browser(url: &str) -> bool {
+    let Some(program) = BROWSER_OPEN else {
+        return false;
+    };
+    // The browser's own streams are not this command's output.
+    std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// What one `neha mcp add` sends: the server itself when the environment
+/// carries a credential, and a browser sign-in when it does not.
+#[derive(Debug, PartialEq)]
+enum McpAddPlan {
+    /// Registers the server with the credential the environment carries.
+    Add(McpAdd),
+    /// Starts a browser sign-in bound to the command's loopback receiver.
+    SignIn,
+}
+
+/// Decides how one `neha mcp add` connects its server.
+///
+/// A credential argument would outlive the command in a shell history and a
+/// process listing, so `NEHA_MCP_TOKEN` (or, for an attach without an address,
+/// the terminal prompt) is its only source; without one the browser sign-in
+/// supplies the credential instead. An empty `url` is passed through: the Space
+/// reads it as the existing package stdio server of that name.
+fn mcp_add_plan(name: &str, url: &str, scope: McpScope, credential: Option<String>) -> McpAddPlan {
+    match credential {
+        Some(credential) => McpAddPlan::Add(McpAdd {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            scope,
+            credential: Some(credential),
+        }),
+        None => McpAddPlan::SignIn,
+    }
+}
+
+/// The start command of a tokenless `neha mcp add`.
+///
+/// A server the Space already holds under `name` and `url` takes the caller's
+/// own credential, so the sign-in names only that server; a new server carries
+/// the name, address, and scope the Space registers when the sign-in finishes.
+/// `redirect_uri` is the loopback receiver this command bound for the browser.
+fn mcp_sign_in_start(
+    name: &str,
+    url: &str,
+    scope: McpScope,
+    redirect_uri: &str,
+    existing: Option<Id>,
+) -> McpSignInStart {
+    let redirect_uri = Some(redirect_uri.to_owned());
+    match existing {
+        Some(server) => McpSignInStart {
+            server: Some(server),
+            name: None,
+            url: None,
+            // The sign-in attaches the caller's own credential; the Space's
+            // own credential is what the token path registers.
+            scope: None,
+            redirect_uri,
+        },
+        None => McpSignInStart {
+            server: None,
+            name: Some(name.to_owned()),
+            url: Some(url.to_owned()),
+            scope: Some(scope),
+            redirect_uri,
+        },
+    }
+}
+
+/// The server a tokenless `neha mcp add` names, when the Space already holds it.
+///
+/// A sign-in attaches the caller's credential to the server the Space already
+/// holds under the same name and address; it never registers a second server
+/// under that name, so a name held at another address is a refusal. The list is
+/// one step of the sign-in, so it is bounded by the sign-in's deadline like the
+/// commands that follow it.
+async fn mcp_existing_server(
+    credential: &Credential,
+    name: &str,
+    url: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Id>> {
+    let list = sign_in_command(credential, deadline, CommandCall::McpList).await?;
+    existing_server(&list, name, url)
+}
+
+/// Reads the server a `mcp_list` answer holds under `name`.
+fn existing_server(list: &Value, name: &str, url: &str) -> Result<Option<Id>> {
+    let rows = list.as_array().context("no MCP servers in the answer")?;
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.get("name").and_then(Value::as_str) == Some(name))
+    else {
+        return Ok(None);
+    };
+    if row.get("url").and_then(Value::as_str) != Some(url.trim()) {
+        bail!("the Space already holds an MCP server named {name:?} at another address");
+    }
+    Ok(Some(id_of(row, "server")?))
+}
+
+/// What one browser callback carries.
+#[derive(Debug, PartialEq, Eq)]
+enum Callback {
+    /// The authorization server returned a code bound to the sign-in's state,
+    /// and the issuer it named when RFC 9207 named one.
+    Code {
+        code: String,
+        state: String,
+        /// The issuer identifier the authorization response named, when it did.
+        iss: Option<String>,
+    },
+    /// The sign-in did not return a code: the authorization server refused it,
+    /// or the browser came back without one. Its own text is never kept.
+    Refused,
+}
+
+/// The loopback receiver one browser sign-in comes back to.
+struct SignInReceiver {
+    listener: tokio::net::TcpListener,
+    /// The address the authorization server redirects the browser to.
+    redirect_uri: String,
+}
+
+impl SignInReceiver {
+    /// Binds a loopback receiver on a free port.
+    async fn bind() -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .context("cannot bind the sign-in receiver on loopback")?;
+        let port = listener
+            .local_addr()
+            .context("cannot read the sign-in receiver's address")?
+            .port();
+        Ok(Self {
+            listener,
+            redirect_uri: format!("http://127.0.0.1:{port}/callback"),
+        })
+    }
+
+    /// The redirect URI the sign-in binds the browser to.
+    fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    /// Waits for the browser's one callback, and keeps it for the reply.
+    ///
+    /// The receiver serves one request: the redirect is single use, so a
+    /// second request has nothing left to find, and the listener is dropped as
+    /// soon as the one request is read. The wait has one deadline, so a browser
+    /// that never comes back cannot hold the command forever.
+    async fn receive(self, deadline: tokio::time::Instant) -> Result<SignInCallback> {
+        match tokio::time::timeout_at(deadline, self.accept_one()).await {
+            Ok(callback) => callback,
+            Err(_) => Err(sign_in_timeout(SIGN_IN_TIMEOUT)),
+        }
+    }
+
+    /// Accepts the one request the browser makes.
+    async fn accept_one(self) -> Result<SignInCallback> {
+        let Self {
+            listener,
+            redirect_uri: _,
+        } = self;
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .context("cannot accept the sign-in callback")?;
+        // The receiver serves one request: the listener is dropped before the
+        // page is written, so no second connection is one this command serves.
+        drop(listener);
+        let request = read_callback_request(&mut stream).await?;
+        let CallbackRequest { path, callback } = callback_of(&request);
+        Ok(SignInCallback {
+            callback,
+            path,
+            stream,
+        })
+    }
+}
+
+/// The one browser callback the receiver read, and the reply it still owes.
+///
+/// The page is held until the Space has finished the sign-in, so a browser can
+/// never read success before the credential is registered. The callback itself
+/// is only handed to the Space; it is never rendered.
+#[derive(Debug)]
+struct SignInCallback {
+    /// What the browser's redirect carried.
+    callback: Callback,
+    /// The raw path the browser requested, when the target was origin-form.
+    ///
+    /// The receiver accepts any path because it cannot know the issuer key the
+    /// Space registered; the Space compares this path with the redirect it
+    /// registered for the flow.
+    path: Option<String>,
+    /// The browser connection its last page is written to.
+    stream: tokio::net::TcpStream,
+}
+
+impl SignInCallback {
+    /// What the browser's redirect carried.
+    fn callback(&self) -> &Callback {
+        &self.callback
+    }
+
+    /// The raw path the browser requested, when the request line named one.
+    fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    /// Answers the browser with the fixed page its sign-in ended on.
+    ///
+    /// `finished` is true only once the Space registered the credential; a
+    /// refusal and every failure get the fixed failure page. The wait for the
+    /// browser to take the page is bounded, because the sign-in is already
+    /// decided: a browser that stopped reading loses its page, not the command.
+    async fn answer(mut self, finished: bool) -> Result<()> {
+        match tokio::time::timeout(
+            SIGN_IN_PAGE_TIMEOUT,
+            answer_callback(&mut self.stream, finished),
+        )
+        .await
+        {
+            Ok(answered) => answered,
+            Err(_) => bail!("the browser did not read the sign-in page"),
+        }
+    }
+}
+
+/// The page a browser shows once the Space finished the sign-in it carried.
+///
+/// The page is fixed: the browser's history must not keep the code, the state,
+/// or the authorization server's own words.
+const SIGN_IN_FINISHED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in finished</title></head><body><h1>MCP sign-in finished</h1>\
+<p>You can close this window and return to Neha.</p></body></html>";
+
+/// The page a browser shows once its callback did not end a sign-in.
+const SIGN_IN_FAILED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in failed</title></head><body><h1>MCP sign-in failed</h1>\
+<p>The sign-in did not finish. You can close this window and try again from Neha.</p></body></html>";
+
+/// Reads one callback request's head, bounded.
+///
+/// The receiver answers the browser only after the request's headers end, so
+/// the page is not cut off by a half-read request; a request without its end is
+/// bounded by [`MAX_CALLBACK_REQUEST_BYTES`] and by the receiver's deadline.
+async fn read_callback_request(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .context("cannot read the sign-in callback")?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.len() > MAX_CALLBACK_REQUEST_BYTES {
+            bail!("the sign-in callback request is too large");
+        }
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(request)
+}
+
+/// Answers the browser's callback with the page that ends its part of the flow.
+async fn answer_callback(stream: &mut tokio::net::TcpStream, finished: bool) -> Result<()> {
+    let (status, page) = if finished {
+        ("200 OK", SIGN_IN_FINISHED_PAGE)
+    } else {
+        ("400 Bad Request", SIGN_IN_FAILED_PAGE)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("cannot answer the sign-in callback")?;
+    stream
+        .flush()
+        .await
+        .context("cannot answer the sign-in callback")?;
+    stream
+        .shutdown()
+        .await
+        .context("cannot answer the sign-in callback")?;
+    Ok(())
+}
+
+/// What one callback request line carries.
+#[derive(Debug, PartialEq, Eq)]
+struct CallbackRequest {
+    /// The raw path the browser requested, when the target was origin-form.
+    ///
+    /// It is exactly the request line's path segment: percent-encoding is kept
+    /// as received, and neither the query nor a fragment is part of it. The
+    /// Space compares it with the issuer-keyed redirect it registered, so the
+    /// receiver never decodes or rewrites it.
+    path: Option<String>,
+    /// What the browser's redirect carried.
+    callback: Callback,
+}
+
+/// Reads the callback one request line carries.
+///
+/// The request target must be origin-form (`/...`): the browser sends the
+/// redirect as it was registered, so an absolute URL, an authority form, or a
+/// fragment is a request this receiver did not register for, and it is refused
+/// with the callback it would otherwise read. Only `code`, `state`, and RFC
+/// 9207's `iss` are kept from the query; the authorization server's `error` and
+/// `error_description` are reduced to the fixed refusal, so no provider text
+/// can reach the command's output.
+fn callback_of(request: &[u8]) -> CallbackRequest {
+    let refused = CallbackRequest {
+        path: None,
+        callback: Callback::Refused,
+    };
+    let line = request
+        .split(|byte| *byte == b'\r' || *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let Ok(line) = std::str::from_utf8(line) else {
+        return refused;
+    };
+    let mut parts = line.split_ascii_whitespace();
+    if parts.next() != Some("GET") {
+        return refused;
+    }
+    let Some(target) = parts.next() else {
+        return refused;
+    };
+    let Some((path, query)) = origin_form_target(target) else {
+        return refused;
+    };
+    CallbackRequest {
+        path: Some(path.to_owned()),
+        callback: callback_of_query(query),
+    }
+}
+
+/// Splits an origin-form request target into its raw path and its query.
+///
+/// A fragment is never part of a request target, so one is refused rather than
+/// silently dropped, and an empty path names no redirect. The path is returned
+/// byte for byte, percent-encoding included.
+fn origin_form_target(target: &str) -> Option<(&str, &str)> {
+    if target.contains('#') {
+        return None;
+    }
+    let (path, query) = target
+        .split_once('?')
+        .map_or((target, ""), |(path, query)| (path, query));
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some((path, query))
+}
+
+/// Reads the callback values one redirect query carries.
+fn callback_of_query(query: &str) -> Callback {
+    let mut code = None;
+    let mut state = None;
+    let mut iss = None;
+    let mut refused = false;
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match name {
+            "code" => code = decode_query_value(value),
+            "state" => state = decode_query_value(value),
+            "iss" => iss = decode_query_value(value).filter(|iss| !iss.is_empty()),
+            "error" => refused = true,
+            _ => {}
+        }
+    }
+    match (refused, code, state) {
+        (false, Some(code), Some(state)) if !code.is_empty() && !state.is_empty() => {
+            Callback::Code { code, state, iss }
+        }
+        _ => Callback::Refused,
+    }
+}
+
+/// Decodes one percent-encoded query value; `+` stands for a space.
+fn decode_query_value(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let hex = [bytes.next()?, bytes.next()?];
+                let hex = std::str::from_utf8(&hex).ok()?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            }
+            byte => decoded.push(byte),
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// What a started browser sign-in is doing, as the Space reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SignInState {
+    /// The browser has not finished the sign-in.
+    Pending,
+    /// The Space registered the server and sealed a credential.
+    Finished {
+        /// The server the Space registered.
+        server: Id,
+        /// Whether the Space holds a credential a call would send.
+        connected: bool,
+    },
+    /// The sign-in cannot finish.
+    Failed {
+        /// The Space's account of the failure, free of any credential.
+        reason: String,
+    },
+}
+
+/// Reads one `mcp_sign_in_status` answer.
+fn sign_in_state(answer: &Value) -> Result<SignInState> {
+    match answer.get("state").and_then(Value::as_str) {
+        Some("pending") => Ok(SignInState::Pending),
+        Some("finished") => Ok(SignInState::Finished {
+            server: id_of(answer, "server")?,
+            connected: answer
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+        Some("failed") => Ok(SignInState::Failed {
+            reason: answer
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the Space gave no reason")
+                .to_owned(),
+        }),
+        Some(state) => bail!("the Space reported an unknown sign-in state {state:?}"),
+        None => bail!("the answer has no sign-in state"),
+    }
+}
+
+/// Polls one browser sign-in until it ends, and returns how it ended.
+///
+/// `ask` sends one `mcp_sign_in_status` and returns its answer; the caller owns
+/// the connection, so the wait is exercised without a Space. The wait shares
+/// the sign-in's one deadline: it is checked before every ask, and every ask is
+/// bounded by the time that is left, because a command that never answers must
+/// not hold the wait past its deadline. A pending answer sleeps only for the
+/// time left.
+async fn poll_sign_in<F, Fut>(
+    sign_in: Id,
+    deadline: tokio::time::Instant,
+    poll: Duration,
+    mut ask: F,
+) -> Result<SignInState>
+where
+    F: FnMut(Id) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    loop {
+        let left = sign_in_left(deadline)?;
+        let answer = match tokio::time::timeout(left, ask(sign_in)).await {
+            Ok(answer) => answer?,
+            Err(_) => return Err(sign_in_timeout(SIGN_IN_TIMEOUT)),
+        };
+        match sign_in_state(&answer)? {
+            SignInState::Pending => {}
+            ended => return Ok(ended),
+        }
+        let left = sign_in_left(deadline)?;
+        tokio::time::sleep(poll.min(left)).await;
+    }
+}
+
+/// The time left before the sign-in's one deadline, or its fixed timeout error.
+fn sign_in_left(deadline: tokio::time::Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if left.is_zero() {
+        return Err(sign_in_timeout(SIGN_IN_TIMEOUT));
+    }
+
+    Ok(left)
+}
+
+/// Runs one command of a browser sign-in with the time left before its deadline.
+///
+/// Every step of a tokenless `neha mcp add` shares the one deadline: opening the
+/// connection, the Space's greeting, sending the command, and reading its answer
+/// must all fit in what remains, so a Space that accepts a socket and never
+/// greets it cannot hold the command past the sign-in budget.
+async fn sign_in_command(
+    credential: &Credential,
+    deadline: tokio::time::Instant,
+    command: CommandCall,
+) -> Result<Value> {
+    let left = sign_in_left(deadline)?;
+    match tokio::time::timeout(left, client::command(credential, command)).await {
+        Ok(result) => result,
+        Err(_) => Err(sign_in_timeout(SIGN_IN_TIMEOUT)),
+    }
+}
+
+/// The error a browser sign-in that outlasts its wait produces.
+fn sign_in_timeout(timeout: Duration) -> anyhow::Error {
+    anyhow!("the browser sign-in did not finish within {timeout:?}; run the command again to retry")
+}
+
+/// The finish command one browser callback sends.
+///
+/// The raw path the browser requested rides with the code and state: the Space
+/// compares it with the issuer-keyed redirect it registered, so a callback
+/// delivered to another path cannot finish this sign-in. A callback that
+/// returned no code finishes nothing, and has no command to send.
+fn sign_in_finish_command(
+    sign_in: Id,
+    callback: &Callback,
+    path: Option<&str>,
+) -> Option<CommandCall> {
+    let Callback::Code { code, state, iss } = callback else {
+        return None;
+    };
+    Some(CommandCall::McpSignInFinish {
+        sign_in,
+        code: code.clone(),
+        state: state.clone(),
+        iss: iss.clone(),
+        path: path.map(str::to_owned),
+    })
+}
+
+/// Hands one browser callback to the Space and waits for the sign-in to end.
+///
+/// The finish command is the token exchange: the Space answers like a poll once
+/// it sealed the credential. A `pending` answer is polled until the Space
+/// settles it; every ask and every pause shares the sign-in's deadline. The
+/// authorization server's own words never reach any answer: a refused callback
+/// is one fixed failure sentence.
+async fn finish_sign_in(
+    credential: &Credential,
+    deadline: tokio::time::Instant,
+    sign_in: Id,
+    callback: &SignInCallback,
+) -> Result<SignInState> {
+    let Some(command) = sign_in_finish_command(sign_in, callback.callback(), callback.path())
+    else {
+        return Ok(SignInState::Failed {
+            reason: "the authorization server refused the sign-in".to_owned(),
+        });
+    };
+    let answered = sign_in_command(credential, deadline, command).await?;
+    match sign_in_state(&answered)? {
+        // The finish answers like a poll; should the Space hand the exchange
+        // to its own work, keep asking until it ends.
+        SignInState::Pending => {
+            poll_sign_in(sign_in, deadline, SIGN_IN_POLL, |sign_in| {
+                client::command(credential, CommandCall::McpSignInStatus { sign_in })
+            })
+            .await
+        }
+        ended => Ok(ended),
+    }
+}
+
+/// Answers the browser's last page from how the sign-in ended.
+///
+/// Success is shown only once the Space answered that the sign-in finished: the
+/// page never claims a credential the Space has not registered, and every error
+/// shows the fixed failure page. A finished sign-in the Space reports as not
+/// connected still registered the credential; that reachability report is the
+/// command line's to print, not a sign-in that did not finish. A browser that
+/// left early loses its page; its answer changes no command's output.
+async fn answer_sign_in_page(callback: SignInCallback, ended: &Result<SignInState>) {
+    let finished = matches!(ended, Ok(SignInState::Finished { .. }));
+    let _ = callback.answer(finished).await;
+}
+
+/// The lines a browser sign-in prints once it ends.
+///
+/// A finished sign-in the Space reports as not connected prints the two lines
+/// `neha mcp add` prints for a server it registered but could not reach. A
+/// failed sign-in is the command's error: the Space's reason, escaped to one
+/// line so the authorization server's text cannot rewrite the terminal.
+fn sign_in_lines(ended: SignInState, name: &str, url: &str, scope: &str) -> Result<Vec<String>> {
+    match ended {
+        SignInState::Pending => bail!("the browser sign-in has not finished"),
+        SignInState::Failed { reason } => bail!("the sign-in failed: {}", escape_text(&reason)),
+        SignInState::Finished {
+            connected: true, ..
+        } => Ok(vec![format!("Connected MCP server {name}.")]),
+        SignInState::Finished {
+            server,
+            connected: false,
+        } => Ok(vec![
+            format!("Added MCP server {server} ({name}) at {url}."),
+            format!("  scope: {scope}; not connected"),
+        ]),
+    }
+}
+
+/// Starts a browser sign-in and waits for its loopback receiver to end it.
+///
+/// The command opens the address the Space answers with and does not wait for
+/// the browser. The browser comes back to this command's receiver instead of
+/// the Space, so the code and state the redirect carries are handed to the
+/// Space with the raw callback path the browser requested: the Space compares
+/// that path with the issuer-keyed redirect it registered, exchanges the code
+/// for the credential, and answers like a poll. The browser's page is written
+/// only after that answer, so it reports success only when the Space registered
+/// the credential. Every step shares the sign-in's one deadline.
+async fn mcp_sign_in(
+    credential: &Credential,
+    deadline: tokio::time::Instant,
+    start: McpSignInStart,
+    name: &str,
+    url: &str,
+    scope: McpScope,
+    receiver: SignInReceiver,
+) -> Result<()> {
+    let started = sign_in_command(credential, deadline, CommandCall::McpSignInStart(start)).await?;
+    let sign_in = id_of(&started, "sign_in")?;
+    let address = text_of(&started, "url")?;
+    if open_browser(address) {
+        println!("Opening the browser to sign in.");
+    } else {
+        println!("Could not open a browser; open this address in your browser:");
+        println!("{address}");
+    }
+    let callback = receiver.receive(deadline).await?;
+    let outcome = finish_sign_in(credential, deadline, sign_in, &callback).await;
+    // The page reports what the Space answered, and is written only now: it
+    // cannot claim success before the Space registered the credential. An error
+    // is still the command's to report after the page is written.
+    answer_sign_in_page(callback, &outcome).await;
+    let ended = outcome?;
+    let scope = mcp_scope_text(scope, Some(credential.account.id));
+    for line in sign_in_lines(ended, name, url, &scope)? {
+        println!("{line}");
+    }
+
+    Ok(())
+}
+
+/// The largest `SKILL.md` a skill directory carries: its frontmatter and its
+/// body. The Space holds the body to its own limit; this bound refuses a stray
+/// file before its bytes are read.
+const MAX_SKILL_DOCUMENT_BYTES: u64 = 256 * 1024;
+/// The largest script a skill directory carries. The Space refuses the same
+/// size, so the CLI reports it before it uploads.
+const MAX_SKILL_SCRIPT_BYTES: u64 = 64 * 1024;
+/// The most scripts a skill directory carries. The Space refuses the same
+/// count, so the CLI reports it before it uploads.
+const MAX_SKILL_SCRIPTS: usize = 16;
+
+/// Reads a skill's directory: its `SKILL.md`, and every file directly in its
+/// `scripts/` folder.
+///
+/// Nothing here follows a symlink. A link at any level — the directory itself,
+/// `SKILL.md`, `scripts/`, or an entry in it — could carry a file the user
+/// never picked, so every level must be the real thing.
+///
+/// On Unix the directory is opened once, and every member is opened relative
+/// to that descriptor through `/proc/self/fd/<dir_fd>/<name>`. The metadata
+/// that authorizes a read is the opened handle's own metadata, and the bytes
+/// come from that same handle, so replacing a path between the check and the
+/// read cannot redirect the upload. Every read is bounded on the stream, so a
+/// file that grows after its metadata is taken is still refused.
+#[cfg(unix)]
+fn read_skill_directory(path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
+    let directory = open_skill_directory(path)?;
+    Ok((
+        read_skill_document(&directory, path)?,
+        read_skill_scripts(&directory, path)?,
+    ))
+}
+
+/// A platform with no directory descriptor to read through refuses the
+/// import instead of checking a pathname and later reopening it.
+///
+/// The Unix path above opens the directory once and reads every member through
+/// its descriptor, so the metadata that authorizes a read and the bytes read
+/// are the same object. This build has no such handle elsewhere, so it fails
+/// closed rather than upload whatever a racing writer put at the path.
+#[cfg(not(unix))]
+fn read_skill_directory(_path: &std::path::Path) -> Result<(String, Vec<SkillAddScript>)> {
+    bail!("adding a skill from a directory needs a Unix platform yet")
+}
+
+/// The path of an opened descriptor. It names the object the descriptor holds,
+/// whatever happens to the pathname it was opened from.
+#[cfg(unix)]
+fn descriptor_path(file: &std::fs::File) -> std::path::PathBuf {
+    use std::os::fd::AsRawFd as _;
+
+    std::path::PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// The path of one member of an opened directory, resolved through the
+/// directory's descriptor rather than through its pathname.
+#[cfg(unix)]
+fn descriptor_member_path(directory: &std::fs::File, name: &std::ffi::OsStr) -> std::path::PathBuf {
+    descriptor_path(directory).join(name)
+}
+
+/// Opens one member of an opened directory with `flags`, never following a
+/// final symlink. The caller checks and reads the returned handle, so a
+/// replacement after the check cannot change what is read.
+#[cfg(unix)]
+fn open_directory_member(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    flags: libc::c_int,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(flags)
+        .open(descriptor_member_path(directory, name))
+}
+
+/// Returns whether the pathname itself is a symlink, without following it.
+/// A final symlink opened with `O_DIRECTORY | O_NOFOLLOW` is reported as
+/// `ENOTDIR` on Linux, so this only picks the message of a refusal that already
+/// happened; nothing is read through it.
+#[cfg(unix)]
+fn is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+}
+
+/// Opens the skill directory itself as a directory, never a symlink to one.
+/// It is the descriptor every member below is opened through.
+#[cfg(unix)]
+fn open_skill_directory(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(directory) => Ok(directory),
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ELOOP) => bail!("{} is a symlink, which is not followed", path.display()),
+            Some(libc::ENOTDIR) if is_symlink(path) => {
+                bail!("{} is a symlink, which is not followed", path.display())
+            }
+            Some(libc::ENOTDIR | libc::ENOENT) => {
+                bail!("{} is not a directory", path.display())
+            }
+            _ => Err(error).with_context(|| format!("{} cannot be read", path.display())),
+        },
+    }
+}
+
+/// Reads the skill's `SKILL.md` through the skill directory's descriptor: one
+/// regular file, checked and bounded on the same opened handle that is read.
+#[cfg(unix)]
+fn read_skill_document(directory: &std::fs::File, path: &std::path::Path) -> Result<String> {
+    let document = path.join("SKILL.md");
+    let mut skill_file = match open_directory_member(
+        directory,
+        std::ffi::OsStr::new("SKILL.md"),
+        libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+    ) {
+        Ok(file) => file,
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ENOENT) => bail!("{} has no SKILL.md", path.display()),
+            Some(libc::ELOOP) => {
+                bail!("{} is a symlink, which is not followed", document.display())
+            }
+            // A directory, or a socket that cannot be opened, is not a file.
+            Some(libc::EISDIR | libc::ENXIO) => {
+                bail!("{} is not a regular file", document.display())
+            }
+            _ => {
+                return Err(error)
+                    .with_context(|| format!("{} cannot be read", document.display()));
+            }
+        },
+    };
+    let metadata = skill_file
+        .metadata()
+        .with_context(|| format!("{} cannot be read", document.display()))?;
+    if !metadata.is_file() {
+        bail!("{} is not a regular file", document.display());
+    }
+    if metadata.len() > MAX_SKILL_DOCUMENT_BYTES {
+        bail!(
+            "{} is {} bytes; a skill document is at most {MAX_SKILL_DOCUMENT_BYTES} bytes",
+            document.display(),
+            metadata.len()
+        );
+    }
+    let Some(bytes) = read_within_limit(&mut skill_file, MAX_SKILL_DOCUMENT_BYTES)
+        .with_context(|| format!("{} cannot be read", document.display()))?
+    else {
+        bail!(
+            "{} holds more than {MAX_SKILL_DOCUMENT_BYTES} bytes; a skill document is at most \
+             {MAX_SKILL_DOCUMENT_BYTES} bytes",
+            document.display()
+        );
+    };
+    String::from_utf8(bytes).with_context(|| format!("{} is not readable text", document.display()))
+}
+
+/// Reads every file directly in the skill's `scripts/` folder, bounded the way
+/// the Space bounds them.
+///
+/// A `scripts/` that is absent carries no scripts; one that is a symlink, or is
+/// not a directory, is refused. Every entry is opened relative to the
+/// `scripts/` descriptor and checked by its opened handle: a folder is not a
+/// script, a symlink and a special file are refused, and a regular file's bytes
+/// are read from the handle that was checked.
+#[cfg(unix)]
+fn read_skill_scripts(
+    directory: &std::fs::File,
+    path: &std::path::Path,
+) -> Result<Vec<SkillAddScript>> {
+    let scripts_dir = path.join("scripts");
+    let Some(scripts) = open_scripts_directory(directory, &scripts_dir)? else {
+        return Ok(Vec::new());
+    };
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(descriptor_path(&scripts))
+        .with_context(|| format!("{} cannot be read", scripts_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("{} cannot be read", scripts_dir.display()))?;
+        names.push(entry.file_name());
+    }
+    names.sort();
+    // Open every entry first: the opened handle's metadata decides what is a
+    // script and what is refused, and the handles that pass are the ones read
+    // below. No script's bytes are read until the count is within the limit.
+    let mut opened: Vec<(std::ffi::OsString, std::fs::File, std::fs::Metadata)> = Vec::new();
+    for name in names {
+        let shown = scripts_dir.join(&name);
+        let file = match open_directory_member(
+            &scripts,
+            &name,
+            libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        ) {
+            Ok(file) => file,
+            Err(error) => match error.raw_os_error() {
+                // The entry vanished between the listing and the open.
+                Some(libc::ENOENT) => continue,
+                Some(libc::ELOOP) => {
+                    bail!("{} is a symlink, which is not followed", shown.display())
+                }
+                // A folder in `scripts/` is not a script, as it has never been one.
+                Some(libc::EISDIR) => continue,
+                // A socket cannot be opened, and is not a regular file.
+                Some(libc::ENXIO) => bail!("{} is not a regular file", shown.display()),
+                _ => {
+                    return Err(error)
+                        .with_context(|| format!("{} cannot be read", shown.display()));
+                }
+            },
+        };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("{} cannot be read", shown.display()))?;
+        // A directory does not open through `O_NOFOLLOW` on every platform, so
+        // the opened handle may be the first thing to say it is a folder.
+        if metadata.is_dir() {
+            continue;
+        }
+        if !metadata.is_file() {
+            bail!("{} is not a regular file", shown.display());
+        }
+        opened.push((name, file, metadata));
+        if opened.len() > MAX_SKILL_SCRIPTS {
+            bail!("a skill carries at most {MAX_SKILL_SCRIPTS} scripts");
+        }
+    }
+    let mut scripts = Vec::with_capacity(opened.len());
+    for (name, mut file, metadata) in opened {
+        let shown = scripts_dir.join(&name);
+        if metadata.len() > MAX_SKILL_SCRIPT_BYTES {
+            bail!(
+                "{} is {} bytes; a script is at most {MAX_SKILL_SCRIPT_BYTES} bytes",
+                shown.display(),
+                metadata.len()
+            );
+        }
+        let Some(bytes) = read_within_limit(&mut file, MAX_SKILL_SCRIPT_BYTES)
+            .with_context(|| format!("{} cannot be read", shown.display()))?
+        else {
+            bail!(
+                "{} holds more than {MAX_SKILL_SCRIPT_BYTES} bytes; a script is at most \
+                 {MAX_SKILL_SCRIPT_BYTES} bytes",
+                shown.display()
+            );
+        };
+        let content = String::from_utf8(bytes)
+            .with_context(|| format!("{} is not readable text", shown.display()))?;
+        let name = name
+            .to_str()
+            .context("a script name is not text")?
+            .to_owned();
+        scripts.push(SkillAddScript { name, content });
+    }
+    Ok(scripts)
+}
+
+/// Opens the skill's `scripts/` folder relative to the skill directory.
+/// `None` means there is no `scripts/` entry; a symlink there, or anything else
+/// that is not a directory, is refused.
+#[cfg(unix)]
+fn open_scripts_directory(
+    directory: &std::fs::File,
+    shown: &std::path::Path,
+) -> Result<Option<std::fs::File>> {
+    let name = std::ffi::OsStr::new("scripts");
+    match open_directory_member(
+        directory,
+        name,
+        libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    ) {
+        Ok(scripts) => Ok(Some(scripts)),
+        Err(error) => match error.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => bail!("{} is a symlink, which is not followed", shown.display()),
+            Some(libc::ENOTDIR) if is_symlink(&descriptor_member_path(directory, name)) => {
+                bail!("{} is a symlink, which is not followed", shown.display())
+            }
+            Some(libc::ENOTDIR) => bail!("{} is not a directory", shown.display()),
+            _ => Err(error).with_context(|| format!("{} cannot be read", shown.display())),
+        },
+    }
+}
+
+/// Reads at most `limit` bytes from an opened file.
+///
+/// `None` means the file held more than `limit` bytes: its bytes are refused
+/// rather than truncated or uploaded. The bound applies to the stream, not only
+/// to the size the metadata reported before the read, so a file that grows
+/// after that snapshot cannot grow past the limit.
+#[cfg(unix)]
+fn read_within_limit(file: &mut std::fs::File, limit: u64) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+
+    let mut bytes = Vec::new();
+    let mut bounded = std::io::Read::take(file, limit + 1);
+    bounded.read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= limit).then_some(bytes))
+}
+
+/// One row per skill: skill, library, name, and what it does.
+fn skill_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no skills in the answer")?
+        .iter()
+        .map(skill_row)
+        .collect()
+}
+
+/// Formats one skill as a single line.
+fn skill_row(skill: &Value) -> Result<String> {
+    let library = match skill.get("library").and_then(Value::as_str) {
+        Some("bot") => skill
+            .get("bot")
+            .and_then(Value::as_str)
+            .map_or_else(|| "bot".to_owned(), |bot| format!("bot {bot}")),
+        _ => "space".to_owned(),
+    };
+    let scripts = skill
+        .get("scripts")
+        .and_then(Value::as_array)
+        .map_or(0, std::vec::Vec::len);
+    Ok(format!(
+        "{}  {library}  {}  {} script(s)  {}",
+        entity_id(skill, &["id", "skill"])?,
+        skill
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        scripts,
+        skill
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    ))
+}
+
+/// One row per MCP server: server, name, scope, who connected it, how the
+/// Space reaches it, and connection state.
+fn mcp_rows(list: &Value) -> Result<Vec<String>> {
+    list.as_array()
+        .context("no MCP servers in the answer")?
+        .iter()
+        .map(mcp_row)
+        .collect()
+}
+
+/// Formats one MCP server as a single line.
+fn mcp_row(server: &Value) -> Result<String> {
+    Ok(format!(
+        "{}  {}  {}  by {}  {}  {}",
+        id_of(server, "server")?,
+        server
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        mcp_scope_label(server),
+        server.get("by").and_then(Value::as_str).unwrap_or("-"),
+        mcp_reach_label(server),
+        mcp_connection_label(server)
+    ))
+}
+
+/// The way one MCP server view is reached: an HTTP server's address, or a
+/// stdio server's transport and command line.
+///
+/// Every field the package supplies is escaped: a command, an argument, or an
+/// address may hold a newline or a terminal escape, and the row must stay one
+/// line the reader's terminal cannot rewrite.
+fn mcp_reach_label(server: &Value) -> String {
+    if server.get("transport").and_then(Value::as_str) != Some("stdio") {
+        return escape_text(
+            server
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+    }
+    let mut line = String::from("stdio");
+    if let Some(command) = server.get("command").and_then(Value::as_str) {
+        line.push(' ');
+        line.push_str(&escape_text(command));
+    }
+    if let Some(arguments) = server.get("args").and_then(Value::as_array) {
+        for argument in arguments.iter().filter_map(Value::as_str) {
+            line.push(' ');
+            line.push_str(&escape_text(argument));
+        }
+    }
+    line
+}
+
+/// The scope of one MCP server view: the Space, or the User who connected it.
+fn mcp_scope_label(server: &Value) -> String {
+    let scope = match server.get("scope").and_then(Value::as_str) {
+        Some("user") => McpScope::User,
+        _ => McpScope::Space,
+    };
+    let user = server
+        .get("user")
+        .and_then(Value::as_str)
+        .and_then(|user| user.parse().ok());
+    mcp_scope_text(scope, user)
+}
+
+/// Names where one MCP server's credential belongs: the Space, or the User who
+/// connected it.
+fn mcp_scope_text(scope: McpScope, user: Option<Id>) -> String {
+    match (scope, user) {
+        (McpScope::User, Some(user)) => format!("user {user}"),
+        (McpScope::User, None) => "user".to_owned(),
+        (McpScope::Space, _) => "space".to_owned(),
+    }
+}
+
+/// Whether one MCP server view says the Space reached the server.
+fn mcp_connection_label(server: &Value) -> &'static str {
+    if server
+        .get("connected")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        "connected"
+    } else {
+        "not connected"
+    }
+}
+
+/// Gives a Bot a skill, or takes one away.
+async fn bot_skill(command: BotSkillCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    let (bot, skill, enabled) = match command {
+        BotSkillCommand::Enable { bot, skill } => (bot, skill, true),
+        BotSkillCommand::Disable { bot, skill } => (bot, skill, false),
+    };
+    let call = if enabled {
+        CommandCall::BotSkillEnable { bot, skill }
+    } else {
+        CommandCall::BotSkillDisable { bot, skill }
+    };
+    let result = client::command(&credential, call).await?;
+    let name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("the skill");
+    if enabled {
+        println!("Bot {bot} may use skill {skill} ({name}).");
+    } else {
+        println!("Bot {bot} no longer uses skill {skill} ({name}).");
+    }
+
+    Ok(())
+}
+
+/// Gives a Bot an MCP server, or takes one away.
+async fn bot_mcp(command: BotMcpCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    let (bot, server, enabled) = match command {
+        BotMcpCommand::Enable { bot, server } => (bot, server, true),
+        BotMcpCommand::Disable { bot, server } => (bot, server, false),
+    };
+    let call = if enabled {
+        CommandCall::BotMcpEnable { bot, server }
+    } else {
+        CommandCall::BotMcpDisable { bot, server }
+    };
+    let result = client::command(&credential, call).await?;
+    let name = result
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("the server");
+    if enabled {
+        println!("Bot {bot} may use MCP server {server} ({name}).");
+    } else {
+        println!("Bot {bot} no longer uses MCP server {server} ({name}).");
     }
 
     Ok(())
@@ -2123,11 +3857,23 @@ fn rule_row(rule: &Value) -> Result<String> {
     if let Some(prefix) = rule["path_prefix"].as_str() {
         row.push_str(&format!("  path-prefix {prefix}"));
     }
+    if let Some(server) = rule["server"].as_str() {
+        let shown = rule["server_name"].as_str().unwrap_or(server);
+        row.push_str(&format!("  server {shown}"));
+    }
+    if let Some(script) = rule["script"].as_str() {
+        let skill = rule["skill_name"]
+            .as_str()
+            .or_else(|| rule["skill"].as_str())
+            .unwrap_or_default();
+        row.push_str(&format!("  skill {skill}  script {script}"));
+    }
 
     Ok(row)
 }
 
 /// The line that reports one added rule.
+#[allow(clippy::too_many_arguments)]
 fn rule_add_line(
     rule: Id,
     bot: Id,
@@ -2135,6 +3881,9 @@ fn rule_add_line(
     tool: &str,
     command_prefix: Option<&str>,
     path_prefix: Option<&str>,
+    skill: Option<&str>,
+    script: Option<&str>,
+    server: Option<&str>,
 ) -> String {
     let mut line = format!("Added rule {rule} for Bot {bot}: {effect} {tool}");
     if let Some(prefix) = command_prefix {
@@ -2142,6 +3891,12 @@ fn rule_add_line(
     }
     if let Some(prefix) = path_prefix {
         line.push_str(&format!(" (path-prefix {prefix:?})"));
+    }
+    if let (Some(skill), Some(script)) = (skill, script) {
+        line.push_str(&format!(" (skill {skill:?}, script {script:?})"));
+    }
+    if let Some(server) = server {
+        line.push_str(&format!(" (server {server:?})"));
     }
 
     line
@@ -2151,6 +3906,7 @@ fn rule_add_line(
 ///
 /// The Space normalizes a prefix before it records the rule; printing what the
 /// Space returned shows the rule that actually exists, not the text typed.
+#[allow(clippy::too_many_arguments)]
 fn rule_add_report(
     result: &Value,
     bot: Id,
@@ -2158,6 +3914,9 @@ fn rule_add_report(
     tool: &str,
     command_prefix: Option<&str>,
     path_prefix: Option<&str>,
+    skill: Option<&str>,
+    script: Option<&str>,
+    server: Option<&str>,
 ) -> Result<String> {
     let rule = entity_id(result, &["rule", "id"])?;
     let command_prefix = result.get("command_prefix").map_or_else(
@@ -2169,6 +3928,10 @@ fn rule_add_report(
         |value| value.as_str().map(str::to_owned),
     );
 
+    // The answer names the server when the rule was about one; the typed
+    // name is the fallback for an answer that predates the field.
+    let server = result.get("server_name").and_then(Value::as_str).or(server);
+
     Ok(rule_add_line(
         rule,
         bot,
@@ -2176,6 +3939,9 @@ fn rule_add_report(
         tool,
         command_prefix.as_deref(),
         path_prefix.as_deref(),
+        skill,
+        script,
+        server,
     ))
 }
 
@@ -2188,13 +3954,41 @@ fn validate_rule_arguments(
     tool: &str,
     command_prefix: Option<&str>,
     path_prefix: Option<&str>,
+    skill: Option<&str>,
+    script: Option<&str>,
+    server: Option<&str>,
 ) -> Result<()> {
     if command_prefix.is_some() && path_prefix.is_some() {
         bail!("pass at most one of --command-prefix and --path-prefix");
     }
+    if let Some(server) = server {
+        // A server's tool rule names the server and the tool and carries no
+        // prefix, so a prefix with --server can only ever match nothing.
+        if command_prefix.is_some() || path_prefix.is_some() {
+            bail!("--server names a server's tool and takes no --command-prefix or --path-prefix");
+        }
+        if server.trim().is_empty() {
+            bail!("--server must not be empty");
+        }
+    }
     let tool = tool.trim();
     if tool.is_empty() {
         bail!("--tool must not be empty");
+    }
+    let script_rule = skill.is_some() || script.is_some();
+    if script_rule && tool != "run_skill_script" {
+        bail!("--skill and --script match a skill's script; {tool} is not run_skill_script");
+    }
+    // A server's tool may be named anything, a built-in spelling included;
+    // the server's id tells it from the built-in.
+    if server.is_none() && tool == "run_skill_script" && !script_rule {
+        bail!("--tool run_skill_script needs --skill and --script");
+    }
+    if server.is_some() && script_rule {
+        bail!("a server rule names a server's tool, not a skill's script");
+    }
+    if script_rule && (command_prefix.is_some() || path_prefix.is_some()) {
+        bail!("--skill and --script take no command or path prefix");
     }
     if let Some(prefix) = command_prefix {
         if tool != "shell" {
@@ -2331,7 +4125,11 @@ impl ApprovalCard {
     /// possible; the User never grants a lasting rule without seeing its
     /// reach.
     fn always_scope(&self) -> Option<String> {
-        if self.reason != "rule" && self.reason != "grant" {
+        if self.reason != "rule"
+            && self.reason != "grant"
+            && self.reason != "first_script_run"
+            && self.reason != "first_mcp_call"
+        {
             return None;
         }
 
@@ -2374,6 +4172,10 @@ impl ApprovalCard {
             "a rule you set".to_owned()
         } else if self.reason == "grant" {
             "a folder you have not granted".to_owned()
+        } else if self.reason == "first_script_run" {
+            "the first run of a skill's script".to_owned()
+        } else if self.reason == "first_mcp_call" {
+            "the first call of an MCP server's tool".to_owned()
         } else {
             self.reason.clone()
         }
@@ -2693,6 +4495,41 @@ fn computer_kind_label(kind: &str) -> &str {
     }
 }
 
+/// The credential an `mcp add` sends, which only the environment carries.
+///
+/// A credential argument would outlive the command in a shell history and a
+/// process listing, so `NEHA_MCP_TOKEN` is its only source. Absent, the command
+/// opens a browser sign-in for the credential instead; an attach without an
+/// address asks for the token on the terminal, because a stdio server has no
+/// address to sign in to.
+fn mcp_credential() -> Option<String> {
+    std::env::var("NEHA_MCP_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+}
+
+/// The MCP credential an `mcp add` attach asks for when the environment
+/// carries none.
+///
+/// Attaching the Space's credential to a package's stdio server has no address
+/// to sign in to, so the command prompts for the token. A non-interactive run
+/// must set `NEHA_MCP_TOKEN`: a prompt would read nothing and block.
+fn read_mcp_credential() -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "attaching the Space's MCP credential needs NEHA_MCP_TOKEN when stdin is not a \
+             terminal"
+        );
+    }
+    let token = rpassword::prompt_password("MCP access token: ")
+        .context("cannot read the MCP credential")?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        bail!("an MCP server's credential is not empty");
+    }
+    Ok(token)
+}
+
 fn provider_key() -> Result<String> {
     if let Ok(key) = std::env::var("NEHA_PROVIDER_KEY")
         && !key.trim().is_empty()
@@ -2731,11 +4568,23 @@ fn text_of<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt as _, StreamExt as _};
     use neha::id::Id;
+    use neha::record::McpScope;
+    use neha::surface::{
+        ClientFrame, CommandCall, McpAdd, McpSignInStart, PROTOCOL_VERSION, ServerFrame,
+    };
     use serde_json::json;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use crate::client::{Credential, SignedIn};
 
     use super::{space_file_name, write_run};
 
+    use clap::CommandFactory as _;
     use clap::Parser as _;
 
     use super::{
@@ -2745,9 +4594,21 @@ mod tests {
 
     use super::{
         ApprovalCard, ApprovalCommand, Decision, LastingScope, RuleCommand, RuleEffectChoice,
-        approval_row, decision_from_input, decision_line, escape_text, read_decision,
-        rule_add_line, rule_add_report, rule_rows, validate_rule_arguments, waiting_advice,
-        write_approval_details,
+        approval_row, decision_from_input, decision_line, escape_text, mcp_row, mcp_rows,
+        read_decision, rule_add_line, rule_add_report, rule_rows, validate_rule_arguments,
+        waiting_advice, write_approval_details,
+    };
+
+    use super::{
+        BotMcpCommand, BotSkillCommand, CleanupStyle, McpCommand, SkillCommand, cleanup_notice,
+        mcp_remove_lines, plugin_rows, read_skill_directory,
+    };
+
+    use super::{
+        Callback, CallbackRequest, McpAddPlan, SIGN_IN_TIMEOUT, SignInReceiver, SignInState,
+        answer_sign_in_page, callback_of, existing_server, finish_sign_in, mcp_add_plan,
+        mcp_scope_text, mcp_sign_in_start, poll_sign_in, sign_in_command, sign_in_finish_command,
+        sign_in_lines, sign_in_state,
     };
 
     use super::{
@@ -3175,6 +5036,497 @@ mod tests {
     }
 
     #[test]
+    fn the_skill_commands_parse() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        let skill = Id::new();
+        let skill_text = skill.to_string();
+
+        match parse(&["skill", "add", "/tmp/skills/weekly"]) {
+            Top::Skill {
+                command: SkillCommand::Add { path, bot: None },
+            } => assert_eq!(path, std::path::Path::new("/tmp/skills/weekly")),
+            _ => panic!("skill add did not parse"),
+        }
+        match parse(&[
+            "skill",
+            "add",
+            "/tmp/skills/weekly",
+            "--bot",
+            bot_text.as_str(),
+        ]) {
+            Top::Skill {
+                command:
+                    SkillCommand::Add {
+                        bot: Some(shown), ..
+                    },
+            } => assert_eq!(shown, bot),
+            _ => panic!("skill add --bot did not parse"),
+        }
+        match parse(&["skill", "list"]) {
+            Top::Skill {
+                command: SkillCommand::List { bot: None },
+            } => {}
+            _ => panic!("skill list did not parse"),
+        }
+        match parse(&["skill", "remove", skill_text.as_str()]) {
+            Top::Skill {
+                command: SkillCommand::Remove { skill: shown },
+            } => assert_eq!(shown, skill),
+            _ => panic!("skill remove did not parse"),
+        }
+        match parse(&[
+            "bot",
+            "skill",
+            "enable",
+            bot_text.as_str(),
+            skill_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Skill {
+                        command:
+                            BotSkillCommand::Enable {
+                                bot: shown_bot,
+                                skill: shown_skill,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_skill, skill);
+            }
+            _ => panic!("bot skill enable did not parse"),
+        }
+        match parse(&[
+            "bot",
+            "skill",
+            "disable",
+            bot_text.as_str(),
+            skill_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Skill {
+                        command:
+                            BotSkillCommand::Disable {
+                                bot: shown_bot,
+                                skill: shown_skill,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_skill, skill);
+            }
+            _ => panic!("bot skill disable did not parse"),
+        }
+        assert!(Cli::try_parse_from(["neha", "skill", "add"]).is_err());
+        assert!(Cli::try_parse_from(["neha", "bot", "skill", "enable"]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_mcp_commands_parse() {
+        match parse(&["mcp", "add", "weather", "https://mcp.example.com/mcp"]) {
+            Top::Mcp {
+                command: McpCommand::Add { name, url, scope },
+            } => {
+                assert_eq!(name, "weather");
+                assert_eq!(url.as_deref(), Some("https://mcp.example.com/mcp"));
+                assert_eq!(scope.unwrap_or(McpScope::Space), McpScope::Space);
+            }
+            _ => panic!("mcp add did not parse"),
+        }
+        // The address is optional: an omitted one names an existing stdio
+        // server the Admin attaches the Space's credential to.
+        match parse(&["mcp", "add", "weather"]) {
+            Top::Mcp {
+                command: McpCommand::Add { name, url, .. },
+            } => {
+                assert_eq!(name, "weather");
+                assert_eq!(url, None);
+            }
+            _ => panic!("mcp add without an address did not parse"),
+        }
+        match parse(&[
+            "mcp",
+            "add",
+            "weather",
+            "https://mcp.example.com/mcp",
+            "--scope",
+            "user",
+        ]) {
+            Top::Mcp {
+                command: McpCommand::Add { scope, .. },
+            } => assert_eq!(scope, Some(McpScope::User)),
+            _ => panic!("mcp add --scope user did not parse"),
+        }
+        assert!(matches!(
+            parse(&["mcp", "list"]),
+            Top::Mcp {
+                command: McpCommand::List
+            }
+        ));
+        let server = Id::new();
+        let server_text = server.to_string();
+        match parse(&["mcp", "remove", server_text.as_str()]) {
+            Top::Mcp {
+                command: McpCommand::Remove { server: shown },
+            } => assert_eq!(shown, server),
+            _ => panic!("mcp remove did not parse"),
+        }
+        for line in [
+            vec!["mcp", "remove"],
+            vec![
+                "mcp",
+                "add",
+                "weather",
+                "https://mcp.example.com/mcp",
+                "--scope",
+                "space",
+            ],
+        ] {
+            let refused = Cli::try_parse_from(std::iter::once("neha").chain(line.iter().copied()));
+            assert!(refused.is_err(), "{line:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn the_bot_mcp_commands_parse() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        let server = Id::new();
+        let server_text = server.to_string();
+        match parse(&[
+            "bot",
+            "mcp",
+            "enable",
+            bot_text.as_str(),
+            server_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Mcp {
+                        command:
+                            BotMcpCommand::Enable {
+                                bot: shown_bot,
+                                server: shown_server,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_server, server);
+            }
+            _ => panic!("bot mcp enable did not parse"),
+        }
+        match parse(&[
+            "bot",
+            "mcp",
+            "disable",
+            bot_text.as_str(),
+            server_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Mcp {
+                        command:
+                            BotMcpCommand::Disable {
+                                bot: shown_bot,
+                                server: shown_server,
+                            },
+                    },
+            } => {
+                assert_eq!(shown_bot, bot);
+                assert_eq!(shown_server, server);
+            }
+            _ => panic!("bot mcp disable did not parse"),
+        }
+        assert!(Cli::try_parse_from(["neha", "bot", "mcp", "enable"]).is_err());
+    }
+
+    #[test]
+    fn a_skill_directory_reads_its_document_and_scripts() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+        )
+        .unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        std::fs::write(
+            directory.path().join("scripts").join("hello.sh"),
+            "printf hi",
+        )
+        .unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "not a script").unwrap();
+        let (document, scripts) = read_skill_directory(directory.path()).unwrap();
+        assert!(document.contains("name: hello"));
+        assert_eq!(scripts.len(), 1, "only scripts/ holds scripts: {scripts:?}");
+        assert_eq!(scripts[0].name, "hello.sh");
+        assert_eq!(scripts[0].content, "printf hi");
+
+        // A directory without SKILL.md is not a skill.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(read_skill_directory(empty.path()).is_err());
+        assert!(read_skill_directory(&directory.path().join("missing")).is_err());
+    }
+
+    /// A platform without directory descriptors refuses a directory import
+    /// instead of uploading whatever a racing writer put at a path.
+    #[cfg(not(unix))]
+    #[test]
+    fn a_skill_directory_import_is_refused_off_unix() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+        )
+        .unwrap();
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("Unix platform"), "{error}");
+    }
+
+    /// A skill directory with a `SKILL.md` and one script in `scripts/`.
+    #[cfg(unix)]
+    fn skill_directory() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "---\nname: hello\ndescription: Say hello.\n---\nRun it.",
+        )
+        .unwrap();
+        std::fs::create_dir(directory.path().join("scripts")).unwrap();
+        std::fs::write(
+            directory.path().join("scripts").join("hello.sh"),
+            "printf hi",
+        )
+        .unwrap();
+        directory
+    }
+
+    /// A skill directory that is itself a symlink is refused: the link could
+    /// name a folder the user never picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_skill_directory_is_refused() {
+        let real = skill_directory();
+        let holder = tempfile::tempdir().unwrap();
+        let link = holder.path().join("skill");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let error = read_skill_directory(&link).unwrap_err().to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A `SKILL.md` that is a symlink is refused, so a skill cannot carry a
+    /// document that lives outside the directory the user picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_skill_document_is_refused() {
+        let directory = skill_directory();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("elsewhere.md"),
+            "---\nname: away\ndescription: Not picked.\n---\n",
+        )
+        .unwrap();
+        std::fs::remove_file(directory.path().join("SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("elsewhere.md"),
+            directory.path().join("SKILL.md"),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A `scripts/` that is a symlink is refused, so a skill cannot carry
+    /// scripts that live outside the directory the user picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_scripts_folder_is_refused() {
+        let directory = skill_directory();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("away.sh"), "printf away").unwrap();
+        std::fs::remove_dir_all(directory.path().join("scripts")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), directory.path().join("scripts")).unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A script that is a symlink is refused, whatever it points at.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlinked_script_is_refused() {
+        let directory = skill_directory();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("away.sh"), "printf away").unwrap();
+        std::fs::remove_file(directory.path().join("scripts").join("hello.sh")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("away.sh"),
+            directory.path().join("scripts").join("hello.sh"),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is a symlink"), "{error}");
+    }
+
+    /// A script that is not a regular file is refused: reading a FIFO can block
+    /// forever, and a socket or a device is not a file the user picked.
+    #[test]
+    #[cfg(unix)]
+    fn a_script_that_is_not_a_regular_file_is_refused() {
+        let directory = skill_directory();
+        let fifo = directory.path().join("scripts").join("pipe.sh");
+        let Ok(made) = std::process::Command::new("mkfifo").arg(&fifo).status() else {
+            return; // No mkfifo here, so the check is not exercised.
+        };
+        assert!(made.success(), "mkfifo did not make a FIFO");
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not a regular file"), "{error}");
+    }
+
+    /// A `SKILL.md` past the bound is refused before it is read, and the
+    /// message names the limit.
+    #[test]
+    #[cfg(unix)]
+    fn an_oversized_skill_document_is_refused() {
+        let directory = skill_directory();
+        std::fs::write(
+            directory.path().join("SKILL.md"),
+            "x".repeat(super::MAX_SKILL_DOCUMENT_BYTES as usize + 1),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "at most {} bytes",
+                super::MAX_SKILL_DOCUMENT_BYTES
+            )),
+            "{error}"
+        );
+    }
+
+    /// A script past the bound is refused before it is read, and the message
+    /// names the limit.
+    #[test]
+    #[cfg(unix)]
+    fn an_oversized_script_is_refused() {
+        let directory = skill_directory();
+        std::fs::write(
+            directory.path().join("scripts").join("hello.sh"),
+            "x".repeat(super::MAX_SKILL_SCRIPT_BYTES as usize + 1),
+        )
+        .unwrap();
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("at most {} bytes", super::MAX_SKILL_SCRIPT_BYTES)),
+            "{error}"
+        );
+    }
+
+    /// A file that holds more than the limit is refused by the read bound
+    /// itself, not only by the size the metadata reported before the read, so a
+    /// file that grows after that snapshot cannot be uploaded past the bound.
+    #[test]
+    #[cfg(unix)]
+    fn a_file_that_grows_past_the_limit_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let grown = directory.path().join("grown.sh");
+        std::fs::write(
+            &grown,
+            "x".repeat(super::MAX_SKILL_SCRIPT_BYTES as usize + 1),
+        )
+        .unwrap();
+        let mut file = std::fs::File::open(&grown).unwrap();
+        assert!(
+            super::read_within_limit(&mut file, super::MAX_SKILL_SCRIPT_BYTES)
+                .unwrap()
+                .is_none(),
+            "a file holding more than the limit is refused"
+        );
+
+        // A file exactly at the limit is still read whole.
+        let exact = directory.path().join("exact.sh");
+        std::fs::write(&exact, "x".repeat(super::MAX_SKILL_SCRIPT_BYTES as usize)).unwrap();
+        let mut file = std::fs::File::open(&exact).unwrap();
+        let bytes = super::read_within_limit(&mut file, super::MAX_SKILL_SCRIPT_BYTES)
+            .unwrap()
+            .expect("a file at the limit is read");
+        assert_eq!(bytes.len() as u64, super::MAX_SKILL_SCRIPT_BYTES);
+    }
+
+    /// More scripts than a skill carries is refused before any of them is read.
+    #[test]
+    #[cfg(unix)]
+    fn too_many_scripts_are_refused() {
+        let directory = skill_directory();
+        for index in 0..=super::MAX_SKILL_SCRIPTS {
+            std::fs::write(
+                directory
+                    .path()
+                    .join("scripts")
+                    .join(format!("script-{index:02}.sh")),
+                "printf hi",
+            )
+            .unwrap();
+        }
+
+        let error = read_skill_directory(directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!("at most {} scripts", super::MAX_SKILL_SCRIPTS)),
+            "{error}"
+        );
+    }
+
+    /// A skill with no `scripts/` folder, or one holding only folders, carries
+    /// no scripts.
+    #[test]
+    #[cfg(unix)]
+    fn a_skill_without_scripts_carries_none() {
+        let bare = skill_directory();
+        std::fs::remove_dir_all(bare.path().join("scripts")).unwrap();
+        let (_, scripts) = read_skill_directory(bare.path()).unwrap();
+        assert!(scripts.is_empty(), "{scripts:?}");
+
+        let folders = skill_directory();
+        std::fs::create_dir(folders.path().join("scripts").join("helpers")).unwrap();
+        std::fs::write(
+            folders
+                .path()
+                .join("scripts")
+                .join("helpers")
+                .join("helper.sh"),
+            "printf help",
+        )
+        .unwrap();
+        let (_, scripts) = read_skill_directory(folders.path()).unwrap();
+        assert_eq!(scripts.len(), 1, "only scripts/ holds scripts: {scripts:?}");
+        assert_eq!(scripts[0].name, "hello.sh");
+    }
+
+    #[test]
     fn the_rule_commands_parse() {
         let bot = Id::new();
         let bot_text = bot.to_string();
@@ -3204,6 +5556,9 @@ mod tests {
                         tool,
                         command_prefix,
                         path_prefix,
+                        skill,
+                        script,
+                        server,
                     },
             } => {
                 assert_eq!(shown, bot);
@@ -3211,8 +5566,30 @@ mod tests {
                 assert_eq!(tool, "shell");
                 assert_eq!(command_prefix.as_deref(), Some("git"));
                 assert_eq!(path_prefix, None);
+                assert_eq!((skill, script), (None, None));
+                assert_eq!(server, None);
             }
             _ => panic!("rule add did not parse"),
+        }
+        match parse(&[
+            "rule",
+            "add",
+            "--bot",
+            bot_text.as_str(),
+            "--effect",
+            "allow",
+            "--tool",
+            "get_weather",
+            "--server",
+            "weather",
+        ]) {
+            Top::Rule {
+                command: RuleCommand::Add { tool, server, .. },
+            } => {
+                assert_eq!(tool, "get_weather");
+                assert_eq!(server.as_deref(), Some("weather"));
+            }
+            _ => panic!("rule add --server did not parse"),
         }
         let rule = Id::new();
         let rule_text = rule.to_string();
@@ -3296,10 +5673,20 @@ mod tests {
 
     #[test]
     fn a_rule_prefix_is_checked_against_its_tool() {
-        validate_rule_arguments("shell", None, None).unwrap();
-        validate_rule_arguments("shell", Some("git"), None).unwrap();
-        validate_rule_arguments("read_file", None, Some("/home/ada")).unwrap();
-        validate_rule_arguments("write_file", None, Some(".")).unwrap();
+        validate_rule_arguments("shell", None, None, None, None, None).unwrap();
+        validate_rule_arguments("shell", Some("git"), None, None, None, None).unwrap();
+        validate_rule_arguments("read_file", None, Some("/home/ada"), None, None, None).unwrap();
+        validate_rule_arguments("write_file", None, Some("."), None, None, None).unwrap();
+        validate_rule_arguments("get_weather", None, None, None, None, Some("weather")).unwrap();
+        validate_rule_arguments(
+            "run_skill_script",
+            None,
+            None,
+            Some("weekly-report"),
+            Some("collect.sh"),
+            None,
+        )
+        .unwrap();
 
         for (tool, command_prefix, path_prefix, expected) in [
             ("shell", Some("git"), Some("/tmp"), "at most one"),
@@ -3310,10 +5697,55 @@ mod tests {
             ("read_file", None, Some(" "), "must not be empty"),
             ("   ", None, None, "--tool"),
         ] {
-            let error = validate_rule_arguments(tool, command_prefix, path_prefix)
-                .unwrap_err()
-                .to_string();
+            let error =
+                validate_rule_arguments(tool, command_prefix, path_prefix, None, None, None)
+                    .unwrap_err()
+                    .to_string();
             assert!(error.contains(expected), "{tool:?}: {error}");
+        }
+        for (tool, command_prefix, path_prefix, skill, script, expected) in [
+            (
+                "shell",
+                None,
+                None,
+                Some("weekly-report"),
+                Some("collect.sh"),
+                "not run_skill_script",
+            ),
+            ("run_skill_script", None, None, None, None, "needs --skill"),
+            (
+                "run_skill_script",
+                Some("git"),
+                None,
+                Some("weekly-report"),
+                Some("collect.sh"),
+                "no command or path prefix",
+            ),
+        ] {
+            let error =
+                validate_rule_arguments(tool, command_prefix, path_prefix, skill, script, None)
+                    .unwrap_err()
+                    .to_string();
+            assert!(error.contains(expected), "{tool:?}: {error}");
+        }
+        // A server's tool rule names the server and the tool and carries no
+        // prefix; a prefix can only ever match nothing, so it is refused here.
+        for (server, command_prefix, path_prefix, expected) in [
+            (Some("weather"), Some("git"), None, "no --command-prefix"),
+            (Some("weather"), None, Some("/tmp"), "no --command-prefix"),
+            (Some("  "), None, None, "must not be empty"),
+        ] {
+            let error = validate_rule_arguments(
+                "get_weather",
+                command_prefix,
+                path_prefix,
+                None,
+                None,
+                server,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected), "{server:?}: {error}");
         }
     }
 
@@ -3663,9 +6095,12 @@ mod tests {
 
     #[test]
     fn a_card_escapes_control_characters_and_keeps_long_commands() {
+        // A control character renders as its escaped form, and the escape
+        // character itself is escaped so a literal `\n` cannot pass for a
+        // newline.
         assert_eq!(
-            escape_text("a\nb\rc\td\u{001b}[31m"),
-            "a\\nb\\rc\\td\\u{001b}[31m"
+            escape_text("a\nb\rc\td\u{001b}[31m\\e\u{0007}f"),
+            "a\\nb\\rc\\td\\u{001b}[31m\\\\e\\u{0007}f"
         );
 
         let mut card = approval_card("shell", "rule");
@@ -3880,6 +6315,7 @@ mod tests {
         assert!(details.contains(&format!("  chat {chat}")), "{details}");
 
         let rule = Id::new();
+        let skill = Id::new();
         let list = json!([{
             "rule": rule,
             "bot": bot,
@@ -3892,13 +6328,48 @@ mod tests {
             rule_rows(&list).unwrap(),
             vec![format!("{rule}  {bot}  ask  shell  command-prefix git")]
         );
+        let script_rule = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "allow",
+            "tool": "run_skill_script",
+            "skill": skill,
+            "skill_name": "weekly-report",
+            "script": "collect.sh",
+        }]);
+        assert_eq!(
+            rule_rows(&script_rule).unwrap(),
+            vec![format!(
+                "{rule}  {bot}  allow  run_skill_script  skill weekly-report  script collect.sh"
+            )]
+        );
         assert_eq!(rule_rows(&json!([])).unwrap(), Vec::<String>::new());
         assert_eq!(
-            rule_add_line(rule, bot, "ask", "shell", Some("git"), None),
+            rule_add_line(
+                rule,
+                bot,
+                "ask",
+                "shell",
+                Some("git"),
+                None,
+                None,
+                None,
+                None
+            ),
             format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
         );
         assert_eq!(
-            rule_add_line(rule, bot, "allow", "read_file", None, Some("/tmp")),
+            rule_add_line(
+                rule,
+                bot,
+                "allow",
+                "read_file",
+                None,
+                Some("/tmp"),
+                None,
+                None,
+                None
+            ),
             format!("Added rule {rule} for Bot {bot}: allow read_file (path-prefix \"/tmp\")")
         );
         assert_eq!(
@@ -3908,6 +6379,1285 @@ mod tests {
         assert_eq!(
             decision_line(false, approval, None),
             format!("Denied {approval}.")
+        );
+    }
+
+    #[test]
+    fn plugin_install_help_states_the_limits_and_source_rules() {
+        let mut cli = Cli::command();
+        let plugin = cli.find_subcommand_mut("plugin").expect("a plugin command");
+        let install = plugin
+            .find_subcommand_mut("install")
+            .expect("a plugin install command");
+        // Help wraps to the terminal; compare phrases, not line breaks.
+        let help = install
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for stated in [
+            "200 files",
+            "1024 entries in all (files and directories)",
+            "100 KiB per file",
+            "4 MiB per package",
+            "<url>@<40-or-64-hex-commit>",
+            "40- or 64-character lowercase hexadecimal object id",
+            "A directory source is a plain path",
+            "supported only on Linux",
+            "install from a repository",
+            "[plugins] sources",
+        ] {
+            assert!(
+                help.contains(stated),
+                "`plugin install --help` does not state {stated:?}:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cleanup_warning_is_reported_escaped_on_one_line() {
+        // A result with no cleanup, or a blank or non-text one, has nothing to
+        // report.
+        let clean = json!({"plugin": Id::new()});
+        assert_eq!(cleanup_notice(&clean, CleanupStyle::Detail), None);
+        assert_eq!(cleanup_notice(&clean, CleanupStyle::Retry), None);
+        assert_eq!(
+            cleanup_notice(&json!({"cleanup": "  "}), CleanupStyle::Detail),
+            None
+        );
+        assert_eq!(
+            cleanup_notice(&json!({"cleanup": 7}), CleanupStyle::Retry),
+            None
+        );
+
+        // The Space sanitizes the text; the CLI still escapes it, so a warning
+        // stays one line and cannot rewrite the terminal.
+        let warning = "incomplete: a package's files could not be deleted\n\u{1b}[31m";
+        let result = json!({"cleanup": warning});
+        assert_eq!(
+            cleanup_notice(&result, CleanupStyle::Detail).unwrap(),
+            "  cleanup: incomplete: a package's files could not be deleted\\n\\u{001b}[31m"
+        );
+        assert_eq!(
+            cleanup_notice(&result, CleanupStyle::Retry).unwrap(),
+            "Cleanup incomplete: a package's files could not be deleted\\n\\u{001b}[31m. Run the command again to finish it."
+        );
+        // A warning that does not carry the Space's prefix is still a warning.
+        assert_eq!(
+            cleanup_notice(
+                &json!({"cleanup": "a package's files could not be deleted"}),
+                CleanupStyle::Retry
+            )
+            .unwrap(),
+            "Cleanup incomplete: a package's files could not be deleted. Run the command again to finish it."
+        );
+        // A retried removal that finished its cleanup says so, and does not ask
+        // for another retry.
+        assert_eq!(
+            cleanup_notice(&json!({"cleanup": "finished"}), CleanupStyle::Retry).unwrap(),
+            "Cleanup finished."
+        );
+    }
+
+    #[test]
+    fn plugin_rows_show_what_a_package_brought() {
+        let plugin = Id::new();
+        let server = Id::new();
+        let skill = Id::new();
+        let digest = "a".repeat(64);
+        let commit = "3f2a1c9d8e4b5a6f7c8d9e0f1a2b3c4d5e6f7a8b";
+        let list = json!([{
+            "plugin": plugin,
+            "name": "reports",
+            "version": "1.2.0",
+            "digest": digest,
+            "commit": commit,
+            "source": format!("https://github.com/acme/reports@{commit}"),
+            "enabled": true,
+            "servers": [{"server": server, "name": "reports-docs"}],
+            "skills": [{"skill": skill, "name": "weekly-report"}],
+        }]);
+        assert_eq!(
+            plugin_rows(&list).unwrap(),
+            vec![format!(
+                "{plugin}  reports  1.2.0  {commit}  digest: {digest}  enabled  servers: reports-docs  skills: weekly-report"
+            )]
+        );
+        // A package that brought nothing, and a disabled one with no version.
+        let bare = json!([{
+            "plugin": plugin,
+            "name": "bare",
+            "enabled": false,
+            "servers": [],
+            "skills": [],
+        }]);
+        assert_eq!(
+            plugin_rows(&bare).unwrap(),
+            vec![format!(
+                "{plugin}  bare  -  -  digest: -  disabled  servers: -  skills: -"
+            )]
+        );
+        assert!(plugin_rows(&json!({})).is_err());
+    }
+
+    #[test]
+    fn mcp_rows_show_the_server_scope_reach_and_connection() {
+        let server = Id::new();
+        let local = Id::new();
+        let user_server = Id::new();
+        let user = Id::new();
+        let by = Id::new();
+        let list = json!([
+            {
+                "server": server,
+                "name": "weather",
+                "transport": "streamable-http",
+                "url": "https://mcp.example.com/mcp",
+                "scope": "space",
+                "by": by,
+                "connected": true,
+            },
+            {
+                "server": local,
+                "name": "notes",
+                "transport": "stdio",
+                "url": null,
+                "command": "./bin/notes",
+                "args": ["--root", "${PLUGIN_DATA}", "--label", "My notes"],
+                "scope": "space",
+                "by": by,
+                "connected": false,
+            },
+            {
+                "server": user_server,
+                "name": "mine",
+                "transport": "streamable-http",
+                "url": "http://127.0.0.1:9000/mcp",
+                "scope": "user",
+                "user": user,
+                "by": user,
+                "connected": false,
+            },
+        ]);
+        assert_eq!(
+            mcp_rows(&list).unwrap(),
+            vec![
+                format!(
+                    "{server}  weather  space  by {by}  https://mcp.example.com/mcp  connected"
+                ),
+                format!(
+                    "{local}  notes  space  by {by}  stdio ./bin/notes --root ${{PLUGIN_DATA}} --label My notes  not connected"
+                ),
+                format!(
+                    "{user_server}  mine  user {user}  by {user}  http://127.0.0.1:9000/mcp  not connected"
+                ),
+            ]
+        );
+        // A row written before the transport was named still reads as an
+        // address, and a stdio row without arguments prints its command alone.
+        assert_eq!(
+            mcp_row(&json!({"server": server, "name": "bare", "url": "https://x/"})).unwrap(),
+            format!("{server}  bare  space  by -  https://x/  not connected")
+        );
+        assert_eq!(
+            mcp_row(&json!({"server": local, "name": "solo", "transport": "stdio", "command": "./bin/solo"}))
+                .unwrap(),
+            format!("{local}  solo  space  by -  stdio ./bin/solo  not connected")
+        );
+        assert_eq!(mcp_rows(&json!([])).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mcp_rows_escape_the_package_controlled_reach_fields() {
+        let server = Id::new();
+        // A command and an argument are package data: they may hold a
+        // newline, a terminal escape, or a backslash that would otherwise
+        // stand for one. The row stays one plain line.
+        let row = mcp_row(&json!({
+            "server": server,
+            "name": "notes",
+            "transport": "stdio",
+            "command": "./bin/no\ntes",
+            "args": ["--title", "a\nb\u{001b}[2Jc\\d", "\u{0007}bell"],
+        }))
+        .unwrap();
+        assert_eq!(
+            row,
+            format!(
+                "{server}  notes  space  by -  stdio ./bin/no\\ntes --title a\\nb\\u{{001b}}[2Jc\\\\d \\u{{0007}}bell  not connected"
+            )
+        );
+        assert!(
+            row.chars().all(|ch| !ch.is_control()),
+            "no raw control character reaches the terminal: {row:?}"
+        );
+
+        // An address is package data too, and an ordinary one is unchanged.
+        assert_eq!(
+            mcp_row(&json!({
+                "server": server,
+                "name": "web",
+                "transport": "streamable-http",
+                "url": "https://x/\u{001b}[2J\\",
+            }))
+            .unwrap(),
+            format!("{server}  web  space  by -  https://x/\\u{{001b}}[2J\\\\  not connected")
+        );
+        assert_eq!(
+            mcp_row(&json!({"server": server, "name": "docs", "url": "https://x/mcp"})).unwrap(),
+            format!("{server}  docs  space  by -  https://x/mcp  not connected")
+        );
+    }
+
+    #[test]
+    fn an_mcp_removal_reports_the_cleanup_its_answer_carries() {
+        // A removal the Space finished its cleanup for leaves one line.
+        let clean = json!({"server": Id::new(), "name": "weather"});
+        assert_eq!(
+            mcp_remove_lines(&clean),
+            vec!["Removed MCP server weather.".to_owned()]
+        );
+
+        // A cleanup the Space still owes is reported on the next line, escaped
+        // into one line so a warning cannot rewrite the terminal, and names the
+        // retry that finishes it.
+        let owes = json!({
+            "server": Id::new(),
+            "name": "weather",
+            "cleanup": "incomplete: an MCP server's Vault credential could not be discarded\n\u{1b}[31m",
+        });
+        let lines = mcp_remove_lines(&owes);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "Removed MCP server weather.");
+        assert_eq!(
+            lines[1],
+            "Cleanup incomplete: an MCP server's Vault credential could not be discarded\\n\\u{001b}[31m. Run the command again to finish it."
+        );
+
+        // A retry that finished the cleanup says so, and asks for no other.
+        let finished = json!({"server": Id::new(), "name": "weather", "cleanup": "finished"});
+        assert_eq!(
+            mcp_remove_lines(&finished),
+            vec![
+                "Removed MCP server weather.".to_owned(),
+                "Cleanup finished.".to_owned(),
+            ]
+        );
+
+        // The Space may hold no name for the server; the line still says which
+        // server was removed.
+        assert_eq!(
+            mcp_remove_lines(&json!({"server": Id::new()})),
+            vec!["Removed MCP server the server.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_mcp_add_sends_the_environment_token_or_starts_a_sign_in() {
+        // The environment's token connects at once, as it did before the
+        // browser sign-in existed.
+        assert_eq!(
+            mcp_add_plan(
+                "weather",
+                "https://mcp.example.com/mcp",
+                McpScope::Space,
+                Some("secret".to_owned()),
+            ),
+            McpAddPlan::Add(McpAdd {
+                name: "weather".to_owned(),
+                url: "https://mcp.example.com/mcp".to_owned(),
+                scope: McpScope::Space,
+                credential: Some("secret".to_owned()),
+            })
+        );
+
+        // An omitted address is passed through empty: the Space reads it as
+        // the existing package stdio server of that name, so the plan names no
+        // address and the command creates nothing.
+        assert_eq!(
+            mcp_add_plan("local", "", McpScope::Space, Some("secret".to_owned())),
+            McpAddPlan::Add(McpAdd {
+                name: "local".to_owned(),
+                url: String::new(),
+                scope: McpScope::Space,
+                credential: Some("secret".to_owned()),
+            })
+        );
+
+        // Without one the command binds its loopback receiver and opens the
+        // browser.
+        assert_eq!(
+            mcp_add_plan("weather", "http://127.0.0.1:9000/mcp", McpScope::User, None),
+            McpAddPlan::SignIn
+        );
+
+        // A new server: the sign-in names the server and scope the Space
+        // registers when it finishes, and binds the command's loopback
+        // receiver as the browser's way back.
+        let redirect = "http://127.0.0.1:4711/callback";
+        assert_eq!(
+            mcp_sign_in_start(
+                "weather",
+                "http://127.0.0.1:9000/mcp",
+                McpScope::User,
+                redirect,
+                None,
+            ),
+            McpSignInStart {
+                server: None,
+                name: Some("weather".to_owned()),
+                url: Some("http://127.0.0.1:9000/mcp".to_owned()),
+                scope: Some(McpScope::User),
+                redirect_uri: Some(redirect.to_owned()),
+            }
+        );
+
+        // A server the Space already holds under the same name and address
+        // takes the caller's own credential, so the sign-in names only that
+        // server.
+        let existing = Id::new();
+        assert_eq!(
+            mcp_sign_in_start(
+                "weather",
+                "http://127.0.0.1:9000/mcp",
+                McpScope::User,
+                redirect,
+                Some(existing),
+            ),
+            McpSignInStart {
+                server: Some(existing),
+                name: None,
+                url: None,
+                scope: None,
+                redirect_uri: Some(redirect.to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_mcp_add_address_is_optional_and_its_help_states_the_attach() {
+        let Top::Mcp {
+            command: McpCommand::Add { name, url, .. },
+        } = parse(&["mcp", "add", "local"])
+        else {
+            panic!("`mcp add <name>` parses");
+        };
+        assert_eq!(name, "local");
+        assert_eq!(url, None, "an omitted address is an attach");
+
+        let Top::Mcp {
+            command: McpCommand::Add { url, .. },
+        } = parse(&["mcp", "add", "docs", "https://docs.example.com/mcp"])
+        else {
+            panic!("`mcp add <name> <url>` parses");
+        };
+        assert_eq!(url.as_deref(), Some("https://docs.example.com/mcp"));
+
+        // The help says what an omitted address attaches, and who may do it.
+        let mut cli = Cli::command();
+        let mcp = cli.find_subcommand_mut("mcp").expect("an mcp command");
+        let add = mcp.find_subcommand_mut("add").expect("an mcp add command");
+        let help = add
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for stated in [
+            "omit it to attach the Space credential",
+            "package's existing stdio server of this name",
+            "only the Admin may do that",
+            "asked for when the environment carries none",
+        ] {
+            assert!(
+                help.contains(stated),
+                "`mcp add --help` does not state {stated:?}:\n{help}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_existing_mcp_server_is_matched_by_name_and_address() {
+        let server = Id::new();
+        let list = json!([
+            {"server": Id::new(), "name": "weather", "url": "https://mcp.example.com/mcp"},
+            {"server": server, "name": "notes", "url": "http://127.0.0.1:9000/mcp"},
+        ]);
+
+        // The same name and address is the server the sign-in attaches to; the
+        // command line's address is trimmed like the Space trims it.
+        assert_eq!(
+            existing_server(&list, "notes", "http://127.0.0.1:9000/mcp").unwrap(),
+            Some(server)
+        );
+        assert_eq!(
+            existing_server(&list, "notes", " http://127.0.0.1:9000/mcp ").unwrap(),
+            Some(server)
+        );
+
+        // A name the Space does not hold starts a new server.
+        assert_eq!(
+            existing_server(&list, "docs", "http://127.0.0.1:9001/mcp").unwrap(),
+            None
+        );
+
+        // A name held at another address is a refusal: the sign-in would
+        // attach to a server the command did not name.
+        let error = existing_server(&list, "weather", "https://other.example.com/mcp")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already holds"), "{error}");
+        assert!(error.contains("weather"), "{error}");
+    }
+
+    #[test]
+    fn a_sign_in_finish_command_carries_the_keyed_callback_path() {
+        let sign_in = Id::new();
+        let callback = Callback::Code {
+            code: "the-code".to_owned(),
+            state: "the-state".to_owned(),
+            iss: Some("https://auth.example.com".to_owned()),
+        };
+
+        // The command sends the raw path the browser requested with the code
+        // and state: the Space compares it with the issuer-keyed redirect it
+        // registered.
+        assert_eq!(
+            sign_in_finish_command(sign_in, &callback, Some("/0123456789abcdef/callback")),
+            Some(CommandCall::McpSignInFinish {
+                sign_in,
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                iss: Some("https://auth.example.com".to_owned()),
+                path: Some("/0123456789abcdef/callback".to_owned()),
+            })
+        );
+
+        // A callback that returned no code finishes nothing: no finish command
+        // is sent, so the receiver's path is forwarded only with a code.
+        assert_eq!(
+            sign_in_finish_command(sign_in, &Callback::Refused, Some("/callback")),
+            None
+        );
+
+        // The path stays absent when the request line named none.
+        assert_eq!(
+            sign_in_finish_command(
+                sign_in,
+                &Callback::Code {
+                    code: "a".to_owned(),
+                    state: "b".to_owned(),
+                    iss: None,
+                },
+                None,
+            ),
+            Some(CommandCall::McpSignInFinish {
+                sign_in,
+                code: "a".to_owned(),
+                state: "b".to_owned(),
+                iss: None,
+                path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_browser_callback_reads_the_keyed_path_and_values_or_refuses() {
+        // The redirect is the issuer-keyed callback path the Space registered,
+        // and its query carries the code and the state; both are
+        // percent-decoded.
+        assert_eq!(
+            callback_of(
+                b"GET /0123456789abcdef/callback?code=the%2Dcode&state=the%2Dstate HTTP/1.1\r\n\
+                  Host: 127.0.0.1:4711\r\n\r\n"
+            ),
+            CallbackRequest {
+                path: Some("/0123456789abcdef/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "the-code".to_owned(),
+                    state: "the-state".to_owned(),
+                    iss: None,
+                },
+            }
+        );
+
+        // The receiver accepts any path: the issuer key is the Space's to
+        // compare, so the path is kept exactly as received.
+        assert_eq!(
+            callback_of(b"GET /callback?code=a&state=b HTTP/1.1\r\n\r\n"),
+            CallbackRequest {
+                path: Some("/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "a".to_owned(),
+                    state: "b".to_owned(),
+                    iss: None,
+                },
+            }
+        );
+
+        // The path is not decoded: percent-encoding reaches the Space as the
+        // browser sent it.
+        assert_eq!(
+            callback_of(b"GET /a%2Fb/callback?code=a&state=b HTTP/1.1\r\n\r\n"),
+            CallbackRequest {
+                path: Some("/a%2Fb/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "a".to_owned(),
+                    state: "b".to_owned(),
+                    iss: None,
+                },
+            }
+        );
+
+        // A refusal is one fixed outcome: the authorization server's own
+        // description never survives it. The path is still the one requested.
+        assert_eq!(
+            callback_of(
+                b"GET /0123456789abcdef/callback?error=access_denied&\
+                  error_description=the%20user%20said%20no HTTP/1.1\r\n\r\n"
+            ),
+            CallbackRequest {
+                path: Some("/0123456789abcdef/callback".to_owned()),
+                callback: Callback::Refused,
+            }
+        );
+
+        // A callback without both values ends the wait as a failure, and its
+        // request target still names the path the Space compares.
+        for request in [
+            &b"GET /callback?code=the-code HTTP/1.1\r\n\r\n"[..],
+            &b"GET /callback?state=the-state HTTP/1.1\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                callback_of(request),
+                CallbackRequest {
+                    path: Some("/callback".to_owned()),
+                    callback: Callback::Refused,
+                }
+            );
+        }
+
+        // A request the receiver did not register for is refused with no path
+        // at all: only origin-form targets name the redirect a browser sends.
+        for request in [
+            &b"POST /callback?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"not a request\r\n\r\n"[..],
+            // An absolute-form target is what a proxy sends, not a browser.
+            &b"GET http://127.0.0.1:4711/callback?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            // A target without a leading slash is no origin-form path.
+            &b"GET callback?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"GET ?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"GET * HTTP/1.1\r\n\r\n"[..],
+            // A fragment is never part of a request target.
+            &b"GET /callback#fragment?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"GET /callback?code=a&state=b#fragment HTTP/1.1\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                callback_of(request),
+                CallbackRequest {
+                    path: None,
+                    callback: Callback::Refused,
+                },
+                "{}",
+                String::from_utf8_lossy(request)
+            );
+        }
+
+        // A `+` in the query is a space, as it is in every form-encoded value,
+        // and RFC 9207's issuer is read like the other values.
+        assert_eq!(
+            callback_of(
+                b"GET /0123456789abcdef/callback?code=a+b&state=c%2Bd&\
+                  iss=https%3A%2F%2Fauth.example.com HTTP/1.1\r\n\r\n"
+            ),
+            CallbackRequest {
+                path: Some("/0123456789abcdef/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "a b".to_owned(),
+                    state: "c+d".to_owned(),
+                    iss: Some("https://auth.example.com".to_owned()),
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_receiver_holds_the_page_until_the_sign_in_ends() {
+        let receiver = SignInReceiver::bind().await.unwrap();
+        let address = receiver.listener.local_addr().unwrap();
+        assert_eq!(
+            receiver.redirect_uri(),
+            format!("http://127.0.0.1:{}/callback", address.port())
+        );
+        let serving = tokio::spawn(receiver.receive(tokio::time::Instant::now() + SIGN_IN_TIMEOUT));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(
+                b"GET /0123456789abcdef/callback?code=the-code&state=the-state HTTP/1.1\r\n\
+                  Host: 127.0.0.1:4711\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let callback = serving.await.unwrap().unwrap();
+        // The receiver accepts any path, and keeps the raw one it read: the
+        // Space compares it with the issuer-keyed redirect it registered.
+        assert_eq!(callback.path(), Some("/0123456789abcdef/callback"));
+        assert_eq!(
+            callback.callback(),
+            &Callback::Code {
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                iss: None,
+            }
+        );
+
+        // The receiver used its one request: it is consumed, and the listener
+        // was dropped, so no second connection is one this command serves.
+        // The released port may belong to another process at any moment, so
+        // the test does not connect to it.
+
+        // The page is held until the sign-in ends. The browser reads nothing
+        // before the outcome is known, so the page can never claim a success
+        // the Space has not reported.
+        let mut held = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), browser.peek(&mut held))
+                .await
+                .is_err(),
+            "the page is written only after the sign-in ends"
+        );
+
+        // Once the outcome is known the browser gets the fixed page, with
+        // neither the code nor the state.
+        callback.answer(true).await.unwrap();
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("Content-Type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("MCP sign-in finished"), "{response}");
+        assert!(
+            !response.contains("the-code") && !response.contains("the-state"),
+            "the page echoes neither value: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_in_receiver_answers_the_failed_page() {
+        let receiver = SignInReceiver::bind().await.unwrap();
+        let address = receiver.listener.local_addr().unwrap();
+        let serving = tokio::spawn(receiver.receive(tokio::time::Instant::now() + SIGN_IN_TIMEOUT));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(
+                b"GET /callback?error=access_denied&error_description=the%20user%20said%20no \
+                  HTTP/1.1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let callback = serving.await.unwrap().unwrap();
+        assert_eq!(callback.callback(), &Callback::Refused);
+        callback.answer(false).await.unwrap();
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+
+        // The page says the sign-in failed and repeats no provider text.
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains("MCP sign-in failed"), "{response}");
+        assert!(!response.contains("access_denied"), "{response}");
+        assert!(!response.contains("user said no"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_receiver_gives_up_when_the_browser_never_comes() {
+        // The wait has one deadline: a browser that never returns cannot hold
+        // the command past it.
+        let started = std::time::Instant::now();
+        let error = SignInReceiver::bind()
+            .await
+            .unwrap()
+            .receive(tokio::time::Instant::now() + Duration::from_millis(100))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the receiver ended at its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The credential the CLI uses for one fake Space.
+    fn credential_at(address: std::net::SocketAddr) -> Credential {
+        Credential {
+            url: format!("http://{address}"),
+            token: "token".to_owned(),
+            account: SignedIn {
+                id: Id::new(),
+                display_name: "Ada".to_owned(),
+                is_admin: false,
+            },
+        }
+    }
+
+    /// Serves a Space that opens the WebSocket and never greets the CLI.
+    async fn ungreeting_space(listener: tokio::net::TcpListener) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        // The client's hello is read, and never answered.
+        let _ = socket.next().await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+
+    /// Accepts the CLI's socket, greets it, and reads the one command it sends.
+    async fn greeting_space(
+        listener: tokio::net::TcpListener,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        Id,
+        CommandCall,
+    ) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let hello = socket.next().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ClientFrame>(hello.to_text().unwrap()).unwrap(),
+            ClientFrame::Hello { .. }
+        ));
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ServerFrame::Hello {
+                    version: PROTOCOL_VERSION,
+                    capabilities: Vec::new(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let command = socket.next().await.unwrap().unwrap();
+        let ClientFrame::Command { id, command } =
+            serde_json::from_str(command.to_text().unwrap()).unwrap()
+        else {
+            panic!("the Space expected one command");
+        };
+        (socket, id, command)
+    }
+
+    /// Serves a Space that greets the CLI, reads one command, and answers it
+    /// with `result` only once the test releases the answer.
+    async fn held_space(
+        listener: tokio::net::TcpListener,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        result: serde_json::Value,
+    ) {
+        let (mut socket, id, _command) = greeting_space(listener).await;
+        reached.send(()).unwrap();
+        release.await.unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ServerFrame::Confirmed { id, result })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = socket.close(None).await;
+    }
+
+    /// Opens the receiver's browser side and writes the callback it waits for.
+    ///
+    /// `target` is the request target the browser asks for: the callback path
+    /// the authorization server's redirect names, and its query.
+    async fn callback_browser(
+        receiver: SignInReceiver,
+        target: &str,
+    ) -> (super::SignInCallback, tokio::net::TcpStream) {
+        let address = receiver.listener.local_addr().unwrap();
+        let waiting = tokio::spawn(receiver.receive(tokio::time::Instant::now() + SIGN_IN_TIMEOUT));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        (waiting.await.unwrap().unwrap(), browser)
+    }
+
+    #[tokio::test]
+    async fn a_silent_space_cannot_hold_the_sign_in_past_its_deadline() {
+        // Each sign-in command opens its own WebSocket, and the client's
+        // greeting wait has no bound of its own: the sign-in's deadline must
+        // bound it, so a Space that accepts a socket and never greets cannot
+        // hold the command.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = tokio::spawn(ungreeting_space(listener));
+        let started = std::time::Instant::now();
+        let error = sign_in_command(
+            &credential_at(address),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            CommandCall::McpSignInStatus { sign_in: Id::new() },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the command ended at the sign-in deadline, not at the greeting: {:?}",
+            started.elapsed()
+        );
+        space.abort();
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_page_reports_success_only_after_the_space_finishes() {
+        let sign_in = Id::new();
+        let server = Id::new();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let space = tokio::spawn(held_space(
+            listener,
+            reached,
+            release_rx,
+            json!({"state": "finished", "server": server, "connected": true}),
+        ));
+        let credential = credential_at(address);
+        let (callback, mut browser) = callback_browser(
+            SignInReceiver::bind().await.unwrap(),
+            "/0123456789abcdef/callback?code=the-code&state=the-state",
+        )
+        .await;
+        let finishing = tokio::spawn(async move {
+            let outcome = finish_sign_in(
+                &credential,
+                tokio::time::Instant::now() + SIGN_IN_TIMEOUT,
+                sign_in,
+                &callback,
+            )
+            .await;
+            answer_sign_in_page(callback, &outcome).await;
+            outcome
+        });
+
+        // The Space holds the finish command unanswered, so the browser must
+        // still hold no page: success is never claimed before the Space says
+        // the sign-in finished.
+        reached_rx.await.unwrap();
+        let mut held = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), browser.peek(&mut held))
+                .await
+                .is_err(),
+            "the page is written only after the Space answers"
+        );
+
+        release.send(()).unwrap();
+        let outcome = finishing.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("MCP sign-in finished"), "{response}");
+        assert!(
+            !response.contains("the-code") && !response.contains("the-state"),
+            "the page echoes neither value: {response}"
+        );
+        space.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_page_reports_a_failed_space_answer() {
+        let sign_in = Id::new();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let space = tokio::spawn(held_space(
+            listener,
+            reached,
+            release_rx,
+            json!({"state": "failed", "reason": "the sign-in expired"}),
+        ));
+        let credential = credential_at(address);
+        let (callback, mut browser) = callback_browser(
+            SignInReceiver::bind().await.unwrap(),
+            "/0123456789abcdef/callback?code=the-code&state=the-state",
+        )
+        .await;
+        let finishing = tokio::spawn(async move {
+            let outcome = finish_sign_in(
+                &credential,
+                tokio::time::Instant::now() + SIGN_IN_TIMEOUT,
+                sign_in,
+                &callback,
+            )
+            .await;
+            answer_sign_in_page(callback, &outcome).await;
+            outcome
+        });
+        reached_rx.await.unwrap();
+        release.send(()).unwrap();
+        let outcome = finishing.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            SignInState::Failed {
+                reason: "the sign-in expired".to_owned(),
+            }
+        );
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains("MCP sign-in failed"), "{response}");
+        assert!(
+            !response.contains("expired"),
+            "the page repeats no Space text: {response}"
+        );
+        space.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_finished_sign_in_sends_the_keyed_callback_path_to_the_space() {
+        // The browser comes back to the issuer-keyed path the Space registered,
+        // and the finish command carries that raw path: the Space is the side
+        // that compares it with the redirect it planned.
+        let sign_in = Id::new();
+        let server = Id::new();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = tokio::spawn(async move {
+            let (mut socket, id, command) = greeting_space(listener).await;
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&ServerFrame::Confirmed {
+                        id,
+                        result: json!({"state": "finished", "server": server, "connected": true}),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+            command
+        });
+        let credential = credential_at(address);
+        let (callback, _browser) = callback_browser(
+            SignInReceiver::bind().await.unwrap(),
+            "/0123456789abcdef/callback?code=the-code&state=the-state",
+        )
+        .await;
+        let outcome = finish_sign_in(
+            &credential,
+            tokio::time::Instant::now() + SIGN_IN_TIMEOUT,
+            sign_in,
+            &callback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        assert_eq!(
+            space.await.unwrap(),
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                iss: None,
+                path: Some("/0123456789abcdef/callback".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_sign_in_answer_reads_pending_finished_or_failed() {
+        let server = Id::new();
+        assert_eq!(
+            sign_in_state(&json!({"state": "pending", "server": null, "connected": false}))
+                .unwrap(),
+            SignInState::Pending
+        );
+        assert_eq!(
+            sign_in_state(&json!({
+                "state": "finished",
+                "server": server,
+                "connected": true,
+                "reason": null,
+            }))
+            .unwrap(),
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        // A finished sign-in the Space could not reach still ends the wait.
+        assert_eq!(
+            sign_in_state(&json!({
+                "state": "finished",
+                "server": server,
+                "connected": false,
+            }))
+            .unwrap(),
+            SignInState::Finished {
+                server,
+                connected: false,
+            }
+        );
+        assert_eq!(
+            sign_in_state(&json!({
+                "state": "failed",
+                "server": null,
+                "connected": false,
+                "reason": "the sign-in expired",
+            }))
+            .unwrap(),
+            SignInState::Failed {
+                reason: "the sign-in expired".to_owned(),
+            }
+        );
+        // A failure the Space explained with nothing still ends the wait.
+        assert_eq!(
+            sign_in_state(&json!({"state": "failed", "reason": null})).unwrap(),
+            SignInState::Failed {
+                reason: "the Space gave no reason".to_owned(),
+            }
+        );
+        // An answer this CLI does not understand is an error, not a wait.
+        for answer in [json!({"state": "expired"}), json!({})] {
+            let error = sign_in_state(&answer).unwrap_err().to_string();
+            assert!(error.contains("sign-in state"), "{answer}: {error}");
+        }
+        // A finished answer without its server names nothing to report.
+        assert!(
+            sign_in_state(&json!({"state": "finished", "connected": true})).is_err(),
+            "a finished sign-in names its server"
+        );
+    }
+
+    #[test]
+    fn a_finished_sign_in_prints_the_connection_or_the_registration() {
+        let server = Id::new();
+        let user = Id::new();
+        assert_eq!(mcp_scope_text(McpScope::Space, Some(user)), "space");
+        assert_eq!(
+            mcp_scope_text(McpScope::User, Some(user)),
+            format!("user {user}")
+        );
+        assert_eq!(mcp_scope_text(McpScope::User, None), "user");
+
+        // A reachable server reads as a connection.
+        assert_eq!(
+            sign_in_lines(
+                SignInState::Finished {
+                    server,
+                    connected: true,
+                },
+                "weather",
+                "https://mcp.example.com/mcp",
+                "space",
+            )
+            .unwrap(),
+            vec!["Connected MCP server weather.".to_owned()]
+        );
+
+        // Registered but unreachable prints `neha mcp add`'s two lines.
+        assert_eq!(
+            sign_in_lines(
+                SignInState::Finished {
+                    server,
+                    connected: false,
+                },
+                "notes",
+                "http://127.0.0.1:9000/mcp",
+                &format!("user {user}"),
+            )
+            .unwrap(),
+            vec![
+                format!("Added MCP server {server} (notes) at http://127.0.0.1:9000/mcp."),
+                format!("  scope: user {user}; not connected"),
+            ]
+        );
+
+        // A failed sign-in is the command's error, escaped to one line so the
+        // authorization server's text cannot rewrite the terminal.
+        let error = sign_in_lines(
+            SignInState::Failed {
+                reason: "access_denied: no\n\u{1b}[31m".to_owned(),
+            },
+            "weather",
+            "https://mcp.example.com/mcp",
+            "space",
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "the sign-in failed: access_denied: no\\n\\u{001b}[31m"
+        );
+
+        // A wait that is not done has no lines to print yet.
+        assert!(
+            sign_in_lines(
+                SignInState::Pending,
+                "weather",
+                "https://mcp.example.com/mcp",
+                "space",
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_wait_polls_until_it_ends_or_times_out() {
+        let sign_in = Id::new();
+        let server = Id::new();
+
+        // A pending answer asks again, and a finished one ends the wait.
+        let mut answers = [
+            json!({"state": "pending"}),
+            json!({"state": "pending"}),
+            json!({"state": "finished", "server": server, "connected": true}),
+        ]
+        .into_iter();
+        let mut asks = 0;
+        let ended = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::ZERO,
+            |asked| {
+                asks += 1;
+                assert_eq!(asked, sign_in);
+                let answer = answers.next().expect("the wait asked past its answers");
+                async move { Ok(answer) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ended,
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        assert_eq!(asks, 3);
+
+        // A failed answer ends the wait too, so its reason is reported instead
+        // of waiting for a sign-in that cannot finish.
+        let failed = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::ZERO,
+            |_| async { Ok(json!({"state": "failed", "reason": "the sign-in expired"})) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            SignInState::Failed {
+                reason: "the sign-in expired".to_owned(),
+            }
+        );
+
+        // A sign-in that never ends is the timeout, and it outlives no retry.
+        let error = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now(),
+            Duration::ZERO,
+            |_| async { Ok(json!({"state": "pending"})) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(error.contains("retry"), "{error}");
+
+        // An ask whose answer never comes is bounded by the time left: the
+        // WebSocket client may wait indefinitely, the poll may not.
+        let started = std::time::Instant::now();
+        let error = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            Duration::ZERO,
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(json!({"state": "pending"}))
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the wait ended at its deadline, not the ask's: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_server_rule_row_names_the_server_or_its_id() {
+        let rule = Id::new();
+        let bot = Id::new();
+        let server = Id::new();
+        let named = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "ask",
+            "tool": "get_weather",
+            "server": server,
+            "server_name": "weather",
+        }]);
+        assert_eq!(
+            rule_rows(&named).unwrap(),
+            vec![format!("{rule}  {bot}  ask  get_weather  server weather")]
+        );
+        // The Space may hold no name for the server; its id is the fallback.
+        let unnamed = json!([{
+            "rule": rule,
+            "bot": bot,
+            "effect": "allow",
+            "tool": "get_weather",
+            "server": server,
+            "server_name": null,
+        }]);
+        assert_eq!(
+            rule_rows(&unnamed).unwrap(),
+            vec![format!(
+                "{rule}  {bot}  allow  get_weather  server {server}"
+            )]
         );
     }
 
@@ -4057,7 +7807,18 @@ mod tests {
             "path_prefix": "logs",
         });
         assert_eq!(
-            rule_add_report(&result, bot, "ask", "write_file", None, Some("./logs/")).unwrap(),
+            rule_add_report(
+                &result,
+                bot,
+                "ask",
+                "write_file",
+                None,
+                Some("./logs/"),
+                None,
+                None,
+                None
+            )
+            .unwrap(),
             format!("Added rule {rule} for Bot {bot}: ask write_file (path-prefix \"logs\")")
         );
 
@@ -4068,14 +7829,60 @@ mod tests {
             "path_prefix": null,
         });
         assert_eq!(
-            rule_add_report(&result, bot, "allow", "shell", Some("  git  "), None).unwrap(),
+            rule_add_report(
+                &result,
+                bot,
+                "allow",
+                "shell",
+                Some("  git  "),
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap(),
             format!("Added rule {rule} for Bot {bot}: allow shell (command-prefix \"git\")")
+        );
+
+        // A server's tool rule names the server, so two servers that offer the
+        // same tool are not reported as the same rule.
+        let server = Id::new();
+        let result = json!({
+            "rule": rule,
+            "server": server,
+            "server_name": "weather",
+        });
+        assert_eq!(
+            rule_add_report(
+                &result,
+                bot,
+                "ask",
+                "get_weather",
+                None,
+                None,
+                None,
+                None,
+                Some("weather")
+            )
+            .unwrap(),
+            format!("Added rule {rule} for Bot {bot}: ask get_weather (server \"weather\")")
         );
 
         // A Space answer without the fields falls back to what was typed.
         let result = json!({"rule": rule});
         assert_eq!(
-            rule_add_report(&result, bot, "ask", "shell", Some("git"), None).unwrap(),
+            rule_add_report(
+                &result,
+                bot,
+                "ask",
+                "shell",
+                Some("git"),
+                None,
+                None,
+                None,
+                None
+            )
+            .unwrap(),
             format!("Added rule {rule} for Bot {bot}: ask shell (command-prefix \"git\")")
         );
     }

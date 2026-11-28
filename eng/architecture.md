@@ -26,7 +26,7 @@ A Space runs as a Local Space or a Hosted Space; the contract is the same. [Spac
                  ▼
    ┌──────────────────────────────────────────┐      Model providers
    │ Space: command surface, record, plugins, │ ──►  one adapter per protocol
-   │ approval gate, SQLite                    │
+   │ approval gate, MCP client, SQLite        │ ──►  MCP servers: tools
    └──────────────────────────────────────────┘
         │                     ▲
         │ bytes of Files      │ outbound HTTPS,
@@ -39,9 +39,9 @@ The built-in Bot loop runs inside the Space and acts as a Bot through the comman
 
 A Local Space signs its first User in through a secret that the desktop shell creates for one launch and hands to the `neha serve` child over a pipe. A Hosted Space prints an invitation link for its first Admin. [Identity](../specs/identity/product.md) covers both.
 
-## Three planes
+## Four planes
 
-Neha's clients, its Computers, and Model providers talk to the Space on three planes that never share a connection.
+Neha's clients, its Computers, Model providers, and MCP servers talk to the Space on four planes that never share a connection.
 
 ### Command surface
 
@@ -57,6 +57,10 @@ A Computer connects out and listens on no network port. Control and data share o
 
 The built-in loop's Model calls leave from the Space, never from a Computer. One thin adapter serves each protocol, OpenAI Chat Completions, OpenAI Responses, or Anthropic Messages, and a provider-neutral vocabulary sits between the adapters and the Bot loop. [Model](../specs/model/design.md) states the Laws.
 
+### Tool access
+
+Calls to an MCP server leave from the Space too, with a credential from the Vault that never reaches a Computer or a Bot. A `stdio` server runs in its own process on the Space's machine, inside bubblewrap on Linux; a Windows Space runs one only when its operator allows an unsandboxed server. [Plugin](../specs/plugin/design.md) states the Laws.
+
 ## Record and storage
 
 SQLite is the source of truth. The record is an append-only log plus projections, and each Space has one local home directory. File bytes live in a store the operator configures: a directory in that home, or one prefix of an S3-compatible bucket.
@@ -67,11 +71,11 @@ A containerized Hosted Space mounts that home from the host. Each Hosted Compute
 
 ## Plugin kernel
 
-The [Kernel](../CONTEXT.md) is fixed. Everything else registers on a seam, which is one Rust trait and a registry, and a Plugin is built in, declarative, or out of process. [Plugin](../specs/plugin/design.md) states the seams and the kinds.
+The [Kernel](../CONTEXT.md) is fixed. Everything else registers on a seam, which is one Rust trait and a registry. A Plugin is built in, an installed package that follows Agent Plugins, or an MCP server added directly; installing a package runs no code. [Plugin](../specs/plugin/design.md) states the seams, the package, and what an installed Plugin can write.
 
 ## Where authority is enforced
 
-Two gates govern a Bot's actions: the Computer's owner grants what it can do, and the User it acts for approves each action that needs an approval. [Bot](../specs/bot/design.md) states which text is an instruction and which is data. [Space](../specs/space/design.md) states what the Space checks before it authenticates a request.
+Two gates govern a Bot's actions: the Computer's owner grants what it can do, and the User it acts for approves each action that needs an approval, including a tool an MCP server gives. [Bot](../specs/bot/design.md) states which text is an instruction and which is data. [Space](../specs/space/design.md) states what the Space checks before it authenticates a request.
 
 ## Repository layout
 
@@ -79,7 +83,7 @@ Two gates govern a Bot's actions: the Computer's owner grants what it can do, an
 crates/
   neha/           domain, record, and command-surface types; no I/O
   neha-loop/      the built-in Bot loop
-  neha-space/     the server: HTTP, command surface, storage
+  neha-space/     the server: HTTP, command surface, storage, MCP client
   neha-computer/  the resident Computer
   neha-app/       the `neha` binary: serve, computer, and the CLI subcommands
   neha-wire/      generates the client's TypeScript wire types

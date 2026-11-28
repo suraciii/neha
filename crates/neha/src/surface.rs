@@ -9,12 +9,12 @@ use ts_rs::TS;
 
 use crate::error::ErrorCode;
 use crate::id::Id;
-use crate::record::{Author, ComputerSharing, Event, RuleEffect};
+use crate::record::{Author, ComputerSharing, Event, RuleEffect, SkillLibrary};
 use crate::seq::Seq;
 use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// The largest frame a client or the Space accepts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -191,11 +191,128 @@ pub enum CommandCall {
         /// The path prefix a matching file action's path starts with.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path_prefix: Option<String>,
+        /// The skill whose script a `run_skill_script` rule matches, by name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skill: Option<String>,
+        /// The script a `run_skill_script` rule matches, within that skill.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        script: Option<String>,
+        /// The MCP server whose tool the rule matches, by name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server: Option<String>,
     },
     /// Removes a lasting rule.
     RuleRemove {
         /// The rule.
         rule: Id,
+    },
+    /// Adds a skill to the Space's library or to a Bot's.
+    SkillAdd(SkillAdd),
+    /// Lists skills: the Space's and the caller's Bots', or one Bot's when named.
+    SkillList {
+        /// Only this Bot's enabled skills, when named.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bot: Option<Id>,
+    },
+    /// Removes a skill from its library.
+    SkillRemove {
+        /// The skill.
+        skill: Id,
+    },
+    /// Lets a Bot use a skill.
+    BotSkillEnable {
+        /// The Bot.
+        bot: Id,
+        /// The skill.
+        skill: Id,
+    },
+    /// Stops a Bot using a skill.
+    BotSkillDisable {
+        /// The Bot.
+        bot: Id,
+        /// The skill.
+        skill: Id,
+    },
+    /// Connects an MCP server.
+    McpAdd(McpAdd),
+    /// Lists the MCP servers the caller may see.
+    McpList,
+    /// Disconnects an MCP server.
+    McpRemove {
+        /// The server.
+        server: Id,
+    },
+    /// Connects the signed-in User to an existing server with their own
+    /// credential.
+    McpConnect {
+        /// The server.
+        server: Id,
+        /// The credential to attach for the caller.
+        credential: Option<String>,
+    },
+    /// Starts an MCP sign-in; the answer carries a browser URL to open.
+    McpSignInStart(McpSignInStart),
+    /// Reports what became of a sign-in.
+    McpSignInStatus {
+        /// The sign-in the start answered with.
+        sign_in: Id,
+    },
+    /// Finishes a sign-in a command line started with a loopback redirect.
+    McpSignInFinish {
+        /// The sign-in the start answered with.
+        sign_in: Id,
+        /// The authorization code the loopback receiver received.
+        code: String,
+        /// The state token the authorization server returned unchanged.
+        state: String,
+        /// The path the loopback receiver received the callback at.
+        ///
+        /// The Space's plan names an issuer-keyed callback path, so a code
+        /// that arrived on another issuer's path belongs to another flow: the
+        /// finish compares the path the command line received with the path of
+        /// the registered redirect and refuses a mismatch before exchanging
+        /// the code. The receiver strips the query it got with the callback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// The issuer the authorization server named, when it named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iss: Option<String>,
+    },
+    /// Lets a Bot call an MCP server's tools.
+    BotMcpEnable {
+        /// The Bot.
+        bot: Id,
+        /// The server.
+        server: Id,
+    },
+    /// Stops a Bot calling an MCP server's tools.
+    BotMcpDisable {
+        /// The Bot.
+        bot: Id,
+        /// The server.
+        server: Id,
+    },
+    /// Installs an Agent Plugins package from an allowed source.
+    PluginInstall {
+        /// The source: a repository URL pinned to a commit, or a directory.
+        source: String,
+    },
+    /// Lists the installed packages.
+    PluginList,
+    /// Removes an installed package and what it brought.
+    PluginRemove {
+        /// The package.
+        plugin: Id,
+    },
+    /// Lets the Space offer a package.
+    PluginEnable {
+        /// The package.
+        plugin: Id,
+    },
+    /// Stops the Space offering a package.
+    PluginDisable {
+        /// The package.
+        plugin: Id,
     },
     /// Lists a Bot's memory entries and the room each kind has left.
     MemoryList {
@@ -210,6 +327,85 @@ pub enum CommandCall {
         /// The entry.
         memory: Id,
     },
+}
+
+/// The parameters of `mcp_add`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
+#[serde(deny_unknown_fields)]
+pub struct McpAdd {
+    /// The name the tool names and a User's commands use.
+    pub name: String,
+    /// The address the server speaks Streamable HTTP at.
+    ///
+    /// Empty (or absent) names no new server: it attaches the Space's
+    /// credential to the existing stdio server of this name, which a package
+    /// brought, and which only the Admin may do.
+    #[serde(default)]
+    pub url: String,
+    /// Where the credential touches the record.
+    pub scope: crate::record::McpScope,
+    /// The credential, which the Space stores encrypted. Absent connects the
+    /// server without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
+}
+
+/// The parameters of `mcp_sign_in_start`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
+#[serde(deny_unknown_fields)]
+pub struct McpSignInStart {
+    /// An existing server to attach a credential to; `None` registers
+    /// `name`/`url` after the sign-in finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The name a new server takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The address a new server speaks Streamable HTTP at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Where the credential belongs when the server is new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::record::McpScope>,
+    /// The loopback redirect base a command line owns, when the flow should
+    /// finish there rather than in the Space's browser callback.
+    ///
+    /// The Space appends the discovered issuer's key and `/callback` to this
+    /// base, so the command line's receiver must accept any callback path. The
+    /// base is plain HTTP on a loopback address with an explicit port, such as
+    /// `http://127.0.0.1:4711`; any path the caller writes is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+}
+
+/// The parameters of `skill_add`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
+#[serde(deny_unknown_fields)]
+pub struct SkillAdd {
+    /// The library that holds the skill.
+    pub library: SkillLibrary,
+    /// The Bot whose library holds it, when it is a Bot's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<Id>,
+    /// The text of its `SKILL.md`, frontmatter included.
+    pub document: String,
+    /// The scripts it carries, each under its file name.
+    #[serde(default)]
+    pub scripts: Vec<SkillAddScript>,
+}
+
+/// A script a `skill_add` command carries.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
+#[serde(deny_unknown_fields)]
+pub struct SkillAddScript {
+    /// The script's file name within the skill, one path component.
+    pub name: String,
+    /// The script's bytes.
+    pub content: String,
 }
 
 /// The parameters of `provider_add`.
@@ -559,8 +755,8 @@ pub enum ServerFrame {
 mod tests {
     use super::{
         BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, MEMORY_CAPABILITY,
-        MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol,
-        ServerFrame, ThinkingLevel, event_capability,
+        McpSignInStart, MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd, ProviderConnect,
+        ProviderProtocol, ServerFrame, ThinkingLevel, event_capability,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -972,7 +1168,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
-            "{\"type\":\"hello\",\"version\":1}"
+            "{\"type\":\"hello\",\"version\":3}"
         );
 
         let error = ServerFrame::Error {
@@ -1043,17 +1239,145 @@ mod tests {
             tool: "shell".to_owned(),
             command_prefix: Some("git".to_owned()),
             path_prefix: None,
+            server: None,
+            skill: None,
+            script: None,
         };
         let text = serde_json::to_string(&add).unwrap();
         assert!(text.contains("\"name\":\"rule_add\""), "{text}");
         assert!(text.contains("\"effect\":\"ask\""), "{text}");
         assert!(!text.contains("path_prefix"), "an absent prefix is omitted");
+        assert!(!text.contains("script"), "an absent script is omitted");
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), add);
+
+        let script = CommandCall::RuleAdd {
+            bot: Id::new(),
+            effect: crate::record::RuleEffect::Allow,
+            tool: "run_skill_script".to_owned(),
+            command_prefix: None,
+            path_prefix: None,
+            skill: Some("weekly-report".to_owned()),
+            script: Some("collect.sh".to_owned()),
+            server: None,
+        };
+        let text = serde_json::to_string(&script).unwrap();
+        assert!(text.contains("\"skill\":\"weekly-report\""), "{text}");
+        assert!(text.contains("\"script\":\"collect.sh\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), script);
 
         let remove = CommandCall::RuleRemove { rule: Id::new() };
         let text = serde_json::to_string(&remove).unwrap();
         assert!(text.contains("\"name\":\"rule_remove\""), "{text}");
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), remove);
+    }
+
+    #[test]
+    fn mcp_sign_in_commands_round_trip() {
+        let server = Id::new();
+        let connect = CommandCall::McpConnect {
+            server,
+            credential: Some("token".to_owned()),
+        };
+        let text = serde_json::to_string(&connect).unwrap();
+        assert!(text.contains("\"name\":\"mcp_connect\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), connect);
+
+        // A connect without a credential decodes for the Space to refuse.
+        let bare: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"mcp_connect\",\"args\":{{\"server\":\"{server}\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            bare,
+            CommandCall::McpConnect {
+                server,
+                credential: None,
+            }
+        );
+
+        let start = CommandCall::McpSignInStart(McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some("http://127.0.0.1:9000/mcp".to_owned()),
+            scope: None,
+            redirect_uri: None,
+        });
+        let text = serde_json::to_string(&start).unwrap();
+        assert!(text.contains("\"name\":\"mcp_sign_in_start\""), "{text}");
+        assert!(!text.contains("\"scope\""), "an absent scope is omitted");
+        assert!(
+            !text.contains("redirect_uri"),
+            "an absent redirect is omitted"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), start);
+
+        // A command line that receives the callback itself names its loopback
+        // redirect.
+        let loopback = CommandCall::McpSignInStart(McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some("http://127.0.0.1:9000/mcp".to_owned()),
+            scope: None,
+            redirect_uri: Some("http://127.0.0.1:4711/api/mcp/signin/callback".to_owned()),
+        });
+        let text = serde_json::to_string(&loopback).unwrap();
+        assert!(
+            text.contains("\"redirect_uri\":\"http://127.0.0.1:4711/api/mcp/signin/callback\""),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandCall>(&text).unwrap(),
+            loopback
+        );
+
+        let sign_in = Id::new();
+        let status = CommandCall::McpSignInStatus { sign_in };
+        let text = serde_json::to_string(&status).unwrap();
+        assert!(text.contains("\"name\":\"mcp_sign_in_status\""), "{text}");
+        assert!(
+            text.contains(&format!("\"sign_in\":\"{sign_in}\"")),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), status);
+
+        let finish = CommandCall::McpSignInFinish {
+            sign_in,
+            code: "the-code".to_owned(),
+            state: "the-state".to_owned(),
+            path: Some("/an-issuer-key/callback".to_owned()),
+            iss: Some("https://auth.example.com".to_owned()),
+        };
+        let text = serde_json::to_string(&finish).unwrap();
+        assert!(text.contains("\"name\":\"mcp_sign_in_finish\""), "{text}");
+        assert!(text.contains("\"code\":\"the-code\""), "{text}");
+        assert!(text.contains("\"state\":\"the-state\""), "{text}");
+        assert!(
+            text.contains("\"path\":\"/an-issuer-key/callback\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"iss\":\"https://auth.example.com\""),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), finish);
+
+        // An authorization server that omits RFC 9207's `iss`, and a caller
+        // that names no path, still decode for the Space to refuse.
+        let bare: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"mcp_sign_in_finish\",\"args\":{{\"sign_in\":\"{sign_in}\",\
+             \"code\":\"the-code\",\"state\":\"the-state\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            bare,
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                path: None,
+                iss: None,
+            }
+        );
     }
 
     #[test]

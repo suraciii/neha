@@ -1806,3 +1806,48 @@ async fn a_space_that_stops_sending_ends_the_channel() {
 
     let _ = space.await;
 }
+
+/// A skill script the Space delivers runs through the channel: the daemon
+/// runs the delivered bytes and answers with the shell's output.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_skill_script_runs_through_the_channel() {
+    let workspace = tempfile::tempdir().unwrap();
+    let bot = Id::new();
+    let (folder, runtimes) = managed_bot(workspace.path(), bot);
+    let config = channel_config(workspace.path());
+    let content = "#!/bin/sh\nprintf 'hello %s' \"$1\"\n";
+
+    let answer = execute_frame(
+        &config,
+        &[],
+        &[],
+        &runtimes,
+        &Mutex::new(None),
+        HostFrame::Action {
+            id: 1,
+            bot: bot.to_string(),
+            action: WireAction::RunScript {
+                name: "greet.sh".to_owned(),
+                content: content.to_owned(),
+                arguments: vec!["space".to_owned()],
+            },
+            working_dir: None,
+            access: AccessFrame::default(),
+            env: Vec::new(),
+        },
+    )
+    .await;
+
+    let DeviceFrame::Result { status, output, .. } = answer else {
+        panic!("expected a result, got {answer:?}");
+    };
+    assert_eq!(status, ActionStatus::Succeeded, "{output:?}");
+    assert!(output.text.contains("hello space"), "{output:?}");
+    // A staged script is unique per action and gone once it ran.
+    let staging = folder.join(".neha/skills");
+    assert!(
+        !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
+        "the delivered script leaves nothing behind"
+    );
+}

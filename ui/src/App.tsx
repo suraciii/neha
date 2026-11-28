@@ -1,14 +1,27 @@
-import { createMemo, createSignal, createStore, onCleanup, onSettled, Show } from "solid-js";
+import {
+  createMemo,
+  createSignal,
+  createStore,
+  For,
+  onCleanup,
+  onSettled,
+  Show,
+  untrack,
+} from "solid-js";
 
 import AuthView from "./components/AuthView";
 import BotPage from "./components/BotPage";
 import ChatView from "./components/ChatView";
+import Icon from "./components/Icon";
+import IntegrationsView from "./components/IntegrationsView";
 import Rail, { type RailView } from "./components/Rail";
 import SettingsPage from "./components/SettingsPage";
 import SetupView from "./components/SetupView";
 import Sidebar, { type SettingsSection } from "./components/Sidebar";
+import SkillsView from "./components/SkillsView";
 import { type MessageKey, t } from "./i18n";
 import { ApiError, api } from "./lib/api";
+import { readCard } from "./lib/cards";
 import { indexFiles, MAX_FILE_BYTES, MAX_FILE_LABEL, mediaTypeFor } from "./lib/files";
 import { watchViewportHeight } from "./lib/viewport";
 import { Commands, ProtocolError } from "./lib/ws";
@@ -19,6 +32,7 @@ import type {
   Bot,
   BotCreateResult,
   BotResult,
+  Card,
   CatalogRefreshResult,
   CatalogStatus,
   CatalogVendor,
@@ -27,6 +41,9 @@ import type {
   Computer,
   Decision,
   FileSummary,
+  InstalledPackage,
+  McpServer,
+  McpSignInState,
   MemoryList,
   Message,
   Model,
@@ -38,6 +55,7 @@ import type {
   RunProgress,
   RunView,
   SendResult,
+  Skill,
   ThinkingLevel,
   ToolAction,
 } from "./types";
@@ -227,6 +245,111 @@ function emptyState(): State {
   };
 }
 
+// What a ChatView renders. Most of it is the page's own state, which moves on
+// to the next Chat as soon as the reader switches; a Chat that leaves keeps the
+// values it showed, so its view — and the apps' frames inside it — is frozen
+// rather than remounted while they answer the host's teardown request.
+interface FrozenChat {
+  bot: Bot | null;
+  computer: Computer | null;
+  messages: Message[];
+  files: Record<string, FileSummary>;
+  approvals: Approval[];
+  submitting: boolean;
+  status: ChatStatus;
+  queue: RunProgress | null;
+  busy: boolean;
+  activity: RunActivity | null;
+  deciding: string | null;
+  error: string | null;
+}
+
+// One ChatView the page renders. The entry keeps its identity for as long as its
+// view is mounted: a Chat that leaves is the same entry, so <For> freezes its
+// view instead of remounting it.
+interface ChatPane {
+  id: string;
+}
+
+// How often the page asks what became of a started browser sign-in, and how
+// long it keeps asking: the Space forgets a sign-in after five minutes.
+const SIGN_IN_POLL_MS = 1_000;
+const SIGN_IN_WINDOW_MS = 5 * 60 * 1_000;
+// Starting a sign-in discovers the provider's OAuth metadata, which may take
+// longer than an ordinary command may wait.
+const SIGN_IN_START_TIMEOUT_MS = 60_000;
+
+// The SKILL.md document the Skills view's Add form describes: the two required
+// frontmatter fields, then the instructions as the body.
+function skillDocument(name: string, description: string, body: string): string {
+  const instructions = body.trim();
+  const suffix = instructions === "" ? "" : `\n${instructions}\n`;
+  return `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n${suffix}`;
+}
+
+// Whether an event changed what a library view lists, or who may use it.
+function isLibraryEvent(kind: string): boolean {
+  return (
+    kind.startsWith("neha.mcp.") ||
+    kind.startsWith("neha.skill.") ||
+    kind.startsWith("neha.plugin.") ||
+    kind.startsWith("neha.bot.")
+  );
+}
+
+// How many live Messages and Cards a page keeps for reads still on their way,
+// and how many Chats it may keep them for. The newest events are the only ones
+// a read in flight can miss; older ones would only grow a map no answer
+// retires.
+const LIVE_MESSAGE_LIMIT = 100;
+const LIVE_CARD_LIMIT = 100;
+const LIVE_CHAT_LIMIT = 16;
+
+// How long a Chat the reader left may keep its view — and the apps' frames
+// inside it — alive while its cards answer the host's teardown request. A
+// document that never answers must not hold the view forever.
+const CHAT_HANDOFF_MS = 600;
+
+// What the newest page still keeps for a read on its way. A test hook: the test
+// that proves a settled read retires what it merged reads this, because the
+// view shows the same row whether or not the copy is still held.
+export const liveRetained = { messages: 0, chats: 0 };
+
+// Whether two record values are the same JSON. A Message is plain data from the
+// Space, so comparing its shape is how a refresh tells an unchanged row from a
+// changed one.
+function sameJson(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (typeof left !== "object" || typeof right !== "object") return false;
+  if (left === null || right === null) return false;
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return (
+      left.length === right.length && left.every((value, index) => sameJson(value, right[index]))
+    );
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const keys = Object.keys(leftRecord);
+  if (keys.length !== Object.keys(rightRecord).length) return false;
+  return keys.every(
+    (key) => Object.hasOwn(rightRecord, key) && sameJson(leftRecord[key], rightRecord[key]),
+  );
+}
+
+// Keeps the row identity of every Message a read did not change. Solid's <For>
+// keys rows by object identity, so a refresh that rebuilt equal Messages would
+// remount each row — and an open app's frame would lose its state. Only a row
+// whose content changed gets a new object.
+function preserveMessages(previous: Message[], next: Message[]): Message[] {
+  if (previous.length === 0) return next;
+  const known = new Map(previous.map((message) => [message.id, message]));
+  return next.map((message) => {
+    const old = known.get(message.id);
+    return old && sameJson(old, message) ? old : message;
+  });
+}
+
 export default function App() {
   const [state, setState] = createStore<State>(emptyState());
   // Writes the fields the caller names, or lets the caller write the store.
@@ -241,8 +364,16 @@ export default function App() {
       const current = draft.previews[chatId];
       if (current === next) return;
       if (current && next && "text" in current && "text" in next) {
-        if (current.text === next.text && current.file === next.file) return;
-        draft.previews[chatId] = { text: next.text, file: next.file };
+        // A Card-only Message has no text to show, so the preview keeps its
+        // card flag: the sidebar names the app instead of drawing a blank line.
+        const card = next.card === true;
+        if (
+          current.text === next.text &&
+          current.file === next.file &&
+          (current.card === true) === card
+        )
+          return;
+        draft.previews[chatId] = { text: next.text, file: next.file, card };
         return;
       }
       if (current && next && "error" in current && "error" in next) return;
@@ -254,8 +385,8 @@ export default function App() {
   const [authMode, setAuthMode] = createSignal<AuthMode>("login");
   const [authSecret, setAuthSecret] = createSignal("");
   const [isMobile, setIsMobile] = createSignal(false);
-  // What the rail selected: the Chats, the approvals that wait, or one of the
-  // management surfaces.
+  // What the rail selected: the Chats, the approvals that wait, one of the
+  // management surfaces, or one of the libraries the Space holds.
   const [view, setView] = createSignal<RailView>("chats");
   // What the Settings surface shows.
   const [section, setSection] = createSignal<SettingsSection>("providers");
@@ -301,8 +432,44 @@ export default function App() {
   const [focus, setFocus] = createSignal<string | null>(null);
   // The Message a notification named, in the Chat it opened.
   const [focusMessage, setFocusMessage] = createSignal<string | null>(null);
+  // What the Integrations and Skills views list. Each list is read when its
+  // view is first opened, and again when the record says it changed.
+  const [integrations, setIntegrations] = createSignal<McpServer[]>([]);
+  const [packages, setPackages] = createSignal<InstalledPackage[]>([]);
+  const [skills, setSkills] = createSignal<Skill[]>([]);
+  // One library command or read is in flight.
+  const [libraryBusy, setLibraryBusy] = createSignal(false);
+  // What the Space refused, in the User's words: the views show it as one line.
+  const [libraryError, setLibraryError] = createSignal<string | null>(null);
+  // The URL of a sign-in whose window the browser would not open, so the view
+  // can offer it as a link while the page keeps polling.
+  const [signInFallback, setSignInFallback] = createSignal<string | null>(null);
   const commands = new Commands();
   let runGeneration = 0;
+  // How many library reads and commands are in flight, so one answer does not
+  // reopen the controls another answer still holds.
+  let libraryWork = 0;
+  let libraryRefreshTimer: number | null = null;
+  let libraryRefreshInFlight = false;
+  let libraryRefreshAgain = false;
+  // The lists this page has read once. A view opens its lists the first time,
+  // and later opens show what the record's events kept current.
+  let integrationsLoaded = false;
+  let packagesLoaded = false;
+  let skillsLoaded = false;
+  // A read of a list is already on its way, so opening the view again adds no
+  // second read.
+  let integrationsLoading = false;
+  let skillsLoading = false;
+  // The browser sign-ins this page polls while the Space has not settled them,
+  // with the URL each was opened at and the window it was opened in.
+  interface SignInWatch {
+    timer: number;
+    url: string;
+    popup: Window | null;
+  }
+  const signInWatches = new Map<string, SignInWatch>();
+  const signInAsking = new Set<string>();
   let following = false;
   let refreshTimer: number | null = null;
   let refreshAgain = false;
@@ -332,6 +499,17 @@ export default function App() {
   // The Chat each Run this page heard about works in, from the events that name
   // both. A Run's end names no Chat, so the page remembers it here.
   const runChats = new Map<string, string>();
+  // The Cards the record named as it added Messages, by Message id, with the
+  // Chat each belongs to. A read of the Chat may answer with a record older
+  // than an event already heard, so a Card the page was told about survives
+  // that answer.
+  const liveCards = new Map<string, { chat: string; card: Card }>();
+  // The Messages the record added live, by Message id. A read sent before the
+  // record wrote one may answer without it, so the page keeps the Message whole
+  // rather than only annotating the rows a read happens to return. Only the
+  // open Chat's Messages are kept: no read of another Chat is on its way, and a
+  // Message the page can never show again must not hold memory.
+  const liveMessages = new Map<string, Message>();
   // The Chats whose Runs the page learned from a snapshot rather than from an
   // event. When such a Run ends, the Space's word is read once more.
   const seeded = new Set<string>();
@@ -341,8 +519,234 @@ export default function App() {
   // The followed Run's tool activity, while it has any.
   const [activity, setActivity] = createSignal<RunActivity | null>(null);
 
+  // The ChatViews the page renders: the Chat on screen, and the one it just left
+  // while its apps answer the host's teardown request. Entries are kept by
+  // identity, so a view that stays mounted is never remounted — a remount would
+  // replace every app's frame and lose the document that must answer.
+  const [panes, setPanes] = createSignal<ChatPane[]>([]);
+  // What the Chat the reader left showed, while its apps close. The page never
+  // reads its own state through this: it is only what the leaving view renders.
+  const [leavingChat, setLeavingChat] = createSignal<{ id: string; frozen: FrozenChat } | null>(
+    null,
+  );
+  // The bounded wait for a leaving view whose apps never answer.
+  let handoffTimer: number | null = null;
+
+  // The values the Chat on screen shows now, kept for its view once the reader
+  // leaves. The fields are replaced by the page, never mutated, so the view sees
+  // exactly what it showed a moment ago.
+  function leavingValues(): FrozenChat {
+    return {
+      bot: state.activeBot,
+      computer: state.activeComputer,
+      messages: [...state.messages],
+      // The same File index object: replacing its identity would tell every
+      // Card's own effect that its File changed, and a Card would reset the
+      // state it is closing.
+      files: state.files,
+      approvals: [...state.approvals],
+      submitting: state.submitting,
+      status: chatStatus(),
+      queue: state.queue,
+      busy: busyChat(),
+      activity: shownActivity(),
+      deciding: state.deciding,
+      error: errorText(),
+    };
+  }
+
+  // Whether a Chat carries an app whose document must answer the host's teardown
+  // request before the Chat's view may leave.
+  function hasApp(messages: Message[]): boolean {
+    return messages.some((message) => message.card?.kind === "app");
+  }
+
+  // Stops the bounded wait and forgets the view that was leaving.
+  function endHandoff() {
+    if (handoffTimer !== null) {
+      window.clearTimeout(handoffTimer);
+      handoffTimer = null;
+    }
+    setLeavingChat(null);
+  }
+
+  // The view of a Chat that left has nothing more to wait for: its apps all
+  // answered, or the bounded wait ended. Only now may the view — and its frames
+  // — leave.
+  function dropChatPane(id: string) {
+    endHandoff();
+    setPanes((current) => current.filter((pane) => pane.id !== id));
+  }
+
+  // The page rendered for a leaving Chat stops waiting once its last app closed.
+  // It runs from the view's effect phase, so it reads the current leaving view
+  // rather than tracking it.
+  function finishChatRetire(id: string) {
+    const leaving = untrack(leavingChat);
+    if (leaving === null || leaving.id !== id) return;
+    dropChatPane(id);
+  }
+
+  // Starts the bounded wait: a document that never answers the host's teardown
+  // request must not hold the view forever.
+  function armHandoff(id: string) {
+    if (handoffTimer !== null) window.clearTimeout(handoffTimer);
+    handoffTimer = window.setTimeout(() => {
+      handoffTimer = null;
+      setLeavingChat(null);
+      setPanes((current) => current.filter((pane) => pane.id !== id));
+    }, CHAT_HANDOFF_MS);
+  }
+
+  // The reader moved to another Chat, or back to the list. The view of the Chat
+  // they left stays mounted — hidden — while its apps answer the host's teardown
+  // request: a frame removed before its document answers is gone for good. A
+  // Chat with no app card has nothing to keep, so the switch is immediate.
+  function handOffChat(next: string | null) {
+    const known = panes();
+    const current = state.activeChat;
+    if (current !== null && current.id === next) {
+      // Re-opening the Chat already on screen changes no view.
+      if (!known.some((pane) => pane.id === next)) setPanes([...known, { id: next }]);
+      return;
+    }
+    const frozen = current !== null && hasApp(state.messages) ? leavingValues() : null;
+    const target = next === null ? undefined : known.find((pane) => pane.id === next);
+    const left = current === null ? undefined : known.find((pane) => pane.id === current.id);
+    const stale = leavingChat();
+    const nextPanes: ChatPane[] = [];
+    for (const pane of known) {
+      if (pane === target) {
+        // The reader came back to a Chat that had not finished leaving: it takes
+        // the screen again, in the place it already held.
+        nextPanes.push(pane);
+        continue;
+      }
+      if (pane === left) {
+        if (frozen !== null) nextPanes.push(pane);
+        continue;
+      }
+      // Only the Chat the reader just left keeps a view: one already leaving is
+      // dropped, so the page never stacks transitions.
+      if (stale !== null && pane.id === stale.id) continue;
+      nextPanes.push(pane);
+    }
+    if (next !== null && !nextPanes.some((pane) => pane.id === next)) {
+      nextPanes.push({ id: next });
+    }
+    setPanes(nextPanes);
+    if (frozen !== null && left !== undefined) {
+      setLeavingChat({ id: left.id, frozen });
+      armHandoff(left.id);
+    } else {
+      endHandoff();
+    }
+  }
+
   function noteRun(run: string, chat: string) {
     if (!runChats.has(run)) runChats.set(run, chat);
+  }
+
+  // Counts what the live maps still keep, for the test hook below.
+  function noteLiveRetention() {
+    liveRetained.messages = liveMessages.size;
+    liveRetained.chats = new Set([...liveMessages.values()].map((message) => message.chat)).size;
+  }
+
+  // Keeps the live maps within a bound: a read that never answers must not grow
+  // them forever. The oldest event goes first, and an old Chat's Messages go
+  // with it, because only the newest events can still be missing from a read
+  // that is on its way.
+  function trimLive() {
+    while (liveMessages.size > LIVE_MESSAGE_LIMIT) {
+      const oldest = liveMessages.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      liveMessages.delete(oldest);
+      liveCards.delete(oldest);
+    }
+    while (liveCards.size > LIVE_CARD_LIMIT) {
+      const oldest = liveCards.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      liveCards.delete(oldest);
+    }
+    const chats = new Set([...liveMessages.values()].map((message) => message.chat));
+    if (chats.size > LIVE_CHAT_LIMIT) {
+      const [oldestChat] = chats;
+      for (const [id, message] of liveMessages) {
+        if (message.chat === oldestChat) liveMessages.delete(id);
+      }
+      for (const [id, entry] of liveCards) {
+        if (entry.chat === oldestChat) liveCards.delete(id);
+      }
+    }
+    noteLiveRetention();
+  }
+
+  // Keeps one Message a read may still be missing.
+  function keepLiveMessage(message: Message) {
+    liveMessages.set(message.id, message);
+    trimLive();
+  }
+
+  // Keeps one Card a read may still be missing for a Message it already has.
+  function keepLiveCard(id: string, chat: string, card: Card) {
+    liveCards.set(id, { chat, card });
+    trimLive();
+  }
+
+  // The reader left a Chat, so no read of it is on its way: what the page kept
+  // live for it retires with it.
+  function forgetLiveChat(chat: string) {
+    for (const [id, message] of liveMessages) {
+      if (message.chat === chat) liveMessages.delete(id);
+    }
+    for (const [id, entry] of liveCards) {
+      if (entry.chat === chat) liveCards.delete(id);
+    }
+    noteLiveRetention();
+  }
+
+  // Takes the Messages a read answered with, attaches the Cards the record
+  // named, and appends the live Messages the answer predates. A stale read
+  // therefore hides neither a Card nor a Message the page was already told
+  // about: both arrive through the same live merge. A Message the answer now
+  // carries needs no live copy, so that copy retires with this read.
+  function withCards(chat: string, messages: Message[]): Message[] {
+    const rows = new Map(messages.map((message) => [message.id, message]));
+    const live = [...liveMessages.values()].filter(
+      (message) => message.chat === chat && !rows.has(message.id),
+    );
+    const shown = live.length === 0 ? messages : [...messages, ...live];
+    for (const id of rows.keys()) {
+      liveMessages.delete(id);
+      // A read that already names the Card no longer needs the event's copy.
+      if (rows.get(id)?.card) liveCards.delete(id);
+    }
+    noteLiveRetention();
+    if (liveCards.size === 0) return shown;
+    return shown.map((message) => {
+      if (message.card) return message;
+      const kept = liveCards.get(message.id);
+      return kept ? { ...message, card: kept.card } : message;
+    });
+  }
+
+  // Writes the File index a read answered with, touching only the Files whose
+  // content changed. A whole new record would tell the reader of one File that
+  // every File moved, and a Card that shows one File would load it again — its
+  // frame would be replaced and its app state lost — though nothing changed.
+  function mergeFiles(files: FileSummary[]) {
+    const next = indexFiles(files);
+    setState((draft) => {
+      for (const id of Object.keys(draft.files)) {
+        if (!(id in next)) delete draft.files[id];
+      }
+      for (const [id, file] of Object.entries(next)) {
+        const known = draft.files[id];
+        if (known && sameJson(known, file)) continue;
+        draft.files[id] = file;
+      }
+    });
   }
 
   // The Run moved to a new step, so the card counts the newest one.
@@ -644,7 +1048,7 @@ export default function App() {
       step: action.step,
       tool: action.tool,
       status: actionStatusOf(action.status),
-      error: action.status === "failed" ? (action.error ?? null) : null,
+      error: action.error ?? null,
     }));
     // A Run that failed before its first step has no steps and no actions to
     // restore, but it still has its reason to show.
@@ -712,6 +1116,18 @@ export default function App() {
     if (mediaQuery && onMediaChange) mediaQuery.removeEventListener("change", onMediaChange);
     if (onPopState) window.removeEventListener("popstate", onPopState);
     if (stopViewport) stopViewport();
+    if (handoffTimer !== null) {
+      window.clearTimeout(handoffTimer);
+      handoffTimer = null;
+    }
+    if (libraryRefreshTimer !== null) {
+      window.clearTimeout(libraryRefreshTimer);
+      libraryRefreshTimer = null;
+    }
+    for (const watch of signInWatches.values()) window.clearInterval(watch.timer);
+    signInWatches.clear();
+    signInAsking.clear();
+    setSignInFallback(null);
     void commands.close();
   });
 
@@ -925,11 +1341,42 @@ export default function App() {
       void refreshProviders();
       return;
     }
+    // An event that changed what a library holds or who may use it: the views
+    // read the lists it touched again. Every other event leaves them alone.
+    if (isLibraryEvent(event.kind)) queueLibraryRefresh();
     const run = typeof data.run === "string" ? data.run : null;
     if (event.kind === "neha.message.added" && chat) {
       const text = typeof data.text === "string" ? data.text : "";
       const carried = typeof data.file === "string" ? data.file : null;
-      setPreview(chat, { text, file: carried !== null });
+      // A tool's Card arrives with the Message that carries it; keep it for the
+      // read that follows, which may answer with the record as it was before.
+      const card = readCard(data.card);
+      const id = typeof data.message === "string" ? data.message : null;
+      // Only the open Chat may keep a live copy: the page reads no other Chat,
+      // so no read of it is on its way that could answer without this Message,
+      // and a copy no read retires would hold memory forever. A Message or Card
+      // the view already holds needs no copy either.
+      const shown = chat === state.activeChat?.id;
+      const known = shown ? state.messages.find((message) => message.id === id) : undefined;
+      if (shown && card && id && !known?.card) keepLiveCard(id, chat, card);
+      // The read that follows may predate the record's write of this Message,
+      // so the live event keeps the whole Message, not only its Card.
+      if (shown && id && !known) {
+        keepLiveMessage({
+          id,
+          chat,
+          author: event.author,
+          acting: event.acting ?? null,
+          text,
+          at: event.at,
+          seq: event.seq,
+          run,
+          file: carried,
+          ...(card ? { card } : {}),
+        });
+      }
+      // A Card-only Message has no text, so the preview names the app instead.
+      setPreview(chat, { text, file: carried !== null, card: card !== null });
       // A Bot reply names its Run, which is how the page learns which Chat a
       // Run belongs to: the events that end a Run name no Chat.
       if (run) noteRun(run, chat);
@@ -1163,6 +1610,387 @@ export default function App() {
     }, 50);
   }
 
+  // Puts one view on screen. A library view reads what it lists the first time
+  // it opens; later opens show what the record kept current.
+  function showView(next: RailView) {
+    setView(next);
+    if (next !== "integrations" && next !== "skills") return;
+    // A refusal from an earlier visit does not belong to the list being opened.
+    setLibraryError(null);
+    if (next === "integrations") void loadIntegrations();
+    else void loadSkills();
+  }
+
+  // Opens a view from the rail or the sidebar, or the Chats a library's own
+  // Back selects. On a phone a surface the rail selects is a step of its own,
+  // so the history gets an entry for it: the system Back then leaves the
+  // library for the surface before it rather than skipping it.
+  function selectView(next: RailView) {
+    remember({ chat: state.activeChat?.id ?? null, view: next, section: null, bot: null });
+    showView(next);
+  }
+
+  function isAdmin(): boolean {
+    return state.account?.is_admin === true;
+  }
+
+  function beginLibraryWork() {
+    libraryWork += 1;
+    setLibraryBusy(true);
+  }
+
+  function endLibraryWork() {
+    libraryWork = Math.max(0, libraryWork - 1);
+    if (libraryWork === 0) setLibraryBusy(false);
+  }
+
+  // The Space's MCP servers and, for the Admin, the packages it installed. A
+  // non-Admin never asks for the packages: the Space refuses that read. The
+  // view still groups the servers a package brought, under a neutral name.
+  async function loadIntegrations(): Promise<void> {
+    if (integrationsLoaded && (packagesLoaded || !isAdmin())) return;
+    if (integrationsLoading) return;
+    integrationsLoading = true;
+    beginLibraryWork();
+    setLibraryError(null);
+    try {
+      if (!integrationsLoaded) {
+        const servers = await commands.command<McpServer[]>("mcp_list");
+        setIntegrations(servers);
+        integrationsLoaded = true;
+      }
+      if (isAdmin() && !packagesLoaded) {
+        const installed = await commands.command<InstalledPackage[]>("plugin_list");
+        setPackages(installed);
+        packagesLoaded = true;
+      }
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      integrationsLoading = false;
+      endLibraryWork();
+    }
+  }
+
+  // The skills the Space and the reader's Bots hold. The packages an Admin may
+  // read come with them, so a skill a package brought can name it.
+  async function loadSkills(): Promise<void> {
+    if (skillsLoaded && (packagesLoaded || !isAdmin())) return;
+    if (skillsLoading) return;
+    skillsLoading = true;
+    beginLibraryWork();
+    setLibraryError(null);
+    try {
+      if (!skillsLoaded) {
+        const listed = await commands.command<Skill[]>("skill_list", {});
+        setSkills(listed);
+        skillsLoaded = true;
+      }
+      if (isAdmin() && !packagesLoaded) {
+        const installed = await commands.command<InstalledPackage[]>("plugin_list");
+        setPackages(installed);
+        packagesLoaded = true;
+      }
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      skillsLoading = false;
+      endLibraryWork();
+    }
+  }
+
+  // Reads the lists the views already hold: a list a User never opened is left
+  // alone, so an event for it changes nothing until its view opens.
+  async function refreshLibraries(): Promise<void> {
+    if (!integrationsLoaded && !skillsLoaded) return;
+    beginLibraryWork();
+    try {
+      const reads: Promise<void>[] = [];
+      if (integrationsLoaded) {
+        reads.push(
+          commands.command<McpServer[]>("mcp_list").then((servers) => {
+            setIntegrations(servers);
+          }),
+        );
+        if (isAdmin()) {
+          reads.push(
+            commands.command<InstalledPackage[]>("plugin_list").then((installed) => {
+              setPackages(installed);
+              packagesLoaded = true;
+            }),
+          );
+        }
+      }
+      if (skillsLoaded) {
+        reads.push(
+          commands.command<Skill[]>("skill_list", {}).then((listed) => {
+            setSkills(listed);
+          }),
+        );
+      }
+      // Both views name Bots and toggle their servers and skills, so the Bots
+      // are read with them. Each one is copied: a row keyed by its object must
+      // see the server and skill lists the read replaced.
+      reads.push(
+        commands.command<Bot[]>("bot_list").then((listed) => {
+          update({
+            bots: listed
+              .map((bot) => ({ ...bot }))
+              .sort((left, right) => left.id.localeCompare(right.id)),
+          });
+        }),
+      );
+      await Promise.all(reads);
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      endLibraryWork();
+    }
+  }
+
+  // Coalesces the reads a burst of library events and command answers asks
+  // for, so an event about a command the page just ran is one read, not two.
+  // A request that lands while a read runs asks for one more read: its change
+  // arrived after the answer the read was sent with.
+  function queueLibraryRefresh(): void {
+    if (libraryRefreshInFlight) {
+      libraryRefreshAgain = true;
+      return;
+    }
+    if (libraryRefreshTimer !== null) window.clearTimeout(libraryRefreshTimer);
+    libraryRefreshTimer = window.setTimeout(() => {
+      libraryRefreshTimer = null;
+      libraryRefreshInFlight = true;
+      void refreshLibraries().finally(() => {
+        libraryRefreshInFlight = false;
+        if (libraryRefreshAgain) {
+          libraryRefreshAgain = false;
+          queueLibraryRefresh();
+        }
+      });
+    }, 50);
+  }
+
+  // Runs one library command. The views wait while it is in flight, a refusal
+  // shows above the list it would have changed, and an accepted change is read
+  // back from the Space after the record's own event has landed.
+  async function libraryCommand(run: () => Promise<unknown>): Promise<void> {
+    if (libraryBusy()) return;
+    beginLibraryWork();
+    setLibraryError(null);
+    let accepted = false;
+    try {
+      await run();
+      accepted = true;
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      endLibraryWork();
+    }
+    if (accepted) queueLibraryRefresh();
+  }
+
+  // Connects an MCP server. The token lives only in this call and the frame it
+  // sends: it never enters a signal, a log, or the page after the answer.
+  function addIntegration(input: {
+    name: string;
+    url: string;
+    scope: "space" | "user";
+    token: string;
+  }): Promise<void> {
+    const args: Record<string, unknown> = { name: input.name, url: input.url, scope: input.scope };
+    if (input.token !== "") args.credential = input.token;
+    return libraryCommand(() => commands.command("mcp_add", args));
+  }
+
+  function connectIntegration(server: string, token: string): Promise<void> {
+    return libraryCommand(() => commands.command("mcp_connect", { server, credential: token }));
+  }
+
+  function removeIntegration(server: string): Promise<void> {
+    return libraryCommand(() => commands.command("mcp_remove", { server }));
+  }
+
+  function setBotIntegration(bot: string, server: string, enabled: boolean): Promise<void> {
+    return libraryCommand(() =>
+      commands.command(enabled ? "bot_mcp_enable" : "bot_mcp_disable", { bot, server }),
+    );
+  }
+
+  function setPackageEnabled(plugin: string, enabled: boolean): Promise<void> {
+    return libraryCommand(() =>
+      commands.command(enabled ? "plugin_enable" : "plugin_disable", { plugin }),
+    );
+  }
+
+  // Adds a skill to the library the Add form names. The Space reads one
+  // SKILL.md document, so the form's fields become its frontmatter and body.
+  function addSkill(input: {
+    name: string;
+    description: string;
+    body: string;
+    bot: string | null;
+    scripts: { name: string; content: string }[];
+  }): Promise<void> {
+    const document = skillDocument(input.name, input.description, input.body);
+    const args =
+      input.bot === null
+        ? { library: "space", document, scripts: input.scripts }
+        : { library: "bot", bot: input.bot, document, scripts: input.scripts };
+    return libraryCommand(() => commands.command("skill_add", args));
+  }
+
+  function removeSkill(skill: string): Promise<void> {
+    return libraryCommand(() => commands.command("skill_remove", { skill }));
+  }
+
+  function setBotSkill(bot: string, skill: string, enabled: boolean): Promise<void> {
+    return libraryCommand(() =>
+      commands.command(enabled ? "bot_skill_enable" : "bot_skill_disable", { bot, skill }),
+    );
+  }
+
+  // Opens the blank window a browser sign-in will use. The click that starts
+  // the sign-in is the browser's permission to open a window; that permission
+  // is gone by the time the command's answer arrives, so the window is opened
+  // before the command is sent.
+  function openSignInWindow(): Window | null {
+    try {
+      const opened = window.open("about:blank", "_blank");
+      if (opened) {
+        // The page this window reaches later has no way back into this one.
+        try {
+          opened.opener = null;
+        } catch {
+          // A window that already navigated keeps its opener; nothing here can.
+        }
+      }
+      return opened ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function closeSignInWindow(popup: Window | null): void {
+    try {
+      if (popup && !popup.closed) popup.close();
+    } catch {
+      // A window the browser already closed needs no second close.
+    }
+  }
+
+  // Sends the sign-in's window where the Space said it goes, or keeps the URL
+  // for the view when the window is blocked or already closed.
+  function deliverSignInUrl(url: string, popup: Window | null): void {
+    if (popup && !popup.closed) {
+      try {
+        popup.location.href = url;
+        return;
+      } catch {
+        // A window this page cannot steer is one the view has to offer.
+      }
+    }
+    setSignInFallback(url);
+  }
+
+  // Starts a browser sign-in, opens the URL the Space answers with, and polls
+  // until the Space says what became of it. The answer's URL is the Space's own
+  // bind address, which sets the Space's cookie and redirects to the provider:
+  // the browser opens it as it is.
+  function startSignIn(input: {
+    name: string;
+    url: string;
+    scope: "space" | "user";
+  }): Promise<void> {
+    if (libraryBusy()) return Promise.resolve();
+    // Opened before the answer, while the click still counts as permission.
+    const popup = openSignInWindow();
+    setSignInFallback(null);
+    // An existing server keeps the name and address the Space connected; the
+    // sign-in attaches a credential to it. A new server enters the record when
+    // the sign-in finishes. Either way the scope is the one the form named,
+    // and the Space refuses a scope this caller may not use.
+    const existing = integrations().find(
+      (server) => server.name === input.name && server.url === input.url,
+    );
+    const args = existing
+      ? { server: existing.server, scope: input.scope }
+      : { name: input.name, url: input.url, scope: input.scope };
+    beginLibraryWork();
+    setLibraryError(null);
+    return (async () => {
+      try {
+        const started = await commands.command<{ sign_in: string; url: string }>(
+          "mcp_sign_in_start",
+          args,
+          SIGN_IN_START_TIMEOUT_MS,
+        );
+        deliverSignInUrl(started.url, popup);
+        watchSignIn(started.sign_in, started.url, popup);
+      } catch (reason) {
+        closeSignInWindow(popup);
+        setLibraryError(messageFor(reason));
+      } finally {
+        endLibraryWork();
+      }
+    })();
+  }
+
+  // Polls one sign-in while the Space holds it pending. The Space forgets a
+  // sign-in after five minutes, so the page stops asking then.
+  function watchSignIn(signIn: string, url: string, popup: Window | null): void {
+    stopSignIn(signIn);
+    const deadline = Date.now() + SIGN_IN_WINDOW_MS;
+    const timer = window.setInterval(() => {
+      // A window the reader closed before the Space settled the sign-in leaves
+      // the URL reachable from the list, and polling goes on.
+      if (popup?.closed && signInFallback() !== url) setSignInFallback(url);
+      if (signInAsking.has(signIn)) return;
+      signInAsking.add(signIn);
+      void (async () => {
+        try {
+          const status = await commands.command<McpSignInState>(
+            "mcp_sign_in_status",
+            { sign_in: signIn },
+            10_000,
+          );
+          if (status.state === "pending") {
+            if (Date.now() >= deadline) {
+              settleSignIn(signIn, url);
+              setLibraryError(t("error.generic"));
+            }
+            return;
+          }
+          settleSignIn(signIn, url);
+          // The Space's reason is one of its own fixed sentences, never the
+          // provider's text.
+          if (status.state === "failed") setLibraryError(status.reason ?? t("error.generic"));
+          queueLibraryRefresh();
+        } catch (reason) {
+          settleSignIn(signIn, url);
+          setLibraryError(messageFor(reason));
+        } finally {
+          signInAsking.delete(signIn);
+        }
+      })();
+    }, SIGN_IN_POLL_MS);
+    signInWatches.set(signIn, { timer, url, popup });
+  }
+
+  // Stops polling one sign-in, and drops its fallback link when it is the one
+  // on the page.
+  function settleSignIn(signIn: string, url: string): void {
+    stopSignIn(signIn);
+    if (signInFallback() === url) setSignInFallback(null);
+  }
+
+  function stopSignIn(signIn: string) {
+    const watch = signInWatches.get(signIn);
+    if (!watch) return;
+    window.clearInterval(watch.timer);
+    signInWatches.delete(signIn);
+  }
+
   async function boot() {
     setOffline(false);
     setReady(false);
@@ -1284,9 +2112,14 @@ export default function App() {
   }
 
   async function selectChat(chat: Chat, focus?: string | null, message?: string | null) {
+    // The Chat on screen keeps its view (and its apps' frames) until they close.
+    handOffChat(chat.id);
     const generation = ++runGeneration;
     followed = null;
     setActivity(null);
+    // The reader left the Chat that was open: no read of it is on its way, so
+    // what the page kept live for it retires before the new Chat's read lands.
+    if (state.activeChat) forgetLiveChat(state.activeChat.id);
     update({
       activeChat: chat,
       messages: [],
@@ -1317,15 +2150,16 @@ export default function App() {
       // about what that Chat does: the page takes it over the list's copy, so
       // the header, the badge and the composer all read the same projection.
       const answered: Chat = bot.chat ? { ...chat, ...bot.chat } : chat;
+      const shown = withCards(chat.id, messages);
       update({
         activeChat: answered,
-        messages,
-        files: indexFiles(files),
+        messages: shown,
         approvals: mergeApprovals(approvals, state.approvals),
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
-      await restoreRun(answered, messages, generation);
+      mergeFiles(files);
+      await restoreRun(answered, shown, generation);
     } catch (reason) {
       if (isCurrentChat(chat, generation)) update({ error: reason });
     }
@@ -1407,14 +2241,17 @@ export default function App() {
         commands.command<Approval[]>("approval_list", { chat: chat.id }),
       ]);
       if (!isCurrentChat(chat, generation)) return;
+      const shown = withCards(chat.id, messages);
+      // A refresh that answers with the same record must not remount its rows:
+      // the rows keep their identity, and an open app's frame keeps its state.
       update({
-        messages,
-        files: indexFiles(files),
+        messages: preserveMessages(state.messages, shown),
         approvals: mergeApprovals(approvals, state.approvals),
       });
-      const last = messages.at(-1);
+      mergeFiles(files);
+      const last = shown.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
-      await reconcileRun(chat, messages, generation);
+      await reconcileRun(chat, shown, generation);
     } catch (reason) {
       if (isCurrentChat(chat, generation)) update({ error: reason });
     }
@@ -1425,6 +2262,10 @@ export default function App() {
     const chat = state.activeChat;
     const bot = state.activeBot;
     if (!chat || !bot || state.submitting) return false;
+    // The Chat already works or waits for an answer, so its composer is closed.
+    // The card sends through this same boundary, so it is refused the same way:
+    // a Card must not be able to enqueue a second Run while the Bot is busy.
+    if (busyChat()) return false;
     if (!text && !file) return false;
     const generation = runGeneration;
 
@@ -1596,9 +2437,13 @@ export default function App() {
   }
 
   function backToList() {
+    // Leaving to the list is a switch too: the Chat's apps close before its view
+    // leaves, exactly as when another Chat takes the screen.
+    handOffChat(null);
     runGeneration += 1;
     followed = null;
     setActivity(null);
+    if (state.activeChat) forgetLiveChat(state.activeChat.id);
     update({
       activeChat: null,
       messages: [],
@@ -1632,7 +2477,13 @@ export default function App() {
     const named = typeof entry.chat === "string" ? entry.chat : entry.nehaChat;
     return {
       chat: typeof named === "string" ? named : null,
-      view: entry.view === "bots" || entry.view === "settings" ? entry.view : "chats",
+      view:
+        entry.view === "bots" ||
+        entry.view === "settings" ||
+        entry.view === "integrations" ||
+        entry.view === "skills"
+          ? entry.view
+          : "chats",
       section: typeof entry.section === "string" ? (entry.section as SettingsSection) : null,
       bot: typeof entry.bot === "string" ? entry.bot : null,
     };
@@ -1690,7 +2541,10 @@ export default function App() {
       const bot = state.bots.find((known) => known.id === shown.bot);
       if (bot) await selectPageBot(bot);
     }
-    setView(shown.view);
+    // A library view reads the list it shows, the way selecting it in the rail
+    // does; every other surface is just the view it names.
+    if (shown.view === "integrations" || shown.view === "skills") showView(shown.view);
+    else setView(shown.view);
     // The Settings surface reads what it connects from, so a screen that lands on
     // it reads it again, the way opening the surface does.
     if (shown.view === "settings") void loadSettings();
@@ -2256,6 +3110,21 @@ export default function App() {
   // unless a management surface is open, where its list is how a Space with no
   // Provider yet gets one.
   const showSetup = () => needsSetup() && !showManage();
+  // The two library views the rail opens, and the account they render with.
+  const libraryView = () => view() === "integrations" || view() === "skills";
+  const viewAccount = () => ({
+    id: state.account?.id ?? "",
+    displayName: state.account?.display_name ?? "",
+    isAdmin: state.account?.is_admin === true,
+  });
+  // The shell's classes: the detail and setup surfaces main's layout gives the
+  // main area, plus the library shell a narrow viewport fills with the view.
+  const shellClass = () => {
+    const library = libraryView();
+    const detail = showDetail() ? " app--detail" : "";
+    const setup = showSetup() && !library ? " app--setup" : "";
+    return `app${detail}${setup}${library ? " app--library" : ""}`;
+  };
 
   // What each Chat is doing, for the list and the attention section.
   const chatStates = createMemo<Record<string, ChatStatus>>(() => {
@@ -2345,15 +3214,14 @@ export default function App() {
           }
         >
           {(account) => (
-            <div
-              class={`app${showDetail() ? " app--detail" : ""}${showSetup() ? " app--setup" : ""}`}
-            >
+            <div class={shellClass()}>
               <Rail
                 account={account()}
                 view={view()}
                 attentionCount={attentionEntries().length}
                 onSelect={(next) => {
-                  if (next === "bots" || next === "settings") openManage(next);
+                  if (next === "integrations" || next === "skills") selectView(next);
+                  else if (next === "bots" || next === "settings") openManage(next);
                   else setView(next);
                 }}
               />
@@ -2379,6 +3247,7 @@ export default function App() {
                   void selectChat(chat);
                 }}
                 onAttention={(entry) => openAttention(entry)}
+                onView={(next) => selectView(next)}
                 onBot={(bot) => {
                   // A Bot's page is a step deeper than the list it was opened from,
                   // so the phone's history gets an entry for it.
@@ -2408,6 +3277,52 @@ export default function App() {
                 canCreateBot={canCreateBot()}
               />
               <main class="main">
+                {/* A narrow viewport gives the library view the whole screen and
+                    the sidebar gives way, so the view carries its own way back. */}
+                <Show when={libraryView() && isMobile()}>
+                  <div class="library__back">
+                    <button
+                      class="btn btn--quiet"
+                      type="button"
+                      aria-label={t("chat.back")}
+                      onClick={() => selectView("chats")}
+                    >
+                      <Icon name="chevron-left" size="sm" />
+                      {t("chat.back")}
+                    </button>
+                  </div>
+                </Show>
+                <Show when={view() === "integrations"}>
+                  <IntegrationsView
+                    account={viewAccount()}
+                    bots={state.bots}
+                    servers={integrations()}
+                    packages={packages()}
+                    busy={libraryBusy()}
+                    error={libraryError()}
+                    signInUrl={signInFallback()}
+                    onScopeChange={() => setLibraryError(null)}
+                    onAdd={addIntegration}
+                    onConnect={connectIntegration}
+                    onSignIn={startSignIn}
+                    onRemove={removeIntegration}
+                    onBot={setBotIntegration}
+                    onPackageEnabled={setPackageEnabled}
+                  />
+                </Show>
+                <Show when={view() === "skills"}>
+                  <SkillsView
+                    account={viewAccount()}
+                    bots={state.bots}
+                    skills={skills()}
+                    packages={packages()}
+                    busy={libraryBusy()}
+                    error={libraryError()}
+                    onAdd={addSkill}
+                    onRemove={removeSkill}
+                    onBot={setBotSkill}
+                  />
+                </Show>
                 <Show when={showManage()}>
                   <Show when={view() === "bots"}>
                     <Show
@@ -2467,56 +3382,146 @@ export default function App() {
                     />
                   </Show>
                 </Show>
-                <Show when={!showManage()}>
-                  <Show
-                    when={showChat() ? state.activeChat?.id : null}
-                    keyed
-                    fallback={
-                      <Show
-                        when={needsSetup()}
-                        fallback={
-                          <div class="select-chat">
-                            <h2>{t("select.title")}</h2>
-                          </div>
-                        }
-                      >
-                        <SetupView
-                          account={account()}
-                          providers={state.providers}
-                          models={state.models}
-                          bots={state.bots}
-                          busy={state.busy}
-                          error={errorText()}
-                          onProvider={(input) => void connectProvider(input)}
-                          onBot={(name) => void createBot(name)}
-                        />
-                      </Show>
-                    }
-                  >
-                    <ChatView
-                      account={account()}
-                      bot={state.activeBot}
-                      computer={state.activeComputer}
-                      messages={state.messages}
-                      files={state.files}
-                      approvals={state.approvals}
-                      submitting={state.submitting}
-                      status={chatStatus()}
-                      queue={state.queue}
-                      busy={busyChat()}
-                      activity={shownActivity()}
-                      focus={focus()}
-                      focusMessage={focusMessage()}
-                      onFocused={() => {
-                        setFocus(null);
-                        setFocusMessage(null);
-                      }}
-                      deciding={state.deciding}
-                      error={errorText()}
-                      onSend={sendMessage}
-                      onDecide={decideApproval}
-                      onBack={closeChat}
-                    />
+                <Show when={!showManage() && !libraryView()}>
+                  <For each={panes()}>
+                    {(pane) => {
+                      // The values a view renders while it is leaving. The page's
+                      // own fields have already moved to the Chat on screen, so
+                      // the leaving view must read only what it showed before.
+                      const frozen = () => {
+                        const leaving = leavingChat();
+                        return leaving !== null && leaving.id === pane.id ? leaving.frozen : null;
+                      };
+                      const retiring = () => frozen() !== null;
+                      // One value the view renders: the page's live state while
+                      // the Chat is on screen, the frozen copy once it leaves.
+                      const shown = <T,>(
+                        live: () => T,
+                        fromFrozen: (values: FrozenChat) => T,
+                      ): (() => T) => {
+                        return () => {
+                          const values = frozen();
+                          return values === null ? live() : fromFrozen(values);
+                        };
+                      };
+                      const bot = shown(
+                        () => state.activeBot,
+                        (values) => values.bot,
+                      );
+                      const computer = shown(
+                        () => state.activeComputer,
+                        (values) => values.computer,
+                      );
+                      const messages = shown(
+                        () => state.messages,
+                        (values) => values.messages,
+                      );
+                      const files = shown(
+                        () => state.files,
+                        (values) => values.files,
+                      );
+                      const approvals = shown(
+                        () => state.approvals,
+                        (values) => values.approvals,
+                      );
+                      const submitting = shown(
+                        () => state.submitting,
+                        (values) => values.submitting,
+                      );
+                      const status = shown(
+                        () => chatStatus(),
+                        (values) => values.status,
+                      );
+                      const queue = shown(
+                        () => state.queue,
+                        (values) => values.queue,
+                      );
+                      const busy = shown(
+                        () => busyChat(),
+                        (values) => values.busy,
+                      );
+                      const activity = shown(
+                        () => shownActivity(),
+                        (values) => values.activity,
+                      );
+                      const deciding = shown(
+                        () => state.deciding,
+                        (values) => values.deciding,
+                      );
+                      const error = shown(
+                        () => errorText(),
+                        (values) => values.error,
+                      );
+                      const paneFocus = shown(
+                        () => focus(),
+                        () => null,
+                      );
+                      const paneMessage = shown(
+                        () => focusMessage(),
+                        () => null,
+                      );
+                      return (
+                        <div
+                          class={retiring() ? "chat-pane chat-pane--retiring" : "chat-pane"}
+                          aria-hidden={retiring() ? "true" : undefined}
+                        >
+                          <ChatView
+                            account={account()}
+                            bot={bot()}
+                            computer={computer()}
+                            messages={messages()}
+                            files={files()}
+                            approvals={approvals()}
+                            submitting={submitting()}
+                            status={status()}
+                            queue={queue()}
+                            busy={busy()}
+                            activity={activity()}
+                            focus={paneFocus()}
+                            focusMessage={paneMessage()}
+                            onFocused={() => {
+                              if (retiring()) return;
+                              setFocus(null);
+                              setFocusMessage(null);
+                            }}
+                            deciding={deciding()}
+                            error={error()}
+                            onSend={(text, file) =>
+                              retiring() ? Promise.resolve(false) : sendMessage(text, file)
+                            }
+                            onDecide={(approval, allow, lasting) => {
+                              if (!retiring()) decideApproval(approval, allow, lasting);
+                            }}
+                            onBack={() => {
+                              if (!retiring()) closeChat();
+                            }}
+                            retiring={retiring()}
+                            onRetired={() => finishChatRetire(pane.id)}
+                          />
+                        </div>
+                      );
+                    }}
+                  </For>
+                  <Show when={!showChat()}>
+                    <Show
+                      when={needsSetup()}
+                      fallback={
+                        <div class="select-chat">
+                          <h2>{t("select.title")}</h2>
+                        </div>
+                      }
+                    >
+                      <SetupView
+                        account={account()}
+                        providers={state.providers}
+                        models={state.models}
+                        bots={state.bots}
+                        busy={state.busy}
+                        error={errorText()}
+                        onProvider={(input) => void connectProvider(input)}
+                        onBot={(name) => void createBot(name)}
+                      />
+                    </Show>
                   </Show>
                 </Show>
               </main>
@@ -2562,7 +3567,11 @@ function Boot() {
 
 // What the sidebar shows for a Chat's last Message.
 function previewOf(message: Message): Preview {
-  return { text: message.text, file: message.file !== null };
+  return {
+    text: message.text,
+    file: message.file !== null,
+    card: message.card != null,
+  };
 }
 
 // Whether the User answered this approval.
@@ -2605,7 +3614,14 @@ function approvalRequested(event: RecordEvent): Approval | null {
   const summary = text("summary");
   const reason = data.reason;
   if (!approval || !run || !bot || !chat || !action || !tool || !summary) return null;
-  if (reason !== "first_use_local" && reason !== "rule" && reason !== "grant") return null;
+  if (
+    reason !== "first_use_local" &&
+    reason !== "first_script_run" &&
+    reason !== "first_mcp_call" &&
+    reason !== "rule" &&
+    reason !== "grant"
+  )
+    return null;
   const card: Approval = {
     approval,
     run,

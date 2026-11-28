@@ -61,6 +61,18 @@ NEHA_PROVIDER_KEY=... neha provider add --base-url https://api.example.com/v1 \
 
 Only the Admin refreshes the catalog. The other catalog commands are reads.
 
+## Plugins and tools
+
+`neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only the Admin MAY do.
+
+`neha mcp add <name>` without an address attaches the Space's credential to an existing package `stdio` server of that name, which only the Admin MAY do.
+
+The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the browser, never from the command line. `neha mcp list` prints each server, its scope, who connected it, and whether it is connected.
+
+`neha plugin install <source>[@<commit>]` installs a package from a source the Admin allows. `neha plugin list` prints each package, its commit, and what it brought.
+
+`neha skill add <path> [--bot <bot>]` adds a skill to the Space's library or to a Bot's. `neha bot mcp enable <bot> <server>` and `neha bot skill enable <bot> <skill>` give a Bot a server or a skill; `disable` takes it away.
+
 ## Computers
 
 A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space. On the Space's own machine it uses the ticket the Space wrote; on another machine it uses a pairing code a signed-in User enters.
@@ -129,15 +141,25 @@ The command prints each kind's total used size and its limit. With no entry, it 
 
 ## Approvals
 
-`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, a lasting rule, or a folder the owner has not granted.
+`neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, the first call of a server's tool, the first run of a skill's script, a lasting rule, or a folder the owner has not granted.
 
 `neha approval show <id>` prints the action's step, call index, action, Chat, whether the form was ambiguous, the asking rule when the approval names one, and full arguments.
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. An Ask or Allow rule names one Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — and belongs to a Local Bot. A rule that names a memory tool or an unknown tool is refused, as is a rule on a Hosted Bot.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a built-in Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — a skill's script, or an MCP server's tool. A rule that names a memory tool or an unknown tool is refused.
 
-A shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
+A rule that names a tool the loop does not offer MUST be offered by an MCP server enabled for the Bot and reachable by the acting User (the named server, when the rule names one). A name no such server lists is refused as unknown, so a misspelling is never recorded.
+
+A rule that names no server matches that tool on every server that offers it. One that names a server matches only that server's tool.
+
+A rule for an action the Bot's Computer runs belongs to a Local Bot, and a Hosted Bot is refused. A rule for a Space-served call, `run_skill_script` or an MCP server's tool, belongs to a Bot on either Computer.
+
+A shell rule can name how the command starts. A file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
+
+A `run_skill_script` rule names the skill and the script it matches. An MCP server's tool rule names the server with `--server` and the tool with `--tool`, or names the tool alone to match every server that offers it.
+
+`neha rule list` and the line `neha rule add` prints distinguish those identities. A server's tool rule shows the server's name. A skill's script rule shows the skill's name and the script's file name.
 
 At a terminal, `neha chat send` shows a waiting approval with whether the action can be undone and, when the card offers it, for a rule, what Always allow covers.
 

@@ -290,13 +290,54 @@ export default function BotPage(props: BotPageProps) {
     patch({ tool: "", command: "", path: "" });
   }
 
-  // What one rule covers, in the record's words.
+  // The name behind the identifier a rule stores: the Space's read adds it,
+  // and a rule whose skill or server left its library falls back to the
+  // identifier rather than showing a name the page made up.
+  function skillName(rule: Rule): string {
+    return rule.skill_name ?? rule.skill ?? "";
+  }
+
+  // What one rule covers, in the record's words. A rule that names a call the
+  // Space answers says which skill or server it covers, so two rules for the
+  // same tool are told apart.
   function scope(rule: Rule): string {
     const parts: string[] = [];
+    if (rule.skill) parts.push(t("bot.rules.scope.skill", { skill: skillName(rule) }));
+    if (rule.script) parts.push(t("bot.rules.scope.script", { script: rule.script }));
+    if (rule.server) {
+      parts.push(
+        t("bot.rules.scope.server", {
+          server: rule.server_name ?? rule.server,
+          tool: rule.tool,
+        }),
+      );
+    }
     if (rule.command_prefix)
       parts.push(t("chat.approval.scope.shell", { command: rule.command_prefix }));
     if (rule.path_prefix) parts.push(t("chat.approval.scope.files", { path: rule.path_prefix }));
     return parts.length === 0 ? t("bot.rules.scope.all", { tool: rule.tool }) : parts.join(" · ");
+  }
+
+  // What a rule's Remove control names. A rule that covers one skill's script
+  // or one server's tool says which one, so its control is not one of two
+  // alike.
+  function removeLabel(rule: Rule): string {
+    if (rule.skill) {
+      return rule.script === undefined || rule.script === null
+        ? t("bot.rules.remove", { tool: skillName(rule) })
+        : t("bot.rules.remove.skill", { skill: skillName(rule), script: rule.script });
+    }
+    if (rule.server) {
+      return t("bot.rules.remove.server", {
+        server: rule.server_name ?? rule.server,
+        tool: rule.tool,
+      });
+    }
+    // A command or path rule is named by what it covers, not only by its tool:
+    // two shell rules for different commands are two different rules.
+    if (rule.command_prefix || rule.path_prefix)
+      return t("bot.rules.remove", { tool: scope(rule) });
+    return t("bot.rules.remove", { tool: rule.tool });
   }
 
   // The entries of one kind and scope, and the bytes that kind holds against
@@ -779,8 +820,8 @@ export default function BotPage(props: BotPageProps) {
                           <button
                             class="row__remove"
                             type="button"
-                            aria-label={t("bot.rules.remove", { tool: rule.tool })}
-                            title={t("bot.rules.remove", { tool: rule.tool })}
+                            aria-label={removeLabel(rule)}
+                            title={removeLabel(rule)}
                             disabled={props.busy}
                             onClick={() => void props.onRuleRemove(rule.rule)}
                           >
@@ -792,8 +833,10 @@ export default function BotPage(props: BotPageProps) {
                   </div>
                 </Show>
 
-                {/* A Hosted run applies no rule, so the page adds none and says
-                    why: a rule here would not protect this Bot. */}
+                {/* The form adds rules for actions the Bot's Computer runs, and
+                    a Hosted Computer takes none of those: it says why instead.
+                    A rule for a call the Space answers still applies on a
+                    Hosted Bot, and the rows above list and remove it. */}
                 <Show
                   when={hosted()}
                   fallback={
