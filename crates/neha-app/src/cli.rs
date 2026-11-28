@@ -772,15 +772,16 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
             Err(error) => bail!("NEHA_PUBLIC_URL is not usable: {error}"),
         },
     };
-    // Refuse an unusable listener before opening the home: a start that may
-    // not serve must not rename a database or clear temporary files.
-    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    neha_space::ensure_listener_allowed(&bind, port, public_url.as_deref())
+    // Validate the origin, proxy list, and listener before opening the home:
+    // a start that may not serve must not rename a database or clear temporary
+    // files. The bound listener is the one this start uses.
+    let startup = neha_space::prepare_start(port, public_url)
+        .await
         .context("the Space cannot start")?;
     let home = Home::from_env()
         .context("NEHA_HOME is not set; set it to the directory that holds this Space")?;
     let has_ui = ui.is_some();
-    let running = neha_space::start_with_ui_public(home, port, ui, public_url)
+    let running = neha_space::start_with_ui_prepared(home, ui, startup)
         .await
         .context("the Space cannot start")?;
     let public = running.public_url();

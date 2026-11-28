@@ -763,6 +763,87 @@ pub async fn start_with_worker_config(
     .await
 }
 
+/// A validated start with its listener already bound.
+///
+/// Prepare it before opening a home: an invalid public origin, proxy list, or
+/// plaintext listener must fail without clearing a home or touching a record.
+/// The prepared listener is the one the start uses, so the address that was
+/// checked is the address that serves.
+pub struct Startup {
+    listener: TcpListener,
+    addr: SocketAddr,
+    public_url: Option<String>,
+    trusted_proxies: Option<TrustedProxies>,
+}
+
+/// Validates the startup configuration and binds its listener.
+///
+/// Resolve the configuration in one place before the caller opens its home.
+/// A hostname is resolved once here and every address is checked; the bound
+/// address is checked again so a wildcard listener cannot pass by name.
+pub async fn prepare_start(port: u16, public_url: Option<String>) -> Result<Startup, ServerError> {
+    let public_url = normalize_public_url(public_url)?;
+    let trusted_proxies = TrustedProxies::from_env().map_err(ServerError::TrustedProxies)?;
+    // A containerized Space listens on its private network so Caddy and its
+    // workers can reach it; a Local Space keeps the loopback default. A
+    // listener beyond this machine needs the TLS proxy its public origin names.
+    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let addresses = (bind.as_str(), port)
+        .to_socket_addrs()
+        .map_err(ServerError::Io)?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("{bind}:{port} resolves to no address"),
+        )));
+    }
+    for address in &addresses {
+        refuse_unencrypted_listener(*address, public_url.as_deref())?;
+    }
+    let mut last_error = None;
+    let mut listener = None;
+    for address in addresses {
+        match TcpListener::bind(address).await {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let listener = listener.ok_or_else(|| {
+        ServerError::Io(last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address to bind")
+        }))
+    })?;
+    let addr = listener.local_addr()?;
+    refuse_unencrypted_listener(addr, public_url.as_deref())?;
+
+    Ok(Startup {
+        listener,
+        addr,
+        public_url,
+        trusted_proxies,
+    })
+}
+
+/// Starts a UI-serving Space from a prepared start.
+pub async fn start_with_ui_prepared(
+    home: Home,
+    ui: Option<PathBuf>,
+    startup: Startup,
+) -> Result<Running, ServerError> {
+    start_prepared(
+        home,
+        ui,
+        neha_computer::local::DEFAULT_TIMEOUT,
+        startup,
+        None,
+    )
+    .await
+}
+
 async fn start_with_workers(
     home: Home,
     port: u16,
@@ -776,25 +857,34 @@ async fn start_with_workers(
     {
         return Err(ServerError::Ui(dir.clone()));
     }
-    // A configuration this start cannot honor refuses it before the Space
-    // opens its record, recovers a run, or issues a ticket.
-    let trusted_proxies = TrustedProxies::from_env().map_err(ServerError::TrustedProxies)?;
-    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    ensure_listener_allowed(&bind, port, public_url.as_deref())?;
+    let startup = prepare_start(port, public_url).await?;
+    start_prepared(home, ui, tool_timeout, startup, worker_config).await
+}
+
+async fn start_prepared(
+    home: Home,
+    ui: Option<PathBuf>,
+    tool_timeout: Duration,
+    startup: Startup,
+    worker_config: Option<crate::workers::WorkerConfig>,
+) -> Result<Running, ServerError> {
+    if let Some(dir) = &ui
+        && !dir.join("index.html").is_file()
+    {
+        return Err(ServerError::Ui(dir.clone()));
+    }
+    let Startup {
+        listener,
+        addr,
+        public_url,
+        trusted_proxies,
+    } = startup;
     let mut server =
         SpaceServer::open_with_ui_workers(home, ui, tool_timeout, public_url, worker_config)
             .await?;
     server.trusted_proxies = trusted_proxies;
     let server = Arc::new(server);
     validate_client_directory(&server).await?;
-    // The port is bound before anything is written or woken: a start that
-    // cannot listen must not make a run, reach a Provider, or record a failure.
-    // A containerized Space listens on its private network so Caddy and its
-    // workers can reach it; a Local Space keeps the loopback default. A
-    // listener beyond this machine needs the TLS proxy its public origin names.
-    let listener = TcpListener::bind((bind.as_str(), port)).await?;
-    let addr = listener.local_addr()?;
-    refuse_unencrypted_listener(addr, server.public_url.as_deref())?;
     let browser_authority = match &server.public_url {
         Some(public) => public.strip_prefix("https://").unwrap_or(public).to_owned(),
         None => format!("{}:{}", server.browser_host, addr.port()),
@@ -1074,24 +1164,6 @@ fn loopback_host(value: &str) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
-}
-
-/// Refuses a listener this configuration cannot serve.
-///
-/// The bind address is resolved here, before the caller opens a home or a
-/// record, so a start that would serve plaintext beyond the machine fails
-/// without writing or clearing anything.
-pub fn ensure_listener_allowed(
-    bind: &str,
-    port: u16,
-    public_url: Option<&str>,
-) -> Result<(), ServerError> {
-    let addresses = (bind, port).to_socket_addrs().map_err(ServerError::Io)?;
-    for address in addresses {
-        refuse_unencrypted_listener(address, public_url)?;
-    }
-
-    Ok(())
 }
 
 /// Refuses a listener beyond this machine without a public origin.

@@ -108,14 +108,39 @@ impl TrustedProxies {
 impl Trusted {
     /// Returns whether `address` is inside this range.
     fn contains(&self, address: IpAddr) -> bool {
-        match (canonical(self.network), canonical(address)) {
-            (IpAddr::V4(network), IpAddr::V4(address)) => {
+        match (self.network, address) {
+            (IpAddr::V4(network), address) => {
+                let IpAddr::V4(address) = canonical(address) else {
+                    return false;
+                };
                 matches_prefix(&network.octets(), &address.octets(), self.prefix)
             }
-            (IpAddr::V6(network), IpAddr::V6(address)) => {
+            (IpAddr::V6(network), address) => {
+                // A mapped range names IPv4 addresses, and its prefix counts
+                // the 96 mapping bits. Compare in the four-byte family so the
+                // prefix and the address always have the same width.
+                if let Some(network) = network.to_ipv4_mapped() {
+                    if self.prefix >= 96 {
+                        let IpAddr::V4(address) = canonical(address) else {
+                            return false;
+                        };
+                        return matches_prefix(
+                            &network.octets(),
+                            &address.octets(),
+                            self.prefix - 96,
+                        );
+                    }
+                    let address = match address {
+                        IpAddr::V4(address) => address.to_ipv6_mapped(),
+                        IpAddr::V6(address) => address,
+                    };
+                    return matches_prefix(&network.octets(), &address.octets(), self.prefix);
+                }
+                let IpAddr::V6(address) = address else {
+                    return false;
+                };
                 matches_prefix(&network.octets(), &address.octets(), self.prefix)
             }
-            (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
         }
     }
 }
@@ -312,6 +337,19 @@ mod tests {
         let one_v6 = TrustedProxies::parse_with("2001:db8::1/128", |_| unreachable!()).unwrap();
         assert!(one_v6.allows("2001:db8::1".parse().unwrap()));
         assert!(!one_v6.allows("2001:db8::2".parse().unwrap()));
+
+        // A mapped address on the configuration side must match the IPv4 peer
+        // without slicing a four-byte address with a 128-bit prefix.
+        let mapped = TrustedProxies::parse_with("::ffff:10.0.0.1", |_| unreachable!()).unwrap();
+        assert!(mapped.allows(ip([10, 0, 0, 1])));
+        assert!(!mapped.allows(ip([10, 0, 0, 2])));
+        assert!(mapped.allows("::ffff:10.0.0.1".parse().unwrap()));
+
+        let mapped_range =
+            TrustedProxies::parse_with("::ffff:10.0.0.0/104", |_| unreachable!()).unwrap();
+        assert!(mapped_range.allows(ip([10, 0, 0, 1])));
+        assert!(mapped_range.allows(ip([10, 255, 255, 254])));
+        assert!(!mapped_range.allows(ip([11, 0, 0, 1])));
     }
 
     #[test]

@@ -38,8 +38,8 @@ pub use secrets::{Secrets, SecretsError};
 #[cfg(feature = "test-support")]
 pub use server::start_with_worker_config;
 pub use server::{
-    Running, ServerError, SpaceServer, ensure_listener_allowed, start, start_with_ui,
-    start_with_ui_public,
+    Running, ServerError, SpaceServer, Startup, prepare_start, start, start_with_ui,
+    start_with_ui_prepared, start_with_ui_public,
 };
 pub use skills::{SkillDocument, SkillError};
 pub use state::{

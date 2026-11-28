@@ -164,7 +164,7 @@ docker compose start caddy
 
 ## Upgrade
 
-Build the new images and recreate the fixed services:
+Build the new images first:
 
 ```bash
 docker build -f deploy/space.Dockerfile -t neha-space:dev .
@@ -174,22 +174,38 @@ cd deploy
 # The fixed services use the tags named in compose.yml. `up` alone does not
 # rebuild an image from a changed Dockerfile; `build` does.
 docker compose build space supervisor
-docker compose up -d --force-recreate space supervisor caddy
 ```
 
-Workers are not Compose services. Remove old `neha-worker-*` containers after the Space starts; the lifecycle manager creates workers from the new image for Computers that need them. A worker running an old channel version refuses to serve, so a mixed-version stack does not answer as if it worked. A worker that still runs keeps its old container even when it is idle; remove it so the next start uses the new image.
+### A stack created before the fixed proxy address
 
-The internal network has a fixed subnet and a fixed Caddy address so the proxy's address survives a proxy-only restart. A stack created before that change must drop its old network once, because a running worker container holds it:
+This release changes the internal network and the proxy's address. Migrate before the first `up`: a running worker holds the old network, and a stopped old worker must not be left to start against it.
 
 ```bash
+# 1. Stop the Compose services. Host data and named Caddy volumes are kept.
 docker compose down
-# Workers are not Compose services; they hold the old network and no data.
-docker ps --filter name=neha-worker- --format '{{.Names}}' | xargs -r docker rm -f
+# 2. Remove this deployment's workers, including stopped ones.
+docker ps -aq --filter label=neha.worker=1 --filter name=neha-worker- | xargs -r docker rm -f
+# 3. Remove the network the old workers held.
 docker network rm neha-internal
+# 4. Start the new stack.
 docker compose up -d
 ```
 
-If Compose reports that `neha-internal` is still in use, stop any remaining `neha-worker-*` container and run `docker network rm neha-internal` again. The data directory is a host bind mount and the Caddy volumes are named volumes, so `down` keeps both. If `172.28.0.0/24` collides with a network on your Docker host, change the subnet and Caddy's address in `compose.yml` before the first start; keep Caddy's address outside the `ip_range`.
+If Compose reports that `neha-internal` is still in use, list the containers on it (`docker ps -a --filter network=neha-internal`) and remove the remaining `neha-worker-*` container before repeating the network removal. If `172.28.0.0/24` collides with a network on your Docker host, change the subnet and Caddy's address in `compose.yml` before the first start; keep Caddy's address outside the `ip_range`.
+
+### Every upgrade
+
+```bash
+docker compose up -d --force-recreate space supervisor caddy
+```
+
+Workers are not Compose services, so `up` does not replace them. Remove the workers that still use the old image; the lifecycle manager creates new ones from the new image for Computers that need them:
+
+```bash
+docker ps -aq --filter label=neha.worker=1 --filter name=neha-worker- | xargs -r docker rm -f
+```
+
+A worker running an old channel version refuses to serve, so a mixed-version stack does not answer as if it worked. A worker that is still running keeps its old container even when it is idle; remove it so the next start uses the new image.
 
 Back up the data directory before an upgrade. The schema migration runs when the Space starts; [Upgrade a Space](upgrading.md) covers the version check and rollback expectations.
 

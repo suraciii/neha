@@ -21,7 +21,7 @@ A Space listens on the loopback address of the machine that runs it, unless its 
 
 A public origin names the TLS proxy in front; the operator keeps the Space's listener off the public network.
 
-A loopback peer is trusted as the Space's own machine. An operator MAY name other proxies. The Space reads a forwarded client address only from a named proxy, and only from the last value of the request's `X-Forwarded-For`.
+A loopback peer is trusted as the Space's own machine. An operator MAY name other proxies. The Space reads a forwarded client address only from a trusted peer, and only from the last value of the request's `X-Forwarded-For`.
 
 It counts sign-in limits for that address; a request from any other peer is counted by its own address.
 
