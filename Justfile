@@ -78,7 +78,11 @@ check-specs-tests:
     python3 scripts/test_check_specs.py
 
 # The gate's fast half; none of it starts the sandbox or the S3 store.
-checks: check-python-cache check-python check-specs fmt clippy wire-types deny doc ui-check desktop-check
+checks: check-python-cache check-python check-specs fmt clippy wire-types deny doc ui-check desktop-check test-deploy
+
+# Check the container deployment's Supervisor request construction.
+test-deploy:
+    cd deploy/supervisor && python3 -m unittest -v test_supervisor.py
 
 # The full gate. Pull requests and main run the same recipes.
 ci: checks test

@@ -10,6 +10,7 @@ Owned by computer. A Computer depends on [Space](../space/product.md) to be reac
 2. A Local Computer runs Neha and connects out to the Space.
 3. A Bot does what its Computer can do.
 4. Where Neha cannot set up an isolated environment, a Space has no Hosted Computer.
+5. A Hosted Computer MAY be asleep, and work wakes it.
 
 ## Kinds
 
@@ -59,11 +60,15 @@ The Computer belongs to the User the pairing names; that owner sees it among the
 
 The machine serves the Space while it runs; after a stop, the User starts it again.
 
-A paired Computer connects out to the Space and shows as online or offline. A Computer that has not greeted yet names no access and no fence: the pairing answer and every later listing agree on that.
+A paired Computer connects out to the Space and shows as online or offline. A worker-backed Hosted Computer also shows as online or offline; it is offline while its worker is asleep.
+
+A Computer that has not greeted yet names no access and no fence: the pairing answer and every later listing agree on that.
 
 A Computer that is offline keeps its Bots and their memory, and its Bots work again when it comes back.
 
-A Message sent to a Bot waits while the Computer assigned to it is offline. Waiting work starts when that Computer is online, including after a move to another online Computer. A run that already started keeps the Computer it started on; [design](design.md#moving-a-bot) covers the move, and the Chat shows the offline Computer.
+A Message sent to a Bot waits while the Computer assigned to it is offline. Waiting work starts when that Computer is online, including after a move to another online Computer, and a Message wakes a worker-backed Hosted Computer.
+
+A run that already started keeps the Computer it started on; [design](design.md#moving-a-bot) covers the move, and the Chat shows the offline Computer.
 
 ## The panel
 
@@ -122,8 +127,9 @@ A credential never appears in a Chat or a Group.
 
 ## Gaps
 
-- Starting, stopping, and waking a Hosted Computer are not yet available.
+- There is no User control to start, stop, or wake a Hosted Computer. A containerized deployment wakes a worker from work and stops it when idle; a process-local Hosted Computer is always awake.
 - Deleting a Hosted Computer is not yet specified.
+- Removing the last Bot from a Hosted Computer does not remove its worker or Workspace root.
 - Saving a Workspace and restoring one are not yet specified.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
 - Revoking a Computer's credential is not yet specified.

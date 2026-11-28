@@ -28,3 +28,7 @@ apps/desktop/dist/
 
 # Generated desktop packaging resources.
 apps/desktop/resources/
+
+# Container deployment state: the record, secrets, Files, and Workspaces.
+deploy/data/
+deploy/.env

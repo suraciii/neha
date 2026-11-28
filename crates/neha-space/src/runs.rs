@@ -444,12 +444,11 @@ fn computer_online(
     if state.is_resetting(computer) {
         return false;
     }
-    let local = state
-        .computers
-        .get(&computer)
-        .is_some_and(|view| view.kind == "local");
+    let remote = state.computers.get(&computer).is_some_and(|view| {
+        view.kind == "local" || (view.kind == "hosted" && links.hosted_workers())
+    });
 
-    !local || links.online(computer)
+    !remote || links.online(computer)
 }
 
 /// Returns the earliest queued run of a Bot whose Computer can start it.
@@ -472,11 +471,10 @@ fn next_queued(
     if state.is_resetting(computer) {
         return None;
     }
-    let local = state
-        .computers
-        .get(&computer)
-        .is_some_and(|view| view.kind == "local");
-    if local && !links.online(computer) {
+    let remote = state.computers.get(&computer).is_some_and(|view| {
+        view.kind == "local" || (view.kind == "hosted" && links.hosted_workers())
+    });
+    if remote && !links.online(computer) {
         return None;
     }
 

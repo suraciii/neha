@@ -79,6 +79,11 @@ pub struct LocalRuntime {
     /// `None` for a managed workspace or a real machine. The file tools keep
     /// the managed rules either way; this field changes only the shell.
     hosted: Option<PathBuf>,
+    /// Whether this runtime is the inside of a Hosted Computer's worker
+    /// container. The container is the fence, so the shell runs without
+    /// bubblewrap and uses the container's own `/tmp`; file tools keep the
+    /// managed Workspace rules.
+    container: bool,
     /// The directories a real Bot must not read or write: the Computer's own
     /// configuration directory, which holds its channel credential. Resolved,
     /// so an opened file's real path can be compared against them. They only
@@ -221,15 +226,26 @@ impl LocalRuntime {
 
     /// Creates and resolves a managed workspace and its temporary folder.
     fn managed(workspace: PathBuf) -> Result<Self, RuntimeError> {
+        Self::managed_with_scratch(workspace, true)
+    }
+
+    /// Creates a managed workspace, optionally preparing its scratch folder.
+    ///
+    /// A worker's scratch space is the container's `/tmp`, and the Workspace
+    /// root is Bot-writable, so a worker must not require a `.tmp` directory
+    /// there: a Bot could replace it with a file and break every run.
+    fn managed_with_scratch(workspace: PathBuf, scratch: bool) -> Result<Self, RuntimeError> {
         std::fs::create_dir_all(&workspace)?;
         let workspace = std::fs::canonicalize(&workspace)?;
-        let temporary = workspace.join(".tmp");
-        std::fs::create_dir_all(&temporary)?;
+        if scratch {
+            std::fs::create_dir_all(workspace.join(".tmp"))?;
+        }
 
         Ok(Self {
             root: workspace,
             mode: Mode::Managed,
             hosted: None,
+            container: false,
             hidden: Vec::new(),
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -240,6 +256,18 @@ impl LocalRuntime {
             env: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             cli_dir: default_cli_dir(),
         })
+    }
+
+    /// Opens a Hosted Computer worker's Workspace root.
+    ///
+    /// The worker container is the fence: this runtime starts no nested
+    /// bubblewrap and keeps the managed file rules, so a Bot can reach the
+    /// Computer Workspace while the container confines it to that mount. A run
+    /// is given its Bot's directory as its working directory by the caller.
+    pub fn worker(workspace: impl Into<PathBuf>) -> Result<Self, RuntimeError> {
+        let mut runtime = Self::managed_with_scratch(workspace.into(), false)?;
+        runtime.container = true;
+        Ok(runtime)
     }
 
     /// Opens one Bot's folder on a real machine.
@@ -315,6 +343,7 @@ impl LocalRuntime {
                 folder,
             },
             hosted: None,
+            container: false,
             hidden: Vec::new(),
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -455,6 +484,7 @@ impl LocalRuntime {
                 folder,
             },
             hosted: None,
+            container: false,
             hidden,
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
@@ -562,6 +592,7 @@ impl LocalRuntime {
             root: self.root.clone(),
             mode,
             hosted: self.hosted.clone(),
+            container: self.container,
             hidden: self.hidden.clone(),
             denied: self.denied.clone(),
             timeout: self.timeout,
@@ -1310,12 +1341,12 @@ impl LocalRuntime {
                 Mode::Managed => {
                     #[cfg(windows)]
                     {
-                        windows_shell(command, &self.root)
+                        windows_shell(command, self.base())
                     }
                     #[cfg(not(windows))]
                     {
                         let mut process = Command::new("sh");
-                        process.arg("-c").arg(command).current_dir(&self.root);
+                        process.arg("-c").arg(command).current_dir(self.base());
                         process
                     }
                 }
@@ -1453,7 +1484,12 @@ impl LocalRuntime {
                 }
             }
         };
-        let (home, temporary) = if self.hosted.is_some() {
+        let (home, temporary) = if self.container {
+            (
+                self.cwd.clone().unwrap_or_else(|| self.root.clone()),
+                PathBuf::from(SANDBOX_TMPDIR),
+            )
+        } else if self.hosted.is_some() {
             let home = self
                 .cwd
                 .as_deref()
@@ -3386,6 +3422,7 @@ pub mod test_support {
                 folder: super::open_directory_path(&std::fs::canonicalize(root).unwrap()).unwrap(),
             },
             hosted: None,
+            container: false,
             hidden: vec![std::fs::canonicalize(hidden).unwrap()],
             denied: Vec::new(),
             timeout: DEFAULT_TIMEOUT,

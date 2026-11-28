@@ -577,6 +577,28 @@ impl Identity {
         Ok(())
     }
 
+    /// Records a worker's token when this record does not hold it yet.
+    ///
+    /// A Supervisor keeps the token in the Space's private state so a restart
+    /// can hand the same credential to the worker container again.
+    pub async fn ensure_computer_token(
+        &self,
+        computer: Id,
+        credential: &str,
+    ) -> Result<(), IdentityError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO computer_tokens (token_hash, computer_id, created_at, finalized) \
+             VALUES (?, ?, ?, 1)",
+        )
+        .bind(digest(credential).as_slice())
+        .bind(computer.to_string())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Forgets a Computer token whose Computer could not be recorded.
     pub async fn forget_computer_token(&self, credential: &str) -> Result<(), IdentityError> {
         sqlx::query("DELETE FROM computer_tokens WHERE token_hash = ?")

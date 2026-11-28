@@ -28,6 +28,9 @@ const BOT_TOKEN_ENV: &str = "NEHA_BOT_TOKEN";
 const BOT_SPACE_ENV: &str = "NEHA_SPACE_URL";
 /// The Chat a run works in.
 const BOT_CHAT_ENV: &str = "NEHA_CHAT";
+/// The public Host a Bot's shell sends when an internal origin is not the
+/// authority the Space's request guard expects.
+const BOT_HOST_ENV: &str = "NEHA_BOT_HOST";
 
 /// The account the CLI acts as.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -326,6 +329,8 @@ pub struct BotSession {
     url: String,
     token: String,
     chat: Option<Id>,
+    /// The public Host an internal Space origin needs.
+    host: Option<String>,
 }
 
 /// What a Bot's shell posted to its Chat.
@@ -358,8 +363,17 @@ impl BotSession {
             ),
             _ => None,
         };
+        let host = std::env::var(BOT_HOST_ENV)
+            .ok()
+            .map(|host| host.trim().to_owned())
+            .filter(|host| !host.is_empty());
 
-        Ok(Some(Self { url, token, chat }))
+        Ok(Some(Self {
+            url,
+            token,
+            chat,
+            host,
+        }))
     }
 
     /// Returns the Chat to act in, which must be the token's Chat.
@@ -374,6 +388,16 @@ impl BotSession {
         }
     }
 
+    /// Builds one Bot request, naming the public Host when the deployment
+    /// gives an internal origin.
+    fn request(&self, method: reqwest::Method, url: String) -> reqwest::RequestBuilder {
+        let mut request = reqwest::Client::new().request(method, url);
+        if let Some(host) = &self.host {
+            request = request.header(reqwest::header::HOST, host);
+        }
+        request
+    }
+
     /// Uploads one File into the token's Chat.
     pub async fn upload(&self, path: &Path) -> Result<FileSummary> {
         let bytes = read_for_upload(path)?;
@@ -381,8 +405,8 @@ impl BotSession {
             .file_name()
             .and_then(std::ffi::OsStr::to_str)
             .with_context(|| format!("{} has no usable file name", path.display()))?;
-        let response = reqwest::Client::new()
-            .post(format!("{}/api/bot/files", self.url))
+        let response = self
+            .request(reqwest::Method::POST, format!("{}/api/bot/files", self.url))
             .query(&[
                 ("name", name),
                 (
@@ -416,13 +440,15 @@ impl BotSession {
             body["file"] = serde_json::json!(file.id);
         }
         let response = accepted(
-            reqwest::Client::new()
-                .post(format!("{}/api/bot/messages", self.url))
-                .bearer_auth(&self.token)
-                .json(&body)
-                .send()
-                .await
-                .context("the Space could not be reached")?,
+            self.request(
+                reqwest::Method::POST,
+                format!("{}/api/bot/messages", self.url),
+            )
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .context("the Space could not be reached")?,
         )
         .await?;
         let value = response
@@ -443,12 +469,14 @@ impl BotSession {
     /// Downloads one File of the token's Chat.
     pub async fn download(&self, file: Id) -> Result<(Option<String>, Vec<u8>)> {
         let response = accepted(
-            reqwest::Client::new()
-                .get(format!("{}/api/bot/files/{file}", self.url))
-                .bearer_auth(&self.token)
-                .send()
-                .await
-                .context("the Space could not be reached")?,
+            self.request(
+                reqwest::Method::GET,
+                format!("{}/api/bot/files/{file}", self.url),
+            )
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .context("the Space could not be reached")?,
         )
         .await?;
         let name = response
@@ -791,5 +819,60 @@ pub mod test_support {
     /// Writes a secret this machine user alone may read.
     pub fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         super::write_private(path, bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BotSession;
+
+    #[test]
+    fn a_bot_request_names_the_public_host_when_the_deployment_gives_one() {
+        let session = BotSession {
+            url: "http://space:7337".to_owned(),
+            token: "bot-token".to_owned(),
+            chat: None,
+            host: Some("neha.example.com".to_owned()),
+        };
+        let request = session
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/api/bot/files/00000000-0000-0000-0000-000000000000",
+                    session.url
+                ),
+            )
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(reqwest::header::HOST)
+                .and_then(|value| value.to_str().ok()),
+            Some("neha.example.com")
+        );
+    }
+
+    #[test]
+    fn a_bot_request_keeps_the_origin_host_without_an_override() {
+        let session = BotSession {
+            url: "http://127.0.0.1:7337".to_owned(),
+            token: "bot-token".to_owned(),
+            chat: None,
+            host: None,
+        };
+        let request = session
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/api/bot/files/00000000-0000-0000-0000-000000000000",
+                    session.url
+                ),
+            )
+            .build()
+            .unwrap();
+
+        assert!(request.headers().get(reqwest::header::HOST).is_none());
     }
 }

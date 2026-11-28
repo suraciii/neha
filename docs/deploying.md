@@ -6,6 +6,8 @@ A Space listens on loopback on the machine that runs it. To reach it from a phon
 
 The proxy is the only public port. The Space never opens one itself.
 
+This guide runs the Space directly on the host, with its Hosted Computers in the Space process. To run the Space, its Caddy proxy, and one worker container per Hosted Computer under Docker Compose instead, see [Run a Space in containers](container.md).
+
 ## Requirements
 
 - A machine that runs the Space.

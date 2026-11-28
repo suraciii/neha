@@ -1,0 +1,9 @@
+target
+data
+**/node_modules
+apps/desktop/dist
+ui/dist
+.git
+.agents
+deploy/data
+deploy/.env

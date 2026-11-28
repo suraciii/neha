@@ -91,7 +91,7 @@ const COMPUTER_IDLE: Duration = Duration::from_secs(60);
 pub struct SpaceServer {
     pub(crate) home: Home,
     pub(crate) store: Store,
-    identity: Identity,
+    pub(crate) identity: Identity,
     pub(crate) blobs: Blobs,
     storage: Storage,
     invite: Mutex<Option<Invite>>,
@@ -121,6 +121,8 @@ pub struct SpaceServer {
     start_ticket: Mutex<Option<crate::ticket::StartTicket>>,
     /// Set once the Space stops: no command may then start new work.
     closed: AtomicBool,
+    /// Worker provisioning, when this Space runs Hosted Computers in containers.
+    worker_config: Option<crate::workers::WorkerConfig>,
     pub(crate) runs: Arc<RunQueue>,
     uploads: Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
     ui: Option<PathBuf>,
@@ -246,6 +248,23 @@ impl SpaceServer {
         tool_timeout: Duration,
         public_url: Option<String>,
     ) -> Result<Self, ServerError> {
+        Self::open_with_ui_workers(
+            home,
+            ui,
+            tool_timeout,
+            public_url,
+            crate::workers::WorkerConfig::from_env(),
+        )
+        .await
+    }
+
+    async fn open_with_ui_workers(
+        home: Home,
+        ui: Option<PathBuf>,
+        tool_timeout: Duration,
+        public_url: Option<String>,
+        worker_config: Option<crate::workers::WorkerConfig>,
+    ) -> Result<Self, ServerError> {
         let session_cookie = session_cookie_name(home.root());
         let browser_host = public_url
             .as_deref()
@@ -300,7 +319,11 @@ impl SpaceServer {
             model,
             events,
             tool_timeout,
-            links: ComputerLinks::new(),
+            links: if worker_config.is_some() {
+                ComputerLinks::with_hosted_workers()
+            } else {
+                ComputerLinks::new()
+            },
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
             approvals: tokio::sync::Mutex::new(()),
             computer_assignments: tokio::sync::Mutex::new(()),
@@ -308,6 +331,7 @@ impl SpaceServer {
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
+            worker_config,
             runs: Arc::new(RunQueue::new()),
             uploads: Mutex::new(std::collections::HashMap::new()),
             ui,
@@ -422,6 +446,7 @@ pub struct Running {
     server: Arc<SpaceServer>,
     task: Option<JoinHandle<()>>,
     push_task: Option<JoinHandle<()>>,
+    worker_task: Option<JoinHandle<()>>,
 }
 
 impl Running {
@@ -485,6 +510,10 @@ impl Running {
             push.abort();
             let _ = push.await;
         }
+        if let Some(worker) = self.worker_task.take() {
+            worker.abort();
+            let _ = worker.await;
+        }
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
@@ -502,6 +531,9 @@ impl Drop for Running {
         }
         if let Some(push) = &self.push_task {
             push.abort();
+        }
+        if let Some(worker) = &self.worker_task {
+            worker.abort();
         }
     }
 }
@@ -563,16 +595,59 @@ async fn start_with(
     tool_timeout: Duration,
     public_url: Option<String>,
 ) -> Result<Running, ServerError> {
+    start_with_workers(
+        home,
+        port,
+        ui,
+        tool_timeout,
+        public_url,
+        crate::workers::WorkerConfig::from_env(),
+    )
+    .await
+}
+
+/// Starts a Space with an explicit worker configuration, for tests.
+#[cfg(any(test, feature = "test-support"))]
+pub async fn start_with_worker_config(
+    home: Home,
+    port: u16,
+    worker_config: Option<crate::workers::WorkerConfig>,
+) -> Result<Running, ServerError> {
+    start_with_workers(
+        home,
+        port,
+        None,
+        neha_computer::local::DEFAULT_TIMEOUT,
+        public_url_from_env()?,
+        worker_config,
+    )
+    .await
+}
+
+async fn start_with_workers(
+    home: Home,
+    port: u16,
+    ui: Option<PathBuf>,
+    tool_timeout: Duration,
+    public_url: Option<String>,
+    worker_config: Option<crate::workers::WorkerConfig>,
+) -> Result<Running, ServerError> {
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
     {
         return Err(ServerError::Ui(dir.clone()));
     }
-    let server = Arc::new(SpaceServer::open_with_ui(home, ui, tool_timeout, public_url).await?);
+    let server = Arc::new(
+        SpaceServer::open_with_ui_workers(home, ui, tool_timeout, public_url, worker_config)
+            .await?,
+    );
     validate_client_directory(&server).await?;
     // The port is bound before anything is written or woken: a start that
     // cannot listen must not make a run, reach a Provider, or record a failure.
-    let listener = TcpListener::bind(("127.0.0.1", port)).await?;
+    // A containerized Space listens on its private network so Caddy and its
+    // workers can reach it; a Local Space keeps the loopback default.
+    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let listener = TcpListener::bind((bind.as_str(), port)).await?;
     let addr = listener.local_addr()?;
     let browser_authority = match &server.public_url {
         Some(public) => public.strip_prefix("https://").unwrap_or(public).to_owned(),
@@ -633,6 +708,10 @@ async fn start_with(
     // and can notify the runs recovery just failed. `wake_all` runs after this
     // spawn, and the task's catch-up covers the window before its subscription.
     let push_task = crate::push::spawn(Arc::clone(&server), push_cursor);
+    let worker_task = server
+        .worker_config
+        .clone()
+        .map(|config| crate::workers::spawn(Arc::clone(&server), config));
     server.runs.wake_all(&server);
     let invite_base = server
         .public_url
@@ -660,6 +739,7 @@ async fn start_with(
         server,
         task: Some(task),
         push_task: Some(push_task),
+        worker_task,
     })
 }
 
@@ -2327,6 +2407,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             approvals: &server.approvals,
                             computer_assignments: &server.computer_assignments,
                             provider_writes: &server.provider_writes,
+                            workers: server.worker_config.is_some(),
                             runs: &server.runs,
                             events: &server.events,
                             catalog: &server.catalog,
@@ -3393,6 +3474,8 @@ pub mod test_support {
         pub computer_assignments: &'a tokio::sync::Mutex<()>,
         /// Serializes Provider writes.
         pub provider_writes: &'a tokio::sync::Mutex<()>,
+        /// Whether Hosted Computers run in worker containers.
+        pub workers: bool,
         /// The run queue.
         pub runs: &'a RunQueue,
         /// The live event stream.
@@ -3417,6 +3500,7 @@ pub mod test_support {
                 approvals: &server.approvals,
                 computer_assignments: &server.computer_assignments,
                 provider_writes: &server.provider_writes,
+                workers: server.worker_config.is_some(),
                 runs: &server.runs,
                 events: &server.events,
                 catalog: &server.catalog,

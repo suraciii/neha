@@ -9,7 +9,7 @@ This milestone pairs the machine that runs the Space, because the Space listens 
 ## What you need
 
 - A Linux machine with the Neha CLI. [Building and verification](building.md) covers the build; the examples use `target/debug/neha`.
-- `bubblewrap` on that machine. A Local Computer runs each shell command in a sandbox it starts, unless the Bot has full access, and the machine that runs the Space needs it for a Hosted Computer too; the file tools check their own paths. [Building and verification](building.md#a-computer-sandbox) covers the install.
+- `bubblewrap` on that machine. A Local Computer runs each shell command in a sandbox it starts, unless the Bot has full access, and a Local Space needs it for a process-local Hosted Computer too; the file tools check their own paths. A containerized Hosted Space uses its worker containers instead. [Building and verification](building.md#a-computer-sandbox) covers the install.
 - A Space running on the same machine, at an address the Local Computer can reach; in this milestone that is the host that runs the Space.
 - A CLI signed in to the Space for commands such as `computer list`, `computer create`, and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
 
@@ -110,7 +110,9 @@ The first action on this Local Computer asks for approval in the Chat: the Bot w
 
 ## The Hosted Computer
 
-A Hosted Computer needs no machine of yours: it runs on the Space's machine, inside the Space process in this milestone. Every User receives a Space Computer, the Hosted Computer they own by default. The Space creates it the first time a Bot needs one, and a new Bot starts on it unless its owner names another Computer. The Space Computer is shared with its owner's Hosted Bots.
+A Hosted Computer needs no machine of yours: it runs on the Space's machine. Every User receives a Space Computer, the Hosted Computer they own by default. The Space creates it the first time a Bot needs one, and a new Bot starts on it unless its owner names another Computer. The Space Computer is shared with its owner's Hosted Bots.
+
+A Local Space and a desktop deployment run a Hosted Computer inside the Space process, fenced by `bubblewrap`. A containerized Hosted Space runs each Hosted Computer in a worker container instead; [Run a Space in containers](container.md) covers that deployment. The user-visible contract is the same: one Computer, one Workspace, and a channel that connects out to the Space.
 
 The owner creates more Hosted Computers with `neha computer create`:
 
@@ -121,13 +123,13 @@ target/debug/neha computer create --name team --shared
 
 A new Hosted Computer is exclusive unless `--shared` says otherwise, so it accepts one Bot; `--exclusive` names that default explicitly. `neha computer update <computer-id> --shared` makes an exclusive Computer shared, and `--exclusive` keeps it to one Bot; the change to exclusive is refused while more than one Bot uses it. The Space Computer stays shared, and a Local Computer is always shared.
 
-Its shell runs in a `bubblewrap` sandbox built from an empty root, with the machine's system directories mounted read-only.
+In a process-local Hosted Computer, the shell runs in a `bubblewrap` sandbox built from an empty root, with the machine's system directories mounted read-only. In a worker container, the container is the fence: the shell starts in the container, with no nested sandbox, and the worker's root filesystem is read-only.
 
-The sandbox mounts the Computer's Workspace root at `/workspace`; the run starts in the Bot's own directory inside it, which is `HOME`. The Workspace root is the only place where files persist, and Bots on the same Hosted Computer can reach each other's directories. The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`.
+Either way the Computer's Workspace root is where files persist, and the run starts in the Bot's own directory inside it, which is `HOME`. Bots on the same Hosted Computer can reach each other's directories. A process-local sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`; a worker container has its own `/tmp` tmpfs and no nested process namespace beyond the container.
 
-The sandbox ends with the Space process. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace. The sandbox's network is the machine's, so it reaches the Space's loopback.
+A process-local sandbox ends with the Space process. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace. Its network is the machine's, so it reaches the Space's loopback. A worker container also cannot see the record, secrets, File store, or another Computer's Workspace; it reaches the Space over the deployment's private network.
 
-The folder holding the `neha` binary is mounted read-only at `/opt/neha-cli` and added to `PATH`, so `neha file get` and `neha chat send --file` work in the shell. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers them.
+In a process-local Hosted Computer the folder holding the `neha` binary is mounted read-only at `/opt/neha-cli` and added to `PATH`, so `neha file get` and `neha chat send --file` work in the shell. A worker image installs the same binary at `/usr/local/bin/neha`, and the Space gives the worker's shell an internal Space address and the public `Host` it needs. The deployment sets those two values on the Space; neither is exposed to a client. [Send and receive Files](files.md#let-the-bot-take-and-deliver) covers them.
 
 A Hosted Computer keeps one Workspace root in the Space's home, and each Bot works in a directory of its own inside it:
 
@@ -135,13 +137,13 @@ A Hosted Computer keeps one Workspace root in the Space's home, and each Bot wor
 $NEHA_HOME/workspaces/<computer-id>/<bot-id>
 ```
 
-The Space creates that directory when the Bot first works there. A Space restart keeps the root and the directories, and no command is needed. It is not an independent image: the system directories are the machine's and read-only, so a system package cannot be installed. A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
+The Space creates that directory when the Bot first works there. A Space restart keeps the root and the directories, and no command is needed. A process-local Hosted Computer is not an independent image: the system directories are the machine's and read-only, so a system package cannot be installed. A worker-backed Hosted Computer uses the worker image's minimal operating system; the Workspace is writable but the system is not, so a package the image does not install cannot be installed either. A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
 
 `neha computer reset <computer-id>` clears every Bot's directory in the Computer's Workspace: every file and folder inside the root is deleted, and the Workspace root stays. Only the Computer's owner can reset it, and only a Hosted Computer is reset.
 
 A run that is queued, running, or waiting refuses the reset with a conflict until it ends. A second reset of an empty Workspace succeeds, and a reset restores no file.
 
-The Space machine needs `bubblewrap` for a Hosted Computer. Where it cannot start the sandbox, `bot create` and `computer create` fail and name `--computer local` as the alternative; they do not fall back. The Space also refuses a Hosted Computer when `NEHA_HOME` would be inside a read-only system directory or the CLI directory, and when the Workspace path uses a symlink. A Bot's directory that holds a hard link, a symlink, or a special file fails its run until the Computer is reset.
+A process-local Hosted Computer needs `bubblewrap` on the Space machine. Where it cannot start the sandbox, `bot create` and `computer create` fail and name `--computer local` as the alternative; they do not fall back. A containerized Hosted Space does not need `bubblewrap` in the Space image; its worker container is the boundary. The Space also refuses a Hosted Computer when `NEHA_HOME` would be inside a read-only system directory or the CLI directory, and when the Workspace path uses a symlink. A Bot's directory that holds a hard link, a symlink, or a special file fails its run until the Computer is reset.
 
 ## The Local Computer's Workspace and the write fence
 
@@ -191,7 +193,9 @@ The old Computer may be offline when you move the Bot. If the new Computer is of
 
 ## While the machine is offline
 
-A Local Computer is online while its daemon holds the channel to the Space; a Hosted Computer is always online because it runs in the Space process. If the daemon stops, the Computer shows as offline in `neha computer list`, and a Message sent to one of its Bots waits in the record.
+A Local Computer is online while its daemon holds the channel to the Space. A process-local Hosted Computer is always online because it runs in the Space process. A worker-backed Hosted Computer is online only while its worker's channel is up; it may be asleep between runs. If a Computer is offline, `neha computer list` says so, and a Message sent to one of its Bots waits in the record until the Computer is online again.
+
+A worker-backed Hosted Computer wakes when it has queued work and stops after an idle period. The operator chooses the idle period and whether a Computer stays awake; [Run a Space in containers](container.md#hosted-computers) covers the settings. A run already in flight when the worker stops is recorded as failed or unknown, as for any Computer whose channel goes away.
 
 The Space and the daemon must come from the same release. The channel speaks version 2, and the Space refuses a daemon whose channel version does not match. A daemon left on an older release connects and is refused; restart it with the `neha computer run` of this release.
 
@@ -238,7 +242,8 @@ The machine ends the command it was running when the channel drops, so no action
 - The Space listens on loopback only, so this milestone pairs the machine that runs the Space. A Computer on another machine is not available; `neha computer add` stays for that future flow.
 - There is no command yet to revoke or replace a Computer's credential.
 - Moving a Bot does not carry its files: the old Computer keeps its Workspace, and the new one gives the Bot a directory of its own. Saving and restoring a Workspace are not available.
-- A Hosted Computer runs only in the Space process in this milestone. Starting, stopping, waking, or deleting one on demand, and worker containers or a Supervisor, are not available. A provider-backed Hosted machine is not specified yet.
+- A Hosted Computer in a Local Space still runs only in the Space process. The containerized Hosted Space runs it in a worker container; a Local Computer never does.
+- There is no client command to start, stop, or delete a Hosted Computer, and no on-demand stop for a process-local one. A worker-backed Hosted Computer wakes and stops from its work and idle settings; the Supervisor is internal. A provider-backed Hosted machine is not specified yet.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet.
 - A Hosted Computer does not ask before an action yet; [Approvals](approvals.md) covers the gate for a Local Computer.
 - An approval of a run no User is with does not expire yet, and a Question, a Group approval, and an independent reviewer are not available.
