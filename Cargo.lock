@@ -1578,6 +1578,7 @@ dependencies = [
  "opendal",
  "rand 0.9.5",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "serde_norway",
@@ -1590,6 +1591,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

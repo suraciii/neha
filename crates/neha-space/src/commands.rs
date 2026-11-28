@@ -20,7 +20,8 @@ use neha::id::Id;
 use neha::record::{
     APP_CARD_KIND, ActionStatus as RecordedActionStatus, ApprovalReason, Author, CardData, Event,
     EventDraft, EventKind, FULL_ACCESS_CONSENT_VERSION, FileAdded, MAX_FILE_NAME_BYTES,
-    MAX_PLUGIN_SOURCE_BYTES, RuleEffect, SkillLibrary, SkillScript, Undoability, valid_script_name,
+    MAX_PLUGIN_SOURCE_BYTES, McpTransport, RuleEffect, SkillLibrary, SkillScript, Undoability,
+    valid_script_name,
 };
 use neha::seq::Seq;
 use neha::surface::{
@@ -1082,6 +1083,253 @@ async fn mcp_reachable(
         .is_ok()
 }
 
+/// The budget one stdio call gets for starting its server, shaking hands, and
+/// calling the tool.
+///
+/// An HTTP call spends its budget on one request; a stdio call spends the same
+/// budget on one use of a freshly started client.
+const STDIO_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The one deadline a stdio action's call and app read share.
+///
+/// A stdio action starts a server, shakes hands, calls the tool, and then may
+/// read the tool's app from the same client. One action gets one budget: the
+/// deadline is computed once, before the start, and the app read gets only what
+/// the call left of it. An HTTP action keeps its own client's budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StdioDeadline(tokio::time::Instant);
+
+impl StdioDeadline {
+    /// The deadline an action started now gets.
+    fn after(budget: Duration) -> Self {
+        Self(tokio::time::Instant::now() + budget)
+    }
+
+    /// Runs one phase of an action within what is left of its budget.
+    async fn run<F: std::future::Future>(
+        self,
+        phase: F,
+    ) -> Result<F::Output, tokio::time::error::Elapsed> {
+        tokio::time::timeout_at(self.0, phase).await
+    }
+}
+
+/// Where one projected stdio server's package lives, and the launch
+/// configuration the record keeps.
+///
+/// A stdio server is one a package brought: the record names the package by
+/// its identifier, and the package's name and digest name the directory the
+/// install published. A server whose package is no longer installed cannot be
+/// launched.
+fn stdio_locations(
+    state: &Mutex<State>,
+    home: &Home,
+    server: &McpServerView,
+) -> Result<(neha::record::StdioServer, PathBuf, PathBuf), String> {
+    let stdio = server
+        .stdio()
+        .ok_or_else(|| "the MCP server is not a stdio server".to_owned())?;
+    let plugin = server
+        .plugin
+        .ok_or_else(|| "the MCP server does not belong to an installed package".to_owned())?;
+    let (name, digest) = {
+        let state = state
+            .lock()
+            .map_err(|_| "the Space state is locked".to_owned())?;
+        let view = state
+            .plugins
+            .iter()
+            .find(|view| view.plugin == plugin)
+            .ok_or_else(|| "the MCP server's package is no longer installed".to_owned())?;
+        (view.name.clone(), view.digest.clone())
+    };
+    let plugin_root = home.plugins_dir().join(format!("{name}@{digest}"));
+    let plugin_data = home.plugin_data_dir(&name);
+
+    Ok((stdio, plugin_root, plugin_data))
+}
+
+/// Where one recorded stdio server starts.
+///
+/// The record keeps the working directory symbolic: a `/`-separated path
+/// relative to the one root its `data_cwd` bit names, with any further
+/// `${PLUGIN_ROOT}` or `${PLUGIN_DATA}` text left as the package wrote it and
+/// with the `..` components its meaning needs. This expands the two recognized
+/// placeholders once against the Space's own roots, normalizes the expanded
+/// path, and requires it to stay in that root. The expression is resolved only
+/// here, against the real roots: what a `..` removes is not known while the
+/// record is read.
+///
+/// The install runs this before registering a package's stdio server, with the
+/// roots it publishes, and skips a server whose directory leaves them: the
+/// loader kept the expression because it could not know those roots. The launch
+/// runs it again for the server it is about to start. A missing data-rooted
+/// directory is the first launch's to create safely; the launch refuses a
+/// missing package-rooted one, because the install published it.
+///
+/// # Errors
+///
+/// Returns the launch's fixed reason when the expansion leaves the root the
+/// record names.
+fn recorded_working_directory(
+    recorded: &neha::record::StdioServer,
+    plugin_root: &Path,
+    plugin_data: &Path,
+) -> Result<PathBuf, String> {
+    let root = if recorded.data_cwd {
+        plugin_data
+    } else {
+        plugin_root
+    };
+    crate::stdio::resolve_launch_cwd(
+        root,
+        recorded.cwd.as_deref().unwrap_or_default(),
+        plugin_root,
+        plugin_data,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// The credential a call by `acting` would find for one server.
+///
+/// The acting User's personal credential wins over the Space's. Only a
+/// successfully read `None` means no credential: a Vault read that fails is not
+/// an absent one, so it is refused rather than launching or calling as another
+/// account. The fixed answer names the failure and never a credential.
+fn selected_mcp_credential(
+    secrets: &Secrets,
+    server: Id,
+    acting: Id,
+) -> Result<Option<String>, &'static str> {
+    match secrets.mcp_credential(server, Some(acting)) {
+        Ok(Some(credential)) => Ok(Some(credential)),
+        Ok(None) => secrets
+            .mcp_credential(server, None)
+            .map_err(|_| "the MCP server's credential cannot be read"),
+        Err(_) => Err("the MCP server's credential cannot be read"),
+    }
+}
+
+/// Resolves one stdio server's launch specification against the Space's home.
+///
+/// The record keeps the package's symbolic form: the command is resolved
+/// against the directory the install published, and the two roots replace the
+/// placeholders in the arguments and the environment. Nothing is cached: a
+/// discovery and a call each resolve from the record and the Vault as they are
+/// now, and the specification is one use of one client.
+///
+/// The credential is the one a call would find: the acting User's personal one
+/// wins over the Space's. A credential that cannot be read is not an absent
+/// one, so the specification is refused instead of launching as another
+/// account. A machine whose sandbox cannot start a process refuses the launch
+/// here too, before it reaches a client.
+#[allow(clippy::too_many_arguments)]
+fn stdio_spec(
+    state: &Mutex<State>,
+    home: &Home,
+    secrets: &Secrets,
+    _bot: Id,
+    acting: Id,
+    server: &McpServerView,
+) -> Result<crate::stdio::StdioSpec, String> {
+    let (recorded, plugin_root, plugin_data) = stdio_locations(state, home, server)?;
+    let command = crate::stdio::resolve_command(&recorded.command, &plugin_root)
+        .map_err(|error| error.to_string())?;
+    // A launch is refused before it starts anything when this machine's sandbox
+    // cannot start a process: the fixed reason names the sandbox, never the
+    // package or a credential.
+    if !crate::stdio::sandbox_smoke() {
+        return Err(crate::stdio::sandbox_unavailable_reason().to_owned());
+    }
+    let args = recorded
+        .args
+        .iter()
+        .map(|argument| crate::stdio::expand_placeholders(argument, &plugin_root, &plugin_data))
+        .collect();
+    let env = recorded
+        .env
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                crate::stdio::expand_placeholders(value, &plugin_root, &plugin_data),
+            )
+        })
+        .collect();
+    // The working directory hangs from one of the two roots the sandbox
+    // mounts. A data-rooted directory is the package's own, and a first launch
+    // may name one that does not exist yet: the launcher creates it safely,
+    // one component at a time, when it starts the server. The package root is
+    // published by the install and must already be there.
+    let cwd = recorded_working_directory(&recorded, &plugin_root, &plugin_data)?;
+    let credential =
+        selected_mcp_credential(secrets, server.server, acting).map_err(str::to_owned)?;
+
+    Ok(crate::stdio::StdioSpec {
+        command,
+        args,
+        env,
+        cwd,
+        plugin_root,
+        plugin_data,
+        space_home: home.root().to_path_buf(),
+        credential,
+    })
+}
+
+/// Whether one stdio server could be launched, without starting its process.
+///
+/// The answer comes from the launch's own checks before it runs anything: the
+/// package directory is there, the recorded command is one this machine may
+/// execute, the sandbox can start a process, and the launch configuration is
+/// runnable. The checks are the launch's, minus creation: a data-rooted working
+/// directory may not exist yet (the first launch creates it safely), so a
+/// listing checks the components that are already there and writes nothing. A
+/// component that exists but is not a directory inside the data root leaves the
+/// row unconnected with the launch's fixed reason.
+fn stdio_launchable(
+    state: &Mutex<State>,
+    home: &Home,
+    server: &McpServerView,
+) -> Result<(), String> {
+    let (recorded, plugin_root, plugin_data) = stdio_locations(state, home, server)?;
+    let command = crate::stdio::resolve_command(&recorded.command, &plugin_root)
+        .map_err(|error| error.to_string())?;
+    if !crate::stdio::sandbox_smoke() {
+        return Err(crate::stdio::sandbox_unavailable_reason().to_owned());
+    }
+    let probe = crate::stdio::StdioSpec {
+        command,
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        cwd: recorded_working_directory(&recorded, &plugin_root, &plugin_data)?,
+        plugin_root,
+        plugin_data,
+        space_home: home.root().to_path_buf(),
+        credential: None,
+    };
+    crate::stdio::check_launch(&probe).map_err(|error| error.to_string())
+}
+
+/// Whether the Space could reach one projected server with one credential.
+///
+/// A stdio server is never started to answer this: its launch is checked, and
+/// a call starts it. An HTTP server is asked over the network, as before.
+async fn mcp_view_reachable(
+    state: &Mutex<State>,
+    home: &Home,
+    server: &McpServerView,
+    credential: &str,
+) -> bool {
+    match server.transport() {
+        McpTransport::StreamableHttp => match server.url.as_deref() {
+            Some(url) => mcp_reachable(url, credential, &server.headers).await,
+            None => false,
+        },
+        McpTransport::Stdio => stdio_launchable(state, home, server).is_ok(),
+    }
+}
+
 /// Connects an MCP server for the Space or one User.
 async fn mcp_add(
     context: &CommandContext<'_>,
@@ -1107,6 +1355,21 @@ async fn mcp_add(
             "an MCP server name is 1 to {} letters, digits, or hyphens",
             neha::record::MAX_MCP_NAME_BYTES
         )));
+    }
+    // An empty address names no HTTP endpoint: it names the existing stdio
+    // server of that name, whose credential belongs to the Space. `mcp add`
+    // still registers HTTP servers, and every other empty address is refused
+    // before anything is read or written.
+    if arguments.url.trim().is_empty() {
+        return mcp_attach_space_credential(
+            context,
+            account,
+            command_id,
+            fingerprint,
+            &name,
+            arguments,
+        )
+        .await;
     }
     let url = arguments.url.trim().to_owned();
     if !neha::record::McpServerAdded::valid_url(&url) {
@@ -1157,7 +1420,7 @@ async fn mcp_add(
                 "the Space already holds an MCP server under this name",
             ));
         }
-        if url != existing.url {
+        if existing.url.as_deref() != Some(url.as_str()) {
             return Err(ApiError::invalid_argument(
                 "connecting an existing server keeps the address the Space connected",
             ));
@@ -1196,7 +1459,8 @@ async fn mcp_add(
             .secrets
             .store_mcp_credential(existing.server, user, &credential)
             .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
-        let connected = mcp_reachable(&existing.url, &credential, &existing.headers).await;
+        let connected =
+            mcp_view_reachable(context.state, context.home, &existing, &credential).await;
         let draft = EventDraft::new(
             EventKind::McpServerUpdated,
             Author::User(account.id),
@@ -1365,6 +1629,148 @@ async fn mcp_add(
     })
 }
 
+/// The fixed answer an `mcp add` without an address gives when it names no
+/// existing package stdio server.
+const EMPTY_MCP_ADDRESS: &str = concat!(
+    "an MCP server's address is required unless the name is an installed ",
+    "package's stdio server"
+);
+
+/// Attaches the Space's credential to a package's existing stdio server.
+///
+/// `mcp add` without an address reaches this instead of registering a server: a
+/// stdio server is one only a package brings, so the name must be one the
+/// Space already holds as a stdio server, and the credential is the Space's,
+/// which only the Admin may attach. It appends the update event an HTTP Space
+/// attach appends, so the projection and the event stream see one shape, and a
+/// retry replays the recorded answer instead of attaching twice.
+async fn mcp_attach_space_credential(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    name: &str,
+    arguments: neha::surface::McpAdd,
+) -> Result<Outcome, ApiError> {
+    if !account.is_admin {
+        return Err(ApiError::forbidden(
+            "only the Admin attaches the Space's credential to a package's stdio server",
+        ));
+    }
+    if arguments.scope != neha::record::McpScope::Space {
+        return Err(ApiError::invalid_argument(EMPTY_MCP_ADDRESS));
+    }
+    let existing = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state.mcp_named(name).cloned()
+    };
+    // The address stays required for every other server: a name the Space does
+    // not hold, or an HTTP server under it, is not a stdio server to attach to.
+    let Some(existing) = existing.filter(|server| server.transport() == McpTransport::Stdio) else {
+        return Err(ApiError::invalid_argument(EMPTY_MCP_ADDRESS));
+    };
+    // An empty token attaches nothing: a launch must either carry the Space's
+    // credential or none.
+    let Some(credential) = arguments
+        .credential
+        .filter(|credential| !credential.trim().is_empty())
+    else {
+        return Err(ApiError::invalid_argument(
+            "attaching the Space's credential to a stdio server needs one",
+        ));
+    };
+    // The same rule every registration applies: a token holds only what a
+    // bearer token takes.
+    if !neha::record::McpServerAdded::valid_credential(&credential) {
+        return Err(ApiError::invalid_argument(
+            "an MCP credential holds only the characters a bearer token takes",
+        ));
+    }
+    // The Space's slot: a package's server belongs to the Space, and this
+    // command writes only the credential the Admin gives it.
+    let user = None;
+    // A rotation replaces the credential that worked. What the record's append
+    // decides, so is the credential this command leaves behind: keep the old
+    // one until the append commits, and put it back when it does not.
+    let previous = context
+        .secrets
+        .mcp_credential(existing.server, user)
+        .map_err(|_| ApiError::internal("cannot read the MCP credential"))?;
+    context
+        .secrets
+        .store_mcp_credential(existing.server, user, &credential)
+        .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
+    let connected = mcp_view_reachable(context.state, context.home, &existing, &credential).await;
+    let draft = EventDraft::new(
+        EventKind::McpServerUpdated,
+        Author::User(account.id),
+        json!({
+            "server": existing.server,
+            "url": null,
+            "credential": true,
+            "by": account.id,
+            // A Space credential's change is the Space's: the event carries the
+            // server's own scope, as an HTTP Space attach does.
+            "scope": existing.scope,
+        }),
+    );
+    let result = json!({
+        "server": existing.server,
+        "name": existing.name,
+        "url": existing.url,
+        "scope": "space",
+        // The command's owner, not the server's: a recorded answer is replayed
+        // only to the account whose command it was.
+        "user": account.id,
+        "by": existing.by,
+        "connected": connected,
+    });
+    let appended = match append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            // The record did not change, so the credential that worked before
+            // this command must not stay replaced by one it wrote.
+            match previous {
+                Some(previous) => {
+                    let _ = context
+                        .secrets
+                        .store_mcp_credential(existing.server, user, &previous);
+                }
+                None => context
+                    .secrets
+                    .discard_mcp_credential(existing.server, user),
+            }
+            return Err(error);
+        }
+    };
+    if appended.existing {
+        context
+            .secrets
+            .discard_mcp_credential(existing.server, user);
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
 /// The credential a call by `reader` would find for one server, and which
 /// slots hold one.
 ///
@@ -1393,27 +1799,45 @@ fn mcp_reader_credential(
 }
 
 /// The credential a call by `reader` would find for one server, which slots
-/// hold one, and whether the server is reachable with it.
+/// hold one, whether the server is reachable with it, and the fixed reason a
+/// stdio row shows when it cannot launch.
 ///
 /// A server a User connected is its owner's: any other reader would find no
 /// credential at all. A credential that is present but refused, and a server
 /// that cannot be reached, are not connected.
 async fn mcp_reader_connection(
-    secrets: &Secrets,
+    context: &CommandContext<'_>,
     server: &McpServerView,
     reader: Id,
-) -> Result<(Option<String>, &'static str, bool), ApiError> {
-    let (found, kind) = mcp_reader_credential(secrets, server.server, reader)?;
+) -> Result<(Option<String>, &'static str, bool, Option<String>), ApiError> {
+    let (found, kind) = mcp_reader_credential(context.secrets, server.server, reader)?;
     let found = match (server.scope, server.user) {
         (neha::record::McpScope::User, Some(user)) if user != reader => None,
         _ => found,
     };
-    let connected = match &found {
-        Some(credential) => mcp_reachable(&server.url, credential, &server.headers).await,
-        None => false,
+    let connection = match server.transport() {
+        // An HTTP server answers a request, so a call with no credential is not
+        // connected and a credential the server refuses is not reached.
+        McpTransport::StreamableHttp => match &found {
+            Some(credential)
+                if mcp_view_reachable(context.state, context.home, server, credential).await =>
+            {
+                Ok(())
+            }
+            Some(_) | None => Err("the MCP server did not answer".to_owned()),
+        },
+        // A stdio server needs no credential to run: the process decides
+        // whether it wants one, and the Vault's is passed when it holds one.
+        McpTransport::Stdio => stdio_launchable(context.state, context.home, server),
+    };
+    // Only a stdio row shows the fixed reason: an HTTP row keeps the shape it
+    // had, and its failure has no single answer to name.
+    let reason = match server.transport() {
+        McpTransport::Stdio => connection.as_ref().err().cloned(),
+        McpTransport::StreamableHttp => None,
     };
 
-    Ok((found, kind, connected))
+    Ok((found, kind, connection.is_ok(), reason))
 }
 
 /// Whether a call by `reader` would reach one server the Space holds.
@@ -1433,9 +1857,7 @@ async fn mcp_reader_reachable(
         return Ok(false);
     };
 
-    Ok(mcp_reader_connection(context.secrets, &view, reader)
-        .await?
-        .2)
+    Ok(mcp_reader_connection(context, &view, reader).await?.2)
 }
 
 /// One MCP server as a reader sees it.
@@ -1444,7 +1866,7 @@ async fn mcp_view(
     server: McpServerView,
     reader: Id,
 ) -> Result<Value, ApiError> {
-    let (_found, kind, connected) = mcp_reader_connection(context.secrets, &server, reader).await?;
+    let (_found, kind, connected, reason) = mcp_reader_connection(context, &server, reader).await?;
     let by_name = context
         .state
         .lock()
@@ -1454,10 +1876,16 @@ async fn mcp_view(
         .map(|user| user.display_name.clone())
         .unwrap_or_default();
 
-    Ok(json!({
+    let mut row = json!({
         "server": server.server,
         "name": server.name,
+        "transport": server.transport(),
         "url": server.url,
+        "command": server.command,
+        "args": server.args,
+        "env": server.env,
+        "cwd": server.cwd,
+        "data_cwd": server.data_cwd,
         "scope": match server.scope {
             neha::record::McpScope::Space => "space",
             neha::record::McpScope::User => "user",
@@ -1468,7 +1896,15 @@ async fn mcp_view(
         "plugin": server.plugin,
         "credential": kind,
         "connected": connected,
-    }))
+    });
+    // A stdio row answers why it cannot launch, so a client can show the reason
+    // instead of only an unconnected server. The field is additive: an HTTP row
+    // keeps the shape it had, and a connected row carries nothing new.
+    if let Some(reason) = reason {
+        row["reason"] = json!(reason);
+    }
+
+    Ok(row)
 }
 
 /// Attaches the signed-in User's own credential to an existing MCP server.
@@ -1538,7 +1974,7 @@ async fn mcp_connect(
         .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
     // A credential that is present but refused is not connected; the answer
     // says what a call would find, the same way `mcp_list` does.
-    let connected = mcp_reachable(&existing.url, &credential, &existing.headers).await;
+    let connected = mcp_view_reachable(context.state, context.home, &existing, &credential).await;
     let draft = EventDraft::new(
         EventKind::McpServerUpdated,
         Author::User(account.id),
@@ -1684,7 +2120,12 @@ async fn mcp_sign_in_start(
                     neha::record::McpScope::User
                 }
             };
-            (Some(server), None, existing.url, scope, existing.headers)
+            let Some(url) = existing.url else {
+                return Err(ApiError::invalid_argument(
+                    "a stdio MCP server has no address to sign in to",
+                ));
+            };
+            (Some(server), None, url, scope, existing.headers)
         }
         None => {
             let (Some(name), Some(url)) = (name, url) else {
@@ -3303,6 +3744,12 @@ async fn plugin_install(
         Source::Directory { .. } => None,
     };
     let served = package.servers;
+    // A package's own stdio command names a file the install publishes, and
+    // extraction keeps every file as data: the writer marks those files
+    // executable so the launch can start one. Computed from the package as
+    // read, so the published bytes do not depend on which servers this Space
+    // decides to register.
+    let executables = package_executable_paths(&served);
     let carried = package.skills;
 
     // The install adds to the Space's library, so it takes the same lock a
@@ -3315,6 +3762,15 @@ async fn plugin_install(
         let failures = finish_recorded_cleanup(context, command_id).await;
         return Ok(warned_replay(outcome, &failures));
     }
+
+    // The loader keeps a stdio working directory symbolic because the roots it
+    // would expand are not known until this install publishes the package. Here
+    // they are: the digest names the directory the install writes and the
+    // package name names its data directory, so the containment the loader
+    // cannot decide is decided against these final roots. Both are the paths
+    // `stdio_locations` resolves for a launch, so one rule governs both.
+    let published_root = context.home.plugins_dir().join(format!("{name}@{digest}"));
+    let published_data = context.home.plugin_data_dir(&name);
 
     // The Space's servers and the Space library's skills have unique names.
     // What the record holds is taken, except for what the replaced package
@@ -3343,22 +3799,7 @@ async fn plugin_install(
             .map(|view| view.name.clone())
             .collect();
         let mut servers = Vec::with_capacity(served.len());
-        for server in served {
-            // A header that could carry a credential keeps the whole server out
-            // of the record: the loader checks a header's shape, and the command
-            // is what decides which names the Space sends. The report names the
-            // header and never its value.
-            let mut server = server;
-            if let Some(header) = server.headers.keys().find_map(|name| {
-                matches!(header_class(name), Some(HeaderClass::Credential)).then(|| name.clone())
-            }) {
-                skipped.push(format!(
-                    "mcp.json: the server `{}` is skipped because it configures the `{header}` \
-                     header, which could carry a credential",
-                    server.key
-                ));
-                continue;
-            }
+        for mut server in served {
             if server_names.contains(&server.name) {
                 skipped.push(format!(
                     "mcp.json: the server `{}` is skipped because the Space already holds a \
@@ -3367,30 +3808,94 @@ async fn plugin_install(
                 ));
                 continue;
             }
-            // The package schema admits addresses the record refuses, and a
-            // server the record cannot hold must not fail the whole package.
-            if !neha::record::McpServerAdded::valid_url(&server.url) {
-                skipped.push(format!(
-                    "mcp.json: the server `{}` names an address this Space cannot call: {}",
-                    server.key, server.url
-                ));
-                continue;
-            }
-            // A header the client owns is dropped with a report: the record
-            // holds visible data, and the client supplies this one itself.
-            let generated: Vec<String> = server
-                .headers
-                .keys()
-                .filter(|name| matches!(header_class(name), Some(HeaderClass::Generated)))
-                .cloned()
-                .collect();
-            for header in generated {
-                server.headers.remove(&header);
-                skipped.push(format!(
-                    "mcp.json: the server `{}` drops the `{header}` header it configures, \
-                     because the Space sets that header itself",
-                    server.key
-                ));
+            match &mut server.transport {
+                crate::plugins::PackageTransport::Http { url, headers } => {
+                    // A header that could carry a credential keeps the whole
+                    // server out of the record: the loader checks a header's
+                    // shape, and the command is what decides which names the
+                    // Space sends. The report names the header and never its
+                    // value.
+                    if let Some(header) = headers.keys().find_map(|name| {
+                        matches!(header_class(name), Some(HeaderClass::Credential))
+                            .then(|| name.clone())
+                    }) {
+                        skipped.push(format!(
+                            "mcp.json: the server `{}` is skipped because it configures the \
+                             `{header}` header, which could carry a credential",
+                            server.key
+                        ));
+                        continue;
+                    }
+                    // The package schema admits addresses the record refuses,
+                    // and a server the record cannot hold must not fail the
+                    // whole package.
+                    if !neha::record::McpServerAdded::valid_url(url) {
+                        skipped.push(format!(
+                            "mcp.json: the server `{}` names an address this Space cannot call: \
+                             {url}",
+                            server.key
+                        ));
+                        continue;
+                    }
+                    // A header the client owns is dropped with a report: the
+                    // record holds visible data, and the client supplies this
+                    // one itself.
+                    let generated: Vec<String> = headers
+                        .keys()
+                        .filter(|name| matches!(header_class(name), Some(HeaderClass::Generated)))
+                        .cloned()
+                        .collect();
+                    for header in generated {
+                        headers.remove(&header);
+                        skipped.push(format!(
+                            "mcp.json: the server `{}` drops the `{header}` header it \
+                             configures, because the Space sets that header itself",
+                            server.key
+                        ));
+                    }
+                }
+                crate::plugins::PackageTransport::Stdio(stdio) => {
+                    // The contract skips a stdio server a machine cannot
+                    // sandbox rather than registering one that can never run.
+                    // The install asks the smoke check, not the cheap one: a
+                    // machine with bubblewrap installed can still refuse to
+                    // start a sandboxed process. The same checks run at launch
+                    // time as defense in depth.
+                    if !crate::stdio::sandbox_smoke() {
+                        skipped.push(format!(
+                            "mcp.json: the server `{}` is skipped because this Space cannot \
+                             sandbox a stdio server",
+                            server.key
+                        ));
+                        continue;
+                    }
+                    // The loader keeps the working directory's symbolic
+                    // expression; only these final roots say what a `..` or a
+                    // second placeholder removes. Resolve the expression with
+                    // the launch's own helper and skip only the server whose
+                    // directory leaves the root it names.
+                    if recorded_working_directory(stdio, &published_root, &published_data).is_err()
+                    {
+                        skipped.push(format!(
+                            "mcp.json: the server `{}` is skipped because its `cwd` leaves the \
+                             directory it is rooted at",
+                            server.key
+                        ));
+                        continue;
+                    }
+                    // The loader reads a launch configuration into the form
+                    // the record keeps; the record is the last gate, and a
+                    // server it cannot hold is skipped with a report like any
+                    // other.
+                    if let Err(reason) = stdio.validate() {
+                        skipped.push(format!(
+                            "mcp.json: the server `{}` has a launch configuration this Space \
+                             cannot hold: {reason}",
+                            server.key
+                        ));
+                        continue;
+                    }
+                }
             }
             server_names.insert(server.name.clone());
             servers.push(server);
@@ -3429,6 +3934,19 @@ async fn plugin_install(
 
     let plugin = Id::new();
     let server_ids: Vec<Id> = servers.iter().map(|_| Id::new()).collect();
+    // A stdio server keeps its installed dependencies and its state in the
+    // plugin's data directory, which must exist before the first launch and
+    // outlives every update. A package that brings no stdio server needs none:
+    // installing it leaves no directory behind.
+    if servers.iter().any(|server| {
+        matches!(
+            &server.transport,
+            crate::plugins::PackageTransport::Stdio(_)
+        )
+    }) {
+        std::fs::create_dir_all(context.home.plugin_data_dir(&name))
+            .map_err(|_| ApiError::internal("cannot create the package's data directory"))?;
+    }
     let skill_ids: Vec<Id> = skills.iter().map(|_| Id::new()).collect();
     // Every script goes to the File store before the record names it; the
     // record keeps only its digest.
@@ -3451,11 +3969,20 @@ async fn plugin_install(
         "digest": digest,
         "commit": commit,
         "source": source,
-        "servers": servers.iter().zip(&server_ids).map(|(server, id)| json!({
-            "server": id,
-            "name": server.name,
-            "url": server.url,
-        })).collect::<Vec<_>>(),
+        "servers": servers.iter().zip(&server_ids).map(|(server, id)| {
+            let mut row = json!({"server": id, "name": server.name});
+            match &server.transport {
+                crate::plugins::PackageTransport::Http { url, .. } => {
+                    row["url"] = json!(url);
+                    row["transport"] = json!("streamable-http");
+                }
+                crate::plugins::PackageTransport::Stdio(stdio) => {
+                    row["command"] = json!(stdio.command);
+                    row["transport"] = json!("stdio");
+                }
+            }
+            row
+        }).collect::<Vec<_>>(),
         "skills": skills.iter().zip(&skill_ids).map(|(skill, id)| json!({
             "skill": id,
             "name": skill.name,
@@ -3495,19 +4022,37 @@ async fn plugin_install(
         }),
     ));
     for (server, id) in servers.iter().zip(&server_ids) {
+        let mut data = json!({
+            "server": id,
+            "name": server.name,
+            "scope": neha::record::McpScope::Space,
+            "user": null,
+            "by": account.id,
+            "plugin": plugin,
+        });
+        match &server.transport {
+            crate::plugins::PackageTransport::Http { url, headers } => {
+                data["url"] = json!(url);
+                data["headers"] = json!(headers);
+            }
+            crate::plugins::PackageTransport::Stdio(stdio) => {
+                // The placeholders stay in the record: a launch expands them
+                // against the roots it resolves at that moment.
+                data["command"] = json!(stdio.command);
+                data["args"] = json!(stdio.args);
+                data["env"] = json!(stdio.env);
+                if let Some(cwd) = &stdio.cwd {
+                    data["cwd"] = json!(cwd);
+                }
+                if stdio.data_cwd {
+                    data["data_cwd"] = json!(true);
+                }
+            }
+        }
         drafts.push(EventDraft::new(
             EventKind::McpServerAdded,
             Author::User(account.id),
-            json!({
-                "server": id,
-                "name": server.name,
-                "url": server.url,
-                "scope": neha::record::McpScope::Space,
-                "user": null,
-                "by": account.id,
-                "plugin": plugin,
-                "headers": server.headers,
-            }),
+            data,
         ));
     }
     for ((skill, id), scripts) in skills.iter().zip(&skill_ids).zip(stored) {
@@ -3531,7 +4076,8 @@ async fn plugin_install(
     // answers success names bytes that are on disk, and a failed publish leaves
     // the record as it was. Publishing never writes into the directory the
     // Space already serves: an existing directory for the same digest stays.
-    write_package(&staging, &files).map_err(|_| ApiError::internal("cannot write the package"))?;
+    write_package(&staging, &files, &executables)
+        .map_err(|_| ApiError::internal("cannot write the package"))?;
     if publish_package(&staging, &package_dir).is_err() {
         discard_staging(&staging);
         return Err(ApiError::internal("cannot publish the package"));
@@ -4189,14 +4735,44 @@ fn cleanup_removed_mcp_server(context: &CommandContext<'_>, server: Id) -> Vec<S
     }
 }
 
+/// The package files its stdio servers name as their command.
+///
+/// A command of the form `./<path>` names one file in the package; the install
+/// publishes it executable, because extraction keeps every file as data and a
+/// launch can only start an executable file. A bare-name command names a
+/// program this machine provides, so it marks no package file.
+fn package_executable_paths(
+    servers: &[crate::plugins::PackageServer],
+) -> std::collections::BTreeSet<String> {
+    let mut paths = std::collections::BTreeSet::new();
+    for server in servers {
+        let crate::plugins::PackageTransport::Stdio(stdio) = &server.transport else {
+            continue;
+        };
+        // The loader keeps a plugin-relative command in the one form
+        // `./<normalized path>`; the file map is keyed by that same path.
+        if let Some(relative) = stdio.command.strip_prefix("./")
+            && !relative.is_empty()
+        {
+            paths.insert(relative.to_owned());
+        }
+    }
+
+    paths
+}
+
 /// Writes one validated package under the directory that holds it.
 ///
 /// A package path is relative and already free of `..`; every component is
 /// checked once more, so a path another platform reads as absolute cannot
 /// write outside the root. A failed write removes the directory, so a refused
 /// install leaves no partial package behind.
-fn write_package(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
-    if let Err(error) = write_package_files(root, files) {
+fn write_package(
+    root: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+    executables: &std::collections::BTreeSet<String>,
+) -> std::io::Result<()> {
+    if let Err(error) = write_package_files(root, files, executables) {
         let _ = std::fs::remove_dir_all(root);
         return Err(error);
     }
@@ -4204,7 +4780,11 @@ fn write_package(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> std::io::Res
     Ok(())
 }
 
-fn write_package_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> std::io::Result<()> {
+fn write_package_files(
+    root: &Path,
+    files: &BTreeMap<String, Vec<u8>>,
+    executables: &std::collections::BTreeSet<String>,
+) -> std::io::Result<()> {
     let _ = std::fs::remove_dir_all(root);
     std::fs::create_dir_all(root)?;
     restrict(root, 0o700)?;
@@ -4223,9 +4803,48 @@ fn write_package_files(root: &Path, files: &BTreeMap<String, Vec<u8>>) -> std::i
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(&target, bytes)?;
-        restrict(&target, 0o600)?;
+        if executables.contains(path) {
+            make_package_executable(root, &target)?;
+        } else {
+            restrict(&target, 0o600)?;
+        }
     }
 
+    Ok(())
+}
+
+/// Gives one package file the executable bit a stdio launch needs.
+///
+/// The file is checked before its mode changes: it must be the regular file
+/// this command just wrote, inside the package root, and never a symlink. A
+/// package path cannot name one today — every component is a plain file name
+/// and the writer creates the file itself — but the launch must never execute
+/// something the package did not bring. Unix carries the bit; another platform
+/// resolves a command by its existence alone.
+#[cfg(unix)]
+fn make_package_executable(root: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let metadata = std::fs::symlink_metadata(target)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a package executable is not a regular file",
+        ));
+    }
+    let root = std::fs::canonicalize(root)?;
+    let resolved = std::fs::canonicalize(target)?;
+    if !resolved.starts_with(&root) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a package executable leaves the package's directory",
+        ));
+    }
+    std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn make_package_executable(_root: &Path, _target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -6377,7 +6996,8 @@ pub async fn resume_run(
         (state.is_resumable(run), state.is_recovering(run))
     };
     if resumable {
-        let offered = offered_tools(state, secrets, run.bot, run.acting, instructions_only).await;
+        let offered =
+            offered_tools(state, home, secrets, run.bot, run.acting, instructions_only).await;
         let (history, resume, base_usage) = match prepare_resume(state, run, &offered.mcp) {
             Ok(plan) => plan,
             Err(error) => {
@@ -6433,7 +7053,7 @@ pub async fn resume_run(
         return Ok(Finished::Completed(events));
     }
     let recovered_offered =
-        offered_tools(state, secrets, run.bot, run.acting, instructions_only).await;
+        offered_tools(state, home, secrets, run.bot, run.acting, instructions_only).await;
     let recovery = match prepare_recovery(state, run, &recovered_offered.mcp) {
         Ok(plan) => plan,
         Err(error) => {
@@ -6736,6 +7356,7 @@ async fn finish_run_with(
         None => {
             offered_tools(
                 state,
+                home,
                 secrets,
                 pending.bot.id,
                 pending.acting,
@@ -6759,6 +7380,7 @@ async fn finish_run_with(
         inner: runtime,
         secret,
         state,
+        home,
         blobs,
         bot: pending.bot.id,
         run: pending.run,
@@ -7705,6 +8327,8 @@ struct RedactingRuntime<'a> {
     inner: RunRuntime,
     secret: Option<String>,
     state: &'a Mutex<State>,
+    /// The Space's home, where a package's directory and data live.
+    home: &'a Home,
     blobs: &'a Blobs,
     bot: Id,
     run: Id,
@@ -7718,6 +8342,43 @@ struct RedactingRuntime<'a> {
     log: Option<RunLog<'a>>,
     /// The MCP tools this run offers, by the name the Model sees.
     mcp: McpCatalog,
+}
+
+/// The client one accepted MCP answer's app is read from.
+///
+/// The app is read from the same client that made the call, whatever transport
+/// answered, so both transports stage a Card through one path and a stdio
+/// client is still alive when its app is read. A stdio client carries the one
+/// deadline its action started with, so the read cannot buy a second budget.
+enum McpCallClient {
+    /// A server the Space reached over Streamable HTTP.
+    Http(crate::mcp::McpClient),
+    /// A server the Space launched as a subprocess, with the deadline its call
+    /// and its app read share.
+    Stdio {
+        client: crate::stdio::StdioClient,
+        deadline: StdioDeadline,
+    },
+}
+
+impl McpCallClient {
+    /// Reads one resource from the server that answered the call.
+    async fn read_resource(&mut self, uri: &str) -> Result<crate::mcp::McpResource, String> {
+        match self {
+            Self::Http(client) => client
+                .read_resource(uri)
+                .await
+                .map_err(|error| error.to_string()),
+            // One action gets one budget: the read runs under the deadline the
+            // call already used, so a server cannot spend a second 30 seconds.
+            Self::Stdio { client, deadline } => {
+                match (*deadline).run(client.read_resource(uri)).await {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("the MCP server did not read its app in time".to_owned()),
+                }
+            }
+        }
+    }
 }
 
 impl RedactingRuntime<'_> {
@@ -7801,46 +8462,152 @@ impl RedactingRuntime<'_> {
         let Some(secrets) = self.secrets else {
             return ActionResult::failed("this runtime cannot read an MCP credential");
         };
-        let credential = match secrets.mcp_credential(server.server, Some(self.acting)) {
-            Ok(Some(credential)) => Some(credential),
-            Ok(None) => secrets.mcp_credential(server.server, None).ok().flatten(),
-            Err(_) => {
-                return ActionResult::failed(
-                    "the MCP server's credential cannot be read, so nothing was sent",
-                );
+        // Each transport starts and uses its client in its own way; the answer
+        // both return is recorded by one path below, so a Card is staged the
+        // same way whichever server answered.
+        let (answer, credential, mut client) = match server.transport() {
+            McpTransport::StreamableHttp => {
+                // Only a successfully read `None` means no credential: a Vault
+                // read that fails is not an absent one, so no request runs with
+                // another account's or with none claimed as absent.
+                let credential = match selected_mcp_credential(secrets, server.server, self.acting)
+                {
+                    Ok(credential) => credential,
+                    Err(_) => {
+                        return ActionResult::failed(
+                            "the MCP server's credential cannot be read, so nothing was sent",
+                        );
+                    }
+                };
+                let Some(credential) = credential else {
+                    return ActionResult::failed(format!(
+                        "the MCP server {:?} is not connected",
+                        server.name
+                    ));
+                };
+                let Some(url) = server.url.as_deref() else {
+                    return ActionResult::failed("the MCP server is not connected");
+                };
+                let Ok(client) = crate::mcp::McpClient::new(url, Some(&credential)) else {
+                    return ActionResult::failed("the MCP server's address is not usable");
+                };
+                let mut client = client.with_headers(&server.headers);
+                if let Err(error) = client.open().await {
+                    return ActionResult::failed(format!(
+                        "the MCP server {:?} did not answer: {error}",
+                        server.name
+                    ));
+                }
+                let answer = match client.call(&identity, arguments).await {
+                    Ok(answer) => answer,
+                    Err(crate::mcp::McpError::NotConnected { .. }) => {
+                        return ActionResult::failed(format!(
+                            "the MCP server {:?} is not connected",
+                            server.name
+                        ));
+                    }
+                    Err(error) => {
+                        return ActionResult::failed(format!(
+                            "the MCP server {:?} did not answer {model_name:?}: {error}",
+                            server.name
+                        ));
+                    }
+                };
+                (answer, Some(credential), McpCallClient::Http(client))
+            }
+            McpTransport::Stdio => {
+                // A stdio server may need a credential or may not: the process
+                // decides. A Vault credential is passed as the token when one
+                // exists, and the launch happens either way.
+                let spec = match stdio_spec(
+                    self.state,
+                    self.home,
+                    secrets,
+                    self.bot,
+                    self.acting,
+                    &server,
+                ) {
+                    Ok(spec) => spec,
+                    Err(reason) => {
+                        return ActionResult::failed(format!(
+                            "the MCP server {:?} cannot be launched: {reason}",
+                            server.name
+                        ));
+                    }
+                };
+                let credential = spec.credential.clone();
+                // One action, one budget: the deadline is computed here, before
+                // the start, and the app read later in the same action runs
+                // under what is left of it. A timeout drops the client, which
+                // kills the child.
+                let deadline = StdioDeadline::after(STDIO_CALL_TIMEOUT);
+                let call = deadline
+                    .run(async {
+                        let mut client = crate::stdio::StdioClient::start(spec)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        client.open().await.map_err(|error| error.to_string())?;
+                        let answer = client
+                            .call(&identity, arguments.clone())
+                            .await
+                            .map_err(|error| error.to_string())?;
+
+                        Ok::<_, String>((client, answer))
+                    })
+                    .await;
+                match call {
+                    Ok(Ok((client, answer))) => (
+                        answer,
+                        credential,
+                        McpCallClient::Stdio { client, deadline },
+                    ),
+                    Ok(Err(error)) => {
+                        return ActionResult::failed(format!(
+                            "the MCP server {:?} did not answer {model_name:?}: {error}",
+                            server.name
+                        ));
+                    }
+                    Err(_) => {
+                        return ActionResult::failed(format!(
+                            "the MCP server {:?} did not answer {model_name:?}: the MCP server \
+                             did not answer in time",
+                            server.name
+                        ));
+                    }
+                }
             }
         };
-        let Some(credential) = credential else {
-            return ActionResult::failed(format!(
-                "the MCP server {:?} is not connected",
-                server.name
-            ));
-        };
-        let Ok(client) = crate::mcp::McpClient::new(&server.url, Some(&credential)) else {
-            return ActionResult::failed("the MCP server's address is not usable");
-        };
-        let mut client = client.with_headers(&server.headers);
-        if let Err(error) = client.open().await {
-            return ActionResult::failed(format!(
-                "the MCP server {:?} did not answer: {error}",
-                server.name
-            ));
-        }
-        let answer = match client.call(&identity, arguments).await {
-            Ok(answer) => answer,
-            Err(crate::mcp::McpError::NotConnected { .. }) => {
-                return ActionResult::failed(format!(
-                    "the MCP server {:?} is not connected",
-                    server.name
-                ));
-            }
-            Err(error) => {
-                return ActionResult::failed(format!(
-                    "the MCP server {:?} did not answer {model_name:?}: {error}",
-                    server.name
-                ));
-            }
-        };
+        self.record_mcp_answer(
+            action,
+            model_name,
+            arguments,
+            &answer,
+            chat,
+            credential.as_deref(),
+            &mut client,
+        )
+        .await
+    }
+
+    /// Records one accepted MCP answer into the action's result and stages its
+    /// app, whatever transport answered.
+    ///
+    /// Every check that can refuse the answer runs before anything is staged:
+    /// the record must never hold a Card for a result the Space refused. Text
+    /// enters as text, an image as a File, and a resource as the JSON block the
+    /// server sent. A credential, when the call found one, never enters either.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_mcp_answer(
+        &self,
+        action: Id,
+        model_name: &str,
+        arguments: &Value,
+        answer: &crate::mcp::McpAnswer,
+        chat: Id,
+        credential: Option<&str>,
+        client: &mut McpCallClient,
+    ) -> ActionResult {
+        let credential = credential.unwrap_or_default();
         // Every check that can refuse the answer runs before anything is
         // staged: the record must never hold a Card for a result the Space
         // refused. Text enters as text, an image as a File, and an audio block
@@ -7852,12 +8619,12 @@ impl RedactingRuntime<'_> {
             // audio block's payload, and a resource's blob arrive as base64, so
             // a credential they hide would enter the record under an encoding
             // the literal redaction cannot see.
-            if content.carries_credential(&credential) {
+            if content.carries_credential(credential) {
                 return ActionResult::failed(MCP_CREDENTIAL_REFUSAL);
             }
             match content {
                 crate::mcp::McpContent::Text(text) => {
-                    parts.push(text.replace(&credential, "[redacted]"));
+                    parts.push(redacted_text(text, credential));
                 }
                 crate::mcp::McpContent::Image { media_type, data } => {
                     if data.len() as u64 > neha::file::MAX_FILE_BYTES {
@@ -7896,7 +8663,7 @@ impl RedactingRuntime<'_> {
                     // `_meta`, and every field a future version adds survive,
                     // and the payload the credential check searched once
                     // decoded is the payload the Model reads.
-                    parts.push(serialized_redacted(raw, &credential));
+                    parts.push(serialized_redacted(raw, credential));
                 }
                 crate::mcp::McpContent::Resource { raw, .. } => {
                     // An embedded resource enters the answer as the whole
@@ -7905,10 +8672,10 @@ impl RedactingRuntime<'_> {
                     // version adds. Its text payload is a plain string, so the
                     // redaction reaches it; a binary payload's decoded bytes
                     // were searched above.
-                    parts.push(serialized_redacted(raw, &credential));
+                    parts.push(serialized_redacted(raw, credential));
                 }
                 crate::mcp::McpContent::Other(value) => {
-                    parts.push(serialized_redacted(value, &credential));
+                    parts.push(serialized_redacted(value, credential));
                 }
             }
         }
@@ -7923,9 +8690,7 @@ impl RedactingRuntime<'_> {
             }
         }
         let mut text = parts.join("\n");
-        if text.contains(&credential) {
-            text = text.replace(&credential, "[redacted]");
-        }
+        text = redacted_text(&text, credential);
         let mut result = self.redact(if answer.is_error {
             ActionResult::failed(text)
         } else {
@@ -7937,13 +8702,7 @@ impl RedactingRuntime<'_> {
         // call.
         let report = self
             .stage_app_card(
-                action,
-                model_name,
-                arguments,
-                &answer,
-                chat,
-                &credential,
-                &mut client,
+                action, model_name, arguments, answer, chat, credential, client,
             )
             .await;
         if let Some(report) = report
@@ -7952,7 +8711,7 @@ impl RedactingRuntime<'_> {
             // A presentation failure is not the Model's business: it rides the
             // action's non-model field, which the run activity shows. The
             // report is redacted too: it enters the record like every answer.
-            let report = report.replace(&credential, "[redacted]");
+            let report = redacted_text(&report, credential);
             result.error = Some(self.redact_text(&report));
         }
 
@@ -7975,7 +8734,7 @@ impl RedactingRuntime<'_> {
         answer: &crate::mcp::McpAnswer,
         chat: Id,
         credential: &str,
-        client: &mut crate::mcp::McpClient,
+        client: &mut McpCallClient,
     ) -> Option<String> {
         let declared = self.mcp.get(model_name)?;
         let uri = declared.ui_resource.clone()?;
@@ -7995,8 +8754,9 @@ impl RedactingRuntime<'_> {
             return Some("the MCP server's app is not an MCP App".to_owned());
         }
         // The policy is composed from the credential the call uses, so a
-        // declared origin that names it never enters the record.
-        let csp = resource.content_security_policy(Some(credential));
+        // declared origin that names it never enters the record. A stdio call
+        // may have no credential at all.
+        let csp = resource.content_security_policy((!credential.is_empty()).then_some(credential));
         if !credential.is_empty() && csp.contains(credential) {
             // A policy the fixed directives happen to spell the credential
             // with would store it in the record: no Card is better than one
@@ -8012,7 +8772,7 @@ impl RedactingRuntime<'_> {
         // a credential a server printed into it never enters the record. The
         // redaction can grow the bytes, so the File bound is checked on the
         // redacted text: an app that outgrows a File records no Card at all.
-        let html = html.replace(credential, "[redacted]");
+        let html = redacted_text(&html, credential);
         if html.len() as u64 > neha::file::MAX_FILE_BYTES {
             return Some("the MCP server's app is too large".to_owned());
         }
@@ -8499,8 +9259,24 @@ fn mcp_declaration_fits(tool: &crate::mcp::McpTool) -> bool {
             .is_ok_and(|schema| schema.len() <= MAX_MCP_SCHEMA_BYTES)
 }
 
+/// Replaces one credential in text.
+///
+/// The empty string means the call found no credential: replacing it would
+/// interleave the marker between every character, so the absence is answered
+/// directly.
+fn redacted_text(text: &str, credential: &str) -> String {
+    if credential.is_empty() {
+        text.to_owned()
+    } else {
+        text.replace(credential, "[redacted]")
+    }
+}
+
 /// Serializes one JSON value with every decoded string redacted of the token.
 fn serialized_redacted(value: &Value, credential: &str) -> String {
+    if credential.is_empty() {
+        return serde_json::to_string(value).unwrap_or_default();
+    }
     fn redacted(value: &Value, credential: &str) -> Value {
         match value {
             Value::String(text) => Value::String(text.replace(credential, "[redacted]")),
@@ -8526,8 +9302,12 @@ fn serialized_redacted(value: &Value, credential: &str) -> String {
 ///
 /// A Card never holds the credential, whatever a server put into the tool's
 /// answer: a string is replaced, and so is an object's key. The credential is
-/// a bearer token, so its characters cannot break the JSON around it.
+/// a bearer token, so its characters cannot break the JSON around it. A call
+/// that found no credential has nothing to remove.
 fn without_credential(value: Value, credential: &str) -> Value {
+    if credential.is_empty() {
+        return value;
+    }
     match value {
         Value::String(text) => Value::String(text.replace(credential, "[redacted]")),
         Value::Array(items) => Value::Array(
@@ -8629,13 +9409,16 @@ struct OfferedTools {
 /// other server and skill usable: a broken integration never breaks the Bot.
 ///
 /// Discovery speaks to every enabled server the Bot may call, with the
-/// credential it finds and the headers the package configures. The headers are
+/// credential it finds. An HTTP server gets it as a bearer and the headers the
+/// package configures; a stdio server is started with the Vault's credential,
+/// when there is one, and the package's launch configuration. The headers are
 /// validated, non-secret package data, so they are sent whatever the credential
 /// is; the tools are still offered without one, so a call can answer that the
 /// server is not connected as the contract says, and a personal credential that
 /// cannot be read stops discovery instead of falling back to the Space's.
 async fn offered_tools(
     state: &Mutex<State>,
+    home: &Home,
     secrets: &Secrets,
     bot: Id,
     acting: Id,
@@ -8650,29 +9433,63 @@ async fn offered_tools(
     // a server that pages or stalls cannot keep the Model waiting behind it.
     const DISCOVERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let discovered = futures_util::future::join_all(servers.into_iter().map(|server| async move {
-        // The acting User's credential wins; the Space's answers otherwise. A
-        // server with neither is still discovered, with the package's headers,
-        // and its tools are still offered, so a call can answer that it is not
-        // connected.
-        let credential = match secrets.mcp_credential(server.server, Some(acting)) {
-            Ok(Some(credential)) => Some(credential),
-            Ok(None) => secrets.mcp_credential(server.server, None).ok().flatten(),
-            // A personal credential that cannot be read is not an absent one:
-            // no request may run as another account.
-            Err(_) => return (server, Vec::new(), None),
-        };
-        let Ok(client) = crate::mcp::McpClient::new(&server.url, credential.as_deref()) else {
-            return (server, Vec::new(), None);
-        };
-        let mut client = client.with_headers(&server.headers);
-        let listed = tokio::time::timeout(DISCOVERY_TIMEOUT, async {
-            client.open().await?;
-            client.tools().await
-        })
-        .await;
-        match listed {
-            Ok(Ok(list)) => (server, list, credential),
-            Ok(Err(_)) | Err(_) => (server, Vec::new(), None),
+        match server.transport() {
+            McpTransport::StreamableHttp => {
+                // The acting User's credential wins; the Space's answers
+                // otherwise. A server with neither is still discovered, with the
+                // package's headers, and its tools are still offered, so a call
+                // can answer that it is not connected.
+                let credential = match selected_mcp_credential(secrets, server.server, acting) {
+                    Ok(credential) => credential,
+                    // A credential that cannot be read is not an absent one:
+                    // no request may run as another account.
+                    Err(_) => return (server, Vec::new(), None),
+                };
+                let Some(url) = server.url.as_deref() else {
+                    return (server, Vec::new(), None);
+                };
+                let Ok(client) = crate::mcp::McpClient::new(url, credential.as_deref()) else {
+                    return (server, Vec::new(), None);
+                };
+                let mut client = client.with_headers(&server.headers);
+                let listed = tokio::time::timeout(DISCOVERY_TIMEOUT, async {
+                    client.open().await?;
+                    client.tools().await
+                })
+                .await;
+                match listed {
+                    Ok(Ok(list)) => (server, list, credential),
+                    Ok(Err(_)) | Err(_) => (server, Vec::new(), None),
+                }
+            }
+            McpTransport::Stdio => {
+                // The launch specification names the package's roots and the
+                // Vault's credential, when there is one. A server with no
+                // credential is still started: the process decides whether it
+                // wants one, and the tools are offered so a call can work.
+                let spec = match stdio_spec(state, home, secrets, bot, acting, &server) {
+                    Ok(spec) => spec,
+                    // A specification the record or this machine cannot
+                    // answer keeps this server's tools out, the way an HTTP
+                    // server that cannot answer a request keeps its own out.
+                    Err(_) => return (server, Vec::new(), None),
+                };
+                let credential = spec.credential.clone();
+                let listed = tokio::time::timeout(DISCOVERY_TIMEOUT, async move {
+                    let mut client = crate::stdio::StdioClient::start(spec).await?;
+                    client.open().await?;
+                    client.tools().await
+                })
+                .await;
+                // Every failure keeps the tools out: SandboxUnavailable,
+                // Unusable, Unreachable, and Protocol are all a server this run
+                // cannot use, and its error text names nothing the Space may
+                // show a Model.
+                match listed {
+                    Ok(Ok(list)) => (server, list, credential),
+                    Ok(Err(_)) | Err(_) => (server, Vec::new(), None),
+                }
+            }
         }
     }))
     .await;
@@ -12292,6 +13109,7 @@ mod tests {
             inner,
             secret: Some("run-token-123".to_owned()),
             state: &Mutex::new(State::default()),
+            home: &home,
             blobs: &blobs,
             bot: Id::new(),
             run: Id::new(),
@@ -13204,7 +14022,7 @@ mod tests {
             let server = state.mcp(view.servers[0]).unwrap().clone();
             assert_eq!(server.plugin, Some(plugin));
             assert_eq!(server.name, "weekly-tools-reports");
-            assert_eq!(server.url, "https://example.com/mcp");
+            assert_eq!(server.url.as_deref(), Some("https://example.com/mcp"));
             assert_eq!(server.scope, neha::record::McpScope::Space);
             assert_eq!(
                 server.headers.get("X-Tenant").map(String::as_str),
@@ -13246,6 +14064,1163 @@ mod tests {
             page.events[0].data["skills"],
             json!([skill.id]),
             "the package names the skill it brought"
+        );
+    }
+
+    /// Writes a package that brings an HTTP server, a stdio server, and an
+    /// invalid stdio entry, and answers its directory.
+    #[cfg(target_os = "linux")]
+    fn write_stdio_package_source(space: &TestSpace) -> std::path::PathBuf {
+        let package = space.home.root().join("packages").join("stdio");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"name\":\"stdio.tools\"}}",
+                crate::plugins::PLUGIN_SCHEMA
+            ),
+        )
+        .unwrap();
+        let mcp = json!({
+            "$schema": crate::plugins::MCP_SCHEMA,
+            "mcpServers": {
+                "local": {
+                    "type": "stdio",
+                    "command": "./bin/server",
+                    "args": ["--data", "${PLUGIN_DATA}/work"],
+                    "env": {"CONFIG": "${PLUGIN_ROOT}/config.json"},
+                    "cwd": "${PLUGIN_DATA}/work",
+                },
+                "remote": {"type": "streamable-http", "url": "https://example.com/mcp"},
+                "broken": {"type": "stdio", "command": "../bin/broken"},
+            },
+        });
+        std::fs::write(package.join("mcp.json"), mcp.to_string()).unwrap();
+
+        package
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_admin_installs_a_package_with_a_stdio_server() {
+        let mut space = TestSpace::open().await;
+        let package = write_stdio_package_source(&space);
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        let plugin: Id = serde_json::from_value(installed.result["plugin"].clone()).unwrap();
+        assert_eq!(installed.result["name"], json!("stdio.tools"));
+        // The contract skips a stdio server a machine cannot sandbox. A Linux
+        // machine whose sandbox cannot start a process reports the skip instead
+        // of registering a server that can never run; the HTTP server still
+        // installs.
+        if !crate::stdio::sandbox_smoke() {
+            let servers = installed.result["servers"].as_array().unwrap();
+            assert_eq!(servers.len(), 1, "{:?}", installed.result["servers"]);
+            assert_eq!(servers[0]["name"], json!("stdio-tools-remote"));
+            assert_eq!(servers[0]["transport"], json!("streamable-http"));
+            let skipped = installed.result["skipped"].as_array().unwrap();
+            assert_eq!(skipped.len(), 2, "{skipped:?}");
+            assert!(
+                skipped.iter().all(|report| report
+                    .as_str()
+                    .is_some_and(|report| report.contains("cannot sandbox a stdio server"))),
+                "{skipped:?}"
+            );
+            assert!(
+                !space.home.plugin_data_dir("stdio.tools").is_dir(),
+                "a package with no registered stdio server leaves no data directory"
+            );
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.mcps.len(), 1, "only the HTTP server is registered");
+            assert_eq!(state.mcps[0].name, "stdio-tools-remote");
+            return;
+        }
+        // A package that brings both transports registers both servers, and
+        // the invalid stdio entry is skipped with a report.
+        let servers = installed.result["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2, "{:?}", installed.result["servers"]);
+        assert_eq!(servers[0]["name"], json!("stdio-tools-local"));
+        assert_eq!(servers[0]["transport"], json!("stdio"));
+        assert_eq!(servers[0]["command"], json!("./bin/server"));
+        assert!(servers[0].get("url").is_none(), "a stdio row names no url");
+        assert_eq!(servers[1]["name"], json!("stdio-tools-remote"));
+        assert_eq!(servers[1]["transport"], json!("streamable-http"));
+        assert_eq!(servers[1]["url"], json!("https://example.com/mcp"));
+        let skipped = installed.result["skipped"].as_array().unwrap();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].as_str().unwrap().contains("`broken`"));
+
+        // The data directory a stdio server writes its state under exists
+        // before the record names the server.
+        assert!(space.home.plugin_data_dir("stdio.tools").is_dir());
+
+        // The projection keeps the transport's fields: an HTTP address, or a
+        // launch configuration relative to the roots the launch resolves.
+        let (local, remote) = {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.plugins.len(), 1);
+            let view = &state.plugins[0];
+            assert_eq!(view.servers.len(), 2);
+            let local = state.mcp(view.servers[0]).unwrap().clone();
+            let remote = state.mcp(view.servers[1]).unwrap().clone();
+            (local, remote)
+        };
+        assert_eq!(local.name, "stdio-tools-local");
+        assert_eq!(local.transport(), neha::record::McpTransport::Stdio);
+        assert_eq!(local.url, None);
+        assert_eq!(local.scope, neha::record::McpScope::Space);
+        assert_eq!(local.plugin, Some(plugin));
+        assert_eq!(local.command.as_deref(), Some("./bin/server"));
+        assert_eq!(local.args, ["--data", "${PLUGIN_DATA}/work"]);
+        assert_eq!(
+            local.env.get("CONFIG").map(String::as_str),
+            Some("${PLUGIN_ROOT}/config.json")
+        );
+        assert_eq!(local.cwd.as_deref(), Some("work"));
+        assert!(local.data_cwd);
+        assert_eq!(local.by, admin.id);
+        assert_eq!(remote.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(
+            remote.transport(),
+            neha::record::McpTransport::StreamableHttp
+        );
+
+        // The record holds one `neha.mcp.server.added` per server, and the
+        // stdio event carries no address and leaves the placeholders for the
+        // launch to expand.
+        let page = space.store.events_from(Seq::ZERO, 100).await.unwrap();
+        let added: Vec<_> = page
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::McpServerAdded)
+            .collect();
+        assert_eq!(added.len(), 2);
+        assert_eq!(added[0].data["server"], json!(local.server));
+        assert_eq!(added[0].data["command"], json!("./bin/server"));
+        assert_eq!(added[0].data["cwd"], json!("work"));
+        assert_eq!(added[0].data["data_cwd"], json!(true));
+        assert!(added[0].data.get("url").is_none(), "{:?}", added[0].data);
+        assert_eq!(
+            added[0].data["env"],
+            json!({"CONFIG": "${PLUGIN_ROOT}/config.json"})
+        );
+        assert_eq!(added[1].data["url"], json!("https://example.com/mcp"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_package_stdio_working_directory_is_checked_against_the_published_roots() {
+        if !crate::stdio::sandbox_smoke() {
+            eprintln!(
+                "skipping the package working directory test: this machine cannot start a \
+                 sandboxed process"
+            );
+            return;
+        }
+        let mut space = TestSpace::open().await;
+        let package = space.home.root().join("packages").join("cwd");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"name\":\"cwd.tools\"}}",
+                crate::plugins::PLUGIN_SCHEMA
+            ),
+        )
+        .unwrap();
+        // The real roots are `plugins/cwd.tools@{digest}` and
+        // `plugin-data/cwd.tools`, both several components below the Space's
+        // home. The contained expression is inside the data root only because
+        // the second placeholder contributes those components; the escaping
+        // one adds one `..` beyond that count.
+        let home_components = space
+            .home
+            .root()
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count();
+        let escaping = format!(
+            "${{PLUGIN_DATA}}/${{PLUGIN_ROOT}}/{}x",
+            "../".repeat(home_components + 3)
+        );
+        let mcp = json!({
+            "$schema": crate::plugins::MCP_SCHEMA,
+            "mcpServers": {
+                "contained": {
+                    "type": "stdio",
+                    "command": "node",
+                    "cwd": "${PLUGIN_DATA}/${PLUGIN_ROOT}/../../work",
+                },
+                "escaping": {
+                    "type": "stdio",
+                    "command": "node",
+                    "cwd": escaping,
+                },
+            },
+        });
+        std::fs::write(package.join("mcp.json"), mcp.to_string()).unwrap();
+        let sources = vec![format!("{}/", package.parent().unwrap().display())];
+        space.plugins = PluginsConfig { sources };
+        let admin = account(true);
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+
+        // The contained directory registers; only the escaping server is
+        // skipped, with a fixed report that repeats no path.
+        let servers = installed.result["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1, "{:?}", installed.result["servers"]);
+        assert_eq!(servers[0]["name"], json!("cwd-tools-contained"));
+        assert_eq!(servers[0]["transport"], json!("stdio"));
+        let skipped: Vec<&str> = installed.result["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0].contains("`escaping`") && skipped[0].contains("`cwd`"),
+            "{skipped:?}"
+        );
+        assert!(
+            !skipped[0].contains("${") && !skipped[0].contains(".."),
+            "the fixed report names no path: {skipped:?}"
+        );
+
+        // The record keeps the symbolic expression, and resolving it with the
+        // roots the install published starts the server inside the data
+        // directory.
+        let digest = installed.result["digest"].as_str().unwrap().to_owned();
+        let plugin_root = space.home.plugins_dir().join(format!("cwd.tools@{digest}"));
+        let plugin_data = space.home.plugin_data_dir("cwd.tools");
+        let recorded = {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.mcps.len(), 1, "only the contained server registers");
+            state.mcps[0]
+                .stdio()
+                .expect("the registered server is a stdio server")
+        };
+        assert_eq!(recorded.cwd.as_deref(), Some("${PLUGIN_ROOT}/../../work"));
+        assert!(recorded.data_cwd);
+        assert_eq!(recorded.command, "node");
+        let cwd = super::recorded_working_directory(&recorded, &plugin_root, &plugin_data)
+            .expect("the recorded directory resolves against the published roots");
+        assert!(cwd.starts_with(&plugin_data), "{cwd:?}");
+        assert!(cwd.ends_with("work"), "{cwd:?}");
+    }
+
+    /// The permissions of one file, as the install left them.
+    #[cfg(target_os = "linux")]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Writes a package that carries an executable `bin/server.sh`, another
+    /// executable-looking file, and a plain file, and answers its directory.
+    ///
+    /// A package source has no file modes of its own: `bin/server.sh` and
+    /// `bin/helper.sh` are written executable in the source directory, as a
+    /// tar would carry them, and only the stdio command decides which one the
+    /// install publishes as a program.
+    #[cfg(target_os = "linux")]
+    fn write_bundled_executable_package_source(
+        space: &TestSpace,
+        name: &str,
+        command: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let package = space
+            .home
+            .root()
+            .join("packages")
+            .join(name.replace('.', "-"));
+        std::fs::create_dir_all(package.join("bin")).unwrap();
+        std::fs::write(
+            package.join("plugin.json"),
+            format!(
+                "{{\"$schema\":\"{}\",\"name\":\"{name}\"}}",
+                crate::plugins::PLUGIN_SCHEMA
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("mcp.json"),
+            json!({
+                "$schema": crate::plugins::MCP_SCHEMA,
+                "mcpServers": {"local": {"type": "stdio", "command": command}},
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for (path, mode) in [
+            ("bin/server.sh", 0o755),
+            ("bin/helper.sh", 0o755),
+            ("config.json", 0o644),
+        ] {
+            let target = package.join(path);
+            std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
+
+        package
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_install_publishes_a_package_stdio_command_as_an_executable() {
+        let mut space = TestSpace::open().await;
+        let admin = account(true);
+        let package =
+            write_bundled_executable_package_source(&space, "exec.tools", "./bin/server.sh");
+        space.plugins = PluginsConfig {
+            sources: vec![format!("{}/", package.parent().unwrap().display())],
+        };
+        let context = space.context();
+
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            package.display().to_string(),
+        )
+        .await
+        .unwrap();
+        let digest = installed.result["digest"].as_str().unwrap().to_owned();
+        let published = space
+            .home
+            .plugins_dir()
+            .join(format!("exec.tools@{digest}"));
+        assert_eq!(
+            mode_of(&published.join("bin").join("server.sh")),
+            0o700,
+            "the package's stdio command is published executable"
+        );
+        assert_eq!(
+            mode_of(&published.join("bin").join("helper.sh")),
+            0o600,
+            "another executable-looking file the package carries stays private"
+        );
+        assert_eq!(
+            mode_of(&published.join("config.json")),
+            0o600,
+            "an ordinary package file stays private"
+        );
+        // The command the install publishes resolves to the executable file.
+        assert_eq!(
+            crate::stdio::resolve_command("./bin/server.sh", &published).unwrap(),
+            published.join("bin").join("server.sh")
+        );
+        // When this machine can launch one, the projected server names that
+        // same command.
+        if let Some(server) = installed.result["servers"]
+            .as_array()
+            .and_then(|servers| servers.first())
+        {
+            assert_eq!(server["command"], json!("./bin/server.sh"));
+            assert_eq!(
+                crate::stdio::resolve_command(server["command"].as_str().unwrap(), &published)
+                    .unwrap(),
+                published.join("bin").join("server.sh")
+            );
+        }
+
+        // A bare-name command names a program this machine provides: the
+        // install marks no package file executable for it.
+        let bare = write_bundled_executable_package_source(&space, "bare.tools", "node");
+        let installed = super::plugin_install(
+            &context,
+            &admin,
+            Id::new(),
+            "install".to_owned(),
+            bare.display().to_string(),
+        )
+        .await
+        .unwrap();
+        let digest = installed.result["digest"].as_str().unwrap().to_owned();
+        let published = space
+            .home
+            .plugins_dir()
+            .join(format!("bare.tools@{digest}"));
+        for path in ["bin/server.sh", "bin/helper.sh"] {
+            assert_eq!(
+                mode_of(&published.join(path)),
+                0o600,
+                "a bare command marks no package file executable: {path}"
+            );
+        }
+    }
+
+    /// Records one installed package whose published directory a test may
+    /// write, with one stdio server on it, and answers that directory.
+    async fn record_stdio_package(
+        space: &TestSpace,
+        admin: Id,
+        name: &str,
+        digest: &str,
+        server: Id,
+        configuration: Value,
+    ) -> std::path::PathBuf {
+        let plugin = Id::new();
+        let mut data = json!({
+            "server": server,
+            "name": format!("{}-local", name.replace('.', "-")),
+            "scope": "space",
+            "by": admin,
+            "plugin": plugin,
+        });
+        if let Some(fields) = configuration.as_object() {
+            for (field, value) in fields {
+                data[field] = value.clone();
+            }
+        }
+        space
+            .record(
+                Id::new(),
+                "install stdio",
+                vec![
+                    EventDraft::new(
+                        EventKind::PluginInstalled,
+                        Author::User(admin),
+                        json!({
+                            "plugin": plugin,
+                            "name": name,
+                            "version": "1.0.0",
+                            "digest": digest,
+                            "source": format!("https://example.com/acme/{name}@abc1234"),
+                            "servers": [server],
+                            "skills": [],
+                        }),
+                    ),
+                    EventDraft::new(EventKind::McpServerAdded, Author::User(admin), data),
+                ],
+                json!({}),
+            )
+            .await;
+
+        space.home.plugins_dir().join(format!("{name}@{digest}"))
+    }
+
+    /// Writes one executable file, creating its directory.
+    fn write_executable(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A path's components below its filesystem root: the text a textual
+    /// placeholder expansion contributes when a placeholder stands for that
+    /// path.
+    fn below_filesystem_root(path: &std::path::Path) -> std::path::PathBuf {
+        let mut below = std::path::PathBuf::new();
+        for component in path.components() {
+            if let std::path::Component::Normal(name) = component {
+                below.push(name);
+            }
+        }
+        below
+    }
+
+    /// A recorded working directory stays symbolic and is rebuilt from the
+    /// record's expression: every recognized placeholder expands against the
+    /// Space's roots, `.` and `..` are applied as a path, and the result stays
+    /// under the root the record names. Resolving it writes nothing, so the
+    /// roots here need not exist.
+    #[test]
+    fn a_recorded_working_directory_resolves_under_its_root() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plugin_root = home.path().join("plugins").join("weekly.tools@abc");
+        let plugin_data = home.path().join("plugin-data").join("weekly.tools");
+        let recorded = |cwd: Option<&str>, data_cwd: bool| neha::record::StdioServer {
+            command: "node".to_owned(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: cwd.map(str::to_owned),
+            data_cwd,
+        };
+        let resolve = |cwd: Option<&str>, data_cwd: bool| {
+            super::recorded_working_directory(&recorded(cwd, data_cwd), &plugin_root, &plugin_data)
+        };
+
+        // A second placeholder expands where it stands: it contributes the
+        // components of the root it names, so the directory stays under the
+        // data root the record's leading form names.
+        let cwd = resolve(Some("cache${PLUGIN_DATA}"), true)
+            .expect("a second placeholder inside the data root resolves");
+        let mut expected = plugin_data.join("cache");
+        expected.push(below_filesystem_root(&plugin_data));
+        assert_eq!(
+            cwd, expected,
+            "the placeholder contributes the root's components"
+        );
+        assert!(
+            cwd.starts_with(&plugin_data),
+            "the launch stays in its root"
+        );
+
+        // The package root expands the same way.
+        let cwd = resolve(Some("a${PLUGIN_ROOT}/b"), false)
+            .expect("a second placeholder inside the package root resolves");
+        let mut expected = plugin_root.join("a");
+        expected.push(below_filesystem_root(&plugin_root));
+        expected.push("b");
+        assert_eq!(cwd, expected);
+        assert!(cwd.starts_with(&plugin_root));
+
+        // The root's own name is the default working directory.
+        assert_eq!(
+            resolve(None, true).expect("the default working directory resolves"),
+            plugin_data
+        );
+
+        // A `${...}` that is not one of the two placeholders stays literal.
+        assert_eq!(
+            resolve(Some("a/${UNKNOWN}/b"), false).unwrap(),
+            plugin_root.join("a").join("${UNKNOWN}").join("b")
+        );
+
+        // A `..` after a component that holds a placeholder is applied to the
+        // expansion, not refused as it was when the loader normalized the
+        // relative text: the directory stays inside the declared data root.
+        let cwd = resolve(Some("a/${PLUGIN_ROOT}/../b"), true)
+            .expect("a `..` after a placeholder resolves inside the data root");
+        let mut expected = plugin_data.join("a");
+        expected.push(below_filesystem_root(&plugin_root));
+        expected.pop();
+        expected.push("b");
+        assert_eq!(cwd, expected);
+        assert!(
+            cwd.starts_with(&plugin_data),
+            "the `..` stays inside the data root"
+        );
+
+        // A `..` that would remove the root itself is refused, so a
+        // hand-built record cannot start a server outside the directory the
+        // sandbox mounts.
+        for cwd in ["..", "a/../../b"] {
+            let error = resolve(Some(cwd), true)
+                .expect_err("a working directory above its root is refused");
+            assert!(error.contains("leaves the directory"), "{error}");
+        }
+
+        // Nothing on disk changed: resolving is a path operation, and the
+        // launcher creates a missing data-rooted directory later, safely.
+        assert!(!plugin_root.exists(), "resolving a launch writes nothing");
+        assert!(!plugin_data.exists(), "resolving a launch writes nothing");
+        assert_eq!(
+            std::fs::read_dir(home.path()).unwrap().count(),
+            0,
+            "resolving a launch writes nothing outside"
+        );
+    }
+
+    /// The install registers a package's stdio server only after it resolves the
+    /// record's symbolic working directory against the roots it publishes. This
+    /// is that decision: the launch's own resolver, run with the published
+    /// roots, before the server enters the record.
+    #[test]
+    fn a_package_working_directory_is_checked_against_the_published_roots() {
+        let home = tempfile::TempDir::new().unwrap();
+        let plugin_root = home.path().join("plugins").join("weekly.tools@abc");
+        let plugin_data = home.path().join("plugin-data").join("weekly.tools");
+        let recorded = |cwd: &str, data_cwd: bool| neha::record::StdioServer {
+            command: "node".to_owned(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: Some(cwd.to_owned()),
+            data_cwd,
+        };
+        let resolves = |cwd: &str, data_cwd: bool| {
+            super::recorded_working_directory(&recorded(cwd, data_cwd), &plugin_root, &plugin_data)
+        };
+
+        // The package name and its digest make the real roots several
+        // components deep. The two `..` after the second placeholder remove
+        // components of the plugin root the placeholder contributes, so the
+        // directory stays inside the data root; the same text measured against
+        // one-component stand-ins would look like an escape.
+        let resolved = resolves("${PLUGIN_ROOT}/../../work", true)
+            .expect("the two `..` stay inside the real data root");
+        let mut expected = plugin_data.clone();
+        expected.push(below_filesystem_root(&plugin_root));
+        expected.pop();
+        expected.pop();
+        expected.push("work");
+        assert_eq!(resolved, expected);
+        assert!(resolved.starts_with(&plugin_data));
+
+        // One `..` beyond the plugin root's component count removes the data
+        // root itself: the install skips that server.
+        let pops = below_filesystem_root(&plugin_root)
+            .components()
+            .filter(|component| matches!(component, std::path::Component::Normal(_)))
+            .count();
+        let escaping = format!("${{PLUGIN_ROOT}}/{}", "../".repeat(pops + 1));
+        assert!(
+            resolves(&escaping, true).is_err(),
+            "a directory above the real data root is refused"
+        );
+
+        // An ordinary package-relative directory registers, and so does the
+        // root itself.
+        assert_eq!(
+            resolves("work", false).expect("an ordinary package-relative directory registers"),
+            plugin_root.join("work")
+        );
+        assert_eq!(
+            resolves("", true).expect("the root itself registers"),
+            plugin_data
+        );
+        // A hand-built record that names a directory above its root is refused
+        // by the same check before it is registered.
+        for cwd in ["..", "a/../../b"] {
+            assert!(resolves(cwd, true).is_err(), "`{cwd}` leaves the data root");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stdio_launch_spec_resolves_roots_arguments_cwd_and_credential() {
+        if !crate::stdio::sandbox_smoke() {
+            eprintln!(
+                "skipping the stdio launch specification test: this machine cannot start a \
+                 sandboxed process"
+            );
+            return;
+        }
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let reader = account(false);
+        let server = Id::new();
+        let digest = "c".repeat(64);
+        let package = record_stdio_package(
+            &space,
+            admin.id,
+            "stdio.tools",
+            &digest,
+            server,
+            json!({
+                "command": "./bin/server",
+                "args": [
+                    "--root", "${PLUGIN_ROOT}/config.json",
+                    "--data", "${PLUGIN_DATA}/work",
+                    "--other", "${UNKNOWN}/value",
+                ],
+                "env": {
+                    "CONFIG": "${PLUGIN_ROOT}/config.json",
+                    "DATA": "${PLUGIN_DATA}",
+                },
+                "cwd": "work",
+                "data_cwd": true,
+            }),
+        )
+        .await;
+        let executable = package.join("bin").join("server");
+        write_executable(&executable);
+        let data = space.home.plugin_data_dir("stdio.tools");
+        std::fs::create_dir_all(&data).unwrap();
+        space
+            .secrets
+            .store_mcp_credential(server, Some(reader.id), "personal-token")
+            .unwrap();
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        let view = space
+            .state
+            .lock()
+            .unwrap()
+            .mcp(server)
+            .cloned()
+            .expect("the server is projected");
+
+        let spec = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            reader.id,
+            &view,
+        )
+        .expect("the package's launch configuration resolves");
+        assert_eq!(
+            spec.command, executable,
+            "a relative command resolves against the package's directory"
+        );
+        assert_eq!(
+            spec.args,
+            [
+                "--root".to_owned(),
+                format!("{}/config.json", package.display()),
+                "--data".to_owned(),
+                format!("{}/work", data.display()),
+                "--other".to_owned(),
+                "${UNKNOWN}/value".to_owned(),
+            ],
+            "the two roots expand once and another placeholder stays literal"
+        );
+        assert_eq!(
+            spec.env.get("CONFIG").map(String::as_str),
+            Some(format!("{}/config.json", package.display()).as_str())
+        );
+        assert_eq!(
+            spec.env.get("DATA").map(String::as_str),
+            Some(data.to_str().unwrap())
+        );
+        assert_eq!(
+            spec.cwd,
+            data.join("work"),
+            "a data-rooted working directory joins the data root"
+        );
+        assert!(
+            !spec.cwd.exists(),
+            "resolving a specification writes nothing; the launcher creates the directory safely"
+        );
+        assert_eq!(spec.plugin_root, package);
+        assert_eq!(spec.plugin_data, data);
+        assert_eq!(
+            spec.space_home.as_path(),
+            space.home.root(),
+            "the specification names the Space's home the sandbox must not expose"
+        );
+        assert_eq!(
+            spec.credential.as_deref(),
+            Some("personal-token"),
+            "the acting User's credential wins over the Space's"
+        );
+
+        // Another account reads the Space's credential.
+        let spec = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            admin.id,
+            &view,
+        )
+        .unwrap();
+        assert_eq!(spec.credential.as_deref(), Some("space-token"));
+
+        // A credential file the Vault cannot open is a read failure, not an
+        // absent credential: the Space's slot must not fall through to a launch
+        // with none, and the fixed reason names no credential.
+        let credentials = space
+            .home
+            .root()
+            .join("secrets")
+            .join(format!("mcp-{server}"));
+        std::fs::write(credentials.join("space.key"), b"not a sealed credential").unwrap();
+        let error = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            admin.id,
+            &view,
+        )
+        .expect_err("a Space credential that cannot be read is a failure");
+        assert_eq!(error, "the MCP server's credential cannot be read");
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+
+        // The acting User's slot is read first, so a personal file the Vault
+        // cannot open is the same failure even when the Space's credential is
+        // fine: the launch never falls back to another account's.
+        std::fs::write(
+            credentials.join(format!("user-{}.key", reader.id)),
+            b"not a sealed credential",
+        )
+        .unwrap();
+        let error = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            reader.id,
+            &view,
+        )
+        .expect_err("a personal credential that cannot be read is a failure");
+        assert_eq!(error, "the MCP server's credential cannot be read");
+
+        // A launch with no credential at all is a launch, not a refusal: the
+        // process decides whether it wants one.
+        space
+            .secrets
+            .discard_mcp_credential(server, Some(reader.id));
+        space.secrets.discard_mcp_credential(server, None);
+        let spec = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            reader.id,
+            &view,
+        )
+        .unwrap();
+        assert_eq!(spec.credential, None);
+
+        // A server whose package is no longer installed names no directory to
+        // launch from.
+        let orphan = Id::new();
+        space
+            .record(
+                Id::new(),
+                "orphan",
+                vec![EventDraft::new(
+                    EventKind::McpServerAdded,
+                    Author::User(admin.id),
+                    json!({
+                        "server": orphan,
+                        "name": "orphan",
+                        "command": "./bin/server",
+                        "scope": "space",
+                        "by": admin.id,
+                        "plugin": Id::new(),
+                    }),
+                )],
+                json!({}),
+            )
+            .await;
+        let view = space.state.lock().unwrap().mcp(orphan).cloned().unwrap();
+        let error = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            reader.id,
+            &view,
+        )
+        .expect_err("a package the Space no longer holds cannot launch");
+        assert!(error.contains("no longer installed"), "{error}");
+    }
+
+    /// A Vault read that fails is not an absent credential, whichever slot it
+    /// names.
+    #[tokio::test]
+    async fn a_credential_that_cannot_be_read_is_not_an_absent_one() {
+        let space = TestSpace::open().await;
+        let server = Id::new();
+        let user = Id::new();
+        let credentials = space
+            .home
+            .root()
+            .join("secrets")
+            .join(format!("mcp-{server}"));
+
+        // No file at all is an absent credential.
+        assert_eq!(
+            super::selected_mcp_credential(&space.secrets, server, user),
+            Ok(None)
+        );
+
+        // A personal credential the Vault cannot open is a failure, never a
+        // fallback to the Space's.
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        std::fs::write(
+            credentials.join(format!("user-{user}.key")),
+            b"not a sealed credential",
+        )
+        .unwrap();
+        assert_eq!(
+            super::selected_mcp_credential(&space.secrets, server, user),
+            Err("the MCP server's credential cannot be read")
+        );
+
+        // A Space credential the Vault cannot open is a failure too: only a
+        // successfully read `None` means no credential.
+        space.secrets.discard_mcp_credential(server, Some(user));
+        std::fs::write(credentials.join("space.key"), b"not a sealed credential").unwrap();
+        assert_eq!(
+            super::selected_mcp_credential(&space.secrets, server, user),
+            Err("the MCP server's credential cannot be read")
+        );
+
+        // A readable credential is the one a call takes.
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        assert_eq!(
+            super::selected_mcp_credential(&space.secrets, server, user),
+            Ok(Some("space-token".to_owned()))
+        );
+    }
+
+    /// Whether this machine's sandbox can start a sandboxed process.
+    #[cfg(target_os = "linux")]
+    fn sandboxed() -> bool {
+        crate::stdio::sandbox_smoke()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_stdio_row_reports_its_launch_without_starting_it() {
+        if !sandboxed() {
+            eprintln!("skipping the stdio row test: this machine cannot start a sandboxed process");
+            return;
+        }
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let context = space.context();
+
+        // A server whose working directory is the package root, which the
+        // install published: a launch can start it.
+        let server = Id::new();
+        let package = record_stdio_package(
+            &space,
+            admin.id,
+            "stdio.tools",
+            &"d".repeat(64),
+            server,
+            json!({
+                "command": "./bin/server",
+                "args": ["--root", "${PLUGIN_ROOT}"],
+            }),
+        )
+        .await;
+        let started = package.join("started");
+        write_executable(&package.join("bin").join("server"));
+        std::fs::write(
+            package.join("bin").join("server"),
+            format!("#!/bin/sh\ntouch '{}'\n", started.display()),
+        )
+        .unwrap();
+        std::fs::create_dir_all(space.home.plugin_data_dir("stdio.tools")).unwrap();
+        let view = space.state.lock().unwrap().mcp(server).cloned().unwrap();
+
+        let row = super::mcp_view(&context, view, admin.id).await.unwrap();
+        assert_eq!(row["transport"], json!("stdio"));
+        assert_eq!(row["command"], json!("./bin/server"));
+        assert!(row["url"].is_null(), "a stdio row names no address");
+        assert_eq!(row["connected"], json!(true));
+        assert!(
+            row.get("reason").is_none(),
+            "a launchable server carries no reason"
+        );
+        assert!(
+            !started.exists(),
+            "listing a server builds the launch but starts nothing"
+        );
+
+        // A working directory that hangs from the package root is published by
+        // the install: a first launch cannot create it, so a missing one leaves
+        // the row unconnected instead of substituting the package root.
+        let missing = Id::new();
+        let missing_package = record_stdio_package(
+            &space,
+            admin.id,
+            "stdio.missing",
+            &"e".repeat(64),
+            missing,
+            json!({"command": "./bin/server", "cwd": "missing"}),
+        )
+        .await;
+        write_executable(&missing_package.join("bin").join("server"));
+        std::fs::create_dir_all(space.home.plugin_data_dir("stdio.missing")).unwrap();
+        let view = space.state.lock().unwrap().mcp(missing).cloned().unwrap();
+        let row = super::mcp_view(&context, view, admin.id).await.unwrap();
+        assert_eq!(
+            row["connected"],
+            json!(false),
+            "a plugin-rooted working directory must exist: {:?}",
+            row["reason"]
+        );
+        assert!(
+            row["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not a directory")),
+            "{:?}",
+            row["reason"]
+        );
+
+        // A working directory under the package's data directory may not exist
+        // yet: the first launch creates it safely, so the probe checks only the
+        // components that are there and writes nothing.
+        let data = Id::new();
+        let data_package = record_stdio_package(
+            &space,
+            admin.id,
+            "stdio.data",
+            &"f".repeat(64),
+            data,
+            json!({"command": "./bin/server", "cwd": "work", "data_cwd": true}),
+        )
+        .await;
+        write_executable(&data_package.join("bin").join("server"));
+        let plugin_data = space.home.plugin_data_dir("stdio.data");
+        std::fs::create_dir_all(&plugin_data).unwrap();
+        let view = space.state.lock().unwrap().mcp(data).cloned().unwrap();
+        let row = super::mcp_view(&context, view.clone(), admin.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            row["connected"],
+            json!(true),
+            "a data-rooted working directory the first launch creates: {:?}",
+            row["reason"]
+        );
+        assert!(
+            !plugin_data.join("work").exists(),
+            "listing a server creates no working directory and starts nothing"
+        );
+
+        // An existing data-rooted component that is not a directory is a fixed
+        // refusal: the first launch would refuse it too, so the row reports the
+        // launch's reason and still writes nothing.
+        std::fs::write(plugin_data.join("work"), b"not a directory").unwrap();
+        let entries = std::fs::read_dir(&plugin_data).unwrap().count();
+        let row = super::mcp_view(&context, view.clone(), admin.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            row["connected"],
+            json!(false),
+            "a file where the working directory would be: {row:?}"
+        );
+        assert!(
+            row["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not a directory")),
+            "{:?}",
+            row["reason"]
+        );
+        assert_eq!(
+            std::fs::read_dir(&plugin_data).unwrap().count(),
+            entries,
+            "listing a server writes nothing, not even a missing component"
+        );
+        assert_eq!(
+            std::fs::read_to_string(plugin_data.join("work")).unwrap(),
+            "not a directory",
+            "the file the working directory would replace is untouched"
+        );
+
+        // A command this machine cannot execute leaves the row unconnected,
+        // with the fixed reason a client can show.
+        std::fs::remove_file(package.join("bin").join("server")).unwrap();
+        let view = space.state.lock().unwrap().mcp(server).cloned().unwrap();
+        let row = super::mcp_view(&context, view, admin.id).await.unwrap();
+        assert_eq!(row["connected"], json!(false));
+        assert!(
+            row["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("not an executable file")),
+            "{:?}",
+            row["reason"]
+        );
+        assert!(
+            !started.exists(),
+            "no check listing a row makes starts the package's command"
+        );
+    }
+
+    /// A stdio action gets one budget: the tool call and the app read that may
+    /// follow it share a deadline, so the read cannot add a second one.
+    #[tokio::test]
+    async fn one_stdio_deadline_covers_the_call_and_the_app_read() {
+        // A short budget keeps the test fast; the real constant is 30 seconds.
+        let budget = super::StdioDeadline::after(std::time::Duration::from_millis(400));
+
+        // The call spends part of the one budget.
+        budget
+            .run(async { tokio::time::sleep(std::time::Duration::from_millis(50)).await })
+            .await
+            .expect("the call fits in the action's budget");
+
+        // The app read runs under the same deadline: a wait that a fresh
+        // budget would allow exceeds what the call left.
+        let read = budget
+            .run(async { tokio::time::sleep(std::time::Duration::from_millis(400)).await })
+            .await;
+        assert!(
+            read.is_err(),
+            "the app read must run under the call's deadline, not a second one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stdio_server_that_cannot_launch_keeps_its_tools_out_of_a_run() {
+        let space = TestSpace::open().await;
+        let owner = account(true).id;
+        let server = Id::new();
+        // A command token the record accepts, but this machine has no such
+        // program: discovery must leave the server out without failing.
+        record_stdio_package(
+            &space,
+            owner,
+            "stdio.tools",
+            &"e".repeat(64),
+            server,
+            json!({"command": "neha-no-such-mcp-server-program"}),
+        )
+        .await;
+        let bot = Id::new();
+        space
+            .record(
+                Id::new(),
+                "bot",
+                vec![
+                    EventDraft::new(
+                        EventKind::BotCreated,
+                        Author::User(owner),
+                        json!({
+                            "bot": bot,
+                            "owner": owner,
+                            "name": "Scout",
+                            "computer": Id::new(),
+                            "chat": Id::new(),
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::BotMcpEnabled,
+                        Author::User(owner),
+                        json!({"bot": bot, "server": server}),
+                    ),
+                ],
+                json!({}),
+            )
+            .await;
+
+        let offered =
+            super::offered_tools(&space.state, &space.home, &space.secrets, bot, owner, false)
+                .await;
+        assert!(
+            offered.mcp.specs().is_empty(),
+            "a server whose command cannot be resolved offers no tool"
         );
     }
 
@@ -13576,6 +15551,215 @@ mod tests {
             "the probe reached the server"
         );
         server_task.abort();
+    }
+
+    /// The Admin gives a package's stdio server the Space's credential through
+    /// `mcp add` without an address, and a later call launches with it.
+    #[tokio::test]
+    async fn the_admin_attaches_the_space_credential_to_a_package_stdio_server() {
+        if !crate::stdio::sandbox_smoke() {
+            eprintln!(
+                "skipping the stdio attach test: this machine cannot start a sandboxed process"
+            );
+            return;
+        }
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let server = Id::new();
+        let package = record_stdio_package(
+            &space,
+            admin.id,
+            "stdio.tools",
+            &"9".repeat(64),
+            server,
+            json!({"command": "./bin/server"}),
+        )
+        .await;
+        write_executable(&package.join("bin").join("server"));
+        std::fs::create_dir_all(space.home.plugin_data_dir("stdio.tools")).unwrap();
+        let context = space.context();
+        let attach =
+            |scope: neha::record::McpScope, credential: Option<&str>| neha::surface::McpAdd {
+                name: "stdio-tools-local".to_owned(),
+                url: String::new(),
+                scope,
+                credential: credential.map(str::to_owned),
+            };
+
+        // Only the Admin gives the Space a credential, and only as the Space's
+        // own: a personal or a User-scoped attach keeps `mcp_connect`.
+        let error = refused(
+            super::mcp_add(
+                &context,
+                &user,
+                Id::new(),
+                "attach-user".to_owned(),
+                attach(neha::record::McpScope::Space, Some("space-token")),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::Forbidden);
+        let error = refused(
+            super::mcp_add(
+                &context,
+                &admin,
+                Id::new(),
+                "attach-personal".to_owned(),
+                attach(neha::record::McpScope::User, Some("user-token")),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            space.secrets.mcp_credential(server, None).unwrap(),
+            None,
+            "a refused attach stores no credential"
+        );
+
+        // An empty address names only an existing package's stdio server: a
+        // name the Space does not hold is a fixed argument error, and so is a
+        // stdio attach with no credential.
+        let unknown = neha::surface::McpAdd {
+            name: "missing".to_owned(),
+            url: String::new(),
+            scope: neha::record::McpScope::Space,
+            credential: Some("space-token".to_owned()),
+        };
+        let error = refused(
+            super::mcp_add(
+                &context,
+                &admin,
+                Id::new(),
+                "attach-missing".to_owned(),
+                unknown,
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        let error = refused(
+            super::mcp_add(
+                &context,
+                &admin,
+                Id::new(),
+                "attach-no-credential".to_owned(),
+                attach(neha::record::McpScope::Space, None),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+
+        // The Admin attaches the Space's credential to the existing server.
+        let command = Id::new();
+        let attached = super::mcp_add(
+            &context,
+            &admin,
+            command,
+            "attach-space".to_owned(),
+            attach(neha::record::McpScope::Space, Some("package-token")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(attached.result["server"], json!(server));
+        assert_eq!(
+            attached.result["url"],
+            json!(null),
+            "a stdio server names no address"
+        );
+        assert_eq!(attached.result["scope"], json!("space"));
+        assert_eq!(attached.result["user"], json!(admin.id));
+        assert_eq!(
+            attached.result["connected"],
+            json!(true),
+            "the attach reports the launch check"
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("package-token")
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(admin.id))
+                .unwrap(),
+            None,
+            "the credential belongs to the Space, not the Admin"
+        );
+        {
+            let state = space.state.lock().unwrap();
+            assert_eq!(state.mcps.len(), 1, "an attach is not a second server");
+            assert_eq!(state.mcps[0].server, server);
+        }
+        let updates: Vec<Value> = space
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events
+            .into_iter()
+            .filter(|event| event.kind == EventKind::McpServerUpdated)
+            .map(|event| event.data)
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0]["server"], json!(server));
+        assert_eq!(
+            updates[0]["scope"],
+            json!("space"),
+            "a Space credential's change is the Space's"
+        );
+        assert_eq!(updates[0]["url"], json!(null));
+        assert_eq!(updates[0]["credential"], json!(true));
+
+        // A later call resolves the same server, and the credential it was
+        // given reaches the launch as NEHA_MCP_TOKEN.
+        let view = space.state.lock().unwrap().mcp(server).cloned().unwrap();
+        let spec = super::stdio_spec(
+            &space.state,
+            &space.home,
+            &space.secrets,
+            Id::new(),
+            user.id,
+            &view,
+        )
+        .expect("the attached server resolves a launch");
+        assert_eq!(
+            spec.credential.as_deref(),
+            Some("package-token"),
+            "a later call finds the Space's credential"
+        );
+        let launch = crate::stdio::sandbox_command(&spec).expect("the launch is built");
+        let environment: Vec<(std::ffi::OsString, std::ffi::OsString)> = launch
+            .as_std()
+            .get_envs()
+            .map(|(name, value)| (name.to_owned(), value.unwrap_or_default().to_owned()))
+            .collect();
+        assert_eq!(
+            environment
+                .iter()
+                .find(|(name, _)| name == "NEHA_MCP_TOKEN")
+                .map(|(_, value)| value.clone()),
+            Some(std::ffi::OsString::from("package-token")),
+            "the launch hands the attached token to the process"
+        );
+
+        // A replay answers the recorded result and appends nothing.
+        let cursor = space.store.last_seq().await.unwrap();
+        let replayed = super::mcp_add(
+            &context,
+            &admin,
+            command,
+            "attach-space".to_owned(),
+            attach(neha::record::McpScope::Space, Some("package-token")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed.result, attached.result);
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
     }
 
     #[tokio::test]
@@ -14795,7 +16979,9 @@ mod tests {
             )
             .await;
 
-        let offered = super::offered_tools(&space.state, &space.secrets, bot, owner, false).await;
+        let offered =
+            super::offered_tools(&space.state, &space.home, &space.secrets, bot, owner, false)
+                .await;
 
         // The tools are offered so a call can answer that the server is not
         // connected; the configured header is visible package data, so it is
@@ -14826,6 +17012,7 @@ mod tests {
             ),
             secret: None,
             state: &space.state,
+            home: &space.home,
             blobs: &space.blobs,
             bot,
             run,
@@ -14904,7 +17091,9 @@ mod tests {
             )
             .await;
 
-        let offered = super::offered_tools(&space.state, &space.secrets, bot, owner, false).await;
+        let offered =
+            super::offered_tools(&space.state, &space.home, &space.secrets, bot, owner, false)
+                .await;
 
         assert!(
             !offered.mcp.specs().is_empty(),

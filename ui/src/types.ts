@@ -31,12 +31,27 @@ export interface Bot {
   skills?: string[];
 }
 
-// One MCP server as the Integrations view lists it: where it answers, who
-// connected it, and whether a call by the reader would find it.
+// One MCP server as the Integrations view lists it: how the Space reaches it,
+// who connected it, and whether a call by the reader would find it.
 export interface McpServer {
   server: string;
   name: string;
-  url: string;
+  // How the Space reaches the server: over Streamable HTTP, or by launching
+  // the package's executable on its own machine.
+  transport?: "streamable-http" | "stdio";
+  // Where the server answers, when it is an HTTP server.
+  url: string | null;
+  // The executable a stdio server launches, and the arguments it gives it.
+  command?: string | null;
+  args?: string[];
+  // A stdio server's environment. The values are package data, so the view
+  // never shows them.
+  env?: Record<string, string>;
+  // A stdio server's working directory, relative to the root below.
+  cwd?: string | null;
+  // Whether the working directory hangs from the package's data directory
+  // rather than its root. Absent means the package root.
+  data_cwd?: boolean;
   // Where the server belongs: the whole Space, or one User.
   scope: "space" | "user";
   // The User whose server it is, when its scope is one User's.
@@ -62,7 +77,15 @@ export interface InstalledPackage {
   digest: string;
   source: string;
   enabled: boolean;
-  servers: { server: string; name: string }[];
+  // What one server row of the package says: the transport, and the address
+  // of an HTTP server or the command of a stdio one.
+  servers: {
+    server: string;
+    name: string;
+    transport?: "streamable-http" | "stdio";
+    url?: string | null;
+    command?: string | null;
+  }[];
   skills: { skill: string; name: string }[];
 }
 

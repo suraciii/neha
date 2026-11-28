@@ -82,7 +82,7 @@ A tool's result enters the record as an action's result: text as text, an image 
 
 An MCP server's credential belongs to the Space or to one User. The Admin connects a server for the Space; a User connects it with their own credential.
 
-A call finds the credential by the server's id: the acting User's when one exists, and otherwise the Space's. With neither, the tool returns that the server is not connected and the call sends no request.
+A call finds the credential by the server's id: the acting User's when one exists, and otherwise the Space's. With neither, the tool returns that the server is not connected and the call sends no request; a `stdio` server's call launches without a credential instead, and a credential attached to it reaches the process as `NEHA_MCP_TOKEN`.
 
 ## Record
 

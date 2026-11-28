@@ -343,7 +343,9 @@ mod tests {
     use super::{
         APP_CARD_KIND, Author, BotMoved, CardData, ComputerKind, EventData, EventDataError,
         EventDraft, EventKind, FileAdded, FileError, MAX_CARD_CSP_BYTES, MAX_CARD_VALUE_BYTES,
-        McpScope, McpServerAdded, RunAccess, RunQueued, SkillAdded, SkillLibrary, SkillScript,
+        MAX_MCP_ARG_BYTES, MAX_MCP_ARGS, MAX_MCP_ARGS_BYTES, MAX_MCP_COMMAND_BYTES, MAX_MCP_ENV,
+        MAX_MCP_ENV_VALUE_BYTES, McpScope, McpServerAdded, McpTransport, RunAccess, RunQueued,
+        SkillAdded, SkillLibrary, SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -409,6 +411,327 @@ mod tests {
             "https://example..com/mcp",
         ] {
             assert!(!McpServerAdded::valid_url(url), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_stdio_server_round_trips_and_an_http_record_still_decodes() {
+        let server = Id::new();
+        let by = Id::new();
+        let stdio = McpServerAdded {
+            server,
+            name: "docs".to_owned(),
+            url: None,
+            command: Some("./bin/server".to_owned()),
+            args: vec!["--data".to_owned(), "${PLUGIN_DATA}/docs".to_owned()],
+            env: [("CONFIG".to_owned(), "${PLUGIN_ROOT}/config.json".to_owned())]
+                .into_iter()
+                .collect(),
+            cwd: Some("work".to_owned()),
+            data_cwd: true,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        stdio.validate().unwrap();
+        assert_eq!(stdio.transport().unwrap(), McpTransport::Stdio);
+        // A view names the transport the way `mcp_list` answers it.
+        assert_eq!(
+            serde_json::to_value(McpTransport::Stdio).unwrap(),
+            serde_json::json!("stdio")
+        );
+        assert_eq!(
+            serde_json::to_value(McpTransport::StreamableHttp).unwrap(),
+            serde_json::json!("streamable-http")
+        );
+        assert_eq!(stdio.stdio().unwrap().cwd.as_deref(), Some("work"));
+        assert!(stdio.stdio().unwrap().data_cwd);
+
+        let value = serde_json::to_value(&stdio).unwrap();
+        assert!(value.get("url").is_none(), "a stdio server carries no url");
+        assert_eq!(value["command"], serde_json::json!("./bin/server"));
+        assert_eq!(value["data_cwd"], serde_json::json!(true));
+        assert_eq!(
+            EventKind::McpServerAdded.decode(&value).unwrap(),
+            EventData::McpServerAdded(stdio.clone())
+        );
+
+        // A record written before stdio servers were supported still decodes
+        // and validates: its `url` is the one transport.
+        let old = serde_json::json!({
+            "server": server,
+            "name": "docs",
+            "url": "https://example.com/mcp",
+            "scope": "space",
+            "by": by,
+        });
+        let EventData::McpServerAdded(old) = EventKind::McpServerAdded.decode(&old).unwrap() else {
+            panic!("the data is a server addition");
+        };
+        assert_eq!(old.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(old.command, None);
+        assert!(old.args.is_empty());
+        assert!(old.env.is_empty());
+        assert_eq!(old.cwd, None);
+        assert!(!old.data_cwd);
+        assert_eq!(old.transport().unwrap(), McpTransport::StreamableHttp);
+
+        // A record that names no working directory works in the plugin root.
+        let root = serde_json::json!({
+            "server": Id::new(),
+            "name": "docs",
+            "command": "npx",
+            "scope": "space",
+            "by": by,
+        });
+        let EventData::McpServerAdded(root) = EventKind::McpServerAdded.decode(&root).unwrap()
+        else {
+            panic!("the data is a server addition");
+        };
+        let stdio = root.stdio().unwrap();
+        assert_eq!(stdio.cwd, None);
+        assert!(!stdio.data_cwd);
+    }
+
+    #[test]
+    fn a_server_names_exactly_one_transport() {
+        let server = Id::new();
+        let by = Id::new();
+        for fields in [
+            // Neither a `url` nor a `command`.
+            serde_json::json!({}),
+            // Both at once.
+            serde_json::json!({"url": "https://example.com/mcp", "command": "npx"}),
+            // The fields of the other transport.
+            serde_json::json!({"url": "https://example.com/mcp", "args": ["--data"]}),
+            serde_json::json!({"url": "https://example.com/mcp", "env": {"A": "b"}}),
+            serde_json::json!({"url": "https://example.com/mcp", "cwd": "work"}),
+            serde_json::json!({"url": "https://example.com/mcp", "data_cwd": true}),
+            serde_json::json!({"command": "npx", "headers": {"X-Tenant": "public"}}),
+        ] {
+            let mut value = serde_json::json!({
+                "server": server,
+                "name": "docs",
+                "scope": "space",
+                "by": by,
+            });
+            for (field, configured) in fields.as_object().unwrap() {
+                value[field] = configured.clone();
+            }
+            assert!(
+                EventKind::McpServerAdded.decode(&value).is_err(),
+                "{fields} must name one transport"
+            );
+        }
+    }
+
+    #[test]
+    fn a_symbolic_working_directory_may_keep_placeholders_and_parents() {
+        let by = Id::new();
+        let server = |cwd: &str, data_cwd: bool| McpServerAdded {
+            server: Id::new(),
+            name: "docs".to_owned(),
+            url: None,
+            command: Some("npx".to_owned()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: Some(cwd.to_owned()),
+            data_cwd,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+
+        // The record keeps the package's symbolic expression: an install and a
+        // launch expand the two placeholders against the real roots, and only
+        // that expansion says what a `..` removes. A `..` after a placeholder
+        // may remove a component of the root the placeholder stands for, whose
+        // component count the text does not carry, so it stays for the install
+        // and the launch to judge.
+        for cwd in [
+            "work",
+            "a/../b",
+            "a/${PLUGIN_ROOT}/../b",
+            "cache${PLUGIN_DATA}",
+            "${PLUGIN_ROOT}/../../work",
+            "${PLUGIN_DATA}/a/${PLUGIN_ROOT}/../../..",
+            "./work",
+            "a/./b",
+            "a/..",
+        ] {
+            server(cwd, true)
+                .validate()
+                .unwrap_or_else(|error| panic!("`{cwd}` is a symbolic working directory: {error}"));
+        }
+    }
+
+    #[test]
+    fn a_stdio_command_is_one_executable_token() {
+        let by = Id::new();
+        let server = |command: &str| McpServerAdded {
+            server: Id::new(),
+            name: "docs".to_owned(),
+            url: None,
+            command: Some(command.to_owned()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            data_cwd: false,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        for command in [
+            "npx",
+            "python3.12",
+            "my-tool",
+            "tool_x",
+            "./bin/server",
+            "./server",
+        ] {
+            server(command)
+                .validate()
+                .unwrap_or_else(|error| panic!("`{command}` is a command token: {error}"));
+        }
+        for command in [
+            "",
+            "bin/server",
+            "/bin/server",
+            "./",
+            "./bin//server",
+            "./bin/../server",
+            "./../server",
+            ".hidden",
+            "..",
+            "a b",
+            "npx;rm -rf /",
+            "npx&&cat",
+            "npx|cat",
+            "$SHELL",
+            "a\\b",
+        ] {
+            assert!(
+                server(command).validate().is_err(),
+                "`{command}` must not name a command"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stdio_server_is_bounded() {
+        let by = Id::new();
+        let stdio = || McpServerAdded {
+            server: Id::new(),
+            name: "docs".to_owned(),
+            url: None,
+            command: Some("npx".to_owned()),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            data_cwd: false,
+            scope: McpScope::Space,
+            user: None,
+            by,
+            plugin: None,
+            headers: std::collections::BTreeMap::new(),
+        };
+        let mut edge = stdio();
+        edge.command = Some("a".repeat(MAX_MCP_COMMAND_BYTES));
+        edge.args = vec!["a".repeat(MAX_MCP_ARG_BYTES); MAX_MCP_ARGS_BYTES / MAX_MCP_ARG_BYTES];
+        edge.validate().unwrap();
+
+        let cases = [
+            ("a command above its bound", {
+                let mut server = stdio();
+                server.command = Some("a".repeat(MAX_MCP_COMMAND_BYTES + 1));
+                server
+            }),
+            ("arguments above their count", {
+                let mut server = stdio();
+                server.args = vec!["a".to_owned(); MAX_MCP_ARGS + 1];
+                server
+            }),
+            ("an argument above its bound", {
+                let mut server = stdio();
+                server.args = vec!["a".repeat(MAX_MCP_ARG_BYTES + 1)];
+                server
+            }),
+            ("arguments above their total", {
+                let mut server = stdio();
+                server.args =
+                    vec!["a".repeat(MAX_MCP_ARG_BYTES); MAX_MCP_ARGS_BYTES / MAX_MCP_ARG_BYTES + 1];
+                server
+            }),
+            ("an environment above its count", {
+                let mut server = stdio();
+                for index in 0..=MAX_MCP_ENV {
+                    server.env.insert(format!("A{index}"), "b".to_owned());
+                }
+                server
+            }),
+            ("an environment value above its bound", {
+                let mut server = stdio();
+                server
+                    .env
+                    .insert("A".to_owned(), "a".repeat(MAX_MCP_ENV_VALUE_BYTES + 1));
+                server
+            }),
+            ("an environment above its total", {
+                let mut server = stdio();
+                for index in 0..MAX_MCP_ENV {
+                    server
+                        .env
+                        .insert(format!("A{index}"), "a".repeat(MAX_MCP_ENV_VALUE_BYTES));
+                }
+                server
+            }),
+            ("an environment name that is not one", {
+                let mut server = stdio();
+                server.env.insert("A-B".to_owned(), "b".to_owned());
+                server
+            }),
+            ("a working directory that leaves its root", {
+                let mut server = stdio();
+                server.cwd = Some("../work".to_owned());
+                server
+            }),
+            ("a working directory that pops above its root", {
+                let mut server = stdio();
+                server.cwd = Some("a/../../b".to_owned());
+                server
+            }),
+            ("a working directory that is not relative", {
+                let mut server = stdio();
+                server.cwd = Some("/work".to_owned());
+                server
+            }),
+            ("a working directory with a path separator", {
+                let mut server = stdio();
+                server.cwd = Some("a\\b".to_owned());
+                server
+            }),
+            ("a working directory with a control character", {
+                let mut server = stdio();
+                server.cwd = Some("a\u{0}b".to_owned());
+                server
+            }),
+            (
+                "a working directory with a separator after a placeholder",
+                {
+                    let mut server = stdio();
+                    server.cwd = Some("${PLUGIN_ROOT}/after:bad".to_owned());
+                    server
+                },
+            ),
+        ];
+        for (reason, server) in cases {
+            assert!(server.validate().is_err(), "{reason} is refused");
         }
     }
 
@@ -2550,16 +2873,305 @@ pub enum McpScope {
 /// names are at most 64 characters.
 pub const MAX_MCP_NAME_BYTES: usize = 32;
 
+/// The most bytes a stdio server's `command` token may take.
+pub const MAX_MCP_COMMAND_BYTES: usize = 1024;
+/// The most arguments a stdio server may name.
+pub const MAX_MCP_ARGS: usize = 128;
+/// The most bytes one argument of a stdio server may take.
+pub const MAX_MCP_ARG_BYTES: usize = 4096;
+/// The most bytes all arguments of a stdio server together may take.
+pub const MAX_MCP_ARGS_BYTES: usize = 16 * 1024;
+/// The most environment variables a stdio server may configure.
+pub const MAX_MCP_ENV: usize = 64;
+/// The most bytes one environment variable's name may take.
+pub const MAX_MCP_ENV_NAME_BYTES: usize = 128;
+/// The most bytes one environment variable's value may take.
+pub const MAX_MCP_ENV_VALUE_BYTES: usize = 4096;
+/// The most bytes all environment variables of a stdio server together may take.
+pub const MAX_MCP_ENV_BYTES: usize = 64 * 1024;
+/// The most bytes a stdio server's working directory may take.
+pub const MAX_MCP_CWD_BYTES: usize = 4096;
+
+/// How a Space reaches an MCP server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpTransport {
+    /// MCP Streamable HTTP: a server that runs elsewhere and is reached over
+    /// the network.
+    StreamableHttp,
+    /// MCP over stdio: a subprocess the Space launches on its own machine.
+    Stdio,
+}
+
+/// A stdio MCP server's launch configuration, as the record holds it.
+///
+/// The record keeps the package's symbolic form: `${PLUGIN_ROOT}` and
+/// `${PLUGIN_DATA}` in `args`, `env`, and `cwd` stand for the plugin root and
+/// its data directory when the Space launches the process. `command` and `cwd`
+/// are relative to a root the package chose, so they stay meaningful when the
+/// home moves; a `cwd` keeps every `..` its expression needs, because only an
+/// install or a launch knows the real roots and can decide what a `..` removes.
+/// Nothing is launched from this type alone: the install resolves the directory
+/// against the roots it publishes, and a launch resolves the two roots again and
+/// checks the resolved directory against the root it names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StdioServer {
+    /// The executable: a bare name the platform resolves, or a path beginning
+    /// with `./` under the plugin root.
+    pub command: String,
+    /// The arguments, as the package wrote them.
+    pub args: Vec<String>,
+    /// The environment variables the package configures, as it wrote them.
+    pub env: std::collections::BTreeMap<String, String>,
+    /// The symbolic working directory under its root, `/`-separated; it may
+    /// hold the two recognized placeholders and `..` components, and `None`
+    /// names the root itself.
+    pub cwd: Option<String>,
+    /// Whether the working directory hangs from the plugin data directory
+    /// rather than the plugin root.
+    pub data_cwd: bool,
+}
+
+impl StdioServer {
+    /// Checks the launch configuration against what the record holds, and
+    /// answers the reason it cannot hold it.
+    pub fn validate(&self) -> Result<(), String> {
+        if normalize_stdio_command(&self.command).as_deref() != Some(self.command.as_str()) {
+            return Err(format!(
+                "a stdio server's command is a bare executable name, or a `./` path that stays \
+                 in the plugin root, at most {MAX_MCP_COMMAND_BYTES} bytes"
+            ));
+        }
+        if self.args.len() > MAX_MCP_ARGS {
+            return Err(format!(
+                "a stdio server takes at most {MAX_MCP_ARGS} arguments"
+            ));
+        }
+        let mut args_bytes = 0;
+        for argument in &self.args {
+            if argument.contains('\0') || argument.len() > MAX_MCP_ARG_BYTES {
+                return Err(format!(
+                    "a stdio server's argument is text without a NUL, at most \
+                     {MAX_MCP_ARG_BYTES} bytes"
+                ));
+            }
+            args_bytes += argument.len();
+        }
+        if args_bytes > MAX_MCP_ARGS_BYTES {
+            return Err(format!(
+                "a stdio server's arguments take at most {MAX_MCP_ARGS_BYTES} bytes"
+            ));
+        }
+        if self.env.len() > MAX_MCP_ENV {
+            return Err(format!(
+                "a stdio server configures at most {MAX_MCP_ENV} environment variables"
+            ));
+        }
+        let mut env_bytes = 0;
+        for (name, value) in &self.env {
+            if !valid_mcp_env_name(name) || name.len() > MAX_MCP_ENV_NAME_BYTES {
+                return Err(format!(
+                    "a stdio server's environment variable name is \
+                     `[A-Za-z_][A-Za-z0-9_]*`, at most {MAX_MCP_ENV_NAME_BYTES} bytes"
+                ));
+            }
+            if value.contains('\0') || value.len() > MAX_MCP_ENV_VALUE_BYTES {
+                return Err(format!(
+                    "a stdio server's environment variable value is text without a NUL, at most \
+                     {MAX_MCP_ENV_VALUE_BYTES} bytes"
+                ));
+            }
+            env_bytes += name.len() + value.len();
+        }
+        if env_bytes > MAX_MCP_ENV_BYTES {
+            return Err(format!(
+                "a stdio server's environment takes at most {MAX_MCP_ENV_BYTES} bytes"
+            ));
+        }
+        if let Some(cwd) = &self.cwd
+            && !symbolic_working_directory_stays_inside(cwd)
+        {
+            return Err(format!(
+                "a stdio server's working directory is a `/`-separated relative path that \
+                 stays in the root its `data_cwd` bit names, at most {MAX_MCP_CWD_BYTES} bytes"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+/// The placeholders a launch expands in a symbolic working directory.
+const SYMBOLIC_ROOT_PLACEHOLDERS: [&str; 2] = ["${PLUGIN_ROOT}", "${PLUGIN_DATA}"];
+
+/// Whether a symbolic working directory is text the record can hold.
+///
+/// The record and the package loader keep the package's expression, not an
+/// expanded result: it may hold the two recognized `${...}` placeholders and
+/// `..` components, and only an expansion against the real plugin root and
+/// plugin data directory says where it lands. The install expands it with the
+/// roots it publishes and skips a directory that leaves the root its `data_cwd`
+/// bit names; the launch expands it again with the roots it finds and refuses
+/// the same escape. So this check is textual and conservative, and it is not the
+/// containment decision. The path is `/`-separated and not absolute, its
+/// components are plain text — no backslash, control character, or drive/stream
+/// separator, because none is a path component on every platform the record may
+/// reach — and a `..` that appears before any placeholder may not remove the
+/// root itself: it names the root's parent wherever the root is. A `..` after a
+/// placeholder may remove a component of the root the placeholder stands for,
+/// and the text does not carry how many, so it stays for the install and the
+/// launch to judge.
+#[must_use]
+pub fn symbolic_working_directory_stays_inside(cwd: &str) -> bool {
+    if cwd.is_empty() || cwd.len() > MAX_MCP_CWD_BYTES || cwd.starts_with('/') {
+        return false;
+    }
+    if cwd.chars().any(char::is_control) || cwd.contains('\\') {
+        return false;
+    }
+    let mut depth = 0_usize;
+    // Once a component holds a placeholder the record cannot know how many
+    // components its expansion contributes, so a later `..` is left for the
+    // install and the launch; the text checks still run over every component.
+    let mut undecidable = false;
+    for component in cwd.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if undecidable {
+                    continue;
+                }
+                let Some(remaining) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = remaining;
+            }
+            component => {
+                // A drive or stream separator is not one path component on
+                // every platform the record may reach: check it on the whole
+                // expression, including the part after a placeholder.
+                if component.contains(':') {
+                    return false;
+                }
+                if SYMBOLIC_ROOT_PLACEHOLDERS
+                    .iter()
+                    .any(|placeholder| component.contains(placeholder))
+                {
+                    undecidable = true;
+                }
+                depth += 1;
+            }
+        }
+    }
+
+    true
+}
+
+/// Normalizes a `/`-separated path relative to one root.
+///
+/// Answers the path's components with `.` components dropped and `..`
+/// components applied, or `None` when the path is not plain text or a `..`
+/// would leave the root. The empty answer names the root itself. A stored
+/// command is one this function answers unchanged; a working directory keeps
+/// its symbolic form, so it may hold placeholders and `..` components and is
+/// checked by [`StdioServer::validate`] instead.
+#[must_use]
+pub fn normalize_relative(path: &str) -> Option<String> {
+    if path.chars().any(char::is_control) || path.contains('\\') {
+        return None;
+    }
+    let mut components: Vec<&str> = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            // A drive or stream separator is not one path component: joining
+            // it would name another root on some platform.
+            component if component.contains(':') => return None,
+            component => components.push(component),
+        }
+    }
+
+    Some(components.join("/"))
+}
+
+/// Whether an environment variable may take this name: `[A-Za-z_][A-Za-z0-9_]*`.
+#[must_use]
+pub fn valid_mcp_env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    match bytes.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == b'_' => {}
+        _ => return false,
+    }
+
+    bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Normalizes a stdio server's command token: a bare executable name, or a
+/// path beginning with `./` that stays in the plugin root.
+///
+/// Answers the token in the one form the record holds, or `None` when it names
+/// no executable token: a shell command line, a path without `./`, an escape
+/// from the plugin root, or text that is not plain.
+///
+/// The package loader reads a command into this form, and the record accepts
+/// only the form this function answers unchanged.
+#[must_use]
+pub fn normalize_stdio_command(command: &str) -> Option<String> {
+    if command.is_empty()
+        || command.len() > MAX_MCP_COMMAND_BYTES
+        || command.chars().any(char::is_control)
+    {
+        return None;
+    }
+    if let Some(relative) = command.strip_prefix("./") {
+        let relative = normalize_relative(relative)?;
+
+        return (!relative.is_empty()).then(|| format!("./{relative}"));
+    }
+    // A bare executable name is one token the platform's search resolves. Any
+    // other character is shell syntax or another path.
+    let bare = command
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'+'));
+
+    (bare && !command.starts_with('.')).then(|| command.to_owned())
+}
+
 /// The data of `neha.mcp.server.added`.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerAdded {
     /// The server.
     pub server: Id,
     /// Its name, unique in the Space.
     pub name: String,
-    /// The address it speaks Streamable HTTP at.
-    pub url: String,
+    /// The address it speaks Streamable HTTP at, when it is an HTTP server.
+    ///
+    /// A record written before stdio servers were supported always carries
+    /// one; a stdio server carries none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The executable a stdio server launches, when it is a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// A stdio server's arguments, with `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`
+    /// left for the launch to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// A stdio server's environment, with the placeholders left for the launch
+    /// to expand.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// A stdio server's working directory under its root, `/`-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether a stdio server's working directory hangs from the plugin data
+    /// directory rather than the plugin root.
+    #[serde(default)]
+    pub data_cwd: bool,
     /// Where its credential belongs.
     pub scope: McpScope,
     /// The User it belongs to, when its scope is one User's.
@@ -2689,6 +3301,52 @@ impl McpServerAdded {
         })
     }
 
+    /// Returns how this Space reaches the server, or why its data names no one
+    /// transport.
+    ///
+    /// A server is reached one way: a `url` over Streamable HTTP, or a
+    /// `command` launched as a subprocess. The fields of the other transport
+    /// stay empty.
+    pub fn transport(&self) -> Result<McpTransport, EventDataError> {
+        match (self.url.is_some(), self.command.is_some()) {
+            (true, false) => {
+                if !self.args.is_empty()
+                    || !self.env.is_empty()
+                    || self.cwd.is_some()
+                    || self.data_cwd
+                {
+                    return Err(EventDataError::Data(
+                        "an HTTP MCP server names one transport".to_owned(),
+                    ));
+                }
+                Ok(McpTransport::StreamableHttp)
+            }
+            (false, true) => {
+                if !self.headers.is_empty() {
+                    return Err(EventDataError::Data(
+                        "a stdio MCP server configures no HTTP headers".to_owned(),
+                    ));
+                }
+                Ok(McpTransport::Stdio)
+            }
+            _ => Err(EventDataError::Data(
+                "an MCP server names one transport: a `url`, or a `command`".to_owned(),
+            )),
+        }
+    }
+
+    /// The launch configuration, when this server is a stdio server.
+    #[must_use]
+    pub fn stdio(&self) -> Option<StdioServer> {
+        self.command.as_ref().map(|command| StdioServer {
+            command: command.clone(),
+            args: self.args.clone(),
+            env: self.env.clone(),
+            cwd: self.cwd.clone(),
+            data_cwd: self.data_cwd,
+        })
+    }
+
     /// Checks the data against what a server may hold.
     pub fn validate(&self) -> Result<(), EventDataError> {
         if !Self::valid_name(&self.name) {
@@ -2696,10 +3354,23 @@ impl McpServerAdded {
                 "an MCP server name is 1 to {MAX_MCP_NAME_BYTES} letters, digits, or hyphens"
             )));
         }
-        if !Self::valid_url(&self.url) {
-            return Err(EventDataError::Data(
-                "an MCP server's address is https, or http on the Space's own loopback".to_owned(),
-            ));
+        match self.transport()? {
+            McpTransport::StreamableHttp => {
+                if !self.url.as_deref().is_some_and(Self::valid_url) {
+                    return Err(EventDataError::Data(
+                        "an MCP server's address is https, or http on the Space's own loopback"
+                            .to_owned(),
+                    ));
+                }
+            }
+            McpTransport::Stdio => match self.stdio() {
+                Some(stdio) => stdio.validate().map_err(EventDataError::Data)?,
+                None => {
+                    return Err(EventDataError::Data(
+                        "a stdio MCP server names its command".to_owned(),
+                    ));
+                }
+            },
         }
         match self.scope {
             McpScope::Space if self.user.is_some() => {

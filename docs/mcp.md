@@ -1,8 +1,9 @@
 # MCP servers
 
 An MCP server gives a Bot tools that the Space calls for it. The Space speaks
-the Streamable HTTP transport of the Model Context Protocol. The tool runs
-elsewhere; the Space sends the request, records the answer as the action's
+the Streamable HTTP transport of the Model Context Protocol, and launches a
+package's `stdio` server on its own machine. A server reached over the network
+runs elsewhere; the Space sends the request, records the answer as the action's
 result, and keeps the credential in its own Vault.
 
 ## Connect a server
@@ -10,28 +11,62 @@ result, and keeps the credential in its own Vault.
 ```bash
 NEHA_MCP_TOKEN=… target/debug/neha mcp add docs https://docs.example.com/mcp
 NEHA_MCP_TOKEN=… target/debug/neha mcp add docs https://docs.example.com/mcp --scope user
+NEHA_MCP_TOKEN=… target/debug/neha mcp add notes
 target/debug/neha mcp list
 ```
 
-The name is unique in the Space, and holds letters, digits, and `-` only. The
-address is `https`, or `http` on the Space's own loopback.
+The name is unique in the Space, and holds letters, digits, and `-` only. An
+HTTP address is `https`, or `http` on the Space's own loopback.
 
 Only the Admin connects a server for the Space. `--scope user` connects it for
 the signed-in User alone: a Bot owner may add one for themselves, or connect an
-existing Space server with their own credential. The Admin adds a Space-wide
-credential to a server a package brought by naming that server again with
-`--scope space` (the default) and its address. The credential comes from
-`NEHA_MCP_TOKEN`, or — when the variable is unset — from a sign-in the command
-opens in the browser; it never comes from the command line. The Space seals it
-on the machine that runs the Space and never puts it in the record or a
-Computer.
+existing Space server with their own credential.
+
+`mcp add` with an address connects an HTTP server. With no address it attaches
+the Space's credential to an existing package's `stdio` server of that name,
+which only the Admin may do; the command asks for the token when
+`NEHA_MCP_TOKEN` is unset, because a stdio server has no address to sign in to.
+The Admin adds a Space-wide credential to an HTTP server a package brought by
+naming that server again with `--scope space` (the default) and its address.
+The credential comes from `NEHA_MCP_TOKEN`, a sign-in the command opens in the
+browser, or — for a stdio attach — the terminal prompt; it never comes from the
+command line. The Space seals it on the machine that runs the Space and never
+puts it in the record or a Computer.
 
 A User-scope server is offered to a Bot only while the Bot acts for that User.
-`neha mcp list` prints each server, its scope, who connected it, its address,
-and whether the Space reaches it: a server with a credential that is refused,
-or that cannot be reached, is not connected. The address is `https`, or `http`
-on a loopback address, and carries no credential of its own.
+`neha mcp list` prints each server, its scope, who connected it, how the Space
+reaches it, and whether it can: an HTTP server's address, or a stdio server's
+`stdio` and command line. An HTTP server with a credential that is refused, or
+that cannot be reached, is not connected; a stdio server is connected when the
+Space could launch it, whether or not its process is running.
 `neha mcp remove <server>` disconnects one.
+
+## Package servers
+
+A package may bring a `stdio` server: a program the Space runs on its own
+machine. The Space starts it in a bubblewrap sandbox: the system directories
+and the package are mounted read-only, the package's data directory is
+writable, the network is shared, and no directory of the Space's home is
+mounted. `PLUGIN_ROOT` and `PLUGIN_DATA` are set, and a `${PLUGIN_ROOT}` or
+`${PLUGIN_DATA}` placeholder in the server's arguments, environment, or working
+directory is expanded before it starts.
+
+The Space launches the server when it discovers the server's tools and when it
+calls one of them, and stops it after: it is not a daemon between calls. A
+credential attached to it — by the Admin with `neha mcp add <name>` for the
+Space, or in the Integrations view for a User — reaches the process as
+`NEHA_MCP_TOKEN`; the package's own environment is data and never holds one. A
+command the package writes as `./path` names a file the package carries, and
+the install publishes that file executable so the launch can start it.
+
+The sandbox is bubblewrap's, so a Linux machine without a working one cannot run
+a stdio server: bubblewrap may be missing, or the kernel may refuse the user
+namespaces a sandbox needs. On Windows one runs unsandboxed only after the
+administrator sets `NEHA_ALLOW_UNSANDBOXED_MCP=1`, and every other platform has
+no sandbox for one; on such a machine the install skips the server with a
+report instead of registering one that can never run, and a server row that
+outlives its sandbox says why it is not connected. [Plugins](plugins.md) covers
+how a package brings one.
 
 ## Give the tools to a Bot
 
@@ -49,16 +84,19 @@ offers is not offered to the run.
 
 The Integrations view lists the MCP servers the Space and you hold, the packages
 the Admin installed, and the Bots that use each server. A server row says
-whether it is connected, who connected it, and its address; a package row says
-what it brought and whether the Space offers it.
+whether it is connected, who connected it, and where it comes from: an HTTP
+server's address, or a stdio server's command line and working directory; a
+package row says what it brought and whether the Space offers it.
 
-The Admin adds a server for the Space, and a User adds one for themselves or
-connects a Space server with their own credential, by naming it, its address,
-and an access token. The token goes to the Space in that one command: the page
-clears the field, never shows the token again, and says whether the Space can
-reach the server. A server without a credential is connected through a browser
-sign-in instead: the page opens the authorization URL and waits for the Space
-to report the sign-in finished or failed.
+The Admin adds an HTTP server for the Space, and a User adds one for themselves
+or connects a Space server with their own credential, by naming it, its
+address, and an access token. The token goes to the Space in that one command:
+the page clears the field, never shows the token again, and says whether the
+Space can reach the server. An HTTP server without a credential is connected
+through a browser sign-in instead: the page opens the authorization URL and
+waits for the Space to report the sign-in finished or failed. A stdio server
+has no address to sign in to; a token attached to it reaches the process as
+`NEHA_MCP_TOKEN`.
 
 Only the Admin sees the packages and enables or disables one. A Bot uses a
 server only when its owner enables it, so every server row carries a switch for
@@ -85,8 +123,9 @@ An action records the server's id and the tool's original name, never the name
 the Model sees, so a rule, a card, and an action name one tool the same way.
 Text enters the answer as text, an image as a File in the Chat, and anything
 else as JSON text. A server that fails to answer leaves its tools out of the
-run and the other servers and skills usable; a call to a server with no
-credential answers that it is not connected and sends no request.
+run and the other servers and skills usable; a call to an HTTP server with no
+credential answers that it is not connected and sends no request, while a
+stdio server launches with or without one.
 
 A tool may declare an MCP App: a `ui://` resource that the Space reads when
 the tool runs, stores as a File in the Chat, and records as an `app` card on

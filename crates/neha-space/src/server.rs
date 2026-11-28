@@ -22021,6 +22021,328 @@ mod tests {
         running.shutdown().await;
     }
 
+    /// The fixture MCP server the stdio end-to-end tests launch.
+    ///
+    /// Its first act names the process in the package's data directory, so a
+    /// test can tell a launch from a list's launch check; it writes the token
+    /// the sandbox gave it there too. The one tool names an app, so a call also
+    /// exercises the card path over stdio.
+    #[cfg(target_os = "linux")]
+    const STDIO_FIXTURE: &str = r#"
+import json, os, sys
+
+with open(os.path.join(os.environ["HOME"], "started"), "w") as marker:
+    marker.write(os.environ.get("NEHA_MCP_TOKEN", ""))
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+def answer(request_id, result):
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    message = json.loads(line)
+    method = message.get("method")
+    request_id = message.get("id")
+    params = message.get("params") or {}
+    if method == "initialize":
+        answer(request_id, {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}, "resources": {}}, "serverInfo": {"name": "fixture", "version": "1"}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        answer(request_id, {"tools": [
+            {"name": "echo", "description": "Echo text back.", "inputSchema": {"type": "object"}, "_meta": {"ui": {"resourceUri": "ui://stdio/app.html", "visibility": ["model"]}}},
+        ]})
+    elif method == "tools/call":
+        arguments = params.get("arguments") or {}
+        answer(request_id, {"content": [{"type": "text", "text": str(arguments.get("text", ""))}], "isError": False})
+    elif method == "resources/read":
+        answer(request_id, {"contents": [{"uri": params.get("uri"), "mimeType": "text/html;profile=mcp-app", "text": "<!doctype html><html><body>stdio app</body></html>"}]})
+"#;
+
+    /// The plugin tarball the stdio end-to-end test installs: one stdio server
+    /// this machine can launch, one whose command it cannot resolve, and the
+    /// app the launchable server's tool renders.
+    #[cfg(target_os = "linux")]
+    fn stdio_plugin_tarball() -> Vec<u8> {
+        let manifest = json!({
+            "$schema": crate::plugins::PLUGIN_SCHEMA,
+            "name": "stdio-tools",
+            "version": "1.0.0",
+        })
+        .to_string();
+        let mcp = json!({
+            "$schema": crate::plugins::MCP_SCHEMA,
+            "mcpServers": {
+                "local": {
+                    "type": "stdio",
+                    "command": "python3",
+                    "args": ["${PLUGIN_ROOT}/server.py"],
+                    "cwd": "${PLUGIN_ROOT}",
+                    "env": {"PYTHONDONTWRITEBYTECODE": "1"},
+                },
+                "broken": {
+                    "type": "stdio",
+                    "command": "neha-no-such-mcp-server-program",
+                },
+            },
+        })
+        .to_string();
+        plugin_tarball(&[
+            ("stdio-tools/plugin.json", &manifest),
+            ("stdio-tools/mcp.json", &mcp),
+            ("stdio-tools/server.py", STDIO_FIXTURE),
+        ])
+    }
+
+    /// The commands a stdio end-to-end test needs this machine to have.
+    #[cfg(target_os = "linux")]
+    fn stdio_commands() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        // The smoke check proves the sandbox actually starts, not merely that
+        // bubblewrap is installed: a machine with user namespaces refused
+        // would otherwise panic here instead of skipping.
+        if !crate::stdio::sandbox_smoke() {
+            return None;
+        }
+        let bwrap = crate::stdio::resolve_command("bwrap", std::path::Path::new("/")).ok()?;
+        let python = crate::stdio::resolve_command("python3", std::path::Path::new("/")).ok()?;
+
+        Some((bwrap, python))
+    }
+
+    /// Installs the stdio package on a fresh Space and answers the socket, the
+    /// Space, its data directory, and the two servers.
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::type_complexity)]
+    async fn install_stdio_package(
+        commit: &str,
+        tarball: Vec<u8>,
+    ) -> (
+        tempfile::TempDir,
+        Running,
+        Socket,
+        tokio::task::JoinHandle<()>,
+        std::path::PathBuf,
+        Id,
+        Id,
+        Id,
+    ) {
+        let (archive, archive_task) = serve_plugin_archive(tarball).await;
+        let config = format!("[plugins]\nsources = [\"{archive}/\"]\n");
+        let (dir, running, invite) = running_with_config(&config).await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let installed = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::PluginInstall {
+                source: format!("{archive}/repo@{commit}"),
+            },
+        )
+        .await;
+        let plugin: Id = serde_json::from_value(installed["plugin"].clone()).unwrap();
+        let servers = installed["servers"].as_array().unwrap().clone();
+        let server = |name: &str| -> Id {
+            serde_json::from_value(
+                servers
+                    .iter()
+                    .find(|row| row["name"] == json!(name))
+                    .unwrap_or_else(|| panic!("the package registers {name}"))["server"]
+                    .clone(),
+            )
+            .unwrap()
+        };
+        let local = server("stdio-tools-local");
+        let broken = server("stdio-tools-broken");
+        let data = running.server.home.plugin_data_dir("stdio-tools");
+
+        (
+            dir,
+            running,
+            socket,
+            archive_task,
+            data,
+            plugin,
+            local,
+            broken,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bot_calls_a_package_stdio_server_and_records_its_card() {
+        let Some((_bwrap, _python)) = stdio_commands() else {
+            eprintln!("skipping the stdio end-to-end test: bubblewrap or python3 is not installed");
+            return;
+        };
+        let commit = "4d1e2a9b8c7f6e5d4c3b2a190817263544556677";
+        let (_dir, running, mut socket, archive_task, data, _plugin, local, broken) =
+            install_stdio_package(commit, stdio_plugin_tarball()).await;
+
+        // The list names the transport and the launch configuration, reports
+        // the launchable server as connected, and says why the unresolvable one
+        // is not; checking a launch starts nothing.
+        let list = command(&mut socket, Id::new(), CommandCall::McpList).await;
+        let rows = list.as_array().unwrap();
+        let row = |server: Id| {
+            rows.iter()
+                .find(|row| row["server"] == json!(server))
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(row(local)["transport"], json!("stdio"));
+        assert_eq!(row(local)["command"], json!("python3"));
+        assert_eq!(row(local)["args"], json!(["${PLUGIN_ROOT}/server.py"]));
+        assert_eq!(row(local)["cwd"], json!(null));
+        assert_eq!(row(local)["connected"], json!(true));
+        assert!(
+            row(local).get("reason").is_none(),
+            "a launchable server carries no reason"
+        );
+        assert_eq!(row(broken)["transport"], json!("stdio"));
+        assert_eq!(row(broken)["connected"], json!(false));
+        assert!(
+            row(broken)["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("PATH")),
+            "{:?}",
+            row(broken)["reason"]
+        );
+        assert!(
+            !data.join("started").exists(),
+            "listing a stdio server starts no process"
+        );
+
+        // The Bot uses the package's server: discovery offers its tool, the
+        // first call asks, and the call reaches the fixture without a Vault
+        // credential. A stdio process decides whether it wants a token, so the
+        // call is never answered "not connected".
+        let (base, provider_task) = scripted_provider(vec![
+            tool("mcp__stdio-tools-local__echo", json!({"text": "hello"})),
+            text("done"),
+            tool("mcp__stdio-tools-local__echo", json!({"text": "again"})),
+            text("second done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        // The broken server is enabled too: discovery leaves it out without
+        // failing the run.
+        for server in [local, broken] {
+            command(
+                &mut socket,
+                Id::new(),
+                CommandCall::BotMcpEnable { bot, server },
+            )
+            .await;
+        }
+        let run = run_of(&submit(&mut socket, chat, "echo", None).await);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        assert_eq!(approvals[0]["reason"], "first_mcp_call");
+        assert_eq!(approvals[0]["server"], json!(local));
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        let finished = wait_run(&mut socket, run).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert_eq!(last_message(&mut socket, chat).await["text"], "done");
+        let marker = std::fs::read_to_string(data.join("started")).expect("the fixture ran");
+        assert_eq!(marker, "", "a stdio call runs without a Vault credential");
+
+        // A browser sign-in names an address the server answers at; a stdio
+        // server has none, and the refusal is one fixed sentence.
+        let sign_in = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: Some(local),
+                name: None,
+                url: None,
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await
+        .expect_err("a stdio server has no address to sign in to");
+        assert_eq!(sign_in.0, ErrorCode::InvalidArgument, "{}", sign_in.1);
+        assert!(sign_in.1.contains("no address to sign in"), "{}", sign_in.1);
+
+        // A credential attaches to a stdio server without an address: the
+        // answer says the server is connected, and the next launch passes the
+        // Vault's credential as the sandbox's token.
+        let attached = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpConnect {
+                server: local,
+                credential: Some("token-1".to_owned()),
+            },
+        )
+        .await;
+        assert_eq!(attached["credential"], json!("user"));
+        assert_eq!(attached["connected"], json!(true));
+        let second = run_of(&submit(&mut socket, chat, "echo again", None).await);
+        let finished = wait_run(&mut socket, second).await;
+        assert_eq!(finished["status"], "succeeded", "{finished}");
+        assert_eq!(last_message(&mut socket, chat).await["text"], "second done");
+        let marker = std::fs::read_to_string(data.join("started")).expect("the fixture ran again");
+        assert_eq!(marker, "token-1");
+
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+        // Each call ran the fixture's tool and answered with its text.
+        for (run, text) in [(run, "hello"), (second, "again")] {
+            let action = finished_action(&events, run);
+            assert_eq!(action["status"], json!("succeeded"));
+            assert_eq!(action["output"], json!(text));
+        }
+
+        // The tool names an app, so each accepted answer recorded its Card and
+        // HTML.
+        let carded: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::MessageAdded && event.data.get("card").is_some()
+            })
+            .collect();
+        assert_eq!(carded.len(), 2, "one Card per call");
+        let mut htmls = Vec::new();
+        for event in &carded {
+            let card = &event.data["card"];
+            assert_eq!(card["kind"], "app");
+            let file: Id = serde_json::from_value(card["file"].clone()).unwrap();
+            let files: Vec<&neha::record::Event> = events
+                .iter()
+                .filter(|event| {
+                    event.kind == EventKind::FileAdded && event.data["file"] == json!(file)
+                })
+                .collect();
+            assert_eq!(files.len(), 1, "the app's HTML is one File");
+            let sha256: String = serde_json::from_value(files[0].data["sha256"].clone()).unwrap();
+            htmls
+                .push(String::from_utf8(running.server.blobs.get(&sha256).await.unwrap()).unwrap());
+        }
+        assert!(
+            htmls.iter().all(|html| html.contains("stdio app")),
+            "{htmls:?}"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        archive_task.abort();
+        running.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn an_install_from_a_source_the_admin_did_not_allow_is_refused() {
         let (_dir, running, invite) = running().await;

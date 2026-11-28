@@ -44,7 +44,7 @@
 //! entry — is reported in [`Package::skipped`] and the rest of the package
 //! still loads, as §7.2.2 and §11.3 require.
 //!
-//! Two readings of the specification are narrowed here:
+//! Three readings of the specification are narrowed here:
 //!
 //! - A repository source names one git commit object id, never a branch or a
 //!   tag: what a package holds may not change under the digest the record
@@ -53,6 +53,17 @@
 //!   package directory is reported in [`Package::skipped`] and not followed
 //!   instead: what it resolves to is not package data, and a package is
 //!   inspectable without following one.
+//! - §9.2 expands `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` in every `cwd`. The
+//!   record keeps the working directory symbolic: relative to the one root its
+//!   leading form names, with any further placeholder and every `..` left in
+//!   the relative text, so it stays meaningful when the home moves. The roots
+//!   the placeholders name do not exist while a package is only read, and a
+//!   synthetic stand-in would make containment depend on the stand-in's shape:
+//!   the install expands the stored expression against the roots it publishes
+//!   and skips a directory that leaves them, and the launch repeats that
+//!   decision against the roots it finds. Any other `${...}` text is not a
+//!   placeholder the client expands, so it names a directory with that literal
+//!   name and is kept as written.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::io::Read as _;
@@ -60,7 +71,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use futures_util::StreamExt as _;
-use neha::record::{MAX_SKILL_BODY_BYTES, valid_script_name};
+use neha::record::{
+    MAX_MCP_CWD_BYTES, MAX_SKILL_BODY_BYTES, normalize_stdio_command, valid_mcp_env_name,
+    valid_script_name,
+};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -103,6 +117,20 @@ const MANIFEST_FIELDS: [&str; 10] = [
 ];
 /// The fields a Streamable HTTP server entry may carry: §7.2.1.
 const HTTP_SERVER_FIELDS: [&str; 3] = ["type", "url", "headers"];
+/// The fields a stdio server entry may carry: §7.2.1.
+const STDIO_SERVER_FIELDS: [&str; 5] = ["type", "command", "args", "env", "cwd"];
+/// The environment variables a stdio server entry may not define.
+///
+/// The Agent Plugins contract reserves `PLUGIN_ROOT` and `PLUGIN_DATA` for the
+/// client (§9.2), and the Space sets the `NEHA_` variables below, so a package
+/// entry that defines one is an invalid server configuration.
+const RESERVED_STDIO_ENV: [&str; 5] = [
+    "PLUGIN_ROOT",
+    "PLUGIN_DATA",
+    "NEHA_MCP_TOKEN",
+    "NEHA_HOME",
+    "NEHA_ALLOW_UNSANDBOXED_MCP",
+];
 
 /// One install source: a repository pinned to a commit, or a directory.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,10 +191,27 @@ pub struct PackageServer {
     pub key: String,
     /// The name the Space registers the server under.
     pub name: String,
-    /// The server's endpoint.
-    pub url: String,
-    /// The headers the package configures, by name.
-    pub headers: BTreeMap<String, String>,
+    /// How the server is reached.
+    pub transport: PackageTransport,
+}
+
+/// How a package's MCP server is reached: §7.2.1.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageTransport {
+    /// Streamable HTTP: a server that runs elsewhere.
+    Http {
+        /// The server's endpoint.
+        url: String,
+        /// The headers the package configures, by name.
+        headers: BTreeMap<String, String>,
+    },
+    /// stdio: an executable the Space launches on its own machine.
+    ///
+    /// The launch configuration holds the package's symbolic form:
+    /// `${PLUGIN_ROOT}` and `${PLUGIN_DATA}` are left in `args` and `env` for
+    /// the launch to expand, and the command and working directory are
+    /// relative to the root the package named.
+    Stdio(neha::record::StdioServer),
 }
 
 /// One package, read and validated.
@@ -1559,8 +1604,7 @@ fn parse_servers(
             servers.push(PackageServer {
                 key: key.clone(),
                 name,
-                url: server.url,
-                headers: server.headers,
+                transport: server,
             });
         }
     }
@@ -1568,14 +1612,8 @@ fn parse_servers(
     Ok(servers)
 }
 
-/// One server entry that satisfies its variant of §7.2.1.
-struct ServerEntry {
-    url: String,
-    headers: BTreeMap<String, String>,
-}
-
 /// Reads one server entry, or reports why it is invalid.
-fn read_server(entry: &serde_json::Value) -> Result<ServerEntry, String> {
+fn read_server(entry: &serde_json::Value) -> Result<PackageTransport, String> {
     let Some(fields) = entry.as_object() else {
         return Err("is not a JSON object".to_owned());
     };
@@ -1583,17 +1621,21 @@ fn read_server(entry: &serde_json::Value) -> Result<ServerEntry, String> {
     let Some(transport) = transport else {
         return Err("names no `type`".to_owned());
     };
-    // This Space connects to a server over Streamable HTTP and launches no
-    // subprocess, so the other transports of §7.2.1 are unsupported here and
-    // their entries are skipped rather than refused.
-    if transport != "streamable-http" {
-        return Err(match transport {
-            "stdio" | "sse" => {
-                format!("uses the {transport} transport, which this Space does not support")
-            }
-            other => format!("names the unknown transport `{other}`"),
-        });
+    match transport {
+        "streamable-http" => read_http_server(fields),
+        "stdio" => read_stdio_server(fields),
+        // This Space reaches a server over Streamable HTTP or launches a stdio
+        // subprocess. The deprecated HTTP+SSE transport is unsupported and its
+        // entries are skipped rather than refused (§7.2.2).
+        "sse" => Err("uses the sse transport, which this Space does not support".to_owned()),
+        other => Err(format!("names the unknown transport `{other}`")),
     }
+}
+
+/// Reads a Streamable HTTP server entry: §7.2.1.
+fn read_http_server(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<PackageTransport, String> {
     for field in fields.keys() {
         if !HTTP_SERVER_FIELDS.contains(&field.as_str()) {
             return Err(format!("names the unknown field `{field}`"));
@@ -1637,10 +1679,203 @@ fn read_server(entry: &serde_json::Value) -> Result<ServerEntry, String> {
         Some(_) => return Err("the `headers` field is not a JSON object".to_owned()),
     }
 
-    Ok(ServerEntry {
+    Ok(PackageTransport::Http {
         url: url.to_owned(),
         headers,
     })
+}
+
+/// Reads a stdio server entry: §7.2.1.
+///
+/// A reserved environment variable (`PLUGIN_ROOT`, `PLUGIN_DATA`, or one of the
+/// `NEHA_` names the Space sets) makes the entry invalid: the client supplies
+/// those variables itself (§9.2), and a package's environment is data.
+fn read_stdio_server(
+    fields: &serde_json::Map<String, serde_json::Value>,
+) -> Result<PackageTransport, String> {
+    for field in fields.keys() {
+        if !STDIO_SERVER_FIELDS.contains(&field.as_str()) {
+            return Err(format!("names the unknown field `{field}`"));
+        }
+    }
+    let Some(command) = fields.get("command").and_then(serde_json::Value::as_str) else {
+        return Err("names no `command`".to_owned());
+    };
+    // A command is one executable token, never a shell command line, and the
+    // record keeps the one canonical spelling of it. The token is not repeated
+    // in a report: an invalid one may hold anything.
+    let Some(command) = normalize_stdio_command(command) else {
+        return Err(
+            "names a `command` that is not one executable token: a bare executable name, or a \
+             path beginning with `./` that stays in the plugin root"
+                .to_owned(),
+        );
+    };
+    let mut args = Vec::new();
+    match fields.get("args") {
+        None => {}
+        Some(serde_json::Value::Array(configured)) => {
+            for argument in configured {
+                let Some(argument) = argument.as_str() else {
+                    return Err("names an `args` entry that is not text".to_owned());
+                };
+                args.push(argument.to_owned());
+            }
+        }
+        Some(_) => return Err("names an `args` field that is not an array of strings".to_owned()),
+    }
+    let mut env = BTreeMap::new();
+    match fields.get("env") {
+        None => {}
+        Some(serde_json::Value::Object(configured)) => {
+            for (name, value) in configured {
+                if !valid_mcp_env_name(name) {
+                    // The name is not repeated: it holds what a report must
+                    // not, and it is not a name a process environment takes.
+                    return Err(
+                        "names an `env` variable whose name is not `[A-Za-z_][A-Za-z0-9_]*`"
+                            .to_owned(),
+                    );
+                }
+                // §9.2: the client supplies the reserved variables itself, and
+                // the Space sets its own. The value is never repeated in the
+                // report: a package wrote it, and the reader is not its owner.
+                if reserved_stdio_env_name(name) {
+                    return Err(
+                        "names an `env` variable reserved by the Agent Plugins contract or the \
+                         Space: `PLUGIN_ROOT`, `PLUGIN_DATA`, `NEHA_MCP_TOKEN`, `NEHA_HOME`, or \
+                         `NEHA_ALLOW_UNSANDBOXED_MCP`"
+                            .to_owned(),
+                    );
+                }
+                let Some(value) = value.as_str() else {
+                    return Err(format!("the environment variable `{name}` is not text"));
+                };
+                env.insert(name.clone(), value.to_owned());
+            }
+        }
+        Some(_) => return Err("names an `env` field that is not an object of strings".to_owned()),
+    }
+    let (cwd, data_cwd) = match fields.get("cwd") {
+        None => (None, false),
+        Some(serde_json::Value::String(cwd)) => read_stdio_cwd(cwd)?,
+        Some(_) => return Err("names a `cwd` field that is not text".to_owned()),
+    };
+    let stdio = neha::record::StdioServer {
+        command,
+        args,
+        env,
+        cwd,
+        data_cwd,
+    };
+    // The record is the one rule for what a launch may hold, so the package
+    // loader reads the entry into the form the record keeps and refuses what
+    // the record would.
+    stdio
+        .validate()
+        .map_err(|reason| format!("has a launch configuration this Space cannot hold: {reason}"))?;
+
+    Ok(PackageTransport::Stdio(stdio))
+}
+
+/// Reads a stdio server's `cwd`: a path under the plugin root or the plugin
+/// data directory, after the package's placeholder expansion (§7.2.1, §9.2).
+///
+/// Answers the symbolic path the record keeps, and whether it hangs from the
+/// plugin data directory. The record keeps the path relative to the one root its
+/// leading form names, with every further `${PLUGIN_ROOT}` or `${PLUGIN_DATA}`
+/// occurrence and every `..` left as written: the expression, not an expanded
+/// result, is what stays portable when the Space's home moves, and an install or
+/// a launch expands it against the roots it knows then.
+///
+/// Where the directory lands is not decided here. A placeholder stands for a
+/// root whose component count the text does not carry, and the real roots —
+/// `plugins/{name}@{digest}` and `plugin-data/{name}` under the Space's home —
+/// are not known until the install publishes the package. So the loader checks
+/// only what the symbolic text alone establishes: the leading form names one
+/// root, the value is a bounded `/`-separated relative path with no backslash,
+/// control character, drive or stream separator, or absolute prefix, and a `..`
+/// that appears before any placeholder cannot remove the root itself. The
+/// install expands the stored expression against the roots it publishes and
+/// skips a directory that leaves them; the launch repeats that decision with the
+/// roots it finds. Any other `${...}` text is not a placeholder the client
+/// expands, so it names a directory with that literal name and stays as written.
+fn read_stdio_cwd(cwd: &str) -> Result<(Option<String>, bool), String> {
+    let (relative, data_cwd) = if cwd == "${PLUGIN_ROOT}" {
+        ("", false)
+    } else if let Some(relative) = cwd.strip_prefix("${PLUGIN_ROOT}/") {
+        (relative, false)
+    } else if cwd == "${PLUGIN_DATA}" {
+        ("", true)
+    } else if let Some(relative) = cwd.strip_prefix("${PLUGIN_DATA}/") {
+        (relative, true)
+    } else if let Some(relative) = cwd.strip_prefix("./") {
+        (relative, false)
+    } else {
+        return Err(
+            "names a `cwd` that is not a `./` path, or a path rooted at ${PLUGIN_ROOT} or \
+             ${PLUGIN_DATA}"
+                .to_owned(),
+        );
+    };
+    if cwd.len() > MAX_MCP_CWD_BYTES {
+        return Err(format!(
+            "names a `cwd` longer than {MAX_MCP_CWD_BYTES} bytes"
+        ));
+    }
+    // A component names one directory on every platform a record may reach: a
+    // backslash, a control character, or a drive or stream separator is not one,
+    // and a path the expression leaves absolute is not relative to the root.
+    if relative.starts_with('/')
+        || relative.chars().any(char::is_control)
+        || relative.contains('\\')
+        || relative.split('/').any(|component| component.contains(':'))
+    {
+        return Err(
+            "names a `cwd` that is not one `/`-separated relative path: it is absolute, or a \
+             component holds a backslash, a control character, or a drive or stream separator"
+                .to_owned(),
+        );
+    }
+    // The symbolic guard is the record's, so the form the loader keeps and the
+    // form the record accepts are judged by one rule. The real containment
+    // decision is the install's, and then the launch's.
+    if !relative.is_empty() && !neha::record::symbolic_working_directory_stays_inside(relative) {
+        return Err("names a `cwd` that leaves the directory it is rooted at".to_owned());
+    }
+
+    Ok((stored_symbolic_cwd(relative), data_cwd))
+}
+
+/// The symbolic path the record keeps for a working directory.
+///
+/// The package's relative path with only its empty and `.` components dropped:
+/// those name nothing the expansion would see, but a `..` is kept because only
+/// the expansion against the real roots says what it removes. Answers `None`
+/// when nothing is left, which names the root itself.
+fn stored_symbolic_cwd(relative: &str) -> Option<String> {
+    let components: Vec<&str> = relative
+        .split('/')
+        .filter(|component| !component.is_empty() && *component != ".")
+        .collect();
+
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+/// Whether the Space reserves this environment variable name.
+///
+/// An environment variable name is case-sensitive on Unix and case-insensitive
+/// on Windows, so the reserved names follow the platform the package is read
+/// on: a package cannot define `plugin_root` on Windows and make it a different
+/// variable from the `PLUGIN_ROOT` the Space sets.
+fn reserved_stdio_env_name(name: &str) -> bool {
+    if cfg!(windows) {
+        RESERVED_STDIO_ENV
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+    } else {
+        RESERVED_STDIO_ENV.contains(&name)
+    }
 }
 
 /// Whether the name is one the plugin name rules of §5.5 allow.
@@ -1946,9 +2181,10 @@ mod tests {
     use super::{
         ArchiveTooLarge, CappedReader, MAX_PACKAGE_BYTES, MAX_PACKAGE_ENTRIES,
         MAX_PACKAGE_FILE_BYTES, MAX_PACKAGE_FILES, MCP_SCHEMA, PLUGIN_SCHEMA, PackageScript,
-        PackageServer, PluginError, Source, authorize_source, digest, extract_archive,
-        fetch_archive, fetch_archive_within, parse_source, read_authorized_directory,
-        read_directory, repository_archive_url, validate,
+        PackageServer, PackageTransport, PluginError, Source, authorize_source, digest,
+        extract_archive, fetch_archive, fetch_archive_within, parse_source,
+        read_authorized_directory, read_directory, repository_archive_url, reserved_stdio_env_name,
+        validate,
     };
 
     /// One commit object id: a git SHA-1 in lowercase hexadecimal.
@@ -3330,13 +3566,15 @@ mod tests {
             [PackageServer {
                 key: "reports".to_owned(),
                 name: "weekly-tools-reports".to_owned(),
-                url: "https://deploy.example.com/mcp".to_owned(),
-                headers: [
-                    ("Accept".to_owned(), "application/json".to_owned()),
-                    ("X-Tenant".to_owned(), "public-tenant".to_owned()),
-                ]
-                .into_iter()
-                .collect(),
+                transport: PackageTransport::Http {
+                    url: "https://deploy.example.com/mcp".to_owned(),
+                    headers: [
+                        ("Accept".to_owned(), "application/json".to_owned()),
+                        ("X-Tenant".to_owned(), "public-tenant".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                },
             }]
         );
         assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
@@ -3371,6 +3609,406 @@ mod tests {
     }
 
     #[test]
+    fn reads_a_stdio_server() {
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"validator":{{"type":"stdio","command":"node","args":["--title","${{PLUGIN_ROOT}}/bin/server.js","${{PLUGIN_DATA}}/work"],"env":{{"CONFIG":"${{PLUGIN_ROOT}}/config.json","DATA":"${{PLUGIN_DATA}}"}},"cwd":"${{PLUGIN_DATA}}/work"}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("a stdio server reads");
+
+        assert_eq!(
+            loaded.servers,
+            [PackageServer {
+                key: "validator".to_owned(),
+                name: "weekly-tools-validator".to_owned(),
+                transport: PackageTransport::Stdio(neha::record::StdioServer {
+                    command: "node".to_owned(),
+                    args: vec![
+                        "--title".to_owned(),
+                        "${PLUGIN_ROOT}/bin/server.js".to_owned(),
+                        "${PLUGIN_DATA}/work".to_owned(),
+                    ],
+                    env: [
+                        ("CONFIG".to_owned(), "${PLUGIN_ROOT}/config.json".to_owned()),
+                        ("DATA".to_owned(), "${PLUGIN_DATA}".to_owned()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    cwd: Some("work".to_owned()),
+                    data_cwd: true,
+                }),
+            }]
+        );
+        assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
+    }
+
+    #[test]
+    fn a_reserved_environment_variable_skips_its_server() {
+        // §9.2: `PLUGIN_ROOT` and `PLUGIN_DATA` are the client's to set, and the
+        // Space sets the `NEHA_` variables it documents. A package that defines
+        // one makes that server configuration invalid, and the report never
+        // repeats the value the package wrote for it.
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"valid":{{"type":"stdio","command":"node","env":{{"CONFIG":"${{PLUGIN_ROOT}}/config.json","MODE":"strict"}}}},"root":{{"type":"stdio","command":"node","env":{{"PLUGIN_ROOT":"root-injection"}}}},"data":{{"type":"stdio","command":"node","env":{{"PLUGIN_DATA":"data-injection"}}}},"token":{{"type":"stdio","command":"node","env":{{"NEHA_MCP_TOKEN":"token-injection"}}}},"home":{{"type":"stdio","command":"node","env":{{"NEHA_HOME":"home-injection"}}}},"unsandboxed":{{"type":"stdio","command":"node","env":{{"NEHA_ALLOW_UNSANDBOXED_MCP":"one-injection"}}}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("a reserved environment variable skips one server");
+
+        // The rest of the package loads, with an ordinary environment intact.
+        assert_eq!(
+            loaded
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["weekly-tools-valid"]
+        );
+        let PackageTransport::Stdio(valid) = &loaded.servers[0].transport else {
+            panic!("the valid server is a stdio server");
+        };
+        assert_eq!(
+            valid.env,
+            [
+                ("CONFIG".to_owned(), "${PLUGIN_ROOT}/config.json".to_owned()),
+                ("MODE".to_owned(), "strict".to_owned()),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        // Each reserved name skips its own entry, in the shape every invalid
+        // entry is reported in, and no value the package wrote reaches it.
+        assert_eq!(loaded.skipped.len(), 5, "{:?}", loaded.skipped);
+        for report in &loaded.skipped {
+            assert!(report.starts_with("mcp.json: the server `"), "{report}");
+            assert!(report.contains("`env`"), "{report}");
+        }
+        let reports = loaded.skipped.join("\n");
+        for value in [
+            "root-injection",
+            "data-injection",
+            "token-injection",
+            "home-injection",
+            "one-injection",
+        ] {
+            assert!(!reports.contains(value), "the report repeats `{value}`");
+        }
+    }
+
+    #[test]
+    fn reserved_environment_names_follow_the_platforms_case_rule() {
+        for name in [
+            "PLUGIN_ROOT",
+            "PLUGIN_DATA",
+            "NEHA_MCP_TOKEN",
+            "NEHA_HOME",
+            "NEHA_ALLOW_UNSANDBOXED_MCP",
+        ] {
+            assert!(reserved_stdio_env_name(name), "`{name}` is reserved");
+        }
+        // An environment name is case-sensitive on Unix and case-insensitive
+        // on Windows, so only Windows reads a lowercase spelling as reserved.
+        if cfg!(windows) {
+            assert!(reserved_stdio_env_name("plugin_root"));
+            assert!(reserved_stdio_env_name("neha_mcp_token"));
+        } else {
+            assert!(!reserved_stdio_env_name("plugin_root"));
+            assert!(!reserved_stdio_env_name("neha_mcp_token"));
+        }
+        assert!(!reserved_stdio_env_name("CONFIG"));
+    }
+
+    #[test]
+    fn reads_a_plugin_relative_stdio_command_and_a_root_cwd() {
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"root":{{"type":"stdio","command":"./bin/server","cwd":"${{PLUGIN_ROOT}}"}},"validator":{{"type":"stdio","command":"./bin/../server","cwd":"${{PLUGIN_ROOT}}/data/../bin"}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("a plugin-relative command and cwd read");
+
+        let [root, relative] = loaded.servers.as_slice() else {
+            panic!("two servers load: {:?}", loaded.servers);
+        };
+        let PackageTransport::Stdio(root) = &root.transport else {
+            panic!("the root server is a stdio server");
+        };
+        // `${PLUGIN_ROOT}` names the plugin root itself, which is the default.
+        assert_eq!(root.command, "./bin/server");
+        assert_eq!(root.cwd, None);
+        assert!(!root.data_cwd);
+        let PackageTransport::Stdio(relative) = &relative.transport else {
+            panic!("the relative server is a stdio server");
+        };
+        // The command is resolved against the plugin root. The working
+        // directory keeps the symbolic relative path, `..` included: a launch
+        // expands it against the real roots and normalizes it there.
+        assert_eq!(relative.command, "./server");
+        assert_eq!(relative.cwd.as_deref(), Some("data/../bin"));
+        assert!(!relative.data_cwd);
+        assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
+    }
+
+    #[test]
+    fn reads_each_working_directory_form() {
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"relative":{{"type":"stdio","command":"node","cwd":"./sub/dir"}},"root":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_ROOT}}/sub"}},"data":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_DATA}}/sub"}},"nested":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_DATA}}/a/b"}},"literal":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_ROOT}}/a/${{UNKNOWN}}/b"}},"literal-data":{{"type":"stdio","command":"node","cwd":"./${{UNKNOWN}}"}},"second-data":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_DATA}}/cache${{PLUGIN_DATA}}"}},"second-root":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_ROOT}}/a${{PLUGIN_ROOT}}/b"}},"second-cross":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_ROOT}}/a/${{PLUGIN_DATA}}/b"}},"second-relative":{{"type":"stdio","command":"node","cwd":"./a/${{PLUGIN_DATA}}"}},"popped":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_DATA}}/a/../b"}},"popped-placeholder":{{"type":"stdio","command":"node","cwd":"${{PLUGIN_DATA}}/a/${{PLUGIN_ROOT}}/../b"}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("each working directory form reads");
+
+        let cwd = |key: &str| {
+            let server = loaded
+                .servers
+                .iter()
+                .find(|server| server.key == key)
+                .unwrap_or_else(|| panic!("the `{key}` server loads"));
+            let PackageTransport::Stdio(stdio) = &server.transport else {
+                panic!("the `{key}` server is a stdio server");
+            };
+            (stdio.cwd.clone(), stdio.data_cwd)
+        };
+        // The record keeps the exact root form: the relative path, and the one
+        // bit that names the root it hangs from. A `./` path is root-relative
+        // like a `${PLUGIN_ROOT}` path, so `./sub/dir` and `${PLUGIN_ROOT}/sub`
+        // differ only in their path.
+        assert_eq!(cwd("relative"), (Some("sub/dir".to_owned()), false));
+        assert_eq!(cwd("root"), (Some("sub".to_owned()), false));
+        assert_eq!(cwd("data"), (Some("sub".to_owned()), true));
+        assert_eq!(cwd("nested"), (Some("a/b".to_owned()), true));
+        // Only the two Agent Plugins placeholders are expanded, and only in one
+        // pass: any other `${...}` text is a literal directory name.
+        assert_eq!(cwd("literal"), (Some("a/${UNKNOWN}/b".to_owned()), false));
+        assert_eq!(cwd("literal-data"), (Some("${UNKNOWN}".to_owned()), false));
+        // A second recognized placeholder expands where it stands when the
+        // launch rebuilds the leading form; containment is checked on that
+        // expansion, and the record keeps the relative text symbolically.
+        assert_eq!(
+            cwd("second-data"),
+            (Some("cache${PLUGIN_DATA}".to_owned()), true)
+        );
+        assert_eq!(
+            cwd("second-root"),
+            (Some("a${PLUGIN_ROOT}/b".to_owned()), false)
+        );
+        assert_eq!(
+            cwd("second-cross"),
+            (Some("a/${PLUGIN_DATA}/b".to_owned()), false)
+        );
+        assert_eq!(
+            cwd("second-relative"),
+            (Some("a/${PLUGIN_DATA}".to_owned()), false)
+        );
+        // A `..` stays in the symbolic form too: whether it removes a plain
+        // component or one that holds a placeholder depends on the expansion,
+        // so the loader keeps it and the launch normalizes it against the real
+        // roots.
+        assert_eq!(cwd("popped"), (Some("a/../b".to_owned()), true));
+        assert_eq!(
+            cwd("popped-placeholder"),
+            (Some("a/${PLUGIN_ROOT}/../b".to_owned()), true)
+        );
+        assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
+    }
+
+    /// §9.2 expands every recognized placeholder in `cwd` in one textual pass.
+    /// The record keeps the relative path symbolic: the roots the placeholders
+    /// name are not known while the package is read, so the loader keeps the
+    /// expression, and an install and a launch resolve it against the real
+    /// roots. Only what the text alone establishes is refused here.
+    #[test]
+    fn a_second_placeholder_stays_symbolic_for_the_install_and_the_launch() {
+        let folder = |cwd: &str| {
+            let files = package(&[
+                ("plugin.json", &plugin_json("weekly.tools")),
+                (
+                    "mcp.json",
+                    &format!(
+                        r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"validator":{{"type":"stdio","command":"node","cwd":"{cwd}"}}}}}}"#
+                    ),
+                ),
+            ]);
+            let loaded = validate(&files).expect("the package loads around the entry");
+            (loaded.servers, loaded.skipped)
+        };
+
+        // A literal `${UNKNOWN}` is not a placeholder the client expands: it
+        // names a directory component and reads.
+        let (servers, skipped) = folder("./a/${UNKNOWN}/b");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let PackageTransport::Stdio(stdio) = &servers[0].transport else {
+            panic!("the server is a stdio server");
+        };
+        assert_eq!(stdio.cwd.as_deref(), Some("a/${UNKNOWN}/b"));
+        assert!(!stdio.data_cwd);
+
+        // A second recognized placeholder is kept where it stands: the record
+        // keeps the relative form symbolic, with only its `.` components
+        // dropped, and only an expansion against the real roots says how many
+        // components the placeholder contributes.
+        for (entry, expected) in [
+            ("${PLUGIN_DATA}/cache${PLUGIN_DATA}", "cache${PLUGIN_DATA}"),
+            (
+                "${PLUGIN_DATA}/./cache${PLUGIN_DATA}",
+                "cache${PLUGIN_DATA}",
+            ),
+        ] {
+            let (servers, skipped) = folder(entry);
+            assert!(skipped.is_empty(), "{entry}: {skipped:?}");
+            let PackageTransport::Stdio(stdio) = &servers[0].transport else {
+                panic!("the server is a stdio server");
+            };
+            assert_eq!(stdio.cwd.as_deref(), Some(expected), "{entry}");
+            assert!(stdio.data_cwd, "{entry}");
+        }
+
+        // A `..` after a component that holds a placeholder stays in the
+        // symbolic form: the launch expands the same expression against the
+        // real roots and normalizes to one directory. Resolving it here, with
+        // roots this machine can name, shows how the recorded expression is
+        // turned into the directory a server starts in.
+        let (servers, skipped) = folder("${PLUGIN_DATA}/a/${PLUGIN_ROOT}/../b");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let PackageTransport::Stdio(stdio) = &servers[0].transport else {
+            panic!("the server is a stdio server");
+        };
+        assert!(stdio.data_cwd);
+        assert_eq!(stdio.cwd.as_deref(), Some("a/${PLUGIN_ROOT}/../b"));
+        let plugin_root = std::env::temp_dir().join("neha-plugin-root");
+        let plugin_data = std::env::temp_dir().join("neha-plugin-data");
+        let resolved = crate::stdio::resolve_launch_cwd(
+            &plugin_data,
+            stdio.cwd.as_deref().unwrap_or_default(),
+            &plugin_root,
+            &plugin_data,
+        )
+        .expect("the recorded expression names a directory inside the data root");
+        let mut expected = plugin_data.join("a");
+        for component in plugin_root.components() {
+            if let std::path::Component::Normal(name) = component {
+                expected.push(name);
+            }
+        }
+        expected.pop();
+        expected.push("b");
+        assert_eq!(resolved, expected, "the launch normalizes the same `..`");
+        assert!(resolved.starts_with(&plugin_data));
+
+        // The real roots are several components deep — under the Space's home,
+        // the package name, and its digest — so this expression stays inside
+        // the data root even though the placeholder text alone looks like it
+        // removes two components. The loader must not decide that with a
+        // stand-in root: it keeps the expression, and the install expands it
+        // against the roots it publishes.
+        let (servers, skipped) = folder("${PLUGIN_DATA}/${PLUGIN_ROOT}/../../work");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        let [server] = servers.as_slice() else {
+            panic!("one server loads: {servers:?}");
+        };
+        let PackageTransport::Stdio(stdio) = &server.transport else {
+            panic!("the server is a stdio server");
+        };
+        assert!(stdio.data_cwd);
+        assert_eq!(stdio.cwd.as_deref(), Some("${PLUGIN_ROOT}/../../work"));
+
+        // A `..` that appears before any placeholder removes components of the
+        // recorded path itself: it names the root's parent wherever the root
+        // is, so the text alone refuses it.
+        for entry in [
+            "${PLUGIN_DATA}/../${PLUGIN_ROOT}",
+            "${PLUGIN_ROOT}/../x",
+            "${PLUGIN_ROOT}/a/../../${PLUGIN_DATA}",
+        ] {
+            let (servers, skipped) = folder(entry);
+            assert!(servers.is_empty(), "{entry}: {servers:?}");
+            assert_eq!(skipped.len(), 1, "{entry}: {skipped:?}");
+            assert!(skipped[0].contains("`cwd`"), "{entry}: {skipped:?}");
+        }
+    }
+
+    #[test]
+    fn reads_a_data_rooted_stdio_server() {
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"validator":{{"type":"stdio","command":"node","env":{{"CACHE":"${{PLUGIN_DATA}}/cache"}},"cwd":"${{PLUGIN_DATA}}"}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("a data-rooted stdio server reads");
+
+        let [server] = loaded.servers.as_slice() else {
+            panic!("one server loads: {:?}", loaded.servers);
+        };
+        let PackageTransport::Stdio(stdio) = &server.transport else {
+            panic!("the server is a stdio server");
+        };
+        assert_eq!(stdio.cwd, None, "the data directory itself is the cwd");
+        assert!(stdio.data_cwd);
+        assert_eq!(
+            stdio.env.get("CACHE").map(String::as_str),
+            Some("${PLUGIN_DATA}/cache")
+        );
+        assert!(loaded.skipped.is_empty(), "{:?}", loaded.skipped);
+    }
+
+    #[test]
+    fn unrecognized_placeholders_in_arguments_stay_literal() {
+        // §4.1 rule 5: arguments and environment values are opaque strings,
+        // and §9.2: text that is not a placeholder remains literal. They are
+        // not paths, so no containment rule applies to them.
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"validator":{{"type":"stdio","command":"node","args":["--home","${{HOME}}"],"env":{{"PATH_PART":"${{HOME}}/bin:${{PLUGIN_DATA}}/bin"}}}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("a literal placeholder stays literal");
+
+        let [server] = loaded.servers.as_slice() else {
+            panic!("one server loads: {:?}", loaded.servers);
+        };
+        let PackageTransport::Stdio(stdio) = &server.transport else {
+            panic!("the server is a stdio server");
+        };
+        assert_eq!(stdio.args, vec!["--home".to_owned(), "${HOME}".to_owned()]);
+        assert_eq!(
+            stdio.env.get("PATH_PART").map(String::as_str),
+            Some("${HOME}/bin:${PLUGIN_DATA}/bin")
+        );
+    }
+
+    #[test]
     fn skips_a_transport_the_space_does_not_support() {
         let files = package(&[
             ("plugin.json", &plugin_json("weekly.tools")),
@@ -3384,7 +4022,10 @@ mod tests {
 
         let loaded = validate(&files).expect("an unsupported transport skips one entry");
 
-        assert!(loaded.servers.is_empty());
+        // The stdio server loads; the deprecated and the unknown transports
+        // are reported and skipped, and the rest of the package still loads.
+        assert_eq!(loaded.servers.len(), 1, "{:?}", loaded.servers);
+        assert_eq!(loaded.servers[0].name, "weekly-tools-validator");
         // Reports arrive in the order the entries are keyed, which is sorted.
         assert_eq!(
             loaded.skipped,
@@ -3392,10 +4033,178 @@ mod tests {
                 "mcp.json: the server `carrier` names the unknown transport `carrier-pigeon`",
                 "mcp.json: the server `legacy` uses the sse transport, which this Space does not \
                  support",
-                "mcp.json: the server `validator` uses the stdio transport, which this Space does \
-                 not support",
             ]
         );
+    }
+
+    #[test]
+    fn skips_a_stdio_entry_that_does_not_conform() {
+        let manifest = plugin_json("weekly.tools");
+        // An invalid entry skips exactly that server and answers one report that
+        // never repeats what the package wrote.
+        let refuses = |entry: &str| {
+            let files = package(&[
+                ("plugin.json", &manifest),
+                (
+                    "mcp.json",
+                    &format!(
+                        r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"validator":{entry}}}}}"#
+                    ),
+                ),
+            ]);
+            let loaded = validate(&files).expect("an invalid entry skips one server");
+            assert!(
+                loaded.servers.is_empty(),
+                "{entry} must load no server, loaded {:?}",
+                loaded.servers
+            );
+            assert_eq!(loaded.skipped.len(), 1, "{entry}: {:?}", loaded.skipped);
+            assert!(
+                loaded.skipped[0].starts_with("mcp.json: the server `validator` "),
+                "{entry}: {:?}",
+                loaded.skipped
+            );
+        };
+        for entry in [
+            // A command is one executable token, either a bare name or a
+            // plugin-relative `./` path.
+            r#"{"type":"stdio"}"#,
+            r#"{"type":"stdio","command":""}"#,
+            r#"{"type":"stdio","command":"bin/server"}"#,
+            r#"{"type":"stdio","command":"/bin/server"}"#,
+            r#"{"type":"stdio","command":"../bin/server"}"#,
+            // A `./` path is resolved against the root: a `..` that leaves it
+            // after resolution is an escape like any other.
+            r#"{"type":"stdio","command":"./../bin/server"}"#,
+            r#"{"type":"stdio","command":"./bin/../../server"}"#,
+            r#"{"type":"stdio","command":"node server.js"}"#,
+            r#"{"type":"stdio","command":"node;rm -rf /"}"#,
+            r#"{"type":"stdio","command":"node|cat"}"#,
+            r#"{"type":"stdio","command":"node\u0000"}"#,
+            // The fields a stdio entry cannot carry.
+            r#"{"type":"stdio","command":"node","url":"https://example.com/mcp"}"#,
+            r#"{"type":"stdio","command":"node","headers":{"X-Tenant":"public"}}"#,
+            r#"{"type":"stdio","command":"node","user":"someone"}"#,
+            r#"{"type":"stdio","command":"node","args":"--flag"}"#,
+            r#"{"type":"stdio","command":"node","args":["--flag",3]}"#,
+            r#"{"type":"stdio","command":"node","env":[]}"#,
+            r#"{"type":"stdio","command":"node","env":{"CONFIG":3}}"#,
+            r#"{"type":"stdio","command":"node","env":{"A-B":"x"}}"#,
+            r#"{"type":"stdio","command":"node","env":{"1A":"x"}}"#,
+            r#"{"type":"stdio","command":"node","env":{"":"x"}}"#,
+            r#"{"type":"stdio","command":"node","cwd":3}"#,
+            // A working directory is a bounded `/`-separated relative path
+            // rooted at one of the two placeholders or `./`, and a component
+            // is plain text: no backslash, control character, or drive or
+            // stream separator.
+            r#"{"type":"stdio","command":"node","cwd":""}"#,
+            r#"{"type":"stdio","command":"node","cwd":"data"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"/data"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}x"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${HOME}/data"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"$PLUGIN_DATA/x"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}//data"}"#,
+            r#"{"type":"stdio","command":"node","cwd":".//data"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}/C:/data"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}/a\\b"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}/a\u0000b"}"#,
+            // A `..` that appears before any placeholder removes components of
+            // the recorded path itself, so it names the root's parent wherever
+            // the root is.
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}/../x"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_DATA}/../../x"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_DATA}/../${PLUGIN_ROOT}"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}/../${PLUGIN_DATA}/x"}"#,
+            r#"{"type":"stdio","command":"node","cwd":"${PLUGIN_ROOT}/a/../../${PLUGIN_DATA}"}"#,
+        ] {
+            refuses(entry);
+        }
+
+        // A `cwd` above the record's bound is refused like any other text the
+        // record cannot hold.
+        let entry = format!(
+            r#"{{"type":"stdio","command":"node","cwd":"${{PLUGIN_ROOT}}/{}"}}"#,
+            "a".repeat(neha::record::MAX_MCP_CWD_BYTES)
+        );
+        refuses(&entry);
+    }
+
+    #[test]
+    fn an_invalid_stdio_entry_leaves_a_mixed_package_loading() {
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"web":{{"type":"streamable-http","url":"https://deploy.example.com/mcp"}},"local":{{"type":"stdio","command":"./bin/local","args":["--data","${{PLUGIN_DATA}}/local"],"cwd":"${{PLUGIN_DATA}}"}},"broken":{{"type":"stdio","command":"../bin/broken"}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("the package loads around the invalid server");
+
+        // What §7.2.2 isolates to one entry: the two valid servers load, and
+        // the invalid one is reported.
+        assert_eq!(
+            loaded
+                .servers
+                .iter()
+                .map(|server| server.name.as_str())
+                .collect::<Vec<_>>(),
+            ["weekly-tools-local", "weekly-tools-web"]
+        );
+        let PackageTransport::Stdio(stdio) = &loaded.servers[0].transport else {
+            panic!("the local server is a stdio server");
+        };
+        assert_eq!(stdio.command, "./bin/local");
+        assert_eq!(stdio.cwd, None);
+        assert!(stdio.data_cwd);
+        assert_eq!(loaded.skipped.len(), 1, "{:?}", loaded.skipped);
+        assert!(
+            loaded.skipped[0].contains("`broken`"),
+            "{:?}",
+            loaded.skipped
+        );
+        assert!(
+            loaded.skipped[0].contains("`command`"),
+            "{:?}",
+            loaded.skipped
+        );
+        // The report never repeats the command a package wrote.
+        assert!(
+            !loaded.skipped[0].contains("../bin/broken"),
+            "{:?}",
+            loaded.skipped
+        );
+    }
+
+    #[test]
+    fn a_command_that_escapes_after_canonicalization_skips_its_server() {
+        let files = package(&[
+            ("plugin.json", &plugin_json("weekly.tools")),
+            (
+                "mcp.json",
+                &format!(
+                    r#"{{"$schema":"{MCP_SCHEMA}","mcpServers":{{"relative":{{"type":"stdio","command":"./../bin/server"}},"absolute":{{"type":"stdio","command":"/bin/server"}}}}}}"#
+                ),
+            ),
+        ]);
+
+        let loaded = validate(&files).expect("an escaping command skips one server");
+
+        // A `./` path is resolved against the plugin root before it is kept,
+        // so a `..` that leaves it fails containment; an absolute path names
+        // no form of command the entry may carry. Either way only the entry is
+        // invalid, and the command token never reaches the report.
+        assert!(loaded.servers.is_empty(), "{:?}", loaded.servers);
+        assert_eq!(loaded.skipped.len(), 2, "{:?}", loaded.skipped);
+        let reports = loaded.skipped.join("\n");
+        assert!(!reports.contains("../bin/server"), "{reports}");
+        assert!(!reports.contains("/bin/server"), "{reports}");
+        for report in &loaded.skipped {
+            assert!(report.starts_with("mcp.json: the server `"), "{report}");
+            assert!(report.contains("`command`"), "{report}");
+        }
     }
 
     #[test]

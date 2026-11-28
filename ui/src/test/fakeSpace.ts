@@ -77,6 +77,29 @@ const reportServer: McpServer = {
   connected: false,
   credential: "none",
 };
+// The stdio server the same package brought: the Space launches its command on
+// its own machine, so it has no address. It is connected when the sandbox,
+// package, and command are launchable, not because a process is running.
+export const stdioServer: McpServer = {
+  server: "s3",
+  name: "Local",
+  transport: "stdio",
+  url: null,
+  command: "./bin/reporter",
+  args: ["--data", "${PLUGIN_DATA}"],
+  env: { REPORT_MODE: "weekly" },
+  // The record keeps the working directory relative to its root; this one
+  // hangs from the package's data directory.
+  cwd: "work",
+  data_cwd: true,
+  scope: "space",
+  user: null,
+  by: account.id,
+  by_name: account.display_name,
+  plugin: "g1",
+  connected: true,
+  credential: "space",
+};
 // The package the Admin installed, and the Space skill it brought.
 const installedPackage: InstalledPackage = {
   plugin: "g1",
@@ -86,7 +109,20 @@ const installedPackage: InstalledPackage = {
   digest: "sha256:0000000000000000000000000000000000000000000000000000000000000000",
   source: "https://github.com/example/reports",
   enabled: true,
-  servers: [{ server: reportServer.server, name: reportServer.name }],
+  servers: [
+    {
+      server: reportServer.server,
+      name: reportServer.name,
+      transport: "streamable-http",
+      url: reportServer.url,
+    },
+    {
+      server: stdioServer.server,
+      name: stdioServer.name,
+      transport: "stdio",
+      command: stdioServer.command,
+    },
+  ],
   skills: [{ skill: "k1", name: "Weekly report" }],
 };
 const spaceSkill: Skill = {
@@ -206,6 +242,15 @@ function signInStateOf(id: string): "pending" | "finished" | "failed" {
   return space.signInStates[id] ?? "pending";
 }
 
+// The identifier the fake Space gives the next server it records: the first
+// free `s<n>`, so a fixture server cannot make two rows share an id.
+function nextServerId(): string {
+  const taken = new Set(space.servers.map((server) => server.server));
+  let index = 1;
+  while (taken.has(`s${index}`)) index += 1;
+  return `s${index}`;
+}
+
 export const space = {
   account,
   bot,
@@ -222,7 +267,7 @@ export const space = {
   timeouts: {} as Record<string, number | undefined>,
   // The MCP servers the Space lists, the packages the Admin installed, and the
   // Space's skills. The commands that change them answer from these.
-  servers: [searchServer, reportServer] as McpServer[],
+  servers: [searchServer, reportServer, stdioServer] as McpServer[],
   packages: [installedPackage] as InstalledPackage[],
   skills: [spaceSkill] as Skill[],
   // What the newest started sign-in's next poll answers with. A finished
@@ -291,7 +336,7 @@ export const space = {
     space.messages = [];
     space.otherMessages = [];
     space.chats = [chat];
-    space.servers = [searchServer, reportServer];
+    space.servers = [searchServer, reportServer, stdioServer];
     space.packages = [installedPackage];
     space.skills = [spaceSkill];
     space.signInState = "pending";
@@ -629,8 +674,9 @@ export class FakeCommands {
         space.sent.push(asked);
         const connected = asked.credential !== undefined;
         const added: McpServer = {
-          server: `s${space.servers.length + 1}`,
+          server: nextServerId(),
           name: asked.name,
+          transport: "streamable-http",
           url: asked.url,
           scope: asked.scope,
           user: asked.scope === "user" ? account.id : null,
@@ -730,8 +776,9 @@ export class FakeCommands {
             space.servers = [
               ...space.servers,
               {
-                server: `s${space.servers.length + 1}`,
+                server: nextServerId(),
                 name: signingIn.name ?? "server",
+                transport: "streamable-http",
                 url: signingIn.url ?? "https://mcp.example.com",
                 scope: "space",
                 user: null,

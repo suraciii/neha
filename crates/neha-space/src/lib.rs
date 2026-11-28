@@ -22,6 +22,7 @@ pub mod secrets;
 pub mod server;
 pub mod skills;
 pub mod state;
+pub mod stdio;
 pub mod store;
 pub mod ticket;
 

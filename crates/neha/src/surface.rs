@@ -292,6 +292,11 @@ pub struct McpAdd {
     /// The name the tool names and a User's commands use.
     pub name: String,
     /// The address the server speaks Streamable HTTP at.
+    ///
+    /// Empty (or absent) names no new server: it attaches the Space's
+    /// credential to the existing stdio server of this name, which a package
+    /// brought, and which only the Admin may do.
+    #[serde(default)]
     pub url: String,
     /// Where the credential touches the record.
     pub scope: crate::record::McpScope,

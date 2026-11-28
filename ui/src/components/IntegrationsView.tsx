@@ -41,6 +41,11 @@ interface PackageGroup {
   servers: McpServer[];
 }
 
+// The two roots a stdio server's working directory hangs from, named as the
+// record's placeholders: the record keeps the directory relative to its root.
+const PLUGIN_ROOT = "${PLUGIN_ROOT}";
+const PLUGIN_DATA = "${PLUGIN_DATA}";
+
 // Runs one command the page owns. A refusal is reported through `error`, so the
 // view does not repeat it.
 function run(action: () => Promise<void>) {
@@ -80,11 +85,38 @@ export default function IntegrationsView(props: IntegrationsViewProps) {
     return server.by === props.account.id || (props.account.isAdmin && server.scope === "space");
   }
 
+  // A stdio server is a command the Space launches on its own machine, so it
+  // has no address: a browser sign-in has nowhere to go for one.
+  function stdio(server: McpServer): boolean {
+    return server.transport === "stdio" || server.url === null;
+  }
+
+  // The way a stdio server starts: the transport, the executable, and its
+  // arguments, with the package's placeholders as the record keeps them.
+  function commandLine(server: McpServer): string {
+    const parts = ["stdio"];
+    if (server.command) parts.push(server.command);
+    parts.push(...(server.args ?? []));
+    return parts.join(" ");
+  }
+
+  // A stdio server's working directory, named under the root it hangs from:
+  // the record keeps only the relative path, so the same text means a
+  // different directory under the package root and under its data directory.
+  // An absent directory names the root itself, and the view shows none.
+  function cwdLabel(server: McpServer): string | null {
+    if (!server.cwd) return null;
+    const root = server.data_cwd === true ? PLUGIN_DATA : PLUGIN_ROOT;
+    return `${root}/${server.cwd}`;
+  }
+
   // A browser sign-in is offered whenever the reader may use the server and a
   // working personal credential does not already replace it: none yet, only
   // the Space's (a personal one attaches over it), or one the Space refuses
-  // (an expired credential to renew). Replacing a token is its own action.
+  // (an expired credential to renew). Replacing a token is its own action. A
+  // stdio server has no address to sign in to, so it is never offered.
   function signInOffered(server: McpServer): boolean {
+    if (stdio(server)) return false;
     return connectable(server) && !(personal(server) && server.connected);
   }
 
@@ -183,7 +215,9 @@ export default function IntegrationsView(props: IntegrationsViewProps) {
     // The sign-in takes the scope the form selected: the Admin may attach the
     // Space's credential to a Space server, anyone else attaches their own. The
     // Space decides whether that scope is this caller's to name.
-    run(() => props.onSignIn({ name: server.name, url: server.url, scope: chosenScope() }));
+    const address = server.url;
+    if (address === null) return;
+    run(() => props.onSignIn({ name: server.name, url: address, scope: chosenScope() }));
   }
 
   function toggleConnect(server: McpServer) {
@@ -242,10 +276,30 @@ export default function IntegrationsView(props: IntegrationsViewProps) {
                 </Show>
               </span>
             </div>
-            <div class="fact">
-              <span class="fact__label">{t("integrations.address")}</span>
-              <span class="fact__value mono">{server.url}</span>
-            </div>
+            <Show
+              when={stdio(server)}
+              fallback={
+                <div class="fact">
+                  <span class="fact__label">{t("integrations.address")}</span>
+                  <span class="fact__value mono">{server.url}</span>
+                </div>
+              }
+            >
+              <div class="fact">
+                <span class="fact__label">{t("integrations.command")}</span>
+                <span class="fact__value mono" data-command>
+                  {commandLine(server)}
+                </span>
+              </div>
+              <Show when={cwdLabel(server)}>
+                {(cwd) => (
+                  <div class="fact">
+                    <span class="fact__label">{t("integrations.cwd")}</span>
+                    <span class="fact__value mono">{cwd()}</span>
+                  </div>
+                )}
+              </Show>
+            </Show>
             <div class="fact">
               <span class="fact__label">{t("integrations.scope")}</span>
               <span class="fact__value">{scopeLabel(server)}</span>

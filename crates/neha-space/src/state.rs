@@ -14,7 +14,7 @@ use rand::Rng as _;
 use neha::id::Id;
 use neha::record::{
     ActionStatus, ApprovalReason, Author, CardData, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
-    McpScope, RuleEffect, RunReply, SkillLibrary, Undoability,
+    McpScope, McpTransport, RuleEffect, RunReply, SkillLibrary, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -138,8 +138,27 @@ pub struct McpServerView {
     pub server: Id,
     /// Its name, unique in the Space.
     pub name: String,
-    /// The address it speaks Streamable HTTP at.
-    pub url: String,
+    /// The address it speaks Streamable HTTP at, when it is an HTTP server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// The executable it launches, when it is a stdio server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// A stdio server's arguments, with `${PLUGIN_ROOT}` and `${PLUGIN_DATA}`
+    /// left for the launch to expand.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// A stdio server's environment, with the placeholders left for the launch
+    /// to expand.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    /// A stdio server's working directory under its root, `/`-separated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Whether a stdio server's working directory hangs from the plugin data
+    /// directory rather than the plugin root.
+    #[serde(default)]
+    pub data_cwd: bool,
     /// Where its credential belongs.
     pub scope: McpScope,
     /// The User it belongs to, when its scope is one User's.
@@ -154,6 +173,33 @@ pub struct McpServerView {
     pub headers: std::collections::BTreeMap<String, String>,
     /// The cursor of `mcp.server.added`.
     pub seq: Seq,
+}
+
+impl McpServerView {
+    /// Returns how the Space reaches this server: over Streamable HTTP, or by
+    /// launching the package's executable as a subprocess.
+    #[must_use]
+    pub fn transport(&self) -> McpTransport {
+        if self.command.is_some() {
+            McpTransport::Stdio
+        } else {
+            McpTransport::StreamableHttp
+        }
+    }
+
+    /// Returns the launch configuration, when this is a stdio server.
+    #[must_use]
+    pub fn stdio(&self) -> Option<neha::record::StdioServer> {
+        self.command
+            .as_ref()
+            .map(|command| neha::record::StdioServer {
+                command: command.clone(),
+                args: self.args.clone(),
+                env: self.env.clone(),
+                cwd: self.cwd.clone(),
+                data_cwd: self.data_cwd,
+            })
+    }
 }
 
 /// The most MCP servers one Space connects.
@@ -1789,6 +1835,11 @@ impl Projection for State {
                     headers: data.headers,
                     name: data.name,
                     url: data.url,
+                    command: data.command,
+                    args: data.args,
+                    env: data.env,
+                    cwd: data.cwd,
+                    data_cwd: data.data_cwd,
                     scope: data.scope,
                     user: data.user,
                     by,
@@ -1822,7 +1873,7 @@ impl Projection for State {
                                 .to_owned(),
                         );
                     }
-                    self.mcps[position].url = url;
+                    self.mcps[position].url = Some(url);
                 }
             }
             EventData::McpServerRemoved(data) => {
@@ -1929,7 +1980,9 @@ impl Projection for State {
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
-    use neha::record::{ActionStatus, Author, Event, EventKind, KIND_VERSION, McpScope};
+    use neha::record::{
+        ActionStatus, Author, Event, EventKind, KIND_VERSION, McpScope, McpTransport,
+    };
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
@@ -4163,6 +4216,69 @@ mod tests {
                 .map(|view| view.name.as_str()),
             Some("docs")
         );
+    }
+
+    #[test]
+    fn a_stdio_server_projects_its_launch_configuration() {
+        let owner = Id::new();
+        let http = Id::new();
+        let stdio = Id::new();
+        let mut state = State::default();
+        for event in [
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": http,
+                    "name": "docs",
+                    "url": "https://example.com/mcp",
+                    "headers": {"X-Tenant": "public"},
+                    "scope": "space",
+                    "by": owner,
+                }),
+                1,
+            ),
+            event(
+                EventKind::McpServerAdded,
+                Author::User(owner),
+                serde_json::json!({
+                    "server": stdio,
+                    "name": "local",
+                    "command": "./bin/server",
+                    "args": ["--data", "${PLUGIN_DATA}/docs"],
+                    "env": {"CONFIG": "${PLUGIN_ROOT}/config.json"},
+                    "cwd": "work",
+                    "data_cwd": true,
+                    "scope": "space",
+                    "by": owner,
+                }),
+                2,
+            ),
+        ] {
+            state.apply(&event).unwrap();
+        }
+
+        let view = state.mcp(http).expect("the HTTP server is connected");
+        assert_eq!(view.transport(), McpTransport::StreamableHttp);
+        assert_eq!(view.url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(view.command, None);
+        assert_eq!(view.stdio(), None);
+
+        let view = state.mcp(stdio).expect("the stdio server is connected");
+        assert_eq!(view.transport(), McpTransport::Stdio);
+        assert_eq!(view.url, None);
+        assert_eq!(view.command.as_deref(), Some("./bin/server"));
+        assert_eq!(view.args, ["--data", "${PLUGIN_DATA}/docs"]);
+        assert_eq!(
+            view.env.get("CONFIG").map(String::as_str),
+            Some("${PLUGIN_ROOT}/config.json")
+        );
+        assert_eq!(view.cwd.as_deref(), Some("work"));
+        assert!(view.data_cwd);
+        let stdio = view.stdio().expect("the launch configuration is kept");
+        assert_eq!(stdio.command, "./bin/server");
+        assert_eq!(stdio.cwd.as_deref(), Some("work"));
+        assert!(stdio.data_cwd);
     }
 
     #[test]

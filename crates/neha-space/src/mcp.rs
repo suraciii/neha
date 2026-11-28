@@ -104,10 +104,10 @@ pub(crate) const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 ///
 /// A server that keeps naming fresh cursors would otherwise spend the run's
 /// whole budget before the Model sees a single tool.
-const MAX_TOOL_PAGES: usize = 16;
+pub(crate) const MAX_TOOL_PAGES: usize = 16;
 
 /// The most tools this client accepts from one server.
-const MAX_TOOLS: usize = 256;
+pub(crate) const MAX_TOOLS: usize = 256;
 
 /// A tool one server offers.
 #[derive(Clone, Debug, PartialEq)]
@@ -569,25 +569,7 @@ impl McpClient {
         self.require_open()?;
         let params = json!({"name": tool, "arguments": arguments});
         let answer = self.rpc("tools/call", Some(params)).await?;
-        let result = answer.result.as_object().ok_or_else(malformed)?;
-        let content = result
-            .get("content")
-            .and_then(Value::as_array)
-            .ok_or_else(malformed)?
-            .iter()
-            .map(content_from_json)
-            .collect::<Result<Vec<_>, _>>()?;
-        let is_error = match result.get("isError") {
-            None => false,
-            Some(Value::Bool(is_error)) => *is_error,
-            Some(_) => return Err(malformed()),
-        };
-
-        Ok(McpAnswer {
-            content,
-            is_error,
-            raw: answer.result.clone(),
-        })
+        answer_from_json(&answer.result)
     }
 
     /// Reads one resource by its URI.
@@ -604,58 +586,7 @@ impl McpClient {
         self.require_open()?;
         let params = json!({"uri": uri});
         let answer = self.rpc("resources/read", Some(params)).await?;
-        let result = answer.result.as_object().ok_or_else(malformed)?;
-        let contents = result
-            .get("contents")
-            .and_then(Value::as_array)
-            .ok_or_else(malformed)?;
-        let mut found = None;
-        for content in contents {
-            let content = content.as_object().ok_or_else(malformed)?;
-            if content.get("uri").and_then(Value::as_str) != Some(uri) {
-                continue;
-            }
-            if found.is_some() {
-                return Err(protocol_error(
-                    "the MCP server answered one resource more than once",
-                ));
-            }
-            found = Some(content);
-        }
-        let content = found.ok_or_else(|| {
-            protocol_error("the MCP server answered no resource it was asked for")
-        })?;
-        let mime_type = match content.get("mimeType") {
-            None => None,
-            Some(Value::String(mime_type)) => Some(mime_type.clone()),
-            Some(_) => return Err(malformed()),
-        };
-        let text = match content.get("text") {
-            None => None,
-            Some(Value::String(text)) => Some(text.clone()),
-            Some(_) => return Err(malformed()),
-        };
-        let blob = match content.get("blob") {
-            None => None,
-            Some(Value::String(blob)) => Some(blob.clone()),
-            Some(_) => return Err(malformed()),
-        };
-        let data = match (text, blob) {
-            (Some(text), None) => text.into_bytes(),
-            (None, Some(blob)) => decode_base64(&blob)
-                .ok_or_else(|| protocol_error("the MCP server's resource is not base64"))?,
-            _ => return Err(malformed()),
-        };
-        if data.len() > MAX_ANSWER_BYTES {
-            return Err(protocol_error("the server's answer is too large"));
-        }
-
-        Ok(McpResource {
-            uri: uri.to_owned(),
-            mime_type,
-            data,
-            csp: ui_csp(content.get("_meta")),
-        })
+        resource_from_answer(uri, &answer.result)
     }
 
     /// Rejects a call that comes before the handshake.
@@ -968,8 +899,9 @@ fn matching_message(answer: Value, id: u64) -> Option<Value> {
 ///
 /// A tool that names its visibility without the model is not offered to the
 /// model at all; a tool that names a `ui://` resource carries it so a call can
-/// show its answer as a Card.
-fn tool_from_json(value: &Value) -> Result<Option<McpTool>, McpError> {
+/// show its answer as a Card. A stdio client reads a declaration with this
+/// same rule.
+pub(crate) fn tool_from_json(value: &Value) -> Result<Option<McpTool>, McpError> {
     let object = value.as_object().ok_or_else(malformed)?;
     let name = object
         .get("name")
@@ -1119,6 +1051,99 @@ fn content_from_json(value: &Value) -> Result<McpContent, McpError> {
         }
         _ => Ok(McpContent::Other(value.clone())),
     }
+}
+
+/// One tool result, as the server sent it.
+///
+/// The shape of a result belongs to the protocol, not to one transport, so a
+/// stdio client parses an answer with this same rule.
+pub(crate) fn answer_from_json(result: &Value) -> Result<McpAnswer, McpError> {
+    let object = result.as_object().ok_or_else(malformed)?;
+    let content = object
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(malformed)?
+        .iter()
+        .map(content_from_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    let is_error = match object.get("isError") {
+        None => false,
+        Some(Value::Bool(is_error)) => *is_error,
+        Some(_) => return Err(malformed()),
+    };
+
+    Ok(McpAnswer {
+        content,
+        is_error,
+        raw: result.clone(),
+    })
+}
+
+/// One resource answer, as the server sent it.
+///
+/// The answer's `contents` may hold more than one resource; only the entries
+/// that name the requested URI count, and exactly one must. A stdio client
+/// reads a resource with this same rule.
+pub(crate) fn resource_from_answer(uri: &str, result: &Value) -> Result<McpResource, McpError> {
+    let object = result.as_object().ok_or_else(malformed)?;
+    let contents = object
+        .get("contents")
+        .and_then(Value::as_array)
+        .ok_or_else(malformed)?;
+    let mut found = None;
+    for content in contents {
+        let content = content.as_object().ok_or_else(malformed)?;
+        if content.get("uri").and_then(Value::as_str) != Some(uri) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(protocol_error(
+                "the MCP server answered one resource more than once",
+            ));
+        }
+        found = Some(content);
+    }
+    let content = found
+        .ok_or_else(|| protocol_error("the MCP server answered no resource it was asked for"))?;
+    resource_from_json(uri, content)
+}
+
+/// One content entry of a `resources/read` answer.
+fn resource_from_json(
+    uri: &str,
+    content: &serde_json::Map<String, Value>,
+) -> Result<McpResource, McpError> {
+    let mime_type = match content.get("mimeType") {
+        None => None,
+        Some(Value::String(mime_type)) => Some(mime_type.clone()),
+        Some(_) => return Err(malformed()),
+    };
+    let text = match content.get("text") {
+        None => None,
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(_) => return Err(malformed()),
+    };
+    let blob = match content.get("blob") {
+        None => None,
+        Some(Value::String(blob)) => Some(blob.clone()),
+        Some(_) => return Err(malformed()),
+    };
+    let data = match (text, blob) {
+        (Some(text), None) => text.into_bytes(),
+        (None, Some(blob)) => decode_base64(&blob)
+            .ok_or_else(|| protocol_error("the MCP server's resource is not base64"))?,
+        _ => return Err(malformed()),
+    };
+    if data.len() > MAX_ANSWER_BYTES {
+        return Err(protocol_error("the server's answer is too large"));
+    }
+
+    Ok(McpResource {
+        uri: uri.to_owned(),
+        mime_type,
+        data,
+        csp: ui_csp(content.get("_meta")),
+    })
 }
 
 /// Decodes standard-alphabet base64, with or without the final padding.
@@ -1415,7 +1440,10 @@ pub(crate) fn sandbox_frame_sources(policy: Option<&str>) -> Vec<String> {
 }
 
 /// The failure every shape of malformed answer reports.
-fn malformed() -> McpError {
+///
+/// Both transports parse an answer with the same rules, so both report the
+/// same failure.
+pub(crate) fn malformed() -> McpError {
     protocol_error("the MCP server's answer did not fit the protocol")
 }
 

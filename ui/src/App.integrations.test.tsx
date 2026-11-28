@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import IntegrationsView, { type IntegrationsViewProps } from "./components/IntegrationsView";
 import { setLocale } from "./i18n";
-import { FakeCommands } from "./test/fakeSpace";
+import { FakeCommands, stdioServer } from "./test/fakeSpace";
 import { element } from "./test/view";
 import type { Bot, InstalledPackage, McpServer } from "./types";
 
@@ -51,7 +51,15 @@ const installedPackage: InstalledPackage = {
   digest: "sha256:0",
   source: "https://github.com/example/reports",
   enabled: true,
-  servers: [{ server: "s2", name: "Reports" }],
+  servers: [
+    {
+      server: "s2",
+      name: "Reports",
+      transport: "streamable-http",
+      url: "https://mcp.example.com/reports",
+    },
+    { server: "s3", name: "Local", transport: "stdio", command: "./bin/reporter" },
+  ],
   skills: [{ skill: "k1", name: "Weekly report" }],
 };
 
@@ -118,6 +126,14 @@ function group(view: View, kind: "packages" | "direct"): HTMLElement {
 
 function row(view: View, server: string): HTMLElement {
   return element<HTMLElement>(view, `[data-server="${server}"]`);
+}
+
+// One fact of a server row, by its label, or null when the row carries none.
+function fact(within: HTMLElement, label: string): string | null {
+  const found = [...within.querySelectorAll(".fact")].find(
+    (candidate) => candidate.querySelector(".fact__label")?.textContent?.trim() === label,
+  );
+  return found?.querySelector(".fact__value")?.textContent?.trim() ?? null;
 }
 
 function packageRow(view: View, plugin: string): HTMLElement {
@@ -250,6 +266,65 @@ describe("IntegrationsView", () => {
     // And enable it for a Bot they own.
     click(checkbox(server, "Scout"));
     expect(onBot).toHaveBeenCalledWith("b1", "s2", true);
+  });
+
+  it("shows a stdio server's command and keeps it without a browser sign-in", () => {
+    const { view, onConnect, onBot } = renderView({ servers: [reportServer, stdioServer] });
+    const server = row(view, stdioServer.server);
+
+    // One package may bring both transports: the HTTP server keeps its address
+    // and the stdio server shows the command line instead.
+    expect(row(view, reportServer.server).textContent).toContain(
+      "https://mcp.example.com/reports",
+    );
+    expect(server.querySelector<HTMLElement>("[data-command]")?.textContent?.trim()).toBe(
+      "stdio ./bin/reporter --data ${PLUGIN_DATA}",
+    );
+    // The working directory the package chose is shown beside it, named under
+    // the data root its row hangs from.
+    expect(fact(server, "Working directory")).toBe("${PLUGIN_DATA}/work");
+
+    // A stdio server has no address, so no browser sign-in is offered.
+    expect(
+      [...server.querySelectorAll("button")].map((candidate) => candidate.textContent?.trim()),
+    ).not.toContain("Sign in");
+
+    // A token still connects it, and the Bot toggles stay.
+    click(button(server, "Connect"));
+    type(input(server, 'input[name="connect_token"]'), "stdio-token");
+    submit(server.querySelector("form")!);
+    expect(onConnect).toHaveBeenCalledWith(stdioServer.server, "stdio-token");
+    click(checkbox(server, "Scout"));
+    expect(onBot).toHaveBeenCalledWith("b1", stdioServer.server, true);
+
+    // The package's environment is its data: a value never reaches the page.
+    expect(view.container.innerHTML).not.toContain("weekly");
+  });
+
+  it("names the root a stdio server's working directory hangs from", () => {
+    // The record keeps only the relative directory; the row's root decides
+    // which directory that names. One hangs from the package root, the other
+    // from its data directory.
+    const rootStdio: McpServer = {
+      ...stdioServer,
+      server: "s4",
+      name: "Local root",
+      data_cwd: false,
+    };
+    // A row with no working directory names the root itself, so no directory
+    // is shown.
+    const bareStdio: McpServer = {
+      ...stdioServer,
+      server: "s5",
+      name: "Local bare",
+      cwd: null,
+      data_cwd: true,
+    };
+    const { view } = renderView({ servers: [stdioServer, rootStdio, bareStdio] });
+
+    expect(fact(row(view, stdioServer.server), "Working directory")).toBe("${PLUGIN_DATA}/work");
+    expect(fact(row(view, rootStdio.server), "Working directory")).toBe("${PLUGIN_ROOT}/work");
+    expect(fact(row(view, bareStdio.server), "Working directory")).toBeNull();
   });
 
   it("adds a member's server to their own scope", () => {

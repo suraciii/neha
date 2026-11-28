@@ -63,6 +63,8 @@ Only the Admin refreshes the catalog. The other catalog commands are reads.
 
 `neha mcp add <name> <url>` adds an MCP server under a name that follows the [Plugin](../plugin/design.md#tools) naming rule. `--scope user` adds it for the signed-in User alone; the default adds it for the Space, which only the Admin MAY do.
 
+`neha mcp add <name>` without an address attaches the Space's credential to an existing package `stdio` server of that name, which only the Admin MAY do.
+
 The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the browser, never from the command line. `neha mcp list` prints each server, its scope, who connected it, and whether it is connected.
 
 `neha plugin install <source>[@<commit>]` installs a package from a source the Admin allows. `neha plugin list` prints each package, its commit, and what it brought.

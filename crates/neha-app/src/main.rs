@@ -541,6 +541,10 @@ enum McpCommand {
     /// With the token set, the Space connects the server at once; naming an
     /// existing Space server again attaches the credential to it.
     ///
+    /// Without an address, the command attaches the Space's credential to an
+    /// existing package's stdio server of that name; only the Admin may do
+    /// that, and the token is asked for when the environment carries none.
+    ///
     /// Without the token, the command opens the browser to sign in. The
     /// sign-in is bound to a loopback receiver this command runs, so the
     /// browser brings the answer back to the terminal. Naming an existing
@@ -549,8 +553,9 @@ enum McpCommand {
     Add {
         /// The server's name, unique in the Space: letters, digits, or hyphens.
         name: String,
-        /// The address it speaks Streamable HTTP at.
-        url: String,
+        /// The address it speaks Streamable HTTP at; omit it to attach the
+        /// Space credential to a package's existing stdio server of this name.
+        url: Option<String>,
         /// Connect it for the signed-in User alone; without it the Space is
         /// the scope, which only the Admin may add to.
         #[arg(long, value_parser = parse_mcp_scope)]
@@ -1869,11 +1874,14 @@ fn write_approval_details(out: &mut impl Write, approval: &Value) -> Result<()> 
     Ok(())
 }
 
-/// Escapes control characters so a card cannot hide or rewrite itself.
+/// Escapes control characters and the escape character so a card cannot hide
+/// or rewrite itself. A literal `\n` renders as `\\n`, so no raw control
+/// character and no ambiguous escape reaches the reader.
 fn escape_text(text: &str) -> String {
     let mut escaped = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
+            '\\' => escaped.push_str("\\\\"),
             '\n' => escaped.push_str("\\n"),
             '\r' => escaped.push_str("\\r"),
             '\t' => escaped.push_str("\\t"),
@@ -2055,10 +2063,12 @@ async fn plugin_command(command: PluginCommand) -> Result<()> {
                 println!("  servers: -");
             }
             for server in servers {
+                // A server row carries its transport's fields: an HTTP
+                // server's address, or a stdio server's command.
                 println!(
                     "  server: {} ({})",
                     server["name"].as_str().unwrap_or_default(),
-                    server["url"].as_str().unwrap_or_default()
+                    mcp_reach_label(server)
                 );
             }
             let skills = result["skills"]
@@ -2201,16 +2211,35 @@ async fn mcp_command(command: McpCommand) -> Result<()> {
     match command {
         McpCommand::Add { name, url, scope } => {
             let scope = scope.unwrap_or(McpScope::Space);
-            match mcp_add_plan(&name, &url, scope, mcp_credential()) {
+            // An omitted address names a package's existing stdio server: no
+            // server is created, and only the Space's own credential can be
+            // attached to it.
+            let url = url.unwrap_or_default();
+            let token = match mcp_credential() {
+                Some(token) => Some(token),
+                // A stdio server has no address to sign in to, so the attach
+                // asks for the token instead of opening a browser.
+                None if url.trim().is_empty() => Some(read_mcp_credential()?),
+                None => None,
+            };
+            match mcp_add_plan(&name, &url, scope, token) {
                 McpAddPlan::Add(arguments) => {
                     let result =
                         client::command(&credential, CommandCall::McpAdd(arguments)).await?;
-                    println!(
-                        "Added MCP server {} ({}) at {}.",
-                        id_of(&result, "server")?,
-                        result["name"].as_str().unwrap_or_default(),
-                        result["url"].as_str().unwrap_or_default()
-                    );
+                    if result["url"].as_str().is_none_or(str::is_empty) {
+                        println!(
+                            "Attached the Space credential to MCP server {} ({}).",
+                            id_of(&result, "server")?,
+                            result["name"].as_str().unwrap_or_default()
+                        );
+                    } else {
+                        println!(
+                            "Added MCP server {} ({}) at {}.",
+                            id_of(&result, "server")?,
+                            result["name"].as_str().unwrap_or_default(),
+                            result["url"].as_str().unwrap_or_default()
+                        );
+                    }
                     println!(
                         "  scope: {}; {}",
                         mcp_scope_label(&result),
@@ -2344,8 +2373,10 @@ enum McpAddPlan {
 /// Decides how one `neha mcp add` connects its server.
 ///
 /// A credential argument would outlive the command in a shell history and a
-/// process listing, so `NEHA_MCP_TOKEN` is its only source; without one the
-/// browser sign-in supplies the credential instead.
+/// process listing, so `NEHA_MCP_TOKEN` (or, for an attach without an address,
+/// the terminal prompt) is its only source; without one the browser sign-in
+/// supplies the credential instead. An empty `url` is passed through: the Space
+/// reads it as the existing package stdio server of that name.
 fn mcp_add_plan(name: &str, url: &str, scope: McpScope, credential: Option<String>) -> McpAddPlan {
     match credential {
         Some(credential) => McpAddPlan::Add(McpAdd {
@@ -3318,8 +3349,8 @@ fn skill_row(skill: &Value) -> Result<String> {
     ))
 }
 
-/// One row per MCP server: server, name, scope, who connected it, url, and
-/// connection state.
+/// One row per MCP server: server, name, scope, who connected it, how the
+/// Space reaches it, and connection state.
 fn mcp_rows(list: &Value) -> Result<Vec<String>> {
     list.as_array()
         .context("no MCP servers in the answer")?
@@ -3339,12 +3370,38 @@ fn mcp_row(server: &Value) -> Result<String> {
             .unwrap_or_default(),
         mcp_scope_label(server),
         server.get("by").and_then(Value::as_str).unwrap_or("-"),
-        server
-            .get("url")
-            .and_then(Value::as_str)
-            .unwrap_or_default(),
+        mcp_reach_label(server),
         mcp_connection_label(server)
     ))
+}
+
+/// The way one MCP server view is reached: an HTTP server's address, or a
+/// stdio server's transport and command line.
+///
+/// Every field the package supplies is escaped: a command, an argument, or an
+/// address may hold a newline or a terminal escape, and the row must stay one
+/// line the reader's terminal cannot rewrite.
+fn mcp_reach_label(server: &Value) -> String {
+    if server.get("transport").and_then(Value::as_str) != Some("stdio") {
+        return escape_text(
+            server
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        );
+    }
+    let mut line = String::from("stdio");
+    if let Some(command) = server.get("command").and_then(Value::as_str) {
+        line.push(' ');
+        line.push_str(&escape_text(command));
+    }
+    if let Some(arguments) = server.get("args").and_then(Value::as_array) {
+        for argument in arguments.iter().filter_map(Value::as_str) {
+            line.push(' ');
+            line.push_str(&escape_text(argument));
+        }
+    }
+    line
 }
 
 /// The scope of one MCP server view: the Space, or the User who connected it.
@@ -4091,11 +4148,35 @@ fn computer_kind_label(kind: &str) -> &str {
 ///
 /// A credential argument would outlive the command in a shell history and a
 /// process listing, so `NEHA_MCP_TOKEN` is its only source. Absent, the command
-/// opens a browser sign-in for the credential instead.
+/// opens a browser sign-in for the credential instead; an attach without an
+/// address asks for the token on the terminal, because a stdio server has no
+/// address to sign in to.
 fn mcp_credential() -> Option<String> {
     std::env::var("NEHA_MCP_TOKEN")
         .ok()
         .filter(|token| !token.is_empty())
+}
+
+/// The MCP credential an `mcp add` attach asks for when the environment
+/// carries none.
+///
+/// Attaching the Space's credential to a package's stdio server has no address
+/// to sign in to, so the command prompts for the token. A non-interactive run
+/// must set `NEHA_MCP_TOKEN`: a prompt would read nothing and block.
+fn read_mcp_credential() -> Result<String> {
+    if !std::io::stdin().is_terminal() {
+        bail!(
+            "attaching the Space's MCP credential needs NEHA_MCP_TOKEN when stdin is not a \
+             terminal"
+        );
+    }
+    let token = rpassword::prompt_password("MCP access token: ")
+        .context("cannot read the MCP credential")?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        bail!("an MCP server's credential is not empty");
+    }
+    Ok(token)
 }
 
 fn provider_key() -> Result<String> {
@@ -4668,10 +4749,21 @@ mod tests {
                 command: McpCommand::Add { name, url, scope },
             } => {
                 assert_eq!(name, "weather");
-                assert_eq!(url, "https://mcp.example.com/mcp");
+                assert_eq!(url.as_deref(), Some("https://mcp.example.com/mcp"));
                 assert_eq!(scope.unwrap_or(McpScope::Space), McpScope::Space);
             }
             _ => panic!("mcp add did not parse"),
+        }
+        // The address is optional: an omitted one names an existing stdio
+        // server the Admin attaches the Space's credential to.
+        match parse(&["mcp", "add", "weather"]) {
+            Top::Mcp {
+                command: McpCommand::Add { name, url, .. },
+            } => {
+                assert_eq!(name, "weather");
+                assert_eq!(url, None);
+            }
+            _ => panic!("mcp add without an address did not parse"),
         }
         match parse(&[
             "mcp",
@@ -4701,7 +4793,6 @@ mod tests {
             _ => panic!("mcp remove did not parse"),
         }
         for line in [
-            vec!["mcp", "add", "weather"],
             vec!["mcp", "remove"],
             vec![
                 "mcp",
@@ -5567,9 +5658,12 @@ mod tests {
 
     #[test]
     fn a_card_escapes_control_characters_and_keeps_long_commands() {
+        // A control character renders as its escaped form, and the escape
+        // character itself is escaped so a literal `\n` cannot pass for a
+        // newline.
         assert_eq!(
-            escape_text("a\nb\rc\td\u{001b}[31m"),
-            "a\\nb\\rc\\td\\u{001b}[31m"
+            escape_text("a\nb\rc\td\u{001b}[31m\\e\u{0007}f"),
+            "a\\nb\\rc\\td\\u{001b}[31m\\\\e\\u{0007}f"
         );
 
         let mut card = approval_card("shell", "rule");
@@ -5960,8 +6054,9 @@ mod tests {
     }
 
     #[test]
-    fn mcp_rows_show_the_server_scope_url_and_connection() {
+    fn mcp_rows_show_the_server_scope_reach_and_connection() {
         let server = Id::new();
+        let local = Id::new();
         let user_server = Id::new();
         let user = Id::new();
         let by = Id::new();
@@ -5969,14 +6064,27 @@ mod tests {
             {
                 "server": server,
                 "name": "weather",
+                "transport": "streamable-http",
                 "url": "https://mcp.example.com/mcp",
                 "scope": "space",
                 "by": by,
                 "connected": true,
             },
             {
-                "server": user_server,
+                "server": local,
                 "name": "notes",
+                "transport": "stdio",
+                "url": null,
+                "command": "./bin/notes",
+                "args": ["--root", "${PLUGIN_DATA}", "--label", "My notes"],
+                "scope": "space",
+                "by": by,
+                "connected": false,
+            },
+            {
+                "server": user_server,
+                "name": "mine",
+                "transport": "streamable-http",
                 "url": "http://127.0.0.1:9000/mcp",
                 "scope": "user",
                 "user": user,
@@ -5991,16 +6099,67 @@ mod tests {
                     "{server}  weather  space  by {by}  https://mcp.example.com/mcp  connected"
                 ),
                 format!(
-                    "{user_server}  notes  user {user}  by {user}  http://127.0.0.1:9000/mcp  not connected"
+                    "{local}  notes  space  by {by}  stdio ./bin/notes --root ${{PLUGIN_DATA}} --label My notes  not connected"
+                ),
+                format!(
+                    "{user_server}  mine  user {user}  by {user}  http://127.0.0.1:9000/mcp  not connected"
                 ),
             ]
         );
-        // Absent fields read as a Space server that has not connected.
+        // A row written before the transport was named still reads as an
+        // address, and a stdio row without arguments prints its command alone.
         assert_eq!(
             mcp_row(&json!({"server": server, "name": "bare", "url": "https://x/"})).unwrap(),
             format!("{server}  bare  space  by -  https://x/  not connected")
         );
+        assert_eq!(
+            mcp_row(&json!({"server": local, "name": "solo", "transport": "stdio", "command": "./bin/solo"}))
+                .unwrap(),
+            format!("{local}  solo  space  by -  stdio ./bin/solo  not connected")
+        );
         assert_eq!(mcp_rows(&json!([])).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn mcp_rows_escape_the_package_controlled_reach_fields() {
+        let server = Id::new();
+        // A command and an argument are package data: they may hold a
+        // newline, a terminal escape, or a backslash that would otherwise
+        // stand for one. The row stays one plain line.
+        let row = mcp_row(&json!({
+            "server": server,
+            "name": "notes",
+            "transport": "stdio",
+            "command": "./bin/no\ntes",
+            "args": ["--title", "a\nb\u{001b}[2Jc\\d", "\u{0007}bell"],
+        }))
+        .unwrap();
+        assert_eq!(
+            row,
+            format!(
+                "{server}  notes  space  by -  stdio ./bin/no\\ntes --title a\\nb\\u{{001b}}[2Jc\\\\d \\u{{0007}}bell  not connected"
+            )
+        );
+        assert!(
+            row.chars().all(|ch| !ch.is_control()),
+            "no raw control character reaches the terminal: {row:?}"
+        );
+
+        // An address is package data too, and an ordinary one is unchanged.
+        assert_eq!(
+            mcp_row(&json!({
+                "server": server,
+                "name": "web",
+                "transport": "streamable-http",
+                "url": "https://x/\u{001b}[2J\\",
+            }))
+            .unwrap(),
+            format!("{server}  web  space  by -  https://x/\\u{{001b}}[2J\\\\  not connected")
+        );
+        assert_eq!(
+            mcp_row(&json!({"server": server, "name": "docs", "url": "https://x/mcp"})).unwrap(),
+            format!("{server}  docs  space  by -  https://x/mcp  not connected")
+        );
     }
 
     #[test]
@@ -6065,6 +6224,19 @@ mod tests {
             })
         );
 
+        // An omitted address is passed through empty: the Space reads it as
+        // the existing package stdio server of that name, so the plan names no
+        // address and the command creates nothing.
+        assert_eq!(
+            mcp_add_plan("local", "", McpScope::Space, Some("secret".to_owned())),
+            McpAddPlan::Add(McpAdd {
+                name: "local".to_owned(),
+                url: String::new(),
+                scope: McpScope::Space,
+                credential: Some("secret".to_owned()),
+            })
+        );
+
         // Without one the command binds its loopback receiver and opens the
         // browser.
         assert_eq!(
@@ -6113,6 +6285,48 @@ mod tests {
                 redirect_uri: Some(redirect.to_owned()),
             }
         );
+    }
+
+    #[test]
+    fn an_mcp_add_address_is_optional_and_its_help_states_the_attach() {
+        let Top::Mcp {
+            command: McpCommand::Add { name, url, .. },
+        } = parse(&["mcp", "add", "local"])
+        else {
+            panic!("`mcp add <name>` parses");
+        };
+        assert_eq!(name, "local");
+        assert_eq!(url, None, "an omitted address is an attach");
+
+        let Top::Mcp {
+            command: McpCommand::Add { url, .. },
+        } = parse(&["mcp", "add", "docs", "https://docs.example.com/mcp"])
+        else {
+            panic!("`mcp add <name> <url>` parses");
+        };
+        assert_eq!(url.as_deref(), Some("https://docs.example.com/mcp"));
+
+        // The help says what an omitted address attaches, and who may do it.
+        let mut cli = Cli::command();
+        let mcp = cli.find_subcommand_mut("mcp").expect("an mcp command");
+        let add = mcp.find_subcommand_mut("add").expect("an mcp add command");
+        let help = add
+            .render_long_help()
+            .to_string()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for stated in [
+            "omit it to attach the Space credential",
+            "package's existing stdio server of this name",
+            "only the Admin may do that",
+            "asked for when the environment carries none",
+        ] {
+            assert!(
+                help.contains(stated),
+                "`mcp add --help` does not state {stated:?}:\n{help}"
+            );
+        }
     }
 
     #[test]

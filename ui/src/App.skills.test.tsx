@@ -155,6 +155,11 @@ describe("App library views", () => {
     expect(packages.textContent).toContain("reports");
     expect(packages.querySelector('[data-package="g1"]')).toBeTruthy();
     expect(packages.querySelector('[data-server="s2"]')).toBeTruthy();
+    // The same package may bring a stdio server: the page shows its command
+    // line instead of an address.
+    expect(packages.querySelector('[data-server="s3"]')?.textContent).toContain(
+      "stdio ./bin/reporter --data ${PLUGIN_DATA}",
+    );
     // A server added directly stays in its own group.
     const direct = element<HTMLElement>(view, '.library__group[data-group="direct"]');
     expect(direct.querySelector('[data-server="s1"]')).toBeTruthy();
@@ -225,7 +230,11 @@ describe("App library views", () => {
     // so the list reads it back without the reader leaving the view.
     space.signInState = "finished";
     await waitFor(() => expect(space.asked).toContain("mcp_sign_in_status"), { timeout: 4000 });
-    await waitFor(() => expect(serverRow(view, "s3")).toBeTruthy(), { timeout: 4000 });
+    // The Space records the signed-in server beside the fixture servers, so
+    // the row the page shows is the one its answer named.
+    await waitFor(() => expect(space.servers.some((server) => server.name === "Docs")).toBe(true));
+    const added = space.servers.find((server) => server.name === "Docs");
+    await waitFor(() => expect(serverRow(view, added!.server)).toBeTruthy(), { timeout: 4000 });
     // The link goes with the sign-in it belonged to.
     await waitFor(() =>
       expect(view.container.querySelector("[data-sign-in-fallback]")).toBeNull(),
@@ -336,7 +345,8 @@ describe("App library views", () => {
       { timeout: 4_000 },
     );
     await waitFor(() => expect(fallback(view)).toBeNull());
-    await waitFor(() => expect(serverRow(view, "s3")).toBeTruthy());
+    const added = space.servers.find((server) => server.name === "Docs B");
+    await waitFor(() => expect(serverRow(view, added!.server)).toBeTruthy());
     expect(stops).toHaveBeenCalledWith(secondTimer);
   });
 
@@ -525,8 +535,9 @@ describe("App library views", () => {
     space.servers = [
       ...space.servers,
       {
-        server: "s3",
+        server: "s4",
         name: "Docs",
+        transport: "streamable-http",
         url: "https://mcp.example.com/docs",
         scope: "space",
         user: null,
@@ -536,8 +547,8 @@ describe("App library views", () => {
         credential: "space",
       },
     ];
-    record("neha.mcp.server.added", { server: "s3", name: "Docs" });
-    await waitFor(() => expect(serverRow(view, "s3")).toBeTruthy());
+    record("neha.mcp.server.added", { server: "s4", name: "Docs" });
+    await waitFor(() => expect(serverRow(view, "s4")).toBeTruthy());
     expect(reads()).toBe(before + 1);
   });
 
