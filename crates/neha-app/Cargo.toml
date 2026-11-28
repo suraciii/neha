@@ -6,10 +6,19 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# What the integration tests need from inside the crate. `cargo test --all-features`
+# turns it on; a production build does not compile it.
+test-support = []
+
 [[bin]]
 name = "neha"
 path = "src/main.rs"
 doc = false
+
+[[test]]
+name = "it"
+required-features = ["test-support"]
 
 [dependencies]
 anyhow = "1"
