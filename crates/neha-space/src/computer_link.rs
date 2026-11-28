@@ -35,7 +35,7 @@ pub const FRAME_QUEUE: usize = 64;
 /// blocked-writer paths are asserted without slowing the suite. A frame that
 /// misses its deadline fails its request and closes the channel, so a Computer
 /// that stops reading cannot grow the Space's memory or strand a run.
-pub const FRAME_TIMEOUT: Duration = if cfg!(test) {
+pub const FRAME_TIMEOUT: Duration = if cfg!(any(test, feature = "test-support")) {
     Duration::from_millis(250)
 } else {
     Duration::from_secs(10)
