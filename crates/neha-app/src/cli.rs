@@ -738,8 +738,6 @@ pub async fn run() -> Result<()> {
 }
 
 async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>) -> Result<()> {
-    let home = Home::from_env()
-        .context("NEHA_HOME is not set; set it to the directory that holds this Space")?;
     let ui = ui
         .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
         .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
@@ -766,15 +764,25 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
     {
         bail!("--domain takes a host[:port], not a URL or path");
     }
-    let public_url = domain.map(|domain| format!("https://{domain}"));
+    let public_url = match domain {
+        Some(domain) => Some(format!("https://{domain}")),
+        None => match std::env::var("NEHA_PUBLIC_URL") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => bail!("NEHA_PUBLIC_URL is not usable: {error}"),
+        },
+    };
+    // Refuse an unusable listener before opening the home: a start that may
+    // not serve must not rename a database or clear temporary files.
+    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    neha_space::ensure_listener_allowed(&bind, port, public_url.as_deref())
+        .context("the Space cannot start")?;
+    let home = Home::from_env()
+        .context("NEHA_HOME is not set; set it to the directory that holds this Space")?;
     let has_ui = ui.is_some();
-    let running = match public_url {
-        Some(public_url) => {
-            neha_space::start_with_ui_public(home, port, ui, Some(public_url)).await
-        }
-        None => neha_space::start_with_ui(home, port, ui).await,
-    }
-    .context("the Space cannot start")?;
+    let running = neha_space::start_with_ui_public(home, port, ui, public_url)
+        .await
+        .context("the Space cannot start")?;
     let public = running.public_url();
     let cli_server = public.clone().unwrap_or_else(|| running.url());
 

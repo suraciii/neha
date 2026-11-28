@@ -27,10 +27,10 @@ services:
     networks:
       edge:
       internal:
-        # The Space resolves `caddy` once, at start. A fixed address keeps that
-        # resolution valid when the proxy container is recreated.
-        ipv4_address: 172.28.0.2
-      workers:
+        # The Space resolves `caddy` once, at start. Caddy shares only the
+        # internal network with the Space, and its fixed address sits outside
+        # the dynamic range, so that resolution survives a proxy-only restart.
+        ipv4_address: 172.28.128.2
 
   space:
     image: neha-space:dev
@@ -101,6 +101,7 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/24
+          ip_range: 172.28.0.0/25
   workers:
     name: neha-workers
 

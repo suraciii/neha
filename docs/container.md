@@ -16,7 +16,7 @@ A **Local Space** is different: the desktop app starts it on your computer and i
 
 The Space creates one worker container per Hosted Computer. A Computer's Bots share its worker and its Workspace, each in a directory of its own. The worker mounts only that Computer's Workspace root at `/workspace`.
 
-The Space trusts the `caddy` service as its TLS proxy (`NEHA_TRUSTED_PROXIES=caddy` in `compose.yml`), so sign-in and pairing limits count each client's forwarded address. Caddy has a fixed address on the internal network, so a proxy container recreated on its own does not leave the Space naming a stale address; restart the Space if you replace the proxy outside this stack.
+The Space trusts the `caddy` service as its TLS proxy (`NEHA_TRUSTED_PROXIES=caddy` in `compose.yml`), so sign-in limits count each client's forwarded address. Caddy shares only the internal network with the Space and has a fixed address there, outside the dynamic range; a proxy container recreated on its own does not leave the Space naming a stale address. Restart the Space if you replace the proxy outside this stack.
 
 ## Requirements
 
@@ -177,9 +177,19 @@ docker compose build space supervisor
 docker compose up -d --force-recreate space supervisor caddy
 ```
 
-Workers are not Compose services. Remove old `neha-worker-*` containers after the Space starts; the lifecycle manager creates workers from the new image for Computers that need them. A worker running an old channel version refuses to serve, so a mixed-version stack does not answer as if it worked.
+Workers are not Compose services. Remove old `neha-worker-*` containers after the Space starts; the lifecycle manager creates workers from the new image for Computers that need them. A worker running an old channel version refuses to serve, so a mixed-version stack does not answer as if it worked. A worker that still runs keeps its old container even when it is idle; remove it so the next start uses the new image.
 
-The internal network has a fixed subnet so the proxy's address survives a proxy-only restart. A stack created before that change recreates the network on the next `up`; if Compose reports that `neha-internal` already exists with a different configuration, stop the stack, run `docker network rm neha-internal` once, and start it again. Data lives on the host, not in the network. If `172.28.0.0/24` collides with a network on your Docker host, change the subnet and Caddy's address in `compose.yml` before the first start.
+The internal network has a fixed subnet and a fixed Caddy address so the proxy's address survives a proxy-only restart. A stack created before that change must drop its old network once, because a running worker container holds it:
+
+```bash
+docker compose down
+# Workers are not Compose services; they hold the old network and no data.
+docker ps --filter name=neha-worker- --format '{{.Names}}' | xargs -r docker rm -f
+docker network rm neha-internal
+docker compose up -d
+```
+
+If Compose reports that `neha-internal` is still in use, stop any remaining `neha-worker-*` container and run `docker network rm neha-internal` again. The data directory is a host bind mount and the Caddy volumes are named volumes, so `down` keeps both. If `172.28.0.0/24` collides with a network on your Docker host, change the subnet and Caddy's address in `compose.yml` before the first start; keep Caddy's address outside the `ip_range`.
 
 Back up the data directory before an upgrade. The schema migration runs when the Space starts; [Upgrade a Space](upgrading.md) covers the version check and rollback expectations.
 

@@ -7,10 +7,10 @@
 //! own address. Reading only named proxies keeps a caller from choosing its
 //! own address for a rate limit.
 //!
-//! The chain is single-hop by contract: the public proxy overwrites or
-//! normalizes `X-Forwarded-For`, so the last value it sends is the client.
-//! A proxy that forwards an earlier chain unchanged names itself instead, and
-//! the Space falls back to the peer.
+//! The chain is single-hop by requirement: the public proxy overwrites
+//! `X-Forwarded-For`, or writes its final value from the request's TCP peer.
+//! The Space cannot tell who wrote a well-formed value, so a proxy that
+//! forwards a client-supplied header unchanged defeats this boundary.
 
 use std::io;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -50,11 +50,11 @@ impl TrustedProxies {
             .to_str()
             .ok_or_else(|| "NEHA_TRUSTED_PROXIES is not UTF-8".to_owned())?;
 
-        Self::parse(value).map(|proxies| proxies.filter(|proxies| !proxies.entries.is_empty()))
+        Self::parse(value).map(|proxies| (!proxies.entries.is_empty()).then_some(proxies))
     }
 
     /// Reads a list of proxies, resolving hostnames through this machine.
-    fn parse(value: &str) -> Result<Option<Self>, String> {
+    fn parse(value: &str) -> Result<Self, String> {
         Self::parse_with(value, |host| {
             (host, 0).to_socket_addrs().map(|addresses| {
                 addresses
@@ -68,7 +68,7 @@ impl TrustedProxies {
     fn parse_with(
         value: &str,
         mut resolve: impl FnMut(&str) -> io::Result<Vec<IpAddr>>,
-    ) -> Result<Option<Self>, String> {
+    ) -> Result<Self, String> {
         let mut entries = Vec::new();
         for entry in value.split(',') {
             let entry = entry.trim();
@@ -95,10 +95,11 @@ impl TrustedProxies {
             }
         }
 
-        Ok(Some(Self { entries }))
+        Ok(Self { entries })
     }
 
-    /// Returns whether `address` is one of the named proxies.
+    /// Returns whether `address` is one of the named proxies, counting an
+    /// IPv4-mapped IPv6 address as the IPv4 address it names.
     fn allows(&self, address: IpAddr) -> bool {
         self.entries.iter().any(|entry| entry.contains(address))
     }
@@ -107,7 +108,7 @@ impl TrustedProxies {
 impl Trusted {
     /// Returns whether `address` is inside this range.
     fn contains(&self, address: IpAddr) -> bool {
-        match (self.network, address) {
+        match (canonical(self.network), canonical(address)) {
             (IpAddr::V4(network), IpAddr::V4(address)) => {
                 matches_prefix(&network.octets(), &address.octets(), self.prefix)
             }
@@ -181,6 +182,20 @@ fn parse_entry(
         .collect())
 }
 
+/// Maps an IPv4-mapped IPv6 address to the IPv4 address it names.
+///
+/// A dual-stack listener reports a proxy's IPv4 address in the mapped form,
+/// and an X-Forwarded-For value can spell either form. One peer must land in
+/// one bucket, or the same client would count twice.
+fn canonical(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(address) => address
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(address), IpAddr::V4),
+        IpAddr::V4(address) => IpAddr::V4(address),
+    }
+}
+
 /// Returns whether the first `prefix` bits of two addresses are equal.
 fn matches_prefix(network: &[u8], address: &[u8], prefix: u8) -> bool {
     let whole = usize::from(prefix / 8);
@@ -194,15 +209,18 @@ fn matches_prefix(network: &[u8], address: &[u8], prefix: u8) -> bool {
 /// Returns the client address one request came from.
 ///
 /// A loopback peer is trusted the way it always was; any other peer must be
-/// named. From a trusted peer the Space reads the last forwarded value, so a
-/// proxy that overwrites or normalizes `X-Forwarded-For` names the client. A
+/// named. From a trusted peer the Space reads the last forwarded value: the
+/// proxy must overwrite `X-Forwarded-For`, or write its final value from the
+/// request's TCP peer. The Space cannot tell who wrote a well-formed value, so
+/// a proxy that passes a client-supplied header through defeats this check. A
 /// value that is absent, malformed, loopback, or itself a proxy falls back to
-/// the peer, so a caller never chooses its own address.
+/// the peer.
 pub(crate) fn client_ip(
     peer: IpAddr,
     headers: &HeaderMap,
     trusted: Option<&TrustedProxies>,
 ) -> IpAddr {
+    let peer = canonical(peer);
     if !peer.is_loopback() && !trusted.is_some_and(|trusted| trusted.allows(peer)) {
         return peer;
     }
@@ -224,12 +242,25 @@ pub(crate) fn client_ip(
 /// Returns the last address in one forwarded field, or `None` when it is not
 /// an address. Earlier values are the client's claim, not the proxy's.
 fn forwarded_address(value: &str) -> Option<IpAddr> {
-    let last = value.split(',').next_back()?.trim().trim_matches('"');
-    let last = last
+    let last = value.split(',').next_back()?.trim();
+    // Only a matched pair is a wrapper; one side alone is not an address.
+    let last = if let Some(inner) = last
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        inner
+    } else {
+        last
+    };
+    let last = if let Some(inner) = last
         .strip_prefix('[')
-        .and_then(|last| last.strip_suffix(']'))
-        .unwrap_or(last);
-    last.parse().ok()
+        .and_then(|value| value.strip_suffix(']'))
+    {
+        inner
+    } else {
+        last
+    };
+    last.parse().ok().map(canonical)
 }
 
 #[cfg(test)]
@@ -251,9 +282,7 @@ mod tests {
     }
 
     fn trusted(value: &str) -> TrustedProxies {
-        TrustedProxies::parse_with(value, |_| Ok(vec![ip([192, 0, 2, 9])]))
-            .unwrap()
-            .unwrap()
+        TrustedProxies::parse_with(value, |_| Ok(vec![ip([192, 0, 2, 9])])).unwrap()
     }
 
     #[test]
@@ -262,7 +291,6 @@ mod tests {
             assert_eq!(host, "proxy.internal");
             Ok(vec![ip([192, 0, 2, 9]), ip([198, 51, 100, 4])])
         })
-        .unwrap()
         .unwrap();
         assert!(proxies.allows(ip([127, 0, 0, 1])));
         assert!(proxies.allows(ip([10, 255, 0, 2])));
@@ -270,17 +298,25 @@ mod tests {
         assert!(proxies.allows(ip([192, 0, 2, 9])));
         assert!(proxies.allows(ip([198, 51, 100, 4])));
 
-        let prefix_of_eight = TrustedProxies::parse_with("10.0.0.0/8", |_| unreachable!())
-            .unwrap()
-            .unwrap();
+        let prefix_of_eight = TrustedProxies::parse_with("10.0.0.0/8", |_| unreachable!()).unwrap();
         assert!(prefix_of_eight.allows(ip([10, 1, 2, 3])));
+
+        let everything = TrustedProxies::parse_with("0.0.0.0/0", |_| unreachable!()).unwrap();
+        assert!(everything.allows(ip([192, 0, 2, 1])));
+        assert!(!everything.allows("2001:db8::1".parse().unwrap()));
+
+        let one = TrustedProxies::parse_with("192.0.2.9/32", |_| unreachable!()).unwrap();
+        assert!(one.allows(ip([192, 0, 2, 9])));
+        assert!(!one.allows(ip([192, 0, 2, 8])));
+
+        let one_v6 = TrustedProxies::parse_with("2001:db8::1/128", |_| unreachable!()).unwrap();
+        assert!(one_v6.allows("2001:db8::1".parse().unwrap()));
+        assert!(!one_v6.allows("2001:db8::2".parse().unwrap()));
     }
 
     #[test]
     fn a_prefix_match_uses_only_the_named_bits() {
-        let proxies = TrustedProxies::parse_with("192.0.2.0/25", |_| unreachable!())
-            .unwrap()
-            .unwrap();
+        let proxies = TrustedProxies::parse_with("192.0.2.0/25", |_| unreachable!()).unwrap();
         assert!(proxies.allows(ip([192, 0, 2, 0])));
         assert!(proxies.allows(ip([192, 0, 2, 127])));
         assert!(!proxies.allows(ip([192, 0, 2, 128])));
@@ -290,7 +326,7 @@ mod tests {
     #[test]
     fn an_empty_or_unusable_list_is_refused() {
         let empty = TrustedProxies::parse_with(" , ", |_| unreachable!()).unwrap();
-        assert!(empty.is_some_and(|proxies| proxies.entries.is_empty()));
+        assert!(empty.entries.is_empty());
 
         assert!(
             TrustedProxies::parse_with("10.0.0.0/33", |_| unreachable!())
@@ -341,6 +377,23 @@ mod tests {
         assert_eq!(
             client_ip(ip([10, 0, 0, 1]), &headers("198.51.100.9"), Some(&proxies)),
             ip([198, 51, 100, 9])
+        );
+        // A dual-stack listener reports the same proxy in its mapped form.
+        assert_eq!(
+            client_ip(
+                "::ffff:10.0.0.1".parse().unwrap(),
+                &headers("198.51.100.9"),
+                Some(&proxies)
+            ),
+            ip([198, 51, 100, 9])
+        );
+        assert_eq!(
+            client_ip(
+                "::ffff:127.0.0.1".parse().unwrap(),
+                &headers("203.0.113.7"),
+                None
+            ),
+            ip([203, 0, 113, 7])
         );
         assert_eq!(
             client_ip(ip([10, 0, 0, 2]), &headers("198.51.100.9"), Some(&proxies)),
@@ -416,6 +469,12 @@ mod tests {
             forwarded_address("[2001:db8::1]"),
             Some("2001:db8::1".parse().unwrap())
         );
+        assert_eq!(
+            forwarded_address("::ffff:203.0.113.7"),
+            Some(ip([203, 0, 113, 7]))
+        );
+        assert_eq!(forwarded_address("\"203.0.113.7"), None);
+        assert_eq!(forwarded_address("[2001:db8::1"), None);
         assert_eq!(forwarded_address("garbage"), None);
     }
 }

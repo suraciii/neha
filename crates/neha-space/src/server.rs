@@ -5,7 +5,7 @@
 //! HTTP. The server listens on loopback until a remote Space is configured.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -780,9 +780,7 @@ async fn start_with_workers(
     // opens its record, recovers a run, or issues a ticket.
     let trusted_proxies = TrustedProxies::from_env().map_err(ServerError::TrustedProxies)?;
     let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    if let Ok(address) = bind.parse::<IpAddr>() {
-        refuse_unencrypted_listener(SocketAddr::new(address, port), public_url.as_deref())?;
-    }
+    ensure_listener_allowed(&bind, port, public_url.as_deref())?;
     let mut server =
         SpaceServer::open_with_ui_workers(home, ui, tool_timeout, public_url, worker_config)
             .await?;
@@ -1076,6 +1074,24 @@ fn loopback_host(value: &str) -> bool {
         || host
             .parse::<IpAddr>()
             .is_ok_and(|address| address.is_loopback())
+}
+
+/// Refuses a listener this configuration cannot serve.
+///
+/// The bind address is resolved here, before the caller opens a home or a
+/// record, so a start that would serve plaintext beyond the machine fails
+/// without writing or clearing anything.
+pub fn ensure_listener_allowed(
+    bind: &str,
+    port: u16,
+    public_url: Option<&str>,
+) -> Result<(), ServerError> {
+    let addresses = (bind, port).to_socket_addrs().map_err(ServerError::Io)?;
+    for address in addresses {
+        refuse_unencrypted_listener(address, public_url)?;
+    }
+
+    Ok(())
 }
 
 /// Refuses a listener beyond this machine without a public origin.
@@ -2774,9 +2790,8 @@ async fn computer_pair(
     ConnectInfo(source): ConnectInfo<SocketAddr>,
     Json(request): Json<PairTicketRequest>,
 ) -> Result<Json<PairedComputerBody>, ApiError> {
-    // The ticket belongs to the Space's own machine: this route takes a direct
-    // loopback peer only (B-1 enforces it), so its source is the peer address
-    // and a forwarded header is never read here.
+    // The ticket belongs to the Space's own machine: this route counts its
+    // attempts by the direct TCP peer and never reads a forwarded header.
     if !server.pairs.lock().expect("pair lock").allows(source.ip()) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,

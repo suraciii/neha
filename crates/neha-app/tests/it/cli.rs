@@ -65,7 +65,11 @@ fn serve_without_bwrap(home: &Path) -> (SpaceProcess, String, Option<String>) {
 #[test]
 fn a_listener_beyond_loopback_refuses_to_start_without_a_public_origin() {
     let directory = tempfile::tempdir().unwrap();
-    let output = Command::new(BIN)
+    // A refused start must not open the home: this file would be cleared if it did.
+    let marker = directory.path().join("tmp").join("marker");
+    std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    std::fs::write(&marker, b"keep").unwrap();
+    let mut child = Command::new(BIN)
         .args(["serve", "--port", "0"])
         .env("NEHA_HOME", directory.path())
         .env("XDG_CONFIG_HOME", directory.path().join("xdg"))
@@ -73,10 +77,25 @@ fn a_listener_beyond_loopback_refuses_to_start_without_a_public_origin() {
         .env_remove("NEHA_PUBLIC_URL")
         .env_remove("NEHA_DOMAIN")
         .env_remove("NEHA_TRUSTED_PROXIES")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
 
-    assert!(!output.status.success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                panic!("neha serve did not refuse a plain listener");
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
+    assert!(!status.success());
+    assert!(marker.is_file(), "the refused start opened the Space home");
+    let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("TLS proxy"),

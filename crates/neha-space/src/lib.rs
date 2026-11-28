@@ -37,7 +37,10 @@ pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage
 pub use secrets::{Secrets, SecretsError};
 #[cfg(feature = "test-support")]
 pub use server::start_with_worker_config;
-pub use server::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
+pub use server::{
+    Running, ServerError, SpaceServer, ensure_listener_allowed, start, start_with_ui,
+    start_with_ui_public,
+};
 pub use skills::{SkillDocument, SkillError};
 pub use state::{
     BotView, ChatStatus, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView,
