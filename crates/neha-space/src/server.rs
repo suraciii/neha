@@ -158,10 +158,33 @@ fn migrate_legacy_hosted_workspaces(
     }
 
     let legacy_root = home.root().join("computers");
-    let computers: Vec<Id> = state.computers.keys().copied().collect();
+    // Only a real directory under the home is ours to move. A symlinked
+    // `computers` or `<computer>` directory could redirect the rename.
+    if std::fs::symlink_metadata(&legacy_root)
+        .map(|metadata| metadata.file_type().is_symlink() || !metadata.is_dir())
+        .unwrap_or(true)
+    {
+        return Ok(());
+    }
+    let home_root = std::fs::canonicalize(home.root())?;
+    let computers: Vec<Id> = state
+        .computers
+        .values()
+        .filter(|computer| computer.kind == "hosted")
+        .map(|computer| computer.id)
+        .collect();
     for computer in computers {
         let legacy = legacy_root.join(computer.to_string()).join("workspace");
-        if !legacy.is_dir() {
+        let Ok(metadata) = std::fs::symlink_metadata(&legacy) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let Ok(real_legacy) = std::fs::canonicalize(&legacy) else {
+            continue;
+        };
+        if !real_legacy.starts_with(&home_root) {
             continue;
         }
         let bots: Vec<Id> = state
@@ -176,11 +199,15 @@ fn migrate_legacy_hosted_workspaces(
             continue;
         }
         let target = home.bot_workspace_dir(computer, bots[0]);
-        if target.exists() {
+        if std::fs::symlink_metadata(&target).is_ok() {
             continue;
         }
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
+            let real_parent = std::fs::canonicalize(parent)?;
+            if !real_parent.starts_with(&home_root) {
+                continue;
+            }
         }
         std::fs::rename(&legacy, &target)?;
         if let Some(parent) = legacy.parent() {
@@ -188,7 +215,9 @@ fn migrate_legacy_hosted_workspaces(
         }
     }
 
-    if legacy_root.is_dir()
+    if std::fs::symlink_metadata(&legacy_root)
+        .map(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
+        .unwrap_or(false)
         && std::fs::read_dir(&legacy_root)
             .map(|mut entries| entries.next().is_none())
             .unwrap_or(false)

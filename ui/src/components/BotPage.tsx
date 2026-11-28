@@ -81,10 +81,11 @@ function sharingOf(computer: Computer): string {
     : t("computer.sharing.shared");
 }
 
-// Two Computers can share a default name, so a move target always carries a
-// short id the User can tell apart.
-function targetLabel(computer: Computer): string {
-  return `${computer.name} · ${computer.id.slice(0, 8)}`;
+// Two Computers can share a default name. Only then does the target carry its
+// full id, which is unique; a unique name stays as it is.
+function targetLabel(computer: Computer, targets: Computer[]): string {
+  const sameName = targets.filter((known) => known.name === computer.name).length;
+  return sameName > 1 ? `${computer.name} · ${computer.id}` : computer.name;
 }
 
 function draftOf(bot: Bot | null, models: Model[]): Draft {
@@ -419,7 +420,9 @@ export default function BotPage(props: BotPageProps) {
                     >
                       <option value="">{t("bot.computer.move.choose")}</option>
                       <For each={targets()}>
-                        {(target) => <option value={target.id}>{targetLabel(target)}</option>}
+                        {(target) => (
+                          <option value={target.id}>{targetLabel(target, targets())}</option>
+                        )}
                       </For>
                     </select>
                     <button

@@ -322,6 +322,16 @@ describe("App management", () => {
     await waitFor(() => expect(space.resets).toEqual(["p1"]));
   });
 
+  it("distinguishes two move targets with the same name", async () => {
+    space.otherComputer.name = "Twin";
+    space.hostedComputer.name = "Twin";
+    const view = await openBots();
+    const target = field<HTMLSelectElement>(view, "move_target");
+    const labels = Array.from(target.options).map((option) => option.textContent ?? "");
+    expect(labels[1]).toBe(`Twin · ${space.otherComputer.id}`);
+    expect(labels[2]).toBe(`Twin · ${space.hostedComputer.id}`);
+  });
+
   it("moves a Bot to another Computer", async () => {
     const view = await openBots();
     // The page names the Computer by its name, and says who may use it.
@@ -332,11 +342,11 @@ describe("App management", () => {
     // a Bot may move between Hosted and Local Computers in either direction.
     const target = field<HTMLSelectElement>(view, "move_target");
     expect(target.options).toHaveLength(3);
-    const targetLabels = Array.from(target.options).map((option) => option.textContent ?? "");
-    expect(targetLabels).toHaveLength(3);
-    expect(targetLabels[0]).toBe("Choose a Computer");
-    expect(targetLabels[1]).toMatch(/^Laptop · /);
-    expect(targetLabels[2]).toMatch(/^Space Computer · /);
+    expect(Array.from(target.options).map((option) => option.textContent)).toEqual([
+      "Choose a Computer",
+      "Laptop",
+      "Space Computer",
+    ]);
 
     choose(view, "move_target", "p9");
     press(view, "Move to another Computer");

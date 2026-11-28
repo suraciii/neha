@@ -915,6 +915,15 @@ impl Projection for State {
                 }
             }
             EventData::BotCreated(data) => {
+                let computer = self
+                    .computers
+                    .get(&data.computer)
+                    .ok_or("a Bot is created on an existing Computer")?;
+                if computer.sharing == ComputerSharing::Exclusive
+                    && self.bots.values().any(|bot| bot.computer == data.computer)
+                {
+                    return Err("an exclusive Computer cannot hold more than one Bot".to_owned());
+                }
                 self.bots.insert(
                     data.bot,
                     BotView {
@@ -3590,12 +3599,12 @@ mod tests {
     }
 
     #[test]
-    fn an_exclusive_update_with_two_bots_is_refused_on_replay() {
+    fn a_second_bot_on_an_exclusive_computer_is_refused_on_replay() {
         let owner = Id::new();
         let (computer, first, second) = (Id::new(), Id::new(), Id::new());
         let mut state = State::default();
         bot_chat(&mut state, owner, first, Id::new(), computer);
-        state
+        let error = state
             .apply(&event(
                 EventKind::BotCreated,
                 Author::User(owner),
@@ -3608,13 +3617,46 @@ mod tests {
                 }),
                 4,
             ))
+            .unwrap_err();
+        assert_eq!(error, "an exclusive Computer cannot hold more than one Bot");
+    }
+
+    #[test]
+    fn an_exclusive_update_with_two_bots_is_refused_on_replay() {
+        let owner = Id::new();
+        let (computer, first, second) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, first, Id::new(), computer);
+        // The old Hosted Computer starts exclusive; make it shared before a
+        // second Bot can join, then try to take sharing back.
+        state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(owner),
+                serde_json::json!({"computer": computer, "sharing": "shared"}),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::BotCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": second,
+                    "owner": owner,
+                    "name": "Other",
+                    "computer": computer,
+                    "chat": Id::new(),
+                }),
+                5,
+            ))
             .unwrap();
         let error = state
             .apply(&event(
                 EventKind::ComputerUpdated,
                 Author::User(owner),
                 serde_json::json!({"computer": computer, "sharing": "exclusive"}),
-                5,
+                6,
             ))
             .unwrap_err();
         assert_eq!(error, "an exclusive Computer cannot hold more than one Bot");

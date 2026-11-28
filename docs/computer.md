@@ -119,7 +119,7 @@ target/debug/neha computer create --name staging
 target/debug/neha computer create --name team --shared
 ```
 
-A new Hosted Computer is exclusive unless `--shared` says otherwise, so it accepts one Bot. `neha computer update <computer-id> --shared` makes an exclusive Computer shared, and `--exclusive` keeps it to one Bot; the change to exclusive is refused while more than one Bot uses it. The Space Computer stays shared, and a Local Computer is always shared.
+A new Hosted Computer is exclusive unless `--shared` says otherwise, so it accepts one Bot; `--exclusive` names that default explicitly. `neha computer update <computer-id> --shared` makes an exclusive Computer shared, and `--exclusive` keeps it to one Bot; the change to exclusive is refused while more than one Bot uses it. The Space Computer stays shared, and a Local Computer is always shared.
 
 Its shell runs in a `bubblewrap` sandbox built from an empty root, with the machine's system directories mounted read-only.
 
@@ -225,7 +225,7 @@ The machine ends the command it was running when the channel drops, so no action
 | A read reports the path is hidden from this Computer | The path is inside the Computer's configuration directory, which granted mode hides from Bots. A Bot with full access reads it; turn full access off to hide it again. |
 | A Bot's folder is refused | The daemon reports `it contains a hard link`, `it contains a symlink`, or `it contains a special file`, or `it is a symlink` or `it is not a directory` when the folder itself is the problem, or the folder exceeds its scan limits (about 10,000 entries and 8 levels deep). Delete those entries from `~/.neha/workspaces/<bot-id>`, or from your `--workspace` folder, then start `computer run` again. |
 | The daemon stops after pairing | `bubblewrap` is missing or cannot start a sandbox. Install it and check the sandbox with `bwrap --ro-bind / / --dev-bind /dev /dev --proc /proc -- /bin/true`. |
-| `bot create` or `computer create` fails because a Hosted Computer cannot start | The Space machine needs a working `bubblewrap`. Install it, or pair this machine and run `neha bot create <name> --computer local`. |
+| `bot create` or `computer create` fails because a Hosted Computer cannot start | The Space machine needs a working `bubblewrap`. Install it; for a Bot, pairing this machine and running `neha bot create <name> --computer local` is the alternative. |
 | A Hosted Bot says it could not start its Computer | `bubblewrap` on the Space machine is missing or broken. Install it and check the sandbox as above; the run fails instead of starting. |
 | `computer reset` reports a run in progress | A queued, running, or waiting run blocks the reset. Wait for the run to end, then run `neha computer reset <computer-id>` again. |
 | A Computer shows offline | The daemon is not running, or it lost the Space. Start it with `neha computer run` and check its terminal. A daemon from another release is refused the same way: restart it with the `neha computer run` of this release. |

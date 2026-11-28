@@ -2116,8 +2116,11 @@ async fn bot_create(
         return Ok(outcome);
     }
     // A new Bot's inherited default Model and thinking level are checked
-    // below; the assignment lock keeps them true through the event and keeps
-    // two creates from making the same Space Computer twice.
+    // below. The approvals lock is the one a default Model change and a
+    // Provider refresh take, so the answer stays true through the event; the
+    // assignment lock then keeps two creates from making the same Space
+    // Computer twice. Nothing takes the assignment lock before this one.
+    let _decisions = context.approvals.lock().await;
     let _assignment = context.computer_assignments.lock().await;
     if let Some(outcome) =
         replay_owned_bot_create(context.store, command_id, &fingerprint, account).await?
