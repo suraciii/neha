@@ -774,14 +774,25 @@ pub struct Startup {
     addr: SocketAddr,
     public_url: Option<String>,
     trusted_proxies: Option<TrustedProxies>,
+    worker_config: Option<crate::workers::WorkerConfig>,
 }
 
 /// Validates the startup configuration and binds its listener.
 ///
 /// Resolve the configuration in one place before the caller opens its home.
 /// A hostname is resolved once here and every address is checked; the bound
-/// address is checked again so a wildcard listener cannot pass by name.
+/// address is checked again so a wildcard listener cannot pass by name. This
+/// is the production entry, so it also reads the deployment's worker
+/// configuration.
 pub async fn prepare_start(port: u16, public_url: Option<String>) -> Result<Startup, ServerError> {
+    prepare_start_with(port, public_url, crate::workers::WorkerConfig::from_env()).await
+}
+
+async fn prepare_start_with(
+    port: u16,
+    public_url: Option<String>,
+    worker_config: Option<crate::workers::WorkerConfig>,
+) -> Result<Startup, ServerError> {
     let public_url = normalize_public_url(public_url)?;
     let trusted_proxies = TrustedProxies::from_env().map_err(ServerError::TrustedProxies)?;
     // A containerized Space listens on its private network so Caddy and its
@@ -825,6 +836,7 @@ pub async fn prepare_start(port: u16, public_url: Option<String>) -> Result<Star
         addr,
         public_url,
         trusted_proxies,
+        worker_config,
     })
 }
 
@@ -834,14 +846,7 @@ pub async fn start_with_ui_prepared(
     ui: Option<PathBuf>,
     startup: Startup,
 ) -> Result<Running, ServerError> {
-    start_prepared(
-        home,
-        ui,
-        neha_computer::local::DEFAULT_TIMEOUT,
-        startup,
-        None,
-    )
-    .await
+    start_prepared(home, ui, neha_computer::local::DEFAULT_TIMEOUT, startup).await
 }
 
 async fn start_with_workers(
@@ -852,13 +857,8 @@ async fn start_with_workers(
     public_url: Option<String>,
     worker_config: Option<crate::workers::WorkerConfig>,
 ) -> Result<Running, ServerError> {
-    if let Some(dir) = &ui
-        && !dir.join("index.html").is_file()
-    {
-        return Err(ServerError::Ui(dir.clone()));
-    }
-    let startup = prepare_start(port, public_url).await?;
-    start_prepared(home, ui, tool_timeout, startup, worker_config).await
+    let startup = prepare_start_with(port, public_url, worker_config).await?;
+    start_prepared(home, ui, tool_timeout, startup).await
 }
 
 async fn start_prepared(
@@ -866,7 +866,6 @@ async fn start_prepared(
     ui: Option<PathBuf>,
     tool_timeout: Duration,
     startup: Startup,
-    worker_config: Option<crate::workers::WorkerConfig>,
 ) -> Result<Running, ServerError> {
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
@@ -878,6 +877,7 @@ async fn start_prepared(
         addr,
         public_url,
         trusted_proxies,
+        worker_config,
     } = startup;
     let mut server =
         SpaceServer::open_with_ui_workers(home, ui, tool_timeout, public_url, worker_config)

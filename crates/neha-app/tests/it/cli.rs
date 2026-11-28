@@ -127,15 +127,116 @@ fn an_unusable_proxy_list_refuses_before_the_home_opens() {
     );
 }
 
+/// Records the Supervisor create request for one Hosted Computer.
+async fn record_worker_request(
+    axum::extract::State(requests): axum::extract::State<Arc<Mutex<Vec<serde_json::Value>>>>,
+    headers: axum::http::HeaderMap,
+    body: String,
+) -> axum::http::StatusCode {
+    requests
+        .lock()
+        .expect("the supervisor probe")
+        .push(serde_json::json!({
+            "path": "/v1/workers",
+            "authorization": headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            "body": serde_json::from_str::<serde_json::Value>(&body)
+                .unwrap_or(serde_json::Value::Null),
+        }));
+    axum::http::StatusCode::OK
+}
+
+/// Starts a fake Supervisor that records every worker create request.
+async fn fake_supervisor() -> (
+    String,
+    Arc<Mutex<Vec<serde_json::Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .route("/v1/workers", post(record_worker_request))
+        .with_state(Arc::clone(&requests));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the fake Supervisor listens");
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (url, requests, task)
+}
+
+/// A Space started from the CLI must use the Supervisor its deployment names.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_computer_asks_the_configured_supervisor() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (supervisor_url, requests, supervisor_task) = fake_supervisor().await;
+    let (server, _url, invite) = serve_with_environment(
+        &home,
+        &[
+            ("NEHA_WORKER_SUPERVISOR_URL", supervisor_url.as_str()),
+            ("NEHA_WORKER_SUPERVISOR_TOKEN", "test-supervisor-token"),
+        ],
+    );
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &["computer", "create", "--name", "Build Box"],
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if !requests.lock().expect("the supervisor probe").is_empty() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            panic!("the Space never asked the Supervisor named by its environment");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let request = requests.lock().expect("the supervisor probe").remove(0);
+    assert_eq!(request["path"], "/v1/workers");
+    assert_eq!(request["authorization"], "Bearer test-supervisor-token");
+    assert!(
+        request["body"]["computer"].is_string(),
+        "the create request names no Computer: {request}"
+    );
+    drop(server);
+    supervisor_task.abort();
+}
+
+/// Starts `neha serve` with one loopback port and extra environment.
+fn serve_with_environment(
+    home: &Path,
+    environment: &[(&str, &str)],
+) -> (SpaceProcess, String, Option<String>) {
+    serve_on_with_environment(home, 0, None, environment)
+}
+
 /// Starts `neha serve` on one loopback port with an optional `PATH` override.
 fn serve_on_with(
     home: &Path,
     port: u16,
     path: Option<&std::ffi::OsStr>,
 ) -> (SpaceProcess, String, Option<String>) {
+    serve_on_with_environment(home, port, path, &[])
+}
+
+fn serve_on_with_environment(
+    home: &Path,
+    port: u16,
+    path: Option<&std::ffi::OsStr>,
+    environment: &[(&str, &str)],
+) -> (SpaceProcess, String, Option<String>) {
     let mut failures = String::new();
     for attempt in 1..=3 {
-        match serve_once(home, port, path) {
+        match serve_once(home, port, path, environment) {
             Ok(space) => return space,
             Err(error) => {
                 eprintln!("neha serve failed on start {attempt}:\n{error}");
@@ -160,6 +261,7 @@ fn serve_once(
     home: &Path,
     port: u16,
     path: Option<&std::ffi::OsStr>,
+    environment: &[(&str, &str)],
 ) -> Result<(SpaceProcess, String, Option<String>), String> {
     let mut command = Command::new(BIN);
     command
@@ -168,8 +270,16 @@ fn serve_once(
         // The Space writes its one-use pairing ticket into the per-user
         // configuration directory; keep that inside the fixture.
         .env("XDG_CONFIG_HOME", home.join("xdg"))
+        // A fixture's worker mode is the test's choice, not the host's.
+        .env_remove("NEHA_WORKER_SUPERVISOR_URL")
+        .env_remove("NEHA_WORKER_SUPERVISOR_TOKEN")
+        .env_remove("NEHA_WORKER_ALWAYS_ON")
+        .env_remove("NEHA_WORKER_IDLE_SECONDS")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
     // Keep the Space from finding the fixture's bubblewrap when a test asks
     // for a machine that cannot provide Hosted.
     if let Some(path) = path {

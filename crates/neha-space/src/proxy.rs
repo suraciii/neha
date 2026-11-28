@@ -167,7 +167,7 @@ fn parse_entry(
             return Err(format!("{entry} has a prefix longer than {maximum}"));
         }
         return Ok(vec![Trusted {
-            network: address,
+            network: masked(address, prefix),
             prefix,
         }]);
     }
@@ -218,6 +218,28 @@ fn canonical(address: IpAddr) -> IpAddr {
             .to_ipv4_mapped()
             .map_or(IpAddr::V6(address), IpAddr::V4),
         IpAddr::V4(address) => IpAddr::V4(address),
+    }
+}
+
+/// Zeroes the host bits of an address, so a range names one network.
+fn masked(address: IpAddr, prefix: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let bits = if prefix == 0 {
+                0
+            } else {
+                u32::from(address) & (u32::MAX << (32 - prefix))
+            };
+            IpAddr::V4(bits.into())
+        }
+        IpAddr::V6(address) => {
+            let bits = if prefix == 0 {
+                0
+            } else {
+                u128::from(address) & (u128::MAX << (128 - prefix))
+            };
+            IpAddr::V6(bits.into())
+        }
     }
 }
 
@@ -350,6 +372,17 @@ mod tests {
         assert!(mapped_range.allows(ip([10, 0, 0, 1])));
         assert!(mapped_range.allows(ip([10, 255, 255, 254])));
         assert!(!mapped_range.allows(ip([11, 0, 0, 1])));
+
+        // Host bits outside the prefix name the same network: ::ffff:0:0/80
+        // is ::/80, so both must agree about an IPv4 peer and an IPv6 one.
+        let mapped_wide = TrustedProxies::parse_with("::ffff:0:0/80", |_| unreachable!()).unwrap();
+        let plain_wide = TrustedProxies::parse_with("::/80", |_| unreachable!()).unwrap();
+        assert_eq!(
+            mapped_wide.allows(ip([10, 0, 0, 1])),
+            plain_wide.allows(ip([10, 0, 0, 1]))
+        );
+        assert!(mapped_wide.allows("::1".parse().unwrap()));
+        assert!(plain_wide.allows("::1".parse().unwrap()));
     }
 
     #[test]
