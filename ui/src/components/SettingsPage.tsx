@@ -50,6 +50,8 @@ interface SettingsPageProps {
   onShare: (computer: string) => Promise<boolean>;
   // Clears a Hosted Computer's Workspace, once the Admin confirms it.
   onReset: (computer: string) => Promise<boolean>;
+  // Adds a Local Computer whose machine printed a pairing code.
+  onAdd: (code: string) => Promise<boolean>;
   // Opens one Bot's page from a Computer that has Bots on it.
   onOpenBot: (bot: Bot) => void;
   onConnect: (input: {
@@ -243,6 +245,9 @@ export default function SettingsPage(props: SettingsPageProps) {
   // exclusive, like the CLI's default, and can be made shared in the list.
   const [computerName, setComputerName] = createSignal("");
   const [computerSharing, setComputerSharing] = createSignal<Computer["sharing"]>("exclusive");
+  // The code a machine on another machine showed. It is entered on any
+  // signed-in client, which approves and records that machine.
+  const [pairingCode, setPairingCode] = createSignal("");
 
   async function createComputer() {
     const name = computerName().trim();
@@ -261,6 +266,16 @@ export default function SettingsPage(props: SettingsPageProps) {
     if (props.busy) return;
     setNote(null);
     if (await props.onShare(computer)) setNote(t("settings.computers.share.done"));
+  }
+
+  async function addComputer() {
+    const code = pairingCode().trim();
+    if (code === "" || props.busy) return;
+    setNote(null);
+    if (await props.onAdd(code)) {
+      setPairingCode("");
+      setNote(t("settings.computers.add.done"));
+    }
   }
 
   async function reset(computer: string) {
@@ -724,6 +739,44 @@ export default function SettingsPage(props: SettingsPageProps) {
                   </button>
                 </div>
                 <span class="field__hint">{t("settings.computers.create.hint")}</span>
+              </form>
+
+              <form
+                class="panel__form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void addComputer();
+                }}
+              >
+                <h3 class="panel__subtitle">{t("settings.computers.add.title")}</h3>
+                <p class="panel__note">{t("settings.computers.add.hint")}</p>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field__label">{t("settings.computers.add.code")}</span>
+                    <input
+                      class="input mono"
+                      name="pairing_code"
+                      autocomplete="off"
+                      spellcheck={false}
+                      maxlength={16}
+                      placeholder={t("settings.computers.add.placeholder")}
+                      value={pairingCode()}
+                      onInput={(event) => setPairingCode(event.currentTarget.value)}
+                    />
+                  </label>
+                </div>
+                <div class="panel__foot panel__foot--end">
+                  <button
+                    class="btn btn--primary"
+                    type="submit"
+                    disabled={props.busy || pairingCode().trim() === ""}
+                  >
+                    {props.busy
+                      ? t("settings.computers.add.adding")
+                      : t("settings.computers.add.action")}
+                    <Icon name="arrow-right" size="sm" />
+                  </button>
+                </div>
               </form>
             </div>
           </section>

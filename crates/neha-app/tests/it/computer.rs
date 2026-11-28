@@ -19,12 +19,14 @@ use neha_app::client::{Credential, SignedIn};
 use neha_app::computer::test_support::{
     TestConfig, TestRuntimes, TestSocket, answer_is_yes, check_saved_origin, check_ticket_space,
     choose_ticket, config, config_directory_from, confirmation_needed, credential_path_from,
-    decode_bytes, default_workspace_from, denied_paths_from, empty_runtimes, encode_bytes,
-    execute_frame, folder_for, found_tickets, hidden_roots_for, legacy_relative_credential_path,
-    load_config, migrate_legacy_credential_for, normalized_space_url, parse_ticket,
-    refuse_older_pairing_from, refuse_workspace, runtimes_all_full_access, runtimes_is_empty,
-    runtimes_len, runtimes_with, same_origin, saved_session_url, serve_channel, socket_url,
-    standard_config_directory, write_receipt,
+    decode_bytes, default_workspace_from, denied_paths_from, display_pairing_code, empty_runtimes,
+    encode_bytes, execute_frame, folder_for, found_tickets, hidden_roots_for,
+    is_loopback_space_url, legacy_relative_credential_path, load_config, local_session_origin,
+    machine_name, migrate_legacy_credential_for, normalized_any_space_url, normalized_space_url,
+    parse_ticket, refuse_older_pairing_from, refuse_workspace, refused_by_proxy,
+    refused_credential, runtimes_all_full_access, runtimes_is_empty, runtimes_len, runtimes_with,
+    same_origin, saved_session_origin, serve_channel, socket_url, standard_config_directory,
+    write_receipt,
 };
 
 /// One saved pairing that names a fixed Computer.
@@ -217,21 +219,98 @@ fn session_at(url: &str) -> Credential {
 }
 
 #[test]
-fn a_saved_session_url_must_be_a_space_this_machine_can_pair_with() {
-    assert_eq!(saved_session_url(None).unwrap(), None);
+fn a_saved_session_can_name_a_remote_https_space() {
+    assert_eq!(saved_session_origin(None).unwrap(), None);
     assert_eq!(
-        saved_session_url(Some(&session_at("http://127.0.0.1:7337/"))).unwrap(),
+        saved_session_origin(Some(&session_at("http://127.0.0.1:7337/"))).unwrap(),
         Some("http://127.0.0.1:7337".to_owned())
     );
-    // A stale or edited file that names another host is an error, never a
-    // URL to send the session's bearer token to.
-    let error = saved_session_url(Some(&session_at("http://192.0.2.1:7337")))
+    assert_eq!(
+        saved_session_origin(Some(&session_at("https://space.example.com/"))).unwrap(),
+        Some("https://space.example.com".to_owned())
+    );
+
+    // A remote Space must use https: the session's bearer token crosses the
+    // network on the ticket fallback.
+    let error = saved_session_origin(Some(&session_at("http://192.0.2.1:7337")))
         .unwrap_err()
         .to_string();
-    assert!(
-        error.contains("127.0.0.1") || error.contains("this machine"),
-        "{error}"
+    assert!(error.contains("https"), "{error}");
+
+    // The local-ticket path only uses a session that names this machine.
+    assert_eq!(
+        local_session_origin(Some("http://127.0.0.1:7337")),
+        Some("http://127.0.0.1:7337".to_owned())
     );
+    assert_eq!(
+        local_session_origin(Some("https://space.example.com")),
+        None
+    );
+}
+
+#[test]
+fn a_remote_space_origin_must_be_https_and_an_origin() {
+    assert_eq!(
+        normalized_any_space_url("https://space.example.com/").unwrap(),
+        "https://space.example.com"
+    );
+    assert!(is_loopback_space_url("http://127.0.0.1:7337"));
+    assert!(!is_loopback_space_url("https://space.example.com"));
+
+    // A remote Space carries a pairing token and then a daemon credential;
+    // plaintext is refused.
+    let error = normalized_any_space_url("http://space.example.com")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("https"), "{error}");
+    // Credentials or a path in the origin would send secrets somewhere else.
+    for value in [
+        "https://user:secret@space.example.com",
+        "https://space.example.com/somewhere",
+        "https://space.example.com?query",
+    ] {
+        assert!(
+            normalized_any_space_url(value).is_err(),
+            "{value} must be refused"
+        );
+    }
+}
+
+#[test]
+fn a_refused_credential_ends_the_retry_loop() {
+    use tokio_tungstenite::tungstenite;
+
+    let refused = |status| {
+        let response = tungstenite::http::Response::builder()
+            .status(status)
+            .body(None)
+            .unwrap();
+        anyhow::Error::new(tungstenite::Error::Http(Box::new(response)))
+            .context("the upgrade failed")
+    };
+    // Both a dead credential and a proxy/Host policy refusal are fatal; the
+    // diagnostic differs, but neither should be retried forever.
+    assert!(refused_credential(&refused(401)));
+    assert!(refused_credential(&refused(403)));
+    assert!(refused_by_proxy(&refused(403)));
+    assert!(!refused_by_proxy(&refused(401)));
+    assert!(!refused_credential(&refused(502)));
+    assert!(!refused_credential(&anyhow::anyhow!(
+        "the Space could not be reached"
+    )));
+}
+
+#[test]
+fn a_pairing_code_is_shown_with_one_dash() {
+    assert_eq!(display_pairing_code("ABCDEFGH"), "ABCD-EFGH");
+    assert_eq!(display_pairing_code("SHORT"), "SHORT");
+    // A malformed answer must not split inside a multi-byte character.
+    assert_eq!(
+        display_pairing_code("あいうえおかきく"),
+        "あいうえ-おかきく"
+    );
+    assert_eq!(display_pairing_code("éééééééé"), "éééé-éééé");
+    assert!(!machine_name().is_empty());
 }
 
 #[test]
@@ -1079,6 +1158,7 @@ async fn a_lost_channel_cancels_the_running_action() {
         // granted folders nor a run directory nor full access.
         supports_grants: Some(!cfg!(windows)),
         supports_full_access: Some(!cfg!(windows)),
+        origin: None,
     };
     socket
         .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
@@ -1209,6 +1289,7 @@ async fn connect_daemon(address: std::net::SocketAddr, workspace: &Path) -> Test
         sandbox: true,
         supports_grants: Some(true),
         supports_full_access: Some(true),
+        origin: None,
     };
     socket
         .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))

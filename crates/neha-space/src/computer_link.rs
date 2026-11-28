@@ -326,6 +326,8 @@ pub struct ComputerLinks {
     /// connection, and a Bot update while it is offline still must not widen
     /// access the machine cannot serve.
     access: Mutex<HashMap<Id, AccessCapabilities>>,
+    /// The origin each connected Local Computer reaches the Space through.
+    origins: Mutex<HashMap<Id, String>>,
     /// The Space-wide request counter; every request on every channel uses it.
     next_id: Arc<AtomicU64>,
 }
@@ -344,6 +346,7 @@ impl ComputerLinks {
             links: Mutex::new(HashMap::new()),
             hosted_workers: false,
             access: Mutex::new(HashMap::new()),
+            origins: Mutex::new(HashMap::new()),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -392,6 +395,16 @@ impl ComputerLinks {
             .copied()
     }
 
+    /// Returns the origin the Computer's daemon reaches the Space through.
+    #[must_use]
+    pub fn origin(&self, computer: Id) -> Option<String> {
+        self.origins
+            .lock()
+            .expect("computer origins lock")
+            .get(&computer)
+            .cloned()
+    }
+
     /// Registers a Computer's new channel, replacing one that still lingers.
     pub fn connect(
         &self,
@@ -399,10 +412,35 @@ impl ComputerLinks {
         frames: mpsc::Sender<HostFrame>,
         access: AccessCapabilities,
     ) -> Arc<ComputerLink> {
+        self.connect_with_origin(computer, frames, access, None)
+    }
+
+    /// Registers a Computer's new channel and the origin it reaches.
+    pub fn connect_with_origin(
+        &self,
+        computer: Id,
+        frames: mpsc::Sender<HostFrame>,
+        access: AccessCapabilities,
+        origin: Option<String>,
+    ) -> Arc<ComputerLink> {
         self.access
             .lock()
             .expect("computer access lock")
             .insert(computer, access);
+        match origin {
+            Some(origin) => {
+                self.origins
+                    .lock()
+                    .expect("computer origins lock")
+                    .insert(computer, origin);
+            }
+            None => {
+                self.origins
+                    .lock()
+                    .expect("computer origins lock")
+                    .remove(&computer);
+            }
+        }
         let link = Arc::new(ComputerLink::new(computer, frames));
         let replaced = self
             .links

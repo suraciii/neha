@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,6 +31,7 @@ use neha_computer::{
     ActionStatus, CHANNEL_VERSION, ComputerRuntime as _, DeviceFrame, HostFrame, LocalRuntime,
     MAX_CHANNEL_FRAME_BYTES, ToolOutput,
 };
+use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
@@ -59,7 +60,14 @@ struct RuntimeKey {
 type Runtimes = Arc<Mutex<HashMap<RuntimeKey, Arc<LocalRuntime>>>>;
 
 /// How long the daemon waits before it reconnects to its Space.
-const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// The first retry delay after a channel that never acknowledged.
+const RECONNECT_MIN: Duration = Duration::from_secs(1);
+
+/// The longest retry delay; a Space that stays away is retried at this pace.
+const RECONNECT_MAX: Duration = Duration::from_secs(60);
+
+/// How long a daemon waits for the Space to acknowledge its greeting.
+const HELLO_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a cancelled action may take to end before its task is dropped.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 /// How many frames may wait in one direction of one channel.
@@ -126,8 +134,10 @@ impl Config {
 
     /// Reads the identity, token, origin, and mount a worker container gets.
     fn from_worker_env() -> Result<Self> {
-        let space_url =
-            std::env::var("NEHA_WORKER_SPACE_URL").context("NEHA_WORKER_SPACE_URL is not set")?;
+        let space_url = normalized_worker_url(
+            &std::env::var("NEHA_WORKER_SPACE_URL").context("NEHA_WORKER_SPACE_URL is not set")?,
+        )
+        .context("NEHA_WORKER_SPACE_URL is not usable")?;
         let computer =
             std::env::var("NEHA_WORKER_COMPUTER").context("NEHA_WORKER_COMPUTER is not set")?;
         let token = std::env::var("NEHA_WORKER_TOKEN").context("NEHA_WORKER_TOKEN is not set")?;
@@ -185,10 +195,35 @@ pub async fn pair(
     };
     refuse_workspace(&config_directory, &workspace)?;
 
+    // The explicit Space decides the flow before any ticket is read or any
+    // request is made: a Space on another machine pairs through a code, while
+    // a loopback Space keeps the local ticket.
+    let explicit_space = space.as_deref().map(normalized_any_space_url).transpose()?;
+    let remote_space = explicit_space
+        .clone()
+        .filter(|origin| !is_loopback_space_url(origin));
+    if let Some(remote_space) = remote_space {
+        if ticket_file.is_some() {
+            bail!(
+                "--ticket-file pairs with a Space on this machine; leave it out when \
+                 --space names another machine"
+            );
+        }
+        return pair_remote(
+            remote_space,
+            workspace,
+            &config_directory,
+            default_workspace,
+            yes,
+        )
+        .await;
+    }
+
     // Everything up to the confirmation only reads local files. The User must
     // see the pairing target before any request leaves this machine, and a
     // ticket or session that names a different Space is refused without one.
     let credential = Credential::load().ok();
+    let saved = saved_session_origin(credential.as_ref())?;
     let (ticket, used_ticket_file) = match ticket_file {
         Some(path) => {
             let ticket = read_ticket(&path)?;
@@ -200,14 +235,23 @@ pub async fn pair(
                 .as_deref()
                 .map(found_tickets)
                 .unwrap_or_default();
-            // With several tickets waiting and no --space, the saved session
-            // names the Space to match. With one ticket no match is needed.
-            let target = match space.as_deref() {
+            // With several tickets waiting and no --space, a loopback saved
+            // session names the Space to match. A remote session is not a
+            // local ticket's target.
+            let target = match explicit_space.as_deref() {
                 Some(space) => Some(normalized_space_url(space)?),
                 None if found.len() <= 1 => None,
-                None => Some(saved_session_url(credential.as_ref())?.context(
-                    "several Space tickets are waiting; pass --space or --ticket-file to choose one",
-                )?),
+                None => Some(
+                    saved
+                        .as_deref()
+                        .filter(|url| is_loopback_space_url(url))
+                        .map(normalized_space_url)
+                        .transpose()?
+                        .context(
+                            "several Space tickets are waiting; pass --space or --ticket-file \
+                             to choose one",
+                        )?,
+                ),
             };
             match choose_ticket(found, target.as_deref())? {
                 Some(found) => (found.ticket, Some(found.file)),
@@ -222,28 +266,33 @@ pub async fn pair(
         }
     };
     let (space_url, ticket, needs_ticket) = if used_ticket_file.is_some() {
-        if let (Some(ticket_url), Some(explicit)) = (ticket.url.as_deref(), space.as_deref()) {
+        if let (Some(ticket_url), Some(explicit)) =
+            (ticket.url.as_deref(), explicit_space.as_deref())
+        {
             check_ticket_space(ticket_url, explicit)?;
         }
-        let space_url = match (space.as_deref(), ticket.url.as_deref()) {
+        let space_url = match (explicit_space.as_deref(), ticket.url.as_deref()) {
             (Some(space), _) => normalized_space_url(space)?,
             (None, Some(ticket_url)) => normalized_space_url(ticket_url)?,
-            (None, None) => saved_session_url(credential.as_ref())?
+            (None, None) => local_session_origin(saved.as_deref())
                 .context("pass --space, or pair with a ticket that names its Space")?,
         };
         (space_url, ticket.ticket, false)
     } else {
-        let saved = saved_session_url(credential.as_ref())?;
-        let space_url = match space.as_deref() {
-            Some(space) => normalized_space_url(space)?,
-            None => saved.clone().context(
-                "there is no local pairing ticket; run `neha serve` on this machine, or sign \
-                 in with `neha login`",
-            )?,
-        };
         let saved = saved.context(
-            "there is no local pairing ticket; run `neha serve` on this machine, or sign in \
-             with `neha login`",
+            "there is no local pairing ticket; run `neha serve` on this machine, or sign \
+             in with `neha login`",
+        )?;
+        let space_url = match explicit_space.as_deref() {
+            Some(space) => normalized_space_url(space)?,
+            None if is_loopback_space_url(&saved) => saved.clone(),
+            None => bail!(
+                "there is no local pairing ticket; pass --space {saved} to pair this machine \
+                 with that Space"
+            ),
+        };
+        let saved = local_session_origin(Some(&saved)).context(
+            "the saved session belongs to another Space; pass --space with this machine's Space",
         )?;
         // The fallback asks the Space this session belongs to for a ticket;
         // sending the session's token anywhere else is refused.
@@ -309,12 +358,134 @@ pub async fn pair(
     Ok(())
 }
 
+/// Pairs this machine with a Space reached over the network.
+///
+/// The machine starts a pairing and prints a code; a signed-in User approves
+/// it on any client, and this machine polls until the Space records its
+/// Computer. No local ticket, saved session, or loopback address is involved.
+async fn pair_remote(
+    space_url: String,
+    workspace: PathBuf,
+    config_directory: &Path,
+    default_workspace: bool,
+    yes: bool,
+) -> Result<()> {
+    if !confirm_pairing(&space_url, yes)? {
+        println!("Pairing cancelled.");
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&workspace)
+        .with_context(|| format!("cannot create {}", workspace.display()))?;
+    if default_workspace {
+        client::restrict(&workspace, 0o700)?;
+    }
+    let workspace = std::fs::canonicalize(&workspace)
+        .with_context(|| format!("cannot resolve {}", workspace.display()))?;
+    refuse_workspace(config_directory, &workspace)?;
+    let workspace_text = workspace
+        .to_str()
+        .context("the Workspace path is not valid UTF-8; pairing needs a text path")?;
+
+    let machine = machine_name();
+    let token = random_secret();
+    let poll_secret = random_secret();
+    let started = client::start_pairing(&space_url, &machine, workspace_text, &token, &poll_secret)
+        .await
+        .with_context(|| format!("cannot start pairing with the Space at {space_url}"))?;
+    println!(
+        "To pair this Computer, sign in to {space_url} and enter code {} (expires in {} minutes).",
+        display_pairing_code(&started.code),
+        started.expires_in.div_ceil(60)
+    );
+    println!("Waiting for approval...");
+
+    let computer = wait_for_remote_approval(&space_url, &started, &poll_secret)
+        .await
+        .with_context(|| format!("cannot poll the pairing at {space_url}"))?;
+    let config = Config {
+        space_url: space_url.clone(),
+        computer,
+        token,
+        workspace,
+    };
+    config.save_to(&config_path()?)?;
+    println!(
+        "Paired Computer {} with {}.",
+        config.computer, config.space_url
+    );
+
+    Ok(())
+}
+
+/// Waits for a User to approve one remote pairing.
+///
+/// A poll that fails for a reason other than the Space forgetting the pairing
+/// is retried: the machine has not saved its token yet, so giving up after one
+/// connection reset could leave an approved Computer on the Space that this
+/// machine can never serve. Every request and sleep shares one deadline.
+async fn wait_for_remote_approval(
+    space_url: &str,
+    started: &client::StartedPairing,
+    poll_secret: &str,
+) -> Result<String> {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(started.expires_in))
+        .context("the Space announced an unusable pairing lifetime")?;
+    let interval = Duration::from_secs(started.interval);
+    let mut retry = Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "the pairing code expired before a User approved it; run \
+                 `neha computer pair --space {space_url}` again"
+            );
+        }
+        let outcome = tokio::time::timeout(
+            remaining.min(Duration::from_secs(30)),
+            client::poll_pairing(space_url, &started.device, poll_secret),
+        )
+        .await;
+        let wait = match outcome {
+            Ok(Ok(client::PairingPoll::Pending)) => interval,
+            Ok(Ok(client::PairingPoll::Approved { computer })) => return Ok(computer),
+            Ok(Ok(client::PairingPoll::Gone)) => bail!(
+                "the pairing code expired or was replaced before a User approved it; run \
+                 `neha computer pair --space {space_url}` again"
+            ),
+            Ok(Err(error)) => {
+                eprintln!("warning: a pairing poll failed; retrying: {error:#}");
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                wait
+            }
+            Err(_) => {
+                eprintln!("warning: a pairing poll timed out; retrying");
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                wait
+            }
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            continue;
+        }
+        tokio::time::sleep(wait.min(remaining)).await;
+    }
+}
+
 /// Starts the daemon with the saved pairing.
 pub async fn run(workspace: Option<PathBuf>) -> Result<()> {
     // A session credential left in the working directory by the old resolver
     // is a secret a Bot could read; refuse to serve when it cannot be cleaned.
     migrate_legacy_credential()?;
     let mut config = Config::load()?;
+    // The saved origin is printed and sent; canonicalize and validate it
+    // before either, so a stale file cannot put credentials or a query in a
+    // terminal or in the Host header.
+    config.space_url = normalized_any_space_url(&config.space_url)
+        .context("the saved Space URL is not usable; run `neha computer pair` again")?;
     if let Some(workspace) = workspace {
         std::fs::create_dir_all(&workspace)
             .with_context(|| format!("cannot create {}", workspace.display()))?;
@@ -345,13 +516,14 @@ pub async fn worker() -> Result<()> {
 
 /// Serves one Space until Ctrl-C, reconnecting after every failure.
 async fn serve(config: Config, worker: bool) -> Result<()> {
-    // Refuse a saved Space URL this milestone cannot serve before opening
-    // anything: a Local Computer pairs with a loopback Space; a worker must
-    // reach the public origin its Supervisor injected.
+    // Refuse a saved Space URL this build cannot serve before opening
+    // anything: a Local Computer keeps the origin it paired with (loopback or
+    // a remote https Space); a worker must reach the public origin its
+    // Supervisor injected.
     if worker {
         normalized_worker_url(&config.space_url).context("the worker Space URL is not usable")?;
     } else {
-        normalized_space_url(&config.space_url).context("the saved Space URL is not usable")?;
+        normalized_any_space_url(&config.space_url).context("the saved Space URL is not usable")?;
     }
     // A saved pairing from before the default moved may still name a workspace
     // inside the configuration directory; serving it would hand that directory
@@ -373,20 +545,85 @@ async fn serve(config: Config, worker: bool) -> Result<()> {
     // One signal future spans the whole reconnect loop: a stop delivered while
     // a channel is closing must not be lost in the gap between two selects.
     let mut shutdown = std::pin::pin!(shutdown_signal());
+    let mut retry = RECONNECT_MIN;
     loop {
-        tokio::select! {
+        let acknowledged = Arc::new(AtomicBool::new(false));
+        let served = tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            served = connect_and_serve(&config, &hidden, &denied, worker, Arc::clone(&runtimes)) => {
-                if let Err(error) = served {
-                    eprintln!("{error:#}");
+            served = connect_and_serve(
+                &config,
+                &hidden,
+                &denied,
+                worker,
+                Arc::clone(&runtimes),
+                &acknowledged,
+            ) => served,
+        };
+        if let Err(error) = served {
+            eprintln!("{error:#}");
+            // A Space that rejected this machine's credential will keep
+            // rejecting it until the machine pairs again; retrying forever
+            // would hide that from the User.
+            if refused_credential(&error) {
+                if refused_by_proxy(&error) {
+                    eprintln!(
+                        "a proxy refused the channel's Host (403); check that the Space's public origin and the proxy's Host header agree, or run `neha computer pair --space {}` again",
+                        config.space_url
+                    );
+                } else {
+                    eprintln!(
+                        "this Computer's saved pairing was refused; run `neha computer pair --space {}` again",
+                        config.space_url
+                    );
                 }
+                return Err(error);
             }
         }
+        if acknowledged.load(Ordering::Relaxed) {
+            retry = RECONNECT_MIN;
+        }
+        let delay = retry + Duration::from_millis(rand::rng().random_range(0..250));
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            () = tokio::time::sleep(RECONNECT_DELAY) => {}
+            () = tokio::time::sleep(delay) => {}
         }
+        retry = (retry * 2).min(RECONNECT_MAX);
     }
+}
+
+/// Returns whether the Space refused the Computer's credential.
+///
+/// The WebSocket upgrade carries the Computer token, so the refusal arrives as
+/// an HTTP status: retrying it cannot succeed, while a proxy or Host problem
+/// may be fixed without pairing again.
+fn refused_credential(error: &anyhow::Error) -> bool {
+    matches!(
+        http_status(error),
+        Some(
+            tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED
+                | tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN
+        )
+    )
+}
+
+/// Returns whether a proxy refused the upgrade before it reached the Space.
+///
+/// A 403 is a policy answer: the Host may disagree with the public origin, or
+/// a proxy may deny the path. It is still fatal, because retrying a policy
+/// refusal indefinitely hides the misconfiguration, but its diagnostic names
+/// the Host/proxy check rather than a dead credential.
+fn refused_by_proxy(error: &anyhow::Error) -> bool {
+    http_status(error) == Some(tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN)
+}
+
+/// Returns the HTTP status a WebSocket upgrade answered with, if any.
+fn http_status(error: &anyhow::Error) -> Option<tokio_tungstenite::tungstenite::http::StatusCode> {
+    error.chain().find_map(|cause| {
+        match cause.downcast_ref::<tokio_tungstenite::tungstenite::Error>() {
+            Some(tokio_tungstenite::tungstenite::Error::Http(response)) => Some(response.status()),
+            _ => None,
+        }
+    })
 }
 
 /// Refuses a machine whose commands bubblewrap cannot fence.
@@ -435,6 +672,7 @@ async fn connect_and_serve(
     denied: &[PathBuf],
     worker: bool,
     runtimes: Runtimes,
+    acknowledged: &AtomicBool,
 ) -> Result<()> {
     // A reconnect starts with fresh runtimes: descriptors opened for an older
     // channel must not outlive it or serve a different access choice.
@@ -490,12 +728,52 @@ async fn connect_and_serve(
             // granted folders or full access either way.
             supports_grants: Some(!worker && !cfg!(windows)),
             supports_full_access: Some(!worker && !cfg!(windows)),
+            // A worker reaches the Space on a private deployment address and
+            // keeps the deployment variable for its Bot environment; a Local
+            // Computer reports the origin it actually serves.
+            origin: (!worker).then(|| config.space_url.clone()),
         },
     )
     .await?;
+    // The greeting is not a connection until the Space says it accepted it:
+    // an old Space, a proxy answering for it, or a Space that registered a
+    // different Computer must not reset the retry pace.
+    wait_for_welcome(&mut socket).await?;
+    acknowledged.store(true, Ordering::Relaxed);
     println!("Connected to {}.", config.space_url);
 
     serve_channel(config, hidden, denied, worker, socket, runtimes).await
+}
+
+/// Waits for the Space's acknowledgement, ignoring heartbeats.
+///
+/// One deadline covers the whole greeting: a Space that only sends heartbeats
+/// cannot keep a daemon waiting forever.
+async fn wait_for_welcome(socket: &mut Socket) -> Result<()> {
+    let deadline = std::time::Instant::now() + HELLO_ACK_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!("the Space did not acknowledge the greeting");
+        }
+        let message = tokio::time::timeout(remaining, socket.next())
+            .await
+            .context("the Space did not acknowledge the greeting")?
+            .context("the Space closed the channel during the greeting")?
+            .context("the channel failed during the greeting")?;
+        match message {
+            Message::Text(text) => match serde_json::from_str::<HostFrame>(text.as_str()) {
+                Ok(HostFrame::Welcome) => return Ok(()),
+                Ok(HostFrame::Ping) => continue,
+                Ok(other) => bail!("the Space sent {other:?} before acknowledging the greeting"),
+                Err(error) => bail!("the Space's greeting answer is not a frame: {error}"),
+            },
+            Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {
+                continue;
+            }
+            Message::Close(_) => bail!("the Space closed the channel during the greeting"),
+        }
+    }
 }
 
 /// Serves one open channel: reads frames, runs them one at a time, and kills
@@ -795,6 +1073,9 @@ async fn execute_frame(
 ) -> DeviceFrame {
     match frame {
         HostFrame::Ping => DeviceFrame::Pong,
+        // The greeting was acknowledged before this channel served any
+        // frame; a repeated acknowledgement needs no work.
+        HostFrame::Welcome => DeviceFrame::Pong,
         HostFrame::Action {
             id,
             bot,
@@ -1034,7 +1315,7 @@ async fn send(socket: &mut Socket, frame: &DeviceFrame) -> Result<()> {
 
 /// Returns the WebSocket address of one Space's Computer channel.
 fn socket_url(space_url: &str) -> Result<String> {
-    let base = normalized_space_url(space_url)?;
+    let base = normalized_any_space_url(space_url)?;
     let socket = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
     } else if let Some(rest) = base.strip_prefix("http://") {
@@ -1085,34 +1366,117 @@ fn normalized_worker_url(url: &str) -> Result<String> {
     Ok(url.to_owned())
 }
 
-/// Returns a Space URL without a trailing slash, refusing a non-loopback one.
+/// Returns a Space origin without a trailing slash, refusing a non-loopback one.
 ///
-/// This milestone's Space listens on loopback only. Pairing with anything else
-/// would send this machine's token to a Space this milestone cannot guard, so
-/// the daemon refuses it with a message that names the allowed hosts.
+/// The local ticket and the saved CLI session both describe a Space on this
+/// machine. Sending either to anything else would hand a secret to another
+/// origin, so this path names the allowed hosts.
 fn normalized_space_url(url: &str) -> Result<String> {
-    let url = url.trim().trim_end_matches('/');
-    if url.is_empty() {
-        bail!("the Space URL is empty");
-    }
-    let parsed =
-        reqwest::Url::parse(url).context("the Space URL must be an absolute http(s) URL")?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        bail!("the Space URL must start with http:// or https://");
-    }
+    let parsed = parsed_space_origin(url)?;
     let host = parsed
         .host_str()
-        .context("the Space URL has no host")?
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    if !matches!(host, "127.0.0.1" | "::1" | "localhost") {
+        .map(str::to_owned)
+        .context("the Space URL has no host")?;
+    if !is_loopback_host(&host) {
         bail!(
-            "this milestone pairs only with a Space on this machine: \
+            "this pairing path uses a Space on this machine: \
              the Space URL must use 127.0.0.1, ::1, or localhost, not {host}"
         );
     }
 
-    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// Returns a Space origin, allowing one reached over the network.
+///
+/// A remote Space must use https: the machine sends its pairing token and its
+/// daemon credential there, and only the system's certificate store is trusted.
+fn normalized_any_space_url(url: &str) -> Result<String> {
+    let parsed = parsed_space_origin(url)?;
+    let host = parsed
+        .host_str()
+        .map(str::to_owned)
+        .context("the Space URL has no host")?;
+    if parsed.scheme() == "http" && !is_loopback_host(&host) {
+        bail!("a Space reached over the network must use https, not http");
+    }
+
+    Ok(parsed.origin().ascii_serialization())
+}
+
+/// Parses one Space origin, leaving the scheme's trust rule to the caller.
+fn parsed_space_origin(url: &str) -> Result<reqwest::Url> {
+    let value = url.trim().trim_end_matches('/');
+    if value.is_empty() {
+        bail!("the Space URL is empty");
+    }
+    let parsed =
+        reqwest::Url::parse(value).context("the Space URL must be an absolute http(s) URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("the Space URL must start with http:// or https://");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("the Space URL must not carry credentials");
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!("the Space URL must be an origin with no path, query, or fragment");
+    }
+
+    Ok(parsed)
+}
+
+/// Returns whether a Space origin is the Space on this machine.
+fn is_loopback_space_url(origin: &str) -> bool {
+    reqwest::Url::parse(origin)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .is_some_and(|host| is_loopback_host(&host))
+}
+
+/// Returns whether a host names this machine's loopback.
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    matches!(host, "127.0.0.1" | "::1" | "localhost")
+}
+
+/// Returns the name this machine reports to a remote Space.
+///
+/// The pairing names the Computer in the record, so the User sees the machine
+/// name rather than a generic one. The value is bounded and control-free
+/// because it reaches a terminal and the record.
+fn machine_name() -> String {
+    let name = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_default();
+    let name: String = name
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    let name = name.trim();
+    if name.is_empty() {
+        return "Computer".to_owned();
+    }
+
+    name.chars().take(64).collect()
+}
+
+/// Returns a fresh 32-byte URL-safe base64 secret.
+fn random_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::Rng::fill_bytes(&mut rand::rng(), &mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Shows a pairing code the way a User types it.
+fn display_pairing_code(code: &str) -> String {
+    let mut letters = code.chars();
+    let first: String = letters.by_ref().take(4).collect();
+    let rest: String = letters.collect();
+    if first.chars().count() == 4 && rest.chars().count() == 4 {
+        format!("{first}-{rest}")
+    } else {
+        code.to_owned()
+    }
 }
 
 /// The ticket file a Space writes for this machine.
@@ -1525,15 +1889,23 @@ fn parse_ticket(text: &str) -> Result<Ticket> {
     })
 }
 
-/// Returns the normalized URL of the saved CLI session, when there is one.
+/// Returns the saved CLI session's Space origin, when there is one.
 ///
-/// A saved URL this milestone cannot pair with is an error, never a fallback:
-/// the HTTP ticket route would otherwise send the session's bearer token to
-/// whatever host the stale or edited file names.
-fn saved_session_url(credential: Option<&Credential>) -> Result<Option<String>> {
+/// The saved session may name a remote Space; the caller decides whether the
+/// local-ticket path may use it. A malformed saved URL is an error, never a
+/// fallback: the HTTP ticket route would otherwise send the session's bearer
+/// token to whatever host the stale or edited file names.
+fn saved_session_origin(credential: Option<&Credential>) -> Result<Option<String>> {
     credential
-        .map(|credential| normalized_space_url(&credential.url))
+        .map(|credential| normalized_any_space_url(&credential.url))
         .transpose()
+}
+
+/// Returns the saved session's origin only when it is this machine's Space.
+fn local_session_origin(saved: Option<&str>) -> Option<String> {
+    saved
+        .filter(|origin| is_loopback_space_url(origin))
+        .map(str::to_owned)
 }
 
 /// Refuses a ticket that names a different Space than `--space` does.
@@ -2102,9 +2474,53 @@ pub mod test_support {
         super::normalized_space_url(url)
     }
 
+    /// Returns a Space origin that may be reached over the network.
+    pub fn normalized_any_space_url(url: &str) -> anyhow::Result<String> {
+        super::normalized_any_space_url(url)
+    }
+
+    /// Returns whether an origin names the Space on this machine.
+    pub fn is_loopback_space_url(origin: &str) -> bool {
+        super::is_loopback_space_url(origin)
+    }
+
+    /// Returns the name this machine reports to a Space.
+    pub fn machine_name() -> String {
+        super::machine_name()
+    }
+
+    /// Shows a pairing code the way a User types it.
+    pub fn display_pairing_code(code: &str) -> String {
+        super::display_pairing_code(code)
+    }
+
+    /// Returns whether a channel error means the saved pairing was refused.
+    pub fn refused_credential(error: &anyhow::Error) -> bool {
+        super::refused_credential(error)
+    }
+
+    /// Returns whether a proxy refused the channel's Host.
+    pub fn refused_by_proxy(error: &anyhow::Error) -> bool {
+        super::refused_by_proxy(error)
+    }
+
+    /// Waits for approval of one remote pairing, retrying transient polls.
+    pub async fn wait_for_remote_approval(
+        space_url: &str,
+        started: &crate::client::StartedPairing,
+        poll_secret: &str,
+    ) -> anyhow::Result<String> {
+        super::wait_for_remote_approval(space_url, started, poll_secret).await
+    }
+
     /// The saved session's Space URL, when the session is usable for pairing.
-    pub fn saved_session_url(credential: Option<&Credential>) -> anyhow::Result<Option<String>> {
-        super::saved_session_url(credential)
+    pub fn saved_session_origin(credential: Option<&Credential>) -> anyhow::Result<Option<String>> {
+        super::saved_session_origin(credential)
+    }
+
+    /// Returns a saved session origin only when it is this machine's Space.
+    pub fn local_session_origin(saved: Option<&str>) -> Option<String> {
+        super::local_session_origin(saved)
     }
 
     /// Refuses a ticket that names another Space.

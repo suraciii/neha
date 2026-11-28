@@ -25,7 +25,9 @@ A Hosted Computer depends on [Space](../space/product.md) for the Workspace it k
 
 A Local Computer runs Neha as a persistent process. The process holds one outgoing connection to the Space for control and data, and one more per screen; it listens on no network port.
 
-A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket, pairing code, and the token the machine keeps. A Space-provisioned Hosted Computer worker receives its token from the Space and opens the same channel.
+A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket, pairing code, and the token the machine keeps. A Local Computer reports the Space origin it reaches in its greeting, and the Space gives that origin to the Bot's shell commands.
+
+A Space-provisioned Hosted Computer worker receives its token from the Space and opens the same channel.
 
 The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange. A Hosted Computer runs its actions in an environment the Space provides; a worker-backed or provider-backed Hosted Computer uses the same channel.
 

@@ -7,6 +7,7 @@
 use futures_util::{SinkExt as _, StreamExt as _};
 use neha::surface::{ClientFrame, PROTOCOL_VERSION, ServerFrame};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use neha_space::blobs::test_s3;
@@ -9316,7 +9317,7 @@ use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, WireAction
 use neha_computer::{ActionStatus, ToolOutput};
 
 use neha_space::computer_link::{AccessCapabilities, Answer};
-use neha_space::identity::MAX_PENDING_PAIRINGS;
+use neha_space::identity::{PAIRING_POLL_SECS, PAIRING_TTL_SECS};
 
 use neha_space::test_support::server::MAX_PAIRING_FIELD_BYTES;
 
@@ -9570,6 +9571,17 @@ async fn send_hello_with(
     sandbox: bool,
     access: AccessCapabilities,
 ) {
+    send_hello_with_origin(socket, version, computer, sandbox, access, None).await;
+}
+
+async fn send_hello_with_origin(
+    socket: &mut Socket,
+    version: u32,
+    computer: &str,
+    sandbox: bool,
+    access: AccessCapabilities,
+    origin: Option<String>,
+) {
     let frame = DeviceFrame::Hello {
         version,
         computer: computer.to_owned(),
@@ -9577,6 +9589,7 @@ async fn send_hello_with(
         sandbox,
         supports_grants: Some(access.grants),
         supports_full_access: Some(access.full_access),
+        origin,
     };
     socket
         .send(Message::Text(serde_json::to_string(&frame).unwrap().into()))
@@ -9596,13 +9609,25 @@ async fn connect_computer_with(
     computer: Id,
     access: AccessCapabilities,
 ) -> Socket {
+    connect_computer_with_origin(running, token, computer, access, None).await
+}
+
+/// Connects a fake machine that reports the Space origin it reaches.
+async fn connect_computer_with_origin(
+    running: &Running,
+    token: &str,
+    computer: Id,
+    access: AccessCapabilities,
+    origin: Option<String>,
+) -> Socket {
     let mut socket = raw_computer(running, token).await;
-    send_hello_with(
+    send_hello_with_origin(
         &mut socket,
         CHANNEL_VERSION,
         &computer.to_string(),
         true,
         access,
+        origin,
     )
     .await;
 
@@ -9617,7 +9642,7 @@ async fn next_host_frame(socket: &mut Socket) -> HostFrame {
             continue;
         };
         let frame: HostFrame = serde_json::from_str(text.as_str()).unwrap();
-        if frame != HostFrame::Ping {
+        if frame != HostFrame::Ping && frame != HostFrame::Welcome {
             return frame;
         }
     }
@@ -9704,6 +9729,49 @@ async fn a_hosted_computer_is_always_sandboxed() {
     );
 
     socket.close(None).await.unwrap();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_computer_reports_the_origin_its_commands_should_use() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (computer, machine) = paired_computer(&mut socket, &running).await;
+    let mut device = raw_computer(&running, &machine).await;
+    send_hello_with_origin(
+        &mut device,
+        CHANNEL_VERSION,
+        &computer.to_string(),
+        true,
+        AccessCapabilities::SUPPORTED,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await;
+    wait_online(&mut socket, computer).await;
+
+    assert_eq!(
+        running.test_fields().links.origin(computer),
+        Some("https://space.example.com".to_owned()),
+        "the Space keeps the origin the daemon reported"
+    );
+
+    // A malformed origin would put another host in front of a run token, so
+    // the handshake is refused rather than stored.
+    let mut invalid = raw_computer(&running, &machine).await;
+    send_hello_with_origin(
+        &mut invalid,
+        CHANNEL_VERSION,
+        &computer.to_string(),
+        true,
+        AccessCapabilities::SUPPORTED,
+        Some("https://user:secret@space.example.com/path".to_owned()),
+    )
+    .await;
+    assert!(
+        closed(&mut invalid).await,
+        "a malformed origin closes the channel"
+    );
+
     running.shutdown().await;
 }
 
@@ -10370,7 +10438,7 @@ async fn a_second_machine_cannot_reuse_a_paired_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn pairing_start_validates_its_fields_and_recycles_the_waiting_quota() {
+async fn pairing_start_validates_its_fields_and_limits_each_source() {
     let (_dir, running, _invite) = running().await;
     let overlong = "m".repeat(MAX_PAIRING_FIELD_BYTES + 1);
     let overlong_workspace = format!("/{}", "w".repeat(MAX_PAIRING_FIELD_BYTES));
@@ -10416,33 +10484,185 @@ async fn pairing_start_validates_its_fields_and_recycles_the_waiting_quota() {
         );
     }
 
-    let mut machines = Vec::new();
-    for _ in 0..MAX_PENDING_PAIRINGS {
-        machines.push(pair_machine(&running).await);
-    }
-    // A full quota recycles a waiting machine instead of refusing the
-    // legitimate one, so an anonymous caller cannot lock a User out.
-    let newest = pair_machine(&running).await;
-    let mut pending = 0;
-    let mut evicted = 0;
-    for (device, _code) in &machines {
-        let status = poll_pairing(&running, device, &machine_poll())
+    // One source may wait with a bounded number of pairings; the next start
+    // from the same source is refused instead of recycling another waiter.
+    let first = pair_machine(&running).await;
+    let second = pair_machine(&running).await;
+    let refused = pair_start(
+        &running,
+        &pair_body(
+            "laptop",
+            MACHINE_WORKSPACE,
+            &machine_token(),
+            &machine_poll(),
+        ),
+    )
+    .await;
+    assert_eq!(refused.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    let refused: Value = refused.json().await.unwrap();
+    assert_eq!(refused["code"], "rate_limited");
+    for (device, _code) in [first, second] {
+        let pending: Value = poll_pairing(&running, &device, &machine_poll())
             .await
-            .status();
-        match status {
-            reqwest::StatusCode::OK => pending += 1,
-            reqwest::StatusCode::NOT_FOUND => evicted += 1,
-            other => panic!("unexpected poll status: {other}"),
-        }
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(pending, json!({"state": "pending"}));
     }
-    assert_eq!(evicted, 1, "only one waiting pairing is recycled");
-    assert_eq!(pending, MAX_PENDING_PAIRINGS - 1);
-    let newest: Value = poll_pairing(&running, &newest.0, &machine_poll())
-        .await
-        .json()
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_start_counts_the_address_a_trusted_proxy_forwards() {
+    let dir = tempfile::tempdir().unwrap();
+    let running = start_with_ui_public(
+        test_home(dir.path()),
+        0,
+        None,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await
+    .unwrap();
+    let client = reqwest::Client::new();
+    let start = |forwarded: &'static str| {
+        let client = client.clone();
+        let url = format!("{}/api/computers/pair", running.url());
+        async move {
+            client
+                .post(url)
+                .header("x-forwarded-for", forwarded)
+                .json(&pair_body(
+                    "laptop",
+                    MACHINE_WORKSPACE,
+                    &machine_token(),
+                    &machine_poll(),
+                ))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+
+    // The loopback peer is the trusted proxy; the bound counts the forwarded
+    // address, so one client cannot fill another client's slots.
+    assert_eq!(start("203.0.113.5").await.status(), reqwest::StatusCode::OK);
+    assert_eq!(start("203.0.113.5").await.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        start("203.0.113.5").await.status(),
+        reqwest::StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(start("203.0.113.6").await.status(), reqwest::StatusCode::OK);
+
+    // A Windows machine's Workspace is absolute on that machine, though this
+    // Space runs on Linux.
+    let (device, _code) =
+        pair_machine_as(&running, "windows-laptop", r"C:\Users\ada\neha\workspace").await;
+    assert!(!device.is_empty());
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pairing_start_announces_the_poll_timing() {
+    let (_dir, running, _invite) = running().await;
+    let started: Value = pair_start(
+        &running,
+        &pair_body(
+            "laptop",
+            MACHINE_WORKSPACE,
+            &machine_token(),
+            &machine_poll(),
+        ),
+    )
+    .await
+    .json()
+    .await
+    .unwrap();
+    assert_eq!(started["expires_in"], json!(PAIRING_TTL_SECS));
+    assert_eq!(started["interval"], json!(PAIRING_POLL_SECS));
+
+    // A poll whose values cannot be one this Space issued is refused before
+    // any lookup, with the same answer as an unknown pairing.
+    let unknown = poll_pairing(&running, "not-a-device", &machine_poll()).await;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    let device = started["device"].as_str().unwrap();
+    let short = poll_pairing(&running, device, "AAAA").await;
+    assert_eq!(short.status(), reqwest::StatusCode::NOT_FOUND);
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_proxied_request_cannot_use_the_local_ticket_routes() {
+    let (_dir, running, invite) = running().await;
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap().to_owned();
+    let client = reqwest::Client::new();
+
+    let issued = client
+        .post(format!("{}/api/computer/ticket", running.url()))
+        .bearer_auth(&token)
+        .header("x-forwarded-for", "203.0.113.7")
+        .send()
         .await
         .unwrap();
-    assert_eq!(newest, json!({"state": "pending"}));
+    assert_eq!(issued.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: Value = issued.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap()
+            .contains("Space's machine"),
+        "the refusal names the local rule: {body}"
+    );
+
+    // The exchange route checks the same rule before reading the ticket.
+    let exchanged = client
+        .post(format!("{}/api/computer/pair", running.url()))
+        .header("forwarded", "for=203.0.113.7")
+        .json(&json!({"ticket": "any ticket"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(exchanged.status(), reqwest::StatusCode::FORBIDDEN);
+
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_public_host_cannot_use_the_local_ticket_route_without_forwarding() {
+    let dir = tempfile::tempdir().unwrap();
+    let running = start_with_ui_public(
+        test_home(dir.path()),
+        0,
+        None,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await
+    .unwrap();
+    let invite = running.invite.clone().expect("a fresh Space invites");
+    let session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let token = session["token"].as_str().unwrap().to_owned();
+
+    // The request comes from loopback and carries no forwarding marker, but
+    // its Host is the public authority: a same-host proxy must not expose the
+    // ticket route this way.
+    let refused = reqwest::Client::new()
+        .post(format!("{}/api/computer/ticket", running.url()))
+        .header("host", "space.example.com")
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), reqwest::StatusCode::FORBIDDEN);
+    let body: Value = refused.json().await.unwrap();
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Space's machine")),
+        "the refusal states the local rule: {body}"
+    );
 
     running.shutdown().await;
 }
@@ -10587,6 +10807,15 @@ async fn a_reconnect_closes_the_replaced_socket() {
     // The same Computer opens a second channel: the Space keeps the new
     // one and closes the old connection instead of serving both.
     let mut second = connect_computer(&running, &machine, computer).await;
+    // The first channel got its greeting acknowledgement before the second
+    // connection replaced it; the acknowledgement is not the close.
+    let Message::Text(welcome) = first.next().await.unwrap().unwrap() else {
+        panic!("the first channel must begin with its Welcome frame");
+    };
+    assert_eq!(
+        serde_json::from_str::<HostFrame>(&welcome).unwrap(),
+        HostFrame::Welcome
+    );
     assert!(closed(&mut first).await, "the replaced socket must close");
     wait_online(&mut socket, computer).await;
 
@@ -10670,7 +10899,16 @@ async fn a_run_on_a_real_computer_round_trips_an_action() {
     let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
     let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
 
-    let mut device = connect_computer(&running, &machine, computer).await;
+    // The machine reaches the Space through a public origin; a Bot's shell
+    // commands must name that origin rather than the Space's listening address.
+    let mut device = connect_computer_with_origin(
+        &running,
+        &machine,
+        computer,
+        AccessCapabilities::SUPPORTED,
+        Some("https://space.example.com".to_owned()),
+    )
+    .await;
     wait_online(&mut socket, computer).await;
     let shown_bot = command(&mut socket, Id::new(), CommandCall::BotShow { bot }).await;
     assert_eq!(shown_bot["computer"]["id"], json!(computer));
@@ -10680,12 +10918,23 @@ async fn a_run_on_a_real_computer_round_trips_an_action() {
     let queued = submit(&mut socket, chat, "run pwd", None).await;
     let run = run_of(&queued);
     allow_first_use(&mut socket, chat).await;
-    let (id, named, action) = match next_host_frame(&mut device).await {
+    let (id, named, action, env) = match next_host_frame(&mut device).await {
         HostFrame::Action {
-            id, bot, action, ..
-        } => (id, bot, action),
+            id,
+            bot,
+            action,
+            env,
+            ..
+        } => (id, bot, action, env),
         other => panic!("expected an action frame, got {other:?}"),
     };
+    assert!(
+        env.contains(&(
+            "NEHA_SPACE_URL".to_owned(),
+            "https://space.example.com".to_owned()
+        )),
+        "the action's commands must use the origin the daemon reported: {env:?}"
+    );
     assert_eq!(named, bot.to_string());
     assert_eq!(
         action,
@@ -12762,6 +13011,54 @@ async fn a_legacy_migration_does_not_follow_an_in_home_alias() {
         std::fs::read_to_string(second_target.join("sentinel-b")).unwrap(),
         "second owner"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hosted_computer_ignores_a_channel_origin() {
+    let (_dir, running, invite) = running().await;
+    let mut socket = admin_socket(&running, &invite).await;
+    let (base, provider_task) = scripted_provider(vec![
+        tool(
+            "shell",
+            json!({"command": "printf '%s' \"$NEHA_SPACE_URL\""}),
+        ),
+        text("done"),
+    ])
+    .await;
+    command(&mut socket, Id::new(), provider_add(base)).await;
+    let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+    let computer: Id = serde_json::from_value(created["computer"]["id"].clone()).unwrap();
+    assert_eq!(created["computer"]["kind"], "hosted");
+
+    // A Hosted credential can outlive a change from worker-backed hosting to
+    // process-local hosting. Its channel must not choose where an in-Space
+    // shell sends its run token.
+    let (frames, _held) = mpsc::channel(4);
+    let link = running.test_fields().links.connect_with_origin(
+        computer,
+        frames,
+        AccessCapabilities::SUPPORTED,
+        Some("https://evil.example.com".to_owned()),
+    );
+    let queued = submit(&mut socket, chat, "read the origin", None).await;
+    let run = run_of(&queued);
+    let result = finish(&mut socket, chat, queued).await;
+    assert_eq!(result["status"], "succeeded", "{result}");
+    let shown = show_run(&mut socket, run).await;
+    let output = shown["actions"][0]["output"].as_str().unwrap_or_default();
+    assert!(
+        output.contains(&running.url()),
+        "a process-local Hosted shell must use the listener origin: {shown}"
+    );
+    assert!(
+        !output.contains("evil.example.com"),
+        "a reported channel origin must not reach a Hosted shell: {shown}"
+    );
+
+    drop(link);
+    provider_task.abort();
+    running.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

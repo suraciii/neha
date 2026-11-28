@@ -11,7 +11,7 @@ Owned by identity. [CLI](../cli/product.md) and [Computer](../computer/product.m
 1. A Space admits a connection only from a caller it has signed in, a device that is pairing, or a Local Computer presenting a valid local ticket.
 2. A connection to a Space is encrypted, except one from the Space's own machine or from a proxy the Space trusts.
 3. A code works once, expires, and belongs to one caller and one Space. A code that a User types can be tried only a limited number of times.
-4. A device on another machine checks the Space's key against one it received from a signed-in User before it connects.
+4. A device on another machine validates the Space's certificate against the system trust store before it connects; without a public certificate it checks a key it received from a signed-in User.
 5. The Space stores only a hash of a token, never its plaintext.
 6. A client that loads the Space's own pages keeps its token only in an HttpOnly cookie. Any other client sends its token in the Authorization header.
 
@@ -37,7 +37,13 @@ An invitation and a pairing code each admit one caller to one Space, work once, 
 
 A Local Computer started on the Space's own machine uses no code. The User who pairs the machine confirms the pairing there.
 
-A Local Computer started on another machine uses a pairing code that a signed-in User enters there. The code admits that User and one Space.
+A Local Computer started on another machine uses a pairing code. The machine shows the code, and a signed-in User enters it in an app or a browser. The code admits that User and one Space.
+
+A pairing code is eight letters shown as `XXXX-XXXX`, and it expires after fifteen minutes. The machine polls the Space for its answer; an approved code records the Computer, and an expired or replaced code answers no poll.
+
+The Space bounds how many pairings wait at once and how many one source address MAY start, and refuses a start when a bound is reached.
+
+A local ticket is offered only on the Space's own machine: its route answers a direct loopback request with no forwarded header, so a public origin does not expose it.
 
 The Space issues a short-lived, one-use ticket that binds one User, one Space, and one Space start. Its database keeps only the ticket's digest, and a used or expired ticket admits no one.
 

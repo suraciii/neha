@@ -37,7 +37,7 @@ pub const MIN_PASSWORD_BYTES: usize = 8;
 pub const MAX_DISPLAY_NAME_CHARS: usize = 64;
 
 /// How long a pairing code stays valid, in seconds.
-pub const PAIRING_TTL_SECS: i64 = 600;
+pub const PAIRING_TTL_SECS: i64 = 900;
 
 /// How many tries a pairing code allows before it is void.
 pub const MAX_CODE_TRIES: i64 = 5;
@@ -45,9 +45,18 @@ pub const MAX_CODE_TRIES: i64 = 5;
 /// How many pairings may wait for a User at once.
 ///
 /// A machine whose code nobody entered holds a slot until the code expires.
-/// At the cap a new pairing evicts the oldest waiting one instead of failing:
-/// an unauthenticated caller can churn rows, but cannot lock a User out.
+/// A source that fills the cap is refused rather than evicting another
+/// source's waiting pairing, so one caller cannot lock a User out.
 pub const MAX_PENDING_PAIRINGS: i64 = 16;
+
+/// How many pairings one source address may wait with at once.
+///
+/// Starting is unauthenticated, so one machine must not fill the global
+/// queue. A refused start tells the caller to try later.
+pub const MAX_PENDING_PER_SOURCE: i64 = 2;
+
+/// The time between two pairing polls a machine should observe.
+pub const PAIRING_POLL_SECS: u64 = 2;
 
 /// The most unused local tickets one owner may hold at once.
 ///
@@ -284,7 +293,23 @@ impl Identity {
         token: &str,
         poll_secret: &str,
     ) -> Result<PairingStart, IdentityError> {
-        self.begin_pairing_at(now(), machine, workspace, token, poll_secret)
+        self.begin_pairing_from("", machine, workspace, token, poll_secret)
+            .await
+    }
+
+    /// Starts a pairing from one source address.
+    ///
+    /// The source bounds how many waiting pairings one caller can create; it
+    /// is not part of the pairing's identity.
+    pub async fn begin_pairing_from(
+        &self,
+        source: &str,
+        machine: &str,
+        workspace: &str,
+        token: &str,
+        poll_secret: &str,
+    ) -> Result<PairingStart, IdentityError> {
+        self.begin_pairing_at(now(), source, machine, workspace, token, poll_secret)
             .await
     }
 
@@ -352,7 +377,7 @@ impl Identity {
     /// Moves a claim past its expiry, for tests that exercise recovery.
     ///
     /// Production code never does this: it only makes a row that a real clock
-    /// would have expired reachable without waiting the ten minutes.
+    /// would have expired reachable without waiting the fifteen minutes.
     #[cfg(feature = "test-support")]
     pub(crate) async fn expire_pairing_for_test(
         &self,
@@ -628,14 +653,13 @@ impl Identity {
     async fn begin_pairing_at(
         &self,
         now: i64,
+        source: &str,
         machine: &str,
         workspace: &str,
         token: &str,
         poll_secret: &str,
     ) -> Result<PairingStart, IdentityError> {
         let device = random_base64(DEVICE_BYTES);
-        let code = random_code();
-        let code_hash = digest(&code);
         let poll_hash = digest(poll_secret);
         let token_hash = digest(token);
         let expires_at = now.saturating_add(PAIRING_TTL_SECS.saturating_mul(1_000_000));
@@ -662,24 +686,39 @@ impl Identity {
             .fetch_one(&mut *connection)
             .await?;
             if waiting >= MAX_PENDING_PAIRINGS {
-                // The cap must not let a caller who never approves anything
-                // lock Users out: evict the oldest waiting pairing and carry
-                // on. Claimed pairings are never evicted.
-                sqlx::query(
-                    "DELETE FROM computer_codes WHERE device_id = (\
-                     SELECT device_id FROM computer_codes \
-                     WHERE owner IS NULL AND expires_at > ? \
-                     ORDER BY created_at ASC, device_id ASC LIMIT 1)",
-                )
-                .bind(now)
-                .execute(&mut *connection)
-                .await?;
+                return Err(IdentityError::TooManyPending);
             }
+            let from_source: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM computer_codes \
+                 WHERE owner IS NULL AND expires_at > ? AND source = ?",
+            )
+            .bind(now)
+            .bind(source)
+            .fetch_one(&mut *connection)
+            .await?;
+            if from_source >= MAX_PENDING_PER_SOURCE {
+                return Err(IdentityError::TooManyPending);
+            }
+            // A waiting code names one machine. Generate until the hash is
+            // free; BEGIN IMMEDIATE holds the write lock, so no other start
+            // can take the hash between this check and the insert.
+            let (code, code_hash) = loop {
+                let code = random_code();
+                let code_hash = digest(&code);
+                let taken: Option<i64> =
+                    sqlx::query_scalar("SELECT 1 FROM computer_codes WHERE code_hash = ? LIMIT 1")
+                        .bind(code_hash.as_slice())
+                        .fetch_optional(&mut *connection)
+                        .await?;
+                if taken.is_none() {
+                    break (code, code_hash);
+                }
+            };
             sqlx::query(
                 "INSERT INTO computer_codes (\
                  device_id, code_hash, poll_hash, token_hash, machine, workspace, \
-                 owner, computer, created_at, expires_at, tries) \
-                 VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0)",
+                 owner, computer, created_at, expires_at, tries, source) \
+                 VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 0, ?)",
             )
             .bind(&device)
             .bind(code_hash.as_slice())
@@ -689,14 +728,15 @@ impl Identity {
             .bind(workspace)
             .bind(now)
             .bind(expires_at)
+            .bind(source)
             .execute(&mut *connection)
             .await?;
 
-            Ok(())
+            Ok(code)
         }
         .await;
         match inserted {
-            Ok(()) => {
+            Ok(code) => {
                 sqlx::query("COMMIT").execute(&mut *connection).await?;
                 Ok(PairingStart { device, code })
             }
@@ -1069,7 +1109,12 @@ fn now() -> i64 {
 }
 
 fn normalize_code(code: &str) -> String {
-    code.trim().to_ascii_uppercase()
+    // A User may type the code the way it was shown: `XXXX-XXXX`, with the
+    // dash and any spaces. The hash names the eight letters alone.
+    code.chars()
+        .filter(|character| *character != '-' && !character.is_ascii_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase()
 }
 
 fn random_code() -> String {
@@ -1124,6 +1169,9 @@ pub enum IdentityError {
     /// The machine's token already belongs to another claim or Computer.
     #[error("the machine token is already in use")]
     TokenTaken,
+    /// Too many pairings are waiting for a User, globally or from one source.
+    #[error("too many pairings are waiting for a User")]
+    TooManyPending,
 }
 
 /// What the integration tests need from inside this module.
@@ -1186,7 +1234,21 @@ pub mod test_support {
             token: &str,
             poll_secret: &str,
         ) -> Result<PairingStart, IdentityError> {
-            self.begin_pairing_at(now, machine, workspace, token, poll_secret)
+            self.begin_pairing_at(now, "", machine, workspace, token, poll_secret)
+                .await
+        }
+
+        /// Starts one pairing from one source at an explicit instant.
+        pub async fn test_begin_pairing_from_at(
+            &self,
+            now: i64,
+            source: &str,
+            machine: &str,
+            workspace: &str,
+            token: &str,
+            poll_secret: &str,
+        ) -> Result<PairingStart, IdentityError> {
+            self.begin_pairing_at(now, source, machine, workspace, token, poll_secret)
                 .await
         }
 

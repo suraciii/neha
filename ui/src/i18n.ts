@@ -474,6 +474,14 @@ const en = {
   "settings.computers.create.done": "Computer created",
   "settings.computers.create.hint":
     "A Hosted Computer belongs to you. A shared one takes any of your Bots; an exclusive one takes a single Bot.",
+  "settings.computers.add.title": "Add a Computer",
+  "settings.computers.add.hint":
+    "On the other machine, run `neha computer pair --space <this Space's HTTPS address>` and enter the code it prints. The Computer belongs to you.",
+  "settings.computers.add.code": "Pairing code",
+  "settings.computers.add.placeholder": "XXXX-XXXX",
+  "settings.computers.add.action": "Add Computer",
+  "settings.computers.add.adding": "Adding…",
+  "settings.computers.add.done": "Computer added",
   "settings.computers.share": "Make shared",
   "settings.computers.share.done": "Computer is shared",
   "settings.computers.access.none": "Only its Workspace",
@@ -954,6 +962,14 @@ const zh: Record<MessageKey, string> = {
   "settings.computers.create.done": "Computer 已创建",
   "settings.computers.create.hint":
     "Hosted Computer 属于你。共享的 Computer 可以承载你的任意 Bot；独占的 Computer 只承载一个 Bot。",
+  "settings.computers.add.title": "添加 Computer",
+  "settings.computers.add.hint":
+    "在另一台机器上运行 `neha computer pair --space <本 Space 的 HTTPS 地址>`，然后输入它显示的配对码。这个 Computer 属于你。",
+  "settings.computers.add.code": "配对码",
+  "settings.computers.add.placeholder": "XXXX-XXXX",
+  "settings.computers.add.action": "添加 Computer",
+  "settings.computers.add.adding": "添加中…",
+  "settings.computers.add.done": "Computer 已添加",
   "settings.computers.share": "改为共享",
   "settings.computers.share.done": "Computer 已改为共享",
   "settings.computers.access.none": "仅自己的 Workspace",
