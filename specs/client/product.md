@@ -107,6 +107,8 @@ Unread is the client's own memory of a Message that landed while the User was no
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
 
+Every User who reads the Chat sees a marker where a compacted part ends, and it says that earlier Messages were compacted. The marker has no action, the Chat still shows every Message, and no summary appears to the User.
+
 A Message that carries a File shows a file card with the File's name and size. Choosing the card downloads the File, and the browser opens no File itself. [Message](../messaging/message/product.md#files) owns what a File is and where its bytes live.
 
 The Chat header names the Bot, the Computer kind (Local Computer or Hosted Computer), and whether the Computer is online.
@@ -154,6 +156,20 @@ Turning full access on states the risk and asks the owner to confirm, as the CLI
 A Local Bot's page lists its Ask and Allow rules, and the owner adds and removes them there. A Hosted Bot's page offers no rule to add or remove. [Bot](../bot/product.md#asking-before-an-action) owns what a rule covers.
 
 The page shows who can use the Bot, and changing that is not yet available.
+
+### Memory
+
+The Bot's page lists the memory entries the User reads, grouped by kind and scope. Each entry names its author, source, and size and shows its content. [Bot](../bot/product.md#memory) owns what a memory entry is, its kinds and scopes, and who reads and clears one.
+
+The owner also sees every entry the owner does not read, with only its scope, author, source, and size.
+
+Each row offers removal to the User who can clear that entry.
+
+The page shows each kind's total used size and its limit.
+
+With no entry, the page says to ask the Bot in a Chat to remember something.
+
+The page offers no control that adds or changes an entry. A User adds and changes memory in a Chat.
 
 ## Settings
 

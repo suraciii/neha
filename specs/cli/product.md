@@ -111,6 +111,16 @@ The directory is that run's write root, is recorded with the run and shown on an
 
 The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
 
+## Memory
+
+The Bot's owner and a User allowed to use the Bot read its memory from the CLI. [Bot](../bot/product.md#memory) owns what a memory entry is, its kinds and scopes, and who reads and clears one.
+
+`neha bot memory <bot>` prints the memory entries the User reads. Each entry prints its id, kind, scope, author, source, size, and content. The owner also sees every entry the owner does not read, with its metadata only.
+
+The command prints each kind's total used size and its limit. With no entry, it says to ask the Bot in a Chat to remember something.
+
+`neha bot memory remove <bot> <entry>` removes the entry with that id when the User can clear it, and refuses one the User cannot clear. The memory commands read and remove entries; a User adds and changes memory in a Chat.
+
 ## Approvals
 
 `neha approval list` shows the approvals that wait for the User: their ids, runs, Bots, tools, reasons, and summaries. A reason is the first use of a Local Computer, a lasting rule, or a folder the owner has not granted.
@@ -119,7 +129,7 @@ The directory MUST exist and be a folder. In granted mode a directory inside a h
 
 `neha approval allow <id>` or `neha approval deny <id>` answers one; `neha approval allow <id> --always` also makes a lasting Allow rule when the action can make one. When the action cannot make a lasting rule, `--always` is refused.
 
-`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. A rule names a tool the loop offers and belongs to a Local Bot; an unknown tool and a Hosted Bot are refused.
+`neha rule list`, `neha rule add`, and `neha rule remove` manage lasting Ask and Allow rules. An Ask or Allow rule names one Computer tool the loop offers — `shell`, `read_file`, `write_file`, or `list_files` — and belongs to a Local Bot. A rule that names a memory tool or an unknown tool is refused, as is a rule on a Hosted Bot.
 
 A shell rule can name how the command starts, and a file tool with a path, such as `read_file`, `write_file`, or `list_files`, can name a path prefix.
 
