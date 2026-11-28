@@ -877,6 +877,23 @@ fn prefix_matches(prefix: &[Fingerprint], messages: &[Message]) -> bool {
             .all(|(fingerprint, message)| *fingerprint == fingerprinted(message))
 }
 
+/// Estimates one candidate projection against the Provider's last count.
+///
+/// The anchor covers the prefix of the request the Provider counted. While the
+/// candidate's own prefix still matches that fingerprint, its count plus the
+/// characters after the prefix is reused; once a replacement lands inside the
+/// prefix, the count starts from zero over the candidate. The tool schemas are
+/// already inside the anchored count, so the anchored branch adds only the
+/// text the Provider never saw.
+fn estimate_projection(projection: &[Message], tools: &[ToolSpec], anchor: Option<&Anchor>) -> u32 {
+    match anchor.filter(|anchor| prefix_matches(&anchor.prefix, projection)) {
+        Some(anchor) => anchor
+            .tokens
+            .saturating_add(tokens_of(chars_of(&projection[anchor.prefix.len()..]))),
+        None => estimate_tokens(projection, tools),
+    }
+}
+
 /// The Messages one request sends, and the estimate that decided them.
 struct Projection {
     /// The Messages after the system Message.
@@ -909,12 +926,7 @@ fn project(
     // It is only reusable while the raw prefix is byte-for-byte what that
     // request sent; otherwise the estimate starts from the current text.
     let anchored = anchor.filter(|anchor| prefix_matches(&anchor.prefix, messages));
-    let mut estimate = match &anchored {
-        Some(anchor) => anchor
-            .tokens
-            .saturating_add(tokens_of(chars_of(&messages[anchor.prefix.len()..]))),
-        None => estimate_tokens(&projection, tools),
-    };
+    let mut estimate = estimate_projection(&projection, tools, anchored.as_ref());
     let Some(budget) = input_budget(context_window, max_output) else {
         return Projection {
             messages: projection,
@@ -946,7 +958,10 @@ fn project(
     for &index in &results[..removable] {
         let call = projection[index].tool_call_id.clone().unwrap_or_default();
         projection[index].content = Some(format!("{PRUNED_TOOL_RESULT}{call}]"));
-        estimate = estimate_tokens(&projection, tools);
+        // A replacement after the anchored prefix keeps the Provider's count;
+        // one inside it invalidates the anchor, and the candidate is counted
+        // from zero again.
+        estimate = estimate_projection(&projection, tools, anchored.as_ref());
         if estimate < budget {
             break;
         }
@@ -3104,6 +3119,88 @@ mod tests {
         assert_eq!(second.estimate, 101, "the anchor covers the prefix");
         assert_ne!(second.estimate, estimate_tokens(&second.messages, &tools));
         assert!(first.estimate < second.estimate - 1);
+    }
+
+    #[test]
+    fn the_estimate_keeps_the_anchor_when_a_new_result_is_pruned() {
+        // The previous request cost the Provider 1,800 input tokens. This step
+        // appends four tool results; trimming the oldest leaves 672 characters
+        // after the anchored prefix, so the estimate is 1,800 + 168 = 1,968 and
+        // the step is over its 1,900-token compaction threshold. Counting the
+        // whole text from zero again would hide the overage.
+        let tools = probe_tools();
+        let mut messages = vec![Message::system("system"), Message::user("go")];
+        let anchor = Anchor {
+            tokens: 1_800,
+            prefix: messages.iter().map(fingerprinted).collect(),
+        };
+        messages.push(Message::tool_result("call-a", "a".repeat(200)));
+        messages.push(Message::tool_result("call-b", "b".repeat(200)));
+        messages.push(Message::tool_result("call-c", "c".repeat(205)));
+        messages.push(Message::tool_result("call-d", "d".repeat(196)));
+        // A window of 2,100 tokens with a 100-token output leaves 2,000 for
+        // input: the 2,006-token projection trims once and then fits.
+        let projection = project(&messages, &tools, Some(anchor), 2_100, 100);
+
+        assert!(
+            projection.messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("[tool result removed from context"),
+            "the oldest new result is trimmed: {:?}",
+            projection.messages[2].content
+        );
+        assert_eq!(
+            projection.estimate, 1_968,
+            "the anchor still covers the prefix before the trimmed result"
+        );
+        assert!(
+            projection.estimate > 1_900,
+            "the 1,900-token compaction threshold sees the step as over"
+        );
+        assert_ne!(
+            projection.estimate,
+            estimate_tokens(&projection.messages, &tools),
+            "counting the whole text again would hide the overage"
+        );
+    }
+
+    #[test]
+    fn a_pruned_message_inside_the_anchor_prefix_counts_from_zero() {
+        // The Provider counted 5,000 tokens for exactly these Messages. A trim
+        // that replaces the result inside that prefix invalidates the count:
+        // the estimate starts over the candidate projection instead.
+        let tools = probe_tools();
+        let messages = vec![
+            Message::system("system"),
+            Message::user("u".repeat(3_000)),
+            Message::tool_result("call-a", "A".repeat(12_000)),
+            Message::tool_result("call-b", "B".repeat(10)),
+            Message::tool_result("call-c", "C".repeat(10)),
+            Message::tool_result("call-d", "D".repeat(10)),
+        ];
+        let anchor = Anchor {
+            tokens: 5_000,
+            prefix: messages.iter().map(fingerprinted).collect(),
+        };
+        let projection = project(&messages, &tools, Some(anchor), 6_900, 5_000);
+
+        assert!(
+            projection.messages[2]
+                .content
+                .as_deref()
+                .unwrap()
+                .contains("call call-a"),
+            "the old result inside the anchored prefix is trimmed: {:?}",
+            projection.messages[2].content
+        );
+        assert_eq!(
+            projection.estimate,
+            estimate_tokens(&projection.messages, &tools),
+            "a replacement inside the prefix invalidates the anchored count"
+        );
+        assert!(projection.estimate < 5_000);
     }
 
     #[tokio::test]

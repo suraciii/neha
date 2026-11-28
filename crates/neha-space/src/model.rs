@@ -321,6 +321,15 @@ impl ModelClient {
                 break;
             }
             let chunk: Chunk = serde_json::from_str(data).map_err(|_| ModelError::Protocol)?;
+            if let Some(error) = &chunk.error {
+                // Only the error's own protocol fields decide what a frame
+                // means; an over-long input asks for a compaction, anything
+                // else is the Provider's final answer for this step.
+                if error.names_too_long() {
+                    return Err(ModelError::ContextTooLarge);
+                }
+                return Err(ModelError::Provider(error.message(data)));
+            }
             if let Some(choice) = chunk.choices.first() {
                 if let Some(reason) = choice.finish_reason.as_deref() {
                     match reason {
@@ -1648,6 +1657,42 @@ struct Chunk {
     choices: Vec<Choice>,
     #[serde(default)]
     usage: Option<ReportedUsage>,
+    /// A plain data frame can carry an error object instead of a chunk.
+    #[serde(default)]
+    error: Option<ChunkError>,
+}
+
+/// An error one Chat Completions data frame carries instead of a chunk.
+#[derive(Deserialize, Default)]
+struct ChunkError {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl ChunkError {
+    /// Whether the error's own protocol fields name an over-long input.
+    fn names_too_long(&self) -> bool {
+        [
+            self.code.as_deref(),
+            self.kind.as_deref(),
+            self.message.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(text_says_input_too_long)
+    }
+
+    /// The error's readable message, falling back to its code and the frame.
+    fn message(&self, fallback: &str) -> String {
+        self.message
+            .clone()
+            .or_else(|| self.code.clone())
+            .unwrap_or_else(|| fallback.to_owned())
+    }
 }
 
 #[derive(Deserialize)]
@@ -3699,6 +3744,81 @@ mod tests {
         let error = client.chat(anthropic_request(&base)).await.unwrap_err();
 
         assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_plain_data_error_that_names_too_long_compacts() {
+        // A Chat Completions stream can carry the error as a plain data frame
+        // instead of a chunk; its protocol fields still name the context limit.
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                event_stream(
+                    "data: {\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long\"}}\n\n",
+                )
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_named_error_frame_that_names_too_long_compacts() {
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                event_stream(
+                    "event: error\ndata: {\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"prompt is too long\"}}\n\n",
+                )
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert!(matches!(error, ModelError::ContextTooLarge), "{error:?}");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_plain_data_error_that_is_not_too_long_ends_the_step() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&attempts);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    event_stream(
+                        "data: {\"error\":{\"code\":\"invalid_request_error\",\"message\":\"the request is malformed\"}}\n\n",
+                    )
+                }
+            }),
+        );
+        let (base, task) = provider(app).await;
+        let client = ModelClient::fast_retry().unwrap();
+
+        let error = client.chat(request(&base, "sk-test")).await.unwrap_err();
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "a Provider error is returned without a retry"
+        );
+        match error {
+            ModelError::Provider(message) => assert_eq!(message, "the request is malformed"),
+            other => panic!("expected the Provider's own error, got {other:?}"),
+        }
         task.abort();
     }
 }

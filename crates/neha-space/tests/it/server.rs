@@ -940,6 +940,11 @@ enum ScriptedReply {
     TooLarge,
     /// The Provider rejects the request as malformed, with this body.
     BadRequest(String),
+    /// The Provider reports this error inside a plain data frame.
+    StreamError {
+        code: String,
+        message: String,
+    },
 }
 
 /// A scripted Provider whose replies run in order; a `Hold` reply waits
@@ -1005,6 +1010,10 @@ async fn gated_provider(
                             .header(CONTENT_TYPE, "application/json")
                             .body(Body::from(body))
                             .unwrap();
+                    }
+                    ScriptedReply::StreamError { code, message } => {
+                        let error = json!({"error": {"code": code, "message": message}});
+                        format!("data: {error}\n\ndata: [DONE]\n\n")
                     }
                     ScriptedReply::Text(text) => {
                         let chunk = json!({"choices":[{"delta":{"content":text}}]});
@@ -27661,6 +27670,86 @@ async fn a_window_that_cannot_hold_its_output_never_compacts() {
         recorded.lock().unwrap().len(),
         1,
         "a window with no input room compacts nothing and retries nothing"
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_stream_error_that_names_too_long_compacts_and_retries() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let summary = "Earlier the owner sent two short notes.";
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        text("first done"),
+        text("second done"),
+        // The error arrives as a plain data frame, not a named event.
+        ScriptedReply::StreamError {
+            code: "context_length_exceeded".to_owned(),
+            message: "prompt is too long".to_owned(),
+        },
+        text("[{\"text\": \"the owner sent two notes\"}]"),
+        text(summary),
+        text("done after the retry"),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let mut history = 0;
+    for prefix in ["first ", "second "] {
+        let message = format!("{prefix}{}", "x".repeat(300));
+        let result = send(&mut socket, chat, &message).await;
+        assert_eq!(result["status"], "succeeded", "{result}");
+        history += 1;
+    }
+    assert_eq!(history, 2);
+
+    let third = send(&mut socket, chat, "third").await;
+    assert_eq!(third["status"], "succeeded", "{third}");
+    assert_eq!(third["text"], "done after the retry");
+    let requests = recorded.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        6,
+        "the stream error, the flush, the summary, and the retried request"
+    );
+    let retried = requests[5]["messages"].as_array().unwrap();
+    assert!(
+        retried[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Summary of earlier messages (data):"),
+        "{retried:?}"
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plain_stream_error_that_is_not_too_long_ends_the_run_without_a_retry() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) =
+        gated_provider(vec![ScriptedReply::StreamError {
+            code: "invalid_request_error".to_owned(),
+            message: "the request is malformed".to_owned(),
+        }])
+        .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+
+    let result = send(&mut socket, chat, "hello").await;
+    assert_eq!(result["status"], "failed", "{result}");
+    assert!(
+        result["text"].as_str().unwrap().contains("malformed"),
+        "the run reports the Provider's own error: {result}"
+    );
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "a Provider error is returned without a retry or a compaction"
     );
 
     socket.close(None).await.unwrap();
