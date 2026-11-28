@@ -24,9 +24,9 @@ The first account on a Hosted Space is its Admin, created with an invitation lin
 | Password | Every Space reached over the network |
 | An external provider | An Admin has added one as a Plugin |
 
-A signed-in client stays signed in until the User signs out or removes that client, or the Admin removes the account.
+A signed-in client stays signed in until the User signs out or removes that client, or the Admin removes the account. This milestone's clients sign out on their own.
 
-A User can see the clients signed in as them and remove any one of them. A removed client is signed out at once.
+A User can see the clients signed in as them and remove any one of them once the device list arrives in a later milestone; this milestone has no device list, so a client leaves only by signing out.
 
 ## Inviting
 
@@ -38,7 +38,9 @@ The invited User opens the link in an app or a browser, sets a display name and 
 
 The CLI signing in shows a code.
 
-A signed-in User enters the code in an app or a browser. The CLI joins the Space on that User's behalf and acts as the User.
+The terminal runs `neha login --device-code`, prints the code, and waits. A signed-in User enters the code in an app or a browser, or with `neha device approve`, and the CLI joins the Space on that User's behalf and acts as the User.
+
+The code admits one terminal token once, expires after fifteen minutes, and never returns the token itself. The Space keeps only the token's hash, and the terminal saves its credential only after the Space accepts it for an authenticated command.
 
 A Local Computer on the Space's own machine needs no code. A User starts the pairing there and confirms it. The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one; [design](design.md#codes) covers the ticket.
 

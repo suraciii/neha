@@ -6576,3 +6576,114 @@ async fn a_skill_runs_its_script_after_one_answer() {
     drop(server);
     provider_task.abort();
 }
+
+#[test]
+fn a_cli_signs_in_with_a_device_code_from_another_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let admin = directory.path().join("admin").join("credential.json");
+    let terminal = directory.path().join("terminal").join("credential.json");
+    let (server, url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &admin, &["join", &invite, "--name", "Ada"]);
+
+    let (mut child, lines, _errors) = spawn_cli(
+        &home,
+        &terminal,
+        &["login", "--server", &url, "--device-code"],
+    );
+    let line = lines
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|_| panic!("the CLI prints a device code: {}", child.id()));
+    assert!(
+        line.starts_with(&format!("To sign in, open {url} and enter code ")),
+        "the CLI names the Space and the code: {line}"
+    );
+    let code = line
+        .split("enter code ")
+        .nth(1)
+        .and_then(|rest| rest.split(" under").next())
+        .expect("the line carries a code")
+        .to_owned();
+
+    // The signed-in Admin approves the terminal from this one.
+    let approved = run(&home, &admin, &["device", "approve", &code]);
+    assert!(
+        approved.contains("Approved a sign-in for Ada"),
+        "{approved}"
+    );
+
+    let mut output = String::new();
+    read_until(&lines, &mut output, "Waiting for approval...");
+    // The saved credential arrives only after an authenticated command works.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("the terminal sign-in did not finish: {output}");
+    }
+    let status = child.wait().unwrap();
+    assert!(status.success(), "the terminal sign-in failed: {output}");
+    assert!(
+        std::fs::read_to_string(&terminal).unwrap().contains("Ada"),
+        "the terminal saved its new credential"
+    );
+    // The device login did not replace the Admin's own credential.
+    assert!(run(&home, &admin, &["whoami"]).contains("Account: Ada"));
+
+    drop(server);
+}
+
+#[test]
+fn a_cancelled_device_sign_in_keeps_the_saved_credential() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let admin = directory.path().join("admin").join("credential.json");
+    let terminal = directory.path().join("terminal").join("credential.json");
+    std::fs::create_dir_all(terminal.parent().unwrap()).unwrap();
+    std::fs::write(&terminal, b"old credential bytes").unwrap();
+    let (server, url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &admin, &["join", &invite, "--name", "Ada"]);
+
+    let (mut child, lines, _errors) = spawn_cli(
+        &home,
+        &terminal,
+        &["login", "--server", &url, "--device-code"],
+    );
+    let _line = lines
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the CLI prints a code");
+    // Cancelling before approval leaves the old credential byte-for-byte.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(
+        std::fs::read(&terminal).unwrap(),
+        b"old credential bytes",
+        "a cancelled sign-in must not touch the saved credential"
+    );
+
+    drop(server);
+}
+
+#[test]
+fn a_device_code_sign_in_requires_a_server_when_none_is_saved() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("credential.json");
+    let output = cli(&home, &credential, &["login", "--device-code"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("pass --server"),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

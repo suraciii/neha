@@ -297,6 +297,16 @@ const en = {
   "sidebar.settings.providers": "Providers",
   "sidebar.settings.models": "Models",
   "sidebar.settings.catalog": "Catalog",
+  "sidebar.settings.devices": "Devices",
+  "settings.devices.hint":
+    "A terminal without a signed-in client can sign in by showing a code. On that terminal run `neha login --server <origin> --device-code`, then enter the code it shows here.",
+  "settings.devices.code": "Device code",
+  "settings.devices.placeholder": "XXXX-XXXX",
+  "settings.devices.action": "Approve sign-in",
+  "settings.devices.approving": "Approving…",
+  "settings.devices.warning":
+    "Only approve a terminal you just started. It will act as your account until you sign out there; closing the terminal does not end the session, and this milestone has no device list to remove it.",
+  "settings.devices.approved": "Terminal signed in",
   "sidebar.settings.computers": "Computers",
   "bots.new": "New Bot",
   "bots.new.computer": "Computer",
@@ -796,6 +806,16 @@ const zh: Record<MessageKey, string> = {
   "sidebar.settings.providers": "Provider",
   "sidebar.settings.models": "Model",
   "sidebar.settings.catalog": "目录",
+  "sidebar.settings.devices": "设备",
+  "settings.devices.hint":
+    "没有已登录客户端的终端可以用设备码登录：在该终端运行 `neha login --server <origin> --device-code`，再在下面输入它显示的码。",
+  "settings.devices.code": "设备码",
+  "settings.devices.placeholder": "XXXX-XXXX",
+  "settings.devices.action": "同意登录",
+  "settings.devices.approving": "正在同意…",
+  "settings.devices.warning":
+    "只同意你才启动的终端。它会以你的账号操作，直到你在 Space 结束这次登录；关闭终端不会结束会话，这次改动还没有设备列表可以一台台移除。",
+  "settings.devices.approved": "终端已登录",
   "sidebar.settings.computers": "Computer",
   "bots.new": "新建 Bot",
   "bots.new.computer": "Computer",

@@ -41,6 +41,10 @@ A Local Computer started on another machine uses a pairing code. The machine sho
 
 A pairing code is eight letters shown as `XXXX-XXXX`, and it expires after fifteen minutes. The machine polls the Space for its answer; an approved code records the Computer, and an expired or replaced code answers no poll.
 
+A CLI signing in without a session uses the same code shape and lifetime. The CLI generates its token and polling secret, the Space stores only their digests, and approving the code inserts the token hash as that User's ordinary session in the same transaction that claims the code.
+
+A retry of the approving command answers the account already bound instead of minting a second session.
+
 The Space bounds how many pairings wait at once and how many one source address MAY start, and refuses a start when a bound is reached.
 
 A local ticket is offered only on the Space's own machine: its route answers a direct loopback request with no forwarded header, so a public origin does not expose it.

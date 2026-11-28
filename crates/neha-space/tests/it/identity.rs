@@ -11,9 +11,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
 use neha_space::home::Home;
 use neha_space::identity::{
-    Account, Identity, IdentityError, MAX_CODE_TRIES, MAX_LOCAL_TICKETS_PER_OWNER,
-    MAX_PENDING_PAIRINGS, MAX_PENDING_PER_SOURCE, PAIRING_TTL_SECS, PairingClaim, PairingRequest,
-    PairingState,
+    Account, DeviceLoginStart, DeviceLoginState, Identity, IdentityError, MAX_CODE_TRIES,
+    MAX_LOCAL_TICKETS_PER_OWNER, MAX_PENDING_PAIRINGS, MAX_PENDING_PER_SOURCE, PAIRING_TTL_SECS,
+    PairingClaim, PairingRequest, PairingState,
 };
 use neha_space::test_support::identity::{
     CODE_ALPHABET, VERSION_ONE_STATEMENTS, VERSION_TWO_STATEMENTS, digest, pool,
@@ -27,6 +27,22 @@ async fn identity() -> (tempfile::TempDir, Home, Identity) {
     let identity = Identity::open(&home).await.unwrap();
 
     (dir, home, identity)
+}
+
+/// Starts a device login with the digests the CLI would send.
+async fn start_device_login(
+    identity: &Identity,
+    source: &str,
+    client: &str,
+    token: &str,
+    poll: &str,
+) -> DeviceLoginStart {
+    let token_hash = neha_space::test_support::identity::digest(token);
+    let poll_hash = neha_space::test_support::identity::digest(poll);
+    identity
+        .begin_device_login(source, client, &token_hash, &poll_hash)
+        .await
+        .unwrap()
 }
 
 /// Claims and finishes a pairing the way the command does, for tests that
@@ -1460,4 +1476,173 @@ async fn revoking_forgets_claims_and_waiting_rows_for_its_token() {
         !identity.revoke_computer(computer).await.unwrap(),
         "a second revoke is idempotent"
     );
+}
+
+#[tokio::test]
+async fn a_device_login_becomes_the_approvers_session_once() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _session) = identity
+        .create_admin("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let started = start_device_login(&identity, "", "laptop", "cli-token", "poll-secret").await;
+    assert_eq!(
+        identity
+            .device_login(&started.device, "poll-secret")
+            .await
+            .unwrap(),
+        Some(DeviceLoginState::Pending)
+    );
+
+    let command = Id::new();
+    let approved = identity
+        .approve_device_login(&started.code, owner.id, command)
+        .await
+        .unwrap();
+    assert_eq!(approved, owner);
+    assert_eq!(
+        identity
+            .device_login(&started.device, "poll-secret")
+            .await
+            .unwrap(),
+        Some(DeviceLoginState::Approved {
+            account: owner.clone()
+        })
+    );
+    assert_eq!(
+        identity.authenticate("cli-token").await.unwrap(),
+        Some(owner.clone()),
+        "the CLI now holds an ordinary session token"
+    );
+    assert_eq!(
+        identity.device_login_by_command(command).await.unwrap(),
+        Some(owner.clone()),
+        "a retry can find the account its command already bound"
+    );
+
+    // The code and the command are single-use; the token is never rebound.
+    assert!(matches!(
+        identity
+            .approve_device_login(&started.code, owner.id, Id::new())
+            .await,
+        Err(IdentityError::InvalidDeviceCode)
+    ));
+    assert!(matches!(
+        identity
+            .approve_device_login("ZZZZ-ZZZZ", owner.id, Id::new())
+            .await,
+        Err(IdentityError::InvalidDeviceCode)
+    ));
+    assert_eq!(
+        identity
+            .device_login(&started.device, "wrong-secret")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_token_already_in_use_does_not_claim_its_code() {
+    let (_dir, _home, identity) = identity().await;
+    let (owner, _session) = identity
+        .create_admin("Ada", "correct horse battery")
+        .await
+        .unwrap();
+    let first = start_device_login(&identity, "", "laptop", "shared-token", "poll-one").await;
+    let second = start_device_login(&identity, "", "desktop", "shared-token", "poll-two").await;
+    identity
+        .approve_device_login(&first.code, owner.id, Id::new())
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        identity
+            .approve_device_login(&second.code, owner.id, Id::new())
+            .await,
+        Err(IdentityError::TokenTaken)
+    ));
+    assert_eq!(
+        identity
+            .device_login(&second.device, "poll-two")
+            .await
+            .unwrap(),
+        Some(DeviceLoginState::Pending),
+        "a refused token leaves the second code usable"
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_start_drops_expired_rows_and_bounds_the_queue() {
+    let (_dir, _home, identity) = identity().await;
+    let first = start_device_login(&identity, "", "laptop", "token-one", "poll-one").await;
+    // Expire the only waiting row, then start enough to reach the cap: the
+    // expired row must not count and must not answer a poll.
+    sqlx::query("UPDATE device_logins SET expires_at = 0 WHERE device_id = ?")
+        .bind(&first.device)
+        .execute(pool(&identity))
+        .await
+        .unwrap();
+    for index in 0..MAX_PENDING_PAIRINGS {
+        start_device_login(
+            &identity,
+            &format!("source-{index}"),
+            "laptop",
+            &format!("token-{index}"),
+            &format!("poll-{index}"),
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            identity
+                .begin_device_login(
+                    "final-source",
+                    "desktop",
+                    &neha_space::test_support::identity::digest("one-too-many"),
+                    &neha_space::test_support::identity::digest("poll-too-many"),
+                )
+                .await,
+            Err(IdentityError::TooManyPending)
+        ),
+        "the waiting queue is bounded"
+    );
+    assert_eq!(
+        identity
+            .device_login(&first.device, "poll-one")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_device_login_source_waits_with_at_most_two_rows() {
+    let (_dir, _home, identity) = identity().await;
+    for index in 0..MAX_PENDING_PER_SOURCE {
+        start_device_login(
+            &identity,
+            "one-source",
+            "laptop",
+            &format!("token-{index}"),
+            &format!("poll-{index}"),
+        )
+        .await;
+    }
+    assert!(
+        matches!(
+            identity
+                .begin_device_login(
+                    "one-source",
+                    "laptop",
+                    &digest("one-too-many"),
+                    &digest("poll-too-many"),
+                )
+                .await,
+            Err(IdentityError::TooManyPending)
+        ),
+        "one source cannot fill the waiting queue"
+    );
+    // Another source still has room.
+    start_device_login(&identity, "other-source", "desktop", "token-ok", "poll-ok").await;
 }

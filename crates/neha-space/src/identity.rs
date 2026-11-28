@@ -108,6 +108,27 @@ pub enum PairingState {
     },
 }
 
+/// What a CLI learns when a device login starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeviceLoginStart {
+    /// The device identifier the CLI polls with.
+    pub device: String,
+    /// The code a signed-in User enters.
+    pub code: String,
+}
+
+/// What a CLI learns when it polls its device login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DeviceLoginState {
+    /// No User approved this CLI yet.
+    Pending,
+    /// A User approved this CLI, and the token is now a session.
+    Approved {
+        /// The account that approved the terminal.
+        account: Account,
+    },
+}
+
 /// What the Space knows about a pairing before a User approves it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PairingRequest {
@@ -334,6 +355,110 @@ impl Identity {
         code: &str,
     ) -> Result<Option<PairingRequest>, IdentityError> {
         self.pairing_request_at(now(), code).await
+    }
+
+    /// Starts a device login for a CLI without a session.
+    ///
+    /// The CLI generated its token and polling secret and keeps them; the
+    /// Space stores only their digests. The returned device identifier and
+    /// code appear once, and a signed-in User approves the code on any client.
+    pub async fn begin_device_login(
+        &self,
+        source: &str,
+        client: &str,
+        token_hash: &[u8],
+        poll_hash: &[u8],
+    ) -> Result<DeviceLoginStart, IdentityError> {
+        self.begin_device_login_at(now(), source, client, token_hash, poll_hash)
+            .await
+    }
+
+    /// Returns the state a CLI polls its device login for.
+    ///
+    /// `None` means the device or secret is unknown, or the login expired
+    /// before a User approved it. An approved login answers until its code
+    /// expiry; the session token itself follows the ordinary token lifetime.
+    pub async fn device_login(
+        &self,
+        device: &str,
+        poll_secret: &str,
+    ) -> Result<Option<DeviceLoginState>, IdentityError> {
+        self.device_login_at(now(), device, poll_secret).await
+    }
+
+    /// Approves a CLI's device code as the signed-in User.
+    ///
+    /// One transaction claims the unexpired code, binds it to the User, records
+    /// the command identifier (so a retry can answer the same account), and
+    /// inserts the CLI's token hash. A token already in use is refused without
+    /// rebinding the code or the other session.
+    pub async fn approve_device_login(
+        &self,
+        code: &str,
+        owner: Id,
+        command: Id,
+    ) -> Result<Account, IdentityError> {
+        self.approve_device_login_at(now(), code, owner, command)
+            .await
+    }
+
+    /// Returns the account a device approval bound to this command, when the
+    /// retry names the same account and code.
+    ///
+    /// A command id is not enough: an old approval must not answer a different
+    /// User or a different code. Both are checked against the approved row, so
+    /// only the original request can replay its result.
+    pub async fn device_approval_for_command(
+        &self,
+        command: Id,
+        code: &str,
+        owner: Id,
+    ) -> Result<Option<Account>, IdentityError> {
+        let row = sqlx::query(
+            "SELECT a.id, a.display_name, a.is_admin, l.owner, l.code_hash \
+             FROM device_logins l JOIN accounts a ON a.id = l.owner \
+             WHERE l.command = ?",
+        )
+        .bind(command.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let approved_owner: String = row.try_get("owner")?;
+        if approved_owner != owner.to_string() {
+            return Ok(None);
+        }
+        let approved_code: Vec<u8> = row.try_get("code_hash")?;
+        let requested_code = digest(&normalize_code(code));
+        let matches: bool = requested_code
+            .as_slice()
+            .ct_eq(approved_code.as_slice())
+            .into();
+        if !matches {
+            return Ok(None);
+        }
+
+        Ok(Some(account_from_row(&row)?))
+    }
+
+    /// Returns the account a device approval already bound to this command.
+    ///
+    /// A command that committed its approval but did not record its result can
+    /// answer a retry from this row instead of claiming a second device login.
+    pub async fn device_login_by_command(
+        &self,
+        command: Id,
+    ) -> Result<Option<Account>, IdentityError> {
+        let row = sqlx::query(
+            "SELECT a.id, a.display_name, a.is_admin FROM device_logins l \
+             JOIN accounts a ON a.id = l.owner WHERE l.command = ?",
+        )
+        .bind(command.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.as_ref().map(account_from_row).transpose()
     }
 
     /// Claims a pairing for a User before the Computer is recorded.
@@ -703,6 +828,214 @@ impl Identity {
         computer
             .map(|computer| computer.parse().map_err(|_| IdentityError::Corrupt))
             .transpose()
+    }
+
+    async fn begin_device_login_at(
+        &self,
+        now: i64,
+        source: &str,
+        client: &str,
+        token_hash: &[u8],
+        poll_hash: &[u8],
+    ) -> Result<DeviceLoginStart, IdentityError> {
+        if token_hash.len() != 32 || poll_hash.len() != 32 {
+            return Err(IdentityError::Corrupt);
+        }
+        let device = random_base64(DEVICE_BYTES);
+        let expires_at = now.saturating_add(PAIRING_TTL_SECS.saturating_mul(1_000_000));
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result = async {
+            sqlx::query("DELETE FROM device_logins WHERE expires_at <= ? AND owner IS NULL")
+                .bind(now)
+                .execute(&mut *connection)
+                .await?;
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM device_logins WHERE owner IS NULL AND expires_at > ?",
+            )
+            .bind(now)
+            .fetch_one(&mut *connection)
+            .await?;
+            if waiting >= MAX_PENDING_PAIRINGS {
+                return Err(IdentityError::TooManyPending);
+            }
+            let from_source: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM device_logins \
+                 WHERE owner IS NULL AND expires_at > ? AND source = ?",
+            )
+            .bind(now)
+            .bind(source)
+            .fetch_one(&mut *connection)
+            .await?;
+            if from_source >= MAX_PENDING_PER_SOURCE {
+                return Err(IdentityError::TooManyPending);
+            }
+            // A code names one login. Generate until the hash is free in both
+            // the waiting and the already-approved rows; BEGIN IMMEDIATE
+            // holds the write lock, so no other start can take it meanwhile.
+            let (code, code_hash) = loop {
+                let code = random_code();
+                let code_hash = digest(&code);
+                let taken: Option<i64> =
+                    sqlx::query_scalar("SELECT 1 FROM device_logins WHERE code_hash = ? LIMIT 1")
+                        .bind(code_hash.as_slice())
+                        .fetch_optional(&mut *connection)
+                        .await?;
+                if taken.is_none() {
+                    break (code, code_hash);
+                }
+            };
+            sqlx::query(
+                "INSERT INTO device_logins (\
+                 device_id, code_hash, poll_hash, token_hash, client, source, \
+                 created_at, expires_at, tries, owner, command) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)",
+            )
+            .bind(&device)
+            .bind(code_hash.as_slice())
+            .bind(poll_hash)
+            .bind(token_hash)
+            .bind(client)
+            .bind(source)
+            .bind(now)
+            .bind(expires_at)
+            .execute(&mut *connection)
+            .await?;
+
+            Ok(code)
+        }
+        .await;
+        match result {
+            Ok(code) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(DeviceLoginStart { device, code })
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn device_login_at(
+        &self,
+        now: i64,
+        device: &str,
+        poll_secret: &str,
+    ) -> Result<Option<DeviceLoginState>, IdentityError> {
+        let row = sqlx::query(
+            "SELECT poll_hash, token_hash, owner, expires_at FROM device_logins \
+             WHERE device_id = ?",
+        )
+        .bind(device)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let poll_hash: Vec<u8> = row.try_get("poll_hash")?;
+        let matches: bool = digest(poll_secret)
+            .as_slice()
+            .ct_eq(poll_hash.as_slice())
+            .into();
+        if !matches {
+            return Ok(None);
+        }
+        let expires_at: i64 = row.try_get("expires_at")?;
+        if now >= expires_at {
+            return Ok(None);
+        }
+        let token_hash: Vec<u8> = row.try_get("token_hash")?;
+        let owner: Option<String> = row.try_get("owner")?;
+        let Some(owner) = owner else {
+            return Ok(Some(DeviceLoginState::Pending));
+        };
+        // The approval transaction inserts the token and binds the owner
+        // together. A row whose session token is gone has no approved session
+        // to hand out; the CLI keeps waiting until the code expires.
+        let account = sqlx::query(
+            "SELECT a.id, a.display_name, a.is_admin FROM tokens t \
+             JOIN accounts a ON a.id = t.account_id \
+             WHERE t.token_hash = ? AND t.account_id = ?",
+        )
+        .bind(token_hash.as_slice())
+        .bind(&owner)
+        .fetch_optional(&self.pool)
+        .await?;
+        match account {
+            Some(ref row) => Ok(Some(DeviceLoginState::Approved {
+                account: account_from_row(row)?,
+            })),
+            None => Ok(Some(DeviceLoginState::Pending)),
+        }
+    }
+
+    async fn approve_device_login_at(
+        &self,
+        now: i64,
+        code: &str,
+        owner: Id,
+        command: Id,
+    ) -> Result<Account, IdentityError> {
+        let code_hash = digest(&normalize_code(code));
+        let mut connection = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *connection)
+            .await?;
+        let result = async {
+            let updated = sqlx::query(
+                "UPDATE device_logins SET owner = ?, command = ?, tries = tries + 1 \
+                 WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
+            )
+            .bind(owner.to_string())
+            .bind(command.to_string())
+            .bind(code_hash.as_slice())
+            .bind(now)
+            .bind(MAX_CODE_TRIES)
+            .execute(&mut *connection)
+            .await?;
+            if updated.rows_affected() != 1 {
+                return Err(IdentityError::InvalidDeviceCode);
+            }
+            let token_hash: Vec<u8> =
+                sqlx::query_scalar("SELECT token_hash FROM device_logins WHERE code_hash = ?")
+                    .bind(code_hash.as_slice())
+                    .fetch_one(&mut *connection)
+                    .await?;
+            let inserted = sqlx::query(
+                "INSERT INTO tokens (token_hash, account_id, created_at) VALUES (?, ?, ?)",
+            )
+            .bind(token_hash.as_slice())
+            .bind(owner.to_string())
+            .bind(now)
+            .execute(&mut *connection)
+            .await;
+            if let Err(sqlx::Error::Database(error)) = inserted {
+                if error.is_unique_violation() {
+                    return Err(IdentityError::TokenTaken);
+                }
+                return Err(sqlx::Error::Database(error).into());
+            }
+            inserted.map_err(IdentityError::Database)?;
+            let row = sqlx::query("SELECT id, display_name, is_admin FROM accounts WHERE id = ?")
+                .bind(owner.to_string())
+                .fetch_one(&mut *connection)
+                .await?;
+            account_from_row(&row)
+        }
+        .await;
+        match result {
+            Ok(account) => {
+                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                Ok(account)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Err(error)
+            }
+        }
     }
 
     async fn begin_pairing_at(
@@ -1227,6 +1560,9 @@ pub enum IdentityError {
     /// Too many pairings are waiting for a User, globally or from one source.
     #[error("too many pairings are waiting for a User")]
     TooManyPending,
+    /// A device code is unknown, already approved, expired, or out of tries.
+    #[error("the device code is not usable")]
+    InvalidDeviceCode,
 }
 
 /// What the integration tests need from inside this module.

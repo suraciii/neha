@@ -2842,6 +2842,20 @@ export default function App() {
     }
   }
 
+  // Approves a terminal's device code, signing it in as this account.
+  async function approveDevice(code: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("device_approve", { code });
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // Revokes a Local Computer's credential. The machine's daemon stops on its
   // Revokes a Local Computer's credential. The machine's daemon stops on its
   // next answer, and the record stays listed offline until it pairs again.
   async function revokeComputer(computer: string): Promise<boolean> {
@@ -3415,6 +3429,7 @@ export default function App() {
                       onReset={(computer) => resetComputer(computer)}
                       onAdd={(code) => addComputer(code)}
                       onRevoke={(computer) => revokeComputer(computer)}
+                      onApproveDevice={(code) => approveDevice(code)}
                       onOpenBot={(bot) => openBotPage(bot)}
                       onConnect={(input) => connectVendor(input)}
                       onRefresh={(provider) => refreshProviderModels(provider)}

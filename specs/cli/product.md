@@ -26,6 +26,12 @@ A Bot's shell runs the same CLI with a short-lived run token instead of a sign-i
 
 `neha serve` starts a Space on the machine and prints its address and an invitation link. The first User opens the link in an app or a browser to become the Admin.
 
+`neha login --name <name>` signs in with a password.
+
+`neha login --device-code [--server <origin>]` signs in a terminal that cannot prompt for one: it prints a code and waits while a signed-in User approves it with `neha device approve <code>` or in the browser's Settings, Devices.
+
+The terminal saves its credential only after the approved token works for an authenticated command; a failed or cancelled sign-in leaves any saved credential unchanged.
+
 ## Providers
 
 `neha provider connect <vendor>` connects a vendor the catalog knows, with the vendor's address, protocol, and Models.

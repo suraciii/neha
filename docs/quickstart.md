@@ -303,6 +303,14 @@ target/debug/neha login --name Ada
 
 When the Space has a new address, or the saved credential is gone, pass `--server` with the API address the Space prints. Then read the old Chat again; it contains every recorded Message.
 
+On a terminal with no password prompt, sign in with a device code instead. Run `neha login --device-code --server <origin>` there, then approve the code it prints with `neha device approve <code>` on this machine, or under Settings, Devices in the browser:
+
+```bash
+target/debug/neha login --device-code --server http://127.0.0.1:7337
+```
+
+The terminal's session lasts until it signs out; closing the terminal does not end it. This milestone has no device list for removing one terminal, so keep its credential private.
+
 ## What this milestone does not do
 
 - The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Computer's Workspace root as the only place where files persist; the run starts in the Bot's own directory inside it, and Bots on the same Computer can reach each other's directories. It has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
