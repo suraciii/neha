@@ -12,7 +12,8 @@ use neha::id::Id;
 use neha_space::home::Home;
 use neha_space::identity::{
     Account, Identity, IdentityError, MAX_CODE_TRIES, MAX_LOCAL_TICKETS_PER_OWNER,
-    MAX_PENDING_PAIRINGS, PAIRING_TTL_SECS, PairingClaim, PairingRequest, PairingState,
+    MAX_PENDING_PAIRINGS, MAX_PENDING_PER_SOURCE, PAIRING_TTL_SECS, PairingClaim, PairingRequest,
+    PairingState,
 };
 use neha_space::test_support::identity::{
     CODE_ALPHABET, VERSION_ONE_STATEMENTS, VERSION_TWO_STATEMENTS, digest, pool,
@@ -340,10 +341,20 @@ async fn a_typed_code_ignores_case_and_surrounding_space() {
         .await
         .unwrap();
     let typed = format!(" {} ", start.code.to_lowercase());
-
     let request = identity.pairing_request(&typed).await.unwrap();
-
     assert!(request.is_some());
+
+    // The code is shown as XXXX-XXXX, so the dash is part of what a User may
+    // type; the hash names the eight letters alone.
+    let dashed = format!(
+        " {}-{} ",
+        start.code[..4].to_lowercase(),
+        start.code[4..].to_lowercase()
+    );
+    assert!(
+        identity.pairing_request(&dashed).await.unwrap().is_some(),
+        "a code typed with its displayed dash must work"
+    );
 }
 
 #[tokio::test]
@@ -424,71 +435,116 @@ async fn an_approved_pairing_expires_with_its_code() {
 }
 
 #[tokio::test]
-async fn a_new_pairing_evicts_the_oldest_waiting_one() {
+async fn a_full_quota_refuses_another_pairing() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
-    // Distinct starts so the oldest waiting pairing is well defined.
+    // One source may not fill the queue, so fill it one source at a time.
     let mut starts = Vec::new();
     for index in 0..MAX_PENDING_PAIRINGS {
         starts.push(
             identity
-                .test_begin_pairing_at(now + index, "laptop", "/ws", "token", "poll")
+                .test_begin_pairing_from_at(
+                    now + index,
+                    &format!("source-{index}"),
+                    "laptop",
+                    "/ws",
+                    "token",
+                    "poll",
+                )
                 .await
                 .unwrap(),
         );
     }
 
-    // A caller who never approves anything must not lock a User out: the
-    // oldest waiting pairing gives way to the new one.
-    let newest = identity
-        .test_begin_pairing_at(now + MAX_PENDING_PAIRINGS, "laptop", "/ws", "token", "poll")
+    let error = identity
+        .test_begin_pairing_from_at(
+            now + MAX_PENDING_PAIRINGS,
+            "one-more-source",
+            "laptop",
+            "/ws",
+            "token",
+            "poll",
+        )
         .await
-        .expect("a full quota evicts instead of refusing");
+        .unwrap_err();
+    assert!(
+        matches!(error, IdentityError::TooManyPending),
+        "a full queue refuses instead of evicting a waiting User"
+    );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
         .fetch_one(pool(&identity))
         .await
         .unwrap();
     assert_eq!(rows, MAX_PENDING_PAIRINGS, "the store stays bounded");
-
     assert_eq!(
         identity
             .test_pairing_at(now, &starts[0].device, "poll")
             .await
             .unwrap(),
-        None,
-        "the oldest waiting pairing is gone"
-    );
-    assert_eq!(
-        identity
-            .test_pairing_at(now, &starts[1].device, "poll")
-            .await
-            .unwrap(),
-        Some(PairingState::Pending)
-    );
-    assert_eq!(
-        identity
-            .test_pairing_at(now, &newest.device, "poll")
-            .await
-            .unwrap(),
-        Some(PairingState::Pending)
+        Some(PairingState::Pending),
+        "a refused start leaves the waiting pairings alone"
     );
 }
 
 #[tokio::test]
-async fn claimed_pairings_are_never_evicted() {
+async fn one_source_cannot_fill_the_waiting_queue() {
+    let (_dir, _home, identity) = identity().await;
+    let now = 1_000_000_i64;
+    for index in 0..MAX_PENDING_PER_SOURCE {
+        identity
+            .test_begin_pairing_from_at(
+                now + index,
+                "one-machine",
+                "laptop",
+                "/ws",
+                "token",
+                "poll",
+            )
+            .await
+            .unwrap();
+    }
+
+    let error = identity
+        .test_begin_pairing_from_at(
+            now + MAX_PENDING_PER_SOURCE,
+            "one-machine",
+            "laptop",
+            "/ws",
+            "token",
+            "poll",
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, IdentityError::TooManyPending));
+    // Another source still has room: the cap is per source, not global yet.
+    identity
+        .test_begin_pairing_from_at(now, "another-machine", "laptop", "/ws", "token", "poll")
+        .await
+        .expect("a different source is not affected by the first source's cap");
+}
+
+#[tokio::test]
+async fn a_claimed_pairing_does_not_take_a_waiting_slot() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
     let mut starts = Vec::new();
     for index in 0..MAX_PENDING_PAIRINGS {
         starts.push(
             identity
-                .test_begin_pairing_at(now + index, "laptop", "/ws", "token", "poll")
+                .test_begin_pairing_from_at(
+                    now + index,
+                    &format!("source-{index}"),
+                    "laptop",
+                    "/ws",
+                    "token",
+                    "poll",
+                )
                 .await
                 .unwrap(),
         );
     }
     // One pairing is claimed and finished: it leaves the waiting count and
-    // must survive any eviction.
+    // must survive a full queue.
     let owner = Id::new();
     let computer = Id::new();
     assert!(
@@ -497,24 +553,19 @@ async fn claimed_pairings_are_never_evicted() {
             .await
             .unwrap()
     );
-    let oldest_waiting = starts[1].device.clone();
-    // Bring the waiting count back to the cap, then one more start evicts
-    // the oldest waiting pairing; the claim is never a candidate.
-    for offset in [MAX_PENDING_PAIRINGS, MAX_PENDING_PAIRINGS + 1] {
-        identity
-            .test_begin_pairing_at(now + offset, "laptop", "/ws", "token", "poll")
-            .await
-            .unwrap();
-    }
+    // The queue has room for one more waiting pairing now.
+    identity
+        .test_begin_pairing_from_at(
+            now + MAX_PENDING_PAIRINGS,
+            "one-more-source",
+            "laptop",
+            "/ws",
+            "token",
+            "poll",
+        )
+        .await
+        .expect("a claimed pairing frees a waiting slot");
 
-    assert_eq!(
-        identity
-            .test_pairing_at(now, &oldest_waiting, "poll")
-            .await
-            .unwrap(),
-        None,
-        "an unclaimed pairing is the one evicted"
-    );
     assert_eq!(
         identity.authenticate_computer("token").await.unwrap(),
         Some(computer),
@@ -534,16 +585,23 @@ async fn claimed_pairings_are_never_evicted() {
 async fn starting_a_pairing_clears_expired_unclaimed_rows() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
-    for _ in 0..MAX_PENDING_PAIRINGS {
+    for index in 0..MAX_PENDING_PAIRINGS {
         identity
-            .test_begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .test_begin_pairing_from_at(
+                now,
+                &format!("source-{index}"),
+                "laptop",
+                "/ws",
+                "token",
+                "poll",
+            )
             .await
             .unwrap();
     }
     let later = now + PAIRING_TTL_SECS * 1_000_000;
 
     let start = identity
-        .test_begin_pairing_at(later, "laptop", "/ws", "token", "poll")
+        .test_begin_pairing_from_at(later, "new-source", "laptop", "/ws", "token", "poll")
         .await
         .expect("expired pairings stop holding the quota");
 
@@ -753,19 +811,34 @@ async fn finishing_a_claim_twice_is_idempotent() {
 async fn two_machines_starting_at_once_keep_the_store_bounded() {
     let (_dir, _home, identity) = identity().await;
     let now = 1_000_000_i64;
-    for _ in 0..MAX_PENDING_PAIRINGS - 1 {
+    for index in 0..MAX_PENDING_PAIRINGS - 1 {
         identity
-            .test_begin_pairing_at(now, "laptop", "/ws", "token", "poll")
+            .test_begin_pairing_from_at(
+                now,
+                &format!("source-{index}"),
+                "laptop",
+                "/ws",
+                "token",
+                "poll",
+            )
             .await
             .unwrap();
     }
 
     let (first, second) = tokio::join!(
-        identity.test_begin_pairing_at(now, "one", "/ws", "token", "poll"),
-        identity.test_begin_pairing_at(now, "two", "/ws", "token", "poll"),
+        identity.test_begin_pairing_from_at(now, "one", "one", "/ws", "token", "poll"),
+        identity.test_begin_pairing_from_at(now, "two", "two", "/ws", "token", "poll"),
     );
-    assert!(first.is_ok(), "{first:?}");
-    assert!(second.is_ok(), "{second:?}");
+    let accepted = usize::from(first.is_ok()) + usize::from(second.is_ok());
+    assert_eq!(
+        accepted, 1,
+        "one start fills the last slot and the other is refused: {first:?} {second:?}"
+    );
+    let refused = if first.is_err() { first } else { second };
+    assert!(
+        matches!(refused, Err(IdentityError::TooManyPending)),
+        "the queue refuses instead of growing: {refused:?}"
+    );
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")
         .fetch_one(pool(&identity))
         .await
@@ -848,22 +921,32 @@ async fn only_one_of_two_concurrent_claims_wins() {
         .begin_pairing("laptop", "/ws", "token", "poll")
         .await
         .unwrap();
-    let owner = Id::new();
+    let ada = Id::new();
+    let grace = Id::new();
     let first = Id::new();
     let second = Id::new();
 
     let (one, two) = tokio::join!(
-        identity.claim_pairing(&start.code, owner, first),
-        identity.claim_pairing(&start.code, owner, second),
+        identity.claim_pairing(&start.code, ada, first),
+        identity.claim_pairing(&start.code, grace, second),
     );
     let one = one.unwrap();
     let two = two.unwrap();
 
     assert_ne!(one, two, "one claim must lose");
-    let winner = if one { first } else { second };
+    let (winner_owner, winner) = if one { (ada, first) } else { (grace, second) };
     assert_eq!(
         identity.pairing(&start.device, "poll").await.unwrap(),
         Some(PairingState::Approved { computer: winner })
+    );
+    assert_eq!(
+        identity.pairing_claims().await.unwrap(),
+        vec![PairingClaim {
+            owner: winner_owner,
+            computer: winner,
+            finalized: true,
+        }],
+        "the code admits one User, not both"
     );
     assert_eq!(
         identity.authenticate_computer("token").await.unwrap(),
@@ -1120,9 +1203,13 @@ async fn concurrent_writers_wait_for_the_database_instead_of_erroring() {
         let polls: Vec<String> = (0..8)
             .map(|index| format!("poll-{round}-{index}"))
             .collect();
+        let sources: Vec<String> = (0..8)
+            .map(|index| format!("source-{round}-{index}"))
+            .collect();
         let starts = futures_util::future::join_all((0..8).map(|index| {
-            identity.test_begin_pairing_at(
+            identity.test_begin_pairing_from_at(
                 now,
+                &sources[index],
                 &machines[index],
                 "/ws",
                 &tokens[index],
@@ -1158,6 +1245,12 @@ async fn concurrent_writers_wait_for_the_database_instead_of_erroring() {
                     .expect("a concurrent release must wait, not fail")
             );
         }
+        // Released rows become waiting again; clear the queue so the next
+        // round exercises the same six writers, not the global cap.
+        sqlx::query("DELETE FROM computer_codes")
+            .execute(pool(&identity))
+            .await
+            .unwrap();
     }
 
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM computer_codes")

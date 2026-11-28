@@ -37,6 +37,8 @@ With the token, `neha file get <id>` and `neha chat send --file <path>` move a F
 
 A Local Computer is reached through the CLI: the binary that runs `neha computer pair` is the daemon that `neha computer run` starts.
 
+A `--space` that names a non-loopback origin pairs through the Space's code flow: the command starts the pairing, prints the Space origin and code, and polls until a signed-in User approves it. It never sends a local ticket or a saved session token to that origin.
+
 The daemon holds no record and runs the actions the Space sends with the machine's rights. [Computer](../computer/design.md#the-channel) covers the connection it makes and what crosses it.
 
 The `neha computer add`, `neha computer list`, `neha computer reset`, `neha bot create --computer`, and `neha bot move` commands are part of the command surface, and so are `neha approval` and `neha rule`.

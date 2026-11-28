@@ -56,6 +56,12 @@ use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError, PairingState};
 use crate::model::{ModelClient, ModelError};
 use crate::proxy::{self, TrustedProxies};
+
+/// How many anonymous pairing requests may wait on the record at once.
+///
+/// Starts are rare and polls are cheap; the bound protects the record's
+/// connections from an unauthenticated queue while allowing normal polling.
+const ANONYMOUS_PAIR_PERMITS: usize = 8;
 use crate::runs::RunQueue;
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
@@ -203,8 +209,13 @@ pub struct SpaceServer {
     pub(crate) instructions_only: bool,
     /// Where this Space may install a package from.
     pub(crate) plugins: crate::config::PluginsConfig,
-    /// Local-ticket pair attempts, counted per source address.
+    /// Local-ticket and device-code starts, counted per source address.
     pub(crate) pairs: Mutex<PairLimiter>,
+    /// Device-code polls, counted per source address at polling pace.
+    pub(crate) device_polls: Mutex<PairLimiter>,
+    /// Bounds anonymous pairing database work so a flood cannot queue ahead
+    /// of signed-in callers for the record's connections.
+    pub(crate) pair_work: tokio::sync::Semaphore,
     /// The ticket file this start wrote for its Admin, with its digest.
     start_ticket: Mutex<Option<crate::ticket::StartTicket>>,
     /// Set once the Space stops: no command may then start new work.
@@ -438,6 +449,8 @@ impl SpaceServer {
             instructions_only,
             plugins,
             pairs: Mutex::new(PairLimiter::default()),
+            device_polls: Mutex::new(PairLimiter::default()),
+            pair_work: tokio::sync::Semaphore::new(ANONYMOUS_PAIR_PERMITS),
             start_ticket: Mutex::new(None),
             closed: AtomicBool::new(false),
             worker_config,
@@ -2724,8 +2737,23 @@ struct PairStartRequest {
 /// polls by and the code a User enters.
 async fn computer_pair_start(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<PairStartRequest>,
 ) -> Result<Json<Value>, ApiError> {
+    // The start is unauthenticated, so its per-source bound must count the
+    // browser or machine a trusted proxy forwards for, not the proxy.
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    // A Space with only a loopback listener has no origin another machine can
+    // reach; a local caller may still exercise the flow, but a peer beyond the
+    // machine is refused. A listener beyond the machine already needs a public
+    // origin, so this refusal states the rule rather than closing a reachable
+    // path.
+    if server.public_url.is_none() && !source.is_loopback() {
+        return Err(ApiError::forbidden(
+            "pairing another machine needs a public origin on this Space",
+        ));
+    }
     let machine = request.machine.trim();
     if !is_pairing_text(machine) {
         return Err(ApiError::invalid_argument(
@@ -2733,7 +2761,7 @@ async fn computer_pair_start(
         ));
     }
     let workspace = request.workspace.trim();
-    if !Path::new(workspace).is_absolute() || !is_pairing_text(workspace) {
+    if !is_absolute_path(workspace) || !is_pairing_text(workspace) {
         return Err(ApiError::invalid_argument(
             "the workspace is not usable: it must be an absolute path of at most 256 bytes with no control characters",
         ));
@@ -2743,15 +2771,52 @@ async fn computer_pair_start(
             "the token and poll_secret must be 32 bytes of URL-safe base64",
         ));
     }
+    // The admission check runs before a database connection is taken.
+    if !server.pairs.lock().expect("pair lock").allows(source) {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing starts; wait a minute",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
     let start = server
         .identity
-        .begin_pairing(machine, workspace, &request.token, &request.poll_secret)
+        .begin_pairing_from(
+            &source.to_string(),
+            machine,
+            workspace,
+            &request.token,
+            &request.poll_secret,
+        )
         .await
         .map_err(identity_error)?;
 
-    Ok(Json(
-        serde_json::json!({"device": start.device, "code": start.code}),
-    ))
+    Ok(Json(serde_json::json!({
+        "device": start.device,
+        "code": start.code,
+        "expires_in": crate::identity::PAIRING_TTL_SECS,
+        "interval": crate::identity::PAIRING_POLL_SECS,
+    })))
+}
+
+/// Returns whether a path is absolute on the machine that sent it.
+///
+/// The Space checks a path from a machine whose platform may differ from its
+/// own: a Linux Space pairs a Windows Computer, whose Workspace starts with a
+/// drive letter or a UNC share.
+fn is_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') || value.starts_with(r"\\") {
+        return true;
+    }
+    let bytes = value.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
 }
 
 /// Returns whether a pairing field is usable: bounded, non-empty, no controls.
@@ -2767,9 +2832,76 @@ fn is_pairing_text(value: &str) -> bool {
 
 /// Returns whether a value is a 32-byte URL-safe base64 secret.
 fn is_pairing_secret(value: &str) -> bool {
-    URL_SAFE_NO_PAD
-        .decode(value)
-        .is_ok_and(|bytes| bytes.len() == 32)
+    value.len() == 43
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == 32)
+}
+
+/// Returns the canonical origin a Computer says it reaches, or `None` when
+/// the value is not an origin with no credentials or path.
+fn computer_origin(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+
+    Some(url.origin().ascii_serialization())
+}
+
+/// Refuses a local-ticket route reached through a proxy.
+///
+/// The ticket is the Space machine's own shorthand for pairing a Computer
+/// with no code. On a public origin it must not become another unauthenticated
+/// entry: a direct loopback peer must also name a local authority and carry no
+/// forwarding marker. A same-host proxy that preserves the public Host is
+/// refused even when it forgets to add a forwarded header.
+fn local_ticket_only(
+    server: &SpaceServer,
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let host = headers.get(HOST).and_then(|value| value.to_str().ok());
+    let local_authority = host.is_some_and(|host| {
+        loopback_host(host) || (server.public_url.is_none() && is_browser_authority(server, host))
+    });
+    let direct = peer.ip().is_loopback() && local_authority && !has_forwarding_marker(headers);
+    if direct {
+        return Ok(());
+    }
+
+    Err(ApiError::forbidden(
+        "the local Computer ticket is available only on the Space's machine",
+    ))
+}
+
+/// Returns whether a request carries a header a proxy adds.
+fn has_forwarding_marker(headers: &HeaderMap) -> bool {
+    [
+        "forwarded",
+        "via",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-proto",
+        "x-real-ip",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name))
+}
+
+/// Returns whether a value has the shape of a device identifier this Space
+/// issues: 16 random bytes in URL-safe base64.
+fn is_pairing_device(value: &str) -> bool {
+    value.len() == 22
+        && URL_SAFE_NO_PAD
+            .decode(value)
+            .is_ok_and(|bytes| bytes.len() == 16)
 }
 
 #[derive(Deserialize)]
@@ -2796,9 +2928,34 @@ enum PairingReply {
 /// up in proxy logs and browser history. A poll never changes the pairing.
 async fn computer_pair_poll(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     PathParams(device): PathParams<String>,
     Json(request): Json<PairPollRequest>,
 ) -> Result<Json<PairingReply>, ApiError> {
+    // An unauthenticated poll reaches the database only when both values have
+    // the shape this Space issued; a cheap refusal keeps junk from taking a
+    // connection or a read.
+    if !is_pairing_device(&device) || !is_pairing_secret(&request.secret) {
+        return Err(ApiError::not_found("no such pairing"));
+    }
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
+    if !server
+        .device_polls
+        .lock()
+        .expect("device polls lock")
+        .allows_poll(source)
+    {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairing polls; slow down",
+        ));
+    }
+    let _permit = server
+        .pair_work
+        .try_acquire()
+        .map_err(|_| ApiError::unavailable("the Space is busy with pairing; try again"))?;
     match server
         .identity
         .pairing(&device, &request.secret)
@@ -2832,8 +2989,11 @@ struct LocalTicketBody {
 /// stays in the response and is never written to the Space's home.
 async fn computer_ticket(
     State(server): State<Arc<SpaceServer>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Authed { account }: Authed,
 ) -> Result<Json<LocalTicketBody>, ApiError> {
+    local_ticket_only(&server, peer, &headers)?;
     let ticket = ticket::issue(&server.identity, account.id)
         .await
         .map_err(ticket_error)?;
@@ -2860,10 +3020,12 @@ struct PairedComputerBody {
 async fn computer_pair(
     State(server): State<Arc<SpaceServer>>,
     ConnectInfo(source): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Json(request): Json<PairTicketRequest>,
 ) -> Result<Json<PairedComputerBody>, ApiError> {
     // The ticket belongs to the Space's own machine: this route counts its
     // attempts by the direct TCP peer and never reads a forwarded header.
+    local_ticket_only(&server, source, &headers)?;
     if !server.pairs.lock().expect("pair lock").allows(source.ip()) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -3054,11 +3216,13 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
                     sandbox,
                     supports_grants,
                     supports_full_access,
+                    origin,
                 }) => Some((
                     version,
                     named,
                     sandbox,
                     hello_access(sandbox, supports_grants, supports_full_access),
+                    origin,
                 )),
                 _ => None,
             }
@@ -3068,7 +3232,7 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
     // A daemon that cannot fence its machine never runs unless the Space
     // operator explicitly opted in to unsandboxed Local Computers. A connection
     // that names another Computer would act as that Computer: both are refused.
-    let Some((version, named, sandbox, access)) = hello else {
+    let Some((version, named, sandbox, access, origin)) = hello else {
         return;
     };
     if version != CHANNEL_VERSION
@@ -3081,10 +3245,32 @@ async fn handle_computer_socket(mut socket: WebSocket, server: Arc<SpaceServer>,
         );
         return;
     }
+    // The origin reaches a Bot's shell environment; a malformed one would put
+    // a different host in front of the run token, so the handshake is refused.
+    let origin = match origin {
+        Some(value) => match computer_origin(&value) {
+            Some(origin) => Some(origin),
+            None => {
+                eprintln!("computer handshake rejected: the reported origin is not an origin");
+                return;
+            }
+        },
+        None => None,
+    };
 
     let (sink, mut stream) = socket.split();
     let (frames, mut outgoing) = mpsc::channel::<HostFrame>(computer_link::FRAME_QUEUE);
-    let link = server.links.connect(computer, frames.clone(), access);
+    // The daemon waits for this acknowledgement before it calls the channel
+    // connected and resets its retry delay. Queue it before the link is
+    // published, so a request that obtains the link cannot put an Action ahead
+    // of the greeting answer.
+    frames
+        .send(HostFrame::Welcome)
+        .await
+        .expect("the fresh channel queue accepts its first frame");
+    let link = server
+        .links
+        .connect_with_origin(computer, frames.clone(), access, origin);
     // When a Computer reconnects, it replaces its old link and this handler
     // must stop: the Space already failed the old link's requests, and two
     // readers acting as one Computer would race each other.
@@ -4059,6 +4245,11 @@ pub(crate) fn identity_error(error: IdentityError) -> ApiError {
             ErrorCode::Unauthorized,
             "invalid credentials",
         ),
+        IdentityError::TooManyPending => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            ErrorCode::RateLimited,
+            "too many pairings are waiting; try again later",
+        ),
         other => ApiError::internal(other.to_string()),
     }
 }
@@ -4806,5 +4997,13 @@ mod tests {
         // Two flows never share a name, so one flow's binding is another's
         // never to write or clear.
         assert_ne!(name, super::sign_in_cookie_name(Id::new()));
+    }
+    #[test]
+    fn a_workspace_path_may_come_from_another_platform() {
+        assert!(super::is_absolute_path("/home/ada/.neha/workspace"));
+        assert!(super::is_absolute_path(r"C:\Users\ada\neha\workspace"));
+        assert!(super::is_absolute_path(r"\\server\share\workspace"));
+        assert!(!super::is_absolute_path("relative/workspace"));
+        assert!(!super::is_absolute_path("C:relative"));
     }
 }

@@ -335,9 +335,9 @@ enum MemoryCommand {
 
 #[derive(Subcommand)]
 enum ComputerCommand {
-    /// Pair this machine with the Space on this machine.
+    /// Pair this machine with a Space, on this machine or another.
     Pair {
-        /// The Space URL; defaults to the ticket file's or the saved Space's.
+        /// The Space URL; a remote https origin pairs with a device code.
         #[arg(long)]
         space: Option<String>,
         /// The ticket file; defaults to a Space ticket under the Neha
@@ -1191,29 +1191,24 @@ fn normalized_grant(path: &std::path::Path) -> Result<String> {
     })
 }
 
-/// Checks one grant path and returns the canonical path to store.
+/// Checks one grant path and returns it in the form the Space records.
 ///
-/// The folder must exist: the Computer opens it as a write root, and a grant
-/// for a folder nobody can see would silently write nowhere.
+/// The folder may be on another machine, so this client checks only the
+/// syntax: it cannot see whether the path exists or what it resolves to. The
+/// Computer resolves the folder when it opens the write root, and a grant for
+/// a folder that is not there fails the action that uses it.
 fn checked_grant(path: &std::path::Path) -> Result<String> {
-    let granted = normalized_grant(path)?;
-    let folder = std::fs::canonicalize(&granted)
-        .with_context(|| format!("the grant folder does not exist: {granted}"))?;
-    if !folder.is_dir() {
-        bail!("a grant must be a folder: {}", folder.display());
-    }
-
-    Ok(folder.to_string_lossy().into_owned())
+    normalized_grant(path)
 }
 
 /// Returns the folder a revoke names, preferring the path the record shows.
 ///
-/// A grant stores a folder's canonical path. The argument is compared as the
-/// User spelled it first, without trimming anything: a directory name that
-/// ends in a space keeps it, so `logs ` cannot take the grant for `logs`. Only
-/// after that does the raw path get normalized at the edge and resolved as a
-/// live alias — the same argument then removes the grant a symlink path added
-/// — and a path that is gone is matched by the value the record holds.
+/// A grant may name a folder on another machine, so this client compares the
+/// argument with the record's paths and never resolves it against this
+/// machine's filesystem. The argument is compared as the User spelled it
+/// first, without trimming anything: a directory name that ends in a space
+/// keeps it, so `logs ` cannot take the grant for `logs`. Only after that does
+/// the raw path get normalized at the edge.
 fn revocable_grant(path: &std::path::Path, shown: &[String]) -> Result<String> {
     let spelled = path.to_string_lossy();
     // The exact spelling, keeping every component. A path that is not a
@@ -1227,15 +1222,8 @@ fn revocable_grant(path: &std::path::Path, shown: &[String]) -> Result<String> {
     if let Some(recorded) = recorded_grant(shown, &normalized) {
         return Ok(recorded);
     }
-    let Ok(alias) = std::fs::canonicalize(&normalized) else {
-        return Ok(normalized);
-    };
-    let alias = alias.to_string_lossy().into_owned();
-    if let Some(recorded) = recorded_grant(shown, &alias) {
-        return Ok(recorded);
-    }
 
-    Ok(alias)
+    Ok(normalized)
 }
 
 /// Returns the recorded grant that names one folder, if the Bot has it.

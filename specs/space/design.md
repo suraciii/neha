@@ -25,6 +25,14 @@ A loopback peer is trusted as the Space's own machine. An operator MAY name othe
 
 It counts sign-in limits for that address; a request from any other peer is counted by its own address.
 
+## Pairing
+
+A machine pairs with a Space by polling it: the machine starts a pairing and shows a code, and a signed-in User enters that code on any client. The Space bounds how many pairings wait and how many one source starts; a full queue refuses a new start.
+
+A Computer the Space creates from a pairing takes the machine name the pairing carried and belongs to the User who approved it. The Space publishes the Computer only after the machine's token is final, so a crash between the two is reconciled on the next start rather than publishing a pairing the machine cannot use.
+
+A local ticket route answers only a direct loopback request with no forwarded header, so a public origin does not expose it.
+
 ## Storage
 
 A Space keeps its record in one SQLite database on the Space's machine.

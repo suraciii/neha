@@ -10,10 +10,31 @@ use neha::surface::PROTOCOL_VERSION;
 use tokio_tungstenite::tungstenite::Message;
 
 use neha_app::client::test_support::{
-    disposition_name, pair_body, pair_url, read_for_upload, socket_url, ticket_url,
+    disposition_name, pair_body, pair_url, pairing_code, read_for_upload, socket_url, ticket_url,
     wait_for_run_within,
 };
-use neha_app::client::{Credential, PairedComputer, SignedIn, pair_with_ticket, request_ticket};
+use neha_app::client::{
+    Credential, PairedComputer, PairingPoll, SignedIn, StartedPairing, pair_with_ticket,
+    poll_pairing, request_ticket, start_pairing,
+};
+use neha_app::computer::test_support::wait_for_remote_approval;
+
+#[test]
+fn a_pairing_code_accepts_every_letter_the_space_issues() {
+    // The Space's alphabet keeps 8 and 9; a validator that stopped at 7 would
+    // reject about 40% of valid codes before showing them.
+    for code in [
+        "ABCDEFGH",
+        "AB8D9FGH",
+        "23456789",
+        "ABCDEFGH".to_owned().as_str(),
+    ] {
+        assert_eq!(pairing_code(code).unwrap(), code);
+    }
+    for code in ["ABCDEFG1", "ABCDEFG0", "ABCDEFGI", "ABCDEFGO", "abcDEFGH"] {
+        assert!(pairing_code(code).is_err(), "{code} must be refused");
+    }
+}
 
 #[test]
 fn a_public_origin_uses_wss() {
@@ -255,6 +276,167 @@ async fn redirecting_space(
     });
 
     (address, task)
+}
+
+const FAKE_DEVICE: &str = "AAAAAAAAAAAAAAAAAAAAAA";
+const FAKE_COMPUTER: &str = "01890a5d-ac96-774b-bcce-b302099a8057";
+
+/// Serves one remote pairing: a start, then pending, approved, and gone polls.
+async fn fake_remote_pairing() -> String {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::{Path, State};
+    use axum::response::{IntoResponse as _, Response};
+    use axum::{Json, Router, routing::post};
+
+    async fn start(Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+        assert_eq!(body["machine"], "laptop");
+        assert_eq!(body["workspace"], "/home/ada/neha");
+        assert_eq!(body["token"], "machine-token");
+        assert_eq!(body["poll_secret"], "poll-secret");
+        Json(serde_json::json!({
+            "device": FAKE_DEVICE,
+            "code": "ABCDEFGH",
+            "expires_in": 600,
+            "interval": 1,
+        }))
+    }
+
+    async fn poll(
+        State(polls): State<Arc<Mutex<usize>>>,
+        Path(device): Path<String>,
+        Json(body): Json<serde_json::Value>,
+    ) -> Response {
+        assert_eq!(device, FAKE_DEVICE);
+        assert_eq!(body["secret"], "poll-secret");
+        let mut polls = polls.lock().unwrap();
+        *polls += 1;
+        match *polls {
+            1 => Json(serde_json::json!({"state": "pending"})).into_response(),
+            2 => Json(serde_json::json!({
+                "state": "approved",
+                "computer": FAKE_COMPUTER,
+            }))
+            .into_response(),
+            _ => (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"code": "not_found"})),
+            )
+                .into_response(),
+        }
+    }
+
+    let app = Router::new()
+        .route("/api/computers/pair", post(start))
+        .route("/api/computers/pair/{device}", post(poll))
+        .with_state(Arc::new(Mutex::new(0_usize)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the fake Space listens");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    base
+}
+
+/// Serves a poll that fails once, reports pending once, then approves.
+async fn flaky_pairing() -> String {
+    use std::sync::{Arc, Mutex};
+
+    use axum::Json;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::{IntoResponse as _, Response};
+    use axum::routing::post;
+
+    async fn poll(
+        State(polls): State<Arc<Mutex<usize>>>,
+        Json(_): Json<serde_json::Value>,
+    ) -> Response {
+        let mut polls = polls.lock().unwrap();
+        *polls += 1;
+        match *polls {
+            1 => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            2 => Json(serde_json::json!({"state": "pending"})).into_response(),
+            _ => Json(serde_json::json!({
+                "state": "approved",
+                "computer": "01890a5d-ac96-774b-bcce-b302099a8057",
+            }))
+            .into_response(),
+        }
+    }
+
+    let app = Router::new()
+        .route("/api/computers/pair/{device}", post(poll))
+        .with_state(Arc::new(Mutex::new(0_usize)));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the fake Space listens");
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    base
+}
+
+#[tokio::test]
+async fn a_transient_poll_failure_is_retried_until_approval() {
+    let space = flaky_pairing().await;
+    let started = StartedPairing {
+        device: "device-1".to_owned(),
+        code: "ABCDEFGH".to_owned(),
+        expires_in: 30,
+        interval: 1,
+    };
+
+    let approved = wait_for_remote_approval(&space, &started, "poll-secret")
+        .await
+        .expect("a failed poll must not lose a later approval");
+
+    assert_eq!(approved, "01890a5d-ac96-774b-bcce-b302099a8057");
+}
+
+#[tokio::test]
+async fn a_remote_pairing_starts_polls_and_notices_when_it_is_gone() {
+    let space = fake_remote_pairing().await;
+    let started = start_pairing(
+        &space,
+        "laptop",
+        "/home/ada/neha",
+        "machine-token",
+        "poll-secret",
+    )
+    .await
+    .unwrap();
+    assert_eq!(started.device, FAKE_DEVICE);
+    assert_eq!(started.code, "ABCDEFGH");
+    assert_eq!(started.expires_in, 600);
+    assert_eq!(started.interval, 1);
+
+    assert_eq!(
+        poll_pairing(&space, &started.device, "poll-secret")
+            .await
+            .unwrap(),
+        PairingPoll::Pending
+    );
+    assert_eq!(
+        poll_pairing(&space, &started.device, "poll-secret")
+            .await
+            .unwrap(),
+        PairingPoll::Approved {
+            computer: FAKE_COMPUTER.to_owned()
+        }
+    );
+    assert_eq!(
+        poll_pairing(&space, &started.device, "poll-secret")
+            .await
+            .unwrap(),
+        PairingPoll::Gone
+    );
 }
 
 #[tokio::test]

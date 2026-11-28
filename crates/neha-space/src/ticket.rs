@@ -36,6 +36,9 @@ pub const TICKET_TTL: Duration = Duration::from_secs(600);
 
 /// The most pairing attempts one address may make per minute.
 pub const MAX_PAIR_ATTEMPTS: usize = 10;
+/// One machine polls about thirty times a minute; allow several machines
+/// behind one forwarded address without making polls free.
+const MAX_POLL_ATTEMPTS: usize = 120;
 
 /// The most addresses the pairing limit remembers at once.
 pub const MAX_PAIR_PEERS: usize = 1024;
@@ -283,8 +286,18 @@ pub struct PairLimiter {
 }
 
 impl PairLimiter {
+    /// Records one device-code poll; false when this address is over its
+    /// per-minute polling quota.
+    pub fn allows_poll(&mut self, peer: IpAddr) -> bool {
+        self.allows_with(peer, MAX_POLL_ATTEMPTS)
+    }
+
     /// Records an attempt; false when this address is over its minute quota.
     pub fn allows(&mut self, peer: IpAddr) -> bool {
+        self.allows_with(peer, MAX_PAIR_ATTEMPTS)
+    }
+
+    fn allows_with(&mut self, peer: IpAddr, limit: usize) -> bool {
         let now = Instant::now();
         if self.attempts.len() >= MAX_PAIR_PEERS / 2 {
             self.attempts.retain(|_, attempts| {
@@ -305,7 +318,7 @@ impl PairLimiter {
         }
         let attempts = self.attempts.entry(peer).or_default();
         prune(attempts, now);
-        if attempts.len() >= MAX_PAIR_ATTEMPTS {
+        if attempts.len() >= limit {
             return false;
         }
         attempts.push_back(now);

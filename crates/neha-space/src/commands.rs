@@ -7503,7 +7503,7 @@ async fn computer_add(
     // Only a refused code stays counted as a failure; a successful approval,
     // or a lookup that failed for a reason the User did not cause, frees the
     // place at once.
-    let (workspace, computer) = match approve_pairing(context, account, &code).await {
+    let (machine, workspace, computer) = match approve_pairing(context, account, &code).await {
         Ok(approved) => {
             context.pairings.lock().await.settle(account.id, false);
             approved
@@ -7548,7 +7548,7 @@ async fn computer_add(
             "owner": account.id,
             "kind": "local",
             "workspace": workspace,
-            "name": "Computer",
+            "name": machine,
             "sharing": "shared",
             "space": false,
         }),
@@ -7562,7 +7562,7 @@ async fn computer_add(
         kind: "local".to_owned(),
         online: false,
         workspace,
-        name: "Computer".to_owned(),
+        name: machine,
         sharing: ComputerSharing::Shared,
         space: false,
         supports_grants: true,
@@ -7613,15 +7613,17 @@ async fn computer_add(
 
 /// Looks a pairing code up and claims it for this User.
 ///
-/// Returns the machine's workspace and the Computer identifier the command will
-/// record. A code that is unknown, expired, used, or out of tries is refused
-/// with the same message so the caller learns nothing about it.
+/// Returns the machine's name and workspace and the Computer identifier the
+/// command will record. A code that is unknown, expired, used, or out of tries
+/// is refused with the same message so the caller learns nothing about it.
 async fn approve_pairing(
     context: &CommandContext<'_>,
     account: &Account,
     code: &str,
-) -> Result<(String, Id), ApiError> {
-    let Some(PairingRequest { workspace, .. }) = context
+) -> Result<(String, String, Id), ApiError> {
+    let Some(PairingRequest {
+        machine, workspace, ..
+    }) = context
         .identity
         .pairing_request(code)
         .await
@@ -7639,7 +7641,7 @@ async fn approve_pairing(
         return Err(invalid_pairing_code());
     }
 
-    Ok((workspace, computer))
+    Ok((machine, workspace, computer))
 }
 
 /// Returns the Computers a User owns, in creation order.
@@ -8998,6 +9000,7 @@ fn bot_environment(
     state: &Mutex<State>,
     pending: &PendingRun,
     workers: bool,
+    links: &ComputerLinks,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let mut state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
     let Some(url) = state.url.clone() else {
@@ -9015,13 +9018,19 @@ fn bot_environment(
     // names. The deployment gives both an internal origin and the public Host
     // the guard expects. A Local Computer on the same Space keeps the origin
     // its daemon can reach.
-    let worker_hosted = workers
-        && state
-            .computers
-            .get(&pending.computer)
-            .is_some_and(|computer| computer.kind == "hosted");
+    let kind = state
+        .computers
+        .get(&pending.computer)
+        .map(|computer| computer.kind.clone());
+    let worker_hosted = workers && kind.as_deref() == Some("hosted");
     let url = if worker_hosted {
         std::env::var("NEHA_BOT_SPACE_URL").unwrap_or(url)
+    } else if kind.as_deref() == Some("local") {
+        // A Local Computer may be on another machine: its daemon reports the
+        // origin it reaches, and a shell command must use that origin rather
+        // than the Space's own listening address. A process-local Hosted
+        // Computer runs inside the Space and never reports an origin.
+        links.origin(pending.computer).unwrap_or(url)
     } else {
         url
     };
@@ -9140,7 +9149,7 @@ async fn finish_run_with(
     let mut base_usage = base_usage;
     let mut start_step = None;
     let computer = pending.computer;
-    let bot_env = bot_environment(state, &pending, links.hosted_workers())?;
+    let bot_env = bot_environment(state, &pending, links.hosted_workers(), links)?;
     let secret = bot_env
         .iter()
         .find(|(key, _)| key == "NEHA_BOT_TOKEN")

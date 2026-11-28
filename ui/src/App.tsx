@@ -2826,6 +2826,22 @@ export default function App() {
     }
   }
 
+  // Adds a Local Computer whose machine printed a pairing code. The code is
+  // entered on any signed-in client; the machine keeps polling until this
+  // answer records its Computer.
+  async function addComputer(code: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command<Computer>("computer_add", { code });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
   // Opens one Bot's page from a Computer in the Settings surface, leaving the
   // Settings where Back returns to.
   function openBotPage(bot: Bot) {
@@ -3382,6 +3398,7 @@ export default function App() {
                       onCreate={(input) => createComputer(input)}
                       onShare={(computer) => shareComputer(computer)}
                       onReset={(computer) => resetComputer(computer)}
+                      onAdd={(code) => addComputer(code)}
                       onOpenBot={(bot) => openBotPage(bot)}
                       onConnect={(input) => connectVendor(input)}
                       onRefresh={(provider) => refreshProviderModels(provider)}

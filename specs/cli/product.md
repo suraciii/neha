@@ -75,11 +75,11 @@ The credential comes from `NEHA_MCP_TOKEN` or a sign-in the command opens in the
 
 ## Computers
 
-A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space. On the Space's own machine it uses the ticket the Space wrote; on another machine it uses a pairing code a signed-in User enters.
+A Local Computer runs the CLI. `neha computer pair` joins a Local Computer to the Space.
 
-In this milestone the Space listens only on loopback, so `neha computer pair` accepts only loopback; the code path arrives with public deployment.
+On the Space's own machine it uses the ticket the Space wrote. On another machine it takes `--space <https origin>`, starts a pairing, prints a pairing code, and waits until a signed-in User enters that code in an app or a browser. A local ticket and a saved session are never sent to that origin.
 
-On the Space's own machine it finds the startup ticket under Neha's configuration directory; on another machine the signed-in User's code names the Space. Either way it pairs the Space the ticket or code names.
+On the Space's own machine it finds the startup ticket under Neha's configuration directory; on another machine `--space` names the Space and the code the machine prints admits it. Either way it pairs the Space the ticket or code names.
 
 `--ticket-file` names another file. `neha computer run` starts the machine again after a stop.
 
@@ -113,7 +113,9 @@ A Hosted Bot has no file access to change: it starts in its own directory inside
 
 The access commands below change a Local Bot's file access. Only the Bot's owner can change it, and the next run uses the new access. A Hosted Bot refuses a file-access change because its Workspace is its only write range.
 
-`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer when the owner grants it; a revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
+`neha bot grant <bot> <path>` adds write access to one folder, and `neha bot revoke <bot> <path>` takes that access away. The folder MUST exist on the Local Computer, which resolves the absolute path when it opens the write root; the client that grants it does not need to hold that folder.
+
+A revoke matches the path `neha bot access` shows, so it also removes a grant whose folder is gone.
 
 A revoke compares the path exactly as the owner spelled it first: a name that ends in a space takes the grant for that name.
 

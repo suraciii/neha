@@ -2645,27 +2645,41 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     let credential = computer.credential.clone();
     let bot = computer.bot.clone();
 
-    // A grant names a folder that exists: a relative path, a `..` climb, and a
-    // folder nobody created are all refused.
+    // A grant names an absolute folder: a relative path and a `..` climb are
+    // refused. The client does not check this machine's filesystem, because
+    // the folder belongs to the Computer that runs the Bot.
     let shared = base.join("shared");
     std::fs::create_dir(&shared).unwrap();
     let shared_path = shared.to_str().unwrap().to_owned();
-    let bad = [
-        "shared".to_owned(),
-        format!("{shared_path}/../shared"),
-        base.join("missing").to_str().unwrap().to_owned(),
-    ];
+    let bad = ["shared".to_owned(), format!("{shared_path}/../shared")];
     for bad in &bad {
         let refused = cli(&home, &credential, &["bot", "grant", &bot, bad]);
         assert!(!refused.status.success(), "accepted {bad}");
         let stderr = String::from_utf8_lossy(&refused.stderr);
         assert!(
-            stderr.contains("absolute")
-                || stderr.contains("`..`")
-                || stderr.contains("does not exist"),
+            stderr.contains("absolute") || stderr.contains("`..`"),
             "{bad}: stderr: {stderr}"
         );
     }
+
+    // A folder that is not on the client's machine is still a valid grant:
+    // the Computer resolves it when it opens the write root.
+    let elsewhere = base.join("on-the-computer");
+    let elsewhere_path = elsewhere.to_str().unwrap().to_owned();
+    let granted_elsewhere = run(&home, &credential, &["bot", "grant", &bot, &elsewhere_path]);
+    assert!(
+        granted_elsewhere.contains(&format!("grant {elsewhere_path}")),
+        "{granted_elsewhere}"
+    );
+    let revoked_elsewhere = run(
+        &home,
+        &credential,
+        &["bot", "revoke", &bot, &elsewhere_path],
+    );
+    assert!(
+        !revoked_elsewhere.contains(&format!("grant {elsewhere_path}")),
+        "{revoked_elsewhere}"
+    );
 
     // The first grant is stored, and the Bot reports it.
     let granted = run(&home, &credential, &["bot", "grant", &bot, &shared_path]);
@@ -2715,21 +2729,18 @@ fn a_bot_owner_manages_file_access_from_the_cli() {
     let access = run(&home, &credential, &["bot", "access", &bot]);
     assert!(access.contains("full access: off"), "{access}");
 
-    // A symlink names the folder it points at: a grant stores the canonical
-    // folder, and revoking the same symlink takes that grant away.
+    // A symlink on this machine is just a path: the grant stores the path as
+    // typed, because the folder it names may be on the Computer, and revoking
+    // the same path takes that grant away.
     let real = base.join("real-folder");
     std::fs::create_dir(&real).unwrap();
     let link = base.join("linked-folder");
     std::os::unix::fs::symlink(&real, &link).unwrap();
-    let canonical = std::fs::canonicalize(&real).unwrap();
-    let symlinked = run(
-        &home,
-        &credential,
-        &["bot", "grant", &bot, link.to_str().unwrap()],
-    );
+    let link_path = link.to_str().unwrap().to_owned();
+    let symlinked = run(&home, &credential, &["bot", "grant", &bot, &link_path]);
     assert!(
-        symlinked.contains(&format!("grant {}", canonical.display())),
-        "a grant stores the folder a symlink names: {symlinked}"
+        symlinked.contains(&format!("grant {link_path}")),
+        "a grant stores the path as typed: {symlinked}"
     );
     let revoked = run(
         &home,
