@@ -19,7 +19,8 @@ use axum::extract::rejection::{BytesRejection, FailedToBufferBody, QueryRejectio
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, FromRequestParts, Query, Request, State};
 use axum::http::header::{
-    AUTHORIZATION, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN, SET_COOKIE,
+    AUTHORIZATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, HOST, ORIGIN,
+    SET_COOKIE,
 };
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
@@ -33,7 +34,7 @@ use futures_util::{SinkExt, StreamExt};
 use neha::error::ErrorCode;
 use neha::file::MAX_FILE_BYTES;
 use neha::id::Id;
-use neha::record::{Author, EventDraft, EventKind};
+use neha::record::{Author, EventDraft, EventKind, McpScope};
 use neha::surface::{ClientFrame, CommandCall, MAX_FRAME_BYTES, PROTOCOL_VERSION, ServerFrame};
 use neha_computer::channel::{CHANNEL_VERSION, DeviceFrame, HostFrame, MAX_CHANNEL_FRAME_BYTES};
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,84 @@ const COMPUTER_PING: Duration = Duration::from_secs(15);
 /// How long a Computer may stay silent before the channel is dropped.
 const COMPUTER_IDLE: Duration = Duration::from_secs(60);
 
+/// How long a browser sign-in stays usable, in seconds.
+///
+/// The browser flow is a person's walk through an authorization server; ten
+/// minutes covers it without leaving a state token acceptable for long.
+pub(crate) const SIGN_IN_TTL: Duration = Duration::from_secs(600);
+
+/// The fixed explanation a sign-in the person cancelled or the authority
+/// refused reports.
+pub(crate) const SIGN_IN_CANCELLED: &str = "the sign-in was cancelled or refused";
+
+/// The fixed explanation a sign-in whose exchange did not finish reports.
+pub(crate) const SIGN_IN_INCOMPLETE: &str = "the sign-in could not be completed";
+
+/// The fixed explanation an unknown or expired sign-in reports.
+pub(crate) const SIGN_IN_EXPIRED: &str = "the sign-in expired or is unknown";
+
+/// The fixed explanation a browser sign-in a newer one replaced reports.
+///
+/// The Space keeps one pending browser flow per account: a second start
+/// supersedes the first, whose callback then finds its state refused and whose
+/// poll reads this sentence.
+pub(crate) const SIGN_IN_REPLACED: &str = "a newer sign-in replaced this one";
+
+/// The prefix of the cookie that binds a browser flow to its browser.
+///
+/// The sign-in's id is appended to the name (see [`sign_in_cookie_name`]), so
+/// one flow's binding is only ever written or cleared by that flow's own
+/// steps.
+const SIGN_IN_COOKIE_PREFIX: &str = "neha_signin";
+
+/// The most browser sign-ins one Space keeps at once.
+pub(crate) const MAX_PENDING_SIGN_INS: usize = 64;
+
+/// A browser sign-in the Space is waiting on.
+pub(crate) struct PendingSignIn {
+    /// The account that started it, and the only account that may read it.
+    pub account: Id,
+    /// An existing server it attaches a credential to; `None` registers a new
+    /// one when it finishes.
+    pub server: Option<Id>,
+    /// The name a new server takes.
+    pub name: Option<String>,
+    /// The address the sign-in speaks to.
+    pub url: String,
+    /// Where the credential belongs.
+    pub scope: McpScope,
+    /// The browser flow the OAuth client planned.
+    pub plan: crate::oauth::SignInPlan,
+    /// The random value the initiating browser's cookie must return.
+    pub nonce: String,
+    /// Whether a command line owns the redirect instead of the browser
+    /// callback.
+    pub cli: bool,
+    /// When the client asked for the sign-in.
+    pub created_at: Instant,
+    /// What the client polls.
+    pub status: SignInStatus,
+}
+
+/// What became of a browser sign-in.
+pub(crate) enum SignInStatus {
+    /// The browser has not answered yet.
+    Pending,
+    /// A callback or command line finish admitted the flow and is exchanging
+    /// its code; the sign-ins lock is not held while the token endpoint runs.
+    Executing,
+    /// The credential is in the Vault and the record holds the server.
+    Finished {
+        /// The connected server.
+        server: Id,
+    },
+    /// The sign-in did not finish.
+    Failed {
+        /// A fixed explanation the client may show.
+        reason: String,
+    },
+}
+
 /// A Space ready to answer clients.
 pub struct SpaceServer {
     pub(crate) home: Home,
@@ -126,6 +205,20 @@ pub struct SpaceServer {
     browser_host: String,
     /// The public https origin a trusted TLS proxy forwards to this Space.
     public_url: Option<String>,
+    /// The browser sign-ins the Space is waiting on, by sign-in.
+    ///
+    /// Lock order: a sign-in's token request runs outside every lock, but its
+    /// commit holds this mutex across the admission re-check and the Vault and
+    /// record writes, taking the library lock inside it. `mcp_sign_in_start`
+    /// holds [`signin_start`](Self::signin_start) and then this mutex and never
+    /// the library, and no path takes the library before this mutex.
+    pub(crate) signins: tokio::sync::Mutex<HashMap<Id, PendingSignIn>>,
+    /// Serializes the start of one sign-in: a redelivered command waits for
+    /// the delivery already planning, then reads the recorded answer instead
+    /// of planning a second flow and a second external registration.
+    pub(crate) signin_start: tokio::sync::Mutex<()>,
+    /// The OAuth client that plans and finishes a browser sign-in.
+    pub(crate) oauth: crate::oauth::OAuthClient,
 }
 
 impl SpaceServer {
@@ -211,7 +304,33 @@ impl SpaceServer {
             session_cookie,
             browser_host,
             public_url,
+            signins: tokio::sync::Mutex::new(HashMap::new()),
+            signin_start: tokio::sync::Mutex::new(()),
+            oauth: crate::oauth::OAuthClient::new(),
         })
+    }
+
+    /// Returns the origin the browser client uses for this Space.
+    ///
+    /// A trusted TLS proxy's origin when configured, otherwise the Space's
+    /// stable browser hostname on the loopback port it bound. An authorization
+    /// server sends the browser to exactly this origin, so it must be the one
+    /// the Host guard and the session cookie name.
+    pub(crate) fn browser_origin(&self) -> String {
+        if let Some(public_url) = &self.public_url {
+            return public_url.clone();
+        }
+        let port = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|state| state.url.clone())
+            .and_then(|url| reqwest::Url::parse(&url).ok())
+            .and_then(|url| url.port());
+        match port {
+            Some(port) => format!("http://{}:{port}", self.browser_host),
+            None => format!("http://{}", self.browser_host),
+        }
     }
 
     /// Returns the lock that serializes uploads in one Chat.
@@ -267,6 +386,8 @@ impl SpaceServer {
                 post(bot_file_upload).layer(DefaultBodyLimit::max(MAX_FILE_BYTES as usize)),
             )
             .route("/api/bot/files/{id}", get(bot_file_download))
+            .route("/api/mcp/signin/bind", get(mcp_sign_in_bind))
+            .route("/api/mcp/signin/{key}/callback", get(mcp_sign_in_callback))
             .route("/api", any(api_not_found))
             .route("/api/", any(api_not_found))
             .route("/api/{*rest}", any(api_not_found));
@@ -756,6 +877,416 @@ async fn api_not_found() -> Response {
     ApiError::not_found("no such API route").into_response()
 }
 
+/// The query the bind route carries.
+#[derive(Deserialize)]
+struct SignInBindQuery {
+    /// The sign-in the start answered with.
+    sign_in: Id,
+}
+
+/// The query an authorization server returns the browser with.
+#[derive(Deserialize)]
+struct SignInCallbackQuery {
+    /// The authorization code, when the person approved.
+    #[serde(default)]
+    code: Option<String>,
+    /// The state token the plan named.
+    #[serde(default)]
+    state: Option<String>,
+    /// The authorization server's error, when it refused or failed. It is
+    /// never rendered or polled.
+    #[serde(default)]
+    error: Option<String>,
+    /// The issuer the authorization server named, when it names one here
+    /// (RFC 9207): the plan's issuer checked byte for byte.
+    #[serde(default)]
+    iss: Option<String>,
+}
+
+/// The page a finished sign-in shows.
+///
+/// The pages are fixed: the browser's history must not keep the state token,
+/// the code, or a token endpoint's error, so none of them is ever rendered.
+const SIGN_IN_FINISHED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in finished</title></head><body><h1>MCP sign-in finished</h1>\
+<p>The Space stored the credential. You can close this window and return to Neha.</p></body></html>";
+
+/// The page a sign-in that did not finish shows.
+const SIGN_IN_FAILED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in failed</title></head><body><h1>MCP sign-in failed</h1>\
+<p>The sign-in did not finish. You can close this window and try again from Neha.</p></body></html>";
+
+fn sign_in_page(status: StatusCode, page: &'static str) -> Response {
+    (
+        status,
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, "no-store"),
+        ],
+        page,
+    )
+        .into_response()
+}
+
+/// The name of the cookie that binds one browser flow to its browser.
+///
+/// The sign-in's id is part of the name, and a UUID's text is letters, digits,
+/// and hyphens, which a cookie name admits. The distinct name is what keeps two
+/// flows of one account apart: an older flow's bind answer that reaches the
+/// browser after a newer flow bound it writes its own name, so the browser
+/// keeps the newer flow's binding instead of overwriting it.
+fn sign_in_cookie_name(sign_in: Id) -> String {
+    format!("{SIGN_IN_COOKIE_PREFIX}_{sign_in}")
+}
+
+/// The cookie that binds one browser flow to the browser that started it.
+///
+/// The cookie is first-party: the bind route runs on the Space's own origin,
+/// so the authorization server's redirect carries it back. It is scoped to the
+/// sign-in paths, script cannot read it, and it lasts no longer than the flow.
+fn sign_in_cookie(sign_in: Id, nonce: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{}={nonce}; Path=/api/mcp/signin; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        sign_in_cookie_name(sign_in),
+        SIGN_IN_TTL.as_secs()
+    )
+}
+
+/// The header that clears one flow's binding once the callback consumed it.
+fn sign_in_cookie_cleared(sign_in: Id, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!(
+        "{}=; Path=/api/mcp/signin; HttpOnly; SameSite=Lax; Max-Age=0{secure}",
+        sign_in_cookie_name(sign_in)
+    )
+}
+
+/// Answers one browser step with a page that also clears the flow's binding
+/// cookie.
+fn sign_in_response(
+    server: &SpaceServer,
+    sign_in: Id,
+    status: StatusCode,
+    page: &'static str,
+) -> Response {
+    let mut response = sign_in_page(status, page);
+    if let Ok(value) = HeaderValue::from_str(&sign_in_cookie_cleared(
+        sign_in,
+        server.public_url.is_some(),
+    )) {
+        response.headers_mut().insert(SET_COOKIE, value);
+    }
+    response
+}
+
+/// Binds one browser flow to the browser that started it.
+///
+/// The route is same-origin and first-party. A page of this Space opens it
+/// with `window.open` on the Space's own origin; that is a same-site
+/// top-level navigation, so the browser sends the initiating account's
+/// `SameSite=Strict` session cookie. A browser flow requires that session and
+/// checks it is the account that started the sign-in before it sets the nonce
+/// cookie: a URL forwarded to another browser gets a generic failure page that
+/// names neither the sign-in nor the account, and nothing is set.
+///
+/// A command line flow is different: the authenticated command line is the
+/// initiator, and its finish is an authenticated command, so the browser that
+/// opens the bind URL need not be signed in to this Space (a fresh browser
+/// profile has no session at all). Such a flow binds without a session and
+/// redirects to the provider, but sets no nonce cookie: the loopback receiver
+/// and the authenticated finish are what bind the second hop, and a command
+/// line flow owns no browser binding.
+///
+/// Only a pending flow may bind. A finished, failed, replaced, or exchanging
+/// one already has or had its browser, so binding it again reads the same
+/// failure page and sets nothing: a terminal flow's bind must not displace the
+/// binding of the flow that replaced it.
+///
+/// The initiating browser's session is authenticated before the flow's record
+/// is checked, and the check and the answer are one critical section under the
+/// sign-ins lock: a flow a second start replaced while this request was
+/// authenticating is refused instead of being answered from a snapshot taken
+/// before the wait. Each flow's cookie carries its own name (see
+/// [`sign_in_cookie_name`]), so a bind answer decided just before a
+/// replacement writes only the older flow's name and cannot disturb the newer
+/// flow's binding even when the browser receives it later.
+///
+/// The authorization server's redirect back is cross-site and the callback
+/// route therefore never asks for the session cookie; the nonce cookie binds
+/// the second hop to the browser the first hop ran in.
+async fn mcp_sign_in_bind(
+    State(server): State<Arc<SpaceServer>>,
+    headers: HeaderMap,
+    Query(query): Query<SignInBindQuery>,
+) -> Response {
+    // A command line flow's browser needs no Space session, so first read which
+    // kind of flow the URL names. Only that immutable flag is read here; the
+    // whole record is read again under the lock below, after the identity
+    // lookup, so a replacement meanwhile is still seen.
+    let cli = {
+        let signins = server.signins.lock().await;
+        signins
+            .get(&query.sign_in)
+            .is_some_and(|pending| pending.cli)
+    };
+    // Authenticate the initiating browser before the flow's record is read: the
+    // identity lookup may wait, and a flow a second start replaces while it does
+    // must be refused by the check under the lock, not answered from a snapshot
+    // taken before the wait.
+    let session = if cli {
+        None
+    } else {
+        match browser_session(&server, &headers).await {
+            Some(session) => Some(session),
+            None => return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE),
+        }
+    };
+    // Decide and build the whole answer under the lock, and await nothing after
+    // releasing it: a second start cannot replace the flow between the checks
+    // and the Set-Cookie the browser receives.
+    let mut signins = server.signins.lock().await;
+    commands::sweep_sign_ins(&mut signins);
+    // An unknown or expired sign-in and a foreign browser all read the same
+    // page: it names neither the sign-in nor the account.
+    let Some(pending) = signins.get(&query.sign_in) else {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    };
+    // Only a flow still waiting for its browser may bind. A flow that is
+    // exchanging, finished, failed, or replaced has already been spent (or was
+    // replaced by one whose binding this browser holds), so its bind sets no
+    // cookie.
+    if !matches!(pending.status, SignInStatus::Pending) {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    }
+    if pending.created_at.elapsed() >= SIGN_IN_TTL {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    }
+    // Only the account that started a browser flow lets its browser bind the
+    // flow. Another account learns nothing: the failure names neither the
+    // sign-in nor the account it belongs to. A command line flow's bind is
+    // authenticated by the command that started it, not by this browser.
+    if !pending.cli {
+        let Some(session) = session.as_ref() else {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        };
+        if pending.account != session.id {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+    }
+    let mut response = StatusCode::FOUND.into_response();
+    let response_headers = response.headers_mut();
+    // The nonce cookie is the browser flow's binding, and its name carries this
+    // flow's sign-in, so no other flow writes it. A command line flow sets
+    // none: it owns no browser binding.
+    if !pending.cli
+        && let Ok(cookie) = HeaderValue::from_str(&sign_in_cookie(
+            query.sign_in,
+            &pending.nonce,
+            server.public_url.is_some(),
+        ))
+    {
+        response_headers.insert(SET_COOKIE, cookie);
+    }
+    if let Ok(location) = HeaderValue::from_str(pending.plan.authorize_url.as_str()) {
+        response_headers.insert(axum::http::header::LOCATION, location);
+    }
+    if let Ok(value) = HeaderValue::from_str("no-store") {
+        response_headers.insert(CACHE_CONTROL, value);
+    }
+    response
+}
+
+/// Finishes a browser sign-in.
+///
+/// The route needs no session cookie: a browser navigation arrives from the
+/// authorization server without one. It is authenticated by the state token,
+/// by the nonce cookie the bind route set for that flow (its name carries the
+/// sign-in id, so another flow's cookie never matches), and by the issuer key
+/// in its path, so a callback forwarded to, or replayed by, another browser or
+/// addressed to another issuer's callback is refused. The state is single use
+/// and cleared before the token exchange, so a replayed callback finds nothing.
+async fn mcp_sign_in_callback(
+    State(server): State<Arc<SpaceServer>>,
+    PathParams(key): PathParams<String>,
+    headers: HeaderMap,
+    Query(query): Query<SignInCallbackQuery>,
+) -> Response {
+    let Some(state) = query.state.as_deref().filter(|state| !state.is_empty()) else {
+        return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+    };
+    // Claim the flow under the lock and copy what the exchange needs: the
+    // token endpoint wait must not hold the sign-ins.
+    let pending = {
+        let mut signins = server.signins.lock().await;
+        commands::sweep_sign_ins(&mut signins);
+        let Some(sign_in) = signins
+            .iter()
+            .find(|(_, pending)| {
+                !pending.cli && !pending.plan.state.is_empty() && pending.plan.state == state
+            })
+            .map(|(sign_in, _)| *sign_in)
+        else {
+            // An unknown or spent state names no flow. This answer may arrive
+            // in the browser a newer flow has since bound, so it must set and
+            // clear no cookie: its page must leave that binding alone.
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        };
+        // The binding cookie is read only once the flow is matched: its name is
+        // the flow's own (see [`sign_in_cookie_name`]), so one flow's cookie
+        // cannot satisfy another, and this answer clears only this flow's.
+        let cookie = cookie_token(&headers, &sign_in_cookie_name(sign_in));
+        let pending = signins
+            .get_mut(&sign_in)
+            .expect("the sign-in was just found");
+        // The redirect URI the authorization server returned to carries the
+        // issuer key the plan was discovered from. A callback under another
+        // issuer's key is a mix-up (or a wrong path): it is refused before the
+        // cookie is compared and before any code is exchanged, the flow is not
+        // spent by it, and nothing is set.
+        if key != crate::oauth::issuer_key(&pending.plan.issuer) {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+        // Only the browser the bind route gave the nonce to completes the
+        // flow; the state token alone confirms nothing about who is here. A
+        // foreign browser's request sets and clears nothing.
+        if cookie != Some(pending.nonce.as_str()) {
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+        // An expired flow is spent without being exchanged. It may have been
+        // abandoned before a newer flow was bound, so it clears no cookie
+        // either; only a flow this request claims may clear the binding.
+        if pending.created_at.elapsed() >= SIGN_IN_TTL {
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_EXPIRED.to_owned(),
+            };
+            return sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE);
+        }
+        // RFC 9207's `iss` names the authorization server that answered. An
+        // answer that names another one would hand this flow's code to the
+        // wrong issuer, and a server whose metadata advertised the parameter
+        // always names its issuer. The request matched the state and the
+        // nonce, so its failure clears the binding cookie it consumed.
+        if !commands::accepts_response_issuer(&pending.plan, query.iss.as_deref()) {
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_INCOMPLETE.to_owned(),
+            };
+            return sign_in_response(
+                &server,
+                sign_in,
+                StatusCode::BAD_REQUEST,
+                SIGN_IN_FAILED_PAGE,
+            );
+        }
+        if query.error.is_some() {
+            // The authority's own words never reach the browser or a client.
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_CANCELLED.to_owned(),
+            };
+            return sign_in_response(
+                &server,
+                sign_in,
+                StatusCode::BAD_REQUEST,
+                SIGN_IN_FAILED_PAGE,
+            );
+        }
+        if query.code.as_deref().is_none_or(|code| code.is_empty()) {
+            pending.plan.state.clear();
+            pending.status = SignInStatus::Failed {
+                reason: SIGN_IN_CANCELLED.to_owned(),
+            };
+            return sign_in_response(
+                &server,
+                sign_in,
+                StatusCode::BAD_REQUEST,
+                SIGN_IN_FAILED_PAGE,
+            );
+        }
+        // Admit the exchange: spending the state and marking the flow
+        // executing are one step under the lock, so a replayed callback finds
+        // nothing and a newer sign-in can still replace the flow while the
+        // token request runs outside the lock.
+        pending.plan.state.clear();
+        pending.status = SignInStatus::Executing;
+        commands::PendingExchange {
+            sign_in,
+            account: pending.account,
+            server: pending.server,
+            name: pending.name.clone(),
+            url: pending.url.clone(),
+            scope: pending.scope,
+            plan: pending.plan.clone(),
+        }
+    };
+    let code = query.code.as_deref().unwrap_or_default();
+    let token = match server.oauth.finish(&pending.plan, code).await {
+        Ok(token) => token,
+        Err(_) => {
+            // The token endpoint's own error is not a client's to read. A
+            // replacement that already wrote a terminal status keeps it, and
+            // this stale answer clears no cookie.
+            let owned = commands::fail_executing_sign_in(&server.signins, pending.sign_in).await;
+            return sign_in_failed_response(&server, pending.sign_in, owned);
+        }
+    };
+    if !neha::record::McpServerAdded::valid_credential(&token) {
+        let owned = commands::fail_executing_sign_in(&server.signins, pending.sign_in).await;
+        return sign_in_failed_response(&server, pending.sign_in, owned);
+    }
+    let writes = commands::SignInWrites {
+        store: &server.store,
+        state: &server.state,
+        secrets: &server.secrets,
+        library: &server.library,
+    };
+    match commands::commit_executing_sign_in(&server.signins, &pending, &token, writes).await {
+        commands::SignInCommit::Committed { events } => {
+            broadcast(&server, &events);
+            sign_in_response(
+                &server,
+                pending.sign_in,
+                StatusCode::OK,
+                SIGN_IN_FINISHED_PAGE,
+            )
+        }
+        // The record did not change, so the client reads a fixed sentence.
+        commands::SignInCommit::Failed { .. } => sign_in_response(
+            &server,
+            pending.sign_in,
+            StatusCode::BAD_REQUEST,
+            SIGN_IN_FAILED_PAGE,
+        ),
+        // A newer sign-in replaced this flow while its token was in flight:
+        // the token is discarded and no binding is cleared. The newer flow's
+        // cookie is its own name, so this answer cannot disturb it.
+        commands::SignInCommit::Discarded => {
+            sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE)
+        }
+    }
+}
+
+/// Answers a browser callback whose exchange produced no credential.
+///
+/// Only a delivery that still owns its flow clears that flow's binding cookie:
+/// a replaced flow's answer may arrive after a newer flow bound the same
+/// browser, and clearing only this flow's cookie leaves the newer flow's
+/// binding alone.
+fn sign_in_failed_response(server: &SpaceServer, sign_in: Id, owned: bool) -> Response {
+    if owned {
+        sign_in_response(
+            server,
+            sign_in,
+            StatusCode::BAD_REQUEST,
+            SIGN_IN_FAILED_PAGE,
+        )
+    } else {
+        sign_in_page(StatusCode::BAD_REQUEST, SIGN_IN_FAILED_PAGE)
+    }
+}
+
 async fn client_file(
     State(server): State<Arc<SpaceServer>>,
     headers: HeaderMap,
@@ -912,7 +1443,7 @@ async fn join(
             "is_admin": account.is_admin,
         }),
     );
-    server
+    let appended = server
         .store
         .append(AppendRequest::new(
             Id::new(),
@@ -921,6 +1452,20 @@ async fn join(
         ))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))?;
+    // The projection holds the people a row can name by their display name.
+    // The join has to reach it now, not only when a later start replays the
+    // record.
+    {
+        let mut state = server
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("the Space state is locked"))?;
+        for event in &appended.events {
+            state
+                .apply(event)
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+        }
+    }
     server.consume_invite();
 
     let account = AccountBody::from(account);
@@ -1042,6 +1587,27 @@ fn browser_request(server: &SpaceServer, headers: &HeaderMap) -> bool {
                 .and_then(|value| value.to_str().ok())
                 .is_some_and(|host| same_authority(origin, host, server.browser_scheme()))
     })
+}
+
+/// Returns the account a browser request's session cookie names, when it
+/// carries one.
+///
+/// The session cookie is first-party and `SameSite=Strict`; a browser sends it
+/// on a same-site top-level navigation, which is what `window.open` from one
+/// of this Space's pages is. Like [`Authed`], the cookie is read only when the
+/// Host names the Space's own browser hostname, so another site cannot borrow
+/// the session.
+async fn browser_session(server: &SpaceServer, headers: &HeaderMap) -> Option<Account> {
+    let browser_host = headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .and_then(split_authority)
+        .is_some_and(|(host, _)| host.eq_ignore_ascii_case(&server.browser_host));
+    if !browser_host {
+        return None;
+    }
+    let token = cookie_token(headers, &server.session_cookie)?;
+    server.identity.authenticate(token).await.ok().flatten()
 }
 
 async fn me(Authed { account }: Authed) -> Json<AccountBody> {
@@ -1926,6 +2492,10 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             events: &server.events,
                             catalog: &server.catalog,
                             plugins: &server.plugins,
+                            signins: &server.signins,
+                            signin_start: &server.signin_start,
+                            oauth: &server.oauth,
+                            browser_origin: server.browser_origin(),
                         };
                         let reset = matches!(command, CommandCall::ComputerReset { .. });
                         let outcome = commands::execute(&context, &account, id, command).await;
@@ -2197,9 +2767,21 @@ async fn catch_up(
 
 /// Returns whether one account may see an event.
 ///
-/// This milestone has no Groups: an event belongs to the User who wrote it,
-/// to the User a Bot wrote it for, or to the Space itself.
+/// This milestone has no Groups: an event belongs to the User who wrote it, to
+/// the User a Bot wrote it for, or to the Space itself. What the Space offers
+/// every member is Space-wide: a Space MCP server or skill, and the changes to
+/// them. A personal credential, a personal server, a Bot's skill, and a
+/// package's installation stay with the account they belong to. A package's
+/// removal is every account's: the payload is only the package's identifier,
+/// and a member whose open views still show the package's servers and skills
+/// must refresh when the Admin takes it away.
+///
+/// The record is what decides: an event that names no scope is a historical
+/// one, and a reader treats it the way the command surface treats a personal
+/// resource, so it never widens what an older record lets a member read.
 fn visible_to(account: Id, event: &neha::record::Event) -> bool {
+    use neha::record::EventKind;
+
     if matches!(event.author, neha::record::Author::User(author) if author == account) {
         return true;
     }
@@ -2207,10 +2789,32 @@ fn visible_to(account: Id, event: &neha::record::Event) -> bool {
         return true;
     }
 
-    matches!(
-        event.kind,
-        neha::record::EventKind::UserJoined | neha::record::EventKind::ProviderAdded
-    )
+    match event.kind {
+        EventKind::UserJoined | EventKind::ProviderAdded => true,
+        // A Space server is every member's; a personal one is its owner's.
+        EventKind::McpServerAdded => {
+            event.data.get("scope").and_then(Value::as_str) == Some("space")
+        }
+        // Only a Space server's change is every member's: the update payload
+        // names no person, so the scope the writer recorded decides. A
+        // personal credential's change records the User scope even on a Space
+        // server, so attaching a credential never reveals who did it.
+        EventKind::McpServerUpdated | EventKind::McpServerRemoved => {
+            event.data.get("scope").and_then(Value::as_str) == Some("space")
+        }
+        // A Space skill is every member's; a Bot's is its owner's.
+        EventKind::SkillAdded => event.data.get("library").and_then(Value::as_str) == Some("space"),
+        EventKind::SkillRemoved => {
+            event.data.get("library").and_then(Value::as_str) == Some("space")
+        }
+        // A removal carries only the package id, so every member may learn
+        // that the package left and refresh what it offered. An installation
+        // and an enabled/disabled change carry source, commit, and digest
+        // metadata and stay the Admin's, as do the package events of a record
+        // this rule does not name.
+        EventKind::PluginRemoved => true,
+        _ => false,
+    }
 }
 
 /// An authenticated account.
@@ -2759,6 +3363,44 @@ mod tests {
     use crate::home::Home;
     use crate::secrets::Secrets;
     use crate::store::{AppendRequest, ContinuationWrite, Store};
+
+    /// Decodes one command frame exactly where the socket decodes it.
+    ///
+    /// The browser builds the command object as JSON text; this test anchors
+    /// the shapes it sends to the production `ClientFrame` decoder instead of
+    /// a mock.
+    fn decode_command_frame(command: &str) -> Result<ClientFrame, serde_json::Error> {
+        serde_json::from_str(&format!(
+            r#"{{"type":"command","id":"{}","command":{command}}}"#,
+            Id::new()
+        ))
+    }
+
+    #[test]
+    fn browser_command_frames_decode_exactly_where_the_socket_decodes_them() {
+        // A command with no parameters is sent without `args`: an empty object
+        // is not the unit variant's shape.
+        assert!(matches!(
+            decode_command_frame(r#"{"name":"provider_list"}"#),
+            Ok(ClientFrame::Command {
+                command: CommandCall::ProviderList,
+                ..
+            })
+        ));
+        assert!(
+            decode_command_frame(r#"{"name":"provider_list","args":{}}"#).is_err(),
+            "a unit command that carries args is not a frame this Space takes"
+        );
+        // A command whose parameters are all optional takes an empty object,
+        // the shape the browser sends for a parameterless struct argument.
+        assert!(matches!(
+            decode_command_frame(r#"{"name":"skill_list","args":{}}"#),
+            Ok(ClientFrame::Command {
+                command: CommandCall::SkillList { bot: None },
+                ..
+            })
+        ));
+    }
 
     async fn running() -> (tempfile::TempDir, Running, String) {
         let dir = tempfile::tempdir().unwrap();
@@ -12769,6 +13411,10 @@ mod tests {
             events: &server.events,
             catalog: &server.catalog,
             plugins: &server.plugins,
+            signins: &server.signins,
+            signin_start: &server.signin_start,
+            oauth: &server.oauth,
+            browser_origin: server.browser_origin(),
         }
     }
 
@@ -13320,6 +13966,10 @@ mod tests {
             events: &server.events,
             catalog: &server.catalog,
             plugins: &server.plugins,
+            signins: &server.signins,
+            signin_start: &server.signin_start,
+            oauth: &server.oauth,
+            browser_origin: server.browser_origin(),
         };
         let stranger = crate::identity::Account {
             id: Id::new(),
@@ -14674,10 +15324,27 @@ mod tests {
         loop {
             match next_frame(socket).await {
                 ServerFrame::Snapshot { cursor, events } => return (cursor, events),
-                ServerFrame::Heartbeat { .. } => {}
+                ServerFrame::Heartbeat { .. } | ServerFrame::Event { .. } => {}
                 other => panic!("expected a snapshot, got {other:?}"),
             }
         }
+    }
+
+    /// Reads the live events a subscribed socket carries until the stream is
+    /// quiet for a moment. A heartbeat is not an event.
+    async fn live_events(socket: &mut Socket) -> Vec<neha::record::Event> {
+        let mut events = Vec::new();
+        while let Ok(frame) =
+            tokio::time::timeout(std::time::Duration::from_millis(300), next_frame(socket)).await
+        {
+            match frame {
+                ServerFrame::Event { event } => events.push(event),
+                ServerFrame::Heartbeat { .. } => {}
+                other => panic!("expected a stream frame, got {other:?}"),
+            }
+        }
+
+        events
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -20008,6 +20675,3177 @@ mod tests {
         );
         socket.close(None).await.unwrap();
         archive_task.abort();
+        running.shutdown().await;
+    }
+
+    /// The text one `application/x-www-form-urlencoded` field carries.
+    fn form_decode(value: &str) -> String {
+        let bytes = value.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'+' => {
+                    decoded.push(b' ');
+                    index += 1;
+                }
+                b'%' if index + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                    match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                        Some(byte) => {
+                            decoded.push(byte);
+                            index += 3;
+                        }
+                        None => {
+                            decoded.push(b'%');
+                            index += 1;
+                        }
+                    }
+                }
+                byte => {
+                    decoded.push(byte);
+                    index += 1;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&decoded).into_owned()
+    }
+
+    /// A fake authorization server and a fake MCP server that asks for OAuth.
+    ///
+    /// The MCP server answers its uncleared `initialize` with a 401 that names
+    /// the authorization server's protected resource metadata, and accepts one
+    /// bearer token afterwards. The authorization server serves the two
+    /// metadata documents, registers the public client, and exchanges the
+    /// code. Both listen on loopback ports, the only HTTP the OAuth rules
+    /// admit.
+    #[allow(clippy::type_complexity)]
+    async fn fake_sign_in_landscape() -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        fake_sign_in_landscape_with(false).await
+    }
+
+    /// A fake authorization server's gate on the first token exchange.
+    ///
+    /// The exchange announces itself through `arrived`, then waits for
+    /// `release`, so a test can start another sign-in while one token request
+    /// is in flight.
+    #[derive(Clone)]
+    struct TokenDelay {
+        arrived: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    impl TokenDelay {
+        fn new() -> Self {
+            Self {
+                arrived: std::sync::Arc::new(tokio::sync::Notify::new()),
+                release: std::sync::Arc::new(tokio::sync::Notify::new()),
+            }
+        }
+    }
+
+    /// The same fake landscape, with the authorization server optionally
+    /// advertising that every authorization response carries RFC 9207's `iss`.
+    ///
+    /// The token exchange count, the discovery requests, the dynamic client
+    /// registrations, and both tasks are returned to the test.
+    #[allow(clippy::type_complexity)]
+    async fn fake_sign_in_landscape_with(
+        iss_required: bool,
+    ) -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        fake_sign_in_landscape_controlled(iss_required, None).await
+    }
+
+    /// The same landscape with the first token exchange held until the test
+    /// releases it.
+    ///
+    /// Each accepted exchange answers a different token, numbered in arrival
+    /// order, so a test can tell which sign-in's credential the Vault kept.
+    #[allow(clippy::type_complexity)]
+    async fn fake_sign_in_landscape_delayed() -> (
+        (
+            String,
+            String,
+            std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+            std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+            tokio::task::JoinHandle<()>,
+            tokio::task::JoinHandle<()>,
+        ),
+        TokenDelay,
+    ) {
+        let delay = TokenDelay::new();
+        let landscape = fake_sign_in_landscape_controlled(false, Some(delay.clone())).await;
+        (landscape, delay)
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn fake_sign_in_landscape_controlled(
+        iss_required: bool,
+        delay: Option<TokenDelay>,
+    ) -> (
+        String,
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        std::sync::Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::body::{Body, Bytes};
+        use axum::http::{HeaderMap, StatusCode, header::CONTENT_TYPE, header::WWW_AUTHENTICATE};
+        use axum::response::Response;
+        use axum::routing::{get, post};
+
+        let mcp_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mcp_address = mcp_listener.local_addr().unwrap();
+        let mcp_url = format!("http://{mcp_address}");
+        let as_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let as_address = as_listener.local_addr().unwrap();
+        let issuer = format!("http://{as_address}");
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let registrations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let challenge =
+            format!("Bearer resource_metadata=\"{issuer}/.well-known/oauth-protected-resource\"");
+        let counted = calls.clone();
+        let mcp_app = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap, body: Bytes| {
+                let log = log.clone();
+                let challenge = challenge.clone();
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if let Some(value) = headers
+                        .get("x-package")
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        log.lock().unwrap().push(format!("x-package:{value}"));
+                    }
+                    let authorization = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_owned();
+                    log.lock().unwrap().push(authorization.clone());
+                    // The delayed landscape numbers its tokens, so the flow
+                    // that wins the race may hold the second one.
+                    if authorization != "Bearer token-1" && authorization != "Bearer token-2" {
+                        return Response::builder()
+                            .status(StatusCode::UNAUTHORIZED)
+                            .header(WWW_AUTHENTICATE, challenge)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    let message: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                    if message["method"] == "notifications/initialized" {
+                        return Response::builder()
+                            .status(StatusCode::ACCEPTED)
+                            .body(Body::empty())
+                            .unwrap();
+                    }
+                    let result = match message["method"].as_str() {
+                        Some("initialize") => json!({
+                            "protocolVersion": crate::mcp::PROTOCOL_VERSION,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "docs", "version": "1"},
+                        }),
+                        _ => json!({"tools": []}),
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("mcp-session-id", "session-1")
+                        .body(Body::from(
+                            json!({"jsonrpc": "2.0", "id": message["id"], "result": result})
+                                .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+
+        let forms = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_forms = forms.clone();
+        let counted_registrations = registrations.clone();
+        let exchanges = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let numbered = delay.is_some();
+        let resource_for_metadata = mcp_url.clone();
+        let resource_for_token = mcp_url.clone();
+        let issuer_for_metadata = issuer.clone();
+        let issuer_for_document = issuer.clone();
+        let as_app = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(move || {
+                    let resource = resource_for_metadata.clone();
+                    let issuer = issuer_for_metadata.clone();
+                    async move {
+                        axum::Json(json!({
+                            "resource": resource,
+                            "authorization_servers": [issuer],
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(move || {
+                    let issuer = issuer_for_document.clone();
+                    async move {
+                        let mut metadata = json!({
+                            "issuer": issuer,
+                            "authorization_endpoint": format!("{issuer}/authorize"),
+                            "token_endpoint": format!("{issuer}/token"),
+                            "registration_endpoint": format!("{issuer}/register"),
+                            "code_challenge_methods_supported": ["S256"],
+                        });
+                        if iss_required {
+                            metadata["authorization_response_iss_parameter_supported"] =
+                                json!(true);
+                        }
+                        axum::Json(metadata)
+                    }
+                }),
+            )
+            .route(
+                "/register",
+                post(move |body: Bytes| {
+                    let registrations = counted_registrations.clone();
+                    async move {
+                        registrations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        // The answer describes a public client for the exact
+                        // redirect it was asked for, the way a registration server
+                        // does.
+                        let request: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        let redirects = request
+                            .get("redirect_uris")
+                            .cloned()
+                            .unwrap_or_else(|| json!([]));
+                        axum::Json(json!({
+                            "client_id": "test-client",
+                            "redirect_uris": redirects,
+                            "token_endpoint_auth_method": "none",
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/token",
+                post(move |body: Bytes| {
+                    let forms = seen_forms.clone();
+                    let resource = resource_for_token.clone();
+                    let exchanges = exchanges.clone();
+                    let gate = delay.clone();
+                    async move {
+                        let text = String::from_utf8_lossy(&body);
+                        let form: std::collections::HashMap<String, String> = text
+                            .split('&')
+                            .filter_map(|pair| pair.split_once('='))
+                            .map(|(name, value)| (form_decode(name), form_decode(value)))
+                            .collect();
+                        let accepted = form.get("grant_type").map(String::as_str)
+                            == Some("authorization_code")
+                            && form.get("code").map(String::as_str) == Some("fake-code")
+                            && form
+                                .get("code_verifier")
+                                .is_some_and(|value| !value.is_empty())
+                            && form
+                                .get("redirect_uri")
+                                .is_some_and(|value| !value.is_empty())
+                            && form.get("client_id").map(String::as_str) == Some("test-client")
+                            && form.get("resource").map(String::as_str) == Some(resource.as_str());
+                        forms.lock().unwrap().push(form);
+                        if !accepted {
+                            return Response::builder()
+                                .status(StatusCode::BAD_REQUEST)
+                                .header(CONTENT_TYPE, "application/json")
+                                .body(Body::from(
+                                    json!({
+                                        "error": "invalid_grant",
+                                        "error_description": "the-provider-secret-code",
+                                    })
+                                    .to_string(),
+                                ))
+                                .unwrap();
+                        }
+                        let order = exchanges.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        if order == 1
+                            && let Some(gate) = &gate
+                        {
+                            gate.arrived.notify_one();
+                            gate.release.notified().await;
+                        }
+                        let token = if numbered {
+                            format!("token-{order}")
+                        } else {
+                            "token-1".to_owned()
+                        };
+                        Response::builder()
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from(
+                                json!({"access_token": token, "token_type": "Bearer"}).to_string(),
+                            ))
+                            .unwrap()
+                    }
+                }),
+            )
+            .route("/authorize", get(|| async { "authorize" }));
+
+        let mcp_task = tokio::spawn(async move {
+            let _ = axum::serve(mcp_listener, mcp_app).await;
+        });
+        let as_task = tokio::spawn(async move {
+            let _ = axum::serve(as_listener, as_app).await;
+        });
+
+        (
+            mcp_url,
+            issuer,
+            seen,
+            forms,
+            calls,
+            registrations,
+            mcp_task,
+            as_task,
+        )
+    }
+
+    /// The value of one query parameter of a URL.
+    fn query_parameter(url: &str, name: &str) -> Option<String> {
+        reqwest::Url::parse(url)
+            .ok()?
+            .query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    }
+
+    #[test]
+    fn a_sign_in_cookie_is_scoped_to_the_flow() {
+        let sign_in = Id::new();
+        let name = super::sign_in_cookie_name(sign_in);
+        // The name carries the sign-in, and a UUID's text is a cookie-name
+        // token: letters, digits, and hyphens.
+        assert_eq!(name, format!("neha_signin_{sign_in}"));
+        assert!(
+            sign_in
+                .to_string()
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-'),
+            "a UUID's text is a cookie-name token"
+        );
+        let cookie = super::sign_in_cookie(sign_in, "a-nonce", false);
+        assert!(
+            cookie.starts_with(&format!("{name}=a-nonce;")),
+            "the cookie's name is the flow's and carries its nonce: {cookie}"
+        );
+        for attribute in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/api/mcp/signin",
+            "Max-Age=600",
+        ] {
+            assert!(
+                cookie.contains(attribute),
+                "{attribute} missing from {cookie}"
+            );
+        }
+        assert!(
+            !cookie.contains("Secure"),
+            "a plain-HTTP Space sets no Secure cookie: {cookie}"
+        );
+        assert!(super::sign_in_cookie(sign_in, "a-nonce", true).contains("; Secure"));
+        let cleared = super::sign_in_cookie_cleared(sign_in, true);
+        assert!(
+            cleared.starts_with(&format!("{name}=;")),
+            "the clearing header names the flow's cookie: {cleared}"
+        );
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(cleared.contains("; Secure"), "{cleared}");
+        // Two flows never share a name, so one flow's binding is another's
+        // never to write or clear.
+        assert_ne!(name, super::sign_in_cookie_name(Id::new()));
+    }
+
+    /// Signs an account in the way its browser page does: on the Space's own
+    /// browser hostname and with that page's Origin. Returns the session cookie
+    /// the bind route requires.
+    async fn browser_session(running: &Running, name: &str) -> String {
+        let page = running.browser_url();
+        let login = reqwest::Client::new()
+            .post(format!("{page}/api/login"))
+            .header("origin", page.clone())
+            .json(&json!({"display_name": name, "password": "correct horse battery"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(login.status(), reqwest::StatusCode::OK);
+        login
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .expect("a browser sign-in sets the session cookie")
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+
+    /// The callback URL one issuer's browser flow returns to.
+    fn sign_in_callback(running: &Running, issuer: &str) -> String {
+        format!(
+            "{}/api/mcp/signin/{}/callback",
+            running.url(),
+            crate::oauth::issuer_key(issuer)
+        )
+    }
+
+    /// Binds one browser flow and returns the binding cookie the browser must
+    /// send back, the nonce that cookie carries, and the provider URL the bind
+    /// route redirects to.
+    ///
+    /// The request is the initiating browser's: it addresses the Space's own
+    /// hostname and carries the session cookie the page that opened the URL
+    /// holds. A command line flow's browser need not be signed in to the
+    /// Space, so its tests bind with `None` (an empty cookie jar).
+    ///
+    /// The binding cookie is the flow's own: its name carries the sign-in, so a
+    /// later answer of an older flow can never overwrite it.
+    async fn bind_sign_in(
+        client: &reqwest::Client,
+        running: &Running,
+        sign_in: Id,
+        session_cookie: Option<&str>,
+    ) -> (String, String, String) {
+        let mut request = client
+            .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+            .query(&[("sign_in", sign_in.to_string())]);
+        if let Some(session_cookie) = session_cookie {
+            request = request.header("cookie", session_cookie);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        let set_cookie = response
+            .headers()
+            .get("set-cookie")
+            .and_then(|value| value.to_str().ok())
+            .expect("the bind answer sets a cookie")
+            .to_owned();
+        for attribute in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/api/mcp/signin",
+            "Max-Age=600",
+        ] {
+            assert!(
+                set_cookie.contains(attribute),
+                "{attribute} missing from {set_cookie}"
+            );
+        }
+        assert!(
+            !set_cookie.contains("Secure"),
+            "a plain-HTTP Space sets no Secure cookie: {set_cookie}"
+        );
+        let cookie = set_cookie
+            .split(';')
+            .next()
+            .expect("the cookie's name and value")
+            .to_owned();
+        let (name, nonce) = cookie.split_once('=').expect("a cookie name and value");
+        assert_eq!(
+            name,
+            super::sign_in_cookie_name(sign_in),
+            "the bind answer sets this flow's cookie"
+        );
+        assert_eq!(
+            nonce.len(),
+            43,
+            "32 random bytes, base64url without padding"
+        );
+        let nonce = nonce.to_owned();
+        let location = response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .expect("the bind answer redirects")
+            .to_owned();
+
+        (cookie, nonce, location)
+    }
+
+    /// Binds one command line flow and returns the provider URL the bind route
+    /// redirects to.
+    ///
+    /// A command line flow sets no browser cookie: its loopback receiver and
+    /// the authenticated finish bind the second hop, and a command line flow
+    /// owns no browser binding.
+    async fn bind_command_line_sign_in(
+        client: &reqwest::Client,
+        running: &Running,
+        sign_in: Id,
+    ) -> String {
+        let response = client
+            .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+            .query(&[("sign_in", sign_in.to_string())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        assert!(
+            response.headers().get("set-cookie").is_none(),
+            "a command line flow binds no browser cookie"
+        );
+
+        response
+            .headers()
+            .get("location")
+            .and_then(|value| value.to_str().ok())
+            .expect("the bind answer redirects")
+            .to_owned()
+    }
+
+    /// The path of one URL: what a loopback receiver passes as the callback's
+    /// path.
+    fn url_path(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .expect("a valid URL")
+            .path()
+            .to_owned()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_sign_in_connects_a_new_mcp_server() {
+        let (
+            mcp_url,
+            authorization_server,
+            tokens,
+            forms,
+            calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let account: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let mut socket = open_socket(&running, token).await;
+        // The browser that starts a sign-in is signed in to this Space.
+        let session_cookie = browser_session(&running, "Ada").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let callback = sign_in_callback(&running, &authorization_server);
+        let scope_callback = format!(
+            "{}/api/mcp/signin/{}/callback",
+            running.server.browser_origin(),
+            crate::oauth::issuer_key(&authorization_server)
+        );
+
+        // The Admin starts a sign-in for a new server; the default scope is the
+        // Space's. The answer names a first-party bind URL, never the provider.
+        let start = neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: None,
+        };
+        let command_id = Id::new();
+        let started = command(
+            &mut socket,
+            command_id,
+            CommandCall::McpSignInStart(start.clone()),
+        )
+        .await;
+        let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        assert_eq!(
+            started["url"],
+            json!(format!(
+                "{}/api/mcp/signin/bind?sign_in={sign_in}",
+                running.server.browser_origin()
+            )),
+            "the command answers the browser's first-party URL"
+        );
+
+        // A redelivered command is answered once: one pending sign-in, the
+        // same answer, no second discovery, and no event.
+        let discovered = calls.load(std::sync::atomic::Ordering::SeqCst);
+        let last = running.server.store.last_seq().await.unwrap();
+        let replayed = command(&mut socket, command_id, CommandCall::McpSignInStart(start)).await;
+        assert_eq!(replayed, started, "a redelivered start repeats its answer");
+        assert_eq!(
+            running.server.signins.lock().await.len(),
+            1,
+            "one pending sign-in, not a second flow"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            discovered,
+            "a replay asks the MCP server nothing"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            last,
+            "a replay appends no event"
+        );
+
+        // The bind route sets the browser's cookie and sends the browser to the
+        // provider with a state the callback must return.
+        let (cookie, nonce, authorize_url) =
+            bind_sign_in(&client, &running, sign_in, Some(&session_cookie)).await;
+        assert!(
+            authorize_url.starts_with(&format!("{authorization_server}/authorize")),
+            "{authorize_url}"
+        );
+        assert_eq!(
+            query_parameter(&authorize_url, "code_challenge_method").as_deref(),
+            Some("S256")
+        );
+        assert_eq!(
+            query_parameter(&authorize_url, "redirect_uri").as_deref(),
+            Some(scope_callback.as_str()),
+            "the browser flow comes back to the Space"
+        );
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        assert!(!state.is_empty());
+
+        // A callback without the cookie is refused and stores nothing, even
+        // with the right state: the state token alone does not say who is here.
+        let without = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(without.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = without.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&state) && !body.contains("fake-code"),
+            "the page echoes neither the state nor the code: {body}"
+        );
+        assert!(
+            !running
+                .server
+                .store
+                .events_from(Seq::ZERO, 100)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::McpServerAdded),
+            "a callback without its cookie stores nothing"
+        );
+        let still_pending = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(still_pending["state"], json!("pending"));
+
+        // A callback with another browser's cookie is refused the same way,
+        // and leaves the flow usable. The flow's cookie name is exact: even its
+        // own nonce under another flow's name is no binding at all.
+        let wrong = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .header(
+                "cookie",
+                format!("{}=a-different-nonce", super::sign_in_cookie_name(sign_in)),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::BAD_REQUEST);
+        let borrowed = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .header(
+                "cookie",
+                format!("{}={nonce}", super::sign_in_cookie_name(Id::new())),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(borrowed.status(), reqwest::StatusCode::BAD_REQUEST);
+
+        // A token endpoint's error never reaches the page or the poll: the
+        // callback spends the flow, the exchange is refused, and both read one
+        // fixed sentence.
+        let failed = client
+            .get(&callback)
+            .query(&[
+                ("code", "wrong-code"),
+                ("state", state.as_str()),
+                ("iss", authorization_server.as_str()),
+            ])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            failed
+                .headers()
+                .get("set-cookie")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"),
+            "the callback clears the binding cookie"
+        );
+        let body = failed.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains("the-provider-secret-code")
+                && !body.contains("invalid_grant")
+                && !body.contains(&state)
+                && !body.contains("wrong-code"),
+            "no provider text, state, or code reaches the page: {body}"
+        );
+        let failed_status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(failed_status["state"], json!("failed"));
+        assert_eq!(
+            failed_status["reason"],
+            json!("the sign-in could not be completed")
+        );
+        let text = failed_status.to_string();
+        assert!(
+            !text.contains("the-provider-secret-code") && !text.contains("invalid_grant"),
+            "no provider text reaches the poll: {text}"
+        );
+        assert!(
+            !running
+                .server
+                .store
+                .events_from(Seq::ZERO, 100)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::McpServerAdded),
+            "a refused exchange stores nothing"
+        );
+
+        // A refusal the person made reads one fixed sentence too: the
+        // authority's own error text never reaches the page or the poll.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("docs".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let cancelled: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, cancelled, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let refused = client
+            .get(&callback)
+            .query(&[
+                ("error", "access_denied"),
+                ("error_description", "provider-secret"),
+                ("state", state.as_str()),
+            ])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = refused.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains("provider-secret")
+                && !body.contains("access_denied")
+                && !body.contains(&state),
+            "no provider text or state reaches the page: {body}"
+        );
+        let cancelled_status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: cancelled },
+        )
+        .await;
+        assert_eq!(cancelled_status["state"], json!("failed"));
+        assert_eq!(
+            cancelled_status["reason"],
+            json!("the sign-in was cancelled or refused")
+        );
+
+        // An issuer another authorization server named is a mix-up: the
+        // callback spends the flow and reads one fixed sentence.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("docs".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let mixed_up: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, mixed_up, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        // The callback path names the issuer the plan was discovered from. A
+        // callback under another issuer's key, a malformed key, and the old
+        // unkeyed path are refused before any code is exchanged, and none of
+        // them spends the flow.
+        let wrong_key = format!(
+            "{}/api/mcp/signin/{}/callback",
+            running.url(),
+            crate::oauth::issuer_key("https://another.example")
+        );
+        let malformed_key = format!("{}/api/mcp/signin/not-a-key/callback", running.url());
+        let unkeyed = format!("{}/api/mcp/signin/callback", running.url());
+        let exchanges_before = forms.lock().unwrap().len();
+        for refused_path in [&wrong_key, &malformed_key] {
+            let refused = client
+                .get(refused_path)
+                .query(&[("code", "fake-code"), ("state", state.as_str())])
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                refused.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "{refused_path}"
+            );
+            let body = refused.text().await.unwrap();
+            assert!(body.contains("failed"), "{body}");
+            assert!(
+                !body.contains(&state) && !body.contains("fake-code"),
+                "the page echoes neither the state nor the code: {body}"
+            );
+        }
+        let old_path = client
+            .get(&unkeyed)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            old_path.status(),
+            reqwest::StatusCode::NOT_FOUND,
+            "the old unkeyed callback path no longer exists"
+        );
+        assert_eq!(
+            forms.lock().unwrap().len(),
+            exchanges_before,
+            "a callback under the wrong key exchanges nothing"
+        );
+        let crossed = client
+            .get(&callback)
+            .query(&[
+                ("code", "fake-code"),
+                ("state", state.as_str()),
+                ("iss", "https://another.example"),
+            ])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(crossed.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = crossed.text().await.unwrap();
+        assert!(
+            !body.contains("another.example") && !body.contains(&state),
+            "the page echoes no issuer or state: {body}"
+        );
+        let crossed_status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: mixed_up },
+        )
+        .await;
+        assert_eq!(crossed_status["state"], json!("failed"));
+        assert_eq!(
+            crossed_status["reason"],
+            json!("the sign-in could not be completed")
+        );
+
+        // The successful flow begins with a bind request and completes in the
+        // browser that received the cookie.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("docs".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, sign_in, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let page = client
+            .get(&callback)
+            .query(&[
+                ("code", "fake-code"),
+                ("state", state.as_str()),
+                ("iss", authorization_server.as_str()),
+            ])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        assert_eq!(page.headers().get("cache-control").unwrap(), "no-store");
+        assert!(
+            page.headers()
+                .get("set-cookie")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .contains("Max-Age=0"),
+            "the callback clears the binding cookie"
+        );
+        assert!(
+            page.headers()
+                .get("content-type")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with("text/html")
+        );
+        let body = page.text().await.unwrap();
+        assert!(body.contains("finished"), "{body}");
+        assert!(
+            !body.contains(&state) && !body.contains("fake-code"),
+            "the page echoes neither the state nor the code: {body}"
+        );
+
+        // The token exchange carried the PKCE verifier and the plan's binding.
+        {
+            let exchanged = forms.lock().unwrap();
+            assert_eq!(
+                exchanged.len(),
+                2,
+                "the refused exchange and the finished one"
+            );
+            let finished = &exchanged[1];
+            assert_eq!(finished.get("code").map(String::as_str), Some("fake-code"));
+            assert_eq!(
+                finished.get("resource").map(String::as_str),
+                Some(mcp_url.as_str()),
+                "the token is bound to the resource"
+            );
+            assert_eq!(
+                finished.get("redirect_uri").map(String::as_str),
+                Some(scope_callback.as_str()),
+                "the token is bound to the Space's callback"
+            );
+            assert!(
+                finished
+                    .get("code_verifier")
+                    .is_some_and(|value| !value.is_empty()),
+                "the exchange carries the PKCE verifier"
+            );
+        }
+
+        // The record holds the new server and the Vault holds the Space's
+        // credential, so the client that started the sign-in sees it connected.
+        let status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(status["state"], json!("finished"));
+        let server: Id = serde_json::from_value(status["server"].clone()).unwrap();
+        assert_eq!(status["connected"], json!(true));
+        assert_eq!(status["reason"], json!(null));
+        assert_eq!(
+            running
+                .server
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("token-1"),
+            "an Admin's Space sign-in stores the Space's credential"
+        );
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events;
+        let added = events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::McpServerAdded && event.data["server"] == json!(server)
+            })
+            .expect("the record holds the connection");
+        assert_eq!(added.data["name"], json!("docs"));
+        assert_eq!(added.data["url"], json!(mcp_url));
+        assert_eq!(added.data["scope"], json!("space"));
+        assert_eq!(added.data["user"], json!(null));
+        assert_eq!(added.data["by"], json!(account));
+        assert_eq!(added.data["plugin"], json!(null));
+        assert_eq!(added.data["headers"], json!({}));
+
+        let listed = command(&mut socket, Id::new(), CommandCall::McpList).await;
+        let row = listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["server"] == json!(server))
+            .expect("the list holds the server");
+        assert_eq!(row["connected"], json!(true));
+        assert_eq!(row["credential"], json!("space"));
+        assert_eq!(row["by_name"], json!("Ada"));
+        assert!(
+            tokens
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|seen| seen == "Bearer token-1"),
+            "the list's probe sent the stored token"
+        );
+
+        // The state is single use: the same callback is refused and the page
+        // echoes neither it nor the code.
+        let replay = client
+            .get(&callback)
+            .query(&[("code", "another-code"), ("state", state.as_str())])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = replay.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&state) && !body.contains("another-code"),
+            "the page echoes nothing: {body}"
+        );
+
+        // A state no sign-in made renders the same generic failure.
+        for (code, state) in [("fake-code", "not-a-state"), ("", "")] {
+            let unknown = client
+                .get(&callback)
+                .query(&[("code", code), ("state", state)])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unknown.status(), reqwest::StatusCode::BAD_REQUEST);
+            let body = unknown.text().await.unwrap();
+            assert!(body.contains("failed"), "{body}");
+        }
+
+        // A bind for a sign-in no Space holds renders the same failure.
+        let missing = client
+            .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+            .query(&[("sign_in", Id::new().to_string())])
+            .header("cookie", &session_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(missing.headers().get("set-cookie").is_none());
+        let body = missing.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+
+        // The metadata does not advertise RFC 9207's parameter, so a response
+        // that omits `iss` is admitted: the flow is not refused for a promise
+        // this authorization server never made.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("docs-omitted-iss".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, sign_in, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let page = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        let body = page.text().await.unwrap();
+        assert!(body.contains("finished"), "{body}");
+        let status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(status["state"], json!("finished"));
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_line_sign_in_finishes_with_the_loopback_code() {
+        let (
+            mcp_url,
+            authorization_server,
+            _tokens,
+            forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let account: Id = serde_json::from_value(session["account"]["id"].clone()).unwrap();
+        let mut socket = open_socket(&running, token).await;
+        // The browser that opens a command line flow's bind URL is a fresh
+        // browser profile: it holds no Space session at all. The command line
+        // is the authenticated initiator, and its finish is an authenticated
+        // command.
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let loopback = "http://127.0.0.1:4711";
+        let loopback_callback = format!(
+            "{loopback}/{}/callback",
+            crate::oauth::issuer_key(&authorization_server)
+        );
+        // What the loopback receiver forwards as the callback's path.
+        let cli_path = url_path(&loopback_callback);
+        let start = neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url.clone()),
+            scope: None,
+            redirect_uri: Some(loopback.to_owned()),
+        };
+
+        // A remote or TLS redirect is no command line's receiver.
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                redirect_uri: Some("https://example.com/api/mcp/signin/callback".to_owned()),
+                ..start.clone()
+            }),
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+            "a non-loopback redirect is refused: {refused:?}"
+        );
+
+        // The command answers the same first-party bind URL the browser flow
+        // does; the bind redirect names the command line's loopback receiver.
+        let started = command(&mut socket, Id::new(), CommandCall::McpSignInStart(start)).await;
+        let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        assert_eq!(
+            started["url"],
+            json!(format!(
+                "{}/api/mcp/signin/bind?sign_in={sign_in}",
+                running.server.browser_origin()
+            ))
+        );
+        // The browser has no cookie jar and needs none: a command line flow
+        // binds without a session and without setting a browser cookie.
+        let authorize_url = bind_command_line_sign_in(&client, &running, sign_in).await;
+        assert!(
+            authorize_url.starts_with(&format!("{authorization_server}/authorize")),
+            "{authorize_url}"
+        );
+        assert_eq!(
+            query_parameter(&authorize_url, "redirect_uri").as_deref(),
+            Some(loopback_callback.as_str()),
+            "the command line's receiver is the redirect, keyed by the issuer"
+        );
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+
+        // The Space's keyed callback cannot finish a flow a command line owns.
+        let callback = sign_in_callback(&running, &authorization_server);
+        let crossed = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(crossed.status(), reqwest::StatusCode::BAD_REQUEST);
+        let pending = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(pending["state"], json!("pending"));
+
+        // An issuer that names another authorization server is a mix-up: the
+        // flow is spent and the answer never repeats the named issuer.
+        let probe_started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("other".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: Some(loopback.to_owned()),
+            }),
+        )
+        .await;
+        let probe: Id = serde_json::from_value(probe_started["sign_in"].clone()).unwrap();
+        let authorize_url = bind_command_line_sign_in(&client, &running, probe).await;
+        let probe_state =
+            query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let mixed_up = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInFinish {
+                sign_in: probe,
+                code: "fake-code".to_owned(),
+                state: probe_state,
+                path: Some(cli_path.clone()),
+                iss: Some("https://another.example".to_owned()),
+            },
+        )
+        .await;
+        let mixed_up = match mixed_up {
+            Err((ErrorCode::InvalidArgument, message)) => message,
+            other => panic!("a mix-up must be refused: {other:?}"),
+        };
+        assert!(
+            !mixed_up.contains("another.example"),
+            "the refusal echoes no issuer: {mixed_up}"
+        );
+        let probe_status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: probe },
+        )
+        .await;
+        assert_eq!(probe_status["state"], json!("failed"));
+        assert_eq!(
+            probe_status["reason"],
+            json!("the sign-in could not be completed")
+        );
+
+        // The command line sends what its loopback receiver got. It received
+        // no issuer, which an authorization server may omit.
+        let finish_command = Id::new();
+        let finished = command(
+            &mut socket,
+            finish_command,
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "fake-code".to_owned(),
+                state: state.clone(),
+                path: Some(cli_path.clone()),
+                iss: None,
+            },
+        )
+        .await;
+        assert_eq!(finished["sign_in"], json!(sign_in));
+        assert_eq!(finished["state"], json!("finished"));
+        assert_eq!(finished["reason"], json!(null));
+        let server: Id = serde_json::from_value(finished["server"].clone()).unwrap();
+        assert_eq!(finished["connected"], json!(true));
+        assert_eq!(
+            running
+                .server
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("token-1"),
+            "the command line's sign-in stores the Space's credential"
+        );
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events;
+        let added: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::McpServerAdded && event.data["server"] == json!(server)
+            })
+            .collect();
+        assert_eq!(added.len(), 1, "the flow records one connection");
+        assert_eq!(added[0].data["scope"], json!("space"));
+        assert_eq!(added[0].data["by"], json!(account));
+
+        // The exchange carried the loopback redirect the browser was sent to,
+        // keyed by the issuer the plan was discovered from.
+        {
+            let exchanged = forms.lock().unwrap();
+            assert_eq!(exchanged.len(), 1);
+            assert_eq!(
+                exchanged[0].get("redirect_uri").map(String::as_str),
+                Some(loopback_callback.as_str())
+            );
+            assert_eq!(
+                exchanged[0].get("resource").map(String::as_str),
+                Some(mcp_url.as_str())
+            );
+        }
+
+        // A redelivered finish is idempotent: the finished status is answered
+        // again, and neither the Vault nor the record changes. The same
+        // command id and a fresh id that names the same sign-in read the same
+        // answer.
+        let cursor = running.server.store.last_seq().await.unwrap();
+        for (command_id, why) in [
+            (finish_command, "a redelivered finish repeats its answer"),
+            (Id::new(), "a fresh command id repeats the finished answer"),
+        ] {
+            let again = command(
+                &mut socket,
+                command_id,
+                CommandCall::McpSignInFinish {
+                    sign_in,
+                    code: "fake-code".to_owned(),
+                    state: state.clone(),
+                    path: Some(cli_path.clone()),
+                    iss: None,
+                },
+            )
+            .await;
+            assert_eq!(again, finished, "{why}");
+        }
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor,
+            "a repeated finish appends no event"
+        );
+        assert_eq!(
+            running
+                .server
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("token-1"),
+            "a repeated finish rewrites no credential"
+        );
+        let polled = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(polled["state"], json!("finished"));
+        assert_eq!(polled["server"], json!(server));
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bind_url_belongs_to_the_account_that_started_the_sign_in() {
+        let (
+            mcp_url,
+            _authorization_server,
+            _tokens,
+            _forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let mut socket = open_socket(&running, token).await;
+        // The initiating browser's session; another account's browser on the
+        // same Space has its own.
+        let ada_cookie = browser_session(&running, "Ada").await;
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_cookie = browser_session(&running, "Grace").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // The bind URL is the only handle to a flow, but it is handed to a
+        // browser: an unauthenticated browser cannot carry it off.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("docs".to_owned()),
+                url: Some(mcp_url),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        for cookie in [None, Some("neha_session_not-a-token")] {
+            let mut request = client
+                .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+                .query(&[("sign_in", sign_in.to_string())]);
+            if let Some(cookie) = cookie {
+                request = request.header("cookie", cookie);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+            assert!(
+                response.headers().get("set-cookie").is_none(),
+                "an unauthenticated bind sets nothing"
+            );
+            let body = response.text().await.unwrap();
+            assert!(body.contains("failed"), "{body}");
+            assert!(
+                !body.contains(&sign_in.to_string()),
+                "the page echoes the sign-in id: {body}"
+            );
+        }
+
+        // Another account's browser cannot bind the flow either; the failure
+        // is the same generic page and the flow stays usable for its owner.
+        let foreign = client
+            .get(format!("{}/api/mcp/signin/bind", running.browser_url()))
+            .query(&[("sign_in", sign_in.to_string())])
+            .header("cookie", &grace_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(foreign.headers().get("set-cookie").is_none());
+        let body = foreign.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&sign_in.to_string()),
+            "the page echoes the sign-in id: {body}"
+        );
+        let pending = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in },
+        )
+        .await;
+        assert_eq!(pending["state"], json!("pending"));
+
+        // The initiating browser binds normally: the session cookie arrives on
+        // the first-party navigation and names the account that started it.
+        let (_cookie, nonce, authorize_url) =
+            bind_sign_in(&client, &running, sign_in, Some(&ada_cookie)).await;
+        assert_eq!(nonce.len(), 43);
+        assert!(
+            authorize_url.contains("state="),
+            "the redirect names the flow's state: {authorize_url}"
+        );
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_command_line_flow_cannot_exchange_its_code() {
+        let (
+            mcp_url,
+            authorization_server,
+            _tokens,
+            forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        // A server the Space already holds, with a credential that a finished
+        // sign-in would replace.
+        let server = add_mcp_server(&mut socket, "docs", &mcp_url, Some("old-token")).await;
+        let loopback = "http://127.0.0.1:4712/api/mcp/signin/callback";
+        let cli_path = format!(
+            "/{}/callback",
+            crate::oauth::issuer_key(&authorization_server)
+        );
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: Some(server),
+                name: None,
+                url: None,
+                scope: Some(neha::record::McpScope::Space),
+                redirect_uri: Some(loopback.to_owned()),
+            }),
+        )
+        .await;
+        let sign_in: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let authorize_url = bind_command_line_sign_in(&client, &running, sign_in).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+
+        // Age the flow past its usable life while it is still pending: the
+        // sweeper marks it failed on the next read and keeps its state token,
+        // so only the status and the age can stop a late exchange.
+        {
+            let mut signins = running.server.signins.lock().await;
+            let pending = signins.get_mut(&sign_in).expect("the flow is pending");
+            pending.created_at = std::time::Instant::now()
+                - (super::SIGN_IN_TTL + std::time::Duration::from_secs(1));
+        }
+        let cursor = running.server.store.last_seq().await.unwrap();
+
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "fake-code".to_owned(),
+                state,
+                path: Some(cli_path),
+                iss: None,
+            },
+        )
+        .await;
+        match refused {
+            Err((ErrorCode::InvalidArgument, message)) => {
+                assert_eq!(message, super::SIGN_IN_EXPIRED)
+            }
+            other => panic!("an expired flow must refuse its code: {other:?}"),
+        }
+        assert!(
+            forms.lock().unwrap().is_empty(),
+            "an expired flow exchanges no code"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor,
+            "an expired flow appends no event"
+        );
+        assert_eq!(
+            running
+                .server
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("old-token"),
+            "an expired flow leaves the Vault unchanged"
+        );
+        {
+            let signins = running.server.signins.lock().await;
+            match &signins
+                .get(&sign_in)
+                .expect("the failed flow is kept")
+                .status
+            {
+                super::SignInStatus::Failed { reason } => {
+                    assert_eq!(reason, super::SIGN_IN_EXPIRED);
+                }
+                _ => panic!("an expired flow reads as failed"),
+            }
+        }
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_browser_callback_must_name_the_issuer_the_advertised_metadata_promises() {
+        let (
+            mcp_url,
+            authorization_server,
+            _tokens,
+            forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape_with(true).await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let mut socket = open_socket(&running, token).await;
+        let session_cookie = browser_session(&running, "Ada").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let callback = sign_in_callback(&running, &authorization_server);
+
+        // The authorization server's metadata says every authorization
+        // response carries `iss`, so a response that omits it is a mix-up
+        // risk: the callback refuses it before the code is exchanged.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("omitted-iss".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let omitted: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, omitted, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let cursor = running.server.store.last_seq().await.unwrap();
+        let refused = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", state.as_str())])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body = refused.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&state) && !body.contains("fake-code"),
+            "the page echoes neither the state nor the code: {body}"
+        );
+        assert!(
+            forms.lock().unwrap().is_empty(),
+            "a response promised an issuer exchanges nothing without it"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor,
+            "a refused response appends no event"
+        );
+        let status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: omitted },
+        )
+        .await;
+        assert_eq!(status["state"], json!("failed"));
+        assert_eq!(status["reason"], json!(super::SIGN_IN_INCOMPLETE));
+
+        // A named issuer that is not the plan's is a mix-up whether or not the
+        // metadata promised the parameter.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("crossed-iss".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let crossed: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, crossed, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let refused = client
+            .get(&callback)
+            .query(&[
+                ("code", "fake-code"),
+                ("state", state.as_str()),
+                ("iss", "https://another.example"),
+            ])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(forms.lock().unwrap().is_empty());
+
+        // The issuer the metadata named completes the flow.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("named-iss".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let named: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (cookie, _nonce, authorize_url) =
+            bind_sign_in(&client, &running, named, Some(&session_cookie)).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let page = client
+            .get(&callback)
+            .query(&[
+                ("code", "fake-code"),
+                ("state", state.as_str()),
+                ("iss", authorization_server.as_str()),
+            ])
+            .header("cookie", &cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        let body = page.text().await.unwrap();
+        assert!(body.contains("finished"), "{body}");
+        let status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: named },
+        )
+        .await;
+        assert_eq!(status["state"], json!("finished"));
+        assert_eq!(forms.lock().unwrap().len(), 1, "one code was exchanged");
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_line_finish_must_name_the_issuer_the_advertised_metadata_promises() {
+        let (
+            mcp_url,
+            authorization_server,
+            _tokens,
+            forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape_with(true).await;
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let loopback = "http://127.0.0.1:4713/api/mcp/signin/callback";
+        let cli_path = format!(
+            "/{}/callback",
+            crate::oauth::issuer_key(&authorization_server)
+        );
+
+        // The same requirement holds for the command line's finish: a response
+        // that omits the issuer the metadata promises is refused before the
+        // token exchange.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("cli-omitted".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: Some(loopback.to_owned()),
+            }),
+        )
+        .await;
+        let omitted: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let authorize_url = bind_command_line_sign_in(&client, &running, omitted).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let cursor = running.server.store.last_seq().await.unwrap();
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInFinish {
+                sign_in: omitted,
+                code: "fake-code".to_owned(),
+                state,
+                path: Some(cli_path.clone()),
+                iss: None,
+            },
+        )
+        .await;
+        match refused {
+            Err((ErrorCode::InvalidArgument, message)) => {
+                assert_eq!(message, super::SIGN_IN_INCOMPLETE)
+            }
+            other => panic!("a missing issuer must be refused: {other:?}"),
+        }
+        assert!(forms.lock().unwrap().is_empty());
+        assert_eq!(running.server.store.last_seq().await.unwrap(), cursor);
+
+        // A crossed issuer is refused the same way.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("cli-crossed".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: Some(loopback.to_owned()),
+            }),
+        )
+        .await;
+        let crossed: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let authorize_url = bind_command_line_sign_in(&client, &running, crossed).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInFinish {
+                sign_in: crossed,
+                code: "fake-code".to_owned(),
+                state,
+                path: Some(cli_path.clone()),
+                iss: Some("https://another.example".to_owned()),
+            },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::InvalidArgument, _))),
+            "a crossed issuer must be refused: {refused:?}"
+        );
+        assert!(forms.lock().unwrap().is_empty());
+
+        // The issuer the metadata named finishes the flow.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("cli-named".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: Some(loopback.to_owned()),
+            }),
+        )
+        .await;
+        let named: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let authorize_url = bind_command_line_sign_in(&client, &running, named).await;
+        let state = query_parameter(&authorize_url, "state").expect("the URL carries a state");
+        let finished = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInFinish {
+                sign_in: named,
+                code: "fake-code".to_owned(),
+                state,
+                path: Some(cli_path),
+                iss: Some(authorization_server),
+            },
+        )
+        .await;
+        assert_eq!(finished["state"], json!("finished"));
+        assert_eq!(forms.lock().unwrap().len(), 1, "one code was exchanged");
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_start_deliveries_plan_one_sign_in() {
+        let (
+            mcp_url,
+            _authorization_server,
+            _tokens,
+            _forms,
+            calls,
+            registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let (mut first, token) = admin(&running, &invite).await;
+        let mut second = open_socket(&running, &token).await;
+        let start = neha::surface::McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some(mcp_url),
+            scope: None,
+            redirect_uri: None,
+        };
+        let command_id = Id::new();
+        let cursor = running.server.store.last_seq().await.unwrap();
+
+        // Both sockets deliver the same command before either answer: one
+        // plans discovery and registration, the other waits and replays.
+        let (one, two) = tokio::join!(
+            command(
+                &mut first,
+                command_id,
+                CommandCall::McpSignInStart(start.clone())
+            ),
+            command(
+                &mut second,
+                command_id,
+                CommandCall::McpSignInStart(start.clone())
+            ),
+        );
+
+        assert_eq!(one, two, "both deliveries read the same recorded answer");
+        assert_eq!(
+            running.server.signins.lock().await.len(),
+            1,
+            "one pending sign-in, not two flows"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one discovery request"
+        );
+        assert_eq!(
+            registrations.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one dynamic client registration"
+        );
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor,
+            "a start writes no event"
+        );
+
+        first.close(None).await.unwrap();
+        second.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_package_servers_configured_headers_reach_discovery() {
+        let (
+            mcp_url,
+            _authorization_server,
+            seen,
+            _forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let directory = tempfile::tempdir().unwrap();
+        let home = test_home(directory.path());
+        let server = Id::new();
+        let by = Id::new();
+        let store = Store::open(&home).await.unwrap();
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "seed",
+                vec![EventDraft::new(
+                    EventKind::McpServerAdded,
+                    Author::User(by),
+                    json!({
+                        "server": server,
+                        "name": "packaged",
+                        "url": mcp_url,
+                        "scope": "space",
+                        "user": null,
+                        "by": by,
+                        "plugin": null,
+                        "headers": {"x-package": "yes"},
+                    }),
+                )],
+            ))
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+        let running = start(home, 0).await.unwrap();
+        let invite = running.invite.clone().expect("a fresh Space invites");
+        let mut socket = admin_socket(&running, &invite).await;
+
+        // A package's fixed headers are how the server admits the discovery
+        // request: the sign-in must carry them.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: Some(server),
+                name: None,
+                url: None,
+                scope: Some(neha::record::McpScope::Space),
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        serde_json::from_value::<Id>(started["sign_in"].clone()).unwrap();
+        assert!(
+            seen.lock().unwrap().contains(&"x-package:yes".to_owned()),
+            "the configured header reaches discovery: {:?}",
+            seen.lock().unwrap()
+        );
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_sees_space_library_changes_and_not_personal_ones() {
+        let (_dir, running, invite) = running().await;
+        let mut admin_socket = admin_socket(&running, &invite).await;
+        let admin = running
+            .server
+            .identity
+            .admin_account()
+            .await
+            .unwrap()
+            .expect("the Space has an Admin");
+        let member = running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let member_token = sign_in(&running, "Grace").await;
+        let mut member_socket = open_socket(&running, &member_token).await;
+        // Both sockets read the stream live from here on.
+        snapshot_events(&mut admin_socket).await;
+        snapshot_events(&mut member_socket).await;
+
+        // The member's own events stay theirs and arrive.
+        let created = command(&mut member_socket, Id::new(), add_bot("Reader", None)).await;
+        let _member_bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+
+        let (url, _log, mcp_task) = fake_mcp_server(|_| json!({"content": []})).await;
+        // The Admin adds a server for the whole Space and one of their own.
+        let space_server =
+            add_mcp_server(&mut admin_socket, "space-docs", &url, Some("token-1")).await;
+        let personal = command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::McpAdd(neha::surface::McpAdd {
+                name: "personal-docs".to_owned(),
+                url: url.clone(),
+                scope: neha::record::McpScope::User,
+                credential: Some("token-2".to_owned()),
+            }),
+        )
+        .await;
+        let personal: Id = serde_json::from_value(personal["server"].clone()).unwrap();
+        // Attaching a credential updates the server. A Space credential's
+        // change is the Space's and every member sees it; a personal
+        // credential's change records the User scope even on the Space's
+        // server, so the member never learns who attached it.
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::McpAdd(neha::surface::McpAdd {
+                name: "space-docs".to_owned(),
+                url: url.clone(),
+                scope: neha::record::McpScope::Space,
+                credential: Some("attached-token".to_owned()),
+            }),
+        )
+        .await;
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::McpConnect {
+                server: personal,
+                credential: Some("attached-token".to_owned()),
+            },
+        )
+        .await;
+        // A Space skill enters and leaves the Space's library.
+        let added = command(
+            &mut admin_socket,
+            Id::new(),
+            add_skill(None, "---\nname: shared\ndescription: d\n---\nBody.", &[]),
+        )
+        .await;
+        let space_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::SkillRemove { skill: space_skill },
+        )
+        .await;
+        // A Bot's skill enters and leaves that Bot's own library.
+        let created = command(&mut admin_socket, Id::new(), add_bot("Writer", None)).await;
+        let writer: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let added = command(
+            &mut admin_socket,
+            Id::new(),
+            add_skill(
+                Some(writer),
+                "---\nname: private\ndescription: d\n---\nBody.",
+                &[],
+            ),
+        )
+        .await;
+        let bot_skill: Id = serde_json::from_value(added["skill"].clone()).unwrap();
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::SkillRemove { skill: bot_skill },
+        )
+        .await;
+        // Both servers leave: a Space server's removal is every member's, a
+        // personal one's stays its owner's.
+        for server in [space_server, personal] {
+            command(
+                &mut admin_socket,
+                Id::new(),
+                CommandCall::McpRemove { server },
+            )
+            .await;
+        }
+        // A package's installation and enablement name what the Admin
+        // installed: the command surface offers them to no member, so the
+        // stream keeps them the Admin's. A removal carries only the package
+        // id and is every member's (its visibility has its own test). Dispatch
+        // it the way the socket's command path does.
+        let plugin = Id::new();
+        let appended = running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                "plugin-enabled".to_owned(),
+                vec![EventDraft::new(
+                    EventKind::PluginEnabled,
+                    Author::User(admin.id),
+                    json!({"plugin": plugin}),
+                )],
+            ))
+            .await
+            .unwrap();
+        super::broadcast(&running.server, &appended.events);
+
+        let events = live_events(&mut member_socket).await;
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::McpServerUpdated
+                    && event.data["server"] == json!(space_server)
+                    && event.data["scope"] == json!("space")
+            }),
+            "a member sees a Space server's update"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::McpServerRemoved
+                    && event.data["server"] == json!(space_server)
+                    && event.data["scope"] == json!("space")
+            }),
+            "a member sees a Space server's removal"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::SkillRemoved
+                    && event.data["skill"] == json!(space_skill)
+                    && event.data["library"] == json!("space")
+            }),
+            "a member sees a Space skill leave"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::SkillAdded
+                    && event.data["skill"] == json!(space_skill)
+                    && event.data["library"] == json!("space")
+            }),
+            "a member sees the Space's skill enter"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.data.get("server") != Some(&json!(personal))),
+            "the Admin's personal server's changes stay the Admin's"
+        );
+        assert!(
+            events.iter().all(|event| {
+                !(event.kind == EventKind::SkillRemoved && event.data["skill"] == json!(bot_skill))
+            }),
+            "a Bot's skill stays its owner's"
+        );
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.kind,
+                EventKind::PluginInstalled | EventKind::PluginEnabled | EventKind::PluginDisabled
+            )),
+            "a member receives no installation or enablement event"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::BotCreated
+                    && event.author == Author::User(member.id)),
+            "the member's own events still arrive"
+        );
+
+        // The Admin is the author of every filtered event, so the record the
+        // Admin reads proves those events exist and only the member's stream
+        // was narrowed. They are read from the catch-up path: the commands
+        // above already consumed the live frames queued for the Admin.
+        let (_cursor, admin_events) = snapshot_events(&mut admin_socket).await;
+        for expected in [
+            (EventKind::McpServerUpdated, json!(personal)),
+            (EventKind::McpServerRemoved, json!(personal)),
+            (EventKind::SkillRemoved, json!(bot_skill)),
+            (EventKind::PluginEnabled, json!(plugin)),
+        ] {
+            let (kind, named) = expected;
+            assert!(
+                admin_events.iter().any(|event| {
+                    event.kind == kind
+                        && (event.data.get("server") == Some(&named)
+                            || event.data.get("skill") == Some(&named)
+                            || event.data.get("plugin") == Some(&named))
+                }),
+                "the Admin sees their own {kind:?}"
+            );
+        }
+
+        member_socket.close(None).await.unwrap();
+        admin_socket.close(None).await.unwrap();
+        mcp_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_personal_credential_attachment_stays_the_members_own() {
+        let (_dir, running, invite) = running().await;
+        let mut admin_socket = admin_socket(&running, &invite).await;
+        let grace = running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        running
+            .server
+            .identity
+            .add_account_for_test("Lin", "correct horse battery")
+            .await
+            .unwrap();
+        let grace_token = sign_in(&running, "Grace").await;
+        let lin_token = sign_in(&running, "Lin").await;
+        let mut grace_socket = open_socket(&running, &grace_token).await;
+        let mut lin_socket = open_socket(&running, &lin_token).await;
+
+        let (url, _log, mcp_task) = fake_mcp_server(|_| json!({"content": []})).await;
+        let server = add_mcp_server(&mut admin_socket, "space-docs", &url, Some("token-1")).await;
+        // Both members read the stream live from here on.
+        snapshot_events(&mut grace_socket).await;
+        snapshot_events(&mut lin_socket).await;
+
+        // Grace attaches her own credential to the Space's server. The event
+        // names her credential change, not the server's scope, so only she
+        // receives it: the other member cannot learn who attached what.
+        command(
+            &mut grace_socket,
+            Id::new(),
+            CommandCall::McpConnect {
+                server,
+                credential: Some("grace-token".to_owned()),
+            },
+        )
+        .await;
+        let grace_events = live_events(&mut grace_socket).await;
+        let lin_events = live_events(&mut lin_socket).await;
+        assert!(
+            grace_events.iter().any(|event| {
+                event.kind == EventKind::McpServerUpdated
+                    && event.data["server"] == json!(server)
+                    && event.data["scope"] == json!("user")
+                    && event.data["by"] == json!(grace.id)
+            }),
+            "the attaching member sees their own credential's change"
+        );
+        assert!(
+            lin_events
+                .iter()
+                .all(|event| event.data.get("server") != Some(&json!(server))),
+            "the other member receives no event for the personal attach"
+        );
+
+        // The Admin attaching the Space's credential records a Space change,
+        // which every member receives.
+        command(
+            &mut admin_socket,
+            Id::new(),
+            CommandCall::McpAdd(neha::surface::McpAdd {
+                name: "space-docs".to_owned(),
+                url: url.clone(),
+                scope: neha::record::McpScope::Space,
+                credential: Some("space-token".to_owned()),
+            }),
+        )
+        .await;
+        let lin_events = live_events(&mut lin_socket).await;
+        assert!(
+            lin_events.iter().any(|event| {
+                event.kind == EventKind::McpServerUpdated
+                    && event.data["server"] == json!(server)
+                    && event.data["scope"] == json!("space")
+            }),
+            "the Admin's Space credential change broadcasts to the member"
+        );
+
+        // Neither change touched the server the Space connected: the event's
+        // scope describes the credential change, and the projection ignores
+        // it for the server's own scope and user.
+        {
+            let state = running.server.state.lock().unwrap();
+            let view = state.mcp(server).expect("the server stays connected");
+            assert_eq!(
+                view.scope,
+                neha::record::McpScope::Space,
+                "an attachment never changes the server's scope"
+            );
+            assert_eq!(view.user, None, "a Space server has no User");
+        }
+
+        grace_socket.close(None).await.unwrap();
+        lin_socket.close(None).await.unwrap();
+        admin_socket.close(None).await.unwrap();
+        mcp_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_member_refreshes_when_a_package_is_removed() {
+        let (_dir, running, invite) = running().await;
+        let mut admin_socket = admin_socket(&running, &invite).await;
+        let admin = running
+            .server
+            .identity
+            .admin_account()
+            .await
+            .unwrap()
+            .expect("the Space has an Admin");
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let member_token = sign_in(&running, "Grace").await;
+        let mut member_socket = open_socket(&running, &member_token).await;
+        snapshot_events(&mut admin_socket).await;
+        snapshot_events(&mut member_socket).await;
+
+        // The Admin installs a package and then removes it. The installation
+        // names the package, its source, and its digest and stays the Admin's;
+        // the removal carries only the id, so every account learns the package
+        // left and can refresh what it offered.
+        let plugin = Id::new();
+        for (name, draft) in [
+            (
+                "plugin-installed",
+                EventDraft::new(
+                    EventKind::PluginInstalled,
+                    Author::User(admin.id),
+                    json!({
+                        "plugin": plugin,
+                        "name": "reports",
+                        "digest": "a".repeat(64),
+                        "source": "https://example.com/reports",
+                    }),
+                ),
+            ),
+            (
+                "plugin-removed",
+                EventDraft::new(
+                    EventKind::PluginRemoved,
+                    Author::User(admin.id),
+                    json!({"plugin": plugin}),
+                ),
+            ),
+        ] {
+            let appended = running
+                .server
+                .store
+                .append(AppendRequest::new(Id::new(), name.to_owned(), vec![draft]))
+                .await
+                .unwrap();
+            super::broadcast(&running.server, &appended.events);
+        }
+
+        let events = live_events(&mut member_socket).await;
+        assert!(
+            events.iter().any(|event| {
+                event.kind == EventKind::PluginRemoved && event.data["plugin"] == json!(plugin)
+            }),
+            "a member receives the package removal and refreshes"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::PluginInstalled),
+            "the installation's source, commit, and digest stay the Admin's"
+        );
+
+        // The catch-up path applies the same rule: a member that subscribes
+        // after the removal reads it from the record, and still not the
+        // installation.
+        let mut late_socket = open_socket(&running, &member_token).await;
+        let (_cursor, caught_up) = snapshot_events(&mut late_socket).await;
+        assert!(
+            caught_up.iter().any(|event| {
+                event.kind == EventKind::PluginRemoved && event.data["plugin"] == json!(plugin)
+            }),
+            "the catch-up path delivers the package removal"
+        );
+        assert!(
+            caught_up
+                .iter()
+                .all(|event| event.kind != EventKind::PluginInstalled),
+            "the catch-up path withholds the installation"
+        );
+
+        late_socket.close(None).await.unwrap();
+        member_socket.close(None).await.unwrap();
+        admin_socket.close(None).await.unwrap();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_browser_flow_leaves_the_newer_flows_cookie_alone() {
+        let (
+            mcp_url,
+            authorization_server,
+            _tokens,
+            forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let mut socket = open_socket(&running, token).await;
+        let session_cookie = browser_session(&running, "Ada").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let callback = sign_in_callback(&running, &authorization_server);
+        let bind_url = format!("{}/api/mcp/signin/bind", running.browser_url());
+
+        // The account starts one browser flow and binds it, then a command
+        // line flow (which owns no browser cookie and stays pending), then a
+        // second browser flow. The Space keeps one pending browser flow per
+        // account, so the second replaces the first; each flow's binding
+        // cookie has its own name.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("first".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let first: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (first_cookie, _first_nonce, first_authorize) =
+            bind_sign_in(&client, &running, first, Some(&session_cookie)).await;
+        let first_state =
+            query_parameter(&first_authorize, "state").expect("the URL carries a state");
+
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("command-line".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: Some("http://127.0.0.1:4714".to_owned()),
+            }),
+        )
+        .await;
+        let command_line: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("second".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let second: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+
+        let replaced = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: first },
+        )
+        .await;
+        assert_eq!(replaced["state"], json!("failed"));
+        assert_eq!(
+            replaced["reason"],
+            json!(super::SIGN_IN_REPLACED),
+            "the replaced flow reads the fixed sentence"
+        );
+        let untouched = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus {
+                sign_in: command_line,
+            },
+        )
+        .await;
+        assert_eq!(
+            untouched["state"],
+            json!("pending"),
+            "a command line flow is not replaced"
+        );
+
+        // A replaced flow cannot bind again: a terminal flow's bind reads the
+        // fixed failure and writes no cookie, so it cannot overwrite the newer
+        // flow's binding.
+        let stale_bind = client
+            .get(&bind_url)
+            .query(&[("sign_in", first.to_string())])
+            .header("cookie", &session_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_bind.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            stale_bind.headers().get("set-cookie").is_none(),
+            "a terminal flow's bind sets no cookie"
+        );
+        let body = stale_bind.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&first.to_string()),
+            "the page echoes no sign-in id: {body}"
+        );
+
+        // The newer flow binds under its own cookie name, so both answers can
+        // reach one browser without either overwriting the other's binding.
+        let (second_cookie, _second_nonce, second_authorize) =
+            bind_sign_in(&client, &running, second, Some(&session_cookie)).await;
+        assert_ne!(
+            first_cookie.split('=').next(),
+            second_cookie.split('=').next(),
+            "each flow's binding has its own cookie name"
+        );
+        let second_state =
+            query_parameter(&second_authorize, "state").expect("the URL carries a state");
+
+        // The browser holds both binding cookies now. The older flow's
+        // callback arrives after the newer bind; its state names no flow any
+        // more, so the fixed failure must clear neither cookie.
+        let stale = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", first_state.as_str())])
+            .header("cookie", format!("{first_cookie}; {second_cookie}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            stale.headers().get("set-cookie").is_none(),
+            "a spent state's failure must not clear the newer flow's cookie"
+        );
+        let body = stale.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert!(
+            !body.contains(&first_state) && !body.contains("fake-code"),
+            "the page echoes neither the state nor the code: {body}"
+        );
+        assert!(
+            forms.lock().unwrap().is_empty(),
+            "a spent state's callback exchanges no code"
+        );
+
+        // The newer flow still finishes with both cookies in the browser, and
+        // its answer clears only its own binding.
+        let page = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+            .header("cookie", format!("{first_cookie}; {second_cookie}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        let cleared = page
+            .headers()
+            .get("set-cookie")
+            .expect("the finished flow clears its binding")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            cleared.starts_with(&format!("{}=", super::sign_in_cookie_name(second))),
+            "the flow that finished clears its own binding cookie: {cleared}"
+        );
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(
+            !cleared.contains(&super::sign_in_cookie_name(first)),
+            "the answer clears no other flow's cookie: {cleared}"
+        );
+        let body = page.text().await.unwrap();
+        assert!(body.contains("finished"), "{body}");
+        let finished = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: second },
+        )
+        .await;
+        assert_eq!(finished["state"], json!("finished"));
+        assert_eq!(forms.lock().unwrap().len(), 1, "one code was exchanged");
+
+        // A finished flow cannot bind: it already has its browser.
+        let finished_bind = client
+            .get(&bind_url)
+            .query(&[("sign_in", second.to_string())])
+            .header("cookie", &session_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(finished_bind.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            finished_bind.headers().get("set-cookie").is_none(),
+            "a finished flow's bind sets no cookie"
+        );
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_older_browsers_bind_cannot_overwrite_the_newer_flows_cookie() {
+        let (
+            mcp_url,
+            authorization_server,
+            _tokens,
+            _forms,
+            _calls,
+            _registrations,
+            mcp_task,
+            as_task,
+        ) = fake_sign_in_landscape().await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let mut socket = open_socket(&running, token).await;
+        let session_cookie = browser_session(&running, "Ada").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let callback = sign_in_callback(&running, &authorization_server);
+        let bind_url = format!("{}/api/mcp/signin/bind", running.browser_url());
+
+        // Flow A starts and binds. Its bind answer is the one an in-progress
+        // request would write; the browser receives it only after B's answer.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("first".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let first: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (first_cookie, _first_nonce, first_authorize) =
+            bind_sign_in(&client, &running, first, Some(&session_cookie)).await;
+        let first_state =
+            query_parameter(&first_authorize, "state").expect("the URL carries a state");
+
+        // Flow B for the same account replaces A and binds. Both answers write
+        // their own cookie names, so the older one cannot overwrite B's.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("second".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let second: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (second_cookie, _second_nonce, second_authorize) =
+            bind_sign_in(&client, &running, second, Some(&session_cookie)).await;
+        let second_state =
+            query_parameter(&second_authorize, "state").expect("the URL carries a state");
+        assert_ne!(
+            first_cookie.split('=').next(),
+            second_cookie.split('=').next(),
+            "each flow's binding has its own cookie name"
+        );
+
+        // A's bind request that was in flight when B replaced A completes: the
+        // handler re-checks the replaced flow under the lock and refuses it,
+        // setting no cookie, so B's binding is untouched.
+        let stale_bind = client
+            .get(&bind_url)
+            .query(&[("sign_in", first.to_string())])
+            .header("cookie", &session_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale_bind.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            stale_bind.headers().get("set-cookie").is_none(),
+            "a replaced flow's bind sets no cookie"
+        );
+
+        // The callback reads the cookie its matched flow names: B's state with
+        // only A's cookie is no binding, and its refusal clears nothing.
+        let crossed = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+            .header("cookie", &first_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(crossed.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            crossed.headers().get("set-cookie").is_none(),
+            "another flow's cookie completes nothing and clears nothing"
+        );
+
+        // The browser holds both binding cookies now. A's state names no flow
+        // any more, so its callback clears neither.
+        let both = format!("{first_cookie}; {second_cookie}");
+        let stale = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", first_state.as_str())])
+            .header("cookie", &both)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            stale.headers().get("set-cookie").is_none(),
+            "a spent state's failure clears no binding"
+        );
+
+        // B's callback succeeds although A's cookie is in the browser too, and
+        // it clears only its own binding.
+        let page = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+            .header("cookie", &both)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        let cleared = page
+            .headers()
+            .get("set-cookie")
+            .expect("the finished flow clears its binding")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            cleared.starts_with(&format!("{}=", super::sign_in_cookie_name(second))),
+            "the flow that finished clears its own binding cookie: {cleared}"
+        );
+        assert!(cleared.contains("Max-Age=0"), "{cleared}");
+        assert!(
+            !cleared.contains(&super::sign_in_cookie_name(first)),
+            "the answer clears no other flow's cookie: {cleared}"
+        );
+        let body = page.text().await.unwrap();
+        assert!(body.contains("finished"), "{body}");
+        let finished = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: second },
+        )
+        .await;
+        assert_eq!(finished["state"], json!("finished"));
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_replaced_flow_discards_the_token_its_exchange_returns() {
+        let (
+            (
+                mcp_url,
+                authorization_server,
+                _tokens,
+                forms,
+                _calls,
+                _registrations,
+                mcp_task,
+                as_task,
+            ),
+            delay,
+        ) = fake_sign_in_landscape_delayed().await;
+        let (_dir, running, invite) = running().await;
+        let session = join(&running, &invite, "Ada", "correct horse battery").await;
+        let token = session["token"].as_str().unwrap();
+        let mut socket = open_socket(&running, token).await;
+        let session_cookie = browser_session(&running, "Ada").await;
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+        let callback = sign_in_callback(&running, &authorization_server);
+
+        // Flow A starts and binds, then its callback claims the flow and its
+        // token request stops inside the fake authorization server.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("first".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let first: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let (first_cookie, _first_nonce, first_authorize) =
+            bind_sign_in(&client, &running, first, Some(&session_cookie)).await;
+        let first_state =
+            query_parameter(&first_authorize, "state").expect("the URL carries a state");
+        let first_callback = tokio::spawn({
+            let client = client.clone();
+            let callback = callback.clone();
+            let state = first_state.clone();
+            let cookie = first_cookie.clone();
+            async move {
+                client
+                    .get(&callback)
+                    .query(&[("code", "fake-code"), ("state", state.as_str())])
+                    .header("cookie", cookie)
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        });
+        // The exchange is in flight: the flow is admitted but not yet
+        // committed, so a poll still reads pending.
+        delay.arrived.notified().await;
+        let during = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: first },
+        )
+        .await;
+        assert_eq!(during["state"], json!("pending"));
+
+        // Flow B for the same account replaces A. Its start finds A
+        // executing and writes the terminal sentence A's delivery must not
+        // overwrite.
+        let started = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStart(neha::surface::McpSignInStart {
+                server: None,
+                name: Some("second".to_owned()),
+                url: Some(mcp_url.clone()),
+                scope: None,
+                redirect_uri: None,
+            }),
+        )
+        .await;
+        let second: Id = serde_json::from_value(started["sign_in"].clone()).unwrap();
+        let replaced = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: first },
+        )
+        .await;
+        assert_eq!(replaced["state"], json!("failed"));
+        assert_eq!(replaced["reason"], json!(super::SIGN_IN_REPLACED));
+
+        // Flow B binds and finishes while A's token request is still held.
+        let (second_cookie, _second_nonce, second_authorize) =
+            bind_sign_in(&client, &running, second, Some(&session_cookie)).await;
+        let second_state =
+            query_parameter(&second_authorize, "state").expect("the URL carries a state");
+        let page = client
+            .get(&callback)
+            .query(&[("code", "fake-code"), ("state", second_state.as_str())])
+            .header("cookie", &second_cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), reqwest::StatusCode::OK);
+        assert!(page.text().await.unwrap().contains("finished"));
+        let finished = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: second },
+        )
+        .await;
+        assert_eq!(finished["state"], json!("finished"));
+        let server: Id = serde_json::from_value(finished["server"].clone()).unwrap();
+        // B's exchange was the second one: its numbered token is the newer
+        // credential, and the Vault holds it now.
+        assert_eq!(
+            running
+                .server
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("token-2"),
+            "the winning flow's credential is in the Vault"
+        );
+        let cursor = running.server.store.last_seq().await.unwrap();
+
+        // Release A's token. Its flow was replaced, so the token is discarded:
+        // no Vault write, no event, and the terminal sentence stays.
+        delay.release.notify_one();
+        let stale = first_callback.await.unwrap();
+        assert_eq!(stale.status(), reqwest::StatusCode::BAD_REQUEST);
+        assert!(
+            stale.headers().get("set-cookie").is_none(),
+            "a replaced flow's answer clears no newer binding"
+        );
+        let body = stale.text().await.unwrap();
+        assert!(body.contains("failed"), "{body}");
+        assert_eq!(
+            running.server.store.last_seq().await.unwrap(),
+            cursor,
+            "a replaced flow's late exchange appends no event"
+        );
+        assert_eq!(
+            running
+                .server
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("token-2"),
+            "a replaced flow's late token does not overwrite the newer credential"
+        );
+        let stale_status = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::McpSignInStatus { sign_in: first },
+        )
+        .await;
+        assert_eq!(stale_status["state"], json!("failed"));
+        assert_eq!(
+            stale_status["reason"],
+            json!(super::SIGN_IN_REPLACED),
+            "the replacement's terminal sentence stays"
+        );
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events;
+        let added: Vec<_> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::McpServerAdded)
+            .collect();
+        assert_eq!(added.len(), 1, "only the winning flow records a connection");
+        assert_eq!(added[0].data["server"], json!(server));
+        assert_eq!(
+            forms.lock().unwrap().len(),
+            2,
+            "both exchanges reached the authority"
+        );
+
+        socket.close(None).await.unwrap();
+        mcp_task.abort();
+        as_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn historical_events_without_a_scope_stay_their_authors() {
+        let (_dir, running, invite) = running().await;
+        let mut admin_socket = admin_socket(&running, &invite).await;
+        let admin = running
+            .server
+            .identity
+            .admin_account()
+            .await
+            .unwrap()
+            .expect("the Space has an Admin");
+        running
+            .server
+            .identity
+            .add_account_for_test("Grace", "correct horse battery")
+            .await
+            .unwrap();
+        let member_token = sign_in(&running, "Grace").await;
+        let mut member_socket = open_socket(&running, &member_token).await;
+
+        // A record written before the events carried a scope or a library: it
+        // says nothing about the Space, so a member must not read it.
+        let server = Id::new();
+        let skill = Id::new();
+        let plugin = Id::new();
+        running
+            .server
+            .store
+            .append(AppendRequest::new(
+                Id::new(),
+                "old-record".to_owned(),
+                vec![
+                    EventDraft::new(
+                        EventKind::McpServerUpdated,
+                        Author::User(admin.id),
+                        json!({
+                            "server": server,
+                            "url": null,
+                            "credential": true,
+                            "by": admin.id,
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::McpServerRemoved,
+                        Author::User(admin.id),
+                        json!({"server": server}),
+                    ),
+                    EventDraft::new(
+                        EventKind::SkillRemoved,
+                        Author::User(admin.id),
+                        json!({"skill": skill}),
+                    ),
+                    EventDraft::new(
+                        EventKind::PluginInstalled,
+                        Author::User(admin.id),
+                        json!({
+                            "plugin": plugin,
+                            "name": "reports",
+                            "digest": "a".repeat(64),
+                            "source": "https://example.com/reports",
+                        }),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+
+        // The author reads the old shaped events back.
+        let (_cursor, admin_events) = snapshot_events(&mut admin_socket).await;
+        assert!(admin_events.iter().any(|event| {
+            event.kind == EventKind::McpServerUpdated
+                && event.data.get("scope").is_none()
+                && event.data["server"] == json!(server)
+        }));
+        assert!(admin_events.iter().any(|event| {
+            event.kind == EventKind::McpServerRemoved
+                && event.data.get("scope").is_none()
+                && event.data["server"] == json!(server)
+        }));
+        assert!(admin_events.iter().any(|event| {
+            event.kind == EventKind::SkillRemoved
+                && event.data.get("library").is_none()
+                && event.data["skill"] == json!(skill)
+        }));
+        assert!(
+            admin_events
+                .iter()
+                .any(|event| event.kind == EventKind::PluginInstalled)
+        );
+
+        // A member receives none of them, and still receives what belongs to
+        // the Space itself.
+        let (_cursor, member_events) = snapshot_events(&mut member_socket).await;
+        assert!(
+            member_events.iter().all(|event| {
+                event.data.get("server") != Some(&json!(server))
+                    && event.data.get("skill") != Some(&json!(skill))
+                    && event.data.get("plugin") != Some(&json!(plugin))
+            }),
+            "the historical events stay their author's"
+        );
+        assert!(
+            member_events
+                .iter()
+                .any(|event| event.kind == EventKind::UserJoined),
+            "a Space-wide event still reaches a member"
+        );
+
+        member_socket.close(None).await.unwrap();
+        admin_socket.close(None).await.unwrap();
         running.shutdown().await;
     }
 }

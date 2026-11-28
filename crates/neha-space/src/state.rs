@@ -1780,6 +1780,13 @@ impl Projection for State {
                     .iter()
                     .position(|view| view.server == data.server)
                     .ok_or("an updated server must exist")?;
+                // The event's `scope` describes the credential change for the
+                // event stream's visibility only: it is never the server's own
+                // scope. The server's scope and user are decided by the
+                // `neha.mcp.server.added` event that put this view here, so
+                // this arm must not (and cannot) change either of them: a
+                // member's personal credential attaching to a Space server
+                // leaves both untouched.
                 if let Some(url) = data.url {
                     // Only the account that connected a server changes where
                     // it points. Any User may attach their own credential to

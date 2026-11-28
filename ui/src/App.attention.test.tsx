@@ -306,9 +306,9 @@ describe("App attention", () => {
     space.chats = [space.chat, space.otherChat, space.thirdChat];
     const view = await openChat();
 
-    // The rail has both entries, and the attention one carries the count.
+    // The rail has all four entries, and the attention one carries the count.
     const rail = Array.from(view.container.querySelectorAll(".rail__item"));
-    expect(rail).toHaveLength(2);
+    expect(rail).toHaveLength(4);
     expect(rail[1]?.getAttribute("aria-label")).toBe("Needs attention: 2 approvals waiting");
     expect(element(view, ".rail__count").textContent).toBe("2");
 

@@ -342,8 +342,8 @@ pub struct Event {
 mod tests {
     use super::{
         Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
-        FileAdded, FileError, McpServerAdded, RunAccess, RunQueued, SkillAdded, SkillLibrary,
-        SkillScript,
+        FileAdded, FileError, McpScope, McpServerAdded, RunAccess, RunQueued, SkillAdded,
+        SkillLibrary, SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -524,6 +524,73 @@ mod tests {
         };
         assert!(rule.skill.is_some());
         assert_eq!(rule.script.as_deref(), Some("collect.sh"));
+    }
+
+    #[test]
+    fn a_shared_change_carries_its_scope_and_an_old_one_still_decodes() {
+        let server = Id::new();
+        let by = Id::new();
+        // A record written before the scope field has none: it still decodes,
+        // and the stream keeps it the author's.
+        let old = serde_json::json!({
+            "server": server,
+            "url": null,
+            "credential": true,
+            "by": by,
+        });
+        let EventData::McpServerUpdated(updated) =
+            EventKind::McpServerUpdated.decode(&old).unwrap()
+        else {
+            panic!("the data is a server update");
+        };
+        assert_eq!(updated.scope, None);
+        for (scope, expected) in [("space", McpScope::Space), ("user", McpScope::User)] {
+            let mut value = old.clone();
+            value["scope"] = serde_json::json!(scope);
+            let EventData::McpServerUpdated(updated) =
+                EventKind::McpServerUpdated.decode(&value).unwrap()
+            else {
+                panic!("the data is a server update");
+            };
+            assert_eq!(updated.scope, Some(expected));
+        }
+        let mut unknown = old.clone();
+        unknown["scope"] = serde_json::json!("somewhere");
+        assert!(EventKind::McpServerUpdated.decode(&unknown).is_err());
+
+        let removed = serde_json::json!({"server": server});
+        let EventData::McpServerRemoved(removal) =
+            EventKind::McpServerRemoved.decode(&removed).unwrap()
+        else {
+            panic!("the data is a server removal");
+        };
+        assert_eq!(removal.scope, None);
+        let mut shared = removed.clone();
+        shared["scope"] = serde_json::json!("space");
+        let EventData::McpServerRemoved(removal) =
+            EventKind::McpServerRemoved.decode(&shared).unwrap()
+        else {
+            panic!("the data is a server removal");
+        };
+        assert_eq!(removal.scope, Some(McpScope::Space));
+
+        let skill = Id::new();
+        let old_removal = serde_json::json!({"skill": skill});
+        let EventData::SkillRemoved(removal) =
+            EventKind::SkillRemoved.decode(&old_removal).unwrap()
+        else {
+            panic!("the data is a skill removal");
+        };
+        assert_eq!(removal.library, None);
+        for (library, expected) in [("space", SkillLibrary::Space), ("bot", SkillLibrary::Bot)] {
+            let mut value = old_removal.clone();
+            value["library"] = serde_json::json!(library);
+            let EventData::SkillRemoved(removal) = EventKind::SkillRemoved.decode(&value).unwrap()
+            else {
+                panic!("the data is a skill removal");
+            };
+            assert_eq!(removal.library, Some(expected));
+        }
     }
 
     #[test]
@@ -2181,6 +2248,14 @@ pub fn valid_script_name(name: &str) -> bool {
 pub struct SkillRemoved {
     /// The skill.
     pub skill: Id,
+    /// The library the skill left, when the writer knew it.
+    ///
+    /// The payload names no person, so the event stream uses this to decide
+    /// whether every member may see the removal: only a Space skill's
+    /// removal is every member's. A record written before this field has
+    /// none and stays its author's.
+    #[serde(default)]
+    pub library: Option<SkillLibrary>,
 }
 
 /// Where an MCP server's credential and tools belong.
@@ -2381,6 +2456,17 @@ pub struct McpServerUpdated {
     pub credential: bool,
     /// The account that changed it.
     pub by: Id,
+    /// Where the credential the update names belongs, when the writer knew it.
+    ///
+    /// The payload names no person, so the event stream uses this to decide
+    /// whether every member may see the change: only a Space credential's
+    /// change is every member's. A personal credential attached to a Space
+    /// server records [`McpScope::User`], so the stream never broadcasts who
+    /// attached it. The projection ignores this field: it describes the
+    /// credential change, not the server's own scope. A record written before
+    /// this field has none and stays its author's.
+    #[serde(default)]
+    pub scope: Option<McpScope>,
 }
 
 /// The data of `neha.mcp.server.removed`.
@@ -2389,6 +2475,14 @@ pub struct McpServerUpdated {
 pub struct McpServerRemoved {
     /// The server.
     pub server: Id,
+    /// Where the server's credential belonged, when the writer knew it.
+    ///
+    /// The payload names no person, so the event stream uses this to decide
+    /// whether every member may see the removal: only a Space-wide server's
+    /// removal is every member's. A record written before this field has none
+    /// and stays its author's.
+    #[serde(default)]
+    pub scope: Option<McpScope>,
 }
 
 /// The data of `neha.bot.mcp.enabled`.

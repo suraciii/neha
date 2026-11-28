@@ -211,6 +211,42 @@ pub enum CommandCall {
         /// The server.
         server: Id,
     },
+    /// Connects the signed-in User to an existing server with their own
+    /// credential.
+    McpConnect {
+        /// The server.
+        server: Id,
+        /// The credential to attach for the caller.
+        credential: Option<String>,
+    },
+    /// Starts an MCP sign-in; the answer carries a browser URL to open.
+    McpSignInStart(McpSignInStart),
+    /// Reports what became of a sign-in.
+    McpSignInStatus {
+        /// The sign-in the start answered with.
+        sign_in: Id,
+    },
+    /// Finishes a sign-in a command line started with a loopback redirect.
+    McpSignInFinish {
+        /// The sign-in the start answered with.
+        sign_in: Id,
+        /// The authorization code the loopback receiver received.
+        code: String,
+        /// The state token the authorization server returned unchanged.
+        state: String,
+        /// The path the loopback receiver received the callback at.
+        ///
+        /// The Space's plan names an issuer-keyed callback path, so a code
+        /// that arrived on another issuer's path belongs to another flow: the
+        /// finish compares the path the command line received with the path of
+        /// the registered redirect and refuses a mismatch before exchanging
+        /// the code. The receiver strips the query it got with the callback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        /// The issuer the authorization server named, when it named one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        iss: Option<String>,
+    },
     /// Lets a Bot call an MCP server's tools.
     BotMcpEnable {
         /// The Bot.
@@ -263,6 +299,34 @@ pub struct McpAdd {
     /// server without one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
+}
+
+/// The parameters of `mcp_sign_in_start`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpSignInStart {
+    /// An existing server to attach a credential to; `None` registers
+    /// `name`/`url` after the sign-in finishes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<Id>,
+    /// The name a new server takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The address a new server speaks Streamable HTTP at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Where the credential belongs when the server is new.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::record::McpScope>,
+    /// The loopback redirect base a command line owns, when the flow should
+    /// finish there rather than in the Space's browser callback.
+    ///
+    /// The Space appends the discovered issuer's key and `/callback` to this
+    /// base, so the command line's receiver must accept any callback path. The
+    /// base is plain HTTP on a loopback address with an explicit port, such as
+    /// `http://127.0.0.1:4711`; any path the caller writes is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
 }
 
 /// The parameters of `skill_add`.
@@ -589,8 +653,8 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, MessageSend, ModelSpec,
-        PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol, ServerFrame,
+        BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, McpSignInStart, MessageSend,
+        ModelSpec, PROTOCOL_VERSION, ProviderAdd, ProviderConnect, ProviderProtocol, ServerFrame,
         ThinkingLevel,
     };
     use crate::error::ErrorCode;
@@ -1011,6 +1075,115 @@ mod tests {
         let text = serde_json::to_string(&remove).unwrap();
         assert!(text.contains("\"name\":\"rule_remove\""), "{text}");
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), remove);
+    }
+
+    #[test]
+    fn mcp_sign_in_commands_round_trip() {
+        let server = Id::new();
+        let connect = CommandCall::McpConnect {
+            server,
+            credential: Some("token".to_owned()),
+        };
+        let text = serde_json::to_string(&connect).unwrap();
+        assert!(text.contains("\"name\":\"mcp_connect\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), connect);
+
+        // A connect without a credential decodes for the Space to refuse.
+        let bare: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"mcp_connect\",\"args\":{{\"server\":\"{server}\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            bare,
+            CommandCall::McpConnect {
+                server,
+                credential: None,
+            }
+        );
+
+        let start = CommandCall::McpSignInStart(McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some("http://127.0.0.1:9000/mcp".to_owned()),
+            scope: None,
+            redirect_uri: None,
+        });
+        let text = serde_json::to_string(&start).unwrap();
+        assert!(text.contains("\"name\":\"mcp_sign_in_start\""), "{text}");
+        assert!(!text.contains("\"scope\""), "an absent scope is omitted");
+        assert!(
+            !text.contains("redirect_uri"),
+            "an absent redirect is omitted"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), start);
+
+        // A command line that receives the callback itself names its loopback
+        // redirect.
+        let loopback = CommandCall::McpSignInStart(McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some("http://127.0.0.1:9000/mcp".to_owned()),
+            scope: None,
+            redirect_uri: Some("http://127.0.0.1:4711/api/mcp/signin/callback".to_owned()),
+        });
+        let text = serde_json::to_string(&loopback).unwrap();
+        assert!(
+            text.contains("\"redirect_uri\":\"http://127.0.0.1:4711/api/mcp/signin/callback\""),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandCall>(&text).unwrap(),
+            loopback
+        );
+
+        let sign_in = Id::new();
+        let status = CommandCall::McpSignInStatus { sign_in };
+        let text = serde_json::to_string(&status).unwrap();
+        assert!(text.contains("\"name\":\"mcp_sign_in_status\""), "{text}");
+        assert!(
+            text.contains(&format!("\"sign_in\":\"{sign_in}\"")),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), status);
+
+        let finish = CommandCall::McpSignInFinish {
+            sign_in,
+            code: "the-code".to_owned(),
+            state: "the-state".to_owned(),
+            path: Some("/an-issuer-key/callback".to_owned()),
+            iss: Some("https://auth.example.com".to_owned()),
+        };
+        let text = serde_json::to_string(&finish).unwrap();
+        assert!(text.contains("\"name\":\"mcp_sign_in_finish\""), "{text}");
+        assert!(text.contains("\"code\":\"the-code\""), "{text}");
+        assert!(text.contains("\"state\":\"the-state\""), "{text}");
+        assert!(
+            text.contains("\"path\":\"/an-issuer-key/callback\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"iss\":\"https://auth.example.com\""),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), finish);
+
+        // An authorization server that omits RFC 9207's `iss`, and a caller
+        // that names no path, still decode for the Space to refuse.
+        let bare: CommandCall = serde_json::from_str(&format!(
+            "{{\"name\":\"mcp_sign_in_finish\",\"args\":{{\"sign_in\":\"{sign_in}\",\
+             \"code\":\"the-code\",\"state\":\"the-state\"}}}}"
+        ))
+        .unwrap();
+        assert_eq!(
+            bare,
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                path: None,
+                iss: None,
+            }
+        );
     }
 }
 

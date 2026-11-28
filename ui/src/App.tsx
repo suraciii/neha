@@ -2,9 +2,12 @@ import { Show, createMemo, createSignal, createStore, onCleanup, onSettled } fro
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
-import Rail from "./components/Rail";
+import Icon from "./components/Icon";
+import IntegrationsView from "./components/IntegrationsView";
+import Rail, { type RailView } from "./components/Rail";
 import SetupView from "./components/SetupView";
 import Sidebar from "./components/Sidebar";
+import SkillsView from "./components/SkillsView";
 import { t, type MessageKey } from "./i18n";
 import { api, ApiError } from "./lib/api";
 import { MAX_FILE_BYTES,
@@ -20,6 +23,9 @@ import type {
   Computer,
   Decision,
   FileSummary,
+  InstalledPackage,
+  McpServer,
+  McpSignInState,
   Message,
   Model,
   Provider,
@@ -31,6 +37,7 @@ import type {
   RunProgress,
   RunView,
   SendResult,
+  Skill,
   ToolAction,
 } from "./types";
 
@@ -170,6 +177,32 @@ function emptyState(): State {
   };
 }
 
+// How often the page asks what became of a started browser sign-in, and how
+// long it keeps asking: the Space forgets a sign-in after five minutes.
+const SIGN_IN_POLL_MS = 1_000;
+const SIGN_IN_WINDOW_MS = 5 * 60 * 1_000;
+// Starting a sign-in discovers the provider's OAuth metadata, which may take
+// longer than an ordinary command may wait.
+const SIGN_IN_START_TIMEOUT_MS = 60_000;
+
+// The SKILL.md document the Skills view's Add form describes: the two required
+// frontmatter fields, then the instructions as the body.
+function skillDocument(name: string, description: string, body: string): string {
+  const instructions = body.trim();
+  const suffix = instructions === "" ? "" : `\n${instructions}\n`;
+  return `---\nname: ${JSON.stringify(name)}\ndescription: ${JSON.stringify(description)}\n---\n${suffix}`;
+}
+
+// Whether an event changed what a library view lists, or who may use it.
+function isLibraryEvent(kind: string): boolean {
+  return (
+    kind.startsWith("neha.mcp.") ||
+    kind.startsWith("neha.skill.") ||
+    kind.startsWith("neha.plugin.") ||
+    kind.startsWith("neha.bot.")
+  );
+}
+
 export default function App() {
   const [state, setState] = createStore<State>(emptyState());
   // Writes the fields the caller names, or lets the caller write the store.
@@ -196,12 +229,49 @@ export default function App() {
   const [authMode, setAuthMode] = createSignal<AuthMode>("login");
   const [authSecret, setAuthSecret] = createSignal("");
   const [isMobile, setIsMobile] = createSignal(false);
-  // What the rail selected: the Chats, or the approvals that wait for the User.
-  const [view, setView] = createSignal<"chats" | "attention">("chats");
+  // What the rail selected: the Chats, the approvals that wait for the User, or
+  // one of the libraries the Space holds.
+  const [view, setView] = createSignal<RailView>("chats");
   // The approval the User asked to see, so its Chat scrolls to its card.
   const [focus, setFocus] = createSignal<string | null>(null);
+  // What the Integrations and Skills views list. Each list is read when its
+  // view is first opened, and again when the record says it changed.
+  const [integrations, setIntegrations] = createSignal<McpServer[]>([]);
+  const [packages, setPackages] = createSignal<InstalledPackage[]>([]);
+  const [skills, setSkills] = createSignal<Skill[]>([]);
+  // One library command or read is in flight.
+  const [libraryBusy, setLibraryBusy] = createSignal(false);
+  // What the Space refused, in the User's words: the views show it as one line.
+  const [libraryError, setLibraryError] = createSignal<string | null>(null);
+  // The URL of a sign-in whose window the browser would not open, so the view
+  // can offer it as a link while the page keeps polling.
+  const [signInFallback, setSignInFallback] = createSignal<string | null>(null);
   const commands = new Commands();
   let runGeneration = 0;
+  // How many library reads and commands are in flight, so one answer does not
+  // reopen the controls another answer still holds.
+  let libraryWork = 0;
+  let libraryRefreshTimer: number | null = null;
+  let libraryRefreshInFlight = false;
+  let libraryRefreshAgain = false;
+  // The lists this page has read once. A view opens its lists the first time,
+  // and later opens show what the record's events kept current.
+  let integrationsLoaded = false;
+  let packagesLoaded = false;
+  let skillsLoaded = false;
+  // A read of a list is already on its way, so opening the view again adds no
+  // second read.
+  let integrationsLoading = false;
+  let skillsLoading = false;
+  // The browser sign-ins this page polls while the Space has not settled them,
+  // with the URL each was opened at and the window it was opened in.
+  interface SignInWatch {
+    timer: number;
+    url: string;
+    popup: Window | null;
+  }
+  const signInWatches = new Map<string, SignInWatch>();
+  const signInAsking = new Set<string>();
   let following = false;
   let refreshTimer: number | null = null;
   let refreshAgain = false;
@@ -564,6 +634,14 @@ export default function App() {
       window.clearTimeout(refreshTimer);
       refreshTimer = null;
     }
+    if (libraryRefreshTimer !== null) {
+      window.clearTimeout(libraryRefreshTimer);
+      libraryRefreshTimer = null;
+    }
+    for (const watch of signInWatches.values()) window.clearInterval(watch.timer);
+    signInWatches.clear();
+    signInAsking.clear();
+    setSignInFallback(null);
     void commands.close();
   });
 
@@ -726,6 +804,9 @@ export default function App() {
       void loadWorkspace();
       return;
     }
+    // An event that changed what a library holds or who may use it: the views
+    // read the lists it touched again. Every other event leaves them alone.
+    if (isLibraryEvent(event.kind)) queueLibraryRefresh();
     const run = typeof data.run === "string" ? data.run : null;
     if (event.kind === "neha.message.added" && chat) {
       const text = typeof data.text === "string" ? data.text : "";
@@ -953,6 +1034,379 @@ export default function App() {
         }
       });
     }, 50);
+  }
+
+  // Opens a view from the rail or the sidebar. A library view reads what it
+  // lists the first time it opens; later opens show what the record kept
+  // current.
+  function selectView(next: RailView) {
+    setView(next);
+    if (next !== "integrations" && next !== "skills") return;
+    // A refusal from an earlier visit does not belong to the list being opened.
+    setLibraryError(null);
+    if (next === "integrations") void loadIntegrations();
+    else void loadSkills();
+  }
+
+  function isAdmin(): boolean {
+    return state.account?.is_admin === true;
+  }
+
+  function beginLibraryWork() {
+    libraryWork += 1;
+    setLibraryBusy(true);
+  }
+
+  function endLibraryWork() {
+    libraryWork = Math.max(0, libraryWork - 1);
+    if (libraryWork === 0) setLibraryBusy(false);
+  }
+
+  // The Space's MCP servers and, for the Admin, the packages it installed. A
+  // non-Admin never asks for the packages: the Space refuses that read. The
+  // view still groups the servers a package brought, under a neutral name.
+  async function loadIntegrations(): Promise<void> {
+    if (integrationsLoaded && (packagesLoaded || !isAdmin())) return;
+    if (integrationsLoading) return;
+    integrationsLoading = true;
+    beginLibraryWork();
+    setLibraryError(null);
+    try {
+      if (!integrationsLoaded) {
+        const servers = await commands.command<McpServer[]>("mcp_list");
+        setIntegrations(servers);
+        integrationsLoaded = true;
+      }
+      if (isAdmin() && !packagesLoaded) {
+        const installed = await commands.command<InstalledPackage[]>("plugin_list");
+        setPackages(installed);
+        packagesLoaded = true;
+      }
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      integrationsLoading = false;
+      endLibraryWork();
+    }
+  }
+
+  // The skills the Space and the reader's Bots hold. The packages an Admin may
+  // read come with them, so a skill a package brought can name it.
+  async function loadSkills(): Promise<void> {
+    if (skillsLoaded && (packagesLoaded || !isAdmin())) return;
+    if (skillsLoading) return;
+    skillsLoading = true;
+    beginLibraryWork();
+    setLibraryError(null);
+    try {
+      if (!skillsLoaded) {
+        const listed = await commands.command<Skill[]>("skill_list", {});
+        setSkills(listed);
+        skillsLoaded = true;
+      }
+      if (isAdmin() && !packagesLoaded) {
+        const installed = await commands.command<InstalledPackage[]>("plugin_list");
+        setPackages(installed);
+        packagesLoaded = true;
+      }
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      skillsLoading = false;
+      endLibraryWork();
+    }
+  }
+
+  // Reads the lists the views already hold: a list a User never opened is left
+  // alone, so an event for it changes nothing until its view opens.
+  async function refreshLibraries(): Promise<void> {
+    if (!integrationsLoaded && !skillsLoaded) return;
+    beginLibraryWork();
+    try {
+      const reads: Promise<void>[] = [];
+      if (integrationsLoaded) {
+        reads.push(
+          commands.command<McpServer[]>("mcp_list").then((servers) => {
+            setIntegrations(servers);
+          }),
+        );
+        if (isAdmin()) {
+          reads.push(
+            commands.command<InstalledPackage[]>("plugin_list").then((installed) => {
+              setPackages(installed);
+              packagesLoaded = true;
+            }),
+          );
+        }
+      }
+      if (skillsLoaded) {
+        reads.push(
+          commands.command<Skill[]>("skill_list", {}).then((listed) => {
+            setSkills(listed);
+          }),
+        );
+      }
+      // Both views name Bots and toggle their servers and skills, so the Bots
+      // are read with them. Each one is copied: a row keyed by its object must
+      // see the server and skill lists the read replaced.
+      reads.push(
+        commands.command<Bot[]>("bot_list").then((listed) => {
+          update({
+            bots: listed
+              .map((bot) => ({ ...bot }))
+              .sort((left, right) => left.id.localeCompare(right.id)),
+          });
+        }),
+      );
+      await Promise.all(reads);
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      endLibraryWork();
+    }
+  }
+
+  // Coalesces the reads a burst of library events and command answers asks
+  // for, so an event about a command the page just ran is one read, not two.
+  // A request that lands while a read runs asks for one more read: its change
+  // arrived after the answer the read was sent with.
+  function queueLibraryRefresh(): void {
+    if (libraryRefreshInFlight) {
+      libraryRefreshAgain = true;
+      return;
+    }
+    if (libraryRefreshTimer !== null) window.clearTimeout(libraryRefreshTimer);
+    libraryRefreshTimer = window.setTimeout(() => {
+      libraryRefreshTimer = null;
+      libraryRefreshInFlight = true;
+      void refreshLibraries().finally(() => {
+        libraryRefreshInFlight = false;
+        if (libraryRefreshAgain) {
+          libraryRefreshAgain = false;
+          queueLibraryRefresh();
+        }
+      });
+    }, 50);
+  }
+
+  // Runs one library command. The views wait while it is in flight, a refusal
+  // shows above the list it would have changed, and an accepted change is read
+  // back from the Space after the record's own event has landed.
+  async function libraryCommand(run: () => Promise<unknown>): Promise<void> {
+    if (libraryBusy()) return;
+    beginLibraryWork();
+    setLibraryError(null);
+    let accepted = false;
+    try {
+      await run();
+      accepted = true;
+    } catch (reason) {
+      setLibraryError(messageFor(reason));
+    } finally {
+      endLibraryWork();
+    }
+    if (accepted) queueLibraryRefresh();
+  }
+
+  // Connects an MCP server. The token lives only in this call and the frame it
+  // sends: it never enters a signal, a log, or the page after the answer.
+  function addIntegration(input: {
+    name: string;
+    url: string;
+    scope: "space" | "user";
+    token: string;
+  }): Promise<void> {
+    const args: Record<string, unknown> = { name: input.name, url: input.url, scope: input.scope };
+    if (input.token !== "") args.credential = input.token;
+    return libraryCommand(() => commands.command("mcp_add", args));
+  }
+
+  function connectIntegration(server: string, token: string): Promise<void> {
+    return libraryCommand(() => commands.command("mcp_connect", { server, credential: token }));
+  }
+
+  function removeIntegration(server: string): Promise<void> {
+    return libraryCommand(() => commands.command("mcp_remove", { server }));
+  }
+
+  function setBotIntegration(bot: string, server: string, enabled: boolean): Promise<void> {
+    return libraryCommand(() =>
+      commands.command(enabled ? "bot_mcp_enable" : "bot_mcp_disable", { bot, server }),
+    );
+  }
+
+  function setPackageEnabled(plugin: string, enabled: boolean): Promise<void> {
+    return libraryCommand(() =>
+      commands.command(enabled ? "plugin_enable" : "plugin_disable", { plugin }),
+    );
+  }
+
+  // Adds a skill to the library the Add form names. The Space reads one
+  // SKILL.md document, so the form's fields become its frontmatter and body.
+  function addSkill(input: {
+    name: string;
+    description: string;
+    body: string;
+    bot: string | null;
+    scripts: { name: string; content: string }[];
+  }): Promise<void> {
+    const document = skillDocument(input.name, input.description, input.body);
+    const args =
+      input.bot === null
+        ? { library: "space", document, scripts: input.scripts }
+        : { library: "bot", bot: input.bot, document, scripts: input.scripts };
+    return libraryCommand(() => commands.command("skill_add", args));
+  }
+
+  function removeSkill(skill: string): Promise<void> {
+    return libraryCommand(() => commands.command("skill_remove", { skill }));
+  }
+
+  function setBotSkill(bot: string, skill: string, enabled: boolean): Promise<void> {
+    return libraryCommand(() =>
+      commands.command(enabled ? "bot_skill_enable" : "bot_skill_disable", { bot, skill }),
+    );
+  }
+
+  // Opens the blank window a browser sign-in will use. The click that starts
+  // the sign-in is the browser's permission to open a window; that permission
+  // is gone by the time the command's answer arrives, so the window is opened
+  // before the command is sent.
+  function openSignInWindow(): Window | null {
+    try {
+      const opened = window.open("about:blank", "_blank");
+      if (opened) {
+        // The page this window reaches later has no way back into this one.
+        try {
+          opened.opener = null;
+        } catch {
+          // A window that already navigated keeps its opener; nothing here can.
+        }
+      }
+      return opened ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  function closeSignInWindow(popup: Window | null): void {
+    try {
+      if (popup && !popup.closed) popup.close();
+    } catch {
+      // A window the browser already closed needs no second close.
+    }
+  }
+
+  // Sends the sign-in's window where the Space said it goes, or keeps the URL
+  // for the view when the window is blocked or already closed.
+  function deliverSignInUrl(url: string, popup: Window | null): void {
+    if (popup && !popup.closed) {
+      try {
+        popup.location.href = url;
+        return;
+      } catch {
+        // A window this page cannot steer is one the view has to offer.
+      }
+    }
+    setSignInFallback(url);
+  }
+
+  // Starts a browser sign-in, opens the URL the Space answers with, and polls
+  // until the Space says what became of it. The answer's URL is the Space's own
+  // bind address, which sets the Space's cookie and redirects to the provider:
+  // the browser opens it as it is.
+  function startSignIn(input: {
+    name: string;
+    url: string;
+    scope: "space" | "user";
+  }): Promise<void> {
+    if (libraryBusy()) return Promise.resolve();
+    // Opened before the answer, while the click still counts as permission.
+    const popup = openSignInWindow();
+    setSignInFallback(null);
+    // An existing server keeps the name and address the Space connected; the
+    // sign-in attaches a credential to it. A new server enters the record when
+    // the sign-in finishes. Either way the scope is the one the form named,
+    // and the Space refuses a scope this caller may not use.
+    const existing = integrations().find(
+      (server) => server.name === input.name && server.url === input.url,
+    );
+    const args = existing
+      ? { server: existing.server, scope: input.scope }
+      : { name: input.name, url: input.url, scope: input.scope };
+    beginLibraryWork();
+    setLibraryError(null);
+    return (async () => {
+      try {
+        const started = await commands.command<{ sign_in: string; url: string }>(
+          "mcp_sign_in_start",
+          args,
+          SIGN_IN_START_TIMEOUT_MS,
+        );
+        deliverSignInUrl(started.url, popup);
+        watchSignIn(started.sign_in, started.url, popup);
+      } catch (reason) {
+        closeSignInWindow(popup);
+        setLibraryError(messageFor(reason));
+      } finally {
+        endLibraryWork();
+      }
+    })();
+  }
+
+  // Polls one sign-in while the Space holds it pending. The Space forgets a
+  // sign-in after five minutes, so the page stops asking then.
+  function watchSignIn(signIn: string, url: string, popup: Window | null): void {
+    stopSignIn(signIn);
+    const deadline = Date.now() + SIGN_IN_WINDOW_MS;
+    const timer = window.setInterval(() => {
+      // A window the reader closed before the Space settled the sign-in leaves
+      // the URL reachable from the list, and polling goes on.
+      if (popup?.closed && signInFallback() !== url) setSignInFallback(url);
+      if (signInAsking.has(signIn)) return;
+      signInAsking.add(signIn);
+      void (async () => {
+        try {
+          const status = await commands.command<McpSignInState>(
+            "mcp_sign_in_status",
+            { sign_in: signIn },
+            10_000,
+          );
+          if (status.state === "pending") {
+            if (Date.now() >= deadline) {
+              settleSignIn(signIn, url);
+              setLibraryError(t("error.generic"));
+            }
+            return;
+          }
+          settleSignIn(signIn, url);
+          // The Space's reason is one of its own fixed sentences, never the
+          // provider's text.
+          if (status.state === "failed") setLibraryError(status.reason ?? t("error.generic"));
+          queueLibraryRefresh();
+        } catch (reason) {
+          settleSignIn(signIn, url);
+          setLibraryError(messageFor(reason));
+        } finally {
+          signInAsking.delete(signIn);
+        }
+      })();
+    }, SIGN_IN_POLL_MS);
+    signInWatches.set(signIn, { timer, url, popup });
+  }
+
+  // Stops polling one sign-in, and drops its fallback link when it is the one
+  // on the page.
+  function settleSignIn(signIn: string, url: string): void {
+    stopSignIn(signIn);
+    if (signInFallback() === url) setSignInFallback(null);
+  }
+
+  function stopSignIn(signIn: string) {
+    const watch = signInWatches.get(signIn);
+    if (!watch) return;
+    window.clearInterval(watch.timer);
+    signInWatches.delete(signIn);
   }
 
   async function boot() {
@@ -1311,6 +1765,20 @@ export default function App() {
   const errorText = () => (state.error ? messageFor(state.error) : null);
   const needsSetup = () => state.providers.length === 0 || state.chats.length === 0;
   const showChat = () => state.activeChat !== null && !needsSetup() && state.bots.length > 0;
+  // The two library views the rail opens, and the account they render with.
+  const libraryView = () => view() === "integrations" || view() === "skills";
+  const viewAccount = () => ({
+    id: state.account?.id ?? "",
+    displayName: state.account?.display_name ?? "",
+    isAdmin: state.account?.is_admin === true,
+  });
+  // The shell keeps its frame for a library view; only the main area changes.
+  const shellClass = () => {
+    const library = libraryView();
+    const chat = showChat() && !library ? " app--chat" : "";
+    const setup = needsSetup() && !library ? " app--setup" : "";
+    return `app${chat}${setup}${library ? " app--library" : ""}`;
+  };
 
   // What each Chat is doing, for the list and the attention section.
   const chatStates = createMemo<Record<string, ChatStatus>>(() => {
@@ -1392,12 +1860,12 @@ export default function App() {
         }
       >
         {(account) => (
-          <div class={`app${showChat() ? " app--chat" : ""}${needsSetup() ? " app--setup" : ""}`}>
+          <div class={shellClass()}>
             <Rail
               account={account()}
               view={view()}
               attentionCount={attentionEntries().length}
-              onSelect={(next) => setView(next)}
+              onSelect={(next) => selectView(next)}
             />
             <Sidebar
               account={account()}
@@ -1409,58 +1877,108 @@ export default function App() {
               unread={state.unread}
               attention={attentionEntries()}
               attentionOpen={view() === "attention"}
+              view={view()}
               onSelect={(chat) => {
                 setView("chats");
                 void selectChat(chat);
               }}
               onAttention={(entry) => openAttention(entry)}
+              onView={(next) => selectView(next)}
             />
             <main class="main">
-              <Show
-                when={showChat() ? state.activeChat?.id : null}
-                keyed
-                fallback={
-                  <Show
-                    when={needsSetup()}
-                    fallback={
-                      <div class="select-chat">
-                        <h2>{t("select.title")}</h2>
-                      </div>
-                    }
+              {/* A narrow viewport gives the library view the whole screen and
+                  the rail gives way, so the view carries its own way back. */}
+              <Show when={libraryView() && isMobile()}>
+                <div class="library__back">
+                  <button
+                    class="btn btn--quiet"
+                    type="button"
+                    aria-label={t("chat.back")}
+                    onClick={() => selectView("chats")}
                   >
-                    <SetupView
-                      account={account()}
-                      providers={state.providers}
-                      models={state.models}
-                      bots={state.bots}
-                      busy={state.busy}
-                      error={errorText()}
-                      onProvider={(input) => void connectProvider(input)}
-                      onBot={(name) => void createBot(name)}
-                    />
-                  </Show>
-                }
-              >
-                <ChatView
-                  account={account()}
-                  bot={state.activeBot}
-                  computer={state.activeComputer}
-                  messages={state.messages}
-                  files={state.files}
-                  approvals={state.approvals}
-                  submitting={state.submitting}
-                  status={chatStatus()}
-                  queue={state.queue}
-                  busy={busyChat()}
-                  activity={shownActivity()}
-                  focus={focus()}
-                  onFocused={() => setFocus(null)}
-                  deciding={state.deciding}
-                  error={errorText()}
-                  onSend={sendMessage}
-                  onDecide={decideApproval}
-                  onBack={backToList}
+                    <Icon name="chevron-left" size="sm" />
+                    {t("chat.back")}
+                  </button>
+                </div>
+              </Show>
+              <Show when={view() === "integrations"}>
+                <IntegrationsView
+                  account={viewAccount()}
+                  bots={state.bots}
+                  servers={integrations()}
+                  packages={packages()}
+                  busy={libraryBusy()}
+                  error={libraryError()}
+                  signInUrl={signInFallback()}
+                  onScopeChange={() => setLibraryError(null)}
+                  onAdd={addIntegration}
+                  onConnect={connectIntegration}
+                  onSignIn={startSignIn}
+                  onRemove={removeIntegration}
+                  onBot={setBotIntegration}
+                  onPackageEnabled={setPackageEnabled}
                 />
+              </Show>
+              <Show when={view() === "skills"}>
+                <SkillsView
+                  account={viewAccount()}
+                  bots={state.bots}
+                  skills={skills()}
+                  packages={packages()}
+                  busy={libraryBusy()}
+                  error={libraryError()}
+                  onAdd={addSkill}
+                  onRemove={removeSkill}
+                  onBot={setBotSkill}
+                />
+              </Show>
+              <Show when={!libraryView()}>
+                <Show
+                  when={showChat() ? state.activeChat?.id : null}
+                  keyed
+                  fallback={
+                    <Show
+                      when={needsSetup()}
+                      fallback={
+                        <div class="select-chat">
+                          <h2>{t("select.title")}</h2>
+                        </div>
+                      }
+                    >
+                      <SetupView
+                        account={account()}
+                        providers={state.providers}
+                        models={state.models}
+                        bots={state.bots}
+                        busy={state.busy}
+                        error={errorText()}
+                        onProvider={(input) => void connectProvider(input)}
+                        onBot={(name) => void createBot(name)}
+                      />
+                    </Show>
+                  }
+                >
+                  <ChatView
+                    account={account()}
+                    bot={state.activeBot}
+                    computer={state.activeComputer}
+                    messages={state.messages}
+                    files={state.files}
+                    approvals={state.approvals}
+                    submitting={state.submitting}
+                    status={chatStatus()}
+                    queue={state.queue}
+                    busy={busyChat()}
+                    activity={shownActivity()}
+                    focus={focus()}
+                    onFocused={() => setFocus(null)}
+                    deciding={state.deciding}
+                    error={errorText()}
+                    onSend={sendMessage}
+                    onDecide={decideApproval}
+                    onBack={backToList}
+                  />
+                </Show>
               </Show>
             </main>
           </div>

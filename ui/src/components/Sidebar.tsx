@@ -6,6 +6,7 @@ import Avatar from "./Avatar";
 import Brand from "./Brand";
 import Icon from "./Icon";
 import LocaleSwitch from "./LocaleSwitch";
+import type { RailView } from "./Rail";
 
 interface SidebarProps {
   account: Account;
@@ -21,8 +22,12 @@ interface SidebarProps {
   attention: AttentionEntry[];
   // The rail selected the attention list, so it fills the sidebar.
   attentionOpen: boolean;
+  // What the rail selected, so the compact entries can mark the open one.
+  view: RailView;
   onSelect: (chat: Chat) => void;
   onAttention: (entry: AttentionEntry) => void;
+  // A compact entry to a view the hidden rail would otherwise take away.
+  onView: (view: RailView) => void;
 }
 
 // One approval that waits: its Bot, what it asks for, and where to answer it.
@@ -59,6 +64,28 @@ export default function Sidebar(props: SidebarProps) {
 
   return (
     <aside class="sidebar" aria-label={props.attentionOpen ? t("attention.title") : t("sidebar.chats")}>
+      {/* The rail gives way on a narrow viewport, so the views it would open
+          stay one tap away here. They are hidden while the rail is shown. */}
+      <nav class="sidebar__views" aria-label={t("rail.primary")}>
+        <button
+          class={`chip chip--button${props.view === "integrations" ? " is-active" : ""}`}
+          type="button"
+          aria-current={props.view === "integrations" ? "page" : undefined}
+          onClick={() => props.onView("integrations")}
+        >
+          <Icon name="server" size="sm" />
+          {t("rail.integrations")}
+        </button>
+        <button
+          class={`chip chip--button${props.view === "skills" ? " is-active" : ""}`}
+          type="button"
+          aria-current={props.view === "skills" ? "page" : undefined}
+          onClick={() => props.onView("skills")}
+        >
+          <Icon name="book" size="sm" />
+          {t("rail.skills")}
+        </button>
+      </nav>
       <Show
         when={!props.attentionOpen}
         fallback={

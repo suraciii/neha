@@ -631,6 +631,25 @@ code,
   font-variant-numeric: tabular-nums;
 }
 
+/* The compact entries that stand in for the rail when a narrow viewport hides
+   it. Above the breakpoint the rail owns these views, so they are not shown. */
+.sidebar__views {
+  display: none;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 18px 6px;
+}
+
+.sidebar__views .chip--button {
+  gap: 6px;
+}
+
+.sidebar__views .chip--button.is-active {
+  border-color: var(--accent-line);
+  background: var(--accent-wash);
+  color: var(--accent);
+}
+
 /* What waits for the User, above the Chat list. The attention color owns this
    one place, so the list itself stays quiet. */
 .attention {
@@ -1789,6 +1808,173 @@ code,
   background: var(--accent-2);
 }
 
+/* ------------------------------------------------------------- library --- */
+
+/* The Integrations and Skills pages: one column of groups, each a heading and
+   rows separated by a hairline. They own no card and no shadow. */
+.library {
+  flex: 1;
+  min-height: 0;
+  width: min(100% - 40px, 880px);
+  margin: 0 auto;
+  padding: clamp(24px, 4vh, 48px) 0 48px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.library > h1 {
+  font-size: clamp(24px, 3vw, 32px);
+  line-height: 1.1;
+  letter-spacing: -0.03em;
+  font-weight: 500;
+}
+
+.library > .panel {
+  margin-top: 18px;
+}
+
+.library > .muted {
+  margin-top: 14px;
+  font-size: var(--text-sm);
+}
+
+.library .banner {
+  margin-top: 14px;
+}
+
+/* A sign-in the browser would not open stays reachable as a link. */
+.library .banner a {
+  color: inherit;
+  text-decoration: underline;
+  overflow-wrap: anywhere;
+}
+
+.library__loading {
+  padding: 10px 0;
+  font-size: var(--text-sm);
+}
+
+/* The way back the main area shows when a narrow viewport hides the rail. */
+.library__back {
+  flex: none;
+  width: min(100% - 40px, 880px);
+  margin: 0 auto;
+  padding-top: 14px;
+}
+
+.library__group {
+  margin-top: 30px;
+}
+
+.library__group > .muted {
+  padding: 10px 0;
+  font-size: var(--text-sm);
+}
+
+.library__head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.library__head h2 {
+  font-size: var(--text-base);
+  font-weight: 500;
+  letter-spacing: -0.005em;
+}
+
+.library__head .badge {
+  margin-left: auto;
+}
+
+.library__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  padding: 16px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.library__server {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.library__name {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.library__name h3 {
+  font-size: var(--text-md);
+  font-weight: 500;
+}
+
+.library__description {
+  max-width: 68ch;
+  color: var(--ink-3);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.library__actions {
+  display: flex;
+  flex: none;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.library__row .chips label {
+  cursor: pointer;
+}
+
+.library__row .chip--button input[type="checkbox"] {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.library__scripts {
+  display: grid;
+  gap: 10px;
+  padding-top: 4px;
+}
+
+.library__script {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.library__script .btn {
+  min-height: 40px;
+}
+
+textarea.library__textarea {
+  height: auto;
+  min-height: 132px;
+  padding: 10px 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+/* A skill's script is more than one line, so the form gives it a box. */
+textarea.library__script__content {
+  height: auto;
+  min-height: 40px;
+  padding: 10px 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
 /* ------------------------------------------------------------- shared --- */
 
 .avatar {
@@ -1902,6 +2088,9 @@ code,
   .sidebar {
     display: flex;
   }
+  .sidebar__views {
+    display: flex;
+  }
   .sidebar__head .brand {
     display: inline-flex;
   }
@@ -1919,6 +2108,27 @@ code,
   }
   .app--setup .main {
     display: flex;
+  }
+  .app--library .sidebar {
+    display: none;
+  }
+  .app--library .main {
+    display: flex;
+  }
+  .library,
+  .library__back {
+    width: calc(100% - 28px);
+  }
+  .library {
+    padding-top: 20px;
+  }
+  .library__row {
+    flex-direction: column;
+    gap: 12px;
+  }
+  .library__actions {
+    justify-content: flex-start;
+    width: 100%;
   }
   .chat__back {
     display: grid;
@@ -2005,6 +2215,16 @@ code,
   .field-row {
     grid-template-columns: 1fr;
   }
+  .library__script {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .library__script > .field:first-child {
+    grid-column: 1 / -1;
+  }
+  .library__script > .btn {
+    grid-row: 2;
+    grid-column: 2;
+  }
   .chat__attention-long {
     display: none;
   }
@@ -2046,7 +2266,10 @@ html[lang="zh-CN"] .setup__head h1,
 html[lang="zh-CN"] .panel__head h2,
 html[lang="zh-CN"] .chat__titles h1,
 html[lang="zh-CN"] .chat__empty h2,
-html[lang="zh-CN"] .select-chat h2 {
+html[lang="zh-CN"] .select-chat h2,
+html[lang="zh-CN"] .library > h1,
+html[lang="zh-CN"] .library__head h2,
+html[lang="zh-CN"] .library__name h3 {
   letter-spacing: 0;
 }
 

@@ -5,6 +5,7 @@ mod computer;
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal as _, Write};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
@@ -12,11 +13,12 @@ use neha::id::Id;
 use neha::record::{McpScope, RuleEffect, SkillLibrary};
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, BotUpdate, CommandCall, McpAdd, MessageSend, ModelSpec, ProviderAdd,
-    ProviderConnect, ProviderProtocol, SkillAdd, SkillAddScript, ThinkingLevel,
+    BotComputer, BotCreate, BotUpdate, CommandCall, McpAdd, McpSignInStart, MessageSend, ModelSpec,
+    ProviderAdd, ProviderConnect, ProviderProtocol, SkillAdd, SkillAddScript, ThinkingLevel,
 };
 use neha_space::Home;
 use serde_json::Value;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::client::Credential;
 
@@ -534,6 +536,16 @@ enum PluginCommand {
 #[derive(Subcommand)]
 enum McpCommand {
     /// Connect an MCP server.
+    ///
+    /// The credential comes from NEHA_MCP_TOKEN, never from the command line.
+    /// With the token set, the Space connects the server at once; naming an
+    /// existing Space server again attaches the credential to it.
+    ///
+    /// Without the token, the command opens the browser to sign in. The
+    /// sign-in is bound to a loopback receiver this command runs, so the
+    /// browser brings the answer back to the terminal. Naming an existing
+    /// server of the same name and address attaches your own credential to it;
+    /// a new server enters the Space when the sign-in finishes.
     Add {
         /// The server's name, unique in the Space: letters, digits, or hyphens.
         name: String,
@@ -2188,27 +2200,57 @@ async fn mcp_command(command: McpCommand) -> Result<()> {
     let credential = Credential::load()?;
     match command {
         McpCommand::Add { name, url, scope } => {
-            let result = client::command(
-                &credential,
-                CommandCall::McpAdd(McpAdd {
-                    name,
-                    url,
-                    scope: scope.unwrap_or(McpScope::Space),
-                    credential: mcp_credential(),
-                }),
-            )
-            .await?;
-            println!(
-                "Added MCP server {} ({}) at {}.",
-                id_of(&result, "server")?,
-                result["name"].as_str().unwrap_or_default(),
-                result["url"].as_str().unwrap_or_default()
-            );
-            println!(
-                "  scope: {}; {}",
-                mcp_scope_label(&result),
-                mcp_connection_label(&result)
-            );
+            let scope = scope.unwrap_or(McpScope::Space);
+            match mcp_add_plan(&name, &url, scope, mcp_credential()) {
+                McpAddPlan::Add(arguments) => {
+                    let result =
+                        client::command(&credential, CommandCall::McpAdd(arguments)).await?;
+                    println!(
+                        "Added MCP server {} ({}) at {}.",
+                        id_of(&result, "server")?,
+                        result["name"].as_str().unwrap_or_default(),
+                        result["url"].as_str().unwrap_or_default()
+                    );
+                    println!(
+                        "  scope: {}; {}",
+                        mcp_scope_label(&result),
+                        mcp_connection_label(&result)
+                    );
+                }
+                McpAddPlan::SignIn => {
+                    // A tokenless add binds its own loopback receiver before it
+                    // starts the sign-in: the authorization server then brings
+                    // the browser back to this command, not to the Space.
+                    //
+                    // One deadline covers everything the tokenless add does:
+                    // listing the server it may attach to, starting the
+                    // sign-in, waiting for the browser, and finishing the
+                    // exchange. Each step gets only the time that is left, so
+                    // no step can hold the command past the sign-in budget.
+                    let deadline = tokio::time::Instant::now() + SIGN_IN_TIMEOUT;
+                    let existing = mcp_existing_server(&credential, &name, &url, deadline).await?;
+                    let receiver = SignInReceiver::bind().await?;
+                    let start =
+                        mcp_sign_in_start(&name, &url, scope, receiver.redirect_uri(), existing);
+                    // An existing server takes the caller's own credential; a
+                    // new server keeps the scope the command asked for.
+                    let reported_scope = if existing.is_some() {
+                        McpScope::User
+                    } else {
+                        scope
+                    };
+                    mcp_sign_in(
+                        &credential,
+                        deadline,
+                        start,
+                        &name,
+                        &url,
+                        reported_scope,
+                        receiver,
+                    )
+                    .await?;
+                }
+            }
         }
         McpCommand::List => {
             let list = client::command(&credential, CommandCall::McpList).await?;
@@ -2243,6 +2285,695 @@ fn mcp_remove_lines(result: &Value) -> Vec<String> {
         lines.push(cleanup);
     }
     lines
+}
+
+/// How often `neha mcp add` asks how a browser sign-in is doing.
+const SIGN_IN_POLL: Duration = Duration::from_secs(1);
+/// How long `neha mcp add` waits for a browser sign-in to finish.
+const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long the receiver waits for the browser to read its last page.
+///
+/// The page is a few hundred bytes on loopback and is written only once the
+/// sign-in has ended, so a browser that stopped reading must not hold the
+/// command: the outcome is already decided, and only the page is lost.
+const SIGN_IN_PAGE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The most of one browser callback the loopback receiver reads.
+///
+/// The redirect carries one request line and a few headers; the bound keeps a
+/// local connection from growing the receiver's memory before the deadline.
+const MAX_CALLBACK_REQUEST_BYTES: usize = 8 * 1024;
+
+/// The program this platform opens an address with.
+#[cfg(target_os = "linux")]
+const BROWSER_OPEN: Option<&str> = Some("xdg-open");
+#[cfg(target_os = "macos")]
+const BROWSER_OPEN: Option<&str> = Some("open");
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+const BROWSER_OPEN: Option<&str> = None;
+
+/// Opens one address in the browser, and reports whether the browser launched.
+///
+/// The opener is detached: the browser may stay open while `neha mcp add` waits
+/// on its loopback receiver and finishes the sign-in, so the command never waits
+/// for the browser process. A missing command or a refused launch leaves the
+/// browser closed, and the caller prints the address for the User instead.
+fn open_browser(url: &str) -> bool {
+    let Some(program) = BROWSER_OPEN else {
+        return false;
+    };
+    // The browser's own streams are not this command's output.
+    std::process::Command::new(program)
+        .arg(url)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// What one `neha mcp add` sends: the server itself when the environment
+/// carries a credential, and a browser sign-in when it does not.
+#[derive(Debug, PartialEq)]
+enum McpAddPlan {
+    /// Registers the server with the credential the environment carries.
+    Add(McpAdd),
+    /// Starts a browser sign-in bound to the command's loopback receiver.
+    SignIn,
+}
+
+/// Decides how one `neha mcp add` connects its server.
+///
+/// A credential argument would outlive the command in a shell history and a
+/// process listing, so `NEHA_MCP_TOKEN` is its only source; without one the
+/// browser sign-in supplies the credential instead.
+fn mcp_add_plan(name: &str, url: &str, scope: McpScope, credential: Option<String>) -> McpAddPlan {
+    match credential {
+        Some(credential) => McpAddPlan::Add(McpAdd {
+            name: name.to_owned(),
+            url: url.to_owned(),
+            scope,
+            credential: Some(credential),
+        }),
+        None => McpAddPlan::SignIn,
+    }
+}
+
+/// The start command of a tokenless `neha mcp add`.
+///
+/// A server the Space already holds under `name` and `url` takes the caller's
+/// own credential, so the sign-in names only that server; a new server carries
+/// the name, address, and scope the Space registers when the sign-in finishes.
+/// `redirect_uri` is the loopback receiver this command bound for the browser.
+fn mcp_sign_in_start(
+    name: &str,
+    url: &str,
+    scope: McpScope,
+    redirect_uri: &str,
+    existing: Option<Id>,
+) -> McpSignInStart {
+    let redirect_uri = Some(redirect_uri.to_owned());
+    match existing {
+        Some(server) => McpSignInStart {
+            server: Some(server),
+            name: None,
+            url: None,
+            // The sign-in attaches the caller's own credential; the Space's
+            // own credential is what the token path registers.
+            scope: None,
+            redirect_uri,
+        },
+        None => McpSignInStart {
+            server: None,
+            name: Some(name.to_owned()),
+            url: Some(url.to_owned()),
+            scope: Some(scope),
+            redirect_uri,
+        },
+    }
+}
+
+/// The server a tokenless `neha mcp add` names, when the Space already holds it.
+///
+/// A sign-in attaches the caller's credential to the server the Space already
+/// holds under the same name and address; it never registers a second server
+/// under that name, so a name held at another address is a refusal. The list is
+/// one step of the sign-in, so it is bounded by the sign-in's deadline like the
+/// commands that follow it.
+async fn mcp_existing_server(
+    credential: &Credential,
+    name: &str,
+    url: &str,
+    deadline: tokio::time::Instant,
+) -> Result<Option<Id>> {
+    let list = sign_in_command(credential, deadline, CommandCall::McpList).await?;
+    existing_server(&list, name, url)
+}
+
+/// Reads the server a `mcp_list` answer holds under `name`.
+fn existing_server(list: &Value, name: &str, url: &str) -> Result<Option<Id>> {
+    let rows = list.as_array().context("no MCP servers in the answer")?;
+    let Some(row) = rows
+        .iter()
+        .find(|row| row.get("name").and_then(Value::as_str) == Some(name))
+    else {
+        return Ok(None);
+    };
+    if row.get("url").and_then(Value::as_str) != Some(url.trim()) {
+        bail!("the Space already holds an MCP server named {name:?} at another address");
+    }
+    Ok(Some(id_of(row, "server")?))
+}
+
+/// What one browser callback carries.
+#[derive(Debug, PartialEq, Eq)]
+enum Callback {
+    /// The authorization server returned a code bound to the sign-in's state,
+    /// and the issuer it named when RFC 9207 named one.
+    Code {
+        code: String,
+        state: String,
+        /// The issuer identifier the authorization response named, when it did.
+        iss: Option<String>,
+    },
+    /// The sign-in did not return a code: the authorization server refused it,
+    /// or the browser came back without one. Its own text is never kept.
+    Refused,
+}
+
+/// The loopback receiver one browser sign-in comes back to.
+struct SignInReceiver {
+    listener: tokio::net::TcpListener,
+    /// The address the authorization server redirects the browser to.
+    redirect_uri: String,
+}
+
+impl SignInReceiver {
+    /// Binds a loopback receiver on a free port.
+    async fn bind() -> Result<Self> {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .context("cannot bind the sign-in receiver on loopback")?;
+        let port = listener
+            .local_addr()
+            .context("cannot read the sign-in receiver's address")?
+            .port();
+        Ok(Self {
+            listener,
+            redirect_uri: format!("http://127.0.0.1:{port}/callback"),
+        })
+    }
+
+    /// The redirect URI the sign-in binds the browser to.
+    fn redirect_uri(&self) -> &str {
+        &self.redirect_uri
+    }
+
+    /// Waits for the browser's one callback, and keeps it for the reply.
+    ///
+    /// The receiver serves one request: the redirect is single use, so a
+    /// second request has nothing left to find, and the listener is dropped as
+    /// soon as the one request is read. The wait has one deadline, so a browser
+    /// that never comes back cannot hold the command forever.
+    async fn receive(self, deadline: tokio::time::Instant) -> Result<SignInCallback> {
+        match tokio::time::timeout_at(deadline, self.accept_one()).await {
+            Ok(callback) => callback,
+            Err(_) => Err(sign_in_timeout(SIGN_IN_TIMEOUT)),
+        }
+    }
+
+    /// Accepts the one request the browser makes.
+    async fn accept_one(self) -> Result<SignInCallback> {
+        let Self {
+            listener,
+            redirect_uri: _,
+        } = self;
+        let (mut stream, _) = listener
+            .accept()
+            .await
+            .context("cannot accept the sign-in callback")?;
+        // The receiver serves one request: the listener is dropped before the
+        // page is written, so no second connection is one this command serves.
+        drop(listener);
+        let request = read_callback_request(&mut stream).await?;
+        let CallbackRequest { path, callback } = callback_of(&request);
+        Ok(SignInCallback {
+            callback,
+            path,
+            stream,
+        })
+    }
+}
+
+/// The one browser callback the receiver read, and the reply it still owes.
+///
+/// The page is held until the Space has finished the sign-in, so a browser can
+/// never read success before the credential is registered. The callback itself
+/// is only handed to the Space; it is never rendered.
+#[derive(Debug)]
+struct SignInCallback {
+    /// What the browser's redirect carried.
+    callback: Callback,
+    /// The raw path the browser requested, when the target was origin-form.
+    ///
+    /// The receiver accepts any path because it cannot know the issuer key the
+    /// Space registered; the Space compares this path with the redirect it
+    /// registered for the flow.
+    path: Option<String>,
+    /// The browser connection its last page is written to.
+    stream: tokio::net::TcpStream,
+}
+
+impl SignInCallback {
+    /// What the browser's redirect carried.
+    fn callback(&self) -> &Callback {
+        &self.callback
+    }
+
+    /// The raw path the browser requested, when the request line named one.
+    fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+
+    /// Answers the browser with the fixed page its sign-in ended on.
+    ///
+    /// `finished` is true only once the Space registered the credential; a
+    /// refusal and every failure get the fixed failure page. The wait for the
+    /// browser to take the page is bounded, because the sign-in is already
+    /// decided: a browser that stopped reading loses its page, not the command.
+    async fn answer(mut self, finished: bool) -> Result<()> {
+        match tokio::time::timeout(
+            SIGN_IN_PAGE_TIMEOUT,
+            answer_callback(&mut self.stream, finished),
+        )
+        .await
+        {
+            Ok(answered) => answered,
+            Err(_) => bail!("the browser did not read the sign-in page"),
+        }
+    }
+}
+
+/// The page a browser shows once the Space finished the sign-in it carried.
+///
+/// The page is fixed: the browser's history must not keep the code, the state,
+/// or the authorization server's own words.
+const SIGN_IN_FINISHED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in finished</title></head><body><h1>MCP sign-in finished</h1>\
+<p>You can close this window and return to Neha.</p></body></html>";
+
+/// The page a browser shows once its callback did not end a sign-in.
+const SIGN_IN_FAILED_PAGE: &str = "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+<title>MCP sign-in failed</title></head><body><h1>MCP sign-in failed</h1>\
+<p>The sign-in did not finish. You can close this window and try again from Neha.</p></body></html>";
+
+/// Reads one callback request's head, bounded.
+///
+/// The receiver answers the browser only after the request's headers end, so
+/// the page is not cut off by a half-read request; a request without its end is
+/// bounded by [`MAX_CALLBACK_REQUEST_BYTES`] and by the receiver's deadline.
+async fn read_callback_request(stream: &mut tokio::net::TcpStream) -> Result<Vec<u8>> {
+    let mut request = Vec::new();
+    let mut buffer = [0_u8; 1024];
+    loop {
+        let read = stream
+            .read(&mut buffer)
+            .await
+            .context("cannot read the sign-in callback")?;
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..read]);
+        if request.len() > MAX_CALLBACK_REQUEST_BYTES {
+            bail!("the sign-in callback request is too large");
+        }
+        if request.windows(4).any(|window| window == b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(request)
+}
+
+/// Answers the browser's callback with the page that ends its part of the flow.
+async fn answer_callback(stream: &mut tokio::net::TcpStream, finished: bool) -> Result<()> {
+    let (status, page) = if finished {
+        ("200 OK", SIGN_IN_FINISHED_PAGE)
+    } else {
+        ("400 Bad Request", SIGN_IN_FAILED_PAGE)
+    };
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n{page}",
+        page.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .await
+        .context("cannot answer the sign-in callback")?;
+    stream
+        .flush()
+        .await
+        .context("cannot answer the sign-in callback")?;
+    stream
+        .shutdown()
+        .await
+        .context("cannot answer the sign-in callback")?;
+    Ok(())
+}
+
+/// What one callback request line carries.
+#[derive(Debug, PartialEq, Eq)]
+struct CallbackRequest {
+    /// The raw path the browser requested, when the target was origin-form.
+    ///
+    /// It is exactly the request line's path segment: percent-encoding is kept
+    /// as received, and neither the query nor a fragment is part of it. The
+    /// Space compares it with the issuer-keyed redirect it registered, so the
+    /// receiver never decodes or rewrites it.
+    path: Option<String>,
+    /// What the browser's redirect carried.
+    callback: Callback,
+}
+
+/// Reads the callback one request line carries.
+///
+/// The request target must be origin-form (`/...`): the browser sends the
+/// redirect as it was registered, so an absolute URL, an authority form, or a
+/// fragment is a request this receiver did not register for, and it is refused
+/// with the callback it would otherwise read. Only `code`, `state`, and RFC
+/// 9207's `iss` are kept from the query; the authorization server's `error` and
+/// `error_description` are reduced to the fixed refusal, so no provider text
+/// can reach the command's output.
+fn callback_of(request: &[u8]) -> CallbackRequest {
+    let refused = CallbackRequest {
+        path: None,
+        callback: Callback::Refused,
+    };
+    let line = request
+        .split(|byte| *byte == b'\r' || *byte == b'\n')
+        .next()
+        .unwrap_or_default();
+    let Ok(line) = std::str::from_utf8(line) else {
+        return refused;
+    };
+    let mut parts = line.split_ascii_whitespace();
+    if parts.next() != Some("GET") {
+        return refused;
+    }
+    let Some(target) = parts.next() else {
+        return refused;
+    };
+    let Some((path, query)) = origin_form_target(target) else {
+        return refused;
+    };
+    CallbackRequest {
+        path: Some(path.to_owned()),
+        callback: callback_of_query(query),
+    }
+}
+
+/// Splits an origin-form request target into its raw path and its query.
+///
+/// A fragment is never part of a request target, so one is refused rather than
+/// silently dropped, and an empty path names no redirect. The path is returned
+/// byte for byte, percent-encoding included.
+fn origin_form_target(target: &str) -> Option<(&str, &str)> {
+    if target.contains('#') {
+        return None;
+    }
+    let (path, query) = target
+        .split_once('?')
+        .map_or((target, ""), |(path, query)| (path, query));
+    if !path.starts_with('/') {
+        return None;
+    }
+    Some((path, query))
+}
+
+/// Reads the callback values one redirect query carries.
+fn callback_of_query(query: &str) -> Callback {
+    let mut code = None;
+    let mut state = None;
+    let mut iss = None;
+    let mut refused = false;
+    for pair in query.split('&') {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match name {
+            "code" => code = decode_query_value(value),
+            "state" => state = decode_query_value(value),
+            "iss" => iss = decode_query_value(value).filter(|iss| !iss.is_empty()),
+            "error" => refused = true,
+            _ => {}
+        }
+    }
+    match (refused, code, state) {
+        (false, Some(code), Some(state)) if !code.is_empty() && !state.is_empty() => {
+            Callback::Code { code, state, iss }
+        }
+        _ => Callback::Refused,
+    }
+}
+
+/// Decodes one percent-encoded query value; `+` stands for a space.
+fn decode_query_value(value: &str) -> Option<String> {
+    let mut decoded = Vec::with_capacity(value.len());
+    let mut bytes = value.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        match byte {
+            b'+' => decoded.push(b' '),
+            b'%' => {
+                let hex = [bytes.next()?, bytes.next()?];
+                let hex = std::str::from_utf8(&hex).ok()?;
+                decoded.push(u8::from_str_radix(hex, 16).ok()?);
+            }
+            byte => decoded.push(byte),
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// What a started browser sign-in is doing, as the Space reports it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SignInState {
+    /// The browser has not finished the sign-in.
+    Pending,
+    /// The Space registered the server and sealed a credential.
+    Finished {
+        /// The server the Space registered.
+        server: Id,
+        /// Whether the Space holds a credential a call would send.
+        connected: bool,
+    },
+    /// The sign-in cannot finish.
+    Failed {
+        /// The Space's account of the failure, free of any credential.
+        reason: String,
+    },
+}
+
+/// Reads one `mcp_sign_in_status` answer.
+fn sign_in_state(answer: &Value) -> Result<SignInState> {
+    match answer.get("state").and_then(Value::as_str) {
+        Some("pending") => Ok(SignInState::Pending),
+        Some("finished") => Ok(SignInState::Finished {
+            server: id_of(answer, "server")?,
+            connected: answer
+                .get("connected")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+        Some("failed") => Ok(SignInState::Failed {
+            reason: answer
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the Space gave no reason")
+                .to_owned(),
+        }),
+        Some(state) => bail!("the Space reported an unknown sign-in state {state:?}"),
+        None => bail!("the answer has no sign-in state"),
+    }
+}
+
+/// Polls one browser sign-in until it ends, and returns how it ended.
+///
+/// `ask` sends one `mcp_sign_in_status` and returns its answer; the caller owns
+/// the connection, so the wait is exercised without a Space. The wait shares
+/// the sign-in's one deadline: it is checked before every ask, and every ask is
+/// bounded by the time that is left, because a command that never answers must
+/// not hold the wait past its deadline. A pending answer sleeps only for the
+/// time left.
+async fn poll_sign_in<F, Fut>(
+    sign_in: Id,
+    deadline: tokio::time::Instant,
+    poll: Duration,
+    mut ask: F,
+) -> Result<SignInState>
+where
+    F: FnMut(Id) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    loop {
+        let left = sign_in_left(deadline)?;
+        let answer = match tokio::time::timeout(left, ask(sign_in)).await {
+            Ok(answer) => answer?,
+            Err(_) => return Err(sign_in_timeout(SIGN_IN_TIMEOUT)),
+        };
+        match sign_in_state(&answer)? {
+            SignInState::Pending => {}
+            ended => return Ok(ended),
+        }
+        let left = sign_in_left(deadline)?;
+        tokio::time::sleep(poll.min(left)).await;
+    }
+}
+
+/// The time left before the sign-in's one deadline, or its fixed timeout error.
+fn sign_in_left(deadline: tokio::time::Instant) -> Result<Duration> {
+    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if left.is_zero() {
+        return Err(sign_in_timeout(SIGN_IN_TIMEOUT));
+    }
+
+    Ok(left)
+}
+
+/// Runs one command of a browser sign-in with the time left before its deadline.
+///
+/// Every step of a tokenless `neha mcp add` shares the one deadline: opening the
+/// connection, the Space's greeting, sending the command, and reading its answer
+/// must all fit in what remains, so a Space that accepts a socket and never
+/// greets it cannot hold the command past the sign-in budget.
+async fn sign_in_command(
+    credential: &Credential,
+    deadline: tokio::time::Instant,
+    command: CommandCall,
+) -> Result<Value> {
+    let left = sign_in_left(deadline)?;
+    match tokio::time::timeout(left, client::command(credential, command)).await {
+        Ok(result) => result,
+        Err(_) => Err(sign_in_timeout(SIGN_IN_TIMEOUT)),
+    }
+}
+
+/// The error a browser sign-in that outlasts its wait produces.
+fn sign_in_timeout(timeout: Duration) -> anyhow::Error {
+    anyhow!("the browser sign-in did not finish within {timeout:?}; run the command again to retry")
+}
+
+/// The finish command one browser callback sends.
+///
+/// The raw path the browser requested rides with the code and state: the Space
+/// compares it with the issuer-keyed redirect it registered, so a callback
+/// delivered to another path cannot finish this sign-in. A callback that
+/// returned no code finishes nothing, and has no command to send.
+fn sign_in_finish_command(
+    sign_in: Id,
+    callback: &Callback,
+    path: Option<&str>,
+) -> Option<CommandCall> {
+    let Callback::Code { code, state, iss } = callback else {
+        return None;
+    };
+    Some(CommandCall::McpSignInFinish {
+        sign_in,
+        code: code.clone(),
+        state: state.clone(),
+        iss: iss.clone(),
+        path: path.map(str::to_owned),
+    })
+}
+
+/// Hands one browser callback to the Space and waits for the sign-in to end.
+///
+/// The finish command is the token exchange: the Space answers like a poll once
+/// it sealed the credential. A `pending` answer is polled until the Space
+/// settles it; every ask and every pause shares the sign-in's deadline. The
+/// authorization server's own words never reach any answer: a refused callback
+/// is one fixed failure sentence.
+async fn finish_sign_in(
+    credential: &Credential,
+    deadline: tokio::time::Instant,
+    sign_in: Id,
+    callback: &SignInCallback,
+) -> Result<SignInState> {
+    let Some(command) = sign_in_finish_command(sign_in, callback.callback(), callback.path())
+    else {
+        return Ok(SignInState::Failed {
+            reason: "the authorization server refused the sign-in".to_owned(),
+        });
+    };
+    let answered = sign_in_command(credential, deadline, command).await?;
+    match sign_in_state(&answered)? {
+        // The finish answers like a poll; should the Space hand the exchange
+        // to its own work, keep asking until it ends.
+        SignInState::Pending => {
+            poll_sign_in(sign_in, deadline, SIGN_IN_POLL, |sign_in| {
+                client::command(credential, CommandCall::McpSignInStatus { sign_in })
+            })
+            .await
+        }
+        ended => Ok(ended),
+    }
+}
+
+/// Answers the browser's last page from how the sign-in ended.
+///
+/// Success is shown only once the Space answered that the sign-in finished: the
+/// page never claims a credential the Space has not registered, and every error
+/// shows the fixed failure page. A finished sign-in the Space reports as not
+/// connected still registered the credential; that reachability report is the
+/// command line's to print, not a sign-in that did not finish. A browser that
+/// left early loses its page; its answer changes no command's output.
+async fn answer_sign_in_page(callback: SignInCallback, ended: &Result<SignInState>) {
+    let finished = matches!(ended, Ok(SignInState::Finished { .. }));
+    let _ = callback.answer(finished).await;
+}
+
+/// The lines a browser sign-in prints once it ends.
+///
+/// A finished sign-in the Space reports as not connected prints the two lines
+/// `neha mcp add` prints for a server it registered but could not reach. A
+/// failed sign-in is the command's error: the Space's reason, escaped to one
+/// line so the authorization server's text cannot rewrite the terminal.
+fn sign_in_lines(ended: SignInState, name: &str, url: &str, scope: &str) -> Result<Vec<String>> {
+    match ended {
+        SignInState::Pending => bail!("the browser sign-in has not finished"),
+        SignInState::Failed { reason } => bail!("the sign-in failed: {}", escape_text(&reason)),
+        SignInState::Finished {
+            connected: true, ..
+        } => Ok(vec![format!("Connected MCP server {name}.")]),
+        SignInState::Finished {
+            server,
+            connected: false,
+        } => Ok(vec![
+            format!("Added MCP server {server} ({name}) at {url}."),
+            format!("  scope: {scope}; not connected"),
+        ]),
+    }
+}
+
+/// Starts a browser sign-in and waits for its loopback receiver to end it.
+///
+/// The command opens the address the Space answers with and does not wait for
+/// the browser. The browser comes back to this command's receiver instead of
+/// the Space, so the code and state the redirect carries are handed to the
+/// Space with the raw callback path the browser requested: the Space compares
+/// that path with the issuer-keyed redirect it registered, exchanges the code
+/// for the credential, and answers like a poll. The browser's page is written
+/// only after that answer, so it reports success only when the Space registered
+/// the credential. Every step shares the sign-in's one deadline.
+async fn mcp_sign_in(
+    credential: &Credential,
+    deadline: tokio::time::Instant,
+    start: McpSignInStart,
+    name: &str,
+    url: &str,
+    scope: McpScope,
+    receiver: SignInReceiver,
+) -> Result<()> {
+    let started = sign_in_command(credential, deadline, CommandCall::McpSignInStart(start)).await?;
+    let sign_in = id_of(&started, "sign_in")?;
+    let address = text_of(&started, "url")?;
+    if open_browser(address) {
+        println!("Opening the browser to sign in.");
+    } else {
+        println!("Could not open a browser; open this address in your browser:");
+        println!("{address}");
+    }
+    let callback = receiver.receive(deadline).await?;
+    let outcome = finish_sign_in(credential, deadline, sign_in, &callback).await;
+    // The page reports what the Space answered, and is written only now: it
+    // cannot claim success before the Space registered the credential. An error
+    // is still the command's to report after the page is written.
+    answer_sign_in_page(callback, &outcome).await;
+    let ended = outcome?;
+    let scope = mcp_scope_text(scope, Some(credential.account.id));
+    for line in sign_in_lines(ended, name, url, &scope)? {
+        println!("{line}");
+    }
+
+    Ok(())
 }
 
 /// The largest `SKILL.md` a skill directory carries: its frontmatter and its
@@ -2618,12 +3349,24 @@ fn mcp_row(server: &Value) -> Result<String> {
 
 /// The scope of one MCP server view: the Space, or the User who connected it.
 fn mcp_scope_label(server: &Value) -> String {
-    match server.get("scope").and_then(Value::as_str) {
-        Some("user") => server
-            .get("user")
-            .and_then(Value::as_str)
-            .map_or_else(|| "user".to_owned(), |user| format!("user {user}")),
-        _ => "space".to_owned(),
+    let scope = match server.get("scope").and_then(Value::as_str) {
+        Some("user") => McpScope::User,
+        _ => McpScope::Space,
+    };
+    let user = server
+        .get("user")
+        .and_then(Value::as_str)
+        .and_then(|user| user.parse().ok());
+    mcp_scope_text(scope, user)
+}
+
+/// Names where one MCP server's credential belongs: the Space, or the User who
+/// connected it.
+fn mcp_scope_text(scope: McpScope, user: Option<Id>) -> String {
+    match (scope, user) {
+        (McpScope::User, Some(user)) => format!("user {user}"),
+        (McpScope::User, None) => "user".to_owned(),
+        (McpScope::Space, _) => "space".to_owned(),
     }
 }
 
@@ -3347,8 +4090,8 @@ fn computer_kind_label(kind: &str) -> &str {
 /// The credential an `mcp add` sends, which only the environment carries.
 ///
 /// A credential argument would outlive the command in a shell history and a
-/// process listing, so `NEHA_MCP_TOKEN` is its only source. Absent, the server
-/// is connected without a credential.
+/// process listing, so `NEHA_MCP_TOKEN` is its only source. Absent, the command
+/// opens a browser sign-in for the credential instead.
 fn mcp_credential() -> Option<String> {
     std::env::var("NEHA_MCP_TOKEN")
         .ok()
@@ -3393,9 +4136,19 @@ fn text_of<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use futures_util::{SinkExt as _, StreamExt as _};
     use neha::id::Id;
     use neha::record::McpScope;
+    use neha::surface::{
+        ClientFrame, CommandCall, McpAdd, McpSignInStart, PROTOCOL_VERSION, ServerFrame,
+    };
     use serde_json::json;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+
+    use crate::client::{Credential, SignedIn};
 
     use super::{space_file_name, write_run};
 
@@ -3417,6 +4170,13 @@ mod tests {
     use super::{
         BotMcpCommand, BotSkillCommand, CleanupStyle, McpCommand, SkillCommand, cleanup_notice,
         mcp_remove_lines, plugin_rows, read_skill_directory,
+    };
+
+    use super::{
+        Callback, CallbackRequest, McpAddPlan, SIGN_IN_TIMEOUT, SignInReceiver, SignInState,
+        answer_sign_in_page, callback_of, existing_server, finish_sign_in, mcp_add_plan,
+        mcp_scope_text, mcp_sign_in_start, poll_sign_in, sign_in_command, sign_in_finish_command,
+        sign_in_lines, sign_in_state,
     };
 
     use super::{
@@ -5283,6 +6043,925 @@ mod tests {
         assert_eq!(
             mcp_remove_lines(&json!({"server": Id::new()})),
             vec!["Removed MCP server the server.".to_owned()]
+        );
+    }
+
+    #[test]
+    fn an_mcp_add_sends_the_environment_token_or_starts_a_sign_in() {
+        // The environment's token connects at once, as it did before the
+        // browser sign-in existed.
+        assert_eq!(
+            mcp_add_plan(
+                "weather",
+                "https://mcp.example.com/mcp",
+                McpScope::Space,
+                Some("secret".to_owned()),
+            ),
+            McpAddPlan::Add(McpAdd {
+                name: "weather".to_owned(),
+                url: "https://mcp.example.com/mcp".to_owned(),
+                scope: McpScope::Space,
+                credential: Some("secret".to_owned()),
+            })
+        );
+
+        // Without one the command binds its loopback receiver and opens the
+        // browser.
+        assert_eq!(
+            mcp_add_plan("weather", "http://127.0.0.1:9000/mcp", McpScope::User, None),
+            McpAddPlan::SignIn
+        );
+
+        // A new server: the sign-in names the server and scope the Space
+        // registers when it finishes, and binds the command's loopback
+        // receiver as the browser's way back.
+        let redirect = "http://127.0.0.1:4711/callback";
+        assert_eq!(
+            mcp_sign_in_start(
+                "weather",
+                "http://127.0.0.1:9000/mcp",
+                McpScope::User,
+                redirect,
+                None,
+            ),
+            McpSignInStart {
+                server: None,
+                name: Some("weather".to_owned()),
+                url: Some("http://127.0.0.1:9000/mcp".to_owned()),
+                scope: Some(McpScope::User),
+                redirect_uri: Some(redirect.to_owned()),
+            }
+        );
+
+        // A server the Space already holds under the same name and address
+        // takes the caller's own credential, so the sign-in names only that
+        // server.
+        let existing = Id::new();
+        assert_eq!(
+            mcp_sign_in_start(
+                "weather",
+                "http://127.0.0.1:9000/mcp",
+                McpScope::User,
+                redirect,
+                Some(existing),
+            ),
+            McpSignInStart {
+                server: Some(existing),
+                name: None,
+                url: None,
+                scope: None,
+                redirect_uri: Some(redirect.to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_existing_mcp_server_is_matched_by_name_and_address() {
+        let server = Id::new();
+        let list = json!([
+            {"server": Id::new(), "name": "weather", "url": "https://mcp.example.com/mcp"},
+            {"server": server, "name": "notes", "url": "http://127.0.0.1:9000/mcp"},
+        ]);
+
+        // The same name and address is the server the sign-in attaches to; the
+        // command line's address is trimmed like the Space trims it.
+        assert_eq!(
+            existing_server(&list, "notes", "http://127.0.0.1:9000/mcp").unwrap(),
+            Some(server)
+        );
+        assert_eq!(
+            existing_server(&list, "notes", " http://127.0.0.1:9000/mcp ").unwrap(),
+            Some(server)
+        );
+
+        // A name the Space does not hold starts a new server.
+        assert_eq!(
+            existing_server(&list, "docs", "http://127.0.0.1:9001/mcp").unwrap(),
+            None
+        );
+
+        // A name held at another address is a refusal: the sign-in would
+        // attach to a server the command did not name.
+        let error = existing_server(&list, "weather", "https://other.example.com/mcp")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already holds"), "{error}");
+        assert!(error.contains("weather"), "{error}");
+    }
+
+    #[test]
+    fn a_sign_in_finish_command_carries_the_keyed_callback_path() {
+        let sign_in = Id::new();
+        let callback = Callback::Code {
+            code: "the-code".to_owned(),
+            state: "the-state".to_owned(),
+            iss: Some("https://auth.example.com".to_owned()),
+        };
+
+        // The command sends the raw path the browser requested with the code
+        // and state: the Space compares it with the issuer-keyed redirect it
+        // registered.
+        assert_eq!(
+            sign_in_finish_command(sign_in, &callback, Some("/0123456789abcdef/callback")),
+            Some(CommandCall::McpSignInFinish {
+                sign_in,
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                iss: Some("https://auth.example.com".to_owned()),
+                path: Some("/0123456789abcdef/callback".to_owned()),
+            })
+        );
+
+        // A callback that returned no code finishes nothing: no finish command
+        // is sent, so the receiver's path is forwarded only with a code.
+        assert_eq!(
+            sign_in_finish_command(sign_in, &Callback::Refused, Some("/callback")),
+            None
+        );
+
+        // The path stays absent when the request line named none.
+        assert_eq!(
+            sign_in_finish_command(
+                sign_in,
+                &Callback::Code {
+                    code: "a".to_owned(),
+                    state: "b".to_owned(),
+                    iss: None,
+                },
+                None,
+            ),
+            Some(CommandCall::McpSignInFinish {
+                sign_in,
+                code: "a".to_owned(),
+                state: "b".to_owned(),
+                iss: None,
+                path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_browser_callback_reads_the_keyed_path_and_values_or_refuses() {
+        // The redirect is the issuer-keyed callback path the Space registered,
+        // and its query carries the code and the state; both are
+        // percent-decoded.
+        assert_eq!(
+            callback_of(
+                b"GET /0123456789abcdef/callback?code=the%2Dcode&state=the%2Dstate HTTP/1.1\r\n\
+                  Host: 127.0.0.1:4711\r\n\r\n"
+            ),
+            CallbackRequest {
+                path: Some("/0123456789abcdef/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "the-code".to_owned(),
+                    state: "the-state".to_owned(),
+                    iss: None,
+                },
+            }
+        );
+
+        // The receiver accepts any path: the issuer key is the Space's to
+        // compare, so the path is kept exactly as received.
+        assert_eq!(
+            callback_of(b"GET /callback?code=a&state=b HTTP/1.1\r\n\r\n"),
+            CallbackRequest {
+                path: Some("/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "a".to_owned(),
+                    state: "b".to_owned(),
+                    iss: None,
+                },
+            }
+        );
+
+        // The path is not decoded: percent-encoding reaches the Space as the
+        // browser sent it.
+        assert_eq!(
+            callback_of(b"GET /a%2Fb/callback?code=a&state=b HTTP/1.1\r\n\r\n"),
+            CallbackRequest {
+                path: Some("/a%2Fb/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "a".to_owned(),
+                    state: "b".to_owned(),
+                    iss: None,
+                },
+            }
+        );
+
+        // A refusal is one fixed outcome: the authorization server's own
+        // description never survives it. The path is still the one requested.
+        assert_eq!(
+            callback_of(
+                b"GET /0123456789abcdef/callback?error=access_denied&\
+                  error_description=the%20user%20said%20no HTTP/1.1\r\n\r\n"
+            ),
+            CallbackRequest {
+                path: Some("/0123456789abcdef/callback".to_owned()),
+                callback: Callback::Refused,
+            }
+        );
+
+        // A callback without both values ends the wait as a failure, and its
+        // request target still names the path the Space compares.
+        for request in [
+            &b"GET /callback?code=the-code HTTP/1.1\r\n\r\n"[..],
+            &b"GET /callback?state=the-state HTTP/1.1\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                callback_of(request),
+                CallbackRequest {
+                    path: Some("/callback".to_owned()),
+                    callback: Callback::Refused,
+                }
+            );
+        }
+
+        // A request the receiver did not register for is refused with no path
+        // at all: only origin-form targets name the redirect a browser sends.
+        for request in [
+            &b"POST /callback?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"not a request\r\n\r\n"[..],
+            // An absolute-form target is what a proxy sends, not a browser.
+            &b"GET http://127.0.0.1:4711/callback?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            // A target without a leading slash is no origin-form path.
+            &b"GET callback?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"GET ?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"GET * HTTP/1.1\r\n\r\n"[..],
+            // A fragment is never part of a request target.
+            &b"GET /callback#fragment?code=a&state=b HTTP/1.1\r\n\r\n"[..],
+            &b"GET /callback?code=a&state=b#fragment HTTP/1.1\r\n\r\n"[..],
+        ] {
+            assert_eq!(
+                callback_of(request),
+                CallbackRequest {
+                    path: None,
+                    callback: Callback::Refused,
+                },
+                "{}",
+                String::from_utf8_lossy(request)
+            );
+        }
+
+        // A `+` in the query is a space, as it is in every form-encoded value,
+        // and RFC 9207's issuer is read like the other values.
+        assert_eq!(
+            callback_of(
+                b"GET /0123456789abcdef/callback?code=a+b&state=c%2Bd&\
+                  iss=https%3A%2F%2Fauth.example.com HTTP/1.1\r\n\r\n"
+            ),
+            CallbackRequest {
+                path: Some("/0123456789abcdef/callback".to_owned()),
+                callback: Callback::Code {
+                    code: "a b".to_owned(),
+                    state: "c+d".to_owned(),
+                    iss: Some("https://auth.example.com".to_owned()),
+                },
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_receiver_holds_the_page_until_the_sign_in_ends() {
+        let receiver = SignInReceiver::bind().await.unwrap();
+        let address = receiver.listener.local_addr().unwrap();
+        assert_eq!(
+            receiver.redirect_uri(),
+            format!("http://127.0.0.1:{}/callback", address.port())
+        );
+        let serving = tokio::spawn(receiver.receive(tokio::time::Instant::now() + SIGN_IN_TIMEOUT));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(
+                b"GET /0123456789abcdef/callback?code=the-code&state=the-state HTTP/1.1\r\n\
+                  Host: 127.0.0.1:4711\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let callback = serving.await.unwrap().unwrap();
+        // The receiver accepts any path, and keeps the raw one it read: the
+        // Space compares it with the issuer-keyed redirect it registered.
+        assert_eq!(callback.path(), Some("/0123456789abcdef/callback"));
+        assert_eq!(
+            callback.callback(),
+            &Callback::Code {
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                iss: None,
+            }
+        );
+
+        // The receiver used its one request: it is consumed, and the listener
+        // was dropped, so no second connection is one this command serves.
+        // The released port may belong to another process at any moment, so
+        // the test does not connect to it.
+
+        // The page is held until the sign-in ends. The browser reads nothing
+        // before the outcome is known, so the page can never claim a success
+        // the Space has not reported.
+        let mut held = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), browser.peek(&mut held))
+                .await
+                .is_err(),
+            "the page is written only after the sign-in ends"
+        );
+
+        // Once the outcome is known the browser gets the fixed page, with
+        // neither the code nor the state.
+        callback.answer(true).await.unwrap();
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(
+            response.contains("Content-Type: text/html; charset=utf-8"),
+            "{response}"
+        );
+        assert!(response.contains("MCP sign-in finished"), "{response}");
+        assert!(
+            !response.contains("the-code") && !response.contains("the-state"),
+            "the page echoes neither value: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_in_receiver_answers_the_failed_page() {
+        let receiver = SignInReceiver::bind().await.unwrap();
+        let address = receiver.listener.local_addr().unwrap();
+        let serving = tokio::spawn(receiver.receive(tokio::time::Instant::now() + SIGN_IN_TIMEOUT));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(
+                b"GET /callback?error=access_denied&error_description=the%20user%20said%20no \
+                  HTTP/1.1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let callback = serving.await.unwrap().unwrap();
+        assert_eq!(callback.callback(), &Callback::Refused);
+        callback.answer(false).await.unwrap();
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+
+        // The page says the sign-in failed and repeats no provider text.
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains("MCP sign-in failed"), "{response}");
+        assert!(!response.contains("access_denied"), "{response}");
+        assert!(!response.contains("user said no"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_receiver_gives_up_when_the_browser_never_comes() {
+        // The wait has one deadline: a browser that never returns cannot hold
+        // the command past it.
+        let started = std::time::Instant::now();
+        let error = SignInReceiver::bind()
+            .await
+            .unwrap()
+            .receive(tokio::time::Instant::now() + Duration::from_millis(100))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the receiver ended at its deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The credential the CLI uses for one fake Space.
+    fn credential_at(address: std::net::SocketAddr) -> Credential {
+        Credential {
+            url: format!("http://{address}"),
+            token: "token".to_owned(),
+            account: SignedIn {
+                id: Id::new(),
+                display_name: "Ada".to_owned(),
+                is_admin: false,
+            },
+        }
+    }
+
+    /// Serves a Space that opens the WebSocket and never greets the CLI.
+    async fn ungreeting_space(listener: tokio::net::TcpListener) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        // The client's hello is read, and never answered.
+        let _ = socket.next().await;
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+
+    /// Accepts the CLI's socket, greets it, and reads the one command it sends.
+    async fn greeting_space(
+        listener: tokio::net::TcpListener,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+        Id,
+        CommandCall,
+    ) {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let hello = socket.next().await.unwrap().unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ClientFrame>(hello.to_text().unwrap()).unwrap(),
+            ClientFrame::Hello { .. }
+        ));
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ServerFrame::Hello {
+                    version: PROTOCOL_VERSION,
+                    capabilities: Vec::new(),
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+        let command = socket.next().await.unwrap().unwrap();
+        let ClientFrame::Command { id, command } =
+            serde_json::from_str(command.to_text().unwrap()).unwrap()
+        else {
+            panic!("the Space expected one command");
+        };
+        (socket, id, command)
+    }
+
+    /// Serves a Space that greets the CLI, reads one command, and answers it
+    /// with `result` only once the test releases the answer.
+    async fn held_space(
+        listener: tokio::net::TcpListener,
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        result: serde_json::Value,
+    ) {
+        let (mut socket, id, _command) = greeting_space(listener).await;
+        reached.send(()).unwrap();
+        release.await.unwrap();
+        socket
+            .send(Message::Text(
+                serde_json::to_string(&ServerFrame::Confirmed { id, result })
+                    .unwrap()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let _ = socket.close(None).await;
+    }
+
+    /// Opens the receiver's browser side and writes the callback it waits for.
+    ///
+    /// `target` is the request target the browser asks for: the callback path
+    /// the authorization server's redirect names, and its query.
+    async fn callback_browser(
+        receiver: SignInReceiver,
+        target: &str,
+    ) -> (super::SignInCallback, tokio::net::TcpStream) {
+        let address = receiver.listener.local_addr().unwrap();
+        let waiting = tokio::spawn(receiver.receive(tokio::time::Instant::now() + SIGN_IN_TIMEOUT));
+        let mut browser = tokio::net::TcpStream::connect(address).await.unwrap();
+        browser
+            .write_all(format!("GET {target} HTTP/1.1\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        (waiting.await.unwrap().unwrap(), browser)
+    }
+
+    #[tokio::test]
+    async fn a_silent_space_cannot_hold_the_sign_in_past_its_deadline() {
+        // Each sign-in command opens its own WebSocket, and the client's
+        // greeting wait has no bound of its own: the sign-in's deadline must
+        // bound it, so a Space that accepts a socket and never greets cannot
+        // hold the command.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = tokio::spawn(ungreeting_space(listener));
+        let started = std::time::Instant::now();
+        let error = sign_in_command(
+            &credential_at(address),
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            CommandCall::McpSignInStatus { sign_in: Id::new() },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the command ended at the sign-in deadline, not at the greeting: {:?}",
+            started.elapsed()
+        );
+        space.abort();
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_page_reports_success_only_after_the_space_finishes() {
+        let sign_in = Id::new();
+        let server = Id::new();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let space = tokio::spawn(held_space(
+            listener,
+            reached,
+            release_rx,
+            json!({"state": "finished", "server": server, "connected": true}),
+        ));
+        let credential = credential_at(address);
+        let (callback, mut browser) = callback_browser(
+            SignInReceiver::bind().await.unwrap(),
+            "/0123456789abcdef/callback?code=the-code&state=the-state",
+        )
+        .await;
+        let finishing = tokio::spawn(async move {
+            let outcome = finish_sign_in(
+                &credential,
+                tokio::time::Instant::now() + SIGN_IN_TIMEOUT,
+                sign_in,
+                &callback,
+            )
+            .await;
+            answer_sign_in_page(callback, &outcome).await;
+            outcome
+        });
+
+        // The Space holds the finish command unanswered, so the browser must
+        // still hold no page: success is never claimed before the Space says
+        // the sign-in finished.
+        reached_rx.await.unwrap();
+        let mut held = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), browser.peek(&mut held))
+                .await
+                .is_err(),
+            "the page is written only after the Space answers"
+        );
+
+        release.send(()).unwrap();
+        let outcome = finishing.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+        assert!(response.contains("MCP sign-in finished"), "{response}");
+        assert!(
+            !response.contains("the-code") && !response.contains("the-state"),
+            "the page echoes neither value: {response}"
+        );
+        space.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_page_reports_a_failed_space_answer() {
+        let sign_in = Id::new();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (reached, reached_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let space = tokio::spawn(held_space(
+            listener,
+            reached,
+            release_rx,
+            json!({"state": "failed", "reason": "the sign-in expired"}),
+        ));
+        let credential = credential_at(address);
+        let (callback, mut browser) = callback_browser(
+            SignInReceiver::bind().await.unwrap(),
+            "/0123456789abcdef/callback?code=the-code&state=the-state",
+        )
+        .await;
+        let finishing = tokio::spawn(async move {
+            let outcome = finish_sign_in(
+                &credential,
+                tokio::time::Instant::now() + SIGN_IN_TIMEOUT,
+                sign_in,
+                &callback,
+            )
+            .await;
+            answer_sign_in_page(callback, &outcome).await;
+            outcome
+        });
+        reached_rx.await.unwrap();
+        release.send(()).unwrap();
+        let outcome = finishing.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            SignInState::Failed {
+                reason: "the sign-in expired".to_owned(),
+            }
+        );
+        let mut response = String::new();
+        browser.read_to_string(&mut response).await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "{response}"
+        );
+        assert!(response.contains("MCP sign-in failed"), "{response}");
+        assert!(
+            !response.contains("expired"),
+            "the page repeats no Space text: {response}"
+        );
+        space.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_finished_sign_in_sends_the_keyed_callback_path_to_the_space() {
+        // The browser comes back to the issuer-keyed path the Space registered,
+        // and the finish command carries that raw path: the Space is the side
+        // that compares it with the redirect it planned.
+        let sign_in = Id::new();
+        let server = Id::new();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let space = tokio::spawn(async move {
+            let (mut socket, id, command) = greeting_space(listener).await;
+            socket
+                .send(Message::Text(
+                    serde_json::to_string(&ServerFrame::Confirmed {
+                        id,
+                        result: json!({"state": "finished", "server": server, "connected": true}),
+                    })
+                    .unwrap()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let _ = socket.close(None).await;
+            command
+        });
+        let credential = credential_at(address);
+        let (callback, _browser) = callback_browser(
+            SignInReceiver::bind().await.unwrap(),
+            "/0123456789abcdef/callback?code=the-code&state=the-state",
+        )
+        .await;
+        let outcome = finish_sign_in(
+            &credential,
+            tokio::time::Instant::now() + SIGN_IN_TIMEOUT,
+            sign_in,
+            &callback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome,
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        assert_eq!(
+            space.await.unwrap(),
+            CommandCall::McpSignInFinish {
+                sign_in,
+                code: "the-code".to_owned(),
+                state: "the-state".to_owned(),
+                iss: None,
+                path: Some("/0123456789abcdef/callback".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn a_sign_in_answer_reads_pending_finished_or_failed() {
+        let server = Id::new();
+        assert_eq!(
+            sign_in_state(&json!({"state": "pending", "server": null, "connected": false}))
+                .unwrap(),
+            SignInState::Pending
+        );
+        assert_eq!(
+            sign_in_state(&json!({
+                "state": "finished",
+                "server": server,
+                "connected": true,
+                "reason": null,
+            }))
+            .unwrap(),
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        // A finished sign-in the Space could not reach still ends the wait.
+        assert_eq!(
+            sign_in_state(&json!({
+                "state": "finished",
+                "server": server,
+                "connected": false,
+            }))
+            .unwrap(),
+            SignInState::Finished {
+                server,
+                connected: false,
+            }
+        );
+        assert_eq!(
+            sign_in_state(&json!({
+                "state": "failed",
+                "server": null,
+                "connected": false,
+                "reason": "the sign-in expired",
+            }))
+            .unwrap(),
+            SignInState::Failed {
+                reason: "the sign-in expired".to_owned(),
+            }
+        );
+        // A failure the Space explained with nothing still ends the wait.
+        assert_eq!(
+            sign_in_state(&json!({"state": "failed", "reason": null})).unwrap(),
+            SignInState::Failed {
+                reason: "the Space gave no reason".to_owned(),
+            }
+        );
+        // An answer this CLI does not understand is an error, not a wait.
+        for answer in [json!({"state": "expired"}), json!({})] {
+            let error = sign_in_state(&answer).unwrap_err().to_string();
+            assert!(error.contains("sign-in state"), "{answer}: {error}");
+        }
+        // A finished answer without its server names nothing to report.
+        assert!(
+            sign_in_state(&json!({"state": "finished", "connected": true})).is_err(),
+            "a finished sign-in names its server"
+        );
+    }
+
+    #[test]
+    fn a_finished_sign_in_prints_the_connection_or_the_registration() {
+        let server = Id::new();
+        let user = Id::new();
+        assert_eq!(mcp_scope_text(McpScope::Space, Some(user)), "space");
+        assert_eq!(
+            mcp_scope_text(McpScope::User, Some(user)),
+            format!("user {user}")
+        );
+        assert_eq!(mcp_scope_text(McpScope::User, None), "user");
+
+        // A reachable server reads as a connection.
+        assert_eq!(
+            sign_in_lines(
+                SignInState::Finished {
+                    server,
+                    connected: true,
+                },
+                "weather",
+                "https://mcp.example.com/mcp",
+                "space",
+            )
+            .unwrap(),
+            vec!["Connected MCP server weather.".to_owned()]
+        );
+
+        // Registered but unreachable prints `neha mcp add`'s two lines.
+        assert_eq!(
+            sign_in_lines(
+                SignInState::Finished {
+                    server,
+                    connected: false,
+                },
+                "notes",
+                "http://127.0.0.1:9000/mcp",
+                &format!("user {user}"),
+            )
+            .unwrap(),
+            vec![
+                format!("Added MCP server {server} (notes) at http://127.0.0.1:9000/mcp."),
+                format!("  scope: user {user}; not connected"),
+            ]
+        );
+
+        // A failed sign-in is the command's error, escaped to one line so the
+        // authorization server's text cannot rewrite the terminal.
+        let error = sign_in_lines(
+            SignInState::Failed {
+                reason: "access_denied: no\n\u{1b}[31m".to_owned(),
+            },
+            "weather",
+            "https://mcp.example.com/mcp",
+            "space",
+        )
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            error,
+            "the sign-in failed: access_denied: no\\n\\u{001b}[31m"
+        );
+
+        // A wait that is not done has no lines to print yet.
+        assert!(
+            sign_in_lines(
+                SignInState::Pending,
+                "weather",
+                "https://mcp.example.com/mcp",
+                "space",
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sign_in_wait_polls_until_it_ends_or_times_out() {
+        let sign_in = Id::new();
+        let server = Id::new();
+
+        // A pending answer asks again, and a finished one ends the wait.
+        let mut answers = [
+            json!({"state": "pending"}),
+            json!({"state": "pending"}),
+            json!({"state": "finished", "server": server, "connected": true}),
+        ]
+        .into_iter();
+        let mut asks = 0;
+        let ended = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::ZERO,
+            |asked| {
+                asks += 1;
+                assert_eq!(asked, sign_in);
+                let answer = answers.next().expect("the wait asked past its answers");
+                async move { Ok(answer) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ended,
+            SignInState::Finished {
+                server,
+                connected: true,
+            }
+        );
+        assert_eq!(asks, 3);
+
+        // A failed answer ends the wait too, so its reason is reported instead
+        // of waiting for a sign-in that cannot finish.
+        let failed = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+            Duration::ZERO,
+            |_| async { Ok(json!({"state": "failed", "reason": "the sign-in expired"})) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed,
+            SignInState::Failed {
+                reason: "the sign-in expired".to_owned(),
+            }
+        );
+
+        // A sign-in that never ends is the timeout, and it outlives no retry.
+        let error = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now(),
+            Duration::ZERO,
+            |_| async { Ok(json!({"state": "pending"})) },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(error.contains("retry"), "{error}");
+
+        // An ask whose answer never comes is bounded by the time left: the
+        // WebSocket client may wait indefinitely, the poll may not.
+        let started = std::time::Instant::now();
+        let error = poll_sign_in(
+            sign_in,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+            Duration::ZERO,
+            |_| async {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                Ok(json!({"state": "pending"}))
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("did not finish within"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the wait ended at its deadline, not the ask's: {:?}",
+            started.elapsed()
         );
     }
 

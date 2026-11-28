@@ -6,8 +6,9 @@ import Avatar from "./Avatar";
 import Brand from "./Brand";
 import Icon from "./Icon";
 
-// What the rail selects: the User's Chats, or the approvals that wait.
-export type RailView = "chats" | "attention";
+// What the rail selects: the User's Chats, the approvals that wait, the
+// integrations the Space holds, or the skills its libraries hold.
+export type RailView = "chats" | "attention" | "integrations" | "skills";
 
 interface RailProps {
   account: Account;
@@ -28,20 +29,25 @@ export default function Rail(props: RailProps) {
     const count = countLabel();
     return count ? `${t("attention.title")}: ${count}` : t("attention.title");
   };
+  // A view entry that names itself in the User's language and marks the one on
+  // screen. The library views carry no count.
+  const item = (view: RailView, label: string, icon: string) => (
+    <button
+      class={`rail__item${props.view === view ? " is-active" : ""}`}
+      type="button"
+      aria-label={label}
+      aria-current={props.view === view ? "page" : undefined}
+      title={label}
+      onClick={() => props.onSelect(view)}
+    >
+      <Icon name={icon} size="lg" />
+    </button>
+  );
   return (
     <aside class="rail" aria-label={t("rail.primary")}>
       <Brand compact />
       <nav class="rail__nav">
-        <button
-          class={`rail__item${props.view === "chats" ? " is-active" : ""}`}
-          type="button"
-          aria-label={t("rail.chats")}
-          aria-current={props.view === "chats" ? "page" : undefined}
-          title={t("rail.chats")}
-          onClick={() => props.onSelect("chats")}
-        >
-          <Icon name="message" size="lg" />
-        </button>
+        {item("chats", t("rail.chats"), "message")}
         <button
           class={`rail__item${props.view === "attention" ? " is-active" : ""}`}
           type="button"
@@ -57,6 +63,8 @@ export default function Rail(props: RailProps) {
             </span>
           </Show>
         </button>
+        {item("integrations", t("rail.integrations"), "server")}
+        {item("skills", t("rail.skills"), "book")}
       </nav>
       <div class="rail__spacer" />
       <div class="rail__account" title={props.account.display_name}>

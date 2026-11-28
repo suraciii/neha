@@ -21,8 +21,10 @@ the signed-in User alone: a Bot owner may add one for themselves, or connect an
 existing Space server with their own credential. The Admin adds a Space-wide
 credential to a server a package brought by naming that server again with
 `--scope space` (the default) and its address. The credential comes from
-`NEHA_MCP_TOKEN` only, never from the command line; the Space seals it on the
-machine that runs the Space and never puts it in the record or a Computer.
+`NEHA_MCP_TOKEN`, or — when the variable is unset — from a sign-in the command
+opens in the browser; it never comes from the command line. The Space seals it
+on the machine that runs the Space and never puts it in the record or a
+Computer.
 
 A User-scope server is offered to a Bot only while the Bot acts for that User.
 `neha mcp list` prints each server, its scope, who connected it, its address,
@@ -42,6 +44,25 @@ The Bot calls a server's tool as `mcp__<server>__<tool>`. A name the Model could
 not take is folded to letters, digits, `_`, and `-`, and a folded or too long
 name carries a hash of the server and the tool. A tool the server no longer
 offers is not offered to the run.
+
+## In the browser client
+
+The Integrations view lists the MCP servers the Space and you hold, the packages
+the Admin installed, and the Bots that use each server. A server row says
+whether it is connected, who connected it, and its address; a package row says
+what it brought and whether the Space offers it.
+
+The Admin adds a server for the Space, and a User adds one for themselves or
+connects a Space server with their own credential, by naming it, its address,
+and an access token. The token goes to the Space in that one command: the page
+clears the field, never shows the token again, and says whether the Space can
+reach the server. A server without a credential is connected through a browser
+sign-in instead: the page opens the authorization URL and waits for the Space
+to report the sign-in finished or failed.
+
+Only the Admin sees the packages and enables or disables one. A Bot uses a
+server only when its owner enables it, so every server row carries a switch for
+each of the reader's Bots.
 
 ## Approvals
 

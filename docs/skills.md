@@ -54,6 +54,19 @@ target/debug/neha bot skill disable <bot-id> <skill-id>
 
 Removing a skill takes it away from every Bot that enabled it.
 
+## In the browser client
+
+The Skills view lists the Space's library and the library of each Bot you own. A
+row shows the skill's name, its description, the scripts it carries, and the
+package that brought it when one did. The Admin adds a skill to the Space's
+library; a Bot's owner adds one to that Bot's library and turns skills on or off
+for it. The browser takes a name, a description, the instructions, and optional
+scripts, and the Space records them as one `SKILL.md`.
+
+Adding a skill loads nothing and runs nothing. A script a skill carries still
+runs only as one of the Bot's actions, under the approvals [Scripts](#scripts)
+describes.
+
 ## What the Bot sees
 
 An enabled skill's name and description enter the Bot's context before each run. The body enters only when the Bot loads it with the `skill` tool, so a large body costs tokens only when the task matches the description.
@@ -82,6 +95,8 @@ The body says which script to run and what to pass. The Bot names the script by 
 
 ## What this milestone does not do
 
-- A skill comes from one directory the User names. Installing a package that carries skills is not available yet.
-- The browser client does not show or enable skills yet.
-- A skill cannot require a tool, and no frontmatter field other than `name` and `description` changes what Neha does.
+- A package installs the skills it carries into the Space's library; see
+  [Plugins](plugins.md). A skill added directly still comes from one directory
+  the User names.
+- A skill cannot require a tool, and no frontmatter field other than `name` and
+  `description` changes what Neha does.

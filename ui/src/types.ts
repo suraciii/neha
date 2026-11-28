@@ -26,6 +26,65 @@ export interface Bot {
   name: string;
   computer: string;
   chat: string;
+  // The MCP servers and skills the Bot uses, when the Space lists them.
+  mcps?: string[];
+  skills?: string[];
+}
+
+// One MCP server as the Integrations view lists it: where it answers, who
+// connected it, and whether a call by the reader would find it.
+export interface McpServer {
+  server: string;
+  name: string;
+  url: string;
+  // Where the server belongs: the whole Space, or one User.
+  scope: "space" | "user";
+  // The User whose server it is, when its scope is one User's.
+  user: string | null;
+  // The account that connected it.
+  by: string;
+  // That account's display name, when the Space names it.
+  by_name?: string;
+  // The package that brought it, when one did.
+  plugin?: string | null;
+  connected: boolean;
+  // What a call by the reader would find: a personal credential wins over the
+  // Space's, so this names both when both are stored.
+  credential?: "none" | "space" | "user" | "space-and-user";
+}
+
+// One package an Admin installed, and what it brought.
+export interface InstalledPackage {
+  plugin: string;
+  name: string;
+  version: string | null;
+  commit: string | null;
+  digest: string;
+  source: string;
+  enabled: boolean;
+  servers: { server: string; name: string }[];
+  skills: { skill: string; name: string }[];
+}
+
+// One skill a library holds: the Space's or one Bot's.
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  body: string;
+  scripts: { name: string; sha256: string }[];
+  library: "space" | "bot";
+  bot: string | null;
+  plugin?: string | null;
+}
+
+// What became of one MCP browser sign-in, as the client polls it.
+export interface McpSignInState {
+  sign_in: string;
+  state: "pending" | "finished" | "failed";
+  server: string | null;
+  connected: boolean;
+  reason: string | null;
 }
 
 export interface Computer {

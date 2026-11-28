@@ -13,6 +13,7 @@ pub mod home;
 pub mod identity;
 pub mod mcp;
 pub mod model;
+pub mod oauth;
 pub mod plugins;
 pub mod remote;
 pub mod runs;

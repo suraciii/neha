@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -24,9 +24,10 @@ use neha::record::{
 };
 use neha::seq::Seq;
 use neha::surface::{
-    BotComputer, BotCreate, BotUpdate, CommandCall, FileSummary, MessageSend, ModelSpec,
-    ProviderAdd, ProviderConnect, ProviderProtocol, SkillAdd, ThinkingLevel,
+    BotComputer, BotCreate, BotUpdate, CommandCall, FileSummary, McpSignInStart, MessageSend,
+    ModelSpec, ProviderAdd, ProviderConnect, ProviderProtocol, SkillAdd, ThinkingLevel,
 };
+use rand::RngCore as _;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -42,10 +43,13 @@ use crate::plugins::{
 };
 use crate::remote::{RemoteRuntime, TIMEOUT_GRACE};
 use crate::secrets::Secrets;
-use crate::server::{ApiError, PairingAttempts, identity_error};
+use crate::server::{
+    ApiError, MAX_PENDING_SIGN_INS, PairingAttempts, PendingSignIn, SIGN_IN_EXPIRED,
+    SIGN_IN_INCOMPLETE, SIGN_IN_REPLACED, SIGN_IN_TTL, SignInStatus, identity_error,
+};
 use crate::state::{
-    ApprovalView, BotView, ChatView, ComputerView, ModelView, ProviderView, RemovedMcpView,
-    RuleView, RunStatus, State,
+    ApprovalView, BotView, ChatView, ComputerView, McpServerView, ModelView, ProviderView,
+    RemovedMcpView, RuleView, RunStatus, State,
 };
 use crate::store::{
     AppendRequest, AppendResult, CommandRecord, ContinuationWrite, Projection, Store,
@@ -192,6 +196,17 @@ pub struct CommandContext<'a> {
     pub catalog: &'a CatalogStore,
     /// Where this Space may install a package from.
     pub plugins: &'a crate::config::PluginsConfig,
+    /// The browser sign-ins the Space is waiting on, by sign-in.
+    pub(crate) signins: &'a tokio::sync::Mutex<HashMap<Id, PendingSignIn>>,
+    /// Serializes the planning of one sign-in start, so two deliveries of one
+    /// command cannot both discover and register before either records its
+    /// answer. It never covers the `library` lock, which sign-in completion
+    /// takes after the network step.
+    pub(crate) signin_start: &'a tokio::sync::Mutex<()>,
+    /// The OAuth client that plans and finishes a browser sign-in.
+    pub oauth: &'a crate::oauth::OAuthClient,
+    /// The origin the browser client uses to reach this Space.
+    pub browser_origin: String,
 }
 
 /// Runs one command for an account.
@@ -428,6 +443,30 @@ pub async fn execute(
         CommandCall::McpRemove { server } => {
             mcp_remove(context, account, command_id, fingerprint, server).await
         }
+        CommandCall::McpConnect { server, credential } => {
+            mcp_connect(
+                context,
+                account,
+                command_id,
+                fingerprint,
+                server,
+                credential,
+            )
+            .await
+        }
+        CommandCall::McpSignInStart(arguments) => {
+            mcp_sign_in_start(context, account, command_id, fingerprint, arguments).await
+        }
+        CommandCall::McpSignInStatus { sign_in } => {
+            mcp_sign_in_status(context, account, sign_in).await
+        }
+        CommandCall::McpSignInFinish {
+            sign_in,
+            code,
+            state,
+            path,
+            iss,
+        } => mcp_sign_in_finish(context, account, sign_in, code, state, path, iss).await,
         CommandCall::BotMcpEnable { bot, server } | CommandCall::BotMcpDisable { bot, server } => {
             let enabled = matches!(command, CommandCall::BotMcpEnable { .. });
             bot_mcp(
@@ -1160,6 +1199,15 @@ async fn mcp_add(
                 "url": null,
                 "credential": true,
                 "by": account.id,
+                // The event's scope describes the credential change, never the
+                // server: a User's own credential stays between the User and
+                // the Space, even on a Space server. A Space credential's
+                // change is the Space's and carries the server's scope.
+                "scope": if user.is_some() {
+                    neha::record::McpScope::User
+                } else {
+                    existing.scope
+                },
             }),
         );
         let result = json!({
@@ -1311,43 +1359,94 @@ async fn mcp_add(
     })
 }
 
-/// One MCP server as a reader sees it.
-async fn mcp_view(
-    context: &CommandContext<'_>,
-    server: crate::state::McpServerView,
+/// The credential a call by `reader` would find for one server, and which
+/// slots hold one.
+///
+/// The personal slot wins over the Space's, the order a call takes. The kind
+/// names both slots whatever the server's scope: a list row shows what the
+/// Vault holds, not what the scope promises.
+fn mcp_reader_credential(
+    secrets: &Secrets,
+    server: Id,
     reader: Id,
-) -> Result<Value, ApiError> {
-    let who = match server.scope {
-        neha::record::McpScope::Space => None,
-        neha::record::McpScope::User => server.user,
+) -> Result<(Option<String>, &'static str), ApiError> {
+    let personal = secrets
+        .mcp_credential(server, Some(reader))
+        .map_err(|_| ApiError::internal("cannot read the MCP credential"))?;
+    let space = secrets
+        .mcp_credential(server, None)
+        .map_err(|_| ApiError::internal("cannot read the MCP credential"))?;
+    let kind = match (personal.is_some(), space.is_some()) {
+        (true, true) => "space-and-user",
+        (true, false) => "user",
+        (false, true) => "space",
+        (false, false) => "none",
     };
-    // A Space server may carry the reader's own credential; a User's own
-    // server carries theirs.
-    let credential =
-        match who {
-            Some(user) if user == reader => context
-                .secrets
-                .mcp_credential(server.server, Some(user))
-                .map_err(|_| ApiError::internal("cannot read the MCP credential"))?,
-            Some(_) => None,
-            None => match context
-                .secrets
-                .mcp_credential(server.server, Some(reader))
-                .map_err(|_| ApiError::internal("cannot read the MCP credential"))?
-            {
-                Some(credential) => Some(credential),
-                None => context
-                    .secrets
-                    .mcp_credential(server.server, None)
-                    .map_err(|_| ApiError::internal("cannot read the MCP credential"))?,
-            },
-        };
-    // A credential that is present but refused, and a server that cannot be
-    // reached, are not connected: the list says what a call would find.
-    let connected = match &credential {
+
+    Ok((personal.or(space), kind))
+}
+
+/// The credential a call by `reader` would find for one server, which slots
+/// hold one, and whether the server is reachable with it.
+///
+/// A server a User connected is its owner's: any other reader would find no
+/// credential at all. A credential that is present but refused, and a server
+/// that cannot be reached, are not connected.
+async fn mcp_reader_connection(
+    secrets: &Secrets,
+    server: &McpServerView,
+    reader: Id,
+) -> Result<(Option<String>, &'static str, bool), ApiError> {
+    let (found, kind) = mcp_reader_credential(secrets, server.server, reader)?;
+    let found = match (server.scope, server.user) {
+        (neha::record::McpScope::User, Some(user)) if user != reader => None,
+        _ => found,
+    };
+    let connected = match &found {
         Some(credential) => mcp_reachable(&server.url, credential, &server.headers).await,
         None => false,
     };
+
+    Ok((found, kind, connected))
+}
+
+/// Whether a call by `reader` would reach one server the Space holds.
+async fn mcp_reader_reachable(
+    context: &CommandContext<'_>,
+    server: Id,
+    reader: Id,
+) -> Result<bool, ApiError> {
+    let view = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state.mcp(server).cloned()
+    };
+    let Some(view) = view else {
+        return Ok(false);
+    };
+
+    Ok(mcp_reader_connection(context.secrets, &view, reader)
+        .await?
+        .2)
+}
+
+/// One MCP server as a reader sees it.
+async fn mcp_view(
+    context: &CommandContext<'_>,
+    server: McpServerView,
+    reader: Id,
+) -> Result<Value, ApiError> {
+    let (_found, kind, connected) = mcp_reader_connection(context.secrets, &server, reader).await?;
+    let by_name = context
+        .state
+        .lock()
+        .map_err(|_| ApiError::internal("state lock"))?
+        .users
+        .get(&server.by)
+        .map(|user| user.display_name.clone())
+        .unwrap_or_default();
 
     Ok(json!({
         "server": server.server,
@@ -1359,8 +1458,1121 @@ async fn mcp_view(
         },
         "user": server.user,
         "by": server.by,
+        "by_name": by_name,
+        "plugin": server.plugin,
+        "credential": kind,
         "connected": connected,
     }))
+}
+
+/// Attaches the signed-in User's own credential to an existing MCP server.
+///
+/// A Space server takes any signed-in User's personal credential; a server a
+/// User connected takes only its owner's, and the Admin has no standing here
+/// beyond their own. The Vault's previous value comes back if the record does
+/// not write the update.
+async fn mcp_connect(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    server: Id,
+    credential: Option<String>,
+) -> Result<Outcome, ApiError> {
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    // A connection changes what the Space holds, so it takes the same lock a
+    // library change takes: the checks below and the append are one decision.
+    // A retry of this same command may have finished while this one waited, so
+    // ask again under the lock.
+    let _library = context.library.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    // An empty token connects nothing: a call must send a bearer or no request.
+    let Some(credential) = credential.filter(|credential| !credential.trim().is_empty()) else {
+        return Err(ApiError::invalid_argument(
+            "connecting an MCP server needs a credential",
+        ));
+    };
+    // The same rule every registration applies: a token holds only what a
+    // bearer token takes.
+    if !neha::record::McpServerAdded::valid_credential(&credential) {
+        return Err(ApiError::invalid_argument(
+            "an MCP credential holds only the characters a bearer token takes",
+        ));
+    }
+    let existing = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        state.mcp(server).cloned()
+    };
+    let Some(existing) = existing else {
+        return Err(ApiError::not_found("no such MCP server"));
+    };
+    if existing.scope == neha::record::McpScope::User && existing.user != Some(account.id) {
+        return Err(ApiError::forbidden(
+            "only the User who connected an MCP server attaches their credential to it",
+        ));
+    }
+    let user = Some(account.id);
+    // A rotation replaces the credential that worked. What the record's append
+    // decides, so is the credential this command leaves behind: keep the old
+    // one until the append commits, and put it back when it does not.
+    let previous = context
+        .secrets
+        .mcp_credential(server, user)
+        .map_err(|_| ApiError::internal("cannot read the MCP credential"))?;
+    context
+        .secrets
+        .store_mcp_credential(server, user, &credential)
+        .map_err(|_| ApiError::internal("cannot store the MCP credential"))?;
+    // A credential that is present but refused is not connected; the answer
+    // says what a call would find, the same way `mcp_list` does.
+    let connected = mcp_reachable(&existing.url, &credential, &existing.headers).await;
+    let draft = EventDraft::new(
+        EventKind::McpServerUpdated,
+        Author::User(account.id),
+        json!({
+            "server": server,
+            "url": null,
+            "credential": true,
+            "by": account.id,
+            // The event's scope describes the credential change, not the
+            // server: a personal credential's change stays between the member
+            // and the Space even when it attaches to the Space's server. The
+            // stream only broadcasts a Space-scope update, so the member's
+            // attach never reveals who made it.
+            "scope": neha::record::McpScope::User,
+        }),
+    );
+    let result = json!({
+        "server": server,
+        // The credential this attached is the caller's, whatever the server's
+        // scope: a Space server keeps its own credential untouched.
+        "credential": "user",
+        "connected": connected,
+        // The command's owner, not the server's: a recorded answer is replayed
+        // only to the account whose command it was.
+        "user": account.id,
+    });
+    let appended = match append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            // The record did not change, so the credential that worked before
+            // this command must not stay replaced by one it wrote.
+            match previous {
+                Some(previous) => {
+                    let _ = context
+                        .secrets
+                        .store_mcp_credential(server, user, &previous);
+                }
+                None => context.secrets.discard_mcp_credential(server, user),
+            }
+            return Err(error);
+        }
+    };
+    if appended.existing {
+        context.secrets.discard_mcp_credential(server, user);
+        return recorded_outcome(context.store, command_id).await;
+    }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Starts a browser sign-in for an MCP server.
+///
+/// The command resolves where the sign-in's credential belongs and plans the
+/// browser flow. The answer names a first-party URL the browser opens; the
+/// bind route there starts the flow, and the callback route finishes it. A
+/// command line may name a loopback redirect of its own instead, in which
+/// case [`CommandCall::McpSignInFinish`] finishes the flow. The plan lives in
+/// memory, so a Space restart drops every sign-in.
+///
+/// The answer is recorded under the command so a redelivery is answered with
+/// the same sign-in instead of planning a second flow.
+async fn mcp_sign_in_start(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    arguments: McpSignInStart,
+) -> Result<Outcome, ApiError> {
+    // Two deliveries of one command can run at once on different sockets. The
+    // first one plans discovery, registration, and the pending flow; the
+    // second waits here, then finds the recorded answer instead of planning a
+    // second flow and a second external registration. This is the sign-in
+    // start's own lock, not the library's: it is held across discovery, but a
+    // sign-in that finishes later takes the library lock only after the
+    // network step.
+    let _start = context.signin_start.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(start_replay(outcome));
+    }
+    let McpSignInStart {
+        server,
+        name,
+        url,
+        scope,
+        redirect_uri,
+    } = arguments;
+    // An existing server keeps the name and address the Space connected, and
+    // takes the caller's own credential unless the Admin asks for the Space's.
+    // A new server is named and addressed here and enters the record only when
+    // its sign-in finishes.
+    let (target, name, url, scope, headers) = match server {
+        Some(server) => {
+            if name.is_some() || url.is_some() {
+                return Err(ApiError::invalid_argument(
+                    "an existing MCP server keeps the name and address the Space connected",
+                ));
+            }
+            let existing = {
+                let state = context
+                    .state
+                    .lock()
+                    .map_err(|_| ApiError::internal("state lock"))?;
+                state.mcp(server).cloned()
+            };
+            let Some(existing) = existing else {
+                return Err(ApiError::not_found("no such MCP server"));
+            };
+            let scope = match scope {
+                Some(neha::record::McpScope::Space) => {
+                    // The Space's credential belongs to the Admin, and only a
+                    // server the Space connected has one.
+                    if !account.is_admin || existing.scope != neha::record::McpScope::Space {
+                        return Err(ApiError::forbidden(
+                            "only the Admin connects an MCP server for the Space, and only the \
+                             Space's own server holds its credential",
+                        ));
+                    }
+                    neha::record::McpScope::Space
+                }
+                Some(neha::record::McpScope::User) | None => {
+                    if existing.scope == neha::record::McpScope::User
+                        && existing.user != Some(account.id)
+                    {
+                        return Err(ApiError::forbidden(
+                            "only the User who connected an MCP server signs in to it",
+                        ));
+                    }
+                    neha::record::McpScope::User
+                }
+            };
+            (Some(server), None, existing.url, scope, existing.headers)
+        }
+        None => {
+            let (Some(name), Some(url)) = (name, url) else {
+                return Err(ApiError::invalid_argument(
+                    "a new MCP server needs a name and an address",
+                ));
+            };
+            let name = name.trim().to_owned();
+            if !neha::record::McpServerAdded::valid_name(&name) {
+                return Err(ApiError::invalid_argument(format!(
+                    "an MCP server name is 1 to {} letters, digits, or hyphens",
+                    neha::record::MAX_MCP_NAME_BYTES
+                )));
+            }
+            let url = url.trim().to_owned();
+            if !neha::record::McpServerAdded::valid_url(&url) {
+                return Err(ApiError::invalid_argument(
+                    "an MCP server's address is https, or http on the Space's own loopback",
+                ));
+            }
+            // The address a sign-in discovers from is where the server
+            // answers; a query a caller wrote may carry a credential.
+            if url.contains('?') {
+                return Err(ApiError::invalid_argument(
+                    "an MCP server's address carries no user information, query string, or \
+                     fragment",
+                ));
+            }
+            let scope = match scope {
+                Some(neha::record::McpScope::Space) => {
+                    if !account.is_admin {
+                        return Err(ApiError::forbidden(
+                            "only the Admin connects an MCP server for the Space",
+                        ));
+                    }
+                    neha::record::McpScope::Space
+                }
+                Some(neha::record::McpScope::User) => neha::record::McpScope::User,
+                None if account.is_admin => neha::record::McpScope::Space,
+                None => neha::record::McpScope::User,
+            };
+            {
+                let state = context
+                    .state
+                    .lock()
+                    .map_err(|_| ApiError::internal("state lock"))?;
+                if state.mcp_named(&name).is_some() {
+                    return Err(ApiError::invalid_argument(
+                        "the Space already holds an MCP server under this name",
+                    ));
+                }
+                if state.mcps.len() >= crate::state::MAX_MCP_SERVERS {
+                    return Err(ApiError::invalid_argument(format!(
+                        "a Space connects at most {} MCP servers",
+                        crate::state::MAX_MCP_SERVERS
+                    )));
+                }
+            }
+            (
+                None,
+                Some(name),
+                url,
+                scope,
+                std::collections::BTreeMap::new(),
+            )
+        }
+    };
+    // A command line owns its loopback receiver, so it names the redirect base
+    // the browser returns to and finishes the flow itself. Every other flow
+    // comes back to the Space's own origin, the one a first-party cookie and
+    // the Host guard name. The OAuth client appends the discovered issuer's
+    // key and `/callback` to the base, so one base serves several issuers
+    // without letting one issuer's response reach another's flow.
+    let (redirect_base, cli) = match redirect_uri {
+        Some(redirect) => {
+            let redirect = redirect.trim().to_owned();
+            let Some(base) = loopback_redirect_base(&redirect) else {
+                return Err(ApiError::invalid_argument(
+                    "a command line sign-in's redirect is http on a loopback address with a port",
+                ));
+            };
+            (base, true)
+        }
+        None => (
+            format!(
+                "{}/api/mcp/signin",
+                context.browser_origin.trim_end_matches('/')
+            ),
+            false,
+        ),
+    };
+    let plan = context
+        .oauth
+        .begin(&url, &redirect_base, &headers)
+        .await
+        .map_err(|error| ApiError::invalid_argument(error.to_string()))?;
+    // The browser opens a first-party URL on the Space's origin, so the nonce
+    // cookie set there is the initiating browser's: a completion forwarded to
+    // another browser carries no cookie and is refused. A command line flow
+    // binds the same way, but its browser need not hold a Space session: the
+    // command that started it is the authenticated initiator.
+    let sign_in = Id::new();
+    let bind_url = format!(
+        "{}/api/mcp/signin/bind?sign_in={sign_in}",
+        context.browser_origin.trim_end_matches('/')
+    );
+    let nonce = random_nonce();
+    {
+        let mut signins = context.signins.lock().await;
+        sweep_sign_ins(&mut signins);
+        // One account has one active browser sign-in at a time: a second
+        // browser flow would otherwise leave the user unsure which consent
+        // window is which, and both flows could race for the same credential.
+        // The bind route names each flow's nonce cookie after the flow, so a
+        // stale response can no longer disturb the newer binding; keeping a
+        // single active flow is the UI rule, not a cookie constraint. A new
+        // browser flow replaces every browser flow of its account that is
+        // still pending or exchanging, whose callback is then refused and
+        // whose poll reads one fixed sentence. An exchanging flow's token is
+        // discarded when its exchange returns: its delivery finds the
+        // replacement's terminal status under the sign-ins lock and commits
+        // nothing. A command line flow owns its own loopback receiver and
+        // never shares that cookie, so it replaces nothing.
+        if !cli {
+            for pending in signins.values_mut() {
+                if !pending.cli
+                    && pending.account == account.id
+                    && matches!(
+                        pending.status,
+                        SignInStatus::Pending | SignInStatus::Executing
+                    )
+                {
+                    pending.plan.state.clear();
+                    pending.status = SignInStatus::Failed {
+                        reason: SIGN_IN_REPLACED.to_owned(),
+                    };
+                }
+            }
+        }
+        // Keep the Space's memory bounded. A sign-in past the limit is
+        // dropped: its client then reads a failed sign-in and its callback
+        // refuses the state.
+        while signins.len() >= MAX_PENDING_SIGN_INS {
+            let Some(oldest) = signins
+                .iter()
+                .min_by_key(|(_, pending)| pending.created_at)
+                .map(|(sign_in, _)| *sign_in)
+            else {
+                break;
+            };
+            signins.remove(&oldest);
+        }
+        signins.insert(
+            sign_in,
+            PendingSignIn {
+                account: account.id,
+                server: target,
+                name,
+                url,
+                scope,
+                plan,
+                nonce,
+                cli,
+                created_at: Instant::now(),
+                status: SignInStatus::Pending,
+            },
+        );
+    }
+    // Record the answer before it is returned, so a redelivery reads the same
+    // sign-in instead of planning a second flow that could rotate the
+    // credential again. The record also holds the owner a replay checks.
+    let answer = sign_in_start_answer(sign_in, &bind_url);
+    let stored = json!({
+        "sign_in": sign_in,
+        "url": bind_url,
+        "user": account.id,
+    });
+    if let Err(error) = context
+        .store
+        .record_command_result(command_id, &fingerprint, stored)
+        .await
+    {
+        context.signins.lock().await.remove(&sign_in);
+        return Err(store_error(error));
+    }
+    // A concurrent delivery of this command may have recorded its answer
+    // first: answer that one and drop the flow this delivery planned.
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await?
+        && outcome.result.get("sign_in") != answer.get("sign_in")
+    {
+        context.signins.lock().await.remove(&sign_in);
+        return Ok(start_replay(outcome));
+    }
+
+    Ok(Outcome {
+        committed: None,
+        result: answer,
+        queued: None,
+        events: Vec::new(),
+    })
+}
+
+/// The answer `mcp_sign_in_start` returns and a replay repeats.
+fn sign_in_start_answer(sign_in: Id, url: &str) -> Value {
+    json!({"sign_in": sign_in, "url": url})
+}
+
+/// Removes the recorded owner from a replayed start answer.
+///
+/// The owner is in the record so a replay is checked against the account; it
+/// is not part of the answer a client reads.
+fn start_replay(mut outcome: Outcome) -> Outcome {
+    if let Some(result) = outcome.result.as_object_mut() {
+        result.remove("user");
+    }
+    outcome
+}
+
+/// The origin a command line's loopback redirect names, when it may receive a
+/// browser.
+///
+/// The command line owns a loopback receiver, so its redirect is plain HTTP on
+/// a loopback address with an explicit port. A remote address would let another
+/// machine receive the authorization code, and a TLS listener is not what a
+/// command line serves. Only the origin is kept: the OAuth client appends the
+/// issuer's key and `/callback` to it, and the command line's receiver accepts
+/// any callback path.
+fn loopback_redirect_base(redirect: &str) -> Option<String> {
+    let url = reqwest::Url::parse(redirect).ok()?;
+    let loopback = url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            host.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+        })
+        && url.port().is_some_and(|port| port != 0)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.fragment().is_none();
+    if !loopback {
+        return None;
+    }
+
+    Some(url.origin().ascii_serialization())
+}
+
+/// A fresh nonce for one browser flow: 32 random bytes, base64url without
+/// padding.
+fn random_nonce() -> String {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// Answers what became of a browser sign-in.
+///
+/// Only the account that started a sign-in may read it. Another account reads
+/// "not found" so the answer cannot confirm that a sign-in exists.
+async fn mcp_sign_in_status(
+    context: &CommandContext<'_>,
+    account: &Account,
+    sign_in: Id,
+) -> Result<Outcome, ApiError> {
+    Ok(Outcome {
+        committed: None,
+        result: sign_in_status_result(context, account, sign_in).await?,
+        queued: None,
+        events: Vec::new(),
+    })
+}
+
+/// Builds the answer one account's poll of a sign-in reads.
+///
+/// A finished sign-in is connected when a call by this account would reach the
+/// server with the credential it would find: a stored token alone claims
+/// nothing.
+async fn sign_in_status_result(
+    context: &CommandContext<'_>,
+    account: &Account,
+    sign_in: Id,
+) -> Result<Value, ApiError> {
+    let (state, server, reason, finished) = {
+        let mut signins = context.signins.lock().await;
+        sweep_sign_ins(&mut signins);
+        let Some(pending) = signins.get(&sign_in) else {
+            return Err(ApiError::not_found("no such MCP sign-in"));
+        };
+        if pending.account != account.id {
+            return Err(ApiError::not_found("no such MCP sign-in"));
+        }
+        let (state, server, reason) = match &pending.status {
+            // An admitted flow is still in flight: its callback or command
+            // line finish is exchanging the code, so its client keeps reading
+            // the same pending answer it read before.
+            SignInStatus::Pending | SignInStatus::Executing => ("pending", pending.server, None),
+            SignInStatus::Finished { server } => ("finished", Some(*server), None),
+            SignInStatus::Failed { reason } => ("failed", pending.server, Some(reason.clone())),
+        };
+        let finished = match &pending.status {
+            SignInStatus::Finished { server } => Some(*server),
+            SignInStatus::Pending | SignInStatus::Executing | SignInStatus::Failed { .. } => None,
+        };
+        (state, server, reason, finished)
+    };
+    // A finished sign-in is connected when a call by this account would reach
+    // the server; it reports the same reachability `mcp_list` does.
+    let connected = match finished {
+        Some(server) => mcp_reader_reachable(context, server, account.id).await?,
+        None => false,
+    };
+
+    Ok(json!({
+        "sign_in": sign_in,
+        "state": state,
+        "server": server,
+        "connected": connected,
+        "reason": reason,
+    }))
+}
+
+/// Whether an authorization response's `iss` fits the plan.
+///
+/// RFC 9207's `iss` names the authorization server that answered. A present
+/// value must equal the plan's issuer byte for byte, whatever the metadata
+/// said. An absent value is admitted only when the authorization server's
+/// metadata did not advertise `authorization_response_iss_parameter_supported`:
+/// a server that promised the parameter would leave a mix-up undetectable if
+/// the omission were tolerated. Both the browser callback and the command
+/// line's finish read this one rule.
+pub(crate) fn accepts_response_issuer(plan: &crate::oauth::SignInPlan, iss: Option<&str>) -> bool {
+    match iss {
+        Some(iss) => iss == plan.issuer,
+        None => !plan.iss_required,
+    }
+}
+
+/// What one command line finish decides to do.
+///
+/// The decision is taken under the sign-ins lock, so a redelivery of the same
+/// finish cannot race the delivery that finished the flow.
+enum FinishStep {
+    /// The flow already finished: answer its finished status again.
+    AlreadyFinished,
+    /// The flow already failed: answer its failure again, unchanged.
+    AlreadyFailed {
+        /// The fixed explanation the poll reads.
+        reason: String,
+    },
+    /// The flow is still pending: this delivery admitted it and exchanges its
+    /// code.
+    Proceed(Box<PendingExchange>),
+}
+
+/// Finishes a sign-in a command line started on its own loopback redirect.
+///
+/// Only the account that started the flow finishes it, only a flow the command
+/// line owns, only a flow still pending and young, only with the state token
+/// the plan named, and only when the code arrived on the path the plan's
+/// issuer-keyed redirect registered: the code is exchanged for the account
+/// whose loopback receiver got it. RFC 9207's `iss` must match the plan
+/// whenever it is present, and must be present when the authorization server's
+/// metadata advertised that every authorization response carries it. The
+/// answer is the one a poll reads.
+///
+/// Admitting the exchange marks the flow executing under the sign-ins lock;
+/// the token request then runs outside it. When the exchange returns, the
+/// delivery re-reads the status under the same lock: a newer sign-in that
+/// replaced the flow while the token was in flight leaves the flow failed and
+/// the token is discarded with nothing written, otherwise the commit and its
+/// `Finished` status are one step under that lock.
+///
+/// A redelivered finish is idempotent: a flow that already finished answers
+/// its finished status again (the reachability probe may run again) without
+/// changing its status, the Vault, or the record, and a flow that already
+/// failed keeps its failure. Only a pending flow exchanges a code.
+async fn mcp_sign_in_finish(
+    context: &CommandContext<'_>,
+    account: &Account,
+    sign_in: Id,
+    code: String,
+    state: String,
+    path: Option<String>,
+    iss: Option<String>,
+) -> Result<Outcome, ApiError> {
+    if code.is_empty() {
+        return Err(ApiError::invalid_argument(
+            "a command line sign-in needs the authorization code its receiver got",
+        ));
+    }
+    // Consume the flow's state under the lock: the checks and the single use
+    // are one decision. The token exchange itself must not hold the sign-ins.
+    let decision = {
+        let mut signins = context.signins.lock().await;
+        sweep_sign_ins(&mut signins);
+        let Some(pending) = signins.get_mut(&sign_in) else {
+            return Err(ApiError::not_found("no such MCP sign-in"));
+        };
+        if pending.account != account.id {
+            return Err(ApiError::not_found("no such MCP sign-in"));
+        }
+        if !pending.cli {
+            return Err(ApiError::invalid_argument(
+                "a browser sign-in finishes in the browser, not from the command line",
+            ));
+        }
+        // A flow that already ended is answered with what it became. Its status
+        // is terminal, so a retried command or a lost answer cannot turn a
+        // finished sign-in failed or overwrite a failure's reason.
+        match &pending.status {
+            SignInStatus::Finished { .. } => FinishStep::AlreadyFinished,
+            SignInStatus::Failed { reason } => FinishStep::AlreadyFailed {
+                reason: reason.clone(),
+            },
+            // Another delivery already claimed the flow and is exchanging its
+            // code: a second finish must not exchange the code again. The
+            // claim is the flow's admission, so the refusal changes nothing.
+            SignInStatus::Executing => {
+                return Err(ApiError::invalid_argument(SIGN_IN_INCOMPLETE));
+            }
+            SignInStatus::Pending => {
+                // A flow is usable only while it is pending and young: the
+                // sweeper marks an expired one failed but keeps its state, so
+                // the age decides here, before any code is exchanged or
+                // recorded.
+                if pending.created_at.elapsed() >= SIGN_IN_TTL {
+                    pending.plan.state.clear();
+                    pending.status = SignInStatus::Failed {
+                        reason: SIGN_IN_EXPIRED.to_owned(),
+                    };
+                    FinishStep::AlreadyFailed {
+                        reason: SIGN_IN_EXPIRED.to_owned(),
+                    }
+                } else if !callback_path_matches(&pending.plan.redirect_uri, path.as_deref()) {
+                    // The plan's redirect is issuer-keyed, so a code that
+                    // arrived on another issuer's path belongs to another
+                    // flow: it is refused before the exchange and nothing
+                    // changes. A receiver that names no path is refused too.
+                    return Err(ApiError::invalid_argument(SIGN_IN_INCOMPLETE));
+                } else {
+                    let matches = !state.is_empty()
+                        && !pending.plan.state.is_empty()
+                        && pending.plan.state == state;
+                    if !matches {
+                        return Err(ApiError::invalid_argument(
+                            "the state the authorization server returned is not this sign-in's",
+                        ));
+                    }
+                    // An `iss` that names another authorization server would
+                    // hand this flow's code to the wrong issuer, and an
+                    // authorization server whose metadata advertised the
+                    // parameter always names one.
+                    if !accepts_response_issuer(&pending.plan, iss.as_deref()) {
+                        pending.plan.state.clear();
+                        pending.status = SignInStatus::Failed {
+                            reason: SIGN_IN_INCOMPLETE.to_owned(),
+                        };
+                        return Err(ApiError::invalid_argument(SIGN_IN_INCOMPLETE));
+                    }
+                    // Admit the exchange: spending the state and marking the
+                    // flow executing are one step under the lock, so a second
+                    // code for this sign-in finds a mismatch and a newer start
+                    // can still replace the flow while the token is in flight.
+                    pending.plan.state.clear();
+                    pending.status = SignInStatus::Executing;
+                    FinishStep::Proceed(Box::new(PendingExchange {
+                        sign_in,
+                        account: pending.account,
+                        server: pending.server,
+                        name: pending.name.clone(),
+                        url: pending.url.clone(),
+                        scope: pending.scope,
+                        plan: pending.plan.clone(),
+                    }))
+                }
+            }
+        }
+    };
+    let pending = match decision {
+        FinishStep::AlreadyFinished => {
+            // Answer the same finished status the poll reads, touching nothing:
+            // the status, the Vault, and the record stay as the finished flow
+            // left them. Only the reachability probe is read again.
+            return Ok(Outcome {
+                committed: None,
+                result: sign_in_status_result(context, account, sign_in).await?,
+                queued: None,
+                events: Vec::new(),
+            });
+        }
+        FinishStep::AlreadyFailed { reason } => return Err(ApiError::invalid_argument(reason)),
+        FinishStep::Proceed(pending) => *pending,
+    };
+    let token = match context.oauth.finish(&pending.plan, &code).await {
+        Ok(token) => token,
+        Err(_) => {
+            // The authority's own words stay out of every answer: a client
+            // reads one fixed sentence whatever the token endpoint said. A
+            // newer start that replaced the flow keeps its terminal sentence.
+            fail_executing_sign_in(context.signins, sign_in).await;
+            return Err(ApiError::invalid_argument(SIGN_IN_INCOMPLETE));
+        }
+    };
+    if !neha::record::McpServerAdded::valid_credential(&token) {
+        fail_executing_sign_in(context.signins, sign_in).await;
+        return Err(ApiError::invalid_argument(SIGN_IN_INCOMPLETE));
+    }
+    let writes = SignInWrites {
+        store: context.store,
+        state: context.state,
+        secrets: context.secrets,
+        library: context.library,
+    };
+    match commit_executing_sign_in(context.signins, &pending, &token, writes).await {
+        SignInCommit::Committed { events } => {
+            let result = sign_in_status_result(context, account, sign_in).await?;
+            Ok(Outcome {
+                // The connection's event is not this command's: a sign-in
+                // records under its own id, so the answer names no committed
+                // cursor. The dispatch broadcasts the events for the open
+                // clients to refresh from.
+                committed: None,
+                result,
+                queued: None,
+                events,
+            })
+        }
+        // The commit failed: the flow reads the fixed sentence and the record
+        // did not change.
+        SignInCommit::Failed { reason } => Err(ApiError::invalid_argument(reason)),
+        // A newer start replaced the flow while its token was in flight: the
+        // token is discarded, nothing is written, and the replacement's
+        // terminal status stays.
+        SignInCommit::Discarded => Err(ApiError::invalid_argument(SIGN_IN_INCOMPLETE)),
+    }
+}
+
+/// Whether the path a command line's loopback receiver got is the one its
+/// flow's redirect registered.
+///
+/// The plan's redirect URI is issuer-keyed (`/{issuer_key}/callback`), so a
+/// code that came back on another issuer's path belongs to another flow and is
+/// never exchanged. Only the path is compared: the receiver knows its own
+/// origin, and a query the callback carried is not part of the redirect. A
+/// missing or malformed path does not match.
+fn callback_path_matches(redirect_uri: &str, received: Option<&str>) -> bool {
+    let Some(received) = received else {
+        return false;
+    };
+    // The receiver may pass along the query it received; only the path is the
+    // redirect's to compare.
+    let received = received.split(['?', '#']).next().unwrap_or_default();
+    let Ok(redirect) = reqwest::Url::parse(redirect_uri) else {
+        return false;
+    };
+
+    redirect.path() == received
+}
+
+/// What became of a token an admitted exchange returned.
+pub(crate) enum SignInCommit {
+    /// The credential and its event are the Space's; the flow is finished.
+    Committed {
+        /// The events to broadcast to open clients.
+        events: Vec<Event>,
+    },
+    /// The commit itself failed: the flow reads one fixed sentence.
+    Failed {
+        /// A fixed explanation the caller may show.
+        reason: String,
+    },
+    /// This delivery no longer owns the flow: a newer start replaced it, it
+    /// expired, or it was dropped. The token is discarded.
+    Discarded,
+}
+
+/// Commits one admitted exchange and records its outcome, under the sign-ins
+/// lock.
+///
+/// The lock is held across the admission re-check, the Vault write, and the
+/// record append, so a newer start cannot replace the flow between the check
+/// and the write. The order is `signins` then `library` (the commit takes the
+/// library lock itself) then `state`; `mcp_sign_in_start` takes `signin_start`
+/// then `signins` and never the library, so nothing takes these locks in the
+/// opposite order.
+pub(crate) async fn commit_executing_sign_in(
+    signins: &tokio::sync::Mutex<HashMap<Id, PendingSignIn>>,
+    pending: &PendingExchange,
+    token: &str,
+    writes: SignInWrites<'_>,
+) -> SignInCommit {
+    let mut signins = signins.lock().await;
+    sweep_sign_ins(&mut signins);
+    // Only the delivery that marked the flow executing owns its token. A
+    // replacement writes a terminal status under this same lock, so it is
+    // read here: nothing the replacement wrote is overwritten.
+    let owns = matches!(
+        signins.get(&pending.sign_in).map(|pending| &pending.status),
+        Some(SignInStatus::Executing)
+    );
+    if !owns {
+        return SignInCommit::Discarded;
+    }
+    match complete_sign_in(writes, pending, token).await {
+        Ok((server, events)) => {
+            if let Some(pending) = signins.get_mut(&pending.sign_in) {
+                pending.status = SignInStatus::Finished { server };
+            }
+            SignInCommit::Committed { events }
+        }
+        Err(reason) => {
+            if let Some(pending) = signins.get_mut(&pending.sign_in) {
+                pending.plan.state.clear();
+                pending.status = SignInStatus::Failed {
+                    reason: SIGN_IN_INCOMPLETE.to_owned(),
+                };
+            }
+            SignInCommit::Failed { reason }
+        }
+    }
+}
+
+/// Marks an admitted flow failed after its exchange produced no credential,
+/// unless a newer start already wrote a terminal status.
+///
+/// Returns whether this delivery still owned the flow. A browser callback uses
+/// the answer to keep a replaced flow's request from clearing the binding
+/// cookie a newer flow may now hold.
+pub(crate) async fn fail_executing_sign_in(
+    signins: &tokio::sync::Mutex<HashMap<Id, PendingSignIn>>,
+    sign_in: Id,
+) -> bool {
+    let mut signins = signins.lock().await;
+    let Some(pending) = signins.get_mut(&sign_in) else {
+        return false;
+    };
+    if !matches!(pending.status, SignInStatus::Executing) {
+        return false;
+    }
+    pending.plan.state.clear();
+    pending.status = SignInStatus::Failed {
+        reason: SIGN_IN_INCOMPLETE.to_owned(),
+    };
+    true
+}
+
+/// Drops sign-ins a reader no longer needs and fails one that expired while
+/// still waiting.
+///
+/// A finished or failed sign-in is kept for [`SIGN_IN_TTL`] so its client can
+/// poll the answer, then dropped. A pending or executing one that lived past
+/// the TTL is reported as failed: its state token is no longer accepted, and
+/// an exchange that is in flight discards its token when it returns. A pending
+/// flow keeps its state token, so its age is what a late delivery reads first.
+pub(crate) fn sweep_sign_ins(signins: &mut HashMap<Id, PendingSignIn>) {
+    let now = Instant::now();
+    signins.retain(|_, pending| {
+        if now.duration_since(pending.created_at) < SIGN_IN_TTL {
+            return true;
+        }
+        match &mut pending.status {
+            SignInStatus::Pending | SignInStatus::Executing => {
+                pending.status = SignInStatus::Failed {
+                    reason: SIGN_IN_EXPIRED.to_owned(),
+                };
+                true
+            }
+            SignInStatus::Finished { .. } | SignInStatus::Failed { .. } => false,
+        }
+    });
+}
+
+/// Records the events a finished MCP sign-in writes.
+///
+/// A sign-in is not a client command: it has no recorded answer to replay, so
+/// it appends under a fresh id and keeps nothing. The caller broadcasts the
+/// returned events to the open clients.
+pub(crate) async fn record_sign_in(
+    store: &Store,
+    state: &Mutex<State>,
+    drafts: Vec<EventDraft>,
+) -> Result<Vec<Event>, ApiError> {
+    let appended = append(
+        store,
+        state,
+        Id::new(),
+        "mcp-sign-in".to_owned(),
+        drafts,
+        None,
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return Err(ApiError::internal("a sign-in command id was reused"));
+    }
+
+    Ok(appended.events)
+}
+
+/// The event a finished sign-in writes for an existing server.
+///
+/// `scope` describes the credential change for visibility only: a personal
+/// credential's change carries [`McpScope::User`] even when it attaches to a
+/// Space server, so the stream never broadcasts who attached it; a Space
+/// credential's change carries the Space server's scope. The projection's
+/// `McpServerUpdated` arm ignores this field, so it cannot change the server's
+/// own scope or user.
+pub(crate) fn mcp_sign_in_updated(server: Id, by: Id, scope: neha::record::McpScope) -> EventDraft {
+    EventDraft::new(
+        EventKind::McpServerUpdated,
+        Author::User(by),
+        json!({
+            "server": server,
+            "url": null,
+            "credential": true,
+            "by": by,
+            "scope": scope,
+        }),
+    )
+}
+
+/// The event a finished sign-in writes for a new server.
+pub(crate) fn mcp_sign_in_added(
+    server: Id,
+    name: &str,
+    url: &str,
+    scope: neha::record::McpScope,
+    user: Option<Id>,
+    by: Id,
+) -> EventDraft {
+    EventDraft::new(
+        EventKind::McpServerAdded,
+        Author::User(by),
+        json!({
+            "server": server,
+            "name": name,
+            "url": url,
+            "scope": scope,
+            "user": user,
+            "by": by,
+            "plugin": null,
+            "headers": {},
+        }),
+    )
+}
+
+/// What an admitted sign-in leaves for the token exchange: the server it
+/// connects and the plan whose verifier the exchange needs.
+///
+/// The flow is marked executing while the token request runs outside the
+/// sign-ins lock; the caller commits through [`commit_executing_sign_in`] when
+/// it returns.
+pub(crate) struct PendingExchange {
+    /// The sign-in the plan belongs to.
+    pub sign_in: Id,
+    /// The account that started it.
+    pub account: Id,
+    /// An existing server it attaches a credential to; `None` registers a new
+    /// one when it finishes.
+    pub server: Option<Id>,
+    /// The name a new server takes.
+    pub name: Option<String>,
+    /// The address the sign-in speaks to.
+    pub url: String,
+    /// Where the credential belongs.
+    pub scope: neha::record::McpScope,
+    /// The browser flow the OAuth client planned.
+    pub plan: crate::oauth::SignInPlan,
+}
+
+/// The record, projection, Vault, and library lock a finished sign-in writes.
+pub(crate) struct SignInWrites<'a> {
+    /// The record.
+    pub store: &'a Store,
+    /// The in-process projection.
+    pub state: &'a Mutex<State>,
+    /// The Vault.
+    pub secrets: &'a Secrets,
+    /// Serializes library changes.
+    pub library: &'a tokio::sync::Mutex<()>,
+}
+
+/// Records what a finished sign-in changed: the Vault credential and the
+/// record event the open clients refresh from.
+///
+/// The credential is stored before the append and put back when the record
+/// refuses it, the order `mcp_add` uses for the same decision. The returned
+/// events are the record's; the caller broadcasts them.
+pub(crate) async fn complete_sign_in(
+    writes: SignInWrites<'_>,
+    pending: &PendingExchange,
+    token: &str,
+) -> Result<(Id, Vec<Event>), String> {
+    // A connection changes what the Space holds, so it takes the same lock a
+    // library change takes: the checks below and the append are one decision.
+    let _library = writes.library.lock().await;
+    let (server_id, user, scope) = match pending.server {
+        Some(existing) => {
+            let found = writes
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.mcp(existing).cloned());
+            let Some(found) = found else {
+                return Err("the MCP server is no longer connected".to_owned());
+            };
+            let user = match pending.scope {
+                neha::record::McpScope::Space if found.scope != neha::record::McpScope::Space => {
+                    return Err("the Space does not hold this MCP server".to_owned());
+                }
+                neha::record::McpScope::Space => None,
+                neha::record::McpScope::User if found.scope == neha::record::McpScope::User => {
+                    if found.user != Some(pending.account) {
+                        return Err("the MCP server belongs to another User".to_owned());
+                    }
+                    Some(pending.account)
+                }
+                neha::record::McpScope::User => Some(pending.account),
+            };
+            // The event's scope describes the credential change, not the
+            // server: a personal credential's change (`user` is this account)
+            // is the member's own even on a Space server, and only a Space
+            // credential's change is every member's.
+            let event_scope = if user.is_some() {
+                neha::record::McpScope::User
+            } else {
+                found.scope
+            };
+            (existing, user, event_scope)
+        }
+        None => {
+            let Some(name) = pending.name.as_deref() else {
+                return Err("the sign-in named no MCP server".to_owned());
+            };
+            {
+                let state = writes
+                    .state
+                    .lock()
+                    .map_err(|_| "the Space cannot read its state".to_owned())?;
+                if state.mcp_named(name).is_some() {
+                    return Err("the Space already holds an MCP server under this name".to_owned());
+                }
+                if state.mcps.len() >= crate::state::MAX_MCP_SERVERS {
+                    return Err(format!(
+                        "a Space connects at most {} MCP servers",
+                        crate::state::MAX_MCP_SERVERS
+                    ));
+                }
+            }
+            let user = match pending.scope {
+                neha::record::McpScope::Space => None,
+                neha::record::McpScope::User => Some(pending.account),
+            };
+            (Id::new(), user, pending.scope)
+        }
+    };
+    let previous = match pending.server {
+        Some(_) => writes
+            .secrets
+            .mcp_credential(server_id, user)
+            .map_err(|_| "the Space cannot read the credential".to_owned())?,
+        None => None,
+    };
+    writes
+        .secrets
+        .store_mcp_credential(server_id, user, token)
+        .map_err(|_| "the Space cannot store the credential".to_owned())?;
+    let Some(draft) = (match pending.server {
+        Some(_) => Some(mcp_sign_in_updated(server_id, pending.account, scope)),
+        None => pending.name.as_deref().map(|name| {
+            mcp_sign_in_added(server_id, name, &pending.url, scope, user, pending.account)
+        }),
+    }) else {
+        return Err("the sign-in named no MCP server".to_owned());
+    };
+    match record_sign_in(writes.store, writes.state, vec![draft]).await {
+        Ok(events) => Ok((server_id, events)),
+        Err(_) => {
+            // The record did not change, so the credential this sign-in stored
+            // is not the Space's to keep.
+            match (pending.server, &previous) {
+                (Some(_), Some(previous)) => {
+                    let _ = writes
+                        .secrets
+                        .store_mcp_credential(server_id, user, previous);
+                }
+                (Some(_), None) => writes.secrets.discard_mcp_credential(server_id, user),
+                (None, _) => {
+                    let _ = writes.secrets.discard_mcp_server(server_id);
+                }
+            }
+            Err("the Space cannot record the connection".to_owned())
+        }
+    }
 }
 
 /// Disconnects an MCP server its account added.
@@ -1422,7 +2634,12 @@ async fn mcp_remove(
     let draft = EventDraft::new(
         EventKind::McpServerRemoved,
         Author::User(account.id),
-        json!({"server": server}),
+        json!({
+            "server": server,
+            // A Space server's removal is every member's; a personal one's
+            // stays its owner's.
+            "scope": view.scope,
+        }),
     );
     let result = json!({
         "server": server,
@@ -1820,7 +3037,12 @@ async fn skill_remove(
     let draft = EventDraft::new(
         EventKind::SkillRemoved,
         Author::User(account.id),
-        json!({ "skill": skill }),
+        json!({
+            "skill": skill,
+            // A Space skill's removal is every member's; a Bot's stays its
+            // owner's.
+            "library": view.library,
+        }),
     );
     let appended = append(
         context.store,
@@ -9208,6 +10430,7 @@ fn store_error(error: crate::store::StoreError) -> ApiError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     use serde_json::{Value, json};
@@ -9230,13 +10453,14 @@ mod tests {
     use crate::identity::{Account, Identity};
     use crate::runs::RunQueue;
     use crate::secrets::Secrets;
-    use crate::server::PairingAttempts;
+    use crate::server::{PairingAttempts, PendingSignIn, SignInStatus};
     use crate::state::{AccessView, BotView, RuleView};
     use crate::store::{AppendRequest, ContinuationWrite, Store};
     use neha::error::ErrorCode;
     use neha::id::Id;
     use neha::record::{EventDraft, EventKind, RuleEffect};
     use neha::seq::Seq;
+    use neha::surface::{CommandCall, McpSignInStart};
 
     /// A Space's connections, opened in one temporary home.
     ///
@@ -9258,6 +10482,10 @@ mod tests {
         events: tokio::sync::broadcast::Sender<Event>,
         catalog: CatalogStore,
         plugins: PluginsConfig,
+        signins: tokio::sync::Mutex<HashMap<Id, PendingSignIn>>,
+        signin_start: tokio::sync::Mutex<()>,
+        oauth: crate::oauth::OAuthClient,
+        browser_origin: String,
         // Dropped last: it holds the directories the rest of the Space uses.
         _directory: tempfile::TempDir,
     }
@@ -9288,6 +10516,10 @@ mod tests {
                 events,
                 catalog,
                 plugins: PluginsConfig::default(),
+                signins: tokio::sync::Mutex::new(HashMap::new()),
+                signin_start: tokio::sync::Mutex::new(()),
+                oauth: crate::oauth::OAuthClient::new(),
+                browser_origin: "http://neha-test.localhost:8080".to_owned(),
                 _directory: directory,
             }
         }
@@ -9308,6 +10540,10 @@ mod tests {
                 events: &self.events,
                 catalog: &self.catalog,
                 plugins: &self.plugins,
+                signins: &self.signins,
+                signin_start: &self.signin_start,
+                oauth: &self.oauth,
+                browser_origin: self.browser_origin.clone(),
             }
         }
 
@@ -9566,6 +10802,40 @@ mod tests {
         });
 
         (format!("http://{address}"), log, task)
+    }
+
+    /// Runs a fake authorization server token endpoint on a loopback port and
+    /// counts its requests.
+    async fn fake_token_endpoint() -> (
+        String,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::Router;
+        use axum::routing::post;
+
+        let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        let app = Router::new().route(
+            "/token",
+            post(move || {
+                let counted = counted.clone();
+                async move {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    axum::Json(json!({
+                        "access_token": "cli-token",
+                        "token_type": "Bearer",
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), requests, task)
     }
 
     fn ask(tool: &str, command_prefix: Option<&str>, path_prefix: Option<&str>) -> RuleView {
@@ -11994,8 +13264,19 @@ mod tests {
             .map(|event| &event.data)
             .collect();
         assert_eq!(updates.len(), 2, "one update per attached credential");
+        assert_eq!(updates[0]["server"], json!(server));
+        assert_eq!(
+            updates[0]["scope"],
+            json!("user"),
+            "a personal credential's change is not the Space's"
+        );
         assert_eq!(updates[1]["server"], json!(server));
         assert_eq!(updates[1]["credential"], json!(true));
+        assert_eq!(
+            updates[1]["scope"],
+            json!("space"),
+            "a Space credential's change is the Space's"
+        );
         assert_eq!(
             updates[1]["url"],
             json!(null),
@@ -13631,5 +14912,902 @@ mod tests {
             "a replay registers no second server"
         );
         server_task.abort();
+    }
+
+    /// A plan the OAuth client would have made; a status test never finishes
+    /// its flow.
+    fn sign_in_plan() -> crate::oauth::SignInPlan {
+        crate::oauth::SignInPlan {
+            authorize_url: reqwest::Url::parse("https://auth.example.com/authorize").unwrap(),
+            state: "state-token".to_owned(),
+            code_verifier: "verifier".to_owned(),
+            token_endpoint: reqwest::Url::parse("https://auth.example.com/token").unwrap(),
+            client_id: "client".to_owned(),
+            redirect_uri: "http://neha-test.localhost:8080/api/mcp/signin/callback".to_owned(),
+            resource: "https://example.com/mcp".to_owned(),
+            issuer: "https://auth.example.com".to_owned(),
+            iss_required: false,
+        }
+    }
+
+    /// A pending sign-in a test places in the projection.
+    fn pending_sign_in(account: Id, server: Option<Id>, url: &str) -> PendingSignIn {
+        PendingSignIn {
+            account,
+            server,
+            name: None,
+            url: url.to_owned(),
+            scope: neha::record::McpScope::Space,
+            plan: sign_in_plan(),
+            nonce: "a-nonce".to_owned(),
+            cli: false,
+            created_at: std::time::Instant::now(),
+            status: SignInStatus::Pending,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_user_connects_their_own_credential_to_a_server() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let stranger = account(false);
+        let (url, _log, server_task) = fake_mcp_server().await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        let context = space.context();
+
+        // A signed-in User attaches a personal credential to the Space's
+        // server; the server stays the Space's and no second one appears.
+        let command = Id::new();
+        let connected = super::mcp_connect(
+            &context,
+            &user,
+            command,
+            "connect".to_owned(),
+            server,
+            Some("user-token".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(connected.result["server"], json!(server));
+        assert_eq!(connected.result["credential"], json!("user"));
+        assert_eq!(connected.result["connected"], json!(true));
+        assert_eq!(
+            connected.result["user"],
+            json!(user.id),
+            "the recorded answer belongs to the command's owner"
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(user.id))
+                .unwrap()
+                .as_deref(),
+            Some("user-token")
+        );
+        assert_eq!(
+            space.secrets.mcp_credential(server, None).unwrap(),
+            None,
+            "a User's credential is not the Space's"
+        );
+        assert_eq!(
+            space.state.lock().unwrap().mcps.len(),
+            1,
+            "a connection is not a second server"
+        );
+        let updates: Vec<Value> = space
+            .store
+            .events_from(Seq::ZERO, 100)
+            .await
+            .unwrap()
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::McpServerUpdated)
+            .map(|event| event.data.clone())
+            .collect();
+        assert_eq!(updates.len(), 1, "a connection writes one update");
+        assert_eq!(updates[0]["server"], json!(server));
+        assert_eq!(updates[0]["credential"], json!(true));
+        assert_eq!(updates[0]["url"], json!(null));
+        assert_eq!(
+            updates[0]["scope"],
+            json!("user"),
+            "a personal credential's change stays between the member and the Space"
+        );
+        // The projection keeps the server the Space connected: the event's
+        // scope describes the credential change, not the server.
+        {
+            let state = space.state.lock().unwrap();
+            let view = state.mcp(server).unwrap();
+            assert_eq!(view.scope, neha::record::McpScope::Space);
+            assert_eq!(view.user, None);
+        }
+
+        // A retry replays the recorded answer and writes nothing.
+        let cursor = space.store.last_seq().await.unwrap();
+        let replayed = super::mcp_connect(
+            &context,
+            &user,
+            command,
+            "connect".to_owned(),
+            server,
+            Some("user-token".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed.result, connected.result);
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert_eq!(space.store.last_seq().await.unwrap(), cursor);
+
+        // An empty token connects nothing.
+        let error = refused(
+            super::mcp_connect(
+                &context,
+                &user,
+                Id::new(),
+                "empty".to_owned(),
+                server,
+                Some("   ".to_owned()),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(user.id))
+                .unwrap()
+                .as_deref(),
+            Some("user-token"),
+            "a refused connection keeps the working token"
+        );
+
+        // A server the Space does not hold is not found.
+        let error = refused(
+            super::mcp_connect(
+                &context,
+                &user,
+                Id::new(),
+                "missing".to_owned(),
+                Id::new(),
+                Some("token".to_owned()),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::NotFound);
+
+        // A server a User connected takes only its owner's credential: the
+        // Admin is not special here.
+        let theirs = Id::new();
+        space
+            .record(
+                Id::new(),
+                "connect-user",
+                vec![EventDraft::new(
+                    EventKind::McpServerAdded,
+                    Author::User(user.id),
+                    json!({
+                        "server": theirs,
+                        "name": "theirs",
+                        "url": url,
+                        "scope": "user",
+                        "user": user.id,
+                        "by": user.id,
+                    }),
+                )],
+                json!({}),
+            )
+            .await;
+        for (account, why) in [(&stranger, "a stranger"), (&admin, "the Admin")] {
+            let error = refused(
+                super::mcp_connect(
+                    &context,
+                    account,
+                    Id::new(),
+                    "theirs".to_owned(),
+                    theirs,
+                    Some("token".to_owned()),
+                )
+                .await,
+            );
+            assert_eq!(error.code(), ErrorCode::Forbidden, "{why} attaches nothing");
+        }
+        let own = super::mcp_connect(
+            &context,
+            &user,
+            Id::new(),
+            "theirs-own".to_owned(),
+            theirs,
+            Some("owner-token".to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(own.result["server"], json!(theirs));
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(theirs, Some(user.id))
+                .unwrap()
+                .as_deref(),
+            Some("owner-token")
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_personal_sign_in_to_a_space_server_stays_the_members_own() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let (url, _log, server_task) = fake_mcp_server().await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        let context = space.context();
+        // A member completes a browser sign-in that stores their own credential
+        // on the Space's server. The event describes the credential change, not
+        // the server, so the stream never broadcasts who attached it.
+        let pending = super::PendingExchange {
+            sign_in: Id::new(),
+            account: user.id,
+            server: Some(server),
+            name: None,
+            url: url.clone(),
+            scope: neha::record::McpScope::User,
+            plan: sign_in_plan(),
+        };
+        let writes = super::SignInWrites {
+            store: context.store,
+            state: context.state,
+            secrets: context.secrets,
+            library: context.library,
+        };
+        let (finished, events) = super::complete_sign_in(writes, &pending, "user-token")
+            .await
+            .unwrap();
+        assert_eq!(finished, server);
+        let updated = events
+            .iter()
+            .find(|event| event.kind == EventKind::McpServerUpdated)
+            .expect("a finished sign-in records one update");
+        assert_eq!(
+            updated.data["scope"],
+            json!("user"),
+            "a personal credential's change is not the Space's"
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(user.id))
+                .unwrap()
+                .as_deref(),
+            Some("user-token")
+        );
+        // The projection keeps the Space's server: the event's scope describes
+        // the credential change and cannot change the server's own scope.
+        {
+            let state = space.state.lock().unwrap();
+            let view = state.mcp(server).unwrap();
+            assert_eq!(view.scope, neha::record::McpScope::Space);
+            assert_eq!(view.user, None);
+        }
+
+        // The Admin completing the Space's credential on the same server
+        // records a Space change, which the stream broadcasts.
+        let pending = super::PendingExchange {
+            sign_in: Id::new(),
+            account: admin.id,
+            server: Some(server),
+            name: None,
+            url,
+            scope: neha::record::McpScope::Space,
+            plan: sign_in_plan(),
+        };
+        let writes = super::SignInWrites {
+            store: context.store,
+            state: context.state,
+            secrets: context.secrets,
+            library: context.library,
+        };
+        let (finished, events) = super::complete_sign_in(writes, &pending, "space-token")
+            .await
+            .unwrap();
+        assert_eq!(finished, server);
+        let updated = events
+            .iter()
+            .find(|event| event.kind == EventKind::McpServerUpdated)
+            .expect("a finished sign-in records one update");
+        assert_eq!(
+            updated.data["scope"],
+            json!("space"),
+            "the Space's credential change is every member's"
+        );
+        {
+            let state = space.state.lock().unwrap();
+            let view = state.mcp(server).unwrap();
+            assert_eq!(view.scope, neha::record::McpScope::Space);
+            assert_eq!(view.user, None);
+        }
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_connect_keeps_the_working_credential() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let (url, _log, server_task) =
+            fake_mcp_server_with_delay(Some(std::time::Duration::from_millis(300))).await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        space
+            .secrets
+            .store_mcp_credential(server, Some(user.id), "old-token")
+            .unwrap();
+        let context = space.context();
+        // The command's id is claimed while the connection waits for the
+        // server's handshake, so the append finds a command recorded under that
+        // id and fails.
+        let command = Id::new();
+        let collision = async {
+            while space
+                .secrets
+                .mcp_credential(server, Some(user.id))
+                .unwrap()
+                .as_deref()
+                != Some("new-token")
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            space
+                .record(
+                    command,
+                    "another command",
+                    vec![EventDraft::new(
+                        EventKind::McpServerAdded,
+                        Author::User(admin.id),
+                        json!({
+                            "server": Id::new(),
+                            "name": "collision",
+                            "url": "https://example.com/mcp",
+                            "scope": "space",
+                            "by": admin.id,
+                        }),
+                    )],
+                    json!({}),
+                )
+                .await;
+        };
+        let connect = async {
+            super::mcp_connect(
+                &context,
+                &user,
+                command,
+                "connect".to_owned(),
+                server,
+                Some("new-token".to_owned()),
+            )
+            .await
+        };
+        let (connected, ()) = tokio::join!(connect, collision);
+        let error = refused(connected);
+        assert_eq!(error.code(), ErrorCode::IdempotencyConflict);
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, Some(user.id))
+                .unwrap()
+                .as_deref(),
+            Some("old-token"),
+            "the failed connection puts the working token back"
+        );
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_server_row_names_its_package_owner_and_credential_slots() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let (url, _log, server_task) = fake_mcp_server().await;
+        // The record knows the people a row names.
+        space
+            .record(
+                Id::new(),
+                "joined",
+                vec![
+                    EventDraft::new(
+                        EventKind::UserJoined,
+                        Author::User(admin.id),
+                        json!({"display_name": "Ada", "is_admin": true}),
+                    ),
+                    EventDraft::new(
+                        EventKind::UserJoined,
+                        Author::User(user.id),
+                        json!({"display_name": "Eve", "is_admin": false}),
+                    ),
+                ],
+                json!({}),
+            )
+            .await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        let context = space.context();
+        let view = || {
+            space
+                .state
+                .lock()
+                .unwrap()
+                .mcp(server)
+                .cloned()
+                .expect("the server is connected")
+        };
+
+        // No credential: nothing a call by either account would find.
+        let row = super::mcp_view(&context, view(), user.id).await.unwrap();
+        assert_eq!(row["credential"], json!("none"));
+        assert_eq!(row["connected"], json!(false));
+        assert_eq!(row["by_name"], json!("Ada"));
+        assert_eq!(row["plugin"], json!(null));
+        assert_eq!(row["by"], json!(admin.id));
+
+        // The Space's credential is the fallback for every signed-in User.
+        space
+            .secrets
+            .store_mcp_credential(server, None, "space-token")
+            .unwrap();
+        let row = super::mcp_view(&context, view(), user.id).await.unwrap();
+        assert_eq!(row["credential"], json!("space"));
+        assert_eq!(row["connected"], json!(true));
+
+        // A personal credential wins over it and names both slots.
+        space
+            .secrets
+            .store_mcp_credential(server, Some(user.id), "user-token")
+            .unwrap();
+        let row = super::mcp_view(&context, view(), user.id).await.unwrap();
+        assert_eq!(row["credential"], json!("space-and-user"));
+        assert_eq!(row["connected"], json!(true));
+        let row = super::mcp_view(&context, view(), admin.id).await.unwrap();
+        assert_eq!(
+            row["credential"],
+            json!("space"),
+            "another account's personal credential is not named"
+        );
+        assert_eq!(row["connected"], json!(true));
+
+        // A package's server names the package.
+        let (plugin, _digest, packaged) =
+            space.install_package_with_server(admin.id, "reports").await;
+        let packaged_view = {
+            let state = space.state.lock().unwrap();
+            state.mcp(packaged).cloned().unwrap()
+        };
+        let row = super::mcp_view(&context, packaged_view, admin.id)
+            .await
+            .unwrap();
+        assert_eq!(row["plugin"], json!(plugin));
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn only_the_account_that_started_a_sign_in_reads_it() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let (url, _log, mcp_task) = fake_mcp_server().await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        let sign_in = Id::new();
+        {
+            let mut signins = space.signins.lock().await;
+            signins.insert(sign_in, pending_sign_in(user.id, Some(server), &url));
+        }
+        let context = space.context();
+
+        let pending = super::mcp_sign_in_status(&context, &user, sign_in)
+            .await
+            .unwrap();
+        assert_eq!(pending.result["state"], json!("pending"));
+        assert_eq!(pending.result["server"], json!(server));
+        assert_eq!(pending.result["connected"], json!(false));
+        assert_eq!(pending.result["reason"], json!(null));
+
+        // Another account cannot read it, and the answer does not confirm it.
+        let error = refused(super::mcp_sign_in_status(&context, &admin, sign_in).await);
+        assert_eq!(error.code(), ErrorCode::NotFound);
+
+        // A finished sign-in is connected when a call by the account would
+        // reach the server with the credential it would send.
+        space
+            .secrets
+            .store_mcp_credential(server, Some(user.id), "user-token")
+            .unwrap();
+        {
+            let mut signins = space.signins.lock().await;
+            signins.get_mut(&sign_in).unwrap().status = SignInStatus::Finished { server };
+        }
+        let finished = super::mcp_sign_in_status(&context, &user, sign_in)
+            .await
+            .unwrap();
+        assert_eq!(finished.result["state"], json!("finished"));
+        assert_eq!(finished.result["server"], json!(server));
+        assert_eq!(finished.result["connected"], json!(true));
+        assert_eq!(finished.result["reason"], json!(null));
+
+        // A stored token alone claims nothing: a server that stopped answering
+        // is not connected, whatever the Vault holds.
+        mcp_task.abort();
+        let _ = mcp_task.await;
+        let unreachable = super::mcp_sign_in_status(&context, &user, sign_in)
+            .await
+            .unwrap();
+        assert_eq!(unreachable.result["state"], json!("finished"));
+        assert_eq!(unreachable.result["connected"], json!(false));
+
+        // One that outlived its TTL is failed, not pending.
+        {
+            let mut signins = space.signins.lock().await;
+            let pending = signins.get_mut(&sign_in).unwrap();
+            pending.created_at = std::time::Instant::now() - crate::server::SIGN_IN_TTL;
+            pending.status = SignInStatus::Pending;
+        }
+        let expired = super::mcp_sign_in_status(&context, &user, sign_in)
+            .await
+            .unwrap();
+        assert_eq!(expired.result["state"], json!("failed"));
+        assert_eq!(
+            expired.result["reason"],
+            json!("the sign-in expired or is unknown")
+        );
+        assert_eq!(expired.result["connected"], json!(false));
+
+        // The same account cannot start a sign-in for a server it cannot see
+        // through the status command.
+        let error = refused(super::mcp_sign_in_status(&context, &user, Id::new()).await);
+        assert_eq!(error.code(), ErrorCode::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_command_line_sign_in_finishes_only_for_its_owner_and_state() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let sign_in = Id::new();
+        {
+            let mut signins = space.signins.lock().await;
+            let mut pending = pending_sign_in(user.id, None, "https://example.com/mcp");
+            pending.name = Some("docs".to_owned());
+            pending.cli = true;
+            signins.insert(sign_in, pending);
+        }
+        let context = space.context();
+        // The path the plan's redirect registered; a finish names it so the
+        // Space can compare it with what the loopback receiver got.
+        let callback_path = Some("/api/mcp/signin/callback".to_owned());
+
+        // Another account cannot finish the flow, and the answer does not
+        // confirm that it exists.
+        let error = refused(
+            super::mcp_sign_in_finish(
+                &context,
+                &admin,
+                sign_in,
+                "code".to_owned(),
+                "state-token".to_owned(),
+                callback_path.clone(),
+                None,
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::NotFound);
+
+        // The state must be the one the plan named.
+        let error = refused(
+            super::mcp_sign_in_finish(
+                &context,
+                &user,
+                sign_in,
+                "code".to_owned(),
+                "another-state".to_owned(),
+                callback_path.clone(),
+                None,
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            !error.to_string().contains("another-state"),
+            "the refusal echoes no state: {error}"
+        );
+
+        // An issuer the authorization server names must be the plan's; the
+        // mismatch spends the flow and the refusal echoes no issuer.
+        let error = refused(
+            super::mcp_sign_in_finish(
+                &context,
+                &user,
+                sign_in,
+                "code".to_owned(),
+                "state-token".to_owned(),
+                callback_path.clone(),
+                Some("https://another.example".to_owned()),
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            !error.to_string().contains("another.example"),
+            "the refusal echoes no issuer: {error}"
+        );
+
+        // A browser sign-in finishes in its callback, not from a command line.
+        let browser = Id::new();
+        {
+            let mut signins = space.signins.lock().await;
+            let mut pending = pending_sign_in(user.id, None, "https://example.com/mcp");
+            pending.name = Some("docs".to_owned());
+            pending.cli = false;
+            signins.insert(browser, pending);
+        }
+        let error = refused(
+            super::mcp_sign_in_finish(
+                &context,
+                &user,
+                browser,
+                "code".to_owned(),
+                "state-token".to_owned(),
+                callback_path,
+                None,
+            )
+            .await,
+        );
+        assert_eq!(error.code(), ErrorCode::InvalidArgument);
+        assert!(
+            !space
+                .store
+                .events_from(Seq::ZERO, 100)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .any(|event| event.kind == EventKind::McpServerAdded),
+            "a refused finish records nothing"
+        );
+        assert!(space.signins.lock().await.contains_key(&browser));
+    }
+
+    #[tokio::test]
+    async fn a_command_line_finish_must_name_the_loopback_path_of_its_redirect() {
+        let space = TestSpace::open().await;
+        let admin = account(true);
+        let user = account(false);
+        let (url, _log, mcp_task) = fake_mcp_server().await;
+        let (token_base, token_requests, token_task) = fake_token_endpoint().await;
+        let server = space.connect_server(admin.id, "docs", &url).await;
+        space
+            .secrets
+            .store_mcp_credential(server, None, "old-token")
+            .unwrap();
+        let sign_in = Id::new();
+        let issuer = "https://auth.example.com";
+        // The plan's redirect is the loopback origin with the issuer key and
+        // `/callback` appended; the receiver gets the path tail.
+        let received_path = format!("/{}/callback", crate::oauth::issuer_key(issuer));
+        {
+            let mut signins = space.signins.lock().await;
+            let mut pending = pending_sign_in(user.id, Some(server), &url);
+            pending.cli = true;
+            pending.plan.token_endpoint =
+                reqwest::Url::parse(&format!("{token_base}/token")).unwrap();
+            pending.plan.redirect_uri = format!("http://127.0.0.1:4711{received_path}");
+            signins.insert(sign_in, pending);
+        }
+        let context = space.context();
+        let cursor = space.store.last_seq().await.unwrap();
+
+        // A code that arrived on another issuer's path belongs to another
+        // flow. It is refused before the token request, and neither the Vault
+        // nor the record changes. A finish that names no path is refused the
+        // same way.
+        let another = format!(
+            "/{}/callback",
+            crate::oauth::issuer_key("https://another.example")
+        );
+        for path in [Some(another.as_str()), None] {
+            let error = refused(
+                super::mcp_sign_in_finish(
+                    &context,
+                    &user,
+                    sign_in,
+                    "fake-code".to_owned(),
+                    "state-token".to_owned(),
+                    path.map(str::to_owned),
+                    None,
+                )
+                .await,
+            );
+            assert_eq!(error.code(), ErrorCode::InvalidArgument, "{path:?}");
+            assert!(
+                !error.to_string().contains("another.example"),
+                "the refusal names no path: {error}"
+            );
+            assert_eq!(
+                token_requests.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "a wrong path exchanges no code"
+            );
+            assert_eq!(
+                space.store.last_seq().await.unwrap(),
+                cursor,
+                "a wrong path appends no event"
+            );
+            assert_eq!(
+                space
+                    .secrets
+                    .mcp_credential(server, None)
+                    .unwrap()
+                    .as_deref(),
+                Some("old-token"),
+                "a wrong path leaves the Vault unchanged"
+            );
+        }
+        // The refusal did not spend the flow: it still reads pending.
+        let pending = super::mcp_sign_in_status(&context, &user, sign_in)
+            .await
+            .unwrap();
+        assert_eq!(pending.result["state"], json!("pending"));
+
+        // The path the redirect registered finishes it. The receiver's query
+        // is not part of the redirect path and is ignored.
+        let finished = super::mcp_sign_in_finish(
+            &context,
+            &user,
+            sign_in,
+            "fake-code".to_owned(),
+            "state-token".to_owned(),
+            Some(format!("{received_path}?code=fake-code&state=state-token")),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(finished.result["state"], json!("finished"));
+        assert_eq!(finished.result["server"], json!(server));
+        assert_eq!(
+            token_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the matching path exchanges the code once"
+        );
+        assert_eq!(
+            space
+                .secrets
+                .mcp_credential(server, None)
+                .unwrap()
+                .as_deref(),
+            Some("cli-token"),
+            "the matching path stores the credential"
+        );
+        assert_eq!(
+            space
+                .store
+                .events_from(Seq::ZERO, 100)
+                .await
+                .unwrap()
+                .events
+                .iter()
+                .filter(|event| event.kind == EventKind::McpServerUpdated)
+                .count(),
+            1,
+            "the finish records one credential change"
+        );
+
+        token_task.abort();
+        mcp_task.abort();
+    }
+
+    #[test]
+    fn a_command_line_redirect_is_a_loopback_http_base() {
+        // The path the command line happens to name is stripped: the Space
+        // appends the issuer key and `/callback` to the origin.
+        for (redirect, base) in [
+            (
+                "http://127.0.0.1:4711/api/mcp/signin/callback",
+                "http://127.0.0.1:4711",
+            ),
+            ("http://127.0.0.1:4711", "http://127.0.0.1:4711"),
+            ("http://[::1]:4711/callback", "http://[::1]:4711"),
+        ] {
+            assert_eq!(
+                super::loopback_redirect_base(redirect).as_deref(),
+                Some(base),
+                "{redirect}"
+            );
+        }
+        for bad in [
+            "https://127.0.0.1:4711/api/mcp/signin/callback",
+            "http://example.com:4711/api/mcp/signin/callback",
+            "http://127.0.0.1/api/mcp/signin/callback",
+            "http://127.0.0.1:0/api/mcp/signin/callback",
+            "http://127.0.0.1:4711/api/mcp/signin/callback#fragment",
+            "http://user@127.0.0.1:4711/api/mcp/signin/callback",
+            "not a uri",
+        ] {
+            assert_eq!(super::loopback_redirect_base(bad), None, "{bad}");
+        }
+
+        // The finish compares the callback path the loopback receiver got with
+        // the redirect's path, whatever query came with it; a missing or other
+        // path does not match.
+        let redirect = "http://127.0.0.1:4711/an-issuer-key/callback";
+        assert!(super::callback_path_matches(
+            redirect,
+            Some("/an-issuer-key/callback")
+        ));
+        assert!(super::callback_path_matches(
+            redirect,
+            Some("/an-issuer-key/callback?code=one&state=two")
+        ));
+        for bad in [
+            None,
+            Some(""),
+            Some("/another-issuer-key/callback"),
+            Some("an-issuer-key/callback"),
+            Some("http://127.0.0.1:4711/an-issuer-key/callback"),
+        ] {
+            assert!(
+                !super::callback_path_matches(redirect, bad),
+                "{bad:?} does not match"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_sign_in_start_replays_its_recorded_answer() {
+        let space = TestSpace::open().await;
+        let user = account(false);
+        let command = Id::new();
+        let call = CommandCall::McpSignInStart(McpSignInStart {
+            server: None,
+            name: Some("docs".to_owned()),
+            url: Some("https://example.com/mcp".to_owned()),
+            scope: None,
+            redirect_uri: None,
+        });
+        let fingerprint = super::fingerprint(&call).unwrap();
+        let sign_in = Id::new();
+        let bind = "http://neha-test.localhost:8080/api/mcp/signin/bind";
+        let stored = json!({
+            "sign_in": sign_in,
+            "url": format!("{bind}?sign_in={sign_in}"),
+            "user": user.id,
+        });
+        space
+            .store
+            .record_command_result(command, fingerprint.clone(), stored)
+            .await
+            .unwrap();
+        let context = space.context();
+        let replayed = super::mcp_sign_in_start(
+            &context,
+            &user,
+            command,
+            fingerprint,
+            match call {
+                CommandCall::McpSignInStart(arguments) => arguments,
+                _ => unreachable!(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // The recorded answer is repeated, without its owner and without
+        // planning a second flow.
+        assert_eq!(
+            replayed.result,
+            json!({
+                "sign_in": sign_in,
+                "url": format!("{bind}?sign_in={sign_in}"),
+            })
+        );
+        assert!(replayed.events.is_empty(), "a replay appends nothing");
+        assert!(
+            space.signins.lock().await.is_empty(),
+            "a replay allocates no pending sign-in"
+        );
     }
 }

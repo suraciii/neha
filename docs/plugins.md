@@ -82,8 +82,9 @@ including discovery.
 A server without a credential is still discovered, so its tools are offered; a
 call made without a credential answers that the server is not connected and
 sends no request. The Admin attaches a Space-wide token with
-`NEHA_MCP_TOKEN=… target/debug/neha mcp add <server-name> <server-url>`;
-once it is attached, the token reaches the server with the configured headers.
+`NEHA_MCP_TOKEN=… target/debug/neha mcp add <server-name> <server-url>`, or
+signs in from the Integrations view in the browser; once it is attached, the
+token reaches the server with the configured headers.
 The token never comes from the package. A `stdio` server is skipped until this
 Space supports it, with a report.
 

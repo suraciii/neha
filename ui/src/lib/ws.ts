@@ -54,20 +54,96 @@ export interface SubscribeOptions {
   limit?: number;
 }
 
-type CommandName =
-  | "provider_add"
-  | "provider_list"
-  | "model_list"
-  | "bot_create"
-  | "bot_list"
-  | "bot_show"
-  | "chat_list"
-  | "chat_read"
-  | "file_list"
-  | "approval_list"
-  | "approval_decide"
-  | "message_send"
-  | "run_show";
+// The Space's `CommandCall` is an adjacently tagged enum: `name` is the tag and
+// `args` is the content. A unit variant has no content, so its frame must leave
+// `args` off; every other variant has a content object, so its frame must state
+// one. These two lists mirror every variant of `CommandCall`
+// (crates/neha/src/surface.rs), and `commandPayload` is their only reader, so
+// the client never guesses a shape from a caller.
+const UNIT_COMMAND_NAMES = [
+  "catalog_list",
+  "catalog_status",
+  "catalog_refresh",
+  "provider_list",
+  "model_list",
+  "computer_list",
+  "bot_list",
+  "chat_list",
+  "mcp_list",
+  "plugin_list",
+] as const;
+
+const ARGUMENT_COMMAND_NAMES = [
+  "provider_add",
+  "provider_connect",
+  "provider_refresh",
+  "computer_add",
+  "computer_reset",
+  "bot_create",
+  "bot_update",
+  "bot_move",
+  "bot_show",
+  "file_list",
+  "chat_read",
+  "message_send",
+  "run_show",
+  "approval_list",
+  "approval_decide",
+  "rule_list",
+  "rule_add",
+  "rule_remove",
+  "skill_add",
+  "skill_list",
+  "skill_remove",
+  "bot_skill_enable",
+  "bot_skill_disable",
+  "mcp_add",
+  "mcp_remove",
+  "mcp_connect",
+  "mcp_sign_in_start",
+  "mcp_sign_in_status",
+  "mcp_sign_in_finish",
+  "bot_mcp_enable",
+  "bot_mcp_disable",
+  "plugin_install",
+  "plugin_remove",
+  "plugin_enable",
+  "plugin_disable",
+] as const;
+
+/** A command whose frame carries no `args` object. */
+export type UnitCommandName = (typeof UNIT_COMMAND_NAMES)[number];
+/** A command whose frame carries an `args` object. */
+export type ArgumentCommandName = (typeof ARGUMENT_COMMAND_NAMES)[number];
+/** Every command the Space's decoder knows. */
+export type CommandName = UnitCommandName | ArgumentCommandName;
+
+/** The production commands a frame must leave `args` off. */
+export const UNIT_COMMANDS: ReadonlySet<string> = new Set(UNIT_COMMAND_NAMES);
+
+const ARGUMENT_COMMANDS: ReadonlySet<string> = new Set(ARGUMENT_COMMAND_NAMES);
+
+/**
+ * The command payload of a frame, exactly as the Space's decoder reads it: a
+ * unit command carries no `args`, every other command carries its object. A
+ * name the Space does not know is a client bug, not a shape to guess, so it
+ * throws instead of picking one.
+ */
+export function commandPayload(name: string, args?: unknown): Record<string, unknown> {
+  if (UNIT_COMMANDS.has(name)) {
+    if (args !== undefined) {
+      throw new Error(`the Space's ${name} carries no args`);
+    }
+    return { name };
+  }
+  if (ARGUMENT_COMMANDS.has(name)) {
+    if (typeof args !== "object" || args === null || Array.isArray(args)) {
+      throw new Error(`the Space's ${name} requires an args object`);
+    }
+    return { name, args };
+  }
+  throw new Error(`the Space knows no command named ${name}`);
+}
 
 interface Following {
   handlers: SubscriptionHandlers;
@@ -122,6 +198,13 @@ export class Commands {
     this.sendSubscribe();
   }
 
+  /**
+   * Sends one command and resolves with its answer. A unit command names no
+   * arguments; every other command names its object. `timeoutMs` is the wait
+   * for that answer; a command whose Space-side work is slow names its own.
+   */
+  async command<T>(name: UnitCommandName): Promise<T>;
+  async command<T>(name: ArgumentCommandName, args: object, timeoutMs?: number): Promise<T>;
   async command<T>(name: CommandName, args?: unknown, timeoutMs = 20_000): Promise<T> {
     await this.ensureConnected();
     const socket = this.socket;
@@ -338,12 +421,11 @@ export class Commands {
   }
 }
 
-export function commandFrame(id: string, name: CommandName, args?: unknown): unknown {
-  return {
-    type: "command",
-    id,
-    command: args === undefined ? { name } : { name, args },
-  };
+// The frame one command travels in. The Space's decoder refuses a unit command
+// that names an `args` object and an argument command that names none, so every
+// frame is shaped by `commandPayload` from the decoder's own classification.
+export function commandFrame(id: string, name: string, args?: unknown): unknown {
+  return { type: "command", id, command: commandPayload(name, args) };
 }
 
 function parse(event: MessageEvent): Frame | null {
