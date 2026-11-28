@@ -8,6 +8,7 @@ Contracts live in [../specs/](../specs/). Domain terms live in [../CONTEXT.md](.
 
 - [Building and verification](building.md) — requirements, commands, and gates.
 - [Quick start: chat with a Bot](quickstart.md) — run a Space, connect a Provider, and talk to a Bot.
+- [Share a Space with other people](users.md) — the Space Owner, Admin, and Member roles, invitations, and who administers the Space.
 - [Serve a Space on a domain](deploying.md) — put a TLS proxy in front, install the client on a phone, and keep the listener on loopback.
 - [Run a Space in containers](container.md) — build and run a Hosted Space with Docker Compose, Caddy, and one worker container per Hosted Computer.
 - [Notifications](notifications.md) — enable Web Push on a phone or desktop, mute the Space, and know what the push service can see.

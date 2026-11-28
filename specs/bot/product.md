@@ -30,7 +30,7 @@ A Bot has a page with its name, picture, Computer, access, Model, and memory. Th
 | Picture | The Bot's avatar | The owner |
 | Computer | The Hosted or Local Computer it lives on | The owner, on the page or with `neha bot move` |
 | Access | Who else can use the Bot, the folders it can write, whether it has full access, and its Ask and Allow rules | The owner |
-| Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner; the Admin sets the Space's default |
+| Model | The Model it thinks with and its thinking level; the Space's default unless the owner chooses | The owner; an Admin sets the Space's default |
 | Memory | The entries it keeps, as `rule` and `note`, and the room each kind has left | The Bot writes its `note` entries; a User's words start a `rule`; the owner clears any entry |
 
 The page shows what the Bot can reach on its Computer: the granted folders, full access, and the Ask and Allow rules. [Computer](../computer/product.md#what-a-bot-can-do) owns the folders and full access, and [asking before an action](#asking-before-an-action) owns the rules.

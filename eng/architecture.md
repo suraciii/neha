@@ -37,7 +37,7 @@ A Space runs as a Local Space or a Hosted Space; the contract is the same. [Spac
 
 The built-in Bot loop runs inside the Space and acts as a Bot through the command surface. [Bot](../specs/bot/design.md) states where work runs. A containerized Hosted Space uses the same Computer channel for a worker; [Container deployment](container-deployment.md) states that topology.
 
-A Local Space signs its first User in through a secret that the desktop shell creates for one launch and hands to the `neha serve` child over a pipe. A Hosted Space prints an invitation link for its first Admin. [Identity](../specs/identity/product.md) covers both.
+A Local Space signs its first User in through a secret that the desktop shell creates for one launch and hands to the `neha serve` child over a pipe. A Hosted Space prints an invitation link for its first User. [Identity](../specs/identity/product.md) covers both.
 
 ## Four planes
 

@@ -70,6 +70,10 @@ fn main() {
         neha::record::RunStep,
         neha::record::Undoability,
         neha::record::UserJoined,
+        neha::record::UserUpdated,
+        neha::record::UserTransferred,
+        // The identity vocabulary.
+        neha::role::Role,
         // The memory vocabulary.
         neha::memory::MemoryKind,
         neha::memory::MemoryScope,
@@ -106,6 +110,8 @@ fn main() {
         neha_space::state::ChatStatus,
         neha_space::state::ChatView,
         neha_space::state::ComputerView,
+        neha_space::state::CreatedInvitation,
+        neha_space::state::InvitationView,
         neha_space::state::MemoryView,
         neha_space::state::MessageView,
         neha_space::state::ModelView,

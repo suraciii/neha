@@ -5,6 +5,7 @@ import { vi } from "vitest";
 
 import type { SubscriptionHandlers } from "../lib/ws";
 import type {
+  Account,
   Approval,
   Bot,
   Card,
@@ -16,6 +17,7 @@ import type {
   EventKind,
   FileSummary,
   InstalledPackage,
+  Invitation,
   McpServer,
   MemoryEntry,
   MemoryKind,
@@ -29,9 +31,32 @@ import type {
   RunView,
   Skill,
   ThinkingLevel,
+  User,
 } from "../types";
 
-const account = { id: "u1", display_name: "Ada", is_admin: true };
+const account: Account = { id: "u1", display_name: "Ada", is_admin: true, role: "owner" };
+
+// The Users the Space lists, in the order they joined: the Owner, an Admin, and
+// a Member. A test may replace the list to decide what the People section shows.
+const adminUser: User = { id: "u2", display_name: "Grace", role: "admin" };
+const memberUser: User = { id: "u3", display_name: "Linus", role: "member" };
+function defaultUsers(): User[] {
+  return [
+    { id: account.id, display_name: account.display_name, role: account.role },
+    adminUser,
+    memberUser,
+  ];
+}
+
+// One invitation, as the Space makes it. The dates come from local calendar
+// fields, so a test reads the same day in any timezone.
+function invitationFor(seq: number): Invitation {
+  return {
+    id: `inv${seq}`,
+    created_at: new Date(2026, 0, 1, 12).toISOString(),
+    expires_at: new Date(2026, 0, 8, 12).toISOString(),
+  };
+}
 
 // The bytes each kind of memory one Bot may hold, as the Space counts them. A
 // test may choose the entries, and the room a kind uses follows from them.
@@ -460,6 +485,19 @@ export const space = {
   vendors: [] as CatalogVendor[],
   // What the catalog's cache holds, like catalog_status answers.
   catalog: null as CatalogStatus | null,
+  // The Users the Space lists, and the invitation that still admits one. A
+  // create replaces the pending invitation; its secret appears only in that
+  // answer.
+  users: defaultUsers() as User[],
+  invitations: [] as Invitation[],
+  invitationSeq: 0,
+  // A create answered from the record keeps no secret; a test may ask for it.
+  redactInvitation: false,
+  // The People writes the Space was asked for: the roles it changed, the
+  // Spaces it transferred, and the invitations it revoked.
+  roleChanges: [] as { user: string; role: "admin" | "member" }[],
+  transfers: [] as string[],
+  invitationRevokes: [] as string[],
   // The Bot updates, in order, with everything the client sent.
   updates: [] as Record<string, unknown>[],
   // The moves and the resets the Space was asked for.
@@ -595,6 +633,15 @@ export const space = {
     space.refreshes = [];
     space.defaults = [];
     space.catalogRefreshes = 0;
+    space.account.is_admin = true;
+    space.account.role = "owner";
+    space.users = defaultUsers();
+    space.invitations = [];
+    space.invitationSeq = 0;
+    space.redactInvitation = false;
+    space.roleChanges = [];
+    space.transfers = [];
+    space.invitationRevokes = [];
     space.refuse = {};
     space.seq = 100;
     ruleGate = null;
@@ -794,10 +841,23 @@ function emit(kind: EventKind, data: Record<string, unknown>) {
 type CommandShape = (name: string, args?: unknown) => unknown;
 
 let commandShape: CommandShape | null = null;
+// The fake refuses a command with the client's own ProtocolError, so the page
+// reads it the way it reads the Space's refusal. The class arrives through the
+// same promise as the decoder rule: a static import would close a module cycle
+// between the fake and the mock that replaces it.
+let protocolError: typeof import("../lib/ws").ProtocolError | null = null;
 const commandShapeReady: Promise<CommandShape> = import("../lib/ws").then((ws) => {
   commandShape = ws.commandPayload;
+  protocolError = ws.ProtocolError;
   return ws.commandPayload;
 });
+
+// One refusal the client reads as the Space's, in the error class the client
+// knows. The class has loaded before any command runs.
+function refuseCommand(code: string, message: string): Error {
+  const ErrorClass = protocolError;
+  return ErrorClass ? new ErrorClass(code, message) : new Error(message);
+}
 
 // Nothing is returned once the rule has loaded, so a command checks its shape
 // without yielding, the way the Space's decoder does.
@@ -1561,6 +1621,85 @@ export class FakeCommands {
         const removed = space.packages.find((plugin) => plugin.plugin === asked.plugin);
         space.packages = space.packages.filter((plugin) => plugin.plugin !== asked.plugin);
         return { plugin: asked.plugin, name: removed?.name ?? "package", user: account.id } as T;
+      }
+      case "user_list":
+        // Like the Space's answer, each row is its own copy, in join order.
+        return space.users.map((known) => ({ ...known })) as T;
+      case "invitation_create": {
+        if (!space.account.is_admin) {
+          throw refuseCommand("forbidden", "only the Space Owner or an Admin invites a User");
+        }
+        space.invitationSeq += 1;
+        const invitation = invitationFor(space.invitationSeq);
+        // Making a new link replaces the pending invitation.
+        space.invitations = [invitation];
+        return {
+          user: space.account.id,
+          invitation: { ...invitation },
+          ...(space.redactInvitation ? {} : { secret: `secret${space.invitationSeq}` }),
+        } as T;
+      }
+      case "invitation_list": {
+        if (!space.account.is_admin) {
+          throw refuseCommand("forbidden", "only the Space Owner or an Admin sees the invitations");
+        }
+        return space.invitations.map((known) => ({ ...known })) as T;
+      }
+      case "invitation_revoke": {
+        if (!space.account.is_admin) {
+          throw refuseCommand(
+            "forbidden",
+            "only the Space Owner or an Admin revokes an invitation",
+          );
+        }
+        const asked = args as { invitation: string };
+        if (!space.invitations.some((invitation) => invitation.id === asked.invitation)) {
+          throw refuseCommand("not_found", "no such invitation");
+        }
+        space.invitationRevokes.push(asked.invitation);
+        space.invitations = space.invitations.filter(
+          (invitation) => invitation.id !== asked.invitation,
+        );
+        return {
+          user: space.account.id,
+          invitation: asked.invitation,
+          revoked: true,
+        } as T;
+      }
+      case "user_set_role": {
+        if (space.account.role !== "owner") {
+          throw refuseCommand("forbidden", "only the Space Owner changes a role");
+        }
+        const asked = args as { user: string; role: "admin" | "member" };
+        space.roleChanges.push(asked);
+        // Like the Space's answer, the list moves with the role it changed.
+        space.users = space.users.map((known) =>
+          known.id === asked.user ? { ...known, role: asked.role } : { ...known },
+        );
+        return {
+          user: space.account.id,
+          users: space.users.map((known) => ({ ...known })),
+        } as T;
+      }
+      case "user_transfer": {
+        if (space.account.role !== "owner") {
+          throw refuseCommand("forbidden", "only the Space Owner transfers the Space");
+        }
+        const asked = args as { user: string };
+        space.transfers.push(asked.user);
+        // The Space's new Owner takes the Space, and the outgoing Owner becomes
+        // an Admin.
+        const outgoing = space.account.id;
+        space.account.role = "admin";
+        space.account.is_admin = true;
+        space.users = space.users.map((known) => ({
+          ...known,
+          role: known.id === asked.user ? "owner" : known.id === outgoing ? "admin" : known.role,
+        }));
+        return {
+          user: outgoing,
+          users: space.users.map((known) => ({ ...known })),
+        } as T;
       }
       default:
         throw new Error(`the fake Space cannot answer ${name}`);

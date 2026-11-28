@@ -33,7 +33,8 @@ Environment:
 The first launch shows **Choose a Space**:
 
 - **This computer** starts a private bundled Space and opens its normal
-  first-run invitation; the User creates the first Admin and signs in there.
+  first-run invitation; the User creates the Space Owner account and signs in
+  there.
 - **Existing Space** takes an `https://` address (loopback `http://` is allowed
   for development), checks it, and loads that Space page: a normal sign-in, or
   the invitation page when the address is an invitation link.

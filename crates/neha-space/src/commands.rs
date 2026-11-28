@@ -52,8 +52,8 @@ use crate::server::{
     SIGN_IN_INCOMPLETE, SIGN_IN_REPLACED, SIGN_IN_TTL, SignInStatus, identity_error,
 };
 use crate::state::{
-    ApprovalView, BotView, ChatView, ComputerView, McpServerView, MemoryView, ModelView,
-    ProviderView, RemovedMcpView, RuleView, RunStatus, State,
+    ApprovalView, BotView, ChatView, ComputerView, InvitationView, McpServerView, MemoryView,
+    ModelView, ProviderView, RemovedMcpView, RuleView, RunStatus, State, UserView,
 };
 use crate::store::{
     AppendRequest, AppendResult, CommandRecord, ContinuationWrite, Projection, Store,
@@ -209,6 +209,10 @@ pub struct CommandContext<'a> {
     /// what the Space offers and appends the change cannot interleave with
     /// another such decision.
     pub library: &'a tokio::sync::Mutex<()>,
+    /// Serializes role changes and the transfer. The authorization check, the
+    /// event, and the account rows must not interleave: two valid commands
+    /// could otherwise append events the record's own projection refuses.
+    pub roles: &'a tokio::sync::Mutex<()>,
     /// The run queue. A command that changes a Bot's authority takes the Bot's
     /// admit lock, so its read and its event cannot interleave with a run
     /// start's read and event: the record's order then decides which access a
@@ -241,6 +245,11 @@ pub async fn execute(
     command: CommandCall,
 ) -> Result<Outcome, ApiError> {
     let fingerprint = fingerprint(&command)?;
+    // The record decides a role; the account row is what authenticates the
+    // call. A change that reached the record but not the row must not make a
+    // demoted Admin keep acting or refuse the new Owner.
+    let account = account_with_recorded_role(context.state, account)?;
+    let account = &account;
 
     match command {
         CommandCall::ProviderAdd(arguments) => {
@@ -567,7 +576,97 @@ pub async fn execute(
         CommandCall::MemoryRemove { bot, memory } => {
             memory_remove(context, account, command_id, fingerprint, bot, memory).await
         }
+        CommandCall::UserList => read(context.state, |state| {
+            serde_json::to_value(members(state)).map_err(json_error)
+        }),
+        CommandCall::InvitationCreate => {
+            invitation_create(context, account, command_id, fingerprint).await
+        }
+        CommandCall::InvitationList => invitation_list(context, account).await,
+        CommandCall::InvitationRevoke { invitation } => {
+            invitation_revoke(context, account, command_id, fingerprint, invitation).await
+        }
+        CommandCall::UserSetRole { user, role } => {
+            user_set_role(context, account, command_id, fingerprint, user, role).await
+        }
+        CommandCall::UserTransfer { user } => {
+            user_transfer(context, account, command_id, fingerprint, user).await
+        }
     }
+}
+
+/// Returns the account with the role the record gives it.
+///
+/// The account row authenticates who is calling; the record decides what the
+/// caller may do. A role change writes both, but a crash between the two
+/// leaves the row behind, and this closes that gap for every command.
+fn account_with_recorded_role(
+    state: &Mutex<State>,
+    account: &Account,
+) -> Result<Account, ApiError> {
+    let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+    let Some(user) = state.users.get(&account.id) else {
+        return Err(ApiError::forbidden(
+            "this account is not a User of the Space",
+        ));
+    };
+    let mut account = account.clone();
+    account.role = user.role;
+    account.is_admin = user.role.administers();
+
+    Ok(account)
+}
+
+/// Returns the Space's Users in the order they joined.
+fn members(state: &State) -> Vec<&UserView> {
+    state
+        .user_order
+        .iter()
+        .filter_map(|user| state.users.get(user))
+        .collect()
+}
+
+/// Returns the User list as it will read once `user` takes `role`.
+fn members_after_role(state: &State, user: Id, role: neha::role::Role) -> Value {
+    let users: Vec<UserView> = members(state)
+        .into_iter()
+        .cloned()
+        .map(|mut view| {
+            if view.id == user {
+                view.role = role;
+            }
+            view
+        })
+        .collect();
+
+    json!(users)
+}
+
+/// Whether the record currently gives this account the Space Owner role.
+fn owns_space(state: &Mutex<State>, account: Id) -> Result<bool, ApiError> {
+    let state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
+    Ok(state
+        .users
+        .get(&account)
+        .is_some_and(|user| user.role.owns()))
+}
+
+/// Returns the User list as it will read once the Space transfers.
+fn members_after_transfer(state: &State, from: Id, to: Id) -> Value {
+    let users: Vec<UserView> = members(state)
+        .into_iter()
+        .cloned()
+        .map(|mut view| {
+            if view.id == from {
+                view.role = neha::role::Role::Admin;
+            } else if view.id == to {
+                view.role = neha::role::Role::Owner;
+            }
+            view
+        })
+        .collect();
+
+    json!(users)
 }
 
 /// Answers an approval the acting User is shown.
@@ -4068,6 +4167,358 @@ async fn memory_remove(
     if appended.existing {
         return recorded_outcome(context.store, command_id).await;
     }
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Returns an invitation's view.
+fn invitation_view(invitation: crate::identity::Invitation) -> Result<InvitationView, ApiError> {
+    let created_at = neha::time::Timestamp::from_microseconds(invitation.created_at)
+        .ok_or_else(|| ApiError::internal("an invitation has an invalid created time"))?;
+    let expires_at = neha::time::Timestamp::from_microseconds(invitation.expires_at)
+        .ok_or_else(|| ApiError::internal("an invitation has an invalid expiry"))?;
+
+    Ok(InvitationView {
+        id: invitation.id,
+        created_at,
+        expires_at,
+    })
+}
+
+/// Rejects a recorded answer that belongs to another account.
+fn recorded_owner(result: &Value, account: &Account) -> Result<(), ApiError> {
+    let owner = result
+        .get("user")
+        .and_then(Value::as_str)
+        .and_then(|owner| owner.parse::<Id>().ok());
+    if owner != Some(account.id) {
+        return Err(ApiError::forbidden(
+            "a recorded command belongs to another User",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Appends the event a change still owes, and forgets the notice.
+///
+/// The change's transaction chose the event command, so a retry after a crash
+/// appends the same event instead of another one. A notice is present only
+/// until its event is in the record; a start replays what a crash left.
+async fn finish_invitation_notice(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    notice: Option<Id>,
+) -> Result<Vec<Event>, ApiError> {
+    let Some(event_command) = notice else {
+        return Ok(Vec::new());
+    };
+    let appended = append(
+        context.store,
+        context.state,
+        event_command,
+        format!("invitation-notice:{command_id}"),
+        vec![EventDraft::new(
+            EventKind::InvitationChanged,
+            Author::User(account.id),
+            json!({}),
+        )],
+        None,
+        None,
+    )
+    .await?;
+    context
+        .identity
+        .clear_notice(command_id)
+        .await
+        .map_err(identity_error)?;
+
+    Ok(appended.events)
+}
+
+/// Makes an invitation link that admits one new User as a Member.
+///
+/// The identity transaction that rotates the link also records the command's
+/// answer, and only the call that made the invitation learns the secret. A
+/// retry answers from the record and rotates nothing.
+async fn invitation_create(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+) -> Result<Outcome, ApiError> {
+    let created = context
+        .identity
+        .create_invitation_for_command(command_id, &fingerprint, account.id, account.administers())
+        .await
+        .map_err(identity_error)?;
+    match created {
+        crate::identity::InvitationCreated::Made {
+            secret,
+            answer,
+            notice,
+            ..
+        } => {
+            let events =
+                finish_invitation_notice(context, account, command_id, Some(notice)).await?;
+            let mut result = answer;
+            result["secret"] = json!(secret);
+
+            Ok(Outcome {
+                committed: events.last().map(|event| event.seq),
+                result,
+                queued: None,
+                events,
+            })
+        }
+        crate::identity::InvitationCreated::Recorded { answer, notice } => {
+            recorded_owner(&answer, account)?;
+            let events = finish_invitation_notice(context, account, command_id, notice).await?;
+
+            Ok(Outcome {
+                committed: events.last().map(|event| event.seq),
+                result: answer,
+                queued: None,
+                events,
+            })
+        }
+    }
+}
+
+/// Lists the invitations that still admit one User.
+async fn invitation_list(
+    context: &CommandContext<'_>,
+    account: &Account,
+) -> Result<Outcome, ApiError> {
+    if !account.administers() {
+        return Err(ApiError::forbidden(
+            "only the Space Owner or an Admin sees the invitations",
+        ));
+    }
+    let invitations = context
+        .identity
+        .invitations()
+        .await
+        .map_err(identity_error)?;
+    let views = invitations
+        .into_iter()
+        .map(invitation_view)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    read(context.state, |_| Ok(json!(views)))
+}
+
+/// Revokes a pending invitation.
+///
+/// The identity transaction that removes the invitation also records the
+/// command's answer, so a retry answers from the record instead of reporting a
+/// success it did not just perform.
+async fn invitation_revoke(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    invitation: Id,
+) -> Result<Outcome, ApiError> {
+    let revoked = context
+        .identity
+        .revoke_invitation_for_command(
+            command_id,
+            &fingerprint,
+            account.id,
+            invitation,
+            account.administers(),
+        )
+        .await
+        .map_err(identity_error)?;
+    match revoked {
+        crate::identity::InvitationRevoked::Revoked { answer, notice } => {
+            let events =
+                finish_invitation_notice(context, account, command_id, Some(notice)).await?;
+
+            Ok(Outcome {
+                committed: events.last().map(|event| event.seq),
+                result: answer,
+                queued: None,
+                events,
+            })
+        }
+        crate::identity::InvitationRevoked::Recorded { answer, notice } => {
+            recorded_owner(&answer, account)?;
+            let events = finish_invitation_notice(context, account, command_id, notice).await?;
+
+            Ok(Outcome {
+                committed: events.last().map(|event| event.seq),
+                result: answer,
+                queued: None,
+                events,
+            })
+        }
+        crate::identity::InvitationRevoked::Absent => {
+            Err(ApiError::not_found("no such invitation"))
+        }
+    }
+}
+
+/// Changes a User's role; only the Space Owner may.
+async fn user_set_role(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    user: Id,
+    role: neha::role::Role,
+) -> Result<Outcome, ApiError> {
+    let _roles = context.roles.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    if !owns_space(context.state, account.id)? {
+        return Err(ApiError::forbidden("only the Space Owner changes a role"));
+    }
+    if role.owns() {
+        return Err(ApiError::invalid_argument(
+            "ownership moves only by transfer",
+        ));
+    }
+    let target = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        let target = state
+            .users
+            .get(&user)
+            .ok_or_else(|| ApiError::not_found("no such User"))?;
+        if target.role.owns() {
+            return Err(ApiError::invalid_argument(
+                "the Space Owner's role changes only by transfer",
+            ));
+        }
+        target.id
+    };
+    if target == account.id {
+        return Err(ApiError::invalid_argument(
+            "the Space Owner cannot change its own role",
+        ));
+    }
+    let draft = EventDraft::new(
+        EventKind::UserUpdated,
+        Author::User(account.id),
+        json!({"user": target, "role": role}),
+    );
+    let result = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        json!({
+            "user": account.id,
+            "users": members_after_role(&state, target, role),
+        })
+    };
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+    context
+        .identity
+        .set_role(target, role)
+        .await
+        .map_err(identity_error)?;
+
+    Ok(Outcome {
+        committed: appended.events.last().map(|event| event.seq),
+        result,
+        queued: None,
+        events: appended.events,
+    })
+}
+
+/// Transfers the Space to another User; only the Space Owner may.
+async fn user_transfer(
+    context: &CommandContext<'_>,
+    account: &Account,
+    command_id: Id,
+    fingerprint: String,
+    user: Id,
+) -> Result<Outcome, ApiError> {
+    let _roles = context.roles.lock().await;
+    if let Some(outcome) = replay_owned(context.store, command_id, &fingerprint, account).await? {
+        return Ok(outcome);
+    }
+    if !owns_space(context.state, account.id)? {
+        return Err(ApiError::forbidden(
+            "only the Space Owner transfers the Space",
+        ));
+    }
+    if user == account.id {
+        return Err(ApiError::invalid_argument(
+            "the Space already belongs to this User",
+        ));
+    }
+    {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        if !state.users.contains_key(&user) {
+            return Err(ApiError::not_found("no such User"));
+        }
+    }
+    let draft = EventDraft::new(
+        EventKind::UserTransferred,
+        Author::User(account.id),
+        json!({"to": user}),
+    );
+    let result = {
+        let state = context
+            .state
+            .lock()
+            .map_err(|_| ApiError::internal("state lock"))?;
+        json!({
+            "user": account.id,
+            "users": members_after_transfer(&state, account.id, user),
+        })
+    };
+    let appended = append(
+        context.store,
+        context.state,
+        command_id,
+        fingerprint,
+        vec![draft],
+        Some(result.clone()),
+        None,
+    )
+    .await?;
+    if appended.existing {
+        return recorded_outcome(context.store, command_id).await;
+    }
+    context
+        .identity
+        .set_role(account.id, neha::role::Role::Admin)
+        .await
+        .map_err(identity_error)?;
+    context
+        .identity
+        .set_role(user, neha::role::Role::Owner)
+        .await
+        .map_err(identity_error)?;
 
     Ok(Outcome {
         committed: appended.events.last().map(|event| event.seq),
@@ -14630,6 +15081,7 @@ mod tests {
         computer_assignments: tokio::sync::Mutex<()>,
         provider_writes: tokio::sync::Mutex<()>,
         library: tokio::sync::Mutex<()>,
+        roles: tokio::sync::Mutex<()>,
         runs: RunQueue,
         events: tokio::sync::broadcast::Sender<Event>,
         catalog: CatalogStore,
@@ -14666,6 +15118,7 @@ mod tests {
                 computer_assignments: tokio::sync::Mutex::new(()),
                 provider_writes: tokio::sync::Mutex::new(()),
                 library: tokio::sync::Mutex::new(()),
+                roles: tokio::sync::Mutex::new(()),
                 runs: RunQueue::new(),
                 events,
                 catalog,
@@ -14693,6 +15146,7 @@ mod tests {
                 provider_writes: &self.provider_writes,
                 workers: false,
                 library: &self.library,
+                roles: &self.roles,
                 runs: &self.runs,
                 events: &self.events,
                 catalog: &self.catalog,
@@ -14823,10 +15277,16 @@ mod tests {
     }
 
     fn account(is_admin: bool) -> Account {
+        let role = if is_admin {
+            neha::role::Role::Owner
+        } else {
+            neha::role::Role::Member
+        };
         Account {
             id: Id::new(),
             display_name: if is_admin { "Admin" } else { "Eve" }.to_owned(),
-            is_admin,
+            is_admin: role.administers(),
+            role,
         }
     }
 

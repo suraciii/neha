@@ -1,6 +1,6 @@
 # Send and receive Files
 
-This guide shows a file going to a Bot and a result coming back: a User sends a file in a Chat, the Bot takes it into its own directory inside its Computer's Workspace, and the Bot delivers a result as a File. It follows [Quick start](quickstart.md), so the Space, the Admin, the Provider, the Bot, and the Chat already exist.
+This guide shows a file going to a Bot and a result coming back: a User sends a file in a Chat, the Bot takes it into its own directory inside its Computer's Workspace, and the Bot delivers a result as a File. It follows [Quick start](quickstart.md), so the Space, an Admin, the Provider, the Bot, and the Chat already exist.
 
 ## What a File is
 

@@ -14,7 +14,7 @@ use crate::seq::Seq;
 use crate::time::Timestamp;
 
 /// The protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 
 /// The largest frame a client or the Space accepts.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -344,6 +344,29 @@ pub enum CommandCall {
         bot: Id,
         /// The entry.
         memory: Id,
+    },
+    /// Lists the Space's Users and their roles.
+    UserList,
+    /// Makes an invitation link that admits one new User as a Member.
+    InvitationCreate,
+    /// Lists the invitations that still admit one User.
+    InvitationList,
+    /// Revokes a pending invitation.
+    InvitationRevoke {
+        /// The invitation.
+        invitation: Id,
+    },
+    /// Changes a User's role.
+    UserSetRole {
+        /// The User.
+        user: Id,
+        /// The role it takes: an Admin or a Member.
+        role: crate::role::Role,
+    },
+    /// Transfers the Space to another User.
+    UserTransfer {
+        /// The User who becomes the Owner.
+        user: Id,
     },
 }
 
@@ -1206,7 +1229,7 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&frame).unwrap(),
-            "{\"type\":\"hello\",\"version\":3}"
+            "{\"type\":\"hello\",\"version\":4}"
         );
 
         let error = ServerFrame::Error {

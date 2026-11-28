@@ -8,7 +8,7 @@ Owned by space. Every other topic depends on a Space to hold its record.
 
 1. Every User belongs to a Space.
 2. The record lives in the Space and nowhere else.
-3. The Admin configures the model providers a Space offers.
+3. An Admin configures the model providers a Space offers.
 
 ## Deliverables
 
@@ -25,7 +25,7 @@ Owned by space. Every other topic depends on a Space to hold its record.
 
 A Space runs as a Local Space or a Hosted Space. The contract is the same.
 
-A Local Space runs on the computer where the desktop app starts it. It is created on first use, and its first User creates the Admin account. Another client, including a phone, reaches it only through an origin that computer exposes and that the other client can reach.
+A Local Space runs on the computer where the desktop app starts it. It is created on first use, and its first User becomes its Space Owner. Another client, including a phone, reaches it only through an origin that computer exposes and that the other client can reach.
 
 A Hosted Space runs on a server. Its operator supplies the server and its origin; a Neha-run Hosted Space is the same contract with Neha as operator. Its Users reach it over the network.
 
@@ -41,7 +41,7 @@ A client connects to one Space at a time.
 
 The desktop app opens with a choice: start a Local Space on this computer, or connect to a Space.
 
-A Local Space is created on first use; its first User creates the Admin account through the invitation page.
+A Local Space is created on first use; its first User becomes the Space Owner through the invitation page.
 
 A new Space has no Provider. Connecting one is the first thing its Admin does, before any Bot can work; see [Model](../model/product.md).
 
@@ -53,7 +53,7 @@ Closing the desktop app's window keeps its Local Space running in the background
 
 ## Connecting
 
-A User connects to a Space with an invitation link: the first from the Space, the rest from its Admin. [Identity](../identity/product.md) covers invitations, accounts, and sign-in.
+A User connects to a Space with an invitation link: the first from the Space, the rest from an Admin. [Identity](../identity/product.md) covers invitations, accounts, and sign-in.
 
 A connected client shows the User's Bots, Chats, and Groups, the same on every client.
 
@@ -63,21 +63,19 @@ Whoever runs a Space can read its record and what passes through it from a Compu
 
 ## Users
 
-Users join and leave a Space as [Identity](../identity/product.md) describes.
-
-A User who is removed loses access to the Space; their Bots stay until the Admin deletes them.
+Users join a Space as [Identity](../identity/product.md) describes.
 
 ## Model providers
 
-The Admin connects the Space's model providers. [Model](../model/product.md) covers connecting one, what a Model can do, and how a Bot chooses.
+An Admin connects the Space's model providers. [Model](../model/product.md) covers connecting one, what a Model can do, and how a Bot chooses.
 
 ## Storage
 
-The Admin decides where the Space keeps the bytes of its Files.
+The Space's operator chooses where it keeps the bytes of its Files, through the Space's configuration.
 
 ## Usage budget
 
-The Admin sets a usage budget for the Space or for one Bot, over a day, a month, or no period.
+An Admin sets a usage budget for the Space or for one Bot, over a day, a month, or no period. Setting a budget is not yet available; the Space counts each run's usage.
 
 A budget counts normalized tokens: uncached input, cache reads, cache writes, and output. [Model](../model/design.md) covers the one normalized form of usage.
 
@@ -91,11 +89,8 @@ A Space with no budget set places no limit.
 
 A Space delivers Notifications to a User's clients. [Notification](../messaging/notification/product.md) covers what starts one and how a User controls it.
 
-## Deleting a Space
-
-The Admin can delete the Space, which deletes its record, Bots, and Users.
-
 ## Gaps
 
+- Removing a User from a Space, leaving one, and deleting a Space are not yet specified.
 - Exporting the Space's record, for backup, is not yet specified.
 - Reaching Neha from outside its apps, by sharing into it from any app or calling it with a global shortcut, is not yet specified and comes after the CLI.

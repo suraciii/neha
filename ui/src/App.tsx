@@ -39,9 +39,11 @@ import type {
   Chat,
   ChatStatus,
   Computer,
+  CreatedInvitation,
   Decision,
   FileSummary,
   InstalledPackage,
+  Invitation,
   McpServer,
   McpSignInState,
   MemoryList,
@@ -61,6 +63,7 @@ import type {
   Skill,
   ThinkingLevel,
   ToolAction,
+  User,
 } from "./types";
 
 type AuthMode = "join" | "login" | "missing-invite";
@@ -228,6 +231,10 @@ interface State {
   // The Settings surface: every vendor the catalog knows, and the cache state.
   vendors: CatalogVendor[];
   catalog: CatalogStatus | null;
+  // The People section: every User who signed in, and the one invitation that
+  // still admits a User. A Member reads the Users and no invitation.
+  users: User[];
+  invitation: Invitation | null;
   // A management read or write is in flight.
   managing: boolean;
   // What the last failed management command said.
@@ -265,6 +272,8 @@ function emptyState(): State {
     memories: emptyMemories(),
     vendors: [],
     catalog: null,
+    users: [],
+    invitation: null,
     managing: false,
     manageError: null,
   };
@@ -1185,11 +1194,16 @@ export default function App() {
 
     const secret = location.hash.replace(/^#/, "");
     if (location.pathname === "/invite") {
+      // The invitation page joins a new User, so it wins over the account this
+      // browser already has: opening a link never hides it behind the
+      // signed-in workspace.
       setAuthSecret(secret);
       setAuthMode(secret ? "join" : "missing-invite");
-    } else {
-      setAuthMode("login");
+      setReady(true);
+
+      return;
     }
+    setAuthMode("login");
 
     void boot();
   });
@@ -1377,6 +1391,22 @@ export default function App() {
       // A Computer another client paired or created is one the Settings
       // surface lists.
       if (event.kind === "neha.computer.created") void refreshComputers();
+      return;
+    }
+    // A User joined or a role moved: the People section reads the Users again,
+    // and the signed-in account takes its own role from the same answer.
+    if (
+      event.kind === "neha.user.joined" ||
+      event.kind === "neha.user.updated" ||
+      event.kind === "neha.user.transferred"
+    ) {
+      void refreshPeople();
+      return;
+    }
+    // Another Admin made, rotated, or revoked the pending invitation: the
+    // People section reads it again, so a stale link leaves the screen.
+    if (event.kind === "neha.invitation.changed") {
+      void refreshPeople();
       return;
     }
     // Another client changed who may use a Computer: the Settings list and an
@@ -3100,18 +3130,71 @@ export default function App() {
   }
 
   // Reads the catalog's vendors and its cache state, which is what the Settings
-  // surface connects from and shows.
+  // surface connects from and shows, and the People section's Users and pending
+  // invitation.
   async function loadSettings() {
     update({ managing: true, manageError: null });
     try {
-      const [vendors, catalog, computers] = await Promise.all([
+      const [vendors, catalog, computers, users] = await Promise.all([
         commands.command<CatalogVendor[]>("catalog_list"),
         commands.command<CatalogStatus>("catalog_status"),
         commands.command<Computer[]>("computer_list"),
+        commands.command<User[]>("user_list"),
       ]);
+      // The directory decides whether this account still administers the
+      // Space; an invitation read belongs to the Space Owner and the Admins.
+      adoptUsers(users);
       update({ vendors, catalog, computers, managing: false });
+      if (state.account?.is_admin) {
+        try {
+          const invitations = await commands.command<Invitation[]>("invitation_list");
+          update({ invitation: invitations[0] ?? null });
+        } catch {
+          // A role that changed between the two reads leaves no invitation to
+          // show; the directory answer above still stands.
+        }
+      } else {
+        update({ invitation: null });
+      }
     } catch (reason) {
       update({ manageError: reason, managing: false });
+    }
+  }
+
+  // Takes the Space's Users as the record lists them. The signed-in account
+  // takes its own role from the same answer, because the Space Owner may have
+  // changed it while this client was open.
+  function adoptUsers(users: User[]): void {
+    const me = state.account;
+    const self = me ? users.find((known) => known.id === me.id) : undefined;
+    if (me && self && (me.role !== self.role || me.is_admin !== (self.role !== "member"))) {
+      update({
+        account: {
+          ...me,
+          role: self.role,
+          is_admin: self.role === "owner" || self.role === "admin",
+        },
+      });
+    }
+    update({ users });
+  }
+
+  // Reads the People the Settings surface shows again, after the record says
+  // they changed. A Member reads the Users list alone.
+  async function refreshPeople(): Promise<void> {
+    try {
+      const users = await commands.command<User[]>("user_list");
+      adoptUsers(users);
+      // The account's own role may have just changed, so the invitation read
+      // follows the role the Users list gave.
+      if (state.account?.is_admin) {
+        const invitations = await commands.command<Invitation[]>("invitation_list");
+        update({ invitation: invitations[0] ?? null });
+      } else {
+        update({ invitation: null });
+      }
+    } catch {
+      // A failed read keeps the list the page already shows.
     }
   }
 
@@ -3185,6 +3268,79 @@ export default function App() {
       return true;
     } catch (reason) {
       update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
+  // A People command the Space refuses says what the reader can do instead. The
+  // generic permission line does not tell a former Owner why a role change
+  // failed, or a stale Member which role an invitation needs.
+  function peopleRefusal(reason: unknown, what: "role" | "invitation"): unknown {
+    if (reason instanceof ProtocolError && reason.code === "forbidden") {
+      return {
+        key: what === "role" ? "settings.people.error.role" : "settings.people.error.invitation",
+      };
+    }
+    return reason;
+  }
+
+  // Makes an invitation and answers it once, so its panel can show the link and
+  // its QR code. The Space keeps only a hash of the secret afterwards.
+  async function createInvitation(): Promise<CreatedInvitation | null> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<CreatedInvitation>("invitation_create");
+      update({ invitation: answer.invitation, managing: false });
+      return answer;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "invitation"), managing: false });
+      return null;
+    }
+  }
+
+  async function revokeInvitation(invitation: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("invitation_revoke", { invitation });
+      update({ invitation: null, managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "invitation"), managing: false });
+      return false;
+    }
+  }
+
+  // Changes another User's role. The answer carries the Users in their new
+  // order, so the list moves with the Space's word.
+  async function setUserRole(user: string, role: "admin" | "member"): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<{ user: string; users: User[] }>("user_set_role", {
+        user,
+        role,
+      });
+      adoptUsers(answer.users);
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "role"), managing: false });
+      return false;
+    }
+  }
+
+  // Gives the Space to another User. The outgoing Owner becomes an Admin, so
+  // the answer's Users also move the signed-in account's own role.
+  async function transferSpace(user: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      const answer = await commands.command<{ user: string; users: User[] }>("user_transfer", {
+        user,
+      });
+      adoptUsers(answer.users);
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: peopleRefusal(reason, "role"), managing: false });
       return false;
     }
   }
@@ -3553,6 +3709,8 @@ export default function App() {
                       bots={state.bots}
                       vendors={state.vendors}
                       catalog={state.catalog}
+                      users={state.users}
+                      invitation={state.invitation}
                       section={section()}
                       busy={state.managing}
                       error={manageErrorText()}
@@ -3568,6 +3726,10 @@ export default function App() {
                       onRefresh={(provider) => refreshProviderModels(provider)}
                       onDefault={(model) => makeDefaultModel(model)}
                       onCatalog={() => refreshCatalog()}
+                      onInvite={() => createInvitation()}
+                      onRevokeInvitation={(invitation) => revokeInvitation(invitation)}
+                      onSetRole={(user, role) => setUserRole(user, role)}
+                      onTransfer={(user) => transferSpace(user)}
                     />
                   </Show>
                 </Show>

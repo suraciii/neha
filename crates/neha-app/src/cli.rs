@@ -74,6 +74,16 @@ enum Top {
         #[command(subcommand)]
         command: DeviceCommand,
     },
+    /// List the Space's Users and their roles.
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
+    /// Make or manage invitations.
+    Invitation {
+        #[command(subcommand)]
+        command: InvitationCommand,
+    },
     /// Connect or list Providers.
     Provider {
         #[command(subcommand)]
@@ -138,6 +148,44 @@ enum Top {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    /// List the Space's Users and their roles.
+    List,
+    /// Change a User's role; only the Space Owner may.
+    Role {
+        /// The User's display name, or their identifier with --id.
+        user: String,
+        /// The role to give: admin or member.
+        role: String,
+        /// Read `user` as an identifier, not a display name.
+        #[arg(long)]
+        id: bool,
+    },
+    /// Transfer the Space to another User; only the Space Owner may.
+    Transfer {
+        /// The display name, or the identifier with --id, of the User who
+        /// becomes the Owner.
+        user: String,
+        /// Read `user` as an identifier, not a display name.
+        #[arg(long)]
+        id: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum InvitationCommand {
+    /// Make an invitation link; the link appears once.
+    Create,
+    /// List the invitations that still admit one User.
+    List,
+    /// Revoke a pending invitation.
+    Revoke {
+        /// The invitation identifier.
+        invitation: String,
     },
 }
 
@@ -753,8 +801,10 @@ pub async fn run() -> Result<()> {
             server,
             device_code,
         } => login(name, server, device_code).await,
-        Top::Whoami => whoami(),
+        Top::Whoami => whoami().await,
         Top::Device { command } => device_command(command).await,
+        Top::User { command } => user(command).await,
+        Top::Invitation { command } => invitation(command).await,
         Top::Provider { command } => provider(command).await,
         Top::Catalog { command } => catalog(command).await,
         Top::Model { command } => model(command).await,
@@ -863,14 +913,10 @@ async fn join(link: &str, name: &str) -> Result<()> {
     let credential = client::join(link, name, &password).await?;
     credential.save()?;
     println!(
-        "Joined {} as {} (Admin: {}).",
+        "Joined {} as {} ({}).",
         credential.url,
         credential.account.display_name,
-        if credential.account.is_admin {
-            "yes"
-        } else {
-            "no"
-        }
+        role_of(&credential.account)
     );
 
     Ok(())
@@ -1000,19 +1046,161 @@ async fn wait_for_device_approval(
     }
 }
 
-fn whoami() -> Result<()> {
+async fn whoami() -> Result<()> {
     let credential = Credential::load()?;
+    // A role can change while the CLI keeps its credential, so the Space
+    // answers this rather than the account saved at sign-in.
+    let account = client::me(&credential).await?;
     println!("Space: {}", credential.url);
-    println!("Account: {}", credential.account.display_name);
-    println!("Id: {}", credential.account.id);
-    println!(
-        "Admin: {}",
-        if credential.account.is_admin {
-            "yes"
-        } else {
-            "no"
+    println!("Account: {}", account.display_name);
+    println!("Id: {}", account.id);
+    println!("Role: {}", role_of(&account));
+
+    Ok(())
+}
+
+/// Prints the role an account holds in the Space.
+fn role_of(account: &crate::client::SignedIn) -> &'static str {
+    account.role().as_str()
+}
+
+/// Parses the role a `user role` command names.
+fn parse_role(text: &str) -> Result<neha::role::Role> {
+    match text.parse::<neha::role::Role>() {
+        Ok(neha::role::Role::Owner) => {
+            bail!("the Space Owner role moves only by transfer; run `neha user transfer <user>`")
         }
-    );
+        Ok(role) => Ok(role),
+        Err(_) => bail!("a role is `admin` or `member`"),
+    }
+}
+
+/// Resolves the User a command names by display name or identifier.
+///
+/// A display name may itself look like an identifier, so the directory is read
+/// first: an exact name wins, and only a name the directory does not hold is
+/// read as the identifier of a User it lists. An argument that is both a
+/// display name and another User's identifier is refused: the command names
+/// the identifier with `--id` instead of guessing.
+async fn resolve_user(credential: &Credential, user: &str, by_id: bool) -> Result<Id> {
+    let result = client::command(credential, CommandCall::UserList).await?;
+    let users = result
+        .as_array()
+        .with_context(|| "the answer carries no User list")?;
+    let named = users
+        .iter()
+        .find(|entry| entry["display_name"].as_str() == Some(user));
+    let parsed = user.parse::<Id>().ok();
+    let identified = parsed.and_then(|id| {
+        users
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(id.to_string().as_str()))
+    });
+    let id_of = |entry: &Value| -> Result<Id> {
+        entry["id"]
+            .as_str()
+            .with_context(|| "the answer's User has no Id")?
+            .parse()
+            .context("the answer's User has an invalid Id")
+    };
+
+    if by_id {
+        let id = parsed.context("an identifier looks like an Id")?;
+        if identified.is_some() {
+            return Ok(id);
+        }
+        bail!("no User has the identifier {user}");
+    }
+    match (named, identified) {
+        (Some(named), Some(identified)) if named["id"] != identified["id"] => bail!(
+            "{user} is both a display name and another User's identifier; pass --id to name the identifier"
+        ),
+        (Some(entry), _) | (None, Some(entry)) => id_of(entry),
+        (None, None) => bail!("no User is named {user}"),
+    }
+}
+
+/// Prints the User list an answer carries.
+fn print_users(result: &Value) -> Result<()> {
+    let users = result
+        .as_array()
+        .with_context(|| "the answer carries no User list")?;
+    for user in users {
+        println!(
+            "{:<7} {}",
+            user["role"].as_str().unwrap_or("member"),
+            user["display_name"].as_str().unwrap_or("-")
+        );
+    }
+
+    Ok(())
+}
+
+async fn user(command: UserCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        UserCommand::List => {
+            let result = client::command(&credential, CommandCall::UserList).await?;
+            print_users(&result)?;
+        }
+        UserCommand::Role { user, role, id } => {
+            let role = parse_role(&role)?;
+            let user = resolve_user(&credential, &user, id).await?;
+            let result =
+                client::command(&credential, CommandCall::UserSetRole { user, role }).await?;
+            println!("Changed the role. The Space's Users now are:");
+            print_users(&result["users"])?;
+        }
+        UserCommand::Transfer { user, id } => {
+            let user = resolve_user(&credential, &user, id).await?;
+            let result = client::command(&credential, CommandCall::UserTransfer { user }).await?;
+            println!("Transferred the Space. The Space's Users now are:");
+            print_users(&result["users"])?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn invitation(command: InvitationCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        InvitationCommand::Create => {
+            let result = client::command(&credential, CommandCall::InvitationCreate).await?;
+            let secret = result["secret"]
+                .as_str()
+                .with_context(|| "the answer carries no invitation secret")?;
+            let base = credential.url.trim_end_matches('/');
+            println!("Invitation: {base}/invite#{secret}");
+            println!(
+                "Expires: {}",
+                result["invitation"]["expires_at"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            );
+            println!("The link admits one new User as a Member and is shown only once.");
+        }
+        InvitationCommand::List => {
+            let result = client::command(&credential, CommandCall::InvitationList).await?;
+            let invitations = result
+                .as_array()
+                .with_context(|| "the answer carries no invitation list")?;
+            for invitation in invitations {
+                println!(
+                    "{} expires {}",
+                    invitation["id"].as_str().unwrap_or("-"),
+                    invitation["expires_at"].as_str().unwrap_or("-")
+                );
+            }
+        }
+        InvitationCommand::Revoke { invitation } => {
+            let invitation: Id = invitation
+                .parse()
+                .with_context(|| "an invitation identifier looks like an Id")?;
+            client::command(&credential, CommandCall::InvitationRevoke { invitation }).await?;
+            println!("Revoked the invitation {invitation}.");
+        }
+    }
 
     Ok(())
 }
@@ -7398,6 +7586,7 @@ mod tests {
                 id: Id::new(),
                 display_name: "Ada".to_owned(),
                 is_admin: false,
+                role: None,
             },
         }
     }

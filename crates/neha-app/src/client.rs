@@ -42,8 +42,26 @@ pub struct SignedIn {
     pub id: Id,
     /// The display name.
     pub display_name: String,
-    /// Whether the account is the Admin.
+    /// Whether the account administers the Space.
     pub is_admin: bool,
+    /// The role the account holds; a credential saved before roles existed
+    /// reads `None`, and its Admin flag decides.
+    #[serde(default)]
+    pub role: Option<neha::role::Role>,
+}
+
+impl SignedIn {
+    /// Returns the role the account holds in the Space.
+    #[must_use]
+    pub fn role(&self) -> neha::role::Role {
+        self.role.unwrap_or({
+            if self.is_admin {
+                neha::role::Role::Owner
+            } else {
+                neha::role::Role::Member
+            }
+        })
+    }
 }
 
 /// What the CLI remembers between runs.
@@ -219,6 +237,27 @@ async fn session(request: reqwest::RequestBuilder) -> Result<(String, SignedIn)>
         .context("the Space's account does not fit")?;
 
     Ok((token, account))
+}
+
+/// Returns the account the Space currently signs this credential in as.
+///
+/// A role can change while the CLI keeps its credential, so whoami asks the
+/// Space instead of trusting the account saved at sign-in.
+pub async fn me(credential: &Credential) -> Result<SignedIn> {
+    let url = credential.url.trim_end_matches('/');
+    let response = reqwest::Client::new()
+        .get(format!("{url}/api/me"))
+        .bearer_auth(&credential.token)
+        .send()
+        .await
+        .context("the Space could not be reached")?;
+    let body: Value = accepted(response)
+        .await?
+        .json()
+        .await
+        .context("the Space did not answer with JSON")?;
+
+    serde_json::from_value(body).context("the Space's account does not fit")
 }
 
 /// Returns the answer when the Space accepted the request, or names why it refused.

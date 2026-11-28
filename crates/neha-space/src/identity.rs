@@ -1,6 +1,7 @@
 //! Accounts, passwords, paired Computers, and device tokens.
 //!
-//! The first User joins with the Space's invitation and becomes the Admin.
+//! The first User joins with the Space's invitation and becomes its Space
+//! Owner; an invitation admits one later User as a Member.
 //! A password is stored as an Argon2id hash, and a device token is stored only
 //! as its SHA-256 digest.
 //!
@@ -9,6 +10,7 @@
 //! digests.
 
 use serde::Serialize;
+use serde_json::Value;
 
 use std::time::Duration;
 use ts_rs::TS;
@@ -19,6 +21,7 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
+use neha::role::Role;
 use neha::time::Timestamp;
 use rand::{Rng as _, RngExt as _};
 use sha2::{Digest, Sha256};
@@ -64,6 +67,9 @@ pub const PAIRING_POLL_SECS: u64 = 2;
 /// tickets cannot make the table grow without bound.
 pub const MAX_LOCAL_TICKETS_PER_OWNER: i64 = 8;
 
+/// How long an invitation link stays usable, in seconds.
+pub const INVITATION_TTL_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// The bytes of random device identifier a pairing starts with.
 const DEVICE_BYTES: usize = 16;
 
@@ -83,8 +89,27 @@ pub struct Account {
     pub id: Id,
     /// The name the person signs in with.
     pub display_name: String,
-    /// Whether the account is the Space's Admin.
+    /// Whether the account administers the Space: its Owner or an Admin.
+    ///
+    /// Kept beside `role` because the wire type existed before roles did and
+    /// older clients read it.
     pub is_admin: bool,
+    /// The role the account holds in this Space.
+    pub role: neha::role::Role,
+}
+
+impl Account {
+    /// Returns whether this account administers the Space.
+    #[must_use]
+    pub const fn administers(&self) -> bool {
+        self.role.administers()
+    }
+
+    /// Returns whether this account owns the Space.
+    #[must_use]
+    pub const fn owns(&self) -> bool {
+        self.role.owns()
+    }
 }
 
 /// What a Space tells a machine when pairing starts.
@@ -151,7 +176,19 @@ pub struct PairingClaim {
     pub finalized: bool,
 }
 
-/// The Space's accounts, their tokens, and its paired Computers.
+/// An invitation an Admin made, as the pending list shows it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Invitation {
+    /// The invitation identifier.
+    pub id: Id,
+    /// When it was made, in microseconds.
+    pub created_at: i64,
+    /// When it stops working, in microseconds.
+    pub expires_at: i64,
+}
+
+/// The Space's accounts, their tokens, its invitations, and its paired
+/// Computers.
 pub struct Identity {
     pool: SqlitePool,
 }
@@ -190,22 +227,55 @@ impl Identity {
         Ok(count > 0)
     }
 
-    /// Creates the first account as the Admin and returns a device token.
-    pub async fn create_admin(
+    /// Creates the first account as the Space Owner and returns a device
+    /// token.
+    ///
+    /// The insert only succeeds while the Space has no account, so two joins
+    /// that race on the first invitation cannot both become the Owner.
+    pub async fn create_owner(
         &self,
         display_name: &str,
         password: &str,
     ) -> Result<(Account, String), IdentityError> {
         let display_name = validate_display_name(display_name)?;
         validate_password(password)?;
-        if self.has_accounts().await? {
-            return Err(IdentityError::AlreadyInitialized);
+        let id = Id::new();
+        let password_hash = hash_password(password)?;
+        let created_at = Timestamp::now().as_microseconds();
+        let inserted = sqlx::query(
+            "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at, role) \
+             SELECT ?, ?, ?, 1, ?, 'owner' WHERE NOT EXISTS (SELECT 1 FROM accounts)",
+        )
+        .bind(id.to_string())
+        .bind(&display_name)
+        .bind(password_hash)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await;
+        match inserted {
+            Ok(inserted) if inserted.rows_affected() == 0 => {
+                return Err(IdentityError::AlreadyInitialized);
+            }
+            Ok(_) => {}
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                return Err(IdentityError::NameTaken);
+            }
+            Err(error) => return Err(error.into()),
         }
+        let token = self.issue_token(id).await?;
 
-        self.insert_account(&display_name, password, true).await
+        Ok((
+            Account {
+                id,
+                display_name,
+                is_admin: true,
+                role: Role::Owner,
+            },
+            token,
+        ))
     }
 
-    /// Adds an account beyond the Admin, as an invitation will; for the
+    /// Adds an account beyond the first one, as an invitation will; for the
     /// integration tests, through `test_support`.
     #[cfg(feature = "test-support")]
     pub(crate) async fn add_account_for_test(
@@ -215,30 +285,56 @@ impl Identity {
     ) -> Result<Account, IdentityError> {
         let display_name = validate_display_name(display_name)?;
         validate_password(password)?;
-        self.insert_account(&display_name, password, false)
+        self.insert_account(&display_name, password, Role::Member)
             .await
             .map(|(account, _)| account)
     }
 
-    /// Inserts an account and returns it with a device token.
+    /// Creates the account an invitation admits, with the identifier the
+    /// invitation's claim already names.
+    pub async fn create_invited(
+        &self,
+        id: Id,
+        display_name: &str,
+        password: &str,
+    ) -> Result<(Account, String), IdentityError> {
+        let display_name = validate_display_name(display_name)?;
+        validate_password(password)?;
+        self.insert_account_with_id(id, &display_name, password, Role::Member)
+            .await
+    }
+
+    /// Inserts an account with a role and returns it with a device token.
     async fn insert_account(
         &self,
         display_name: &str,
         password: &str,
-        is_admin: bool,
+        role: Role,
     ) -> Result<(Account, String), IdentityError> {
-        let id = Id::new();
+        self.insert_account_with_id(Id::new(), display_name, password, role)
+            .await
+    }
+
+    /// Inserts an account with a given identifier and role.
+    async fn insert_account_with_id(
+        &self,
+        id: Id,
+        display_name: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<(Account, String), IdentityError> {
         let password_hash = hash_password(password)?;
         let created_at = Timestamp::now().as_microseconds();
         let inserted = sqlx::query(
-            "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at) \
-             VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO accounts (id, display_name, password_hash, is_admin, created_at, role) \
+             VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(id.to_string())
         .bind(display_name)
         .bind(password_hash)
-        .bind(is_admin)
+        .bind(role.administers())
         .bind(created_at)
+        .bind(role.as_str())
         .execute(&self.pool)
         .await;
         match inserted {
@@ -254,7 +350,8 @@ impl Identity {
             Account {
                 id,
                 display_name: display_name.to_owned(),
-                is_admin,
+                is_admin: role.administers(),
+                role,
             },
             token,
         ))
@@ -267,7 +364,7 @@ impl Identity {
         password: &str,
     ) -> Result<(Account, String), IdentityError> {
         let row = sqlx::query(
-            "SELECT id, display_name, is_admin, password_hash FROM accounts \
+            "SELECT id, display_name, is_admin, role, password_hash FROM accounts \
              WHERE display_name = ?",
         )
         .bind(display_name)
@@ -292,7 +389,7 @@ impl Identity {
     pub async fn authenticate(&self, token: &str) -> Result<Option<Account>, IdentityError> {
         let digest = digest(token);
         let row = sqlx::query(
-            "SELECT a.id, a.display_name, a.is_admin FROM tokens t \
+            "SELECT a.id, a.display_name, a.is_admin, a.role FROM tokens t \
              JOIN accounts a ON a.id = t.account_id WHERE t.token_hash = ?",
         )
         .bind(digest.as_slice())
@@ -415,7 +512,7 @@ impl Identity {
         owner: Id,
     ) -> Result<Option<Account>, IdentityError> {
         let row = sqlx::query(
-            "SELECT a.id, a.display_name, a.is_admin, l.owner, l.code_hash \
+            "SELECT a.id, a.display_name, a.is_admin, a.role, l.owner, l.code_hash \
              FROM device_logins l JOIN accounts a ON a.id = l.owner \
              WHERE l.command = ?",
         )
@@ -451,7 +548,7 @@ impl Identity {
         command: Id,
     ) -> Result<Option<Account>, IdentityError> {
         let row = sqlx::query(
-            "SELECT a.id, a.display_name, a.is_admin FROM device_logins l \
+            "SELECT a.id, a.display_name, a.is_admin, a.role FROM device_logins l \
              JOIN accounts a ON a.id = l.owner WHERE l.command = ?",
         )
         .bind(command.to_string())
@@ -551,15 +648,342 @@ impl Identity {
         Ok(claims)
     }
 
-    /// Returns the Space's Admin, once the first User has joined.
-    pub async fn admin_account(&self) -> Result<Option<Account>, IdentityError> {
+    /// Returns the Space's Owner, once the first User has joined.
+    pub async fn owner_account(&self) -> Result<Option<Account>, IdentityError> {
         let row = sqlx::query(
-            "SELECT id, display_name, is_admin FROM accounts WHERE is_admin = 1 LIMIT 1",
+            "SELECT id, display_name, is_admin, role FROM accounts \
+             WHERE role = 'owner' LIMIT 1",
         )
         .fetch_optional(&self.pool)
         .await?;
 
         row.as_ref().map(account_from_row).transpose()
+    }
+
+    /// Returns every account identifier the Space holds.
+    pub async fn account_ids(&self) -> Result<Vec<Id>, IdentityError> {
+        let rows = sqlx::query("SELECT id FROM accounts")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.iter()
+            .map(|row| -> Result<Id, IdentityError> {
+                let id: String = row.try_get("id")?;
+                id.parse().map_err(|_| IdentityError::Corrupt)
+            })
+            .collect()
+    }
+
+    /// Deletes an account and the tokens that sign it in.
+    ///
+    /// A join that ends between the account and the record leaves an account
+    /// that never became a User; the start-up repair drops it here.
+    pub async fn forget_account(&self, account: Id) -> Result<(), IdentityError> {
+        // Reserve the write lock before reading, so another writer cannot make
+        // this snapshot stale between a check and its write.
+        let mut transaction = self
+            .pool
+            .begin_with(sqlx::AssertSqlSafe("BEGIN IMMEDIATE"))
+            .await?;
+        sqlx::query("DELETE FROM tokens WHERE account_id = ?")
+            .bind(account.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM accounts WHERE id = ?")
+            .bind(account.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    /// Sets an account's role and keeps its legacy Admin flag in step.
+    pub async fn set_role(&self, account: Id, role: Role) -> Result<bool, IdentityError> {
+        let updated = sqlx::query(
+            "UPDATE accounts SET role = ?, is_admin = ? \
+             WHERE id = ? AND (role <> ? OR is_admin <> ?)",
+        )
+        .bind(role.as_str())
+        .bind(role.administers())
+        .bind(account.to_string())
+        .bind(role.as_str())
+        .bind(role.administers())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(updated.rows_affected() > 0)
+    }
+
+    /// Brings the stored roles in step with the record.
+    ///
+    /// The record decides a role; the account row is what authenticates a
+    /// call. A start repairs a change that ended between the two writes.
+    pub async fn sync_roles(&self, roles: &[(Id, Role)]) -> Result<usize, IdentityError> {
+        let mut changed = 0;
+        for (account, role) in roles {
+            if self.set_role(*account, *role).await? {
+                changed += 1;
+            }
+        }
+
+        Ok(changed)
+    }
+
+    /// Makes an invitation link and returns it with the secret it carries.
+    ///
+    /// The invitation takes the given identifier, so a repeated call answers
+    /// that same invitation and rotates nothing. The secret is returned once:
+    /// the Space keeps only its digest.
+    pub async fn create_invitation(
+        &self,
+        id: Id,
+        created_by: Id,
+    ) -> Result<(Invitation, Option<String>), IdentityError> {
+        self.create_invitation_at(id, now(), created_by).await
+    }
+
+    /// Makes an invitation link at an explicit instant.
+    async fn create_invitation_at(
+        &self,
+        id: Id,
+        created_at: i64,
+        created_by: Id,
+    ) -> Result<(Invitation, Option<String>), IdentityError> {
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            if let Some(invitation) = existing_invitation(&mut connection, id, created_by).await? {
+                return Ok((invitation, None));
+            }
+
+            let (invitation, secret) =
+                insert_invitation(&mut connection, id, created_at, created_by).await?;
+
+            Ok((invitation, Some(secret)))
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
+    }
+
+    /// Makes an invitation for one command, recording its answer in the same
+    /// transaction.
+    ///
+    /// A crash either leaves both the invitation and the command's answer or
+    /// neither, so a retry never rotates a newer invitation the command never
+    /// made, and it never hands the secret out twice.
+    pub async fn create_invitation_for_command(
+        &self,
+        command: Id,
+        fingerprint: &str,
+        created_by: Id,
+        administers: bool,
+    ) -> Result<InvitationCreated, IdentityError> {
+        let created_at = now();
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            if let Some(answer) = recorded_command(&mut connection, command, fingerprint).await? {
+                let notice = notice_for(&mut connection, command).await?;
+                return Ok(InvitationCreated::Recorded { answer, notice });
+            }
+            if !administers {
+                return Err(IdentityError::Forbidden);
+            }
+
+            let (invitation, secret) =
+                insert_invitation(&mut connection, command, created_at, created_by).await?;
+            let answer = invitation_created_answer(&invitation, created_by)?;
+            record_command_answer(&mut connection, command, fingerprint, &answer).await?;
+            let notice = record_notice(&mut connection, command, created_by).await?;
+
+            Ok(InvitationCreated::Made {
+                invitation,
+                secret,
+                answer,
+                notice,
+            })
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
+    }
+
+    /// Returns the invitations that still admit one User, oldest first.
+    pub async fn invitations(&self) -> Result<Vec<Invitation>, IdentityError> {
+        let rows = sqlx::query(
+            "SELECT id, created_at, expires_at FROM invitations \
+             WHERE claimed_by IS NULL AND expires_at > ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(now())
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| -> Result<Invitation, IdentityError> {
+                let id: String = row.try_get("id")?;
+                Ok(Invitation {
+                    id: id.parse().map_err(|_| IdentityError::Corrupt)?,
+                    created_at: row.try_get("created_at")?,
+                    expires_at: row.try_get("expires_at")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Revokes a pending invitation. Returns whether one was revoked.
+    ///
+    /// An invitation a join is already claiming stays: the join owns it until
+    /// it finishes or the start-up repair releases it.
+    pub async fn revoke_invitation(&self, invitation: Id) -> Result<bool, IdentityError> {
+        let deleted = sqlx::query("DELETE FROM invitations WHERE id = ? AND claimed_by IS NULL")
+            .bind(invitation.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(deleted.rows_affected() > 0)
+    }
+
+    /// Revokes a pending invitation for one command, recording its answer in
+    /// the same transaction.
+    ///
+    /// A crash either leaves the invitation revoked with its answer recorded or
+    /// leaves both, so a retry answers from the record or finds the invitation
+    /// already gone rather than inventing a success.
+    pub async fn revoke_invitation_for_command(
+        &self,
+        command: Id,
+        fingerprint: &str,
+        created_by: Id,
+        invitation: Id,
+        administers: bool,
+    ) -> Result<InvitationRevoked, IdentityError> {
+        let mut connection = self.pool.acquire().await?;
+        begin_immediate(&mut connection).await?;
+        let result = async {
+            if let Some(answer) = recorded_command(&mut connection, command, fingerprint).await? {
+                let notice = notice_for(&mut connection, command).await?;
+                return Ok(InvitationRevoked::Recorded { answer, notice });
+            }
+            if !administers {
+                return Err(IdentityError::Forbidden);
+            }
+
+            let deleted =
+                sqlx::query("DELETE FROM invitations WHERE id = ? AND claimed_by IS NULL")
+                    .bind(invitation.to_string())
+                    .execute(&mut *connection)
+                    .await?;
+            if deleted.rows_affected() == 0 {
+                return Ok(InvitationRevoked::Absent);
+            }
+            let answer = serde_json::json!({
+                "user": created_by.to_string(),
+                "invitation": invitation.to_string(),
+                "revoked": true,
+            });
+            record_command_answer(&mut connection, command, fingerprint, &answer).await?;
+            let notice = record_notice(&mut connection, command, created_by).await?;
+
+            Ok(InvitationRevoked::Revoked { answer, notice })
+        }
+        .await;
+
+        finish_immediate(&mut connection, result).await
+    }
+
+    /// Returns the notices a change still owes, with their author.
+    ///
+    /// A start replays them, so a crash between a change's transaction and its
+    /// event's append loses no notification.
+    pub async fn pending_notices(&self) -> Result<Vec<(Id, Id, Id)>, IdentityError> {
+        let rows = sqlx::query(
+            "SELECT command_id, event_command, author FROM invitation_notices \
+             ORDER BY created_at ASC, command_id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| -> Result<(Id, Id, Id), IdentityError> {
+                let command: String = row.try_get("command_id")?;
+                let event_command: String = row.try_get("event_command")?;
+                let author: String = row.try_get("author")?;
+                let parse = |text: &str| text.parse::<Id>().map_err(|_| IdentityError::Corrupt);
+
+                Ok((parse(&command)?, parse(&event_command)?, parse(&author)?))
+            })
+            .collect()
+    }
+
+    /// Forgets a notice whose event the record now holds.
+    pub async fn clear_notice(&self, command: Id) -> Result<(), IdentityError> {
+        sqlx::query("DELETE FROM invitation_notices WHERE command_id = ?")
+            .bind(command.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Claims an invitation for one account that is about to be created.
+    ///
+    /// The claim is one conditional update, so two joins that present the same
+    /// secret cannot both take it.
+    pub async fn reserve_invitation(
+        &self,
+        secret: &str,
+        account: Id,
+    ) -> Result<bool, IdentityError> {
+        let secret_hash = digest(secret);
+        let claimed = sqlx::query(
+            "UPDATE invitations SET claimed_by = ? \
+             WHERE secret_hash = ? AND claimed_by IS NULL AND expires_at > ?",
+        )
+        .bind(account.to_string())
+        .bind(secret_hash.as_slice())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(claimed.rows_affected() > 0)
+    }
+
+    /// Finishes the invitation a join claimed: it admits no one else.
+    pub async fn finalize_invitation(&self, account: Id) -> Result<(), IdentityError> {
+        sqlx::query("DELETE FROM invitations WHERE claimed_by = ?")
+            .bind(account.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Releases the invitation a join claimed, so it admits one User again.
+    pub async fn release_invitation(&self, account: Id) -> Result<(), IdentityError> {
+        sqlx::query("UPDATE invitations SET claimed_by = NULL WHERE claimed_by = ?")
+            .bind(account.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Returns the accounts whose join claimed an invitation and has not
+    /// finished.
+    pub async fn invitation_claims(&self) -> Result<Vec<Id>, IdentityError> {
+        let rows = sqlx::query("SELECT claimed_by FROM invitations WHERE claimed_by IS NOT NULL")
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.iter()
+            .map(|row| -> Result<Id, IdentityError> {
+                let account: String = row.try_get("claimed_by")?;
+                account.parse().map_err(|_| IdentityError::Corrupt)
+            })
+            .collect()
     }
 
     /// Forgets every local ticket.
@@ -956,7 +1380,7 @@ impl Identity {
         // together. A row whose session token is gone has no approved session
         // to hand out; the CLI keeps waiting until the code expires.
         let account = sqlx::query(
-            "SELECT a.id, a.display_name, a.is_admin FROM tokens t \
+            "SELECT a.id, a.display_name, a.is_admin, a.role FROM tokens t \
              JOIN accounts a ON a.id = t.account_id \
              WHERE t.token_hash = ? AND t.account_id = ?",
         )
@@ -1019,10 +1443,11 @@ impl Identity {
                 return Err(sqlx::Error::Database(error).into());
             }
             inserted.map_err(IdentityError::Database)?;
-            let row = sqlx::query("SELECT id, display_name, is_admin FROM accounts WHERE id = ?")
-                .bind(owner.to_string())
-                .fetch_one(&mut *connection)
-                .await?;
+            let row =
+                sqlx::query("SELECT id, display_name, is_admin, role FROM accounts WHERE id = ?")
+                    .bind(owner.to_string())
+                    .fetch_one(&mut *connection)
+                    .await?;
             account_from_row(&row)
         }
         .await;
@@ -1202,7 +1627,12 @@ impl Identity {
         code: &str,
     ) -> Result<Option<PairingRequest>, IdentityError> {
         let code_hash = digest(&normalize_code(code));
-        let mut transaction = self.pool.begin().await?;
+        // Reserve the write lock before reading, so another writer cannot make
+        // this snapshot stale between a check and its write.
+        let mut transaction = self
+            .pool
+            .begin_with(sqlx::AssertSqlSafe("BEGIN IMMEDIATE"))
+            .await?;
         let updated = sqlx::query(
             "UPDATE computer_codes SET tries = tries + 1 \
              WHERE code_hash = ? AND owner IS NULL AND expires_at > ? AND tries < ?",
@@ -1455,10 +1885,13 @@ async fn finish_immediate<T>(
 
 fn account_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<Account, IdentityError> {
     let id: String = row.try_get("id")?;
+    let role: String = row.try_get("role")?;
+    let role: Role = role.parse().map_err(|_| IdentityError::Corrupt)?;
     Ok(Account {
         id: id.parse().map_err(|_| IdentityError::Corrupt)?,
         display_name: row.try_get("display_name")?,
-        is_admin: row.try_get("is_admin")?,
+        is_admin: role.administers(),
+        role,
     })
 }
 
@@ -1541,8 +1974,14 @@ pub enum IdentityError {
     /// Another account already uses the name.
     #[error("display name is taken")]
     NameTaken,
+    /// A command identifier was used for a different request.
+    #[error("the command was used for a different request")]
+    CommandConflict,
+    /// The caller may not make this change.
+    #[error("not allowed")]
+    Forbidden,
     /// The Space already has its first account.
-    #[error("the Space already has its Admin")]
+    #[error("the Space already has its Space Owner")]
     AlreadyInitialized,
     /// The name or password does not match.
     #[error("invalid credentials")]
@@ -1565,6 +2004,223 @@ pub enum IdentityError {
     InvalidDeviceCode,
 }
 
+/// What a create-invitation command left behind.
+pub enum InvitationCreated {
+    /// A fresh invitation, with the secret this answer shows once.
+    Made {
+        /// The invitation the command made.
+        invitation: Invitation,
+        /// The secret the link carries.
+        secret: String,
+        /// The answer the command records, without the secret.
+        answer: Value,
+        /// The command the matching `neha.invitation.changed` event takes.
+        notice: Id,
+    },
+    /// The answer this command recorded when it ran before.
+    Recorded {
+        /// The answer the command recorded.
+        answer: Value,
+        /// The event command still owed, when an earlier attempt did not append
+        /// it.
+        notice: Option<Id>,
+    },
+}
+
+/// What a revoke-invitation command left behind.
+pub enum InvitationRevoked {
+    /// The invitation is revoked, and the command recorded this answer.
+    Revoked {
+        /// The answer the command recorded.
+        answer: Value,
+        /// The command the matching `neha.invitation.changed` event takes.
+        notice: Id,
+    },
+    /// The answer this command recorded when it ran before.
+    Recorded {
+        /// The answer the command recorded.
+        answer: Value,
+        /// The event command still owed, when an earlier attempt did not append
+        /// it.
+        notice: Option<Id>,
+    },
+    /// No pending invitation had that identifier.
+    Absent,
+}
+
+/// Returns the invitation a repeated create names, if it exists.
+async fn existing_invitation(
+    connection: &mut sqlx::SqliteConnection,
+    id: Id,
+    created_by: Id,
+) -> Result<Option<Invitation>, IdentityError> {
+    let row =
+        sqlx::query("SELECT created_by, created_at, expires_at FROM invitations WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let owner: String = row.try_get("created_by")?;
+    if owner != created_by.to_string() {
+        return Err(IdentityError::Corrupt);
+    }
+
+    Ok(Some(Invitation {
+        id,
+        created_at: row.try_get("created_at")?,
+        expires_at: row.try_get("expires_at")?,
+    }))
+}
+
+/// Replaces every earlier invitation with one that takes the command's
+/// identifier, and returns it with its secret.
+async fn insert_invitation(
+    connection: &mut sqlx::SqliteConnection,
+    id: Id,
+    created_at: i64,
+    created_by: Id,
+) -> Result<(Invitation, String), IdentityError> {
+    let mut bytes = [0_u8; 32];
+    rand::rng().fill_bytes(&mut bytes);
+    let secret = URL_SAFE_NO_PAD.encode(bytes);
+    let secret_hash = digest(&secret);
+    let expires_at = created_at.saturating_add(INVITATION_TTL_SECS.saturating_mul(1_000_000));
+
+    // A new link replaces every earlier one, claimed or not: an older link that
+    // was shared stops working even if its first join failed.
+    sqlx::query("DELETE FROM invitations")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query(
+        "INSERT INTO invitations (id, secret_hash, created_by, created_at, expires_at) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(id.to_string())
+    .bind(secret_hash.as_slice())
+    .bind(created_by.to_string())
+    .bind(created_at)
+    .bind(expires_at)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok((
+        Invitation {
+            id,
+            created_at,
+            expires_at,
+        },
+        secret,
+    ))
+}
+
+/// The answer a create-invitation command records: the invitation and its
+/// maker, never the secret.
+fn invitation_created_answer(
+    invitation: &Invitation,
+    created_by: Id,
+) -> Result<Value, IdentityError> {
+    let created_at =
+        Timestamp::from_microseconds(invitation.created_at).ok_or(IdentityError::Corrupt)?;
+    let expires_at =
+        Timestamp::from_microseconds(invitation.expires_at).ok_or(IdentityError::Corrupt)?;
+    let view = crate::state::InvitationView {
+        id: invitation.id,
+        created_at,
+        expires_at,
+    };
+
+    serde_json::to_value(serde_json::json!({
+        "user": created_by.to_string(),
+        "invitation": view,
+    }))
+    .map_err(|_| IdentityError::Corrupt)
+}
+
+/// Returns a recorded command's answer if this fingerprint already ran it.
+async fn recorded_command(
+    connection: &mut sqlx::SqliteConnection,
+    command: Id,
+    fingerprint: &str,
+) -> Result<Option<Value>, IdentityError> {
+    let row = sqlx::query("SELECT fingerprint, result FROM commands WHERE command_id = ?")
+        .bind(command.to_string())
+        .fetch_optional(&mut *connection)
+        .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let stored: String = row.try_get("fingerprint")?;
+    if stored != fingerprint {
+        return Err(IdentityError::CommandConflict);
+    }
+    let answer: Option<String> = row.try_get("result")?;
+    let answer = answer.ok_or(IdentityError::Corrupt)?;
+
+    serde_json::from_str(&answer).map_err(|_| IdentityError::Corrupt)
+}
+
+/// Records a command's answer in the transaction that changed the identity.
+async fn record_command_answer(
+    connection: &mut sqlx::SqliteConnection,
+    command: Id,
+    fingerprint: &str,
+    answer: &Value,
+) -> Result<(), IdentityError> {
+    let stored = serde_json::to_string(answer).map_err(|_| IdentityError::Corrupt)?;
+    sqlx::query(
+        "INSERT INTO commands (command_id, fingerprint, first_seq, last_seq, result) \
+         VALUES (?, ?, 0, 0, ?)",
+    )
+    .bind(command.to_string())
+    .bind(fingerprint)
+    .bind(stored)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(())
+}
+
+/// Returns the event command a change still owes, if it was not appended.
+async fn notice_for(
+    connection: &mut sqlx::SqliteConnection,
+    command: Id,
+) -> Result<Option<Id>, IdentityError> {
+    let row: Option<String> =
+        sqlx::query_scalar("SELECT event_command FROM invitation_notices WHERE command_id = ?")
+            .bind(command.to_string())
+            .fetch_optional(&mut *connection)
+            .await?;
+
+    row.map(|text| text.parse().map_err(|_| IdentityError::Corrupt))
+        .transpose()
+}
+
+/// Records the event a change owes in the transaction that made the change.
+///
+/// The event command is chosen here, so an append that a crash interrupted can
+/// be retried with the same identifier and answers its earlier events.
+async fn record_notice(
+    connection: &mut sqlx::SqliteConnection,
+    command: Id,
+    created_by: Id,
+) -> Result<Id, IdentityError> {
+    let event_command = Id::new();
+    sqlx::query(
+        "INSERT INTO invitation_notices (command_id, event_command, author, created_at) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(command.to_string())
+    .bind(event_command.to_string())
+    .bind(created_by.to_string())
+    .bind(now())
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(event_command)
+}
+
 /// What the integration tests need from inside this module.
 ///
 /// Integration tests live in `tests/` and see only the crate's public
@@ -1576,7 +2232,7 @@ pub enum IdentityError {
 pub mod test_support {
     use neha::id::Id;
 
-    use super::{Account, Identity, IdentityError, PairingStart};
+    use super::{Account, Identity, IdentityError, Invitation, PairingStart};
 
     /// The characters a pairing code is drawn from.
     pub const CODE_ALPHABET: &[u8] = super::CODE_ALPHABET;
@@ -1598,13 +2254,23 @@ pub mod test_support {
     }
 
     impl Identity {
-        /// Adds an account beyond the Admin, as an invitation will; for tests.
+        /// Adds an account beyond the first one; for tests.
         pub async fn test_add_account_for_test(
             &self,
             display_name: &str,
             password: &str,
         ) -> Result<Account, IdentityError> {
             self.add_account_for_test(display_name, password).await
+        }
+
+        /// Makes an invitation at an explicit instant, for tests of expiry.
+        pub async fn test_create_invitation_at(
+            &self,
+            id: Id,
+            created_at: i64,
+            created_by: Id,
+        ) -> Result<(Invitation, Option<String>), IdentityError> {
+            self.create_invitation_at(id, created_at, created_by).await
         }
 
         /// Moves a claim past its expiry, for tests that exercise recovery.
