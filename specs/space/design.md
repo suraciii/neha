@@ -53,7 +53,11 @@ A reader keeps every event. A kind it does not know that decides who can read or
 
 A caller that names no Presentation kinds reads every kind its protocol version already carries; a later Presentation kind reaches only a caller that names it.
 
-A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The two memory kinds and `neha.chat.compacted` change no right to read, write, act, or approve.
+A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory and compaction kinds change no right to read, write, act, or approve.
+
+A caller names the capability that admits a later kind, such as `memory`; the command surface defines the capability names and the fixed set of kinds each one admits, as [CLI](../cli/design.md#versions) states. A capability admits no kind added after it was published; a later kind needs a new capability name.
+
+A capable caller still receives only the events its account can see.
 
 ## Approval events
 
@@ -96,12 +100,17 @@ The record holds these kinds for a Bot's memory:
 | --- | --- |
 | `neha.memory.added` | The entry: its id, Bot, kind, scope, author, source, text, and `replaces: [id]`, the entries it replaces |
 | `neha.memory.removed` | The entry's id |
+| `neha.memory.answered` | The run, step, call, and the answer a memory tool gave |
 
 The `replaces` list names every entry the write replaces, so a replay applies the whole write or none.
 
-Both are Presentation events: a reader that does not know the kind skips it and asks for no upgrade.
+For each memory tool result the Bot receives, the Space records the exact answer, including a no-op, a refusal, or an error. The answer is appended in the same commit as the entry changes the call makes, or alone when the call changes no memory entry. A replay takes the recorded answer and does not run the memory call again.
 
-A `neha.memory.added` event is authored by the Bot, with the acting User. A `neha.memory.removed` event is authored by the User who removes the entry; the Bot authors it, acting for that User, when it removes a `note`. A memory event goes only to its author or acting User, so the owner never receives a `user` entry's text.
+Each memory kind is a Presentation event: a reader that does not know the kind skips it and asks for no upgrade.
+
+A `neha.memory.added` event and a `neha.memory.answered` event are authored by the Bot, with the acting User. A `neha.memory.removed` event is authored by the User who removes the entry; the Bot authors it, acting for that User, when it removes a `note`.
+
+A memory event goes only to its author or acting User, so the owner never receives a `user` entry's text.
 
 The owner reads an entry's metadata through the command surface.
 
