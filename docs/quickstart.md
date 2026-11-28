@@ -183,6 +183,14 @@ target/debug/neha run show "$RUN_ID"
 
 `neha run show` prints `position N` while the run waits in the queue, and no position once it starts.
 
+A Run can keep a plan of the work the Bot means to do for the request. Print it with:
+
+```bash
+target/debug/neha run plan "$RUN_ID"
+```
+
+The command prints `Plan for run <id>: 1 of 3 done`, then one line per entry with its state in brackets, such as `  [doing] Buy the ticket`. It changes nothing. A Run with no plan prints `Plan for run <id>: no plan`.
+
 ## Put a Bot on a Local Computer
 
 A Local Computer is the machine where Neha runs: a Neha process that connects out to the Space and runs each Bot's actions in the Bot's own directory inside that Computer's Workspace on the machine. This milestone pairs the machine that runs the Space, because the Space listens on loopback only.
@@ -314,4 +322,4 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 - The browser client downloads a File and opens no preview of it. Choosing a file card downloads the File.
 - The Bot's page shows a Bot's picture and who can use it. Changing the picture, and sharing a Bot with other Users, come later.
 - A Bot on a Hosted Computer does not ask before the actions its Computer runs, so its page offers no rule for those. It still lists and removes its rules for a skill's script or an MCP server's tool, which ask on either Computer.
-- The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed with the state, the step, and the tools in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.
+- The browser client does not stream a reply. It shows a working state while the Run works, and one activity card starts collapsed. A Run with a plan shows a progress bar and the count of done lines in its title row, and the plan appears when the card expands. A Run without a plan keeps the state, the step, and the tools in use in its title row. An action appears when it starts and updates with its result, and a failed Run expands the card to its reason.

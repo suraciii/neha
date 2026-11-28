@@ -1485,6 +1485,82 @@ async fn a_bot_works_on_its_computer_with_tools() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_run_plan_prints_what_the_bot_planned() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential: PathBuf = directory.path().join("session").join("credential.json");
+    let (base, script, provider_task) = scripted_provider().await;
+    script.call(
+        "plan",
+        serde_json::json!({"entries": [
+            {"title": "Read the receipts", "state": "done"},
+            {"title": "Buy the pass", "state": "doing"},
+        ]}),
+    );
+    script.call(
+        "plan",
+        serde_json::json!({"entries": [
+            {"title": "Read the receipts", "state": "done"},
+            {"title": "Buy the pass", "state": "done"},
+            {"title": "Email finance", "state": "pending"},
+        ]}),
+    );
+    script.say("Done.");
+
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    run(&home, &credential, &["bot", "create", "Scout"]);
+
+    let sent = run(&home, &credential, &["chat", "send", "do the work"]);
+    assert!(sent.contains("Done."), "{sent}");
+    let run_id = field(&sent, "run ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+
+    // `run plan` prints the newest list the record holds, with each line's
+    // state; it writes nothing, so a second read prints the same answer.
+    let plan = run(&home, &credential, &["run", "plan", &run_id]);
+    assert!(
+        plan.starts_with(&format!("Plan for run {run_id}: 2 of 3 done\n")),
+        "{plan}"
+    );
+    assert!(plan.contains("  [done] Read the receipts"), "{plan}");
+    assert!(plan.contains("  [done] Buy the pass"), "{plan}");
+    assert!(plan.contains("  [pending] Email finance"), "{plan}");
+    let again = run(&home, &credential, &["run", "plan", &run_id]);
+    assert_eq!(again, plan, "the command changes nothing");
+
+    // A Run that kept no plan says so.
+    script.say("No plan needed.");
+    let plain = run(&home, &credential, &["chat", "send", "just answer"]);
+    let plain_id = field(&plain, "run ")
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let plan = run(&home, &credential, &["run", "plan", &plain_id]);
+    assert!(plan.contains(": no plan"), "{plan}");
+
+    drop(server);
+    provider_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_user_runs_a_space_and_chats_with_a_bot() {
     let directory = tempfile::tempdir().unwrap();
     let home = directory.path().join("home");

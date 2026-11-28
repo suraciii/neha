@@ -469,6 +469,11 @@ enum RunCommand {
         /// The run identifier.
         run: Id,
     },
+    /// Print the plan one run kept.
+    Plan {
+        /// The run identifier.
+        run: Id,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1350,6 +1355,10 @@ fn visible_text(text: &str) -> String {
             '\n' => shown.push_str("\\n"),
             '\r' => shown.push_str("\\r"),
             '\t' => shown.push_str("\\t"),
+            // A line or paragraph separator ends a line the same way a
+            // newline does.
+            '\u{2028}' => shown.push_str("\\u{2028}"),
+            '\u{2029}' => shown.push_str("\\u{2029}"),
             ch if ch.is_control() => {
                 shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
             }
@@ -2043,6 +2052,33 @@ async fn file(command: FileCommand) -> Result<()> {
     Ok(())
 }
 
+/// Prints one run's plan the way `run plan` reports it.
+fn write_plan(out: &mut impl Write, result: &Value) -> Result<()> {
+    let run = id_of(result, "id")?;
+    let entries = result["plan"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        writeln!(out, "Plan for run {run}: no plan")?;
+        return Ok(());
+    }
+    let done = entries
+        .iter()
+        .filter(|entry| entry["state"].as_str() == Some("done"))
+        .count();
+    writeln!(out, "Plan for run {run}: {done} of {} done", entries.len())?;
+    for entry in &entries {
+        // A title is the Bot's own text: escaping its breaks and controls
+        // keeps one entry on one line and the terminal's state out of it.
+        writeln!(
+            out,
+            "  [{}] {}",
+            entry["state"].as_str().unwrap_or("?"),
+            visible_text(entry["title"].as_str().unwrap_or(""))
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Reads the name the Space gave a File, as one path component.
 ///
 /// Only an implicit destination, or a `--out` directory, needs this name.
@@ -2071,6 +2107,11 @@ async fn run_command(command: RunCommand) -> Result<()> {
             let result = client::command(&credential, CommandCall::RunShow { run }).await?;
             let stdout = std::io::stdout();
             write_run(&mut stdout.lock(), &result)?;
+        }
+        RunCommand::Plan { run } => {
+            let result = client::command(&credential, CommandCall::RunShow { run }).await?;
+            let stdout = std::io::stdout();
+            write_plan(&mut stdout.lock(), &result)?;
         }
     }
 
@@ -4616,14 +4657,14 @@ mod tests {
 
     use crate::client::{Credential, SignedIn};
 
-    use super::{space_file_name, write_run};
+    use super::{space_file_name, write_plan, write_run};
 
     use clap::CommandFactory as _;
     use clap::Parser as _;
 
     use super::{
-        Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer,
-        parse_protocol, parse_thinking,
+        Cli, ComputerCommand, RunCommand, Top, computer_kind_label, pairing_hint,
+        parse_bot_computer, parse_protocol, parse_thinking,
     };
 
     use super::{
@@ -4992,6 +5033,7 @@ mod tests {
             "usage": null,
             "steps": [],
             "actions": [],
+            "plan": [],
         });
         if let Some(position) = position {
             view["position"] = position.into();
@@ -5013,6 +5055,60 @@ mod tests {
         write_run(&mut shown, &running).unwrap();
         let shown = String::from_utf8(shown).unwrap();
         assert!(!shown.contains("position"), "{shown}");
+    }
+
+    #[test]
+    fn a_run_plan_prints_each_line_and_its_done_count() {
+        let mut view = run_view("succeeded", None);
+        view["plan"] = json!([
+            {"title": "Read the receipts", "state": "done"},
+            {"title": "Buy the pass", "state": "doing"},
+            {"title": "Email finance", "state": "pending"},
+        ]);
+        let mut shown = Vec::new();
+        write_plan(&mut shown, &view).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        let run = view["id"].as_str().unwrap();
+        assert!(
+            shown.starts_with(&format!("Plan for run {run}: 1 of 3 done\n")),
+            "{shown}"
+        );
+        assert!(shown.contains("  [done] Read the receipts"), "{shown}");
+        assert!(shown.contains("  [doing] Buy the pass"), "{shown}");
+        assert!(shown.contains("  [pending] Email finance"), "{shown}");
+
+        let empty = run_view("succeeded", None);
+        let mut shown = Vec::new();
+        write_plan(&mut shown, &empty).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains(": no plan"), "{shown}");
+    }
+
+    #[test]
+    fn a_run_plan_title_prints_on_one_line() {
+        let mut view = run_view("succeeded", None);
+        view["plan"] = json!([
+            {"title": "a\nforged \u{1b}[31mred", "state": "doing"},
+        ]);
+        let mut shown = Vec::new();
+        write_plan(&mut shown, &view).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(
+            shown.contains("  [doing] a\\nforged \\u{1b}[31mred\n"),
+            "{shown}"
+        );
+        assert_eq!(shown.lines().count(), 2, "{shown}");
+    }
+
+    #[test]
+    fn the_run_plan_command_parses() {
+        let id = Id::new();
+        match parse(&["run", "plan", id.to_string().as_str()]) {
+            Top::Run {
+                command: RunCommand::Plan { run },
+            } => assert_eq!(run, id),
+            _ => panic!("run plan did not parse"),
+        }
     }
 
     #[test]
@@ -7843,6 +7939,7 @@ mod tests {
         assert_eq!(visible_text("one\ntwo"), r"one\ntwo");
         assert_eq!(visible_text("one\ttwo"), r"one\ttwo");
         assert_eq!(visible_text("one\rtwo"), r"one\rtwo");
+        assert_eq!(visible_text("one\u{2028}two"), r"one\u{2028}two");
         // Every other control character, including the C1 block, is named.
         assert_eq!(
             visible_text("\u{0}\u{7}\u{1b}\u{7f}\u{85}"),

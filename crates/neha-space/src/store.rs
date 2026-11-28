@@ -1292,6 +1292,17 @@ mod tests {
                 }),
             )
             .acting(user),
+            EventKind::RunPlanned => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "run": Id::new(),
+                    "step": 1,
+                    "call": "call-1",
+                    "entries": [{"title": "a line", "state": "done"}],
+                }),
+            )
+            .acting(user),
         }
     }
 

@@ -158,6 +158,9 @@ pub enum EventKind {
     /// A Bot compacted a span of a Chat's Messages into a summary.
     #[serde(rename = "neha.chat.compacted")]
     ChatCompacted,
+    /// A Bot replaced the plan of one run.
+    #[serde(rename = "neha.run.planned")]
+    RunPlanned,
 }
 
 impl EventKind {
@@ -207,6 +210,7 @@ impl EventKind {
             Self::MemoryRemoved => "neha.memory.removed",
             Self::MemoryAnswered => "neha.memory.answered",
             Self::ChatCompacted => "neha.chat.compacted",
+            Self::RunPlanned => "neha.run.planned",
         }
     }
 
@@ -230,6 +234,9 @@ impl EventKind {
             // A summary decides nothing about access or work: a reader that
             // does not know it reads the original Messages and reads on.
             Self::ChatCompacted => EventClass::Presentation,
+            // A plan decides nothing about access or work either: a reader
+            // that does not know it shows no progress and reads on.
+            Self::RunPlanned => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunContext
@@ -315,6 +322,7 @@ impl FromStr for EventKind {
             "neha.memory.removed" => Ok(Self::MemoryRemoved),
             "neha.memory.answered" => Ok(Self::MemoryAnswered),
             "neha.chat.compacted" => Ok(Self::ChatCompacted),
+            "neha.run.planned" => Ok(Self::RunPlanned),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -393,8 +401,9 @@ mod tests {
         ComputerSharing, ComputerUpdated, EventData, EventDataError, EventDraft, EventKind,
         FileAdded, FileError, MAX_CARD_CSP_BYTES, MAX_CARD_VALUE_BYTES, MAX_MCP_ARG_BYTES,
         MAX_MCP_ARGS, MAX_MCP_ARGS_BYTES, MAX_MCP_COMMAND_BYTES, MAX_MCP_ENV,
-        MAX_MCP_ENV_VALUE_BYTES, McpScope, McpServerAdded, McpTransport, MemoryAdded,
-        MemoryAnswered, MemoryRemoved, RunAccess, RunQueued, SkillAdded, SkillLibrary, SkillScript,
+        MAX_MCP_ENV_VALUE_BYTES, MAX_PLAN_ENTRIES, MAX_PLAN_TITLE_BYTES, McpScope, McpServerAdded,
+        McpTransport, MemoryAdded, MemoryAnswered, MemoryRemoved, PlanEntry, PlanState, RunAccess,
+        RunPlanned, RunQueued, SkillAdded, SkillLibrary, SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -1922,6 +1931,146 @@ mod tests {
     }
 
     #[test]
+    fn a_plan_write_round_trips() {
+        let data = RunPlanned {
+            run: Id::new(),
+            step: 2,
+            call: "call-1".to_owned(),
+            entries: vec![
+                PlanEntry {
+                    title: "Read the receipts".to_owned(),
+                    state: PlanState::Done,
+                },
+                PlanEntry {
+                    title: "Buy the pass".to_owned(),
+                    state: PlanState::Doing,
+                },
+            ],
+        };
+        let value = serde_json::json!({
+            "run": data.run,
+            "step": data.step,
+            "call": data.call,
+            "entries": [
+                {"title": "Read the receipts", "state": "done"},
+                {"title": "Buy the pass", "state": "doing"},
+            ],
+        });
+
+        assert_eq!(
+            EventKind::RunPlanned.decode(&value).unwrap(),
+            EventData::RunPlanned(data.clone())
+        );
+        assert_eq!(
+            serde_json::from_value::<RunPlanned>(value.clone()).unwrap(),
+            data
+        );
+        assert_eq!(EventKind::RunPlanned.as_str(), "neha.run.planned");
+        assert_eq!(
+            EventKind::RunPlanned.class(),
+            EventClass::Presentation,
+            "a reader that does not know the kind skips it"
+        );
+
+        // An empty list is a legal clear.
+        let cleared = serde_json::json!({
+            "run": Id::new(),
+            "step": 1,
+            "call": "call-1",
+            "entries": [],
+        });
+        assert!(EventKind::RunPlanned.decode(&cleared).is_ok());
+    }
+
+    #[test]
+    fn a_plan_write_rejects_what_its_schema_forbids() {
+        let value = |entries: serde_json::Value| {
+            serde_json::json!({
+                "run": Id::new(),
+                "step": 1,
+                "call": "call-1",
+                "entries": entries,
+            })
+        };
+        // An unknown state, an unknown field, or no title is refused.
+        assert!(
+            EventKind::RunPlanned
+                .decode(&value(
+                    serde_json::json!([{"title": "x", "state": "blocked"}])
+                ))
+                .is_err()
+        );
+        assert!(
+            EventKind::RunPlanned
+                .decode(&value(
+                    serde_json::json!([{"title": "x", "state": "done", "id": "y"}])
+                ))
+                .is_err()
+        );
+        assert!(
+            EventKind::RunPlanned
+                .decode(&value(serde_json::json!([{"state": "done"}])))
+                .is_err()
+        );
+        assert!(
+            EventKind::RunPlanned
+                .decode(&value(
+                    serde_json::json!([{"title": "   ", "state": "done"}])
+                ))
+                .is_err(),
+            "a title holds a line of work"
+        );
+        let long = "x".repeat(MAX_PLAN_TITLE_BYTES + 1);
+        assert!(
+            EventKind::RunPlanned
+                .decode(&value(
+                    serde_json::json!([{"title": long, "state": "done"}])
+                ))
+                .is_err()
+        );
+        let too_many: Vec<serde_json::Value> = (0..MAX_PLAN_ENTRIES + 1)
+            .map(|index| serde_json::json!({"title": format!("line {index}"), "state": "pending"}))
+            .collect();
+        assert!(
+            EventKind::RunPlanned
+                .decode(&value(serde_json::Value::Array(too_many)))
+                .is_err()
+        );
+
+        // A plan write names its call.
+        let blank = serde_json::json!({
+            "run": Id::new(),
+            "step": 1,
+            "call": "  ",
+            "entries": [],
+        });
+        assert!(EventKind::RunPlanned.decode(&blank).is_err());
+    }
+
+    #[test]
+    fn a_plan_write_is_the_bots_record_operation() {
+        let bot = Id::new();
+        let user = Id::new();
+        assert!(
+            EventKind::RunPlanned
+                .validate_author(Author::Bot(bot), Some(user))
+                .is_ok()
+        );
+        assert!(
+            EventKind::RunPlanned
+                .validate_author(Author::Bot(bot), None)
+                .is_err(),
+            "the acting User is named"
+        );
+        assert!(
+            EventKind::RunPlanned
+                .validate_author(Author::User(user), None)
+                .is_err(),
+            "a User does not write the Bot's plan"
+        );
+    }
+
+    #[test]
     fn a_memory_answer_rejects_a_blank_call() {
         let value = serde_json::json!({
             "run": Id::new(),
@@ -2144,6 +2293,8 @@ pub enum EventData {
     MemoryAnswered(MemoryAnswered),
     /// A Bot compacted a span of a Chat's Messages into a summary.
     ChatCompacted(Compacted),
+    /// A Bot replaced the plan of one run.
+    RunPlanned(RunPlanned),
 }
 
 /// The first version of every event kind.
@@ -2250,6 +2401,12 @@ impl EventKind {
                 EventData::MemoryAnswered(data)
             }
             Self::ChatCompacted => EventData::ChatCompacted(decode(data)?),
+            Self::RunPlanned => {
+                let data: RunPlanned = decode(data)?;
+                data.validate()?;
+
+                EventData::RunPlanned(data)
+            }
         };
 
         Ok(decoded)
@@ -2310,8 +2467,8 @@ impl EventKind {
             }
             // A memory write and a memory answer are record operations the
             // Bot runs: they are authored by the Bot with the User it acts
-            // for.
-            Self::MemoryAdded | Self::MemoryAnswered => {
+            // for. A plan write is one too.
+            Self::MemoryAdded | Self::MemoryAnswered | Self::RunPlanned => {
                 if !matches!(author, Author::Bot(_)) || acting.is_none() {
                     return Err(EventDataError::Author);
                 }
@@ -3102,6 +3259,94 @@ pub struct RunReply {
     /// The usage the Model reported for the reply.
     #[serde(default)]
     pub usage: Option<Usage>,
+}
+
+/// The largest number of entries one plan holds.
+pub const MAX_PLAN_ENTRIES: usize = 32;
+
+/// The largest title one plan entry holds, in UTF-8 bytes.
+pub const MAX_PLAN_TITLE_BYTES: usize = 200;
+
+/// The state of one plan entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(rename_all = "snake_case")]
+pub enum PlanState {
+    /// The line has not started.
+    Pending,
+    /// The line is being worked on.
+    Doing,
+    /// The line is finished.
+    Done,
+}
+
+/// One entry of a plan.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct PlanEntry {
+    /// The line's title, as the Bot wrote it.
+    pub title: String,
+    /// Its state.
+    pub state: PlanState,
+}
+
+impl PlanEntry {
+    /// Checks the parts of one entry that its fields alone decide.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if self.title.trim().is_empty() {
+            return Err(EventDataError::Data(
+                "a plan entry needs a title".to_owned(),
+            ));
+        }
+        if self.title.len() > MAX_PLAN_TITLE_BYTES {
+            return Err(EventDataError::Data(format!(
+                "a plan entry's title is larger than {MAX_PLAN_TITLE_BYTES} bytes"
+            )));
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.run.planned`.
+///
+/// A Bot replaced the whole plan of one run. The entries are the list as the
+/// call wrote it, so each event replays the list instead of a change to it,
+/// and the projection keeps the newest event of a run.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct RunPlanned {
+    /// The run.
+    pub run: Id,
+    /// The step the call belongs to.
+    pub step: u32,
+    /// The call's identifier, the one its tool result answers under.
+    pub call: String,
+    /// The whole list; an empty list clears the plan.
+    pub entries: Vec<PlanEntry>,
+}
+
+impl RunPlanned {
+    /// Checks the parts of one plan write that its fields alone decide.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if self.call.trim().is_empty() {
+            return Err(EventDataError::Data(
+                "a plan write names its call".to_owned(),
+            ));
+        }
+        if self.entries.len() > MAX_PLAN_ENTRIES {
+            return Err(EventDataError::Data(format!(
+                "a plan holds at most {MAX_PLAN_ENTRIES} entries"
+            )));
+        }
+        for entry in &self.entries {
+            entry.validate()?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Why a run asks its acting User for an approval.

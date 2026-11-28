@@ -108,6 +108,16 @@ When work fails, the Bot says so as a Message, and the work is done.
 
 A Bot asks for information, a decision, or an approval in the Chat or Group where the request was made.
 
+## Plan
+
+A Bot MAY keep a Plan for a Run: a flat list of lines, each naming a piece of the request's work. Each entry is `pending`, `doing`, or `done`. A short request MAY have no Plan.
+
+Every write replaces the whole Plan, and an empty list clears it. The Chat shows the Plan's progress while the Run works.
+
+A Plan holds at most 32 entries of at most 200 bytes of title text each. A write that passes a bound changes nothing.
+
+A Plan belongs to one Run and does not outlive it. It is not a Task.
+
 ## Asking before an action
 
 A Bot does what it was asked without asking. It asks before an action that goes beyond the request, an action the User said to ask about, an action the Computer's owner requires asking for, and an action that its tool asks about by default.

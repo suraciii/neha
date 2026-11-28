@@ -73,7 +73,7 @@ A reader keeps every event. A kind it does not know that decides who can read or
 
 A caller that names no Presentation kinds reads every kind its protocol version already carries; a later Presentation kind reaches only a caller that names it.
 
-A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory and compaction kinds change no right to read, write, act, or approve.
+A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory, compaction, and plan kinds change no right to read, write, act, or approve.
 
 A caller names the capability that admits a later kind; the command surface defines the capability names and the fixed set of kinds each one admits, as [CLI](../cli/design.md#versions) states. A capability admits no kind added after it was published; a later kind needs a new capability name.
 
@@ -171,6 +171,8 @@ The Space projects one state for each Chat: working, waiting, failed, or idle. T
 A queued, running, or resumed run projects working, and a run that waits for an Approval or an answer projects waiting. A run that ended in failure projects failed, and that state stays until the next run for the Chat starts. A Chat whose record holds no such run projects idle, including a record written before the projection existed.
 
 The projection names one `active_run`: the waiting run when one waits, otherwise the working run with the earliest sequence, and none when the state is failed or idle. None does not mean idle, because a failed state also names no active run.
+
+The view also carries the followed run's plan progress, `done` and `total`, when the run holds a plan. A view with no plan, a Chat that follows no run, or a plan the Bot cleared names no progress.
 
 An old `ChatView` with no `status` reads as idle, and with no `active_run` reads as null. Replaying the record builds the same projection from the run and approval events: a `RunStarted` with no end in the record reads as working, and several waiting runs name the one with the earliest sequence.
 

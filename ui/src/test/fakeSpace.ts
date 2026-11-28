@@ -22,6 +22,7 @@ import type {
   MemoryList,
   Message,
   Model,
+  PlanEntry,
   Provider,
   RecordEvent,
   Rule,
@@ -236,10 +237,19 @@ let madeBots = 0;
 function project(known: Chat): Chat {
   const status = space.statuses[known.id];
   const active = space.activeRuns[known.id];
+  const plan = active == null ? undefined : space.runs[active]?.plan;
   return {
     ...known,
     ...(status === undefined ? {} : { status }),
     ...(active === undefined ? {} : { active_run: active }),
+    ...(plan === undefined || plan.length === 0
+      ? {}
+      : {
+          plan: {
+            done: plan.filter((entry) => entry.state === "done").length,
+            total: plan.length,
+          },
+        }),
   };
 }
 // A send or a decision can be held open, so a test can act while the Space
@@ -409,6 +419,8 @@ export const space = {
       approval?: string;
       steps?: { index: number; tool_calls: number }[];
       actions?: { id: string; step: number; tool: string; status: string; error?: string | null }[];
+      // The plan the record holds for the Run, when it wrote one.
+      plan?: PlanEntry[];
       // Why the Run failed, when it did before any step or action.
       error?: string | null;
     }
@@ -1274,6 +1286,7 @@ export class FakeCommands {
           usage: null,
           steps: known.steps ?? [],
           actions: known.actions ?? [],
+          plan: known.plan ?? [],
         } as T;
       }
       case "mcp_list": {

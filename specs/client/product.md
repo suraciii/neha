@@ -103,6 +103,8 @@ After the Bot is created, the client opens its Chat.
 
 Each row in the Chat list shows the Chat's state: Working, Waiting, or Unread. [Chat](../messaging/chat/product.md#state) defines the states and their precedence.
 
+A Chat that works on a Run with a [Plan](../bot/product.md#plan) shows the done count in its Working badge, such as `3/7`.
+
 Unread is the client's own memory of a Message that landed while the User was not looking at the Chat. The record holds no such state, and the badge clears when the User opens the Chat.
 
 ## A Chat
@@ -129,9 +131,13 @@ A failed Run leaves a Bot Message that states the failure. The Chat keeps the Me
 
 ## Tool activity
 
-While a Run works, the Chat shows one collapsible activity card for that Run. The card starts collapsed, and its title row names the state, the step, and the tools in use.
+While a Run works, the Chat shows one collapsible activity card for that Run. The card starts collapsed.
 
-An action appears when it starts and updates with its result when it completes. A failed Run expands the card and shows its reason, and the card never shows an action's raw arguments.
+A Run with a [Plan](../bot/product.md#plan) shows its state in the title row, with a progress bar and the count of done lines, such as `3 / 7`. A Run with no Plan shows the state, the step, and the tools in use in its title row, and no progress bar.
+
+Expanding the card shows the Plan's entries with their states, then the tools the Run used.
+
+An action appears when it starts and updates with its result when it completes. A failed Run expands the card and shows its reason. The card never shows raw arguments.
 
 ## Needs attention
 
@@ -223,6 +229,7 @@ Product terms stay in English in both locales: Space, Bot, Chat, Computer, Provi
 
 - Every control has an accessible name; focus is visible.
 - A waiting Approval is exposed as a status, not by color alone.
+- Progress is stated as text: the count of done lines appears beside the bar, not by the bar alone.
 - On a narrow viewport, controls meet the touch targets in [design-system.md](design-system.md).
 
 ## Page states

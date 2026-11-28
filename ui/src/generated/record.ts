@@ -511,7 +511,7 @@ data: Record<string, unknown>, };
 /**
  * The kinds of event the record carries.
  */
-export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.skill.added" | "neha.skill.removed" | "neha.bot.skill.enabled" | "neha.bot.skill.disabled" | "neha.mcp.server.added" | "neha.mcp.server.updated" | "neha.mcp.server.removed" | "neha.bot.mcp.enabled" | "neha.bot.mcp.disabled" | "neha.plugin.installed" | "neha.plugin.removed" | "neha.plugin.enabled" | "neha.plugin.disabled" | "neha.memory.added" | "neha.memory.removed" | "neha.memory.answered" | "neha.chat.compacted";
+export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.skill.added" | "neha.skill.removed" | "neha.bot.skill.enabled" | "neha.bot.skill.disabled" | "neha.mcp.server.added" | "neha.mcp.server.updated" | "neha.mcp.server.removed" | "neha.bot.mcp.enabled" | "neha.bot.mcp.disabled" | "neha.plugin.installed" | "neha.plugin.removed" | "neha.plugin.enabled" | "neha.plugin.disabled" | "neha.memory.added" | "neha.memory.removed" | "neha.memory.answered" | "neha.chat.compacted" | "neha.run.planned";
 
 /**
  * The data of `neha.file.added`.
@@ -721,6 +721,24 @@ tools: boolean,
  * The thinking levels it supports; empty means every level.
  */
 thinking_levels: Array<ThinkingLevel>, };
+
+/**
+ * One entry of a plan.
+ */
+export type PlanEntry = { 
+/**
+ * The line's title, as the Bot wrote it.
+ */
+title: string, 
+/**
+ * Its state.
+ */
+state: PlanState, };
+
+/**
+ * The state of one plan entry.
+ */
+export type PlanState = "pending" | "doing" | "done";
 
 /**
  * The data of `neha.provider.added`.
@@ -954,6 +972,31 @@ usage: Usage | null,
  * The failure.
  */
 error: string | null, };
+
+/**
+ * The data of `neha.run.planned`.
+ *
+ * A Bot replaced the whole plan of one run. The entries are the list as the
+ * call wrote it, so each event replays the list instead of a change to it,
+ * and the projection keeps the newest event of a run.
+ */
+export type RunPlanned = { 
+/**
+ * The run.
+ */
+run: string, 
+/**
+ * The step the call belongs to.
+ */
+step: number, 
+/**
+ * The call's identifier, the one its tool result answers under.
+ */
+call: string, 
+/**
+ * The whole list; an empty list clears the plan.
+ */
+entries: Array<PlanEntry>, };
 
 /**
  * The data of `neha.run.queued`.
