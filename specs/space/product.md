@@ -29,6 +29,12 @@ A Local Space runs on the computer where the desktop app starts it. It is create
 
 A Hosted Space runs on a server. Its operator supplies the server and its origin; a Neha-run Hosted Space is the same contract with Neha as operator. Its Users reach it over the network.
 
+A Hosted Space MAY run in containers. A containerized Hosted Space puts only its TLS proxy on a public port; the Space, its Supervisor, and its Hosted Computer workers run on private Docker networks.
+
+The deployment mode changes where a Hosted Computer runs, not what a User sees: the record, Bots, Chats, Files, and the Computer channel keep the same contract.
+
+A Hosted Computer in a containerized Hosted Space MAY be offline between runs while its worker is asleep; a Message waits for it to wake, as it waits for an offline Local Computer.
+
 A client connects to one Space at a time.
 
 ## Starting

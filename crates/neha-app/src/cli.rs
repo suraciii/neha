@@ -351,6 +351,8 @@ enum ComputerCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Run this container as a Hosted Computer worker.
+    Worker,
     /// Start this machine's daemon with its saved pairing.
     Run {
         /// The Workspace root that holds one folder per Bot.
@@ -1702,6 +1704,7 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
             yes,
         } => computer::pair(space, ticket_file, workspace, yes).await?,
         ComputerCommand::Run { workspace } => computer::run(workspace).await?,
+        ComputerCommand::Worker => computer::worker().await?,
         ComputerCommand::Add { code } => {
             let credential = Credential::load()?;
             let computer = client::command(&credential, CommandCall::ComputerAdd { code }).await?;

@@ -26,6 +26,7 @@ pub mod state;
 pub mod stdio;
 pub mod store;
 pub mod ticket;
+pub mod workers;
 
 pub use blobs::{Blobs, BlobsError};
 pub use config::{Config, ConfigError, S3Storage, Storage};
@@ -33,6 +34,8 @@ pub use home::{Home, HomeError, SCHEMA_VERSION};
 pub use identity::{Account, Identity, IdentityError};
 pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage};
 pub use secrets::{Secrets, SecretsError};
+#[cfg(feature = "test-support")]
+pub use server::start_with_worker_config;
 pub use server::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
 pub use skills::{SkillDocument, SkillError};
 pub use state::{

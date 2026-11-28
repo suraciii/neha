@@ -124,6 +124,35 @@ impl Config {
         serde_json::from_slice(&bytes).context("the saved computer configuration is corrupt")
     }
 
+    /// Reads the identity, token, origin, and mount a worker container gets.
+    fn from_worker_env() -> Result<Self> {
+        let space_url =
+            std::env::var("NEHA_WORKER_SPACE_URL").context("NEHA_WORKER_SPACE_URL is not set")?;
+        let computer =
+            std::env::var("NEHA_WORKER_COMPUTER").context("NEHA_WORKER_COMPUTER is not set")?;
+        let token = std::env::var("NEHA_WORKER_TOKEN").context("NEHA_WORKER_TOKEN is not set")?;
+        let workspace = std::env::var_os("NEHA_WORKER_WORKSPACE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/workspace"));
+        if token.trim().is_empty() {
+            bail!("NEHA_WORKER_TOKEN is empty");
+        }
+        computer
+            .parse::<Id>()
+            .context("NEHA_WORKER_COMPUTER is not an identifier")?;
+        std::fs::create_dir_all(&workspace)
+            .with_context(|| format!("cannot create {}", workspace.display()))?;
+        let workspace = std::fs::canonicalize(&workspace)
+            .with_context(|| format!("cannot resolve {}", workspace.display()))?;
+
+        Ok(Self {
+            space_url,
+            computer,
+            token,
+            workspace,
+        })
+    }
+
     /// Saves the pairing at one path, readable only by this machine user.
     fn save_to(&self, path: &Path) -> Result<()> {
         client::write_private(path, &serde_json::to_vec(self)?)
@@ -299,38 +328,62 @@ pub async fn run(workspace: Option<PathBuf>) -> Result<()> {
     );
     println!("Workspace root: {}", config.workspace.display());
     println!("Press Ctrl-C to stop.");
-    serve(config).await
+    serve(config, false).await
+}
+
+/// Runs this container as one Hosted Computer's worker.
+///
+/// The container is the sandbox. The worker takes its identity, token, Space
+/// origin, and Workspace mount from the container environment, serves the
+/// Computer channel, and starts no nested bubblewrap.
+pub async fn worker() -> Result<()> {
+    let config = Config::from_worker_env()?;
+    println!("Hosted Computer worker {} is starting.", config.computer);
+    println!("Workspace root: {}", config.workspace.display());
+    serve(config, true).await
 }
 
 /// Serves one Space until Ctrl-C, reconnecting after every failure.
-async fn serve(config: Config) -> Result<()> {
+async fn serve(config: Config, worker: bool) -> Result<()> {
     // Refuse a saved Space URL this milestone cannot serve before opening
-    // anything: the Space listens on loopback only.
-    normalized_space_url(&config.space_url).context("the saved Space URL is not usable")?;
+    // anything: a Local Computer pairs with a loopback Space; a worker must
+    // reach the public origin its Supervisor injected.
+    if worker {
+        normalized_worker_url(&config.space_url).context("the worker Space URL is not usable")?;
+    } else {
+        normalized_space_url(&config.space_url).context("the saved Space URL is not usable")?;
+    }
     // A saved pairing from before the default moved may still name a workspace
     // inside the configuration directory; serving it would hand that directory
     // to the Bot through its own write root.
-    refuse_workspace(&config_directory()?, &config.workspace)?;
-    // The configuration directory holds this Computer's channel credential.
-    // Every Bot runtime hides it from the file tools and the sandbox.
-    let hidden = hidden_roots()?;
-    let denied = denied_paths()?;
-    // A machine that cannot fence a command never serves as a Computer. This
-    // only probes bubblewrap: Bot folders are opened lazily, each through the
-    // workspace root's descriptor.
-    fence()?;
+    if !worker {
+        refuse_workspace(&config_directory()?, &config.workspace)?;
+    }
+    // A Local Computer hides its configuration directory from the file tools
+    // and the sandbox. A worker container holds no Space or host secrets: its
+    // whole persistent mount is the Computer's Workspace.
+    let hidden = if worker { Vec::new() } else { hidden_roots()? };
+    let denied = if worker { Vec::new() } else { denied_paths()? };
+    // A machine that cannot fence a command never serves as a Computer. The
+    // worker container is the fence, so it has nothing to probe.
+    if !worker {
+        fence()?;
+    }
     let runtimes: Runtimes = Arc::new(Mutex::new(HashMap::new()));
+    // One signal future spans the whole reconnect loop: a stop delivered while
+    // a channel is closing must not be lost in the gap between two selects.
+    let mut shutdown = std::pin::pin!(shutdown_signal());
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
-            served = connect_and_serve(&config, &hidden, &denied, Arc::clone(&runtimes)) => {
+            _ = &mut shutdown => return Ok(()),
+            served = connect_and_serve(&config, &hidden, &denied, worker, Arc::clone(&runtimes)) => {
                 if let Err(error) = served {
                     eprintln!("{error:#}");
                 }
             }
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            _ = &mut shutdown => return Ok(()),
             () = tokio::time::sleep(RECONNECT_DELAY) => {}
         }
     }
@@ -357,11 +410,30 @@ fn fence() -> Result<()> {
     Ok(())
 }
 
+/// Resolves on Ctrl-C, or on the termination signal a service manager sends.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("the termination signal cannot be watched");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
 /// Holds the channel to the Space until it closes, then returns the failure.
 async fn connect_and_serve(
     config: &Config,
     hidden: &[PathBuf],
     denied: &[PathBuf],
+    worker: bool,
     runtimes: Runtimes,
 ) -> Result<()> {
     // A reconnect starts with fresh runtimes: descriptors opened for an older
@@ -369,9 +441,26 @@ async fn connect_and_serve(
     if let Ok(mut runtimes) = runtimes.lock() {
         runtimes.clear();
     }
-    let mut request = socket_url(&config.space_url)?
-        .into_client_request()
-        .context("the Space URL is not usable")?;
+    let mut request = if worker {
+        socket_url_worker(&config.space_url)?
+    } else {
+        socket_url(&config.space_url)?
+    }
+    .into_client_request()
+    .context("the Space URL is not usable")?;
+    // A worker reaches the Space on its private network but must present the
+    // public browser authority the Space's Host guard expects.
+    if let Ok(host) = std::env::var("NEHA_WORKER_HOST")
+        && !host.trim().is_empty()
+    {
+        let value = host
+            .trim()
+            .parse()
+            .context("NEHA_WORKER_HOST is not a valid Host header")?;
+        request
+            .headers_mut()
+            .insert(tokio_tungstenite::tungstenite::http::header::HOST, value);
+    }
     request.headers_mut().insert(
         "authorization",
         format!("Bearer {}", config.token)
@@ -396,17 +485,17 @@ async fn connect_and_serve(
             workspace: config.workspace.to_string_lossy().into_owned(),
             // Windows runs a managed folder without an OS fence. The Space
             // accepts a truthful false only when its operator opted in.
-            sandbox: !cfg!(windows),
-            // A Windows managed runtime has no OS fence, so it serves neither
-            // granted folders nor a run directory nor full access.
-            supports_grants: Some(!cfg!(windows)),
-            supports_full_access: Some(!cfg!(windows)),
+            sandbox: worker || !cfg!(windows),
+            // A worker's container is the fence; a Hosted Computer serves no
+            // granted folders or full access either way.
+            supports_grants: Some(!worker && !cfg!(windows)),
+            supports_full_access: Some(!worker && !cfg!(windows)),
         },
     )
     .await?;
     println!("Connected to {}.", config.space_url);
 
-    serve_channel(config, hidden, denied, socket, runtimes).await
+    serve_channel(config, hidden, denied, worker, socket, runtimes).await
 }
 
 /// Serves one open channel: reads frames, runs them one at a time, and kills
@@ -421,6 +510,7 @@ async fn serve_channel(
     config: &Config,
     hidden: &[PathBuf],
     denied: &[PathBuf],
+    worker: bool,
     socket: Socket,
     runtimes: Runtimes,
 ) -> Result<()> {
@@ -562,6 +652,7 @@ async fn serve_channel(
                             &denied,
                             &runtimes,
                             &current,
+                            worker,
                             frame,
                         );
                         tokio::pin!(executing);
@@ -654,6 +745,44 @@ fn release_bytes(counted: &AtomicUsize, size: usize) {
     }
 }
 
+/// Opens the managed runtime a Hosted worker uses for one Bot.
+fn worker_base(config: &Config, bot: &str) -> Result<LocalRuntime, String> {
+    let folder = folder_for(&config.workspace, bot)?;
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("cannot create {}: {error}", folder.display()))?;
+    LocalRuntime::worker(&config.workspace).map_err(|error| error.to_string())
+}
+
+/// Opens a Hosted worker run in the Bot's directory.
+fn worker_runtime(config: &Config, bot: &str) -> Result<Arc<LocalRuntime>, String> {
+    let folder = folder_for(&config.workspace, bot)?;
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("cannot create {}: {error}", folder.display()))?;
+    let runtime = LocalRuntime::worker(&config.workspace).map_err(|error| error.to_string())?;
+    runtime
+        .with_working_dir(&folder.to_string_lossy())
+        .map(Arc::new)
+        .map_err(|error| error.to_string())
+}
+
+/// Returns the runtime for one action, in either a worker or a Local daemon.
+#[allow(clippy::too_many_arguments)]
+fn bot_runtime(
+    config: &Config,
+    hidden: &[PathBuf],
+    denied: &[PathBuf],
+    runtimes: &Runtimes,
+    bot: &str,
+    access: &AccessFrame,
+    working_dir: Option<&str>,
+    worker: bool,
+) -> Result<Arc<LocalRuntime>, String> {
+    if worker {
+        return worker_runtime(config, bot);
+    }
+    machine(config, hidden, denied, runtimes, bot, access, working_dir)
+}
+
 /// Answers one frame from the Space.
 async fn execute_frame(
     config: &Config,
@@ -661,6 +790,7 @@ async fn execute_frame(
     denied: &[PathBuf],
     runtimes: &Runtimes,
     current: &Mutex<Option<Arc<LocalRuntime>>>,
+    worker: bool,
     frame: HostFrame,
 ) -> DeviceFrame {
     match frame {
@@ -673,7 +803,7 @@ async fn execute_frame(
             access,
             env,
         } => {
-            let runtime = match machine(
+            let runtime = match bot_runtime(
                 config,
                 hidden,
                 denied,
@@ -681,6 +811,7 @@ async fn execute_frame(
                 &bot,
                 &access,
                 working_dir.as_deref(),
+                worker,
             ) {
                 Ok(runtime) => runtime,
                 Err(message) => return DeviceFrame::Failed { id, message },
@@ -707,7 +838,7 @@ async fn execute_frame(
             // The read uses the run's own access: a verification of a write an
             // interrupted full-access run may have made outside the Bot's
             // folder has to reach the same paths that run could.
-            match machine(
+            match bot_runtime(
                 config,
                 hidden,
                 denied,
@@ -715,6 +846,7 @@ async fn execute_frame(
                 &bot,
                 &access,
                 working_dir.as_deref(),
+                worker,
             ) {
                 Ok(runtime) => match runtime.read_bytes(&path).await {
                     Ok(bytes) => DeviceFrame::Bytes {
@@ -740,25 +872,33 @@ async fn execute_frame(
             // Bot's folder whatever the run's access: full access only picks
             // the base runtime that opens no sandbox, and the delivery then
             // goes through the folder descriptor with no write roots.
-            match machine_base(config, hidden, denied, runtimes, &bot, access.full_access) {
-                Ok(base) => match base.with_machine_access(false, &[], None) {
-                    Ok(runtime) => match decode_bytes(&bytes) {
-                        Ok(bytes) => {
-                            let length = bytes.len();
-                            match runtime.write_bytes(&path, bytes).await {
-                                Ok(()) => write_receipt(id, &path, length),
-                                Err(error) => DeviceFrame::Failed {
-                                    id,
-                                    message: error.to_string(),
-                                },
-                            }
+            let opened: Result<LocalRuntime, String> = if worker {
+                worker_base(config, &bot).and_then(|base| {
+                    let folder = folder_for(&config.workspace, &bot)?;
+                    base.with_working_dir(&folder.to_string_lossy())
+                        .map_err(|error| error.to_string())
+                })
+            } else {
+                match machine_base(config, hidden, denied, runtimes, &bot, access.full_access) {
+                    Ok(base) => base
+                        .with_machine_access(false, &[], None)
+                        .map_err(|error| error.to_string()),
+                    Err(message) => Err(message),
+                }
+            };
+            match opened {
+                Ok(runtime) => match decode_bytes(&bytes) {
+                    Ok(bytes) => {
+                        let length = bytes.len();
+                        match runtime.write_bytes(&path, bytes).await {
+                            Ok(()) => write_receipt(id, &path, length),
+                            Err(error) => DeviceFrame::Failed {
+                                id,
+                                message: error.to_string(),
+                            },
                         }
-                        Err(message) => DeviceFrame::Failed { id, message },
-                    },
-                    Err(error) => DeviceFrame::Failed {
-                        id,
-                        message: error.to_string(),
-                    },
+                    }
+                    Err(message) => DeviceFrame::Failed { id, message },
                 },
                 Err(message) => DeviceFrame::Failed { id, message },
             }
@@ -904,6 +1044,45 @@ fn socket_url(space_url: &str) -> Result<String> {
     };
 
     Ok(format!("{socket}/api/computer/socket"))
+}
+
+/// Returns the WebSocket address a worker reaches its public Space through.
+fn socket_url_worker(space_url: &str) -> Result<String> {
+    let base = normalized_worker_url(space_url)?;
+    let socket = if let Some(rest) = base.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        bail!("the Space URL must start with http:// or https://");
+    };
+
+    Ok(format!("{socket}/api/computer/socket"))
+}
+
+/// Returns a worker Space URL without a trailing slash.
+///
+/// Unlike a Local Computer's loopback-only pairing, a worker container reaches
+/// the Space over the deployment's public origin; credentials in the URL are
+/// still refused because the origin is logged.
+fn normalized_worker_url(url: &str) -> Result<String> {
+    let url = url.trim().trim_end_matches('/');
+    if url.is_empty() {
+        bail!("the Space URL is empty");
+    }
+    let parsed =
+        reqwest::Url::parse(url).context("the Space URL must be an absolute http(s) URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        bail!("the Space URL must start with http:// or https://");
+    }
+    if parsed.host_str().is_none() {
+        bail!("the Space URL has no host");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!("the Space URL must not carry credentials");
+    }
+
+    Ok(url.to_owned())
 }
 
 /// Returns a Space URL without a trailing slash, refusing a non-loopback one.
@@ -1736,7 +1915,16 @@ pub mod test_support {
         current: &Mutex<Option<Arc<LocalRuntime>>>,
         frame: HostFrame,
     ) -> DeviceFrame {
-        super::execute_frame(&config.0, hidden, denied, &runtimes.0, current, frame).await
+        super::execute_frame(
+            &config.0,
+            hidden,
+            denied,
+            &runtimes.0,
+            current,
+            false,
+            frame,
+        )
+        .await
     }
 
     /// Serves one connected channel until it ends or fails.
@@ -1747,7 +1935,7 @@ pub mod test_support {
         socket: TestSocket,
         runtimes: TestRuntimes,
     ) -> anyhow::Result<()> {
-        super::serve_channel(&config.0, hidden, denied, socket, runtimes.0).await
+        super::serve_channel(&config.0, hidden, denied, false, socket, runtimes.0).await
     }
 
     /// Returns a Bot's folder, refusing a name that is not an identifier.

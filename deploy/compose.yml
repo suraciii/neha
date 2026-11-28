@@ -1,0 +1,102 @@
+name: neha
+
+services:
+  init:
+    image: alpine:3.21
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - mkdir -p /data/workspaces && chown 10001:10001 /data /data/workspaces
+    volumes:
+      - ./data:/data
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      NEHA_DOMAIN: ${NEHA_DOMAIN:?set NEHA_DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - edge
+      - internal
+      - workers
+
+  space:
+    image: neha-space:dev
+    build:
+      context: ..
+      dockerfile: deploy/space.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      caddy:
+        condition: service_started
+      supervisor:
+        condition: service_started
+    environment:
+      NEHA_HOME: /data
+      NEHA_BIND: 0.0.0.0
+      NEHA_PUBLIC_URL: https://${NEHA_DOMAIN:?set NEHA_DOMAIN in .env}
+      NEHA_BOT_SPACE_URL: http://space:7337
+      NEHA_BOT_HOST: ${NEHA_DOMAIN:?set NEHA_DOMAIN in .env}
+      NEHA_WORKER_SUPERVISOR_URL: http://supervisor:8787
+      NEHA_WORKER_SUPERVISOR_TOKEN: ${NEHA_SUPERVISOR_TOKEN:?set NEHA_SUPERVISOR_TOKEN in .env}
+      NEHA_WORKER_ALWAYS_ON: ${NEHA_WORKER_ALWAYS_ON:-0}
+      NEHA_WORKER_IDLE_SECONDS: ${NEHA_WORKER_IDLE_SECONDS:-600}
+    volumes:
+      - ./data:/data
+    networks:
+      - internal
+      - workers
+
+  supervisor:
+    image: neha-supervisor:dev
+    build:
+      context: ./supervisor
+    restart: unless-stopped
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      NEHA_SUPERVISOR_TOKEN: ${NEHA_SUPERVISOR_TOKEN:?set NEHA_SUPERVISOR_TOKEN in .env}
+      NEHA_WORKER_IMAGE: ${NEHA_WORKER_IMAGE:-neha-worker:dev}
+      NEHA_WORKER_INTERNAL_NETWORK: neha-internal
+      NEHA_WORKER_PUBLIC_NETWORK: neha-workers
+      NEHA_HOST_DATA_DIR: ${NEHA_HOST_DATA_DIR:?set the absolute host path in .env}
+      NEHA_CONTAINER_WORKSPACES_DIR: /workspaces
+      NEHA_SPACE_URL: http://space:7337
+      NEHA_PUBLIC_HOST: ${NEHA_DOMAIN:?set NEHA_DOMAIN in .env}
+      NEHA_WORKER_EGRESS: ${NEHA_WORKER_EGRESS:-auto}
+      NEHA_WORKER_CPUS: ${NEHA_WORKER_CPUS:-1.0}
+      NEHA_WORKER_MEMORY: ${NEHA_WORKER_MEMORY:-1g}
+      NEHA_WORKER_PIDS: ${NEHA_WORKER_PIDS:-256}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Only the Workspace tree is visible, read-only: the Supervisor never
+      # reads the record, Vault, or File store.
+      - ./data/workspaces:/workspaces:ro
+    networks:
+      - internal
+      - workers
+
+networks:
+  edge:
+    name: neha-edge
+  internal:
+    name: neha-internal
+    internal: true
+  workers:
+    name: neha-workers
+
+volumes:
+  caddy_data:
+  caddy_config:

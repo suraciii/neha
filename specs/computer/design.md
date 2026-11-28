@@ -81,11 +81,15 @@ On Windows, an explicitly opted-in Local Computer has no operating-system sandbo
 
 On a Hosted Computer in the Space process, a Bot's shell runs in a sandbox that starts from an empty root. The sandbox mounts the Space machine's system directories read-only, and the Bot's directory at `/workspace` is the one place where files persist.
 
-On a Hosted Computer in a worker container, the shell runs in that container. The container starts no nested sandbox; the worker's container is the fence. The Computer's Workspace is the only persistent writable mount, and each Bot starts in its own directory there.
+On a Hosted Computer in a worker container, the shell runs in that container. The container starts no nested sandbox; the worker's container is the fence.
 
-The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`, and it ends with the Space process. The Space's record, Vault, File store, and another Computer's Workspace are not mounted in it.
+The Computer's Workspace is the only persistent writable mount, and each Bot starts in its own directory there.
 
-The process-local sandbox shares the machine's network, so the Bot's shell reaches the Space's loopback for `neha file get` and `neha chat send --file`. A worker container reaches the Space over the network. The file tools stay in the Workspace, and the other writable places are the sandbox's own `/tmp` and `/dev/shm`.
+A process-local sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`, and it ends with the Space process. A worker container has its own `/tmp` tmpfs and ends with the worker process. Neither mounts the Space's record, Vault, File store, or another Computer's Workspace.
+
+The process-local sandbox shares the machine's network, so the Bot's shell reaches the Space's loopback for `neha file get` and `neha chat send --file`. A worker container reaches the Space over the deployment's private network and presents the Space's public origin authority.
+
+The file tools stay in the Workspace, and the other writable place is the container's own `/tmp` tmpfs. The worker listens on no port.
 
 A machine that cannot start its sandbox does not serve as a process-local Computer, except for an explicitly opted-in Windows Local Computer. A worker container uses its container runtime as the sandbox. The Space accepts a Windows daemon's truthful `sandbox: false` only when its operator sets `NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`.
 
@@ -113,7 +117,15 @@ Resetting clears every entry inside the Computer's Workspace and keeps the Works
 
 A reset runs only when no Bot on the Computer has a queued, running, or waiting run. No run starts while a reset is in progress.
 
-Starting, stopping, and waking a Hosted Computer, and saving and restoring a Workspace, are not yet specified. A worker container follows the same lifecycle as a Hosted Computer.
+A process-local Hosted Computer is online while the Space process runs. A worker-backed Hosted Computer is online while its worker's channel is up.
+
+A worker-backed Hosted Computer is created stopped. Its deployment starts it when the Computer has queued, running, or waiting work, or when its operator configured it always on. It stops after an idle period with no such work.
+
+A waiting run starts when the worker's channel connects. Starting and stopping a worker is a deployment action; there is no client command for it yet.
+
+A run already in flight when its worker stops follows the channel-loss rule: its in-flight actions are unknown and the Space records the failure. Background processes do not keep a worker awake beyond the run that started them.
+
+Removing a Bot removes its directory when that removal is implemented; the Computer's worker and Workspace root stay while another Bot uses them. Removing the last Bot, and deleting a Computer, are not yet specified. Saving and restoring a Workspace are not yet specified.
 
 ## Files
 
@@ -122,6 +134,8 @@ A File crosses between a Workspace and the Space only as a copy: a Bot takes byt
 ## Online and offline
 
 A Computer is online while its channel is up. The Space shows it as offline after its channel has been down for longer than a set time.
+
+A process-local Hosted Computer has no channel of its own and is online while the Space runs. A worker-backed Hosted Computer has a channel and is offline while its worker is stopped or disconnected.
 
 ## Tools
 

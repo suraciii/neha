@@ -1,0 +1,4 @@
+{$NEHA_DOMAIN:localhost} {
+	encode zstd gzip
+	reverse_proxy space:7337
+}

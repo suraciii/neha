@@ -193,6 +193,10 @@ pub struct CommandContext<'a> {
     /// Serializes Computer creation and Bot assignment, so an exclusive
     /// Computer cannot take two Bots and a create cannot race a move.
     pub computer_assignments: &'a tokio::sync::Mutex<()>,
+    /// Whether this Space runs Hosted Computers in worker containers. It
+    /// changes how a Hosted Computer is created and how its online state is
+    /// reported, not the record.
+    pub workers: bool,
     /// Serializes Provider writes: a refresh reads the record's default before
     /// its HTTP call and writes after it, so nothing else may write a Provider
     /// in between.
@@ -7642,32 +7646,37 @@ fn new_hosted(
             "cannot create the Computer workspace: {error}"
         )));
     }
-    // Probe the sandbox in a directory of its own: the Workspace root may
-    // already hold another Bot's links, which are not this Computer's test.
-    let probe = workspace.join(".probe");
-    let probed = std::fs::create_dir_all(&probe).and_then(|()| {
-        LocalRuntime::hosted_with_hidden(&probe, vec![context.home.root().to_path_buf()])
-            .map(|_| ())
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("this machine cannot provide an isolated Hosted Computer: {error}"),
-                )
-            })
-    });
-    let _ = std::fs::remove_dir_all(&probe);
-    if let Err(error) = probed {
-        let _ = std::fs::remove_dir_all(&workspace);
-        return Err(ApiError::invalid_argument(format!(
-            "{error}; pair a Local Computer and use `--computer local` instead"
-        )));
+    // A containerized Space uses a worker container as the isolation
+    // boundary; it must not need bubblewrap in the Space image. The manager
+    // creates the worker after the record commits.
+    if !context.workers {
+        // Probe the sandbox in a directory of its own: the Workspace root may
+        // already hold another Bot's links, which are not this Computer's test.
+        let probe = workspace.join(".probe");
+        let probed = std::fs::create_dir_all(&probe).and_then(|()| {
+            LocalRuntime::hosted_with_hidden(&probe, vec![context.home.root().to_path_buf()])
+                .map(|_| ())
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("this machine cannot provide an isolated Hosted Computer: {error}"),
+                    )
+                })
+        });
+        let _ = std::fs::remove_dir_all(&probe);
+        if let Err(error) = probed {
+            let _ = std::fs::remove_dir_all(&workspace);
+            return Err(ApiError::invalid_argument(format!(
+                "{error}; pair a Local Computer and use `--computer local` instead"
+            )));
+        }
     }
 
     Ok(ComputerView {
         id: computer,
         owner: account.id,
         kind: "hosted".to_owned(),
-        online: true,
+        online: !context.workers,
         workspace: workspace.to_string_lossy().into_owned(),
         name,
         sharing,
@@ -8093,7 +8102,10 @@ fn clear_workspace(path: &std::path::Path) -> std::io::Result<()> {
 
 fn viewed_computer(computer: &ComputerView, links: &ComputerLinks) -> ComputerView {
     let mut computer = computer.clone();
-    computer.online = computer.kind != "local" || links.online(computer.id);
+    // A process-local Hosted Computer is online whenever the Space is; a
+    // worker-backed one is online only while its channel is up.
+    let remote = computer.kind == "local" || (computer.kind == "hosted" && links.hosted_workers());
+    computer.online = !remote || links.online(computer.id);
     // A real Computer declares which access its machine can serve. The links
     // keep the last declaration after it disconnects, so an offline machine
     // does not show a control its runtime refuses. Before the first handshake
@@ -8821,6 +8833,7 @@ pub async fn resume_run(
 fn bot_environment(
     state: &Mutex<State>,
     pending: &PendingRun,
+    workers: bool,
 ) -> Result<Vec<(String, String)>, ApiError> {
     let mut state = state.lock().map_err(|_| ApiError::internal("state lock"))?;
     let Some(url) = state.url.clone() else {
@@ -8833,12 +8846,34 @@ fn bot_environment(
         acting: pending.acting,
         expires: std::time::Instant::now() + std::time::Duration::from_secs(60 * 60),
     });
-
-    Ok(vec![
+    // A worker-backed Hosted Computer reaches the Space on the deployment's
+    // private network, where the public origin is not what the listener
+    // names. The deployment gives both an internal origin and the public Host
+    // the guard expects. A Local Computer on the same Space keeps the origin
+    // its daemon can reach.
+    let worker_hosted = workers
+        && state
+            .computers
+            .get(&pending.computer)
+            .is_some_and(|computer| computer.kind == "hosted");
+    let url = if worker_hosted {
+        std::env::var("NEHA_BOT_SPACE_URL").unwrap_or(url)
+    } else {
+        url
+    };
+    let mut environment = vec![
         ("NEHA_BOT_TOKEN".to_owned(), token),
         ("NEHA_SPACE_URL".to_owned(), url),
         ("NEHA_CHAT".to_owned(), pending.chat.id.to_string()),
-    ])
+    ];
+    if worker_hosted
+        && let Ok(host) = std::env::var("NEHA_BOT_HOST")
+        && !host.trim().is_empty()
+    {
+        environment.push(("NEHA_BOT_HOST".to_owned(), host));
+    }
+
+    Ok(environment)
 }
 
 /// The access one started run's actions carry, fixed when the run started.
@@ -8940,7 +8975,7 @@ async fn finish_run_with(
     let mut base_usage = base_usage;
     let mut start_step = None;
     let computer = pending.computer;
-    let bot_env = bot_environment(state, &pending)?;
+    let bot_env = bot_environment(state, &pending, links.hosted_workers())?;
     let secret = bot_env
         .iter()
         .find(|(key, _)| key == "NEHA_BOT_TOKEN")
@@ -8953,8 +8988,17 @@ async fn finish_run_with(
         .lock()
         .ok()
         .and_then(|state| state.computers.get(&computer).map(|view| view.kind.clone()));
-    let runtime = match kind.as_deref() {
-        Some("local") => {
+    let runtime = match (kind.as_deref(), links.hosted_workers()) {
+        (Some("local"), _) | (Some("hosted"), true) => {
+            if kind.as_deref() == Some("hosted") && pending.cwd.is_some() {
+                let outcome = RunOutcome::Reply {
+                    text: "I could not start my Computer: a Hosted Computer works only in its Workspace."
+                        .to_owned(),
+                    usage: neha::usage::Usage::default(),
+                    succeeded: false,
+                };
+                return finish_completion(store, state, pending, outcome).await;
+            }
             let Some(link) = links.link(computer) else {
                 let outcome = RunOutcome::Reply {
                     text: "I could not start my Computer: it is offline.".to_owned(),
@@ -13596,6 +13640,7 @@ mod tests {
                 approvals: &self.approvals,
                 computer_assignments: &self.computer_assignments,
                 provider_writes: &self.provider_writes,
+                workers: false,
                 library: &self.library,
                 runs: &self.runs,
                 events: &self.events,

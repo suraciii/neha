@@ -25,8 +25,16 @@ A Space the desktop app runs on the User's computer. The User who starts it is i
 _Avoid_: built-in Space, desktop Space, local server
 
 **Hosted Space**:
-A Space deployed on a server. Its Users reach it over the network; an operator, which may be the User or Neha, runs it.
+A Space deployed on a server. Its Users reach it over the network; an operator, which may be the User or Neha, runs it. A Hosted Space may be containerized, with one worker container per Hosted Computer.
 _Avoid_: remote Space, cloud Space, hosted server
+
+**Worker**:
+The container that runs one Hosted Computer's actions in a containerized Hosted Space. It is a Computer, connects out to the Space, and listens on no network port.
+_Avoid_: sandbox, pod, container Computer
+
+**Supervisor**:
+The internal control process that creates, starts, and stops worker containers through the Docker API in a containerized Hosted Space. It is not a Computer and publishes no port.
+_Avoid_: agent, orchestrator, daemon
 
 **Admin**:
 The User who runs a Space: invites its Users, connects its Providers, and configures the Space.
@@ -45,7 +53,7 @@ A Computer provided by a machine a User controls. It runs Neha's Computer proces
 _Avoid_: real Computer, user Computer, local machine
 
 **Hosted Computer**:
-A Computer the Space provides on its own machine, isolated from the record and from other Computers. A User owns the Hosted Computers they create or receive.
+A Computer the Space provides on its own machine, isolated from the record and from other Computers. A User owns the Hosted Computers they create or receive. It runs in the Space process in a Local Space and in a worker container in a containerized Hosted Space.
 _Avoid_: managed Computer, sandbox Computer, cloud Computer
 
 **Space Computer**:

@@ -26,6 +26,40 @@ fn runtime() -> (tempfile::TempDir, LocalRuntime) {
     (directory, runtime)
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_worker_starts_in_its_bot_directory_without_a_nested_sandbox() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let bot = directory.path().join("bot-id");
+    std::fs::create_dir_all(&workspace).unwrap();
+    // The Workspace is Bot-writable: a file named .tmp must not break the
+    // worker's runtime construction.
+    std::fs::write(workspace.join(".tmp"), "not a directory").unwrap();
+    std::fs::create_dir_all(&bot).unwrap();
+    let runtime = LocalRuntime::worker(&workspace)
+        .unwrap()
+        .with_working_dir(bot.to_str().unwrap())
+        .unwrap();
+
+    let result = runtime
+        .execute(Action::Shell {
+            command: "pwd; printf worker > result.txt".to_owned(),
+        })
+        .await;
+
+    assert_eq!(result.status, ActionStatus::Succeeded, "{result:?}");
+    assert!(
+        result.output.text.contains(bot.to_str().unwrap()),
+        "the worker did not start in the Bot directory: {}",
+        result.output.text
+    );
+    assert_eq!(
+        std::fs::read_to_string(bot.join("result.txt")).unwrap(),
+        "worker"
+    );
+}
+
 /// Returns whether the bubblewrap tests are switched on.
 fn bwrap_enabled() -> bool {
     if std::env::var_os("NEHA_TEST_BWRAP").is_none() {

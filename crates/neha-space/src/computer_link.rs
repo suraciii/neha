@@ -318,6 +318,9 @@ pub fn answer(frame: DeviceFrame) -> Option<(u64, Answer)> {
 /// Every Computer channel a Space has, by Computer.
 pub struct ComputerLinks {
     links: Mutex<HashMap<Id, Arc<ComputerLink>>>,
+    /// Whether Hosted Computers run in worker containers, so a Hosted
+    /// Computer's channel is as necessary as a Local Computer's.
+    hosted_workers: bool,
     /// The access capabilities each Computer last declared. Kept after the
     /// channel goes away: a machine's runtime does not change with its
     /// connection, and a Bot update while it is offline still must not widen
@@ -339,9 +342,25 @@ impl ComputerLinks {
     pub fn new() -> Self {
         Self {
             links: Mutex::new(HashMap::new()),
+            hosted_workers: false,
             access: Mutex::new(HashMap::new()),
             next_id: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Builds a Space whose Hosted Computers are worker-backed.
+    #[must_use]
+    pub fn with_hosted_workers() -> Self {
+        Self {
+            hosted_workers: true,
+            ..Self::new()
+        }
+    }
+
+    /// Returns whether Hosted Computers need a connected worker channel.
+    #[must_use]
+    pub fn hosted_workers(&self) -> bool {
+        self.hosted_workers
     }
 
     /// Returns whether the Computer's channel is up.
