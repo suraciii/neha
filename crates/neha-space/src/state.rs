@@ -14,8 +14,8 @@ use rand::RngExt as _;
 
 use neha::id::Id;
 use neha::record::{
-    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
-    RuleEffect, RunReply, Undoability,
+    ActionStatus, ApprovalReason, Author, ComputerSharing, Event, EventData,
+    FULL_ACCESS_CONSENT_VERSION, RuleEffect, RunReply, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -144,6 +144,12 @@ pub struct ComputerView {
     pub online: bool,
     /// The Computer's workspace directory.
     pub workspace: String,
+    /// Its name for its owner.
+    pub name: String,
+    /// Who may use it.
+    pub sharing: ComputerSharing,
+    /// Whether it is its owner's Space Computer.
+    pub space: bool,
     /// Whether its owner may grant it folders and name a run's directory.
     ///
     /// A real Computer declares this in its channel greeting; the projection
@@ -909,6 +915,15 @@ impl Projection for State {
                 }
             }
             EventData::BotCreated(data) => {
+                let computer = self
+                    .computers
+                    .get(&data.computer)
+                    .ok_or("a Bot is created on an existing Computer")?;
+                if computer.sharing == ComputerSharing::Exclusive
+                    && self.bots.values().any(|bot| bot.computer == data.computer)
+                {
+                    return Err("an exclusive Computer cannot hold more than one Bot".to_owned());
+                }
                 self.bots.insert(
                     data.bot,
                     BotView {
@@ -925,14 +940,26 @@ impl Projection for State {
                 );
             }
             EventData::BotMoved(data) => {
+                let Some(current) = self.bots.get(&data.bot) else {
+                    return Err("a moved Bot must exist".to_owned());
+                };
+                if current.computer != data.from {
+                    return Err("a move starts from the Bot's Computer".to_owned());
+                }
+                let target = self
+                    .computers
+                    .get(&data.to)
+                    .ok_or("a move goes to an existing Computer")?;
+                let occupied = self
+                    .bots
+                    .values()
+                    .any(|bot| bot.computer == data.to && bot.id != data.bot);
+                let exclusive = target.sharing == ComputerSharing::Exclusive;
                 let Some(bot) = self.bots.get_mut(&data.bot) else {
                     return Err("a moved Bot must exist".to_owned());
                 };
-                if bot.computer != data.from {
-                    return Err("a move starts from the Bot's Computer".to_owned());
-                }
-                if !self.computers.contains_key(&data.to) {
-                    return Err("a move goes to an existing Computer".to_owned());
+                if exclusive && occupied {
+                    return Err("an exclusive Computer cannot hold more than one Bot".to_owned());
                 }
                 bot.computer = data.to;
             }
@@ -1027,9 +1054,28 @@ impl Projection for State {
             }
             EventData::ComputerCreated(data) => {
                 let kind = data.kind.as_str().to_owned();
+                let local = kind == "local";
                 // A Hosted Computer always runs in the Space's own sandbox;
                 // only a real machine's handshake can tell what it serves.
                 let sandboxed = (kind == "hosted").then_some(true);
+                // A record written before sharing was recorded has no
+                // sharing. Its Hosted Computers held one Bot each, and its
+                // Local Computers could already hold several.
+                let sharing = data.sharing.unwrap_or(if kind == "hosted" {
+                    ComputerSharing::Exclusive
+                } else {
+                    ComputerSharing::Shared
+                });
+                let name = if data.name.is_empty() {
+                    if data.space {
+                        "Space Computer"
+                    } else {
+                        "Computer"
+                    }
+                    .to_owned()
+                } else {
+                    data.name
+                };
                 self.computers.insert(
                     data.computer,
                     ComputerView {
@@ -1038,12 +1084,48 @@ impl Projection for State {
                         kind,
                         online: true,
                         workspace: data.workspace,
-                        supports_grants: true,
-                        supports_full_access: true,
+                        name,
+                        sharing,
+                        space: data.space,
+                        // A Local Computer declares what it serves at its
+                        // handshake; a Hosted Computer serves neither grants
+                        // nor full access.
+                        supports_grants: local,
+                        supports_full_access: local,
                         sandboxed,
                     },
                 );
                 self.computer_order.push(data.computer);
+            }
+            EventData::ComputerUpdated(data) => {
+                let computer = self
+                    .computers
+                    .get(&data.computer)
+                    .ok_or("an updated Computer must exist")?;
+                if !matches!(event.author, Author::User(author) if author == computer.owner) {
+                    return Err("a Computer update comes from its owner".to_owned());
+                }
+                if computer.kind != "hosted" {
+                    return Err("only a Hosted Computer changes sharing".to_owned());
+                }
+                if computer.space && data.sharing == ComputerSharing::Exclusive {
+                    return Err("the Space Computer stays shared".to_owned());
+                }
+                if data.sharing == ComputerSharing::Exclusive
+                    && self
+                        .bots
+                        .values()
+                        .filter(|bot| bot.computer == data.computer)
+                        .count()
+                        > 1
+                {
+                    return Err("an exclusive Computer cannot hold more than one Bot".to_owned());
+                }
+                let computer = self
+                    .computers
+                    .get_mut(&data.computer)
+                    .ok_or("an updated Computer must exist")?;
+                computer.sharing = data.sharing;
             }
             EventData::ChatCreated(data) => {
                 self.chats.insert(
@@ -1433,7 +1515,7 @@ impl Projection for State {
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
-    use neha::record::{ActionStatus, Author, Event, EventKind, KIND_VERSION};
+    use neha::record::{ActionStatus, Author, ComputerSharing, Event, EventKind, KIND_VERSION};
     use neha::seq::Seq;
     use neha::time::Timestamp;
 
@@ -3450,6 +3532,227 @@ mod tests {
             !state.bots[&bot].full_access,
             "turning it off needs no consent"
         );
+    }
+
+    #[test]
+    fn an_old_hosted_computer_replays_as_exclusive_and_a_local_one_shared() {
+        let owner = Id::new();
+        let mut state = State::default();
+        let hosted = Id::new();
+        let local = Id::new();
+        for (computer, kind) in [(hosted, "managed"), (local, "real")] {
+            state
+                .apply(&event(
+                    EventKind::ComputerCreated,
+                    Author::User(owner),
+                    serde_json::json!({
+                        "computer": computer,
+                        "owner": owner,
+                        "kind": kind,
+                        "workspace": "/tmp/workspace",
+                    }),
+                    1,
+                ))
+                .unwrap();
+        }
+        assert_eq!(state.computers[&hosted].sharing, ComputerSharing::Exclusive);
+        assert_eq!(state.computers[&local].sharing, ComputerSharing::Shared);
+        assert_eq!(state.computers[&hosted].name, "Computer");
+        assert!(!state.computers[&hosted].space);
+    }
+
+    #[test]
+    fn a_computer_update_changes_sharing() {
+        let owner = Id::new();
+        let (computer, bot, chat) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, bot, chat, computer);
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                    "name": "Build Box",
+                    "sharing": "exclusive",
+                    "space": false,
+                }),
+                4,
+            ))
+            .unwrap();
+        assert_eq!(
+            state.computers[&computer].sharing,
+            ComputerSharing::Exclusive
+        );
+        state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(owner),
+                serde_json::json!({"computer": computer, "sharing": "shared"}),
+                5,
+            ))
+            .unwrap();
+        assert_eq!(state.computers[&computer].sharing, ComputerSharing::Shared);
+    }
+
+    #[test]
+    fn a_second_bot_on_an_exclusive_computer_is_refused_on_replay() {
+        let owner = Id::new();
+        let (computer, first, second) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, first, Id::new(), computer);
+        let error = state
+            .apply(&event(
+                EventKind::BotCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": second,
+                    "owner": owner,
+                    "name": "Other",
+                    "computer": computer,
+                    "chat": Id::new(),
+                }),
+                4,
+            ))
+            .unwrap_err();
+        assert_eq!(error, "an exclusive Computer cannot hold more than one Bot");
+    }
+
+    #[test]
+    fn an_exclusive_update_with_two_bots_is_refused_on_replay() {
+        let owner = Id::new();
+        let (computer, first, second) = (Id::new(), Id::new(), Id::new());
+        let mut state = State::default();
+        bot_chat(&mut state, owner, first, Id::new(), computer);
+        // The old Hosted Computer starts exclusive; make it shared before a
+        // second Bot can join, then try to take sharing back.
+        state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(owner),
+                serde_json::json!({"computer": computer, "sharing": "shared"}),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::BotCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": second,
+                    "owner": owner,
+                    "name": "Other",
+                    "computer": computer,
+                    "chat": Id::new(),
+                }),
+                5,
+            ))
+            .unwrap();
+        let error = state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(owner),
+                serde_json::json!({"computer": computer, "sharing": "exclusive"}),
+                6,
+            ))
+            .unwrap_err();
+        assert_eq!(error, "an exclusive Computer cannot hold more than one Bot");
+    }
+
+    #[test]
+    fn a_space_computer_cannot_become_exclusive_on_replay() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                    "name": "Space Computer",
+                    "sharing": "shared",
+                    "space": true,
+                }),
+                1,
+            ))
+            .unwrap();
+        let error = state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(owner),
+                serde_json::json!({"computer": computer, "sharing": "exclusive"}),
+                2,
+            ))
+            .unwrap_err();
+        assert_eq!(error, "the Space Computer stays shared");
+    }
+
+    #[test]
+    fn a_computer_update_comes_from_its_owner_on_replay() {
+        let owner = Id::new();
+        let stranger = Id::new();
+        let computer = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                    "name": "Box",
+                    "sharing": "exclusive",
+                }),
+                1,
+            ))
+            .unwrap();
+        let error = state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(stranger),
+                serde_json::json!({"computer": computer, "sharing": "shared"}),
+                2,
+            ))
+            .unwrap_err();
+        assert_eq!(error, "a Computer update comes from its owner");
+    }
+
+    #[test]
+    fn a_local_computer_cannot_change_sharing_on_replay() {
+        let owner = Id::new();
+        let computer = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "local",
+                    "workspace": "/tmp/workspace",
+                }),
+                1,
+            ))
+            .unwrap();
+        let error = state
+            .apply(&event(
+                EventKind::ComputerUpdated,
+                Author::User(owner),
+                serde_json::json!({"computer": computer, "sharing": "exclusive"}),
+                2,
+            ))
+            .unwrap_err();
+        assert_eq!(error, "only a Hosted Computer changes sharing");
     }
 
     #[test]

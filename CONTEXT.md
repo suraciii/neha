@@ -17,8 +17,16 @@ A User's identity on a Space: a display name, a picture, and one or more ways to
 _Avoid_: login, profile, credential
 
 **Space**:
-The Neha that Users belong to: it holds the record, the Users, the Bots, and their memory. The desktop app runs a built-in Space or connects to a remote one.
+The Neha that Users belong to: it holds the record, the Users, the Bots, and their memory. A Space runs as a Local Space or a Hosted Space.
 _Avoid_: instance, workspace, server, community, tenant, organization
+
+**Local Space**:
+A Space the desktop app runs on the User's computer. The User who starts it is its first User, and another client reaches it only through an origin that computer exposes.
+_Avoid_: built-in Space, desktop Space, local server
+
+**Hosted Space**:
+A Space deployed on a server. Its Users reach it over the network; an operator, which may be the User or Neha, runs it.
+_Avoid_: remote Space, cloud Space, hosted server
 
 **Admin**:
 The User who runs a Space: invites its Users, connects its Providers, and configures the Space.
@@ -29,11 +37,31 @@ Neha's own agent: a persistent identity with memory and a Computer that takes wo
 _Avoid_: teammate (as a term), agent (when meaning Neha's own), assistant, primary bot
 
 **Computer**:
-The machine a Bot runs on, Hosted or Local; a Local Computer runs Neha, and the record names its kind `local` or `hosted`. Each Bot has its own Computer, chosen by its owner, and several Bots may share one.
+The machine a Bot's actions run on, Hosted or Local; a Local Computer runs Neha, and the record names its kind `local` or `hosted`. A Bot's loop and record remain in its Space; only its actions run on its Computer. A Bot has one Computer at a time, chosen by its owner, and several Bots may share one.
 _Avoid_: host, sandbox (as the umbrella), VM, device
 
+**Local Computer**:
+A Computer provided by a machine a User controls. It runs Neha's Computer process and connects out to a Space; the machine may be the one running the Space or another machine the User controls.
+_Avoid_: real Computer, user Computer, local machine
+
+**Hosted Computer**:
+A Computer the Space provides on its own machine, isolated from the record and from other Computers. A User owns the Hosted Computers they create or receive.
+_Avoid_: managed Computer, sandbox Computer, cloud Computer
+
+**Space Computer**:
+The Hosted Computer a User receives by default. Every Hosted Bot the User owns starts on it, and several of those Bots may share it.
+_Avoid_: default Computer, personal Computer, team Computer
+
+**Shared Computer**:
+A Computer that more than one Bot may use.
+_Avoid_: team Computer, common Computer
+
+**Exclusive Computer**:
+A Computer assigned to one Bot. Another Bot may use it only after its owner makes it shared.
+_Avoid_: private Computer, dedicated Computer, personal Computer
+
 **Workspace**:
-The durable file tree of one Bot. A Hosted Computer keeps it in the Space, and a Local Computer keeps it in a directory on the machine.
+The durable file tree of one Computer. A Hosted Computer keeps its Workspace in the Space, and a Local Computer keeps it on the machine. Each Bot works in its own directory inside its Computer's Workspace. Bots on one Computer can reach each other's directories; the Space does not isolate them from each other.
 _Avoid_: home, volume, sandbox disk
 
 **Run**:

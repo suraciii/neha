@@ -93,8 +93,8 @@ function NewBotForm(props: {
   onCancel: () => void;
 }) {
   const [name, setName] = createSignal("");
-  // A new Bot works on a Computer of its own unless the User gives it one they
-  // already paired.
+  // A new Bot works on the owner's Space Computer unless the User gives it one
+  // they already paired.
   const [computer, setComputer] = createSignal("");
   const [sending, setSending] = createSignal(false);
   const [refused, setRefused] = createSignal<string | null>(null);
@@ -147,7 +147,7 @@ function NewBotForm(props: {
             value={computer()}
             onChange={(event) => setComputer(event.currentTarget.value)}
           >
-            <option value="">{t("chat.hostedComputer")}</option>
+            <option value="">{t("computer.space")}</option>
             <For each={locals()}>
               {(known) => (
                 <option value={known.id} disabled={!known.online}>

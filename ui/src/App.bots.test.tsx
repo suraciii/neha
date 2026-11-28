@@ -117,19 +117,22 @@ describe("App bots", () => {
     expect(pressed(view, "New Bot")).toBeTruthy();
 
     await openNewBot(view);
+    const reads = space.asked.filter((asked) => asked === "bot_list").length;
     flush(() => fireEvent.click(pressed(view, "Create Bot")));
 
-    // The Bot is asked for by its name and nothing else: the Space gives a new
-    // Bot a Computer of its own, so the arguments at the boundary are the whole
-    // of what was sent.
+    // The Bot is asked for by its name and nothing else: a Bot that names no
+    // Computer starts on its owner's Space Computer, so the arguments at the
+    // boundary are the whole of what was sent.
     await waitFor(() =>
       expect(frames("bot_create")).toEqual([{ name: "bot_create", args: { name: "Nova" } }]),
     );
     expect(space.creates).toEqual([{ name: "Nova" }]);
-    // The Space records the create as three events, and the client reads the
+    // The Space records the create as its own events, and the client reads the
     // workspace again for each of them.
     await waitFor(() =>
-      expect(space.asked.filter((asked) => asked === "bot_list").length).toBeGreaterThan(3),
+      expect(space.asked.filter((asked) => asked === "bot_list").length).toBeGreaterThanOrEqual(
+        reads + 2,
+      ),
     );
 
     // The Chat the answer names is the one on screen, under the new Bot's name.
@@ -148,7 +151,7 @@ describe("App bots", () => {
 
   it("gives a new Bot a Local Computer the User picks", async () => {
     // A Bot may work on a Computer the User already paired, which is the one
-    // they choose instead of the fresh Hosted one.
+    // they choose instead of the Space Computer.
     const view = await openBotsList();
     await openNewBot(view, "");
     flush(() =>
@@ -175,8 +178,8 @@ describe("App bots", () => {
   });
 
   it("offers no Computer where the User owns no Local one", async () => {
-    // A Hosted Computer is not one a Bot can be given, so a Space whose
-    // Computers are all Hosted has nothing to choose between.
+    // The form offers the Local Computers the User paired; a Space with none
+    // leaves the new Bot on its default Space Computer.
     space.computer.kind = "hosted";
     space.otherComputer.kind = "hosted";
     const view = await openBotsList();
@@ -222,7 +225,7 @@ describe("App bots", () => {
     expect(option.disabled).toBe(true);
     // The list says why it cannot be chosen.
     expect(element(view, ".field__hint").textContent).toContain("offline Computer");
-    // A name that is typed still makes a Bot, on the Hosted Computer the form
+    // A name that is typed still makes a Bot, on the Space Computer the form
     // starts with.
     type(view, "bot_name", "Nova");
     await readyToCreate(view);

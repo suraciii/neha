@@ -59,16 +59,16 @@ The launcher is the only page with a preload bridge to the shell. A Space page
 loads over its own origin with the same sandbox, no Node integration, and no
 desktop bridge.
 
-The local choice starts the bundled Space. The remote choice does not start a
-sidecar and loads only the chosen `https://` origin, or a loopback `http://`
-origin for development. The window MUST NOT navigate outside the chosen
+The Local Space choice starts the bundled Space. The Hosted Space choice does
+not start a sidecar and loads only the chosen `https://` origin, or a loopback
+`http://` origin for development. The window MUST NOT navigate outside the chosen
 origin, except the narrow loopback-to-canonical-`*.localhost` redirect a local
 Space uses for its browser host.
 
 The shell MAY read the local Space's `HttpOnly` cookie from its own Electron
 session to ask the Space for a Local Computer ticket after sign-in. It sends the
 ticket to the bundled CLI over loopback; it MUST NOT expose the token to the
-launcher or to a remote Space page.
+launcher or to a Hosted Space page.
 
 ## Sessions
 

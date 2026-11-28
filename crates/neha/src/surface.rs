@@ -9,7 +9,7 @@ use ts_rs::TS;
 
 use crate::error::ErrorCode;
 use crate::id::Id;
-use crate::record::{Author, Event, RuleEffect};
+use crate::record::{Author, ComputerSharing, Event, RuleEffect};
 use crate::seq::Seq;
 use crate::time::Timestamp;
 
@@ -88,6 +88,10 @@ pub enum CommandCall {
     },
     /// Lists the caller's Computers.
     ComputerList,
+    /// Creates a Hosted Computer.
+    ComputerCreate(ComputerCreate),
+    /// Changes who may use a Computer.
+    ComputerUpdate(ComputerUpdate),
     /// Clears a Hosted Computer's Workspace.
     ComputerReset {
         /// The Hosted Computer to reset.
@@ -97,11 +101,11 @@ pub enum CommandCall {
     BotCreate(BotCreate),
     /// Changes a Bot's file access.
     BotUpdate(BotUpdate),
-    /// Moves a Bot to another real Computer.
+    /// Moves a Bot to another Computer its owner owns.
     BotMove {
         /// The Bot.
         bot: Id,
-        /// The real Computer it should work on.
+        /// The Computer it should work on.
         computer: Id,
     },
     /// Lists the caller's Bots.
@@ -305,7 +309,7 @@ pub struct BotCreate {
     pub name: String,
     /// Where the Bot works.
     ///
-    /// An absent value means a fresh Hosted Computer.
+    /// An absent value means the owner's Space Computer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub computer: Option<BotComputer>,
     /// The Bot's thinking level; absent uses the Space's default.
@@ -314,6 +318,26 @@ pub struct BotCreate {
     /// The Bot's Model; absent uses the Space's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<Id>,
+}
+
+/// The parameters of `computer_create`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
+pub struct ComputerCreate {
+    /// The Computer's name for its owner.
+    pub name: String,
+    /// Who may use it.
+    pub sharing: ComputerSharing,
+}
+
+/// The parameters of `computer_update`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "surface.ts")]
+pub struct ComputerUpdate {
+    /// The Computer to change.
+    pub computer: Id,
+    /// Who may use it now.
+    pub sharing: ComputerSharing,
 }
 
 /// The parameters of `bot_update`.
@@ -377,7 +401,7 @@ pub struct BotUpdate {
 pub enum BotComputer {
     /// The owner's paired Local Computer.
     Local,
-    /// A fresh Hosted Computer.
+    /// A new exclusive Hosted Computer.
     Hosted,
     /// One Computer the caller already owns.
     Id(Id),

@@ -6,7 +6,7 @@
 
 Owned by computer. A Computer's channel depends on [Space](../space/product.md) for the connection it makes and on [Identity](../identity/product.md) for the pairing that admits it.
 
-A Hosted Computer depends on [Space](../space/product.md) for the workspace it keeps.
+A Hosted Computer depends on [Space](../space/product.md) for the Workspace it keeps.
 
 ## Laws
 
@@ -25,9 +25,11 @@ A Hosted Computer depends on [Space](../space/product.md) for the workspace it k
 
 A Local Computer runs Neha as a persistent process. The process holds one outgoing connection to the Space for control and data, and one more per screen; it listens on no network port.
 
-A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket and the token the machine keeps.
+A machine joins a Space by pairing; [Identity](../identity/design.md#codes) covers the local ticket, pairing code, and the token the machine keeps. A Space-provisioned Hosted Computer worker receives its token from the Space and opens the same channel.
 
-The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange. A Hosted Computer runs its actions inside the Space; a provider-backed Hosted Computer would use the same channel.
+The channel carries commands, file reads and writes, process streams, and the screen. A File's bytes cross it as their own exchange. A Hosted Computer runs its actions in an environment the Space provides; a worker-backed or provider-backed Hosted Computer uses the same channel.
+
+A Space Computer is the Hosted Computer its owner receives by default. A Space Computer is shared, and the owner MAY create additional Hosted Computers that are shared or exclusive.
 
 The Space sends each action with an id, and the Computer answers that id with the action's result. Each action has a time limit, including one that moves a File's bytes, and an action that runs past its limit ends as timed out.
 
@@ -41,7 +43,9 @@ The view also names whether the machine fences a Bot's run, and it names nothing
 
 ## The machine
 
-A Local Computer runs on the machine where Neha runs, which its owner paired. A Hosted Computer runs in a sandbox on the Space's machine.
+A Local Computer runs on a machine its owner controls. A Hosted Computer runs on the Space's machine, in a process-local sandbox or in a worker container.
+
+A worker-backed Hosted Computer runs as a container on the Space's machine. It connects out over the same channel, mounts only the Computer's Workspace root, and listens on no network port. The container is its isolation boundary, so it starts no nested sandbox.
 
 A provider-backed Hosted Computer would run as a machine a provider starts, with four operations: start and stop a machine, show its screen, run a process on it, and read and write its files. That form is not specified yet.
 
@@ -49,35 +53,41 @@ The record names a Computer's kind. A provider-backed Computer would also name i
 
 ## The workspace
 
-A Hosted Computer keeps each Bot's Workspace in the Space, and a restart of the Space keeps it. A Local Computer keeps each Bot's Workspace on the machine, under `~/.neha/workspaces/<bot-id>/` by default, and the Space keeps no copy.
+A Computer keeps one Workspace. A Hosted Computer keeps it in the Space, whether its actions run in the Space process or in a worker container, and a restart of the Space keeps it. A Local Computer keeps it on the machine, and the Space keeps no copy.
 
-A Local Computer keeps its Bots' Workspaces under one root, and the machine's owner can choose another root for it. Each Bot has its own Workspace there, and the actions of a run start in it.
+A Workspace holds one directory for each Bot assigned to the Computer. A Bot's actions start in its own directory. The Space creates the directory when the Bot first works there.
 
-A Local pairing MAY record no Workspace root; the root its daemon serves is the one its runs use.
+A Local Computer keeps its Workspace under one root, and the machine's owner can choose another root for it. A Local pairing MAY record no Workspace root; the root its daemon serves is the one its runs use.
+
+A Hosted Computer's Workspace root is derived from the Space home and the Computer id. The record's `workspace` field names the root a Local Computer serves; a Hosted Computer's root follows the current home.
 
 ## Moving a Bot
 
 A move is recorded as an Authority event. A run fixes the Bot's Computer when it starts, so a run already under way ends on the old Computer, and a run that starts after the move uses the new one.
 
-Working files do not migrate. The old Computer keeps them, and the new Computer gives the Bot a Workspace of its own.
+A move reaches any Computer the Bot's owner owns; a Hosted Computer is not special. An exclusive Computer refuses a second Bot until its owner makes it shared.
+
+Working files do not migrate. The old Computer keeps them, and the new Computer gives the Bot a directory of its own inside its Workspace.
 
 ## Isolation
 
 A Computer is the unit of isolation.
 
-Bots assigned to one Computer share its files, processes, and logins. The Space does not isolate them from each other.
+Bots assigned to one Computer share its files and logins. On a Local Computer they also share its processes; on a Hosted Computer each run's shell has its own process namespace. The Space does not isolate their files from each other.
 
-On a Local Computer with granted folders, a Bot's write range is its own Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path. On Linux, the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
+On a Local Computer with granted folders, a Bot's write range is its own directory inside the Computer's Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path. On Linux, the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
 
 On Windows, an explicitly opted-in Local Computer has no operating-system sandbox. Its file tools stay in the Bot's folder, but its shell runs with the machine user's rights.
 
-On a Hosted Computer, a Bot's shell runs in a sandbox that starts from an empty root. The sandbox mounts the Space machine's system directories read-only, and the Bot's Workspace at `/workspace` is the one place where files persist.
+On a Hosted Computer in the Space process, a Bot's shell runs in a sandbox that starts from an empty root. The sandbox mounts the Space machine's system directories read-only, and the Bot's directory at `/workspace` is the one place where files persist.
+
+On a Hosted Computer in a worker container, the shell runs in that container. The container starts no nested sandbox; the worker's container is the fence. The Computer's Workspace is the only persistent writable mount, and each Bot starts in its own directory there.
 
 The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`, and it ends with the Space process. The Space's record, Vault, File store, and another Computer's Workspace are not mounted in it.
 
-The sandbox shares the machine's network, so the Bot's shell reaches the Space's loopback for `neha file get` and `neha chat send --file`. The file tools stay in the Workspace, and the sandbox's other writable places are its own `/tmp` and `/dev/shm`.
+The process-local sandbox shares the machine's network, so the Bot's shell reaches the Space's loopback for `neha file get` and `neha chat send --file`. A worker container reaches the Space over the network. The file tools stay in the Workspace, and the other writable places are the sandbox's own `/tmp` and `/dev/shm`.
 
-A machine that cannot start its sandbox does not serve as a Computer, except for an explicitly opted-in Windows Local Computer. The Space accepts a Windows daemon's truthful `sandbox: false` only when its operator sets `NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`.
+A machine that cannot start its sandbox does not serve as a process-local Computer, except for an explicitly opted-in Windows Local Computer. A worker container uses its container runtime as the sandbox. The Space accepts a Windows daemon's truthful `sandbox: false` only when its operator sets `NEHA_ALLOW_UNSANDBOXED_COMPUTERS=1`.
 
 The desktop sets the opt-in for its bundled Space after the owner accepts the warning. Such a Computer has no OS fence, and its owner MUST treat approvals and Bot trust as the boundary.
 
@@ -91,19 +101,19 @@ On a Local Computer, a run MAY name another existing directory as its working di
 
 A grant and a run's working directory keep every component name exactly: `logs` and `logs ` are different folders.
 
-On a Local Computer with granted folders, a Bot's Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted. A Bot with full access is served without that check.
+On a Local Computer with granted folders, a Bot's directory inside the Workspace is checked before it is served: a hard link, a symlink, and a special file are not accepted. A Bot with full access is served without that check.
 
 A Local Computer's owner grants what a Bot on it can reach. [product.md](product.md) covers the grants.
 
 ## Lifecycle
 
-A Hosted Computer is created with its Bot, and only its owner resets it. A Local Computer is paired; no command resets it.
+A User's Space Computer is created when the User first needs it, and additional Hosted Computers are created by their owner. Only the owner resets a Hosted Computer. A Local Computer is paired; no command resets it.
 
-Resetting clears every entry inside the Bot's Workspace and keeps the Workspace folder. It restores no file and writes no event. Repeating the same command returns its recorded result instead of clearing again.
+Resetting clears every entry inside the Computer's Workspace and keeps the Workspace root. It restores no file and writes no event. Repeating the same command returns its recorded result instead of clearing again.
 
-A reset runs only when the Bot has no queued, running, or waiting run. No run starts while a reset is in progress.
+A reset runs only when no Bot on the Computer has a queued, running, or waiting run. No run starts while a reset is in progress.
 
-Starting, stopping, recovering, and destroying a provider-backed Hosted Computer, and saving and restoring a Workspace, are not yet specified.
+Starting, stopping, and waking a Hosted Computer, and saving and restoring a Workspace, are not yet specified. A worker container follows the same lifecycle as a Hosted Computer.
 
 ## Files
 
