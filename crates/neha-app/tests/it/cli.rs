@@ -660,11 +660,14 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
 /// Waits for `computer list` to show one Local Computer online, and returns
 /// the listing that showed it.
 fn wait_for_computer_online(home: &Path, credential: &Path, computer: &str) -> String {
-    let wanted = format!("{computer}  local  online  ");
     let mut listing = String::new();
     wait_until("the Computer to come online", || {
         listing = run(home, credential, &["computer", "list"]);
-        listing.lines().any(|line| line.starts_with(&wanted))
+        listing.lines().any(|line| {
+            line.starts_with(&format!("{computer}  "))
+                && line.contains("  local  ")
+                && line.contains("  online  ")
+        })
     });
 
     listing
@@ -672,11 +675,14 @@ fn wait_for_computer_online(home: &Path, credential: &Path, computer: &str) -> S
 
 /// Waits for `computer list` to show one Local Computer offline.
 fn wait_for_computer_offline(home: &Path, credential: &Path, computer: &str) {
-    let wanted = format!("{computer}  local  offline  ");
     wait_until("the Computer to go offline", || {
         run(home, credential, &["computer", "list"])
             .lines()
-            .any(|line| line.starts_with(&wanted))
+            .any(|line| {
+                line.starts_with(&format!("{computer}  "))
+                    && line.contains("  local  ")
+                    && line.contains("  offline  ")
+            })
     });
 }
 
@@ -1180,10 +1186,11 @@ fn bare_local_computer(directory: tempfile::TempDir, provider: &str) -> LocalCom
         "an explicit Local Computer creates the Bot there"
     );
     assert!(
-        paired
-            .listed
-            .lines()
-            .any(|line| line.starts_with(&format!("{}  local  ", paired.computer))),
+        paired.listed.lines().any(|line| {
+            line.starts_with(&format!("{}  ", paired.computer))
+                && line.contains("  local  ")
+                && line.contains("  online  ")
+        }),
         "`computer list` shows the paired Local Computer: {}",
         paired.listed
     );
@@ -3152,9 +3159,12 @@ async fn a_local_computer_pairs_without_a_code_and_takes_a_bot_on_it() {
         &["bot", "show", &default_bot],
     );
     assert!(shown.contains("(Hosted, online: true)"), "{shown}");
-    let listed = format!("{}  local  online  ", computer.computer);
     assert!(
-        computer.listed.lines().any(|line| line == listed),
+        computer.listed.lines().any(|line| {
+            line.starts_with(&format!("{}  ", computer.computer))
+                && line.contains("  local  ")
+                && line.contains("  online  ")
+        }),
         "`computer list` shows the Local Computer online: {}",
         computer.listed
     );
