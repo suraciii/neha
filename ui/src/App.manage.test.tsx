@@ -515,6 +515,23 @@ describe("App management", () => {
     await waitFor(() =>
       expect(memory()).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.rule)}`),
     );
+
+    // The last entry goes too: the page keeps the room each kind has left, and
+    // the advice that returns once nothing is remembered.
+    flush(() =>
+      fireEvent.click(
+        memoryRow(view, "The project runs on Node 22.").querySelector(".row__remove")!,
+      ),
+    );
+    await waitFor(() =>
+      expect(space.memoryRemoves).toEqual([
+        { bot: "b1", memory: "mem1" },
+        { bot: "b1", memory: "mem2" },
+      ]),
+    );
+    await waitFor(() => expect(memory()).toContain("Ask the Bot in a Chat to remember something."));
+    expect(memory()).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.rule)}`);
+    expect(memory()).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.note)}`);
   });
 
   it("groups memory by kind and then by the scope it applies in", async () => {
@@ -582,12 +599,18 @@ describe("App management", () => {
     await waitFor(() => expect(space.memoryRemoves).toEqual([{ bot: "b1", memory: "mem3" }]));
   });
 
-  it("says how to add the first memory entry", async () => {
+  it("says how to add the first memory entry and what each kind may hold", async () => {
     const view = await openBots();
 
     // With no entry, the page points the User at a Chat. It offers no control
     // that adds or changes one: a User does that in a Chat.
-    expect(memoryPanel(view).textContent).toContain("Ask the Bot in a Chat to remember something.");
+    const memory = memoryPanel(view).textContent ?? "";
+    expect(memory).toContain("Ask the Bot in a Chat to remember something.");
+    expect(memory).toContain("Rules");
+    expect(memory).toContain("Notes");
+    // An empty memory still names the room each kind has left.
+    expect(memory).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.rule)}`);
+    expect(memory).toContain(`${formatBytes(0)} / ${formatBytes(space.memoryLimits.note)}`);
     expect(memoryPanel(view).querySelector("form")).toBeNull();
     expect(memoryPanel(view).querySelector("input")).toBeNull();
   });

@@ -877,75 +877,73 @@ export default function BotPage(props: BotPageProps) {
                 <h2>{t("bot.section.memory")}</h2>
               </div>
               <div class="panel__body">
-                <Show
-                  when={props.memories.entries.length > 0}
-                  fallback={<p class="rows__empty">{t("bot.memory.empty")}</p>}
-                >
-                  <div class="memory">
-                    <For each={KINDS}>
-                      {(kind) => (
-                        <div class="memory__group">
-                          <div class="memory__head">
-                            <h3 class="memory__kind">{t(`bot.memory.${kind}s`)}</h3>
-                            <span class="memory__capacity">
-                              {t("bot.memory.capacity", {
-                                used: formatBytes(usedOf(kind)),
-                                limit: formatBytes(limitOf(kind)),
-                              })}
-                            </span>
-                          </div>
-                          {/* One group per scope the kind holds entries in;
+                {/* An empty memory still shows how much each kind may hold, so
+                    the page names the room before the Bot keeps anything. */}
+                <Show when={props.memories.entries.length === 0}>
+                  <p class="rows__empty">{t("bot.memory.empty")}</p>
+                </Show>
+                <div class="memory">
+                  <For each={KINDS}>
+                    {(kind) => (
+                      <div class="memory__group">
+                        <div class="memory__head">
+                          <h3 class="memory__kind">{t(`bot.memory.${kind}s`)}</h3>
+                          <span class="memory__capacity">
+                            {t("bot.memory.capacity", {
+                              used: formatBytes(usedOf(kind)),
+                              limit: formatBytes(limitOf(kind)),
+                            })}
+                          </span>
+                        </div>
+                        {/* One group per scope the kind holds entries in;
                               a scope with none stays off the page. */}
-                          <For each={SCOPES}>
-                            {(scope) => (
-                              <Show when={scopedOf(kind, scope).length > 0}>
-                                <div class="memory__scope">
-                                  <h4 class="memory__scope-title">
-                                    {`${t(`bot.memory.${kind}s`)} · ${t(`bot.memory.scope.${scope}`)}`}
-                                  </h4>
-                                  <div class="rows">
-                                    <For each={scopedOf(kind, scope)}>
-                                      {(entry) => (
-                                        <div class="row">
-                                          <span class="chip">
-                                            {t(`bot.memory.scope.${entry.scope}`)}
-                                          </span>
-                                          <span class="row__text">
-                                            {/* A User who does not read an entry
+                        <For each={SCOPES}>
+                          {(scope) => (
+                            <Show when={scopedOf(kind, scope).length > 0}>
+                              <div class="memory__scope">
+                                <h4 class="memory__scope-title">
+                                  {`${t(`bot.memory.${kind}s`)} · ${t(`bot.memory.scope.${scope}`)}`}
+                                </h4>
+                                <div class="rows">
+                                  <For each={scopedOf(kind, scope)}>
+                                    {(entry) => (
+                                      <div class="row">
+                                        <span class="chip">
+                                          {t(`bot.memory.scope.${entry.scope}`)}
+                                        </span>
+                                        <span class="row__text">
+                                          {/* A User who does not read an entry
                                                 sees its metadata only, the way
                                                 the Space answers it. */}
-                                            <Show when={entry.readable}>
-                                              <span class="row__name memory__text">
-                                                {entry.text}
-                                              </span>
-                                            </Show>
-                                            <span class="row__meta">
-                                              {`${authorOf(entry)} · ${sourceOf(entry)} · ${formatBytes(entry.size)}`}
-                                            </span>
+                                          <Show when={entry.readable}>
+                                            <span class="row__name memory__text">{entry.text}</span>
+                                          </Show>
+                                          <span class="row__meta">
+                                            {`${authorOf(entry)} · ${sourceOf(entry)} · ${formatBytes(entry.size)}`}
                                           </span>
-                                          <button
-                                            class="row__remove"
-                                            type="button"
-                                            aria-label={t("bot.memory.remove")}
-                                            title={t("bot.memory.remove")}
-                                            disabled={props.busy}
-                                            onClick={() => void props.onMemoryRemove(entry.memory)}
-                                          >
-                                            <Icon name="x" size="sm" />
-                                          </button>
-                                        </div>
-                                      )}
-                                    </For>
-                                  </div>
+                                        </span>
+                                        <button
+                                          class="row__remove"
+                                          type="button"
+                                          aria-label={t("bot.memory.remove")}
+                                          title={t("bot.memory.remove")}
+                                          disabled={props.busy}
+                                          onClick={() => void props.onMemoryRemove(entry.memory)}
+                                        >
+                                          <Icon name="x" size="sm" />
+                                        </button>
+                                      </div>
+                                    )}
+                                  </For>
                                 </div>
-                              </Show>
-                            )}
-                          </For>
-                        </div>
-                      )}
-                    </For>
-                  </div>
-                </Show>
+                              </div>
+                            </Show>
+                          )}
+                        </For>
+                      </div>
+                    )}
+                  </For>
+                </div>
               </div>
             </section>
           </div>

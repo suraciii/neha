@@ -976,24 +976,14 @@ fn memory_limits_json() -> Value {
     Value::Object(limits)
 }
 
-/// The bytes each kind of one Bot's memory has left after one write of
-/// `kind` leaves `used_after` bytes of that kind.
-fn memory_remaining_after_json(
-    state: &State,
-    bot: Id,
-    kind: MemoryKind,
-    used_after: usize,
-) -> Value {
+/// The bytes each kind of one Bot's memory has left after one write leaves
+/// `used` bytes of each kind, in the order of [`MemoryKind::ALL`].
+fn memory_remaining_after_json(used: [usize; 2]) -> Value {
     let mut remaining = serde_json::Map::new();
-    for each in MemoryKind::ALL {
-        let used = if each == kind {
-            used_after
-        } else {
-            state.memory_used(bot, each)
-        };
+    for (kind, used) in MemoryKind::ALL.into_iter().zip(used) {
         remaining.insert(
-            each.as_str().to_owned(),
-            json!(each.limit().saturating_sub(used)),
+            kind.as_str().to_owned(),
+            json!(kind.limit().saturating_sub(used)),
         );
     }
 
@@ -1276,6 +1266,9 @@ fn plan_remember(
         ));
     }
 
+    // Every entry the write replaces must still apply and must be one the
+    // acting User may remove. A single target that is absent, replaced, or
+    // the caller's to keep changes nothing: a replacement never lands in part.
     let mut targets: Vec<&MemoryView> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for replaced in replaces {
@@ -1292,48 +1285,42 @@ fn plan_remember(
             ));
         };
         if entry.superseded {
-            // A replay of a write whose target a later write replaced changes
-            // nothing.
-            continue;
+            return MemoryWrite::Nothing(format!(
+                "the memory write changed nothing: the entry {replaced} no longer applies"
+            ));
+        }
+        if !entry.removable_by(acting, owner) {
+            return MemoryWrite::Nothing(format!(
+                "the memory write changed nothing: the entry {replaced} is not one the acting User can replace"
+            ));
         }
         targets.push(entry);
     }
-    if !replaces.is_empty() && targets.is_empty() {
-        // The whole write already happened and a later write replaced its
-        // entry too: replaying it writes no third entry.
-        let earlier = state.memories_of(bot).into_iter().find(same);
-        let Some(earlier) = earlier else {
-            return MemoryWrite::Nothing(
-                "the memory write changed nothing: the entries it replaces no longer apply"
-                    .to_owned(),
-            );
-        };
-        return MemoryWrite::Nothing(remember_output(
-            state,
-            bot,
-            earlier.memory,
-            kind,
-            scope,
-            scope_id,
-            &[],
-        ));
-    }
+    // Only a replaced entry of the same kind frees room in that kind's
+    // budget. A write may replace entries of both kinds, but replacing a note
+    // gives a rule no room and replacing a rule gives a note none: the kinds
+    // have separate limits.
+    let mut used_after = [
+        state.memory_used(bot, MemoryKind::Rule),
+        state.memory_used(bot, MemoryKind::Note),
+    ];
     for target in &targets {
-        if !target.removable_by(acting, owner) {
-            return MemoryWrite::Nothing(format!(
-                "the memory write changed nothing: the entry {} is not one the acting User can replace",
-                target.memory
-            ));
-        }
+        let index = match target.kind {
+            MemoryKind::Rule => 0,
+            MemoryKind::Note => 1,
+        };
+        used_after[index] = used_after[index].saturating_sub(target.text.len());
     }
+    let index = match kind {
+        MemoryKind::Rule => 0,
+        MemoryKind::Note => 1,
+    };
+    used_after[index] = used_after[index].saturating_add(text.len());
     let used = state.memory_used(bot, kind);
-    let replaced_bytes: usize = targets.iter().map(|entry| entry.text.len()).sum();
-    let used_after = used
-        .saturating_sub(replaced_bytes)
-        .saturating_add(text.len());
-    if used_after > kind.limit() {
+    let used_after_kind = used_after[index];
+    if used_after_kind > kind.limit() {
         return MemoryWrite::Nothing(format!(
-            "I cannot remember that: my {} memory uses {used} of {} bytes, and this write would make it {used_after}",
+            "I cannot remember that: my {} memory uses {used} of {} bytes, and this write would make it {used_after_kind}",
             kind.as_str(),
             kind.limit()
         ));
@@ -1365,7 +1352,7 @@ fn plan_remember(
         "scope": scope,
         "scope_id": scope_id,
         "replaced": replaced,
-        "remaining": memory_remaining_after_json(state, bot, kind, used_after),
+        "remaining": memory_remaining_after_json(used_after),
     })
     .to_string();
 
@@ -4291,6 +4278,7 @@ pub async fn finish_run(
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
     links: &ComputerLinks,
+    approvals: &tokio::sync::Mutex<()>,
     pending: PendingRun,
 ) -> Result<Finished, ApiError> {
     let history = build_history(state, &pending)?;
@@ -4302,6 +4290,7 @@ pub async fn finish_run(
         events,
         tool_timeout,
         links,
+        approvals,
         pending,
         history,
         None,
@@ -4409,6 +4398,7 @@ pub async fn resume_run(
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
     links: &ComputerLinks,
+    approvals: &tokio::sync::Mutex<()>,
     run: &crate::state::RunView,
 ) -> Result<Finished, ApiError> {
     let (resumable, recovering) = {
@@ -4452,6 +4442,7 @@ pub async fn resume_run(
             events,
             tool_timeout,
             links,
+            approvals,
             pending,
             history,
             None,
@@ -4552,6 +4543,7 @@ pub async fn resume_run(
                 events,
                 tool_timeout,
                 links,
+                approvals,
                 pending,
                 history,
                 continuation,
@@ -4673,6 +4665,7 @@ async fn finish_run_with(
     events: &tokio::sync::broadcast::Sender<Event>,
     tool_timeout: Duration,
     links: &ComputerLinks,
+    approvals: &tokio::sync::Mutex<()>,
     pending: PendingRun,
     history: Vec<neha_loop::Message>,
     mut continuation: Option<neha_loop::Continuation>,
@@ -4897,6 +4890,7 @@ async fn finish_run_with(
         store,
         state,
         events,
+        approvals,
         bot: pending.bot.id,
         acting: pending.acting,
         run: pending.run,
@@ -5875,6 +5869,10 @@ struct RunLog<'a> {
     store: &'a Store,
     state: &'a Mutex<State>,
     events: &'a tokio::sync::broadcast::Sender<Event>,
+    /// Serializes a memory write's plan with its append: two calls that plan
+    /// against the same projection must not both write, or the record holds
+    /// an event the projection refuses on replay.
+    approvals: &'a tokio::sync::Mutex<()>,
     bot: Id,
     acting: Id,
     run: Id,
@@ -6187,6 +6185,11 @@ impl Recorder for RunRecorder<'_> {
         _call: &LoopCall,
         request: &MemoryCall,
     ) -> Result<ToolOutput, LoopError> {
+        // The plan and the append hold the Space's write lock, the same one
+        // the command surface takes for a memory removal. Two calls that plan
+        // from one projection must not both write: the record would hold an
+        // event the projection refuses.
+        let _write = self.log.approvals.lock().await;
         let plan = {
             let state = self
                 .log
@@ -6207,6 +6210,10 @@ impl Recorder for RunRecorder<'_> {
                 request,
             )
         };
+        // A test can hold the planned write against the projection it read,
+        // so a command that writes the same entries can be interleaved.
+        #[cfg(feature = "test-support")]
+        memory_pause::before_append(self.log.bot).await;
         match plan {
             MemoryWrite::Nothing(output) => Ok(ToolOutput::full(output)),
             MemoryWrite::Add { entry, output } => {
@@ -9087,6 +9094,167 @@ mod tests {
     }
 
     #[test]
+    fn a_cross_kind_replacement_does_not_free_the_written_kinds_room() {
+        // A note's bytes are not a rule's bytes: replacing a large note while
+        // writing a rule must not let the rule pass its 4 KiB limit.
+        let (mut state, owner, bot, chat) = memory_space();
+        push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Rule,
+            MemoryScope::Owner,
+            None,
+            owner,
+            false,
+            owner,
+            &"r".repeat(4090),
+            &[],
+            4,
+        );
+        let note = push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Note,
+            MemoryScope::Owner,
+            None,
+            bot,
+            true,
+            owner,
+            &"n".repeat(16000),
+            &[],
+            5,
+        );
+        let MemoryWrite::Nothing(output) = plan_memory(
+            &state,
+            bot,
+            owner,
+            chat,
+            Id::new(),
+            &remember(MemoryKind::Rule, MemoryScope::Owner, "0123456789", &[note]),
+        ) else {
+            panic!("a replaced note frees no rule room");
+        };
+        assert!(output.contains("4096"), "{output}");
+
+        // The other way around: replacing a rule frees no note room.
+        let (mut state, owner, bot, chat) = memory_space();
+        let rule = push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Rule,
+            MemoryScope::Owner,
+            None,
+            owner,
+            false,
+            owner,
+            &"r".repeat(400),
+            &[],
+            4,
+        );
+        push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Note,
+            MemoryScope::Owner,
+            None,
+            bot,
+            true,
+            owner,
+            &"n".repeat(16000),
+            &[],
+            5,
+        );
+        let MemoryWrite::Nothing(output) = plan_memory(
+            &state,
+            bot,
+            owner,
+            chat,
+            Id::new(),
+            &remember(
+                MemoryKind::Note,
+                MemoryScope::Owner,
+                &"x".repeat(500),
+                &[rule],
+            ),
+        ) else {
+            panic!("a replaced rule frees no note room");
+        };
+        assert!(output.contains("16384"), "{output}");
+
+        // A same-kind replacement still frees the room it replaces.
+        let (mut state, owner, bot, chat) = memory_space();
+        let replaced = push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Rule,
+            MemoryScope::Owner,
+            None,
+            owner,
+            false,
+            owner,
+            &"r".repeat(4090),
+            &[],
+            4,
+        );
+        assert!(
+            matches!(
+                plan_memory(
+                    &state,
+                    bot,
+                    owner,
+                    chat,
+                    Id::new(),
+                    &remember(
+                        MemoryKind::Rule,
+                        MemoryScope::Owner,
+                        &"s".repeat(4090),
+                        &[replaced],
+                    ),
+                ),
+                MemoryWrite::Add { .. }
+            ),
+            "replacing a rule with a rule of the same size stays within the limit"
+        );
+    }
+
+    #[test]
+    fn a_cross_kind_replacement_reports_the_other_kinds_room() {
+        let (mut state, owner, bot, chat) = memory_space();
+        let note = push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Note,
+            MemoryScope::Owner,
+            None,
+            bot,
+            true,
+            owner,
+            &"n".repeat(100),
+            &[],
+            4,
+        );
+
+        let MemoryWrite::Add { entry, output } = plan_memory(
+            &state,
+            bot,
+            owner,
+            chat,
+            Id::new(),
+            &remember(MemoryKind::Rule, MemoryScope::Owner, "abc", &[note]),
+        ) else {
+            panic!("a small rule may replace a note");
+        };
+        assert_eq!(entry.replaces, vec![note]);
+        let value: Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(value["remaining"]["rule"], json!(4096 - 3));
+        assert_eq!(
+            value["remaining"]["note"],
+            json!(16384),
+            "the write releases the note it replaces"
+        );
+    }
+
+    #[test]
     fn a_remember_refuses_a_scope_the_calling_user_cannot_write() {
         let (state, _owner, bot, chat) = memory_space();
         let other = Id::new();
@@ -9169,6 +9337,94 @@ mod tests {
             ),
             MemoryWrite::Add { .. }
         ));
+    }
+
+    #[test]
+    fn a_replacement_never_lands_in_part() {
+        let (mut state, owner, bot, chat) = memory_space();
+        let replaced = push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Note,
+            MemoryScope::Owner,
+            None,
+            bot,
+            true,
+            owner,
+            "first note",
+            &[],
+            4,
+        );
+        let active = push_memory(
+            &mut state,
+            bot,
+            MemoryKind::Note,
+            MemoryScope::Owner,
+            None,
+            bot,
+            true,
+            owner,
+            "second note",
+            &[replaced],
+            5,
+        );
+
+        // One target no longer applies, so the whole write changes nothing;
+        // the active target is not replaced by a partial write.
+        let MemoryWrite::Nothing(output) = plan_memory(
+            &state,
+            bot,
+            owner,
+            chat,
+            Id::new(),
+            &remember(
+                MemoryKind::Note,
+                MemoryScope::Owner,
+                "third note",
+                &[replaced, active],
+            ),
+        ) else {
+            panic!("one superseded target refuses the whole write");
+        };
+        assert!(output.contains("no longer applies"), "{output}");
+        assert!(
+            state
+                .memories
+                .iter()
+                .any(|entry| entry.memory == active && !entry.superseded),
+            "the active target still applies"
+        );
+        assert!(
+            !state
+                .memories
+                .iter()
+                .any(|entry| entry.text == "third note"),
+            "the refused write added nothing"
+        );
+
+        // A target that does not exist refuses it too.
+        let MemoryWrite::Nothing(output) = plan_memory(
+            &state,
+            bot,
+            owner,
+            chat,
+            Id::new(),
+            &remember(
+                MemoryKind::Note,
+                MemoryScope::Owner,
+                "third note",
+                &[active, Id::new()],
+            ),
+        ) else {
+            panic!("one absent target refuses the whole write");
+        };
+        assert!(output.contains("changed nothing"), "{output}");
+        assert!(
+            state
+                .memories
+                .iter()
+                .any(|entry| entry.memory == active && !entry.superseded)
+        );
     }
 
     #[test]
@@ -9693,6 +9949,46 @@ mod tests {
     }
 }
 
+/// A test seam: a test pauses one Bot's next memory write between planning it
+/// and appending it, so a command can be interleaved deterministically.
+#[cfg(feature = "test-support")]
+mod memory_pause {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use neha::id::Id;
+    use tokio::sync::Notify;
+
+    pub(crate) type MemoryPause = (Arc<Notify>, Arc<Notify>);
+
+    static MEMORY_PAUSES: Mutex<Option<HashMap<Id, MemoryPause>>> = Mutex::new(None);
+
+    /// Installs a pause for one Bot's next memory write; returns (reached,
+    /// release). The write holds the Space's write lock while it waits.
+    pub(crate) fn pause_for_test(bot: Id) -> MemoryPause {
+        let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        MEMORY_PAUSES
+            .lock()
+            .expect("memory pause lock")
+            .get_or_insert_with(HashMap::new)
+            .insert(bot, pause.clone());
+
+        pause
+    }
+
+    /// Waits for the test to release the paused write.
+    pub(crate) async fn before_append(bot: Id) {
+        let pause = MEMORY_PAUSES
+            .lock()
+            .ok()
+            .and_then(|mut pauses| pauses.as_mut().and_then(|pauses| pauses.remove(&bot)));
+        if let Some((reached, release)) = pause {
+            reached.notify_one();
+            release.notified().await;
+        }
+    }
+}
+
 /// What the integration tests need from inside this module.
 ///
 /// Integration tests live in `tests/` and see only the crate's public
@@ -9782,6 +10078,17 @@ pub mod test_support {
         {
             self.0.write_bytes(path, bytes)
         }
+    }
+
+    /// Installs a pause for one Bot's next memory write; returns (reached,
+    /// release). The write holds the Space's write lock while it waits.
+    pub fn pause_memory_write_for_test(
+        bot: Id,
+    ) -> (
+        std::sync::Arc<tokio::sync::Notify>,
+        std::sync::Arc<tokio::sync::Notify>,
+    ) {
+        super::memory_pause::pause_for_test(bot)
     }
 
     /// Loads the provider-native state a resumed step needs.

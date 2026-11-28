@@ -5948,6 +5948,132 @@ async fn a_bot_forgets_the_note_its_owner_asks_it_to() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn two_clients_removing_one_memory_entry_agree() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+        tool(
+            "remember",
+            json!({"kind": "note", "scope": "owner", "text": "the build uses nix"}),
+        ),
+        text("Noted."),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let first = send(&mut socket, chat, "remember that the build uses nix").await;
+    assert_eq!(first["status"], "succeeded");
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    let memory: Id = serde_json::from_value(listed["entries"][0]["memory"].clone()).unwrap();
+
+    let mut other = open_socket(&running, &token).await;
+    let (one, two) = tokio::join!(
+        try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::MemoryRemove { bot, memory }
+        ),
+        try_command(
+            &mut other,
+            Id::new(),
+            CommandCall::MemoryRemove { bot, memory }
+        ),
+    );
+    let (mut removed, mut missing) = (0, 0);
+    for result in [one, two] {
+        match result {
+            Ok(_) => removed += 1,
+            Err((ErrorCode::NotFound, _)) => missing += 1,
+            Err(error) => panic!("unexpected answer: {error:?}"),
+        }
+    }
+    assert_eq!(removed, 1, "one removal wins");
+    assert_eq!(missing, 1, "the other finds the entry already gone");
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    assert!(listed["entries"].as_array().unwrap().is_empty(), "{listed}");
+
+    // A restart replays the record: the removal it holds projects cleanly.
+    let root = running.server_home();
+    socket.close(None).await.unwrap();
+    other.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+    let restarted = start(test_home(&root), 0).await.unwrap();
+    let mut socket = open_socket(&restarted, &token).await;
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    assert!(listed["entries"].as_array().unwrap().is_empty(), "{listed}");
+    socket.close(None).await.unwrap();
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_removal_and_a_run_forget_do_not_both_write() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let note = "the build uses nix";
+    let (base, provider_task, _gates, _recorded) = gated_provider(vec![
+        tool(
+            "remember",
+            json!({"kind": "note", "scope": "owner", "text": note}),
+        ),
+        text("Noted."),
+        tool("forget", json!({"text": note})),
+        text("I forgot it."),
+    ])
+    .await;
+    let (bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    let first = send(&mut socket, chat, "remember that the build uses nix").await;
+    assert_eq!(first["status"], "succeeded");
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    let memory: Id = serde_json::from_value(listed["entries"][0]["memory"].clone()).unwrap();
+
+    // Pause the next run's memory write once it has planned the removal.
+    let (reached, release) = neha_space::test_support::commands::pause_memory_write_for_test(bot);
+    let queued = submit(&mut socket, chat, "forget that the build uses nix", None).await;
+    reached.notified().await;
+
+    // A command that removes the same entry waits for the same write lock
+    // instead of planning from the state the run is about to change.
+    let mut other = open_socket(&running, &token).await;
+    let removal = tokio::spawn(async move {
+        try_command(
+            &mut other,
+            Id::new(),
+            CommandCall::MemoryRemove { bot, memory },
+        )
+        .await
+    });
+    // Let the command reach the write lock the paused run holds.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    release.notify_one();
+    let finished = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        finish(&mut socket, chat, queued),
+    )
+    .await
+    .expect("the run records its removal; a racing write would strand it");
+    assert_eq!(finished["status"], "succeeded");
+    let removal = removal.await.expect("the command task");
+    assert!(
+        matches!(removal, Err((ErrorCode::NotFound, _))),
+        "the run wrote the removal first: {removal:?}"
+    );
+
+    // The entry is gone and a restart replays the record.
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    assert!(listed["entries"].as_array().unwrap().is_empty(), "{listed}");
+    let root = running.server_home();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+    let restarted = start(test_home(&root), 0).await.unwrap();
+    let mut socket = open_socket(&restarted, &token).await;
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    assert!(listed["entries"].as_array().unwrap().is_empty(), "{listed}");
+    socket.close(None).await.unwrap();
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_tool_cannot_leave_the_workspace() {
     let (_dir, running, invite) = running().await;
     let (mut socket, _token) = admin(&running, &invite).await;

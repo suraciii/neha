@@ -15,7 +15,7 @@ Only a User's words start a `rule`: the Bot never starts one on its own. The Bot
 
 A `rule`'s author is the User whose words gave it, and a `note`'s author is the Bot. An entry's source names the Message, run, or command that wrote it.
 
-The Bot's job is its earliest `rule` in `owner` scope that still applies. Give the Bot its job before its other rules, so the first rule it keeps is the job.
+The Bot's job is its earliest `rule` in `owner` scope that still applies. Tell it its job before its other rules: a rule kept earlier would become the job instead.
 
 The Bot reads a `rule` as an instruction and a `note` as data. Ask it to remember only what you want it to follow.
 
@@ -34,7 +34,7 @@ The default scope is the owner's Chats. An entry applies only in its scope.
 
 A Group entry belongs to the Group where it was learned. Group memory is not available yet.
 
-When you own the Bot and ask it to remember something in your Chat, the entry is in `owner` scope and applies in the owner's Chats. When a Bot is shared with other Users, a User who asks it to remember something in their Chat gets a `user` entry that applies only in that Chat.
+When you own the Bot and ask it to remember something in your Chat, the entry is in `owner` scope and applies in the owner's Chats. A `user` entry belongs to the Chat between the Bot and one other User, and applies only in that Chat. Sharing a Bot with other Users is not available yet.
 
 The owner sees every entry's scope, author, and source without reading another User's content. A User reads and clears the entries that are theirs, including the `note` entries the Bot wrote while acting for that User.
 
@@ -44,7 +44,7 @@ A Bot's memory holds at most 4 KiB of `rule` text and 16 KiB of `note` text, cou
 
 A write that passes a limit changes nothing, and the Bot says that its memory is full. To keep something when a kind is full, the Bot can remove or replace entries of that kind in the same request. A request that still passes the limit changes nothing. Clear an entry on the Bot's page or from the CLI to make room.
 
-The same text written again in the same kind and scope changes nothing; a retry adds no second entry.
+The same text written again for the same Bot, kind, scope, and acting User changes nothing; a retry adds no second entry. Two Users who write the same text keep one entry each.
 
 ## Read and clear memory
 
@@ -62,10 +62,11 @@ The page adds and changes no entry. You add and change memory in a Chat.
 
 ### From the CLI
 
-The Bot's owner and a User allowed to use the Bot read its memory from the CLI. List the entries with the Bot's id in `BOT_ID`:
+The Bot's owner and a User allowed to use the Bot read its memory from the CLI. Copy the Bot's id from `neha bot list` into `BOT_ID`, then list its memory:
 
 ```bash
-BOT_ID=$(target/debug/neha bot list | awk '$2 == "Scout" {print $1; exit}')
+target/debug/neha bot list
+BOT_ID="<the Bot's id>"
 target/debug/neha bot memory "$BOT_ID"
 ```
 
@@ -82,12 +83,12 @@ The command removes an entry when the User can clear it, and the owner can clear
 
 ### In a Chat
 
-The Bot adds and changes memory in a Chat. Ask it to remember a preference or its job, ask it what it remembers, or ask it to forget an entry:
+The Bot adds and changes memory in a Chat. Give it its job first, then the other rules it should follow:
 
 | Say in the Chat | What it does |
 | --- | --- |
-| "Remember that I prefer short answers." | Keeps a `rule` in the scope of the Chat |
-| "Remember that your job is to keep my release notes up to date." | Gives the Bot its job |
+| "Remember that your job is to keep my release notes up to date." | Gives the Bot its job: its earliest `rule` in `owner` scope |
+| "Remember that I prefer short answers." | Keeps another `rule`; the job stays the earliest one |
 | "What do you remember?" | Answers from the entries that apply |
 | "Forget that I prefer short answers." | Removes an entry the User can clear |
 
@@ -99,15 +100,14 @@ Both use the word rule, and they do different work. A memory `rule` is an instru
 
 For a Local Bot, approval rules are on the Bot's page under Access, and `neha rule` manages them. [Approvals](approvals.md) covers them. Memory entries are in the Memory section, and `neha bot memory` reads them.
 
-An Always allow answers one approval and writes an Allow rule. It writes no memory.
+Always allow writes no memory. See [Approvals](approvals.md) for its lasting effect.
 
 A memory write needs no approval. No Ask or Allow rule covers it, and it is not a Computer action.
 
 To teach the Bot a lasting preference, ask it in a Chat to remember the preference. To let an action proceed without asking, add an Allow rule.
 
-## What this milestone does not do
+## Limits
 
-- Sharing a Bot with other Users is not available, so every memory entry is in `owner` scope in this milestone.
 - Memory has no on or off switch.
 - Sharing a Bot as a template is not available. A template copy carries the Bot's `owner` rules that still apply, including its job, and no `note`, `user`, or `group` entry.
 - Deleting a Bot is not available. It takes its Chats, its memory, and its page with it.

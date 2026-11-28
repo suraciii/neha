@@ -107,7 +107,9 @@ pub struct SpaceServer {
     pub(crate) links: ComputerLinks,
     /// Pairing attempts that are running or recently failed, per account.
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
-    /// Serializes approval answers and rule changes.
+    /// Serializes approval answers, rule changes, and memory writes: each
+    /// reads the projection and then appends, so two writes that read one
+    /// state must not both land.
     pub(crate) approvals: tokio::sync::Mutex<()>,
     /// Serializes Computer creation and Bot assignment, so an exclusive
     /// Computer cannot take two Bots and a create cannot race a move.
