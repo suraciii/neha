@@ -137,7 +137,7 @@ The Needs attention entry opens the [Needs attention view](../messaging/notifica
 
 The Bots entry lists the User's Bots. Selecting one opens that Bot's page.
 
-The list offers **New Bot**: the User names the Bot and picks its Computer. The choice lists the Computers the User owns, and one that is offline cannot be picked. Without a choice the Bot starts on the User's Space Computer.
+The list offers **New Bot**: the User names the Bot and picks its Computer. The choice lists the Local Computers the User owns, and one that is offline cannot be picked. Without a choice the Bot starts on the User's Space Computer.
 
 The client opens the new Bot's Chat. [Bot](../bot/product.md#creating-a-bot) owns what a new Bot starts with, and [Computer](../computer/product.md#adding-a-local-computer) owns when a paired Computer is online.
 
