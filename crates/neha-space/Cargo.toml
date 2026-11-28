@@ -24,7 +24,7 @@ neha = { path = "../neha" }
 neha-computer = { path = "../neha-computer" }
 neha-loop = { path = "../neha-loop" }
 opendal.workspace = true
-rand = "0.9"
+rand = "0.10"
 reqwest = { workspace = true, features = ["json", "query", "rustls", "stream"] }
 serde = { workspace = true, features = ["derive"] }
 sha2 = "0.11"
