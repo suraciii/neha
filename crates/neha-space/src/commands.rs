@@ -18,9 +18,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::error::ErrorCode;
 use neha::id::Id;
 use neha::record::{
-    ActionStatus as RecordedActionStatus, ApprovalReason, Author, Event, EventDraft, EventKind,
-    FULL_ACCESS_CONSENT_VERSION, FileAdded, MAX_PLUGIN_SOURCE_BYTES, RuleEffect, SkillLibrary,
-    SkillScript, Undoability, valid_script_name,
+    APP_CARD_KIND, ActionStatus as RecordedActionStatus, ApprovalReason, Author, CardData, Event,
+    EventDraft, EventKind, FULL_ACCESS_CONSENT_VERSION, FileAdded, MAX_FILE_NAME_BYTES,
+    MAX_PLUGIN_SOURCE_BYTES, RuleEffect, SkillLibrary, SkillScript, Undoability, valid_script_name,
 };
 use neha::seq::Seq;
 use neha::surface::{
@@ -66,6 +66,12 @@ use neha_loop::{
 const RESULT_RUNNING: &str = "running";
 const RESULT_QUEUED: &str = "queued";
 const RUN_POLL: Duration = Duration::from_millis(100);
+/// The answer one MCP call gives when its content hides the credential.
+///
+/// The same sentence covers every shape that can hide it (an image's bytes, a
+/// resource's decoded blob), so a caller cannot tell which block did it.
+const MCP_CREDENTIAL_REFUSAL: &str =
+    "the MCP server's answer carried its credential, so nothing was recorded";
 /// What a command wrote and whether work follows.
 pub struct Outcome {
     /// The cursor of the command's last event.
@@ -6747,6 +6753,7 @@ async fn finish_run_with(
         run: pending.run,
         cwd: pending.cwd.clone(),
         access: pending.access.clone(),
+        cards: std::sync::Arc::new(Mutex::new(HashMap::new())),
     };
     let runtime = RedactingRuntime {
         inner: runtime,
@@ -6759,6 +6766,7 @@ async fn finish_run_with(
         acting: pending.acting,
         secrets: Some(secrets),
         log: Some(log.clone()),
+        mcp: offered.mcp.clone(),
     };
     if let Some((next_step, unknown)) = recovery {
         start_step = Some(next_step);
@@ -7708,15 +7716,22 @@ struct RedactingRuntime<'a> {
     secrets: Option<&'a Secrets>,
     /// Where this run records the Files an MCP answer carries.
     log: Option<RunLog<'a>>,
+    /// The MCP tools this run offers, by the name the Model sees.
+    mcp: McpCatalog,
 }
 
 impl RedactingRuntime<'_> {
+    fn redact_text(&self, text: &str) -> String {
+        match &self.secret {
+            Some(secret) => text.replace(secret, "[redacted]"),
+            None => text.to_owned(),
+        }
+    }
+
     fn redact(&self, mut result: neha_computer::ActionResult) -> neha_computer::ActionResult {
-        if let Some(secret) = &self.secret {
-            result.output.text = result.output.text.replace(secret, "[redacted]");
-            if let Some(error) = &mut result.error {
-                *error = error.replace(secret, "[redacted]");
-            }
+        result.output.text = self.redact_text(&result.output.text);
+        if let Some(error) = &mut result.error {
+            *error = self.redact_text(error);
         }
 
         result
@@ -7826,29 +7841,31 @@ impl RedactingRuntime<'_> {
                 ));
             }
         };
+        // Every check that can refuse the answer runs before anything is
+        // staged: the record must never hold a Card for a result the Space
+        // refused. Text enters as text, an image as a File, and an audio block
+        // or a resource as the JSON block the server sent.
         let mut parts = Vec::new();
         let mut files = Vec::new();
-        for (index, content) in answer.content.into_iter().enumerate() {
+        for (index, content) in answer.content.iter().enumerate() {
+            // A block is searched before it is rendered: an image's payload, an
+            // audio block's payload, and a resource's blob arrive as base64, so
+            // a credential they hide would enter the record under an encoding
+            // the literal redaction cannot see.
+            if content.carries_credential(&credential) {
+                return ActionResult::failed(MCP_CREDENTIAL_REFUSAL);
+            }
             match content {
                 crate::mcp::McpContent::Text(text) => {
-                    parts.push(text.replace(&credential, "[redacted]"))
+                    parts.push(text.replace(&credential, "[redacted]"));
                 }
                 crate::mcp::McpContent::Image { media_type, data } => {
-                    if media_type.contains(&credential)
-                        || data
-                            .windows(credential.len())
-                            .any(|window| window == credential.as_bytes())
-                    {
-                        return ActionResult::failed(
-                            "the MCP server's answer carried its credential, so nothing was recorded",
-                        );
-                    }
                     if data.len() as u64 > neha::file::MAX_FILE_BYTES {
                         parts.push(format!("[an image of {} bytes was too large]", data.len()));
                         continue;
                     }
-                    let name = format!("mcp-image-{}.{}", index + 1, media_extension(&media_type));
-                    let sha256 = match self.blobs.put(&data).await {
+                    let name = format!("mcp-image-{}.{}", index + 1, media_extension(media_type));
+                    let sha256 = match self.blobs.put(data).await {
                         Ok(sha256) => sha256,
                         Err(error) => {
                             return ActionResult::failed(format!(
@@ -7873,8 +7890,25 @@ impl RedactingRuntime<'_> {
                     ));
                     parts.push(format!("[image {name}]"));
                 }
+                crate::mcp::McpContent::Audio { raw, .. } => {
+                    // An audio block enters the answer as the whole block the
+                    // server sent, redacted, not as a rebuilt one: annotations,
+                    // `_meta`, and every field a future version adds survive,
+                    // and the payload the credential check searched once
+                    // decoded is the payload the Model reads.
+                    parts.push(serialized_redacted(raw, &credential));
+                }
+                crate::mcp::McpContent::Resource { raw, .. } => {
+                    // An embedded resource enters the answer as the whole
+                    // block the server sent, redacted, so the Model reads its
+                    // annotations, its `_meta`, and every field a future
+                    // version adds. Its text payload is a plain string, so the
+                    // redaction reaches it; a binary payload's decoded bytes
+                    // were searched above.
+                    parts.push(serialized_redacted(raw, &credential));
+                }
                 crate::mcp::McpContent::Other(value) => {
-                    parts.push(serialized_redacted(&value, &credential));
+                    parts.push(serialized_redacted(value, &credential));
                 }
             }
         }
@@ -7892,13 +7926,162 @@ impl RedactingRuntime<'_> {
         if text.contains(&credential) {
             text = text.replace(&credential, "[redacted]");
         }
-        let result = if answer.is_error {
+        let mut result = self.redact(if answer.is_error {
             ActionResult::failed(text)
         } else {
             ActionResult::succeeded(ToolOutput::full(text))
-        };
+        });
+        // The result is accepted and final. Only now may the app be read and
+        // its Card staged: the record never sees a Card for a result the Space
+        // did not accept, and an app that cannot be presented never fails the
+        // call.
+        let report = self
+            .stage_app_card(
+                action,
+                model_name,
+                arguments,
+                &answer,
+                chat,
+                &credential,
+                &mut client,
+            )
+            .await;
+        if let Some(report) = report
+            && result.error.is_none()
+        {
+            // A presentation failure is not the Model's business: it rides the
+            // action's non-model field, which the run activity shows. The
+            // report is redacted too: it enters the record like every answer.
+            let report = report.replace(&credential, "[redacted]");
+            result.error = Some(self.redact_text(&report));
+        }
 
-        self.redact(result)
+        result
+    }
+
+    /// Stores the app that renders one tool's answer and stages its Card.
+    ///
+    /// Called only once the tool's result is accepted. The HTML is stored
+    /// before the record names it, and the File and the Message wait for the
+    /// action's result so one append records them all. A failure never fails
+    /// the call: the line this returns says what the app could not do, and the
+    /// caller reports it outside the Model's text.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_app_card(
+        &self,
+        action: Id,
+        model_name: &str,
+        arguments: &Value,
+        answer: &crate::mcp::McpAnswer,
+        chat: Id,
+        credential: &str,
+        client: &mut crate::mcp::McpClient,
+    ) -> Option<String> {
+        let declared = self.mcp.get(model_name)?;
+        let uri = declared.ui_resource.clone()?;
+        let log = self.log.as_ref()?;
+        let resource = match client.read_resource(&uri).await {
+            Ok(resource) => resource,
+            Err(error) => {
+                return Some(format!("the MCP server's app could not be read: {error}"));
+            }
+        };
+        let is_app = resource.mime_type.as_deref().is_some_and(|mime_type| {
+            mime_type
+                .trim()
+                .eq_ignore_ascii_case(crate::mcp::APP_MIME_TYPE)
+        });
+        if !is_app {
+            return Some("the MCP server's app is not an MCP App".to_owned());
+        }
+        // The policy is composed from the credential the call uses, so a
+        // declared origin that names it never enters the record.
+        let csp = resource.content_security_policy(Some(credential));
+        if !credential.is_empty() && csp.contains(credential) {
+            // A policy the fixed directives happen to spell the credential
+            // with would store it in the record: no Card is better than one
+            // that does.
+            return Some(
+                "the MCP server's app cannot keep its credential out of a Card".to_owned(),
+            );
+        }
+        let Ok(html) = String::from_utf8(resource.data) else {
+            return Some("the MCP server's app is not text".to_owned());
+        };
+        // The HTML goes through the same redaction as every other answer, so
+        // a credential a server printed into it never enters the record. The
+        // redaction can grow the bytes, so the File bound is checked on the
+        // redacted text: an app that outgrows a File records no Card at all.
+        let html = html.replace(credential, "[redacted]");
+        if html.len() as u64 > neha::file::MAX_FILE_BYTES {
+            return Some("the MCP server's app is too large".to_owned());
+        }
+        let input = without_credential(arguments.clone(), credential);
+        let card = CardData {
+            kind: APP_CARD_KIND.to_owned(),
+            file: Some(Id::new()),
+            input: matches!(input, Value::Object(_) | Value::Array(_) | Value::Null)
+                .then_some(input),
+            result: Some(without_credential(answer.raw.clone(), credential)),
+            csp: Some(csp),
+        };
+        if card.validate().is_err() {
+            return Some("the MCP server's app does not fit a Card".to_owned());
+        }
+        // The Card is the record: a credential the server hid behind base64 in
+        // the arguments or the raw result would be recoverable there, even
+        // though every literal occurrence was replaced. No Card is better than
+        // one that keeps it.
+        if card
+            .input
+            .as_ref()
+            .is_some_and(|input| carries_credential(input, credential))
+            || card
+                .result
+                .as_ref()
+                .is_some_and(|result| carries_credential(result, credential))
+        {
+            return Some(
+                "the MCP server's app cannot keep its credential out of a Card".to_owned(),
+            );
+        }
+        let sha256 = match self.blobs.put(html.as_bytes()).await {
+            Ok(sha256) => sha256,
+            Err(error) => {
+                return Some(format!("the MCP server's app cannot be stored: {error}"));
+            }
+        };
+        let file = card
+            .file
+            .expect("an app Card names the File it was checked for");
+        let card = serde_json::to_value(&card).unwrap_or(Value::Null);
+        let message = Id::new();
+        log.stage_card(
+            action,
+            vec![
+                log.bot_draft(
+                    EventKind::FileAdded,
+                    json!({
+                        "file": file,
+                        "chat": chat,
+                        "name": app_file_name(&declared.tool),
+                        "media_type": crate::mcp::APP_MIME_TYPE,
+                        "size": html.len(),
+                        "sha256": sha256,
+                    }),
+                ),
+                log.bot_draft(
+                    EventKind::MessageAdded,
+                    json!({
+                        "message": message,
+                        "chat": chat,
+                        "text": "",
+                        "card": card,
+                    }),
+                ),
+            ],
+        );
+        None
     }
 
     /// Returns the script identity the action recorded when it started.
@@ -8097,6 +8280,8 @@ struct ExposedMcpTool {
     description: String,
     /// The JSON schema the Model reads.
     input_schema: Value,
+    /// The `ui://` resource that renders the tool's answer, when it names one.
+    ui_resource: Option<String>,
 }
 
 /// The MCP tools one run offers, by the name the Model sees.
@@ -8337,6 +8522,80 @@ fn serialized_redacted(value: &Value, credential: &str) -> String {
     serde_json::to_string(&redacted(value, credential)).unwrap_or_default()
 }
 
+/// Returns a decoded JSON value with the credential removed from every string.
+///
+/// A Card never holds the credential, whatever a server put into the tool's
+/// answer: a string is replaced, and so is an object's key. The credential is
+/// a bearer token, so its characters cannot break the JSON around it.
+fn without_credential(value: Value, credential: &str) -> Value {
+    match value {
+        Value::String(text) => Value::String(text.replace(credential, "[redacted]")),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|item| without_credential(item, credential))
+                .collect(),
+        ),
+        Value::Object(entries) => Value::Object(
+            entries
+                .into_iter()
+                .map(|(key, value)| {
+                    (
+                        key.replace(credential, "[redacted]"),
+                        without_credential(value, credential),
+                    )
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// Whether a value a Card carries still holds the credential.
+///
+/// [`without_credential`] replaces the literal token in every string, so the
+/// only form a server can leave is an encoded one: a string that is standard
+/// base64 is decoded exactly as the MCP client decodes a payload, and its bytes
+/// are searched for the credential. Ordinary text that is not base64 carries
+/// nothing this can recover.
+fn carries_credential(value: &Value, credential: &str) -> bool {
+    match value {
+        Value::String(text) => crate::mcp::base64_carries_credential(text, credential),
+        Value::Array(items) => items
+            .iter()
+            .any(|item| carries_credential(item, credential)),
+        Value::Object(entries) => entries.iter().any(|(key, entry)| {
+            crate::mcp::base64_carries_credential(key, credential)
+                || carries_credential(entry, credential)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+/// The name the File that holds one app's HTML takes.
+fn app_file_name(tool: &str) -> String {
+    const SUFFIX: &str = "-app.html";
+    let limit = MAX_FILE_NAME_BYTES.saturating_sub(SUFFIX.len());
+    let mut name = String::new();
+    for character in tool.chars() {
+        let character = if character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        {
+            character
+        } else {
+            '_'
+        };
+        if name.len() + character.len_utf8() > limit {
+            break;
+        }
+        name.push(character);
+    }
+    if name.is_empty() {
+        name.push_str("app");
+    }
+
+    format!("{name}{SUFFIX}")
+}
+
 /// Whether a tool declaration would carry a credential into a model request.
 ///
 /// The schema is searched as decoded JSON: a token that JSON would escape
@@ -8439,6 +8698,7 @@ async fn offered_tools(
                 tool: tool.name,
                 description,
                 input_schema: tool.input_schema,
+                ui_resource: tool.ui_resource,
             });
         }
     }
@@ -8636,6 +8896,11 @@ struct RunLog<'a> {
     cwd: Option<String>,
     /// The access this run's actions carry, pinned when it started.
     access: crate::state::AccessView,
+    /// The events of each Card a tool made, waiting for the action's result.
+    ///
+    /// A Card's File and Message are recorded in the same append as the
+    /// action's result: an append that fails leaves no Card and no orphan.
+    cards: std::sync::Arc<Mutex<HashMap<Id, Vec<EventDraft>>>>,
 }
 
 impl RunLog<'_> {
@@ -8691,6 +8956,22 @@ impl RunLog<'_> {
     /// Returns an event the Bot writes for the User it acts for.
     fn bot_draft(&self, kind: EventKind, data: Value) -> EventDraft {
         EventDraft::new(kind, Author::Bot(self.bot), data).acting(self.acting)
+    }
+
+    /// Keeps the events of a Card until the action that made it finishes.
+    fn stage_card(&self, action: Id, drafts: Vec<EventDraft>) {
+        if let Ok(mut cards) = self.cards.lock() {
+            cards.insert(action, drafts);
+        }
+    }
+
+    /// Takes the events of the Card one action made.
+    fn take_card(&self, action: Id) -> Vec<EventDraft> {
+        self.cards
+            .lock()
+            .ok()
+            .and_then(|mut cards| cards.remove(&action))
+            .unwrap_or_default()
     }
 }
 
@@ -9256,23 +9537,26 @@ impl Recorder for RunRecorder<'_> {
                 None => (tool, None),
             },
         };
-        self.log
-            .append(vec![self.log.bot_draft(
-                EventKind::ActionFinished,
-                json!({
-                    "run": self.log.run,
-                    "step": step,
-                    "action": action,
-                    "tool": tool,
-                    "server": server,
-                    "status": status,
-                    "output": output.text,
-                    "truncated": output.truncated,
-                    "omitted_bytes": output.omitted_bytes,
-                    "error": error,
-                }),
-            )])
-            .await
+        // A Card the action's tool made is recorded with the action's result:
+        // one append holds the result, the Card's File, and its Message, so a
+        // failed append leaves no Card and no orphaned File or Message.
+        let mut drafts = self.log.take_card(action);
+        drafts.push(self.log.bot_draft(
+            EventKind::ActionFinished,
+            json!({
+                "run": self.log.run,
+                "step": step,
+                "action": action,
+                "tool": tool,
+                "server": server,
+                "status": status,
+                "output": output.text,
+                "truncated": output.truncated,
+                "omitted_bytes": output.omitted_bytes,
+                "error": error,
+            }),
+        ));
+        self.log.append(drafts).await
     }
 }
 
@@ -11378,6 +11662,7 @@ mod tests {
             tool: name.to_owned(),
             description: String::new(),
             input_schema: json!({"type": "object"}),
+            ui_resource: None,
         };
         // Names that fold to one another, a long name, and plain names all
         // keep an identity of their own.
@@ -11410,6 +11695,7 @@ mod tests {
             tool: "search".to_owned(),
             description: String::new(),
             input_schema: json!({"type": "object"}),
+            ui_resource: None,
         };
         let mut call = super::LoopCall {
             tool: "mcp__docs__search".to_owned(),
@@ -11437,6 +11723,7 @@ mod tests {
             name: name.to_owned(),
             description: description.to_owned(),
             input_schema: schema,
+            ui_resource: None,
         };
         assert!(!super::declaration_carries(
             &tool("search", "Find things.", json!({"type": "object"})),
@@ -11466,6 +11753,7 @@ mod tests {
             name: name.to_owned(),
             description: description.to_owned(),
             input_schema: schema,
+            ui_resource: None,
         };
         assert!(super::mcp_declaration_fits(&tool(
             "search",
@@ -12011,6 +12299,7 @@ mod tests {
             acting: Id::new(),
             secrets: None,
             log: None,
+            mcp: super::McpCatalog::default(),
         };
         let result = runtime
             .execute(neha_computer::Action::Shell {
@@ -14544,6 +14833,7 @@ mod tests {
             acting: owner,
             secrets: Some(&space.secrets),
             log: None,
+            mcp: super::McpCatalog::default(),
         };
         let answer = runtime
             .mcp_call(action, "mcp__docs__search", &json!({"query": "hi"}))
@@ -15809,5 +16099,73 @@ mod tests {
             space.signins.lock().await.is_empty(),
             "a replay allocates no pending sign-in"
         );
+    }
+
+    #[test]
+    fn a_card_refuses_a_credential_hidden_behind_base64() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        let hidden = STANDARD.encode("token-1");
+        assert!(super::carries_credential(
+            &json!({"content": [{
+                "type": "resource",
+                "resource": {"uri": "file:///data.bin", "blob": hidden},
+            }]}),
+            "token-1"
+        ));
+        assert!(super::carries_credential(
+            &json!({"payload": {"nested": hidden}}),
+            "token-1"
+        ));
+        assert!(
+            !super::carries_credential(
+                &json!({"content": [{"type": "text", "text": "the answer is [redacted]"}]}),
+                "token-1"
+            ),
+            "ordinary text and a redacted occurrence carry no hidden credential"
+        );
+
+        // A resource's text payload is plain text: the same redaction reaches
+        // every string of the block, so the answer cannot keep the token.
+        let text = super::serialized_redacted(
+            &json!({"resource": {"uri": "file:///report.txt", "text": "the answer is token-1"}}),
+            "token-1",
+        );
+        assert!(!text.contains("token-1"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+    }
+
+    #[test]
+    fn an_audio_blocks_extra_fields_reach_the_model_text() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+
+        // The Audio variant keeps the whole block the server sent, and the
+        // model-facing text is its serialized redaction: an annotation, a
+        // `_meta`, and any field a future version adds survive instead of
+        // being dropped when a block is rebuilt from the fields this client
+        // models.
+        let block = json!({
+            "type": "audio",
+            "mimeType": "audio/wav",
+            "data": STANDARD.encode(b"clean sound"),
+            "_meta": {"ui": {"annotations": {"audience": ["user"]}}},
+            "annotations": [{"audience": ["user"], "priority": 0.5}],
+        });
+        let text = super::serialized_redacted(&block, "token-1");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["_meta"], block["_meta"], "{text}");
+        assert_eq!(parsed["annotations"], block["annotations"], "{text}");
+        assert_eq!(parsed["data"], block["data"], "{text}");
+
+        // Redaction still reaches every string of the block, as it does for a
+        // resource.
+        let text = super::serialized_redacted(
+            &json!({"type": "audio", "data": "x", "_meta": {"note": "token-1"}}),
+            "token-1",
+        );
+        assert!(!text.contains("token-1"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
     }
 }

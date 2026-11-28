@@ -1,9 +1,12 @@
 // A Space that answers every command from memory and records what it was asked.
 // Tests import `space` to set up and read what happened, and hand
 // `FakeCommands` to the client in place of its WebSocket.
+import { vi } from "vitest";
+
 import type { SubscriptionHandlers } from "../lib/ws";
 import type {
   Approval,
+  Card,
   Chat,
   ChatStatus,
   FileSummary,
@@ -139,6 +142,53 @@ export const signInReplacedReason = "a newer sign-in replaced this one";
 // The fixed explanation the fake Space's poll reports for a sign-in it refused.
 export const signInRefusedReason = "the sign-in was refused";
 
+// A small app Card's HTML, as the Space stores it in a File: a Card is an HTML
+// document, and the client reads it through the File download path.
+export const appHtml = [
+  "<!doctype html>",
+  "<html>",
+  "<head><title>Test card</title></head>",
+  "<body><p>Hello from the card.</p></body>",
+  "</html>",
+].join("");
+
+// The File the fake Space stores the app's HTML in.
+export const appFile: FileSummary = {
+  id: "f2",
+  chat: "h1",
+  name: "card.html",
+  media_type: "text/html",
+  size: appHtml.length,
+  sha256: "cd".repeat(32),
+  author: { kind: "bot", id: "b1" },
+  at: "2026-01-01T00:00:00.000Z",
+  seq: "3",
+};
+
+// The Card a tool's result carries: the app's File, the call it ran with, and
+// the object it answered.
+export const appCard: Card = {
+  kind: "app",
+  file: appFile.id,
+  input: { query: "hello" },
+  result: { answer: 42 },
+  csp: null,
+};
+
+// Answers the client's File download path from the fake Space's Files, so an
+// app Card's HTML arrives the way a real Space serves a File's bytes.
+export function serveFiles() {
+  return vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const path = new URL(url, "http://space.test").pathname;
+    if (!path.startsWith("/api/files/")) return new Response("not found", { status: 404 });
+    const id = decodeURIComponent(path.slice("/api/files/".length));
+    const html = space.fileContents[id];
+    if (html === undefined) return new Response("not found", { status: 404 });
+    return new Response(html, { status: 200, headers: { "content-type": "text/html" } });
+  });
+}
+
 // One browser sign-in the fake Space started.
 interface SignInFlow {
   id: string;
@@ -184,6 +234,8 @@ export const space = {
   signIns: [] as SignInFlow[],
   signInStates: {} as Record<string, "pending" | "finished" | "failed">,
   files: [] as FileSummary[],
+  // The HTML each File holds, so the File download path can answer it.
+  fileContents: {} as Record<string, string>,
   messages: [] as Message[],
   otherMessages: [] as Message[],
   chats: [chat] as Chat[],
@@ -235,6 +287,7 @@ export const space = {
     space.sent = [];
     space.timeouts = {};
     space.files = [];
+    space.fileContents = {};
     space.messages = [];
     space.otherMessages = [];
     space.chats = [chat];
@@ -339,6 +392,44 @@ export const space = {
     space.skills = space.skills.filter((skill) => skill.plugin !== plugin);
     emit("neha.plugin.removed", { plugin });
   },
+  // A Bot Message that carries an app Card, as the Space records a tool's
+  // result. The Card's HTML becomes the File's bytes, and the Message joins the
+  // Chat's record, so chat_read answers with the Card.
+  showAppCard(card: Card = appCard, html = appHtml): Message {
+    const file = card.file ?? null;
+    if (file !== null) {
+      space.files = [
+        ...space.files.filter((known) => known.id !== file),
+        { ...appFile, id: file, size: html.length },
+      ];
+      space.fileContents = { ...space.fileContents, [file]: html };
+    }
+    const message: Message = {
+      id: `card${space.messages.length + 1}`,
+      chat: space.chat.id,
+      author: { kind: "bot", id: bot.id },
+      acting: "u1",
+      text: "Here is the result.",
+      at: "2026-01-01T00:00:01.000Z",
+      seq: String(space.messages.length + 2),
+      run: null,
+      file: null,
+      card,
+    };
+    space.messages = [...space.messages, message];
+    return message;
+  },
+  // Tells the page that the record added a Message, with the Card it carries.
+  announceCard(message: Message) {
+    emit("neha.message.added", {
+      chat: message.chat,
+      message: message.id,
+      text: message.text,
+      file: message.file,
+      run: message.run,
+      ...(message.card ? { card: message.card } : {}),
+    });
+  },
 };
 
 // One event the Space writes to the record, delivered live to the page that
@@ -418,8 +509,14 @@ export class FakeCommands {
         return space.chats.map((known) => project(known)) as T;
       case "chat_read": {
         const asked = args as { chat: string };
+        // The answer describes the record as it was when the read was sent, so
+        // a held answer can be overtaken by a live event a test fires while it
+        // waits. Like the Space's JSON, each answer carries its own copies: a
+        // page that keys rows by object identity must keep its own state
+        // across a refresh that answers with the same record.
+        const snapshot = asked.chat === space.chat.id ? [...space.messages] : [...space.otherMessages];
         await space.chatDelay?.(asked.chat);
-        return (asked.chat === space.chat.id ? [...space.messages] : [...space.otherMessages]) as T;
+        return JSON.parse(JSON.stringify(snapshot)) as T;
       }
       case "file_list":
         return [...space.files] as T;

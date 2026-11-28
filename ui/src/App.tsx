@@ -1,4 +1,4 @@
-import { Show, createMemo, createSignal, createStore, onCleanup, onSettled } from "solid-js";
+import { For, Show, createMemo, createSignal, createStore, onCleanup, onSettled, untrack } from "solid-js";
 
 import AuthView from "./components/AuthView";
 import ChatView from "./components/ChatView";
@@ -10,6 +10,7 @@ import Sidebar from "./components/Sidebar";
 import SkillsView from "./components/SkillsView";
 import { t, type MessageKey } from "./i18n";
 import { api, ApiError } from "./lib/api";
+import { readCard } from "./lib/cards";
 import { MAX_FILE_BYTES,
   MAX_FILE_LABEL, formatBytes, indexFiles, mediaTypeFor } from "./lib/files";
 import { Commands, ProtocolError } from "./lib/ws";
@@ -18,6 +19,7 @@ import type {
   Approval,
   AttentionEntry,
   Bot,
+  Card,
   Chat,
   ChatStatus,
   Computer,
@@ -177,6 +179,32 @@ function emptyState(): State {
   };
 }
 
+// What a ChatView renders. Most of it is the page's own state, which moves on
+// to the next Chat as soon as the reader switches; a Chat that leaves keeps the
+// values it showed, so its view — and the apps' frames inside it — is frozen
+// rather than remounted while they answer the host's teardown request.
+interface FrozenChat {
+  bot: Bot | null;
+  computer: Computer | null;
+  messages: Message[];
+  files: Record<string, FileSummary>;
+  approvals: Approval[];
+  submitting: boolean;
+  status: ChatStatus;
+  queue: RunProgress | null;
+  busy: boolean;
+  activity: RunActivity | null;
+  deciding: string | null;
+  error: string | null;
+}
+
+// One ChatView the page renders. The entry keeps its identity for as long as its
+// view is mounted: a Chat that leaves is the same entry, so <For> freezes its
+// view instead of remounting it.
+interface ChatPane {
+  id: string;
+}
+
 // How often the page asks what became of a started browser sign-in, and how
 // long it keeps asking: the Space forgets a sign-in after five minutes.
 const SIGN_IN_POLL_MS = 1_000;
@@ -203,6 +231,55 @@ function isLibraryEvent(kind: string): boolean {
   );
 }
 
+// How many live Messages and Cards a page keeps for reads still on their way,
+// and how many Chats it may keep them for. The newest events are the only ones
+// a read in flight can miss; older ones would only grow a map no answer
+// retires.
+const LIVE_MESSAGE_LIMIT = 100;
+const LIVE_CARD_LIMIT = 100;
+const LIVE_CHAT_LIMIT = 16;
+
+// How long a Chat the reader left may keep its view — and the apps' frames
+// inside it — alive while its cards answer the host's teardown request. A
+// document that never answers must not hold the view forever.
+const CHAT_HANDOFF_MS = 600;
+
+// What the newest page still keeps for a read on its way. A test hook: the test
+// that proves a settled read retires what it merged reads this, because the
+// view shows the same row whether or not the copy is still held.
+export const liveRetained = { messages: 0, chats: 0 };
+
+// Whether two record values are the same JSON. A Message is plain data from the
+// Space, so comparing its shape is how a refresh tells an unchanged row from a
+// changed one.
+function sameJson(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (typeof left !== "object" || typeof right !== "object") return false;
+  if (left === null || right === null) return false;
+  if (Array.isArray(left) !== Array.isArray(right)) return false;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => sameJson(value, right[index]));
+  }
+  const leftRecord = left as Record<string, unknown>;
+  const rightRecord = right as Record<string, unknown>;
+  const keys = Object.keys(leftRecord);
+  if (keys.length !== Object.keys(rightRecord).length) return false;
+  return keys.every((key) => Object.hasOwn(rightRecord, key) && sameJson(leftRecord[key], rightRecord[key]));
+}
+
+// Keeps the row identity of every Message a read did not change. Solid's <For>
+// keys rows by object identity, so a refresh that rebuilt equal Messages would
+// remount each row — and an open app's frame would lose its state. Only a row
+// whose content changed gets a new object.
+function preserveMessages(previous: Message[], next: Message[]): Message[] {
+  if (previous.length === 0) return next;
+  const known = new Map(previous.map((message) => [message.id, message]));
+  return next.map((message) => {
+    const old = known.get(message.id);
+    return old && sameJson(old, message) ? old : message;
+  });
+}
+
 export default function App() {
   const [state, setState] = createStore<State>(emptyState());
   // Writes the fields the caller names, or lets the caller write the store.
@@ -217,8 +294,11 @@ export default function App() {
       const current = draft.previews[chatId];
       if (current === next) return;
       if (current && next && "text" in current && "text" in next) {
-        if (current.text === next.text && current.file === next.file) return;
-        draft.previews[chatId] = { text: next.text, file: next.file };
+        // A Card-only Message has no text to show, so the preview keeps its
+        // card flag: the sidebar names the app instead of drawing a blank line.
+        const card = next.card === true;
+        if (current.text === next.text && current.file === next.file && (current.card === true) === card) return;
+        draft.previews[chatId] = { text: next.text, file: next.file, card };
         return;
       }
       if (current && next && "error" in current && "error" in next) return;
@@ -297,6 +377,17 @@ export default function App() {
   // The Chat each Run this page heard about works in, from the events that name
   // both. A Run's end names no Chat, so the page remembers it here.
   const runChats = new Map<string, string>();
+  // The Cards the record named as it added Messages, by Message id, with the
+  // Chat each belongs to. A read of the Chat may answer with a record older
+  // than an event already heard, so a Card the page was told about survives
+  // that answer.
+  const liveCards = new Map<string, { chat: string; card: Card }>();
+  // The Messages the record added live, by Message id. A read sent before the
+  // record wrote one may answer without it, so the page keeps the Message whole
+  // rather than only annotating the rows a read happens to return. Only the
+  // open Chat's Messages are kept: no read of another Chat is on its way, and a
+  // Message the page can never show again must not hold memory.
+  const liveMessages = new Map<string, Message>();
   // The Chats whose Runs the page learned from a snapshot rather than from an
   // event. When such a Run ends, the Space's word is read once more.
   const seeded = new Set<string>();
@@ -306,8 +397,232 @@ export default function App() {
   // The followed Run's tool activity, while it has any.
   const [activity, setActivity] = createSignal<RunActivity | null>(null);
 
+  // The ChatViews the page renders: the Chat on screen, and the one it just left
+  // while its apps answer the host's teardown request. Entries are kept by
+  // identity, so a view that stays mounted is never remounted — a remount would
+  // replace every app's frame and lose the document that must answer.
+  const [panes, setPanes] = createSignal<ChatPane[]>([]);
+  // What the Chat the reader left showed, while its apps close. The page never
+  // reads its own state through this: it is only what the leaving view renders.
+  const [leavingChat, setLeavingChat] = createSignal<{ id: string; frozen: FrozenChat } | null>(null);
+  // The bounded wait for a leaving view whose apps never answer.
+  let handoffTimer: number | null = null;
+
+  // The values the Chat on screen shows now, kept for its view once the reader
+  // leaves. The fields are replaced by the page, never mutated, so the view sees
+  // exactly what it showed a moment ago.
+  function leavingValues(): FrozenChat {
+    return {
+      bot: state.activeBot,
+      computer: state.activeComputer,
+      messages: [...state.messages],
+      // The same File index object: replacing its identity would tell every
+      // Card's own effect that its File changed, and a Card would reset the
+      // state it is closing.
+      files: state.files,
+      approvals: [...state.approvals],
+      submitting: state.submitting,
+      status: chatStatus(),
+      queue: state.queue,
+      busy: busyChat(),
+      activity: shownActivity(),
+      deciding: state.deciding,
+      error: errorText(),
+    };
+  }
+
+  // Whether a Chat carries an app whose document must answer the host's teardown
+  // request before the Chat's view may leave.
+  function hasApp(messages: Message[]): boolean {
+    return messages.some((message) => message.card?.kind === "app");
+  }
+
+  // Stops the bounded wait and forgets the view that was leaving.
+  function endHandoff() {
+    if (handoffTimer !== null) {
+      window.clearTimeout(handoffTimer);
+      handoffTimer = null;
+    }
+    setLeavingChat(null);
+  }
+
+  // The view of a Chat that left has nothing more to wait for: its apps all
+  // answered, or the bounded wait ended. Only now may the view — and its frames
+  // — leave.
+  function dropChatPane(id: string) {
+    endHandoff();
+    setPanes((current) => current.filter((pane) => pane.id !== id));
+  }
+
+  // The page rendered for a leaving Chat stops waiting once its last app closed.
+  // It runs from the view's effect phase, so it reads the current leaving view
+  // rather than tracking it.
+  function finishChatRetire(id: string) {
+    const leaving = untrack(leavingChat);
+    if (leaving === null || leaving.id !== id) return;
+    dropChatPane(id);
+  }
+
+  // Starts the bounded wait: a document that never answers the host's teardown
+  // request must not hold the view forever.
+  function armHandoff(id: string) {
+    if (handoffTimer !== null) window.clearTimeout(handoffTimer);
+    handoffTimer = window.setTimeout(() => {
+      handoffTimer = null;
+      setLeavingChat(null);
+      setPanes((current) => current.filter((pane) => pane.id !== id));
+    }, CHAT_HANDOFF_MS);
+  }
+
+  // The reader moved to another Chat, or back to the list. The view of the Chat
+  // they left stays mounted — hidden — while its apps answer the host's teardown
+  // request: a frame removed before its document answers is gone for good. A
+  // Chat with no app card has nothing to keep, so the switch is immediate.
+  function handOffChat(next: string | null) {
+    const known = panes();
+    const current = state.activeChat;
+    if (current !== null && current.id === next) {
+      // Re-opening the Chat already on screen changes no view.
+      if (!known.some((pane) => pane.id === next)) setPanes([...known, { id: next }]);
+      return;
+    }
+    const frozen = current !== null && hasApp(state.messages) ? leavingValues() : null;
+    const target = next === null ? undefined : known.find((pane) => pane.id === next);
+    const left = current === null ? undefined : known.find((pane) => pane.id === current.id);
+    const stale = leavingChat();
+    const nextPanes: ChatPane[] = [];
+    for (const pane of known) {
+      if (pane === target) {
+        // The reader came back to a Chat that had not finished leaving: it takes
+        // the screen again, in the place it already held.
+        nextPanes.push(pane);
+        continue;
+      }
+      if (pane === left) {
+        if (frozen !== null) nextPanes.push(pane);
+        continue;
+      }
+      // Only the Chat the reader just left keeps a view: one already leaving is
+      // dropped, so the page never stacks transitions.
+      if (stale !== null && pane.id === stale.id) continue;
+      nextPanes.push(pane);
+    }
+    if (next !== null && !nextPanes.some((pane) => pane.id === next)) {
+      nextPanes.push({ id: next });
+    }
+    setPanes(nextPanes);
+    if (frozen !== null && left !== undefined) {
+      setLeavingChat({ id: left.id, frozen });
+      armHandoff(left.id);
+    } else {
+      endHandoff();
+    }
+  }
+
   function noteRun(run: string, chat: string) {
     if (!runChats.has(run)) runChats.set(run, chat);
+  }
+
+  // Counts what the live maps still keep, for the test hook below.
+  function noteLiveRetention() {
+    liveRetained.messages = liveMessages.size;
+    liveRetained.chats = new Set([...liveMessages.values()].map((message) => message.chat)).size;
+  }
+
+  // Keeps the live maps within a bound: a read that never answers must not grow
+  // them forever. The oldest event goes first, and an old Chat's Messages go
+  // with it, because only the newest events can still be missing from a read
+  // that is on its way.
+  function trimLive() {
+    while (liveMessages.size > LIVE_MESSAGE_LIMIT) {
+      const oldest = liveMessages.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      liveMessages.delete(oldest);
+      liveCards.delete(oldest);
+    }
+    while (liveCards.size > LIVE_CARD_LIMIT) {
+      const oldest = liveCards.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      liveCards.delete(oldest);
+    }
+    const chats = new Set([...liveMessages.values()].map((message) => message.chat));
+    if (chats.size > LIVE_CHAT_LIMIT) {
+      const [oldestChat] = chats;
+      for (const [id, message] of liveMessages) {
+        if (message.chat === oldestChat) liveMessages.delete(id);
+      }
+      for (const [id, entry] of liveCards) {
+        if (entry.chat === oldestChat) liveCards.delete(id);
+      }
+    }
+    noteLiveRetention();
+  }
+
+  // Keeps one Message a read may still be missing.
+  function keepLiveMessage(message: Message) {
+    liveMessages.set(message.id, message);
+    trimLive();
+  }
+
+  // Keeps one Card a read may still be missing for a Message it already has.
+  function keepLiveCard(id: string, chat: string, card: Card) {
+    liveCards.set(id, { chat, card });
+    trimLive();
+  }
+
+  // The reader left a Chat, so no read of it is on its way: what the page kept
+  // live for it retires with it.
+  function forgetLiveChat(chat: string) {
+    for (const [id, message] of liveMessages) {
+      if (message.chat === chat) liveMessages.delete(id);
+    }
+    for (const [id, entry] of liveCards) {
+      if (entry.chat === chat) liveCards.delete(id);
+    }
+    noteLiveRetention();
+  }
+
+  // Takes the Messages a read answered with, attaches the Cards the record
+  // named, and appends the live Messages the answer predates. A stale read
+  // therefore hides neither a Card nor a Message the page was already told
+  // about: both arrive through the same live merge. A Message the answer now
+  // carries needs no live copy, so that copy retires with this read.
+  function withCards(chat: string, messages: Message[]): Message[] {
+    const rows = new Map(messages.map((message) => [message.id, message]));
+    const live = [...liveMessages.values()].filter(
+      (message) => message.chat === chat && !rows.has(message.id),
+    );
+    const shown = live.length === 0 ? messages : [...messages, ...live];
+    for (const id of rows.keys()) {
+      liveMessages.delete(id);
+      // A read that already names the Card no longer needs the event's copy.
+      if (rows.get(id)?.card) liveCards.delete(id);
+    }
+    noteLiveRetention();
+    if (liveCards.size === 0) return shown;
+    return shown.map((message) => {
+      if (message.card) return message;
+      const kept = liveCards.get(message.id);
+      return kept ? { ...message, card: kept.card } : message;
+    });
+  }
+
+  // Writes the File index a read answered with, touching only the Files whose
+  // content changed. A whole new record would tell the reader of one File that
+  // every File moved, and a Card that shows one File would load it again — its
+  // frame would be replaced and its app state lost — though nothing changed.
+  function mergeFiles(files: FileSummary[]) {
+    const next = indexFiles(files);
+    setState((draft) => {
+      for (const id of Object.keys(draft.files)) {
+        if (!(id in next)) delete draft.files[id];
+      }
+      for (const [id, file] of Object.entries(next)) {
+        const known = draft.files[id];
+        if (known && sameJson(known, file)) continue;
+        draft.files[id] = file;
+      }
+    });
   }
 
   // The Run moved to a new step, so the card counts the newest one.
@@ -584,7 +899,7 @@ export default function App() {
       step: action.step,
       tool: action.tool,
       status: actionStatusOf(action.status),
-      error: action.status === "failed" ? (action.error ?? null) : null,
+      error: action.error ?? null,
     }));
     // A Run that failed before its first step has no steps and no actions to
     // restore, but it still has its reason to show.
@@ -633,6 +948,10 @@ export default function App() {
     if (refreshTimer !== null) {
       window.clearTimeout(refreshTimer);
       refreshTimer = null;
+    }
+    if (handoffTimer !== null) {
+      window.clearTimeout(handoffTimer);
+      handoffTimer = null;
     }
     if (libraryRefreshTimer !== null) {
       window.clearTimeout(libraryRefreshTimer);
@@ -811,7 +1130,35 @@ export default function App() {
     if (event.kind === "neha.message.added" && chat) {
       const text = typeof data.text === "string" ? data.text : "";
       const carried = typeof data.file === "string" ? data.file : null;
-      setPreview(chat, { text, file: carried !== null });
+      // A tool's Card arrives with the Message that carries it; keep it for the
+      // read that follows, which may answer with the record as it was before.
+      const card = readCard(data.card);
+      const id = typeof data.message === "string" ? data.message : null;
+      // Only the open Chat may keep a live copy: the page reads no other Chat,
+      // so no read of it is on its way that could answer without this Message,
+      // and a copy no read retires would hold memory forever. A Message or Card
+      // the view already holds needs no copy either.
+      const shown = chat === state.activeChat?.id;
+      const known = shown ? state.messages.find((message) => message.id === id) : undefined;
+      if (shown && card && id && !known?.card) keepLiveCard(id, chat, card);
+      // The read that follows may predate the record's write of this Message,
+      // so the live event keeps the whole Message, not only its Card.
+      if (shown && id && !known) {
+        keepLiveMessage({
+          id,
+          chat,
+          author: event.author,
+          acting: event.acting ?? null,
+          text,
+          at: event.at,
+          seq: event.seq,
+          run,
+          file: carried,
+          ...(card ? { card } : {}),
+        });
+      }
+      // A Card-only Message has no text, so the preview names the app instead.
+      setPreview(chat, { text, file: carried !== null, card: card !== null });
       // A Bot reply names its Run, which is how the page learns which Chat a
       // Run belongs to: the events that end a Run name no Chat.
       if (run) noteRun(run, chat);
@@ -1485,9 +1832,14 @@ export default function App() {
   }
 
   async function selectChat(chat: Chat, focus?: string | null) {
+    // The Chat on screen keeps its view (and its apps' frames) until they close.
+    handOffChat(chat.id);
     const generation = ++runGeneration;
     followed = null;
     setActivity(null);
+    // The reader left the Chat that was open: no read of it is on its way, so
+    // what the page kept live for it retires before the new Chat's read lands.
+    if (state.activeChat) forgetLiveChat(state.activeChat.id);
     update({
       activeChat: chat,
       messages: [],
@@ -1517,15 +1869,16 @@ export default function App() {
       // about what that Chat does: the page takes it over the list's copy, so
       // the header, the badge and the composer all read the same projection.
       const answered: Chat = bot.chat ? { ...chat, ...bot.chat } : chat;
+      const shown = withCards(chat.id, messages);
       update({
         activeChat: answered,
-        messages,
-        files: indexFiles(files),
+        messages: shown,
         approvals: mergeApprovals(approvals, state.approvals),
         activeBot: bot.bot,
         activeComputer: bot.computer,
       });
-      await restoreRun(answered, messages, generation);
+      mergeFiles(files);
+      await restoreRun(answered, shown, generation);
     } catch (reason) {
       if (isCurrentChat(chat, generation)) update({ error: reason });
     }
@@ -1603,10 +1956,17 @@ export default function App() {
         commands.command<Approval[]>("approval_list", { chat: chat.id }),
       ]);
       if (!isCurrentChat(chat, generation)) return;
-      update({ messages, files: indexFiles(files), approvals: mergeApprovals(approvals, state.approvals) });
-      const last = messages.at(-1);
+      const shown = withCards(chat.id, messages);
+      // A refresh that answers with the same record must not remount its rows:
+      // the rows keep their identity, and an open app's frame keeps its state.
+      update({
+        messages: preserveMessages(state.messages, shown),
+        approvals: mergeApprovals(approvals, state.approvals),
+      });
+      mergeFiles(files);
+      const last = shown.at(-1);
       if (last) setPreview(chat.id, previewOf(last));
-      await reconcileRun(chat, messages, generation);
+      await reconcileRun(chat, shown, generation);
     } catch (reason) {
       if (isCurrentChat(chat, generation)) update({ error: reason });
     }
@@ -1617,6 +1977,10 @@ export default function App() {
     const chat = state.activeChat;
     const bot = state.activeBot;
     if (!chat || !bot || state.submitting) return false;
+    // The Chat already works or waits for an answer, so its composer is closed.
+    // The card sends through this same boundary, so it is refused the same way:
+    // a Card must not be able to enqueue a second Run while the Bot is busy.
+    if (busyChat()) return false;
     if (!text && !file) return false;
     const generation = runGeneration;
 
@@ -1756,9 +2120,13 @@ export default function App() {
   }
 
   function backToList() {
+    // Leaving to the list is a switch too: the Chat's apps close before its view
+    // leaves, exactly as when another Chat takes the screen.
+    handOffChat(null);
     runGeneration += 1;
     followed = null;
     setActivity(null);
+    if (state.activeChat) forgetLiveChat(state.activeChat.id);
     update({ activeChat: null, messages: [], files: {}, approvals: [], activeBot: null, activeComputer: null, submitting: false, queue: null, deciding: null, error: null });
   }
 
@@ -1933,51 +2301,101 @@ export default function App() {
                 />
               </Show>
               <Show when={!libraryView()}>
-                <Show
-                  when={showChat() ? state.activeChat?.id : null}
-                  keyed
-                  fallback={
-                    <Show
-                      when={needsSetup()}
-                      fallback={
-                        <div class="select-chat">
-                          <h2>{t("select.title")}</h2>
-                        </div>
-                      }
-                    >
-                      <SetupView
-                        account={account()}
-                        providers={state.providers}
-                        models={state.models}
-                        bots={state.bots}
-                        busy={state.busy}
-                        error={errorText()}
-                        onProvider={(input) => void connectProvider(input)}
-                        onBot={(name) => void createBot(name)}
-                      />
-                    </Show>
-                  }
-                >
-                  <ChatView
-                    account={account()}
-                    bot={state.activeBot}
-                    computer={state.activeComputer}
-                    messages={state.messages}
-                    files={state.files}
-                    approvals={state.approvals}
-                    submitting={state.submitting}
-                    status={chatStatus()}
-                    queue={state.queue}
-                    busy={busyChat()}
-                    activity={shownActivity()}
-                    focus={focus()}
-                    onFocused={() => setFocus(null)}
-                    deciding={state.deciding}
-                    error={errorText()}
-                    onSend={sendMessage}
-                    onDecide={decideApproval}
-                    onBack={backToList}
-                  />
+                <For each={panes()}>
+                  {(pane) => {
+                    // The values a view renders while it is leaving. The page's
+                    // own fields have already moved to the Chat on screen, so
+                    // the leaving view must read only what it showed before.
+                    const frozen = () => {
+                      const leaving = leavingChat();
+                      return leaving !== null && leaving.id === pane.id
+                        ? leaving.frozen
+                        : null;
+                    };
+                    const retiring = () => frozen() !== null;
+                    // One value the view renders: the page's live state while
+                    // the Chat is on screen, the frozen copy once it leaves.
+                    const shown = <T,>(
+                      live: () => T,
+                      fromFrozen: (values: FrozenChat) => T,
+                    ): (() => T) => {
+                      return () => {
+                        const values = frozen();
+                        return values === null ? live() : fromFrozen(values);
+                      };
+                    };
+                    const bot = shown(() => state.activeBot, (values) => values.bot);
+                    const computer = shown(() => state.activeComputer, (values) => values.computer);
+                    const messages = shown(() => state.messages, (values) => values.messages);
+                    const files = shown(() => state.files, (values) => values.files);
+                    const approvals = shown(() => state.approvals, (values) => values.approvals);
+                    const submitting = shown(() => state.submitting, (values) => values.submitting);
+                    const status = shown(() => chatStatus(), (values) => values.status);
+                    const queue = shown(() => state.queue, (values) => values.queue);
+                    const busy = shown(() => busyChat(), (values) => values.busy);
+                    const activity = shown(() => shownActivity(), (values) => values.activity);
+                    const deciding = shown(() => state.deciding, (values) => values.deciding);
+                    const error = shown(() => errorText(), (values) => values.error);
+                    const paneFocus = shown(() => focus(), () => null);
+                    return (
+                      <div
+                        class={retiring() ? "chat-pane chat-pane--retiring" : "chat-pane"}
+                        aria-hidden={retiring() ? "true" : undefined}
+                      >
+                        <ChatView
+                          account={account()}
+                          bot={bot()}
+                          computer={computer()}
+                          messages={messages()}
+                          files={files()}
+                          approvals={approvals()}
+                          submitting={submitting()}
+                          status={status()}
+                          queue={queue()}
+                          busy={busy()}
+                          activity={activity()}
+                          focus={paneFocus()}
+                          onFocused={() => {
+                            if (!retiring()) setFocus(null);
+                          }}
+                          deciding={deciding()}
+                          error={error()}
+                          onSend={(text, file) =>
+                            retiring() ? Promise.resolve(false) : sendMessage(text, file)
+                          }
+                          onDecide={(approval, allow, lasting) => {
+                            if (!retiring()) decideApproval(approval, allow, lasting);
+                          }}
+                          onBack={() => {
+                            if (!retiring()) backToList();
+                          }}
+                          retiring={retiring()}
+                          onRetired={() => finishChatRetire(pane.id)}
+                        />
+                      </div>
+                    );
+                  }}
+                </For>
+                <Show when={!showChat()}>
+                  <Show
+                    when={needsSetup()}
+                    fallback={
+                      <div class="select-chat">
+                        <h2>{t("select.title")}</h2>
+                      </div>
+                    }
+                  >
+                    <SetupView
+                      account={account()}
+                      providers={state.providers}
+                      models={state.models}
+                      bots={state.bots}
+                      busy={state.busy}
+                      error={errorText()}
+                      onProvider={(input) => void connectProvider(input)}
+                      onBot={(name) => void createBot(name)}
+                    />
+                  </Show>
                 </Show>
               </Show>
             </main>
@@ -2004,7 +2422,11 @@ function Boot() {
 
 // What the sidebar shows for a Chat's last Message.
 function previewOf(message: Message): Preview {
-  return { text: message.text, file: message.file !== null };
+  return {
+    text: message.text,
+    file: message.file !== null,
+    card: message.card != null,
+  };
 }
 
 // Whether the User answered this approval.

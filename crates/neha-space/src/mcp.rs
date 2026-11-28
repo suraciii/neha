@@ -7,6 +7,7 @@
 //! reach, or whose answer does not fit the protocol, becomes an [`McpError`]
 //! that the Space reports, and the credential never enters an error message.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -17,6 +18,18 @@ use serde_json::{Value, json};
 
 /// The MCP protocol revision this client speaks.
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// The MCP extension that lets a tool answer with an interactive Card.
+pub const UI_EXTENSION: &str = "io.modelcontextprotocol/ui";
+
+/// The media type an MCP App's HTML carries.
+pub const APP_MIME_TYPE: &str = "text/html;profile=mcp-app";
+
+/// The policy a client applies when an app's resource declares none.
+pub const DEFAULT_APP_CSP: &str = "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self' data:; connect-src 'none'; object-src 'none'";
+
+/// The longest `ui://` resource URI this client accepts from one declaration.
+const MAX_UI_RESOURCE_URI: usize = 2048;
 
 /// The header a server names the session it made for the client.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -85,7 +98,7 @@ pub fn header_class(name: &str) -> Option<HeaderClass> {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The largest answer this client reads for one request.
-const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_ANSWER_BYTES: usize = 8 * 1024 * 1024;
 
 /// The most pages one tool listing may follow.
 ///
@@ -105,6 +118,8 @@ pub struct McpTool {
     pub description: String,
     /// The tool's JSON input schema; empty when the server declares none.
     pub input_schema: Value,
+    /// The `ui://` resource that renders this tool's answer, when it names one.
+    pub ui_resource: Option<String>,
 }
 
 /// One content block of a tool result.
@@ -119,8 +134,70 @@ pub enum McpContent {
         /// The image's bytes, decoded from the server's base64.
         data: Vec<u8>,
     },
+    /// An audio clip the Model reads as JSON text.
+    ///
+    /// The wire carries the clip's bytes as standard base64, so a credential
+    /// they hide is invisible to the literal redaction: the decoded bytes are
+    /// searched instead.
+    Audio {
+        /// The clip's bytes as standard base64, as the server sent them.
+        data: String,
+        /// The clip's media type, when the server declares one.
+        mime_type: Option<String>,
+        /// The whole content block, as the server sent it.
+        ///
+        /// The Model reads the server's own JSON block, so fields this client
+        /// does not parse (annotations, `_meta`, a future addition) survive.
+        raw: Value,
+    },
+    /// An embedded resource, as the server sent it.
+    Resource {
+        /// The resource's URI.
+        uri: String,
+        /// The resource's media type, when the server declares one.
+        mime_type: Option<String>,
+        /// The resource's text, when it carries text.
+        text: Option<String>,
+        /// The resource's bytes as standard base64, when it carries a blob.
+        blob: Option<String>,
+        /// The whole content block, as the server sent it.
+        ///
+        /// The Model reads the server's own JSON block, so fields this client
+        /// does not parse (annotations, `_meta`, a future addition) survive.
+        raw: Value,
+    },
     /// A block this client does not model, as the server sent it.
     Other(Value),
+}
+
+impl McpContent {
+    /// Whether this block hides the credential in bytes the record would keep.
+    ///
+    /// A text block is redacted as text where it enters the answer, so a
+    /// literal occurrence is replaced. An image's payload, an audio block's
+    /// payload, and a resource's `blob` arrive as base64 and are opaque once
+    /// decoded: a literal redaction cannot see the credential in them, so the
+    /// decoded bytes are searched instead. A resource's `blob` is decoded again
+    /// here, under the answer bound [`content_from_json`] already enforces.
+    pub(crate) fn carries_credential(&self, credential: &str) -> bool {
+        match self {
+            Self::Image { media_type, data } => {
+                media_type.contains(credential) || bytes_carry_credential(data, credential)
+            }
+            Self::Resource {
+                blob: Some(blob), ..
+            } => decode_base64(blob).is_some_and(|data| bytes_carry_credential(&data, credential)),
+            Self::Audio {
+                data, mime_type, ..
+            } => {
+                mime_type
+                    .as_deref()
+                    .is_some_and(|mime_type| mime_type.contains(credential))
+                    || base64_carries_credential(data, credential)
+            }
+            Self::Text(_) | Self::Resource { blob: None, .. } | Self::Other(_) => false,
+        }
+    }
 }
 
 /// What one tool call answered.
@@ -130,6 +207,107 @@ pub struct McpAnswer {
     pub content: Vec<McpContent>,
     /// Whether the server reported the call as failed.
     pub is_error: bool,
+    /// The answer's `result` object, as the server sent it.
+    pub raw: Value,
+}
+
+/// One resource an MCP server answered.
+#[derive(Clone, Debug, PartialEq)]
+pub struct McpResource {
+    /// The resource's URI, as the server answered it.
+    pub uri: String,
+    /// The resource's media type, when the server declares one.
+    pub mime_type: Option<String>,
+    /// The resource's bytes: its text, or its decoded base64 blob.
+    pub data: Vec<u8>,
+    /// The domains the resource's `_meta.ui.csp` declares, when it does.
+    csp: Option<UiCsp>,
+}
+
+impl McpResource {
+    /// The Content Security Policy a client applies to the app this resource
+    /// holds.
+    ///
+    /// A resource that declares no policy gets the restrictive default. A
+    /// policy names only the origins this Space accepts: the declared domains
+    /// widen the directives the MCP Apps extension assigns them, and every
+    /// directive it does not assign stays locked down.
+    ///
+    /// A declared source that names the credential, or whose origin would, is
+    /// dropped: the policy is stored in the record, and a credential never is.
+    /// The policy is built under the bound a Card accepts, so a declaration
+    /// too large for a Card falls back to the restrictive default instead of
+    /// becoming unrecordable. The collection stops as soon as the declaration
+    /// is already past that bound, so a server cannot make the Space serialize
+    /// a policy it will refuse.
+    #[must_use]
+    pub fn content_security_policy(&self, credential: Option<&str>) -> String {
+        let Some(csp) = &self.csp else {
+            return DEFAULT_APP_CSP.to_owned();
+        };
+        // A resource domain is named by five directives; every other domain
+        // is named by one.
+        let mut budget = CspBudget::default();
+        let Some(resources) = csp_origins(&csp.resource_domains, credential, 5, &mut budget) else {
+            return DEFAULT_APP_CSP.to_owned();
+        };
+        let Some(connect) = csp_origins(&csp.connect_domains, credential, 1, &mut budget) else {
+            return DEFAULT_APP_CSP.to_owned();
+        };
+        let Some(frames) = csp_origins(&csp.frame_domains, credential, 1, &mut budget) else {
+            return DEFAULT_APP_CSP.to_owned();
+        };
+        let Some(base) = csp_origins(&csp.base_uri_domains, credential, 1, &mut budget) else {
+            return DEFAULT_APP_CSP.to_owned();
+        };
+        let directives = [
+            "default-src 'none'".to_owned(),
+            with_sources("script-src 'self' 'unsafe-inline'", &resources),
+            with_sources("style-src 'self' 'unsafe-inline'", &resources),
+            with_sources("img-src 'self' data:", &resources),
+            with_sources("media-src 'self' data:", &resources),
+            with_sources("font-src 'self'", &resources),
+            if connect.is_empty() {
+                "connect-src 'none'".to_owned()
+            } else {
+                with_sources("connect-src", &connect)
+            },
+            if frames.is_empty() {
+                "frame-src 'none'".to_owned()
+            } else {
+                with_sources("frame-src", &frames)
+            },
+            if base.is_empty() {
+                "base-uri 'self'".to_owned()
+            } else {
+                with_sources("base-uri", &base)
+            },
+            "object-src 'none'".to_owned(),
+        ];
+        let mut policy = String::new();
+        for directive in directives {
+            // The bound is enforced as the policy is built: a declared policy
+            // that would outgrow a Card never becomes one.
+            if !append_directive(&mut policy, &directive) {
+                return DEFAULT_APP_CSP.to_owned();
+            }
+        }
+
+        policy
+    }
+}
+
+/// The Content Security Policy domains one resource declares.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct UiCsp {
+    /// Origins the app may connect to.
+    connect_domains: Vec<String>,
+    /// Origins the app may load scripts, styles, images, fonts, and media from.
+    resource_domains: Vec<String>,
+    /// Origins the app may frame.
+    frame_domains: Vec<String>,
+    /// Origins the app's documents may use as their base.
+    base_uri_domains: Vec<String>,
 }
 
 /// One MCP server the Space may call.
@@ -288,9 +466,16 @@ impl McpClient {
         if self.opened {
             return Ok(());
         }
+        // The extension tells a server this host renders an app's HTML; a
+        // server that offers none still answers the handshake.
+        let mut extensions = serde_json::Map::new();
+        extensions.insert(
+            UI_EXTENSION.to_owned(),
+            json!({"mimeTypes": [APP_MIME_TYPE]}),
+        );
         let params = json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {},
+            "capabilities": {"extensions": extensions},
             "clientInfo": {
                 "name": "neha",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -326,6 +511,7 @@ impl McpClient {
     pub async fn tools(&mut self) -> Result<Vec<McpTool>, McpError> {
         self.require_open()?;
         let mut tools = Vec::new();
+        let mut declared = 0_usize;
         let mut cursor: Option<String> = None;
         let mut seen = std::collections::HashSet::new();
         let mut pages = 0_usize;
@@ -342,10 +528,13 @@ impl McpClient {
                 .and_then(Value::as_array)
                 .ok_or_else(malformed)?;
             for tool in listed {
-                if tools.len() >= MAX_TOOLS {
+                if declared >= MAX_TOOLS {
                     return Err(protocol_error("the MCP server lists too many tools"));
                 }
-                tools.push(tool_from_json(tool)?);
+                declared = declared.saturating_add(1);
+                if let Some(tool) = tool_from_json(tool)? {
+                    tools.push(tool);
+                }
             }
             let next = page
                 .get("nextCursor")
@@ -394,7 +583,79 @@ impl McpClient {
             Some(_) => return Err(malformed()),
         };
 
-        Ok(McpAnswer { content, is_error })
+        Ok(McpAnswer {
+            content,
+            is_error,
+            raw: answer.result.clone(),
+        })
+    }
+
+    /// Reads one resource by its URI.
+    ///
+    /// The answer's `contents` may hold more than one resource; only the
+    /// entries that name the requested URI count, and exactly one must.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`McpError::Protocol`] when the client is not open, the server's
+    /// answer does not fit the protocol, or the resource it answers is larger
+    /// than this client reads.
+    pub async fn read_resource(&mut self, uri: &str) -> Result<McpResource, McpError> {
+        self.require_open()?;
+        let params = json!({"uri": uri});
+        let answer = self.rpc("resources/read", Some(params)).await?;
+        let result = answer.result.as_object().ok_or_else(malformed)?;
+        let contents = result
+            .get("contents")
+            .and_then(Value::as_array)
+            .ok_or_else(malformed)?;
+        let mut found = None;
+        for content in contents {
+            let content = content.as_object().ok_or_else(malformed)?;
+            if content.get("uri").and_then(Value::as_str) != Some(uri) {
+                continue;
+            }
+            if found.is_some() {
+                return Err(protocol_error(
+                    "the MCP server answered one resource more than once",
+                ));
+            }
+            found = Some(content);
+        }
+        let content = found.ok_or_else(|| {
+            protocol_error("the MCP server answered no resource it was asked for")
+        })?;
+        let mime_type = match content.get("mimeType") {
+            None => None,
+            Some(Value::String(mime_type)) => Some(mime_type.clone()),
+            Some(_) => return Err(malformed()),
+        };
+        let text = match content.get("text") {
+            None => None,
+            Some(Value::String(text)) => Some(text.clone()),
+            Some(_) => return Err(malformed()),
+        };
+        let blob = match content.get("blob") {
+            None => None,
+            Some(Value::String(blob)) => Some(blob.clone()),
+            Some(_) => return Err(malformed()),
+        };
+        let data = match (text, blob) {
+            (Some(text), None) => text.into_bytes(),
+            (None, Some(blob)) => decode_base64(&blob)
+                .ok_or_else(|| protocol_error("the MCP server's resource is not base64"))?,
+            _ => return Err(malformed()),
+        };
+        if data.len() > MAX_ANSWER_BYTES {
+            return Err(protocol_error("the server's answer is too large"));
+        }
+
+        Ok(McpResource {
+            uri: uri.to_owned(),
+            mime_type,
+            data,
+            csp: ui_csp(content.get("_meta")),
+        })
     }
 
     /// Rejects a call that comes before the handshake.
@@ -704,7 +965,11 @@ fn matching_message(answer: Value, id: u64) -> Option<Value> {
 }
 
 /// One tool as the server declared it.
-fn tool_from_json(value: &Value) -> Result<McpTool, McpError> {
+///
+/// A tool that names its visibility without the model is not offered to the
+/// model at all; a tool that names a `ui://` resource carries it so a call can
+/// show its answer as a Card.
+fn tool_from_json(value: &Value) -> Result<Option<McpTool>, McpError> {
     let object = value.as_object().ok_or_else(malformed)?;
     let name = object
         .get("name")
@@ -718,12 +983,45 @@ fn tool_from_json(value: &Value) -> Result<McpTool, McpError> {
         .get("inputSchema")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    let meta = object.get("_meta").and_then(Value::as_object);
+    let ui = meta
+        .and_then(|meta| meta.get("ui"))
+        .and_then(Value::as_object);
+    if let Some(visibility) = ui
+        .and_then(|ui| ui.get("visibility"))
+        .and_then(Value::as_array)
+        && !visibility
+            .iter()
+            .any(|entry| entry.as_str() == Some("model"))
+    {
+        return Ok(None);
+    }
+    // The nested form is the current one; the flat key is the deprecated form
+    // an older server still writes.
+    let resource = ui
+        .and_then(|ui| ui.get("resourceUri"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            meta.and_then(|meta| meta.get("ui/resourceUri"))
+                .and_then(Value::as_str)
+        });
 
-    Ok(McpTool {
+    Ok(Some(McpTool {
         name: name.to_owned(),
         description: description.to_owned(),
         input_schema,
-    })
+        ui_resource: resource.and_then(ui_resource),
+    }))
+}
+
+/// The `ui://` resource a tool declaration names.
+///
+/// A resource of another scheme is no UI resource this client reads, and a
+/// server that names one keeps a tool the model sees without a Card.
+fn ui_resource(uri: &str) -> Option<String> {
+    let uri = uri.trim();
+    (!uri.is_empty() && uri.len() <= MAX_UI_RESOURCE_URI && uri.starts_with("ui://"))
+        .then(|| uri.to_owned())
 }
 
 /// One content block of a tool result.
@@ -753,6 +1051,72 @@ fn content_from_json(value: &Value) -> Result<McpContent, McpError> {
                 data,
             })
         }
+        Some("audio") => {
+            let data = block
+                .get("data")
+                .and_then(Value::as_str)
+                .ok_or_else(malformed)?;
+            // The wire carries standard base64. A payload this client cannot
+            // decode is refused here, like an image's, so the bytes the
+            // credential check searches are exactly the bytes a record would
+            // expose.
+            decode_base64(data)
+                .ok_or_else(|| protocol_error("the MCP server's audio is not base64"))?;
+            let mime_type = match block.get("mimeType") {
+                None => None,
+                Some(Value::String(mime_type)) => Some(mime_type.clone()),
+                Some(_) => return Err(malformed()),
+            };
+            Ok(McpContent::Audio {
+                data: data.to_owned(),
+                mime_type,
+                raw: value.clone(),
+            })
+        }
+        Some("resource") => {
+            let resource = block
+                .get("resource")
+                .and_then(Value::as_object)
+                .ok_or_else(malformed)?;
+            let uri = resource
+                .get("uri")
+                .and_then(Value::as_str)
+                .ok_or_else(malformed)?;
+            let mime_type = match resource.get("mimeType") {
+                None => None,
+                Some(Value::String(mime_type)) => Some(mime_type.clone()),
+                Some(_) => return Err(malformed()),
+            };
+            let text = match resource.get("text") {
+                None => None,
+                Some(Value::String(text)) => Some(text.clone()),
+                Some(_) => return Err(malformed()),
+            };
+            let blob = match resource.get("blob") {
+                None => None,
+                Some(Value::String(blob)) => Some(blob.clone()),
+                Some(_) => return Err(malformed()),
+            };
+            // A blob's size is bounded after decoding, so its base64 padding
+            // cannot buy a server more than the answer limit.
+            if let Some(blob) = &blob {
+                let decoded = decode_base64(blob)
+                    .ok_or_else(|| protocol_error("the MCP server's resource is not base64"))?;
+                if decoded.len() > MAX_ANSWER_BYTES {
+                    return Err(protocol_error("the server's answer is too large"));
+                }
+            }
+            if text.is_some() == blob.is_some() {
+                return Err(malformed());
+            }
+            Ok(McpContent::Resource {
+                uri: uri.to_owned(),
+                mime_type,
+                text,
+                blob,
+                raw: value.clone(),
+            })
+        }
         _ => Ok(McpContent::Other(value.clone())),
     }
 }
@@ -760,6 +1124,294 @@ fn content_from_json(value: &Value) -> Result<McpContent, McpError> {
 /// Decodes standard-alphabet base64, with or without the final padding.
 fn decode_base64(data: &str) -> Option<Vec<u8>> {
     STANDARD_NO_PAD.decode(data.trim_end_matches('=')).ok()
+}
+
+/// Whether one standard-base64 payload decodes to bytes that spell the
+/// credential.
+///
+/// The MCP wire carries standard base64, so a payload is read exactly as
+/// [`decode_base64`] reads one. A string that is not base64 is no payload this
+/// client can recover, so it hides nothing behind an encoding.
+pub(crate) fn base64_carries_credential(payload: &str, credential: &str) -> bool {
+    decode_base64(payload).is_some_and(|bytes| bytes_carry_credential(&bytes, credential))
+}
+
+/// Whether decoded bytes spell the credential anywhere in them.
+///
+/// The bytes need not be UTF-8, so the search is over bytes; an empty
+/// credential is no credential and matches nothing.
+pub(crate) fn bytes_carry_credential(bytes: &[u8], credential: &str) -> bool {
+    !credential.is_empty()
+        && bytes
+            .windows(credential.len())
+            .any(|window| window == credential.as_bytes())
+}
+
+/// The Content Security Policy domains a resource's `_meta` declares.
+///
+/// A metadata document of another shape is no declaration: the resource gets
+/// the restrictive default rather than a guessed policy.
+fn ui_csp(meta: Option<&Value>) -> Option<UiCsp> {
+    let csp = meta?
+        .as_object()?
+        .get("ui")?
+        .as_object()?
+        .get("csp")?
+        .as_object()?;
+    Some(UiCsp {
+        connect_domains: declared_domains(csp.get("connectDomains")),
+        resource_domains: declared_domains(csp.get("resourceDomains")),
+        frame_domains: declared_domains(csp.get("frameDomains")),
+        base_uri_domains: declared_domains(csp.get("baseUriDomains")),
+    })
+}
+
+/// The domains one policy field declares.
+fn declared_domains(value: Option<&Value>) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The most unique origins one policy collects before it falls back.
+///
+/// The fixed directives already spend a few hundred bytes of the policy
+/// budget, and a resource origin is named by five of them, so a declaration
+/// keeping more origins than this is not worth building: it falls back from
+/// the collection instead of spending work on source lists that are then
+/// thrown away.
+const MAX_CSP_ORIGINS: usize = 64;
+
+/// The bounds a policy's declared sources are collected under.
+///
+/// Every accepted origin is counted and its serialized text estimated as an
+/// upper bound: one space follows it in each directive that names it. A
+/// declaration past either bound falls back, so it is refused while it is still
+/// being read and no directive is built.
+#[derive(Default)]
+struct CspBudget {
+    /// The unique origins kept across every directive.
+    origins: usize,
+    /// An upper bound on the bytes those origins serialize into.
+    bytes: usize,
+}
+
+impl CspBudget {
+    /// Adds one kept origin that `copies` directives will name.
+    ///
+    /// Returns false once the collected sources already doom the policy: too
+    /// many origins to build a small policy, or source text past the Card's
+    /// whole policy budget. The byte estimate over-counts rather than
+    /// under-counts, so the authoritative bound is still checked when the
+    /// directives are appended.
+    fn add(&mut self, origin: &str, copies: usize) -> bool {
+        self.origins += 1;
+        self.bytes = self
+            .bytes
+            .saturating_add(origin.len().saturating_add(1).saturating_mul(copies));
+        self.origins <= MAX_CSP_ORIGINS && self.bytes <= neha::record::MAX_CARD_CSP_BYTES
+    }
+}
+
+/// The declared sources this Space accepts, as origins, in order, once each.
+///
+/// A source is checked against the credential because the policy is stored in
+/// the record; a duplicate is skipped in constant time. Each kept origin is
+/// counted into `budget` before it is kept, and `None` means the declaration
+/// outgrew the budget: the caller falls back without building a directive.
+fn csp_origins(
+    declared: &[String],
+    credential: Option<&str>,
+    copies: usize,
+    budget: &mut CspBudget,
+) -> Option<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut origins = Vec::new();
+    for source in declared {
+        if let Some(origin) = csp_origin(source, credential)
+            && seen.insert(origin.clone())
+        {
+            if !budget.add(&origin, copies) {
+                return None;
+            }
+            origins.push(origin);
+        }
+    }
+    Some(origins)
+}
+
+/// Appends one directive to a policy, if the policy still fits a Card.
+fn append_directive(policy: &mut String, directive: &str) -> bool {
+    let separator = if policy.is_empty() { 0 } else { 2 };
+    if policy
+        .len()
+        .saturating_add(separator)
+        .saturating_add(directive.len())
+        > neha::record::MAX_CARD_CSP_BYTES
+    {
+        return false;
+    }
+    if !policy.is_empty() {
+        policy.push_str("; ");
+    }
+    policy.push_str(directive);
+
+    true
+}
+
+/// Appends origins to a directive, when there is one to append.
+fn with_sources(directive: &str, sources: &[String]) -> String {
+    if sources.is_empty() {
+        directive.to_owned()
+    } else {
+        format!("{directive} {}", sources.join(" "))
+    }
+}
+
+/// Returns one declared source as an origin this Space accepts.
+///
+/// A source must be exactly an origin: `https://` anywhere, or `http://` on
+/// the Space's own machine (`127.0.0.1` or `localhost`), a host of lowercase
+/// ASCII letters, digits, dots, and hyphens, and an optional numeric port. A
+/// path, a query, a fragment, a credential, userinfo, whitespace, a separator,
+/// a wildcard, or another scheme is no origin: dropping it can only narrow the
+/// policy, never widen it. An origin whose text names the credential is
+/// dropped too, because the policy is stored in the record.
+fn csp_origin(source: &str, credential: Option<&str>) -> Option<String> {
+    let source = source.trim();
+    if source.is_empty() || source.len() > 255 || names_credential(source, credential) {
+        return None;
+    }
+    let (scheme, authority) = source.split_once("://")?;
+    if !matches!(scheme, "https" | "http") {
+        return None;
+    }
+    // Only what an origin's authority may carry: letters and digits, a dot, a
+    // hyphen, and the colon before a port. Anything else (a path, a query, a
+    // fragment, userinfo, a separator, a quote, a wildcard, whitespace) is no
+    // source this policy stores.
+    if !authority.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b':')
+    }) {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) => {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            port.parse::<u16>().ok()?;
+            (host, Some(port))
+        }
+        None => (authority, None),
+    };
+    if host.is_empty()
+        || host.len() > 253
+        || !host.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+        })
+    {
+        return None;
+    }
+    if scheme == "http" && !is_loopback_host(host) {
+        return None;
+    }
+    let mut origin = format!("{scheme}://{host}");
+    if let Some(port) = port {
+        origin.push(':');
+        origin.push_str(port);
+    }
+    // The host is lowercase already, but a port can also spell the credential.
+    if names_credential(&origin, credential) {
+        return None;
+    }
+
+    Some(origin)
+}
+
+/// Whether a serialized origin contains the credential.
+fn names_credential(text: &str, credential: Option<&str>) -> bool {
+    credential.is_some_and(|credential| !credential.is_empty() && text.contains(credential))
+}
+
+/// Whether a host is the Space's own machine, by the name a policy uses.
+///
+/// Only the two names the proxy's inherited policy can express are accepted:
+/// `127.0.0.1` and `localhost`. Every address in 127.0.0.0/8 is loopback too,
+/// but a policy cannot name one, so accepting it would store a declaration the
+/// proxy could never make effective.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "127.0.0.1")
+}
+
+/// The most frame sources the sandbox proxy names in its response header.
+///
+/// The Card's own policy is narrower; this is the proxy's own bound, so a
+/// policy this route is handed cannot turn one page's header into an unbounded
+/// source list.
+pub(crate) const MAX_FRAME_SOURCES: usize = 32;
+
+/// The frame sources one Card policy admits to the sandbox proxy.
+///
+/// The proxy's response header carries a `frame-src` directive built from the
+/// Card's policy, which reaches the route as a query parameter, so it is
+/// untrusted: the page embedding the proxy chooses it. Only the `frame-src`
+/// directive is read; every other directive is ignored. Every source must be
+/// exactly an origin this Space accepts (see [`csp_origin`]), and the policy's
+/// directive boundaries are the semicolons the Space's own policy format
+/// separates with, so a source carrying one is malformed rather than a
+/// directive boundary to trust. A policy that names no frame source, names a
+/// source that is no origin, or outgrows the bounds falls back to no source
+/// rather than to a directive built from text this Space cannot vouch for; a
+/// fallback only ever narrows where the app's frame may navigate.
+pub(crate) fn sandbox_frame_sources(policy: Option<&str>) -> Vec<String> {
+    let Some(policy) = policy else {
+        return Vec::new();
+    };
+    if policy.len() > neha::record::MAX_CARD_CSP_BYTES {
+        return Vec::new();
+    }
+    let tokens: Vec<&str> = policy.split_whitespace().collect();
+    let Some(start) = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("frame-src"))
+    else {
+        return Vec::new();
+    };
+    let mut sources = Vec::new();
+    for token in &tokens[start + 1..] {
+        let (source, ends_directive) = match token.strip_suffix(';') {
+            Some(source) => (source, true),
+            None => (*token, false),
+        };
+        // A semicolon inside a source is neither a source nor a boundary this
+        // parser may trust: the policy format separates directives with `"; "`,
+        // so such a token means the policy is malformed.
+        if source.contains(';') {
+            return Vec::new();
+        }
+        if !source.is_empty() {
+            if sources.len() == MAX_FRAME_SOURCES {
+                return Vec::new();
+            }
+            let Some(origin) = csp_origin(source, None) else {
+                return Vec::new();
+            };
+            sources.push(origin);
+        }
+        if ends_directive {
+            break;
+        }
+    }
+
+    sources
 }
 
 /// The failure every shape of malformed answer reports.
@@ -792,7 +1444,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     use super::{
-        HeaderClass, MAX_ANSWER_BYTES, McpClient, McpContent, McpError, PROTOCOL_VERSION,
+        APP_MIME_TYPE, DEFAULT_APP_CSP, HeaderClass, MAX_ANSWER_BYTES, MAX_CSP_ORIGINS,
+        MAX_FRAME_SOURCES, McpClient, McpContent, McpError, McpResource, PROTOCOL_VERSION, UiCsp,
         header_class,
     };
 
@@ -990,7 +1643,17 @@ mod tests {
             initialize.message["params"]["protocolVersion"],
             PROTOCOL_VERSION
         );
-        assert_eq!(initialize.message["params"]["capabilities"], json!({}));
+        assert_eq!(
+            initialize.message["params"]["capabilities"],
+            json!({
+                "extensions": {
+                    "io.modelcontextprotocol/ui": {
+                        "mimeTypes": ["text/html;profile=mcp-app"],
+                    },
+                },
+            }),
+            "the handshake names the UI extension this host renders"
+        );
         assert_eq!(initialize.message["params"]["clientInfo"]["name"], "neha");
         assert_eq!(
             initialize.message["params"]["clientInfo"]["version"],
@@ -1251,7 +1914,11 @@ mod tests {
                                 {"type": "image", "data": unpadded, "mimeType": "image/jpeg"},
                                 {
                                     "type": "resource",
-                                    "resource": {"uri": "file:///report.txt"},
+                                    "resource": {
+                                        "uri": "file:///report.txt",
+                                        "mimeType": "text/plain",
+                                        "text": "report body",
+                                    },
                                 },
                             ],
                         }),
@@ -1289,10 +1956,20 @@ mod tests {
                     media_type: "image/jpeg".to_owned(),
                     data: b"other-bytes".to_vec(),
                 },
-                McpContent::Other(json!({
-                    "type": "resource",
-                    "resource": {"uri": "file:///report.txt"},
-                })),
+                McpContent::Resource {
+                    uri: "file:///report.txt".to_owned(),
+                    mime_type: Some("text/plain".to_owned()),
+                    text: Some("report body".to_owned()),
+                    blob: None,
+                    raw: json!({
+                        "type": "resource",
+                        "resource": {
+                            "uri": "file:///report.txt",
+                            "mimeType": "text/plain",
+                            "text": "report body",
+                        },
+                    }),
+                },
             ]
         );
 
@@ -1661,6 +2338,772 @@ mod tests {
         assert_eq!(tools.len(), 16);
         assert_eq!(tools[15].name, "tool-16");
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_tool_declaration_names_the_app_that_renders_it() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                assert_eq!(message["method"], "tools/list");
+                rpc_result(
+                    &message["id"],
+                    json!({
+                        "tools": [
+                            {
+                                "name": "chart",
+                                "description": "Plot a chart.",
+                                "inputSchema": {"type": "object"},
+                                "_meta": {"ui": {"resourceUri": "ui://charts/bar"}},
+                            },
+                            {
+                                "name": "flat",
+                                "inputSchema": {},
+                                "_meta": {"ui/resourceUri": "ui://charts/flat"},
+                            },
+                            {
+                                "name": "hidden",
+                                "inputSchema": {},
+                                "_meta": {"ui": {
+                                    "visibility": ["app"],
+                                    "resourceUri": "ui://charts/hidden",
+                                }},
+                            },
+                            {
+                                "name": "both",
+                                "inputSchema": {},
+                                "_meta": {"ui": {"visibility": ["model", "app"]}},
+                            },
+                            {
+                                "name": "elsewhere",
+                                "inputSchema": {},
+                                "_meta": {"ui": {"resourceUri": "file:///etc/passwd"}},
+                            },
+                        ],
+                    }),
+                )
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let tools = client.tools().await.unwrap();
+
+        let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["chart", "flat", "both", "elsewhere"],
+            "a tool only an app sees is not offered to the model"
+        );
+        assert_eq!(tools[0].ui_resource.as_deref(), Some("ui://charts/bar"));
+        assert_eq!(
+            tools[1].ui_resource.as_deref(),
+            Some("ui://charts/flat"),
+            "the deprecated flat key still names the app"
+        );
+        assert_eq!(tools[2].ui_resource, None);
+        assert_eq!(
+            tools[3].ui_resource, None,
+            "a resource of another scheme is no app this host renders"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_resource_is_read_by_its_uri() {
+        let (url, log) = {
+            let log = log();
+            let (url, task) = server(
+                log.clone(),
+                Arc::new(|message: &Value, _: &HeaderMap| {
+                    if let Some(response) = handshake(message) {
+                        return response;
+                    }
+                    assert_eq!(message["method"], "resources/read");
+                    rpc_result(
+                        &message["id"],
+                        json!({
+                            "contents": [
+                                {"uri": "ui://other/view", "text": "not this one"},
+                                {
+                                    "uri": "ui://charts/bar",
+                                    "mimeType": APP_MIME_TYPE,
+                                    "text": "<html></html>",
+                                    "_meta": {"ui": {"csp": {
+                                        "connectDomains": ["https://api.example.com"],
+                                        "resourceDomains": ["https://cdn.example.com"],
+                                        "frameDomains": ["https://frames.example.com"],
+                                        "baseUriDomains": ["https://base.example.com"],
+                                    }}},
+                                },
+                            ],
+                        }),
+                    )
+                }),
+            )
+            .await;
+            (url, (log, task))
+        };
+        let (log, task) = log;
+        let mut client = McpClient::new(&url, Some("secret-token")).unwrap();
+        client.open().await.unwrap();
+
+        let resource = client.read_resource("ui://charts/bar").await.unwrap();
+
+        assert_eq!(resource.uri, "ui://charts/bar");
+        assert_eq!(resource.mime_type.as_deref(), Some(APP_MIME_TYPE));
+        assert_eq!(resource.data, b"<html></html>");
+        assert_eq!(
+            resource.csp,
+            Some(UiCsp {
+                connect_domains: vec!["https://api.example.com".to_owned()],
+                resource_domains: vec!["https://cdn.example.com".to_owned()],
+                frame_domains: vec!["https://frames.example.com".to_owned()],
+                base_uri_domains: vec!["https://base.example.com".to_owned()],
+            })
+        );
+        let read = received(&log);
+        let request = read.last().unwrap();
+        assert_eq!(request.message["method"], "resources/read");
+        assert_eq!(request.message["params"], json!({"uri": "ui://charts/bar"}));
+        assert_eq!(
+            header(&request.headers, "mcp-session-id"),
+            Some(SESSION),
+            "the read uses the session the handshake settled"
+        );
+        assert_eq!(
+            header(&request.headers, "authorization"),
+            Some("Bearer secret-token"),
+            "the read uses the credential the call uses"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_blob_resource_is_decoded() {
+        let encoded = STANDARD.encode(b"report bytes");
+        let (url, task) = server(
+            log(),
+            Arc::new(move |message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                rpc_result(
+                    &message["id"],
+                    json!({"contents": [{
+                        "uri": "ui://charts/blob",
+                        "mimeType": APP_MIME_TYPE,
+                        "blob": encoded,
+                    }]}),
+                )
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let resource = client.read_resource("ui://charts/blob").await.unwrap();
+
+        assert_eq!(resource.data, b"report bytes");
+        assert_eq!(resource.mime_type.as_deref(), Some(APP_MIME_TYPE));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_resource_read_reports_its_media_type() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                rpc_result(
+                    &message["id"],
+                    json!({"contents": [{
+                        "uri": "ui://charts/bar",
+                        "mimeType": "text/html",
+                        "text": "<html></html>",
+                    }]}),
+                )
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        // The client reports what the server answered; the Space decides
+        // whether that type is an app it renders.
+        let resource = client.read_resource("ui://charts/bar").await.unwrap();
+
+        assert_eq!(resource.mime_type.as_deref(), Some("text/html"));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_resource_read_answers_only_the_uri_it_was_asked_for() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                rpc_result(
+                    &message["id"],
+                    json!({"contents": [{"uri": "ui://other/view", "text": "no"}]}),
+                )
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let error = client.read_resource("ui://charts/bar").await.unwrap_err();
+        assert!(
+            matches!(error, McpError::Protocol(ref message) if message == "the MCP server answered no resource it was asked for"),
+            "{error}"
+        );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_resource_metadata_is_no_policy() {
+        let (url, task) = server(
+            log(),
+            Arc::new(|message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                rpc_result(
+                    &message["id"],
+                    json!({"contents": [{
+                        "uri": "ui://charts/bar",
+                        "mimeType": APP_MIME_TYPE,
+                        "text": "<html></html>",
+                        "_meta": "not a metadata document",
+                    }]}),
+                )
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let resource = client.read_resource("ui://charts/bar").await.unwrap();
+
+        assert_eq!(resource.csp, None, "an unknown shape declares nothing");
+        assert_eq!(resource.content_security_policy(None), DEFAULT_APP_CSP);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_resource_larger_than_the_limit_is_refused() {
+        let padding = "a".repeat(MAX_ANSWER_BYTES);
+        let (url, task) = server(
+            log(),
+            Arc::new(move |message: &Value, _: &HeaderMap| {
+                if let Some(response) = handshake(message) {
+                    return response;
+                }
+                rpc_result(
+                    &message["id"],
+                    json!({"contents": [{"uri": "ui://charts/bar", "text": padding}]}),
+                )
+            }),
+        )
+        .await;
+        let mut client = McpClient::new(&url, None).unwrap();
+        client.open().await.unwrap();
+
+        let error = client.read_resource("ui://charts/bar").await.unwrap_err();
+        assert!(
+            matches!(error, McpError::Protocol(ref message) if message == "the server's answer is too large"),
+            "{error}"
+        );
+        task.abort();
+    }
+
+    fn app_resource(csp: Option<UiCsp>) -> McpResource {
+        McpResource {
+            uri: "ui://charts/bar".to_owned(),
+            mime_type: Some(APP_MIME_TYPE.to_owned()),
+            data: b"<html></html>".to_vec(),
+            csp,
+        }
+    }
+
+    #[test]
+    fn an_apps_policy_names_only_declared_origins() {
+        assert_eq!(
+            app_resource(None).content_security_policy(None),
+            DEFAULT_APP_CSP,
+            "a resource that declares no policy gets the restrictive default"
+        );
+
+        let declared = UiCsp {
+            connect_domains: vec![
+                "https://api.example.com".to_owned(),
+                "http://127.0.0.1:8080".to_owned(),
+                "http://localhost:3000".to_owned(),
+                "http://example.com".to_owned(),
+                "ftp://files.example.com".to_owned(),
+                "https://api.example.com/path".to_owned(),
+                "https://user@api.example.com".to_owned(),
+            ],
+            resource_domains: vec![
+                "https://cdn.example.com".to_owned(),
+                "https://cdn.example.com".to_owned(),
+                "https://cdn.example.com/path".to_owned(),
+            ],
+            frame_domains: vec!["https://frames.example.com".to_owned()],
+            base_uri_domains: Vec::new(),
+        };
+        let policy = app_resource(Some(declared)).content_security_policy(None);
+
+        assert!(policy.contains("default-src 'none'"), "{policy}");
+        assert!(policy.contains("object-src 'none'"), "{policy}");
+        assert!(
+            policy.contains("script-src 'self' 'unsafe-inline' https://cdn.example.com;"),
+            "{policy}"
+        );
+        assert!(
+            policy.contains("style-src 'self' 'unsafe-inline' https://cdn.example.com;"),
+            "{policy}"
+        );
+        assert!(
+            policy.contains("img-src 'self' data: https://cdn.example.com;"),
+            "{policy}"
+        );
+        assert!(
+            policy.contains("media-src 'self' data: https://cdn.example.com;"),
+            "{policy}"
+        );
+        assert!(
+            policy.contains("font-src 'self' https://cdn.example.com;"),
+            "{policy}"
+        );
+        assert!(
+            policy.contains(
+                "connect-src https://api.example.com http://127.0.0.1:8080 http://localhost:3000;"
+            ),
+            "a declared origin widens only its directive: {policy}"
+        );
+        assert!(
+            policy.contains("frame-src https://frames.example.com;"),
+            "{policy}"
+        );
+        assert!(policy.contains("base-uri 'self';"), "{policy}");
+        for refused in [
+            "http://example.com",
+            "ftp://",
+            "https://api.example.com/path",
+            "https://user@",
+            "https://cdn.example.com/path",
+        ] {
+            assert!(
+                !policy.contains(refused),
+                "{refused} is no origin this Space accepts: {policy}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_apps_policy_that_would_outgrow_a_card_is_restricted() {
+        let many: Vec<String> = (0..40)
+            .map(|index| format!("https://cdn{index}.example.com"))
+            .collect();
+        let declared = UiCsp {
+            connect_domains: Vec::new(),
+            resource_domains: many,
+            frame_domains: Vec::new(),
+            base_uri_domains: Vec::new(),
+        };
+
+        assert_eq!(
+            app_resource(Some(declared)).content_security_policy(None),
+            DEFAULT_APP_CSP,
+            "a policy a Card cannot hold falls back instead of failing the record"
+        );
+    }
+
+    #[test]
+    fn an_apps_policy_takes_only_strict_origins() {
+        for (source, expected) in [
+            ("https://good.example", Some("https://good.example")),
+            (
+                "https://good.example:8443",
+                Some("https://good.example:8443"),
+            ),
+            ("http://127.0.0.1:8123", Some("http://127.0.0.1:8123")),
+            ("http://localhost", Some("http://localhost")),
+        ] {
+            assert_eq!(
+                super::csp_origin(source, None),
+                expected.map(str::to_owned),
+                "{source}"
+            );
+        }
+        for source in [
+            "https://a;script-src *",
+            "https://x.example/\"",
+            "https://x.example/<script>",
+            "*",
+            "https://*.example",
+            "https://good.example/path",
+            "https://good.example?query=1",
+            "https://good.example#fragment",
+            "https://user@good.example",
+            "ftp://good.example",
+            "HTTP://good.example",
+            "https://Good.example",
+            "http://good.example",
+            // Only the loopback names the proxy's own policy can express are
+            // origins this Space accepts: another 127.0.0.0/8 address or the
+            // IPv6 loopback would be a declaration no policy could honor.
+            "http://127.0.0.2:8123",
+            "http://127.0.0.2",
+            "http://127.1.2.3:8080",
+            "http://[::1]:8123",
+            "https://",
+            "https://good.example:abc",
+            "https://good.example:70000",
+            "https://good.example:80/x",
+        ] {
+            assert_eq!(super::csp_origin(source, None), None, "{source}");
+        }
+        // A source whose text names the credential is no source, and neither
+        // is one whose serialized origin does: the policy is stored.
+        assert_eq!(
+            super::csp_origin("https://token-1.example", Some("token-1")),
+            None
+        );
+        assert_eq!(
+            super::csp_origin("https://good.example:8443", Some("8443")),
+            None
+        );
+    }
+
+    #[test]
+    fn an_apps_policy_drops_the_credential_from_a_declared_origin() {
+        let declared = UiCsp {
+            connect_domains: vec![
+                "https://token-1.example".to_owned(),
+                "https://good.example".to_owned(),
+            ],
+            ..UiCsp::default()
+        };
+
+        let policy = app_resource(Some(declared)).content_security_policy(Some("token-1"));
+
+        assert!(
+            policy.contains("connect-src https://good.example;"),
+            "{policy}"
+        );
+        assert!(!policy.contains("token-1"), "{policy}");
+        assert!(policy.len() <= neha::record::MAX_CARD_CSP_BYTES);
+    }
+
+    #[test]
+    fn an_apps_policy_dedupes_and_keeps_its_bound_while_building() {
+        // A source declared a thousand times is kept once and does not inflate
+        // the policy.
+        let declared = UiCsp {
+            resource_domains: vec!["https://cdn.example.com".to_owned(); 1_000],
+            ..UiCsp::default()
+        };
+        let policy = app_resource(Some(declared)).content_security_policy(None);
+        assert_eq!(
+            policy.matches("https://cdn.example.com").count(),
+            5,
+            "one per resource directive: {policy}"
+        );
+        assert!(policy.len() <= neha::record::MAX_CARD_CSP_BYTES);
+
+        // Many declared domains would outgrow a Card: the restrictive default.
+        let many: Vec<String> = (0..1_000)
+            .map(|index| format!("https://cdn{index}.example.com"))
+            .collect();
+        let declared = UiCsp {
+            resource_domains: many,
+            ..UiCsp::default()
+        };
+        assert_eq!(
+            app_resource(Some(declared)).content_security_policy(None),
+            DEFAULT_APP_CSP,
+            "a policy built past the Card bound falls back instead of failing"
+        );
+    }
+
+    #[test]
+    fn an_apps_policy_stops_collecting_a_declaration_that_cannot_fit() {
+        // Thousands of declared domains are refused from the collection bound:
+        // no directive string is built for a policy that cannot fit a Card.
+        // The test completes without relying on the size of the declaration.
+        let many: Vec<String> = (0..10_000)
+            .map(|index| format!("https://cdn{index}.example.com"))
+            .collect();
+        let declared = UiCsp {
+            connect_domains: many.clone(),
+            resource_domains: many.clone(),
+            frame_domains: many.clone(),
+            base_uri_domains: many,
+        };
+
+        assert_eq!(
+            app_resource(Some(declared)).content_security_policy(None),
+            DEFAULT_APP_CSP,
+            "a declaration past the collection bound falls back"
+        );
+    }
+
+    #[test]
+    fn an_apps_policy_counts_origins_while_it_collects_them() {
+        // More unique origins than one policy may collect fall back even when
+        // their text alone would fit: the count bound is checked while the
+        // declaration is read, not after every directive is built.
+        let many: Vec<String> = (0..MAX_CSP_ORIGINS + 1)
+            .map(|index| format!("https://host{index}.example"))
+            .collect();
+        let declared = UiCsp {
+            connect_domains: many,
+            ..UiCsp::default()
+        };
+
+        assert_eq!(
+            app_resource(Some(declared)).content_security_policy(None),
+            DEFAULT_APP_CSP
+        );
+    }
+
+    #[test]
+    fn the_sandbox_proxy_names_only_a_cards_frame_sources() {
+        // The proxy's header rebuilds the Card's frame-src and nothing else:
+        // the policy itself is never re-emitted, so every other directive is
+        // ignored rather than copied into a header.
+        assert_eq!(
+            super::sandbox_frame_sources(Some(
+                "default-src 'none'; frame-src https://frames.example; object-src 'none'"
+            )),
+            ["https://frames.example".to_owned()]
+        );
+        assert_eq!(
+            super::sandbox_frame_sources(Some("frame-src http://127.0.0.1:8080 http://localhost")),
+            [
+                "http://127.0.0.1:8080".to_owned(),
+                "http://localhost".to_owned()
+            ]
+        );
+
+        // A policy with no frame-src, or no frames, names no source: the
+        // header falls back to 'none'.
+        assert!(super::sandbox_frame_sources(None).is_empty());
+        assert!(super::sandbox_frame_sources(Some("")).is_empty());
+        assert!(super::sandbox_frame_sources(Some("frame-src 'none'")).is_empty());
+        assert!(
+            super::sandbox_frame_sources(Some("default-src 'none'; object-src 'none'")).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_sandbox_proxy_refuses_a_frame_source_that_is_no_origin() {
+        // A query parameter is untrusted text: only an origin this Space
+        // accepts may become a source of the response's frame-src, so a
+        // keyword, a wildcard, a path, userinfo, another scheme, a bare host,
+        // or a non-loopback http origin falls back to naming no source.
+        for policy in [
+            "frame-src javascript:alert(1)",
+            "frame-src *",
+            "frame-src 127.0.0.2",
+            "frame-src http://example.com",
+            "frame-src https://frames.example/path",
+            "frame-src https://user@frames.example",
+            "frame-src https://UPPER.example",
+            "frame-src https://",
+            "frame-src https://a;b",
+            "frame-src 'self'",
+            "frame-src https://frames.example 'self'",
+        ] {
+            assert!(
+                super::sandbox_frame_sources(Some(policy)).is_empty(),
+                "{policy}"
+            );
+        }
+        // One bad entry makes the whole source list unusable: a header built
+        // from part of a list is not the policy the Card declared.
+        assert!(
+            super::sandbox_frame_sources(Some("frame-src https://frames.example *")).is_empty()
+        );
+    }
+
+    #[test]
+    fn the_sandbox_proxy_bounds_how_many_frame_sources_it_names() {
+        let policy = |count: usize| {
+            let sources: Vec<String> = (0..count)
+                .map(|index| format!("https://frames{index}.example"))
+                .collect();
+            format!(
+                "default-src 'none'; frame-src {}; object-src 'none'",
+                sources.join(" ")
+            )
+        };
+
+        assert_eq!(
+            super::sandbox_frame_sources(Some(&policy(MAX_FRAME_SOURCES))).len(),
+            MAX_FRAME_SOURCES,
+            "the bound admits as many sources as it names"
+        );
+        assert!(
+            super::sandbox_frame_sources(Some(&policy(MAX_FRAME_SOURCES + 1))).is_empty(),
+            "one source past the bound falls back"
+        );
+
+        // The whole policy is read under the Card's own bound too: the route
+        // does not decode an unbounded query parameter.
+        let oversized = format!(
+            "frame-src https://frames.example {}",
+            "a".repeat(neha::record::MAX_CARD_CSP_BYTES)
+        );
+        assert!(super::sandbox_frame_sources(Some(&oversized)).is_empty());
+    }
+
+    #[test]
+    fn an_embedded_block_hides_the_credential_only_in_decoded_bytes() {
+        let resource = |value: Value| super::content_from_json(&value).unwrap();
+
+        // A resource's text is plain text: redaction reaches it, so it is no
+        // hidden credential.
+        let text = resource(json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///report.txt",
+                "mimeType": "text/plain",
+                "text": "the answer is token-1",
+            },
+        }));
+        assert!(!text.carries_credential("token-1"));
+
+        // A resource's blob is base64 on the wire: its decoded bytes carry the
+        // credential even though the payload does not spell it.
+        let blob = resource(json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///data.bin",
+                "mimeType": "application/octet-stream",
+                "blob": STANDARD.encode(b"prefix token-1"),
+            },
+        }));
+        assert!(
+            blob.carries_credential("token-1"),
+            "a resource blob that decodes to the credential is found"
+        );
+        let harmless = resource(json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///data.bin",
+                "mimeType": "application/octet-stream",
+                "blob": STANDARD.encode(b"harmless bytes"),
+            },
+        }));
+        assert!(!harmless.carries_credential("token-1"));
+
+        // An image's decoded bytes are searched the same way.
+        let image = resource(json!({
+            "type": "image",
+            "mimeType": "image/png",
+            "data": STANDARD.encode(b"token-1"),
+        }));
+        assert!(image.carries_credential("token-1"));
+
+        // One payload helper serves every string a Card or a block carries.
+        assert!(super::base64_carries_credential(
+            &STANDARD.encode(b"token-1"),
+            "token-1"
+        ));
+        assert!(!super::base64_carries_credential("not base64!", "token-1"));
+    }
+
+    #[test]
+    fn an_audio_block_hides_the_credential_in_its_decoded_bytes() {
+        let audio = |value: &[u8]| {
+            super::content_from_json(&json!({
+                "type": "audio",
+                "mimeType": "audio/wav",
+                "data": STANDARD.encode(value),
+            }))
+            .expect("a base64 audio block is a modelled block")
+        };
+
+        // The base64 payload spells nothing the literal redaction could see,
+        // but its decoded bytes are the credential: only decoding finds it.
+        let hidden = audio(b"token-1");
+        assert!(
+            hidden.carries_credential("token-1"),
+            "an audio payload that decodes to the credential is found"
+        );
+        let prefixed = audio(b"prefix token-1");
+        assert!(prefixed.carries_credential("token-1"));
+
+        // A clean clip carries nothing, and the block is modelled as audio
+        // rather than as an unmodelled block.
+        let clean = audio(b"clean sound");
+        assert!(!clean.carries_credential("token-1"));
+        assert!(
+            matches!(&clean, McpContent::Audio { mime_type, .. } if mime_type.as_deref() == Some("audio/wav"))
+        );
+
+        // A payload the client cannot decode is no audio block: it is refused
+        // at parse time, before any output is built.
+        assert!(
+            super::content_from_json(&json!({
+                "type": "audio",
+                "mimeType": "audio/wav",
+                "data": "not base64!",
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn an_audio_block_keeps_the_block_the_server_sent() {
+        // An answer may annotate a block, and the Model reads the server's own
+        // block: a field this client does not model survives on the Audio
+        // variant instead of being dropped with a rebuilt block.
+        let block = json!({
+            "type": "audio",
+            "mimeType": "audio/wav",
+            "data": STANDARD.encode(b"clean sound"),
+            "_meta": {"ui": {"annotations": {"audience": ["user"]}}},
+            "annotations": [{"audience": ["user"], "priority": 0.5}],
+        });
+
+        let McpContent::Audio { raw, .. } = super::content_from_json(&block).unwrap() else {
+            panic!("expected an audio block");
+        };
+
+        assert_eq!(raw, block, "the Model reads the server's own block");
+    }
+
+    #[test]
+    fn an_embedded_resource_keeps_the_block_the_server_sent() {
+        let block = json!({
+            "type": "resource",
+            "resource": {
+                "uri": "file:///report.txt",
+                "mimeType": "text/plain",
+                "text": "report body",
+                "_meta": {"ui": {"annotations": {"audience": ["user"]}}},
+                "annotations": [{"audience": ["user"], "priority": 0.5}],
+            },
+        });
+
+        let McpContent::Resource { raw, .. } = super::content_from_json(&block).unwrap() else {
+            panic!("expected a resource");
+        };
+
+        assert_eq!(raw, block, "the Model reads the server's own block");
     }
 
     #[test]

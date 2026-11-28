@@ -23,7 +23,7 @@ use axum::http::header::{
     SET_COOKIE,
 };
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -388,6 +388,7 @@ impl SpaceServer {
             .route("/api/bot/files/{id}", get(bot_file_download))
             .route("/api/mcp/signin/bind", get(mcp_sign_in_bind))
             .route("/api/mcp/signin/{key}/callback", get(mcp_sign_in_callback))
+            .route("/api/mcp/card/sandbox", get(mcp_card_sandbox))
             .route("/api", any(api_not_found))
             .route("/api/", any(api_not_found))
             .route("/api/{*rest}", any(api_not_found));
@@ -924,6 +925,297 @@ fn sign_in_page(status: StatusCode, page: &'static str) -> Response {
             (CACHE_CONTROL, "no-store"),
         ],
         page,
+    )
+        .into_response()
+}
+
+/// The fixed page one Card's sandbox is mounted in.
+///
+/// The page is same-origin with the Space but shows nothing of it: its one job
+/// is to put the untrusted app document in a frame that shares no origin with
+/// the Space and to relay messages between that frame and the page that
+/// mounted it. The app's bytes never pass through this page's markup, so the
+/// host parses no remote HTML; a `mount` message hands them to a frame's
+/// `srcdoc` behind the app's own Content Security Policy.
+///
+/// The relay is bound to the mounted document, not to the frame's window: a
+/// WindowProxy survives the untrusted document navigating itself, so a
+/// replacement document would otherwise inherit the relay. The page injects a
+/// trusted script ahead of the app's markup; that script opens one
+/// `MessageChannel`, keeps one half in the app's realm, and transfers the
+/// other half to this page. From then on app→host data crosses only through
+/// the port, and a document that replaces the mounted one never held it, so it
+/// can neither receive host data nor speak as the app. The injected script
+/// stands an `EventTarget` in for the app's replaceable `parent` property, so
+/// the app's ordinary `window.parent.postMessage` calls leave over the port and
+/// the source of a message it receives compares equal to `window.parent`. The
+/// load watch still reports a navigation, so the host revokes the relay even
+/// when the frame leaves the document the host mounted.
+///
+/// The page fills the frame that the host allocates: a zero-margin document
+/// with no scrolling, and the app's frame absolutely positioned over it, so
+/// the app's viewport is the space the host gave the sandbox rather than the
+/// default body box.
+const CARD_SANDBOX_PAGE: &str = r##"<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Neha app sandbox</title>
+<style>
+html,body{margin:0;padding:0;height:100%;overflow:hidden}
+</style>
+</head>
+<body>
+<template id="neha-card-frame"><iframe sandbox="allow-scripts" style="position:absolute;inset:0;width:100%;height:100%;border:0"></iframe></template>
+<script>
+(function () {
+  "use strict";
+  var parentWindow = window.parent;
+  var inner = null;
+  var mounted = false;
+  var inert = false;
+  var port = null;
+
+  function post(message) {
+    try {
+      parentWindow.postMessage(message, "*");
+    } catch (_) {
+      // A relay never throws into the page.
+    }
+  }
+
+  function escapeAttribute(value) {
+    return String(value)
+      .replace(/&/g, "&amp;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+  }
+
+  // The trusted script the page injects into the app's document ahead of the
+  // app's markup. It runs in the app's realm, so it can stand between the app
+  // and the one host window that realm may speak to. It carries no secret: the
+  // channel it opens is the only line either direction.
+  function appRelay() {
+    "use strict";
+    var hostWindow = window.parent;
+    // Capture the one window message path the app's realm has before the app's
+    // own `parent` is replaced: the channel's other half leaves through it.
+    var sendToHost = hostWindow.postMessage.bind(hostWindow);
+    var channel = new MessageChannel();
+    var appPort = channel.port1;
+    var hostPort = channel.port2;
+    // The object the app sees as `window.parent`. An app says
+    // `window.parent.postMessage(message)`; the stand-in sends it over the
+    // app's half of the channel, whose other half only this page holds. It is
+    // an `EventTarget`, so a listener can compare a received message's source
+    // with `window.parent` and find the parent it trusts.
+    class Bridge extends EventTarget {
+      postMessage(message, _targetOrigin, transfer) {
+        appPort.postMessage(message, Array.isArray(transfer) ? transfer : []);
+      }
+    }
+    var appParent = new Bridge();
+    // Host payloads arrive on the same channel and leave as ordinary window
+    // messages from the app's own parent, which is where an app's listener
+    // expects them. The port is the only way in: a document that replaces this
+    // one never held it. A browser admits only a Window or a MessagePort as a
+    // message event's source, so the event is created with the channel's port
+    // as the source and then names the visible parent as its source: what the
+    // app reads is `window.parent`, just as if the host window had sent it.
+    appPort.onmessage = function (event) {
+      var message = new MessageEvent("message", {
+        data: event.data,
+        source: appPort,
+      });
+      Object.defineProperty(message, "source", { value: appParent });
+      window.dispatchEvent(message);
+    };
+    // `parent` is a replaceable property of the app's own window: the relay
+    // stands in for it, so every message the app sends leaves over the
+    // channel. A document that replaces this one never ran the relay, so it
+    // has no channel at all.
+    try {
+      Object.defineProperty(window, "parent", {
+        value: appParent,
+        configurable: true,
+      });
+    } catch (_) {
+      window.parent = appParent;
+    }
+    // Hand the other half of the channel to the page that mounted this
+    // document. The transfer is one-time, and the page keeps only the first
+    // one it receives.
+    sendToHost({ __nehaPort: true }, "*", [hostPort]);
+  }
+
+  function closePort() {
+    if (!port) return;
+    try {
+      port.close();
+    } catch (_) {}
+    port = null;
+  }
+
+  function navigated() {
+    if (inert) return;
+    inert = true;
+    closePort();
+    post({ neha: "sandbox-navigation" });
+    if (inner) {
+      // Blank the navigated document: the frame is inert from here, and the
+      // blank page loads once more under the guard above.
+      try {
+        inner.setAttribute("srcdoc", "");
+      } catch (_) {}
+    }
+  }
+
+  function mount(data) {
+    if (mounted) return;
+    if (typeof data.html !== "string" || typeof data.csp !== "string") return;
+    mounted = true;
+    var template = document.getElementById("neha-card-frame");
+    var frame = template.content.firstElementChild.cloneNode(true);
+    // The app's policy is the first thing in the document, so the browser
+    // applies it before it parses the app's own bytes, which are never parsed
+    // here.
+    // The relay script follows the policy, before the app's markup, and it
+    // takes no argument: nothing secret is ever written into the app document.
+    frame.srcdoc =
+      '<meta http-equiv="Content-Security-Policy" content="' +
+      escapeAttribute(data.csp) +
+      '">' +
+      "<scr" +
+      "ipt>(" +
+      appRelay.toString() +
+      ")();</scr" +
+      "ipt>" +
+      data.html;
+    var firstLoad = true;
+    frame.addEventListener("load", function () {
+      // The mount's own load is the app document; a later one means the
+      // untrusted document navigated itself.
+      if (firstLoad) {
+        firstLoad = false;
+        return;
+      }
+      navigated();
+    });
+    inner = frame;
+    document.body.appendChild(frame);
+  }
+
+  window.addEventListener("message", function (event) {
+    var data = event.data;
+    if (event.source === parentWindow) {
+      if (!data || typeof data !== "object") return;
+      if (data.neha === "mount") {
+        mount(data);
+        return;
+      }
+      if (inert) return;
+      if (data.neha === "sandbox-post" && port) {
+        try {
+          port.postMessage(data.payload);
+        } catch (_) {
+          // A payload the frame cannot take is dropped, not thrown.
+        }
+      }
+      return;
+    }
+    if (!inner || event.source !== inner.contentWindow) return;
+    if (inert) return;
+    // The mounted document hands over one half of its channel exactly once,
+    // during its bootstrap. That window message is the only one this page ever
+    // takes from the frame: app data arrives over the port, and a document
+    // that replaces the mounted one holds no port, so its window messages are
+    // dropped.
+    if (data && typeof data === "object" && data.__nehaPort === true && !port) {
+      if (!event.ports || event.ports.length !== 1) return;
+      port = event.ports[0];
+      port.onmessage = function (message) {
+        if (inert) return;
+        post({ neha: "sandbox-message", payload: message.data });
+      };
+    }
+  });
+
+  post({ neha: "sandbox-ready" });
+})();
+</script>
+</body>
+</html>
+"##;
+
+/// The policy the page that mounts a Card's sandbox runs under.
+///
+/// The page needs its own inline relay script and the one frame it builds; it
+/// needs no image, style, connection, or object. The app's frame is a
+/// `srcdoc` document, which inherits this policy: creating it is not a fetch,
+/// so `frame-src` does not gate the initial mount, but it does gate every
+/// navigation the app's frame starts afterwards.
+// The proxy only runs its own inline relay script and the untrusted app
+// document carries its own policy. A `srcdoc` frame inherits its embedder's
+// policy, so this header must not block a resource the card's policy names:
+// it allows the categories an app may use (HTTPS or the loopback origins a
+// card's policy can name) and the card's meta policy narrows the intersection.
+// `base-uri` is one of those categories: a card's `baseUriDomains` are stored
+// as origins the proxy's own policy must also admit, so it names the same
+// origins rather than locking the base down. It names no default-src and no
+// frame-src: the route appends exactly one frame-src, built from the Card's
+// policy ([`card_sandbox_policy`]), because the first occurrence of a
+// directive is the one a browser applies.
+const CARD_SANDBOX_CSP: &str = "script-src 'unsafe-inline' https: http://127.0.0.1:* http://localhost:*; style-src 'unsafe-inline' https: http://127.0.0.1:* http://localhost:*; img-src data: https: http://127.0.0.1:* http://localhost:*; font-src data: https: http://127.0.0.1:* http://localhost:*; media-src data: https: http://127.0.0.1:* http://localhost:*; connect-src https: http://127.0.0.1:* http://localhost:*; base-uri https: http://127.0.0.1:* http://localhost:*; object-src 'none'";
+
+/// The query the sandbox proxy page carries.
+#[derive(Deserialize)]
+struct CardSandboxQuery {
+    /// The Card's effective policy, percent-encoded by the page that mounts
+    /// it. Only its `frame-src` source list is read.
+    #[serde(default)]
+    csp: Option<String>,
+}
+
+/// The policy the fixed sandbox page is served under, with the Card's frame
+/// sources appended.
+///
+/// The inherited categories are [`CARD_SANDBOX_CSP`] unchanged; `frame-src` is
+/// the one directive the mounting page decides, because it governs where the
+/// app's frame itself may navigate. The sources are validated origins (see
+/// [`crate::mcp::sandbox_frame_sources`]), so no attacker text can reach the
+/// header, and a Card that names none gets `'none'`: a fallback only ever
+/// narrows the navigation this header admits.
+fn card_sandbox_policy(frame_sources: &[String]) -> String {
+    let frame = if frame_sources.is_empty() {
+        "'none'".to_owned()
+    } else {
+        frame_sources.join(" ")
+    };
+    let inherited = CARD_SANDBOX_CSP;
+    format!("{inherited}; frame-src {frame}")
+}
+
+/// Answers the fixed page one Card's sandbox is mounted in.
+///
+/// The route needs no session: the page carries no record data and no
+/// credential, and the only app it hosts is a frame the client mounts from a
+/// Card the Space already gave it. It is served under its own policy, so a
+/// page that loads it cannot use it to reach anything the Space offers. The
+/// Card's policy arrives as a query parameter, because only the page that
+/// embeds the sandbox knows which Card it mounts; its `frame-src` list is what
+/// stops the app's frame navigating to an origin the Card did not declare.
+async fn mcp_card_sandbox(query: Result<Query<CardSandboxQuery>, QueryRejection>) -> Response {
+    let policy = query.ok().and_then(|Query(query)| query.csp);
+    let header = card_sandbox_policy(&crate::mcp::sandbox_frame_sources(policy.as_deref()));
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8".to_owned()),
+            (CACHE_CONTROL, "no-store".to_owned()),
+            (HeaderName::from_static("content-security-policy"), header),
+        ],
+        CARD_SANDBOX_PAGE,
     )
         .into_response()
 }
@@ -4868,6 +5160,201 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(native.status(), reqwest::StatusCode::OK);
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_card_sandbox_proxy_serves_the_fixed_relay_page() {
+        let (_dir, running, _invite) = running().await;
+
+        // The route needs no session: a Card's sandbox is loaded as a frame's
+        // document by a page of this Space, and it carries nothing secret.
+        let response = reqwest::Client::new()
+            .get(format!("{}/api/mcp/card/sandbox", running.url()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.headers().get("content-type").unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+        // The inherited categories stay as they are, and the route appends the
+        // one frame-src the Card decides: with no policy in the query, the app
+        // frame may not navigate anywhere at all.
+        let expected = format!("{}; frame-src 'none'", super::CARD_SANDBOX_CSP);
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected
+        );
+
+        // The document is fixed: it reports itself, relays both directions,
+        // and names the one message that stops the relay. The relay is one
+        // transferred `MessageChannel`: the app's half is handed to the page
+        // during the mounted document's bootstrap, and no secret is ever
+        // written into the app's document.
+        let page = response.text().await.unwrap();
+        assert_eq!(page, super::CARD_SANDBOX_PAGE, "the proxy page is fixed");
+        for kind in [
+            "sandbox-ready",
+            "sandbox-message",
+            "sandbox-post",
+            "sandbox-navigation",
+            "__nehaPort",
+            "MessageChannel",
+            "[hostPort]",
+        ] {
+            assert!(page.contains(kind), "{kind} missing from the proxy page");
+        }
+        // A received host message must name the app's visible parent as its
+        // source, and that parent must be a real `EventTarget`: a plain object
+        // there made Chromium throw before dispatch, so the app never got the
+        // host's answer. The markers are the regression guard a route test can
+        // keep without a browser.
+        for marker in [
+            "extends EventTarget",
+            "new Bridge()",
+            r#"Object.defineProperty(window, "parent""#,
+            r#"Object.defineProperty(message, "source""#,
+            "window.parent",
+        ] {
+            assert!(
+                page.contains(marker),
+                "{marker} missing from the proxy page"
+            );
+        }
+        // The sandbox document fills the frame the host allocates: no default
+        // body margin or auto height, no scrolling, and the app's frame laid
+        // over the whole viewport.
+        for marker in [
+            "margin:0",
+            "height:100%",
+            "overflow:hidden",
+            "position:absolute",
+            "inset:0",
+        ] {
+            assert!(
+                page.contains(marker),
+                "{marker} missing from the proxy page"
+            );
+        }
+        assert!(
+            !page.contains("token"),
+            "the relay carries no secret: {page}"
+        );
+        assert!(
+            page.contains(r#"sandbox="allow-scripts""#),
+            "the app frame is the sandboxed one: {page}"
+        );
+        assert!(
+            page.contains(r#"Content-Security-Policy"#),
+            "the app's policy meta is built by the page: {page}"
+        );
+
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_card_sandbox_proxy_carries_the_cards_frame_sources() {
+        let (_dir, running, _invite) = running().await;
+
+        // The embedding page names the Card's effective policy, percent-
+        // encoded, and the proxy rebuilds only its frame-src: every other
+        // directive stays inherited, never copied from the query.
+        let response = reqwest::Client::new()
+            .get(format!("{}/api/mcp/card/sandbox", running.url()))
+            .query(&[(
+                "csp",
+                "default-src 'none'; frame-src https://frames.example",
+            )])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let expected = format!(
+            "{}; frame-src https://frames.example",
+            super::CARD_SANDBOX_CSP
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-security-policy")
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            expected
+        );
+        // The policy is a header, never markup: the fixed page is unchanged,
+        // so where the app may navigate cannot be rewritten by app bytes.
+        assert_eq!(response.text().await.unwrap(), super::CARD_SANDBOX_PAGE);
+
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_card_sandbox_proxy_falls_back_to_no_frame_source() {
+        let (_dir, running, _invite) = running().await;
+        let client = reqwest::Client::new();
+        let none = format!("{}; frame-src 'none'", super::CARD_SANDBOX_CSP);
+        let many_sources = {
+            let sources: Vec<String> = (0..=crate::mcp::MAX_FRAME_SOURCES)
+                .map(|index| format!("https://frames{index}.example"))
+                .collect();
+            format!(
+                "default-src 'none'; frame-src {}; object-src 'none'",
+                sources.join(" ")
+            )
+        };
+        let oversized = format!(
+            "frame-src https://frames.example {}",
+            "a".repeat(neha::record::MAX_CARD_CSP_BYTES)
+        );
+        for policy in [
+            "frame-src 'none'".to_owned(),
+            "frame-src https://a;b".to_owned(),
+            "frame-src javascript:alert(1)".to_owned(),
+            "frame-src *".to_owned(),
+            "frame-src 127.0.0.2".to_owned(),
+            "frame-src http://example.com".to_owned(),
+            "frame-src https://frames.example/path".to_owned(),
+            "frame-src https://user@frames.example".to_owned(),
+            "default-src 'none'; object-src 'none'".to_owned(),
+            many_sources,
+            oversized,
+        ] {
+            let response = client
+                .get(format!("{}/api/mcp/card/sandbox", running.url()))
+                .query(&[("csp", policy.as_str())])
+                .send()
+                .await
+                .unwrap();
+            // A policy this Space cannot vouch for narrows the app to no
+            // navigation, and the fixed page still serves: the mount never
+            // depends on the query.
+            assert_eq!(response.status(), reqwest::StatusCode::OK, "{policy}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get("content-security-policy")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                none,
+                "{policy}"
+            );
+            assert_eq!(
+                response.text().await.unwrap(),
+                super::CARD_SANDBOX_PAGE,
+                "{policy}"
+            );
+        }
+
         running.shutdown().await;
     }
 
@@ -11941,7 +12428,16 @@ mod tests {
         .await;
         expect_accepted(&mut first, first_id).await;
         expect_accepted(&mut second, second_id).await;
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Wait until both commands are observably waiting on the Bot's lock:
+        // a fixed sleep races a slow machine and lets the loser read the moved
+        // Computer instead of the one it saw before the wait.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while crate::runs::admit_waiters(bot) < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("both moves wait on the Bot's lock");
         drop(held);
 
         let one = expect_answer(&mut first, first_id).await;
@@ -19698,6 +20194,150 @@ mod tests {
         serde_json::from_value(result["server"].clone()).unwrap()
     }
 
+    /// Runs a fake MCP server whose one tool names an app, answering the
+    /// `resources/read` for it with `resource` and the call with `call_result`.
+    /// Returns its URL and a log.
+    async fn fake_mcp_app_server(
+        meta: Value,
+        resource: Value,
+        call_result: Value,
+    ) -> (String, McpLog, tokio::task::JoinHandle<()>) {
+        use axum::Router;
+        use axum::body::{Body, Bytes};
+        use axum::http::{HeaderMap, header::CONTENT_TYPE};
+        use axum::response::Response;
+        use axum::routing::post;
+
+        let log: McpLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = log.clone();
+        let resource = std::sync::Arc::new(resource);
+        let meta = std::sync::Arc::new(meta);
+        let call_result = std::sync::Arc::new(call_result);
+        let app = Router::new().route(
+            "/",
+            post(move |_headers: HeaderMap, body: Bytes| {
+                let log = seen.clone();
+                let resource = resource.clone();
+                let meta = meta.clone();
+                let call_result = call_result.clone();
+                async move {
+                    let message: Value = serde_json::from_slice(&body).unwrap();
+                    log.lock().unwrap().push(message.clone());
+                    let id = message.get("id").cloned().unwrap_or(Value::Null);
+                    let result = match message["method"].as_str() {
+                        Some("initialize") => serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {"tools": {}, "resources": {}},
+                            "serverInfo": {"name": "docs", "version": "1"},
+                        }),
+                        Some("notifications/initialized") => return Response::new(Body::empty()),
+                        Some("tools/list") => serde_json::json!({
+                            "tools": [{
+                                "name": "search",
+                                "description": "Search the docs.",
+                                "inputSchema": {"type": "object"},
+                                "_meta": *meta,
+                            }],
+                        }),
+                        Some("tools/call") => (*call_result).clone(),
+                        Some("resources/read") => (*resource).clone(),
+                        _ => Value::Null,
+                    };
+                    Response::builder()
+                        .header(CONTENT_TYPE, "application/json")
+                        .header("mcp-session-id", "session-1")
+                        .body(Body::from(
+                            serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
+                                .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        (format!("http://{address}"), log, task)
+    }
+
+    /// Runs one MCP app call through the socket and returns what the record,
+    /// the fake server, and the fake provider saw.
+    async fn mcp_app_run(
+        running: &Running,
+        socket: &mut Socket,
+        meta: Value,
+        resource: Value,
+    ) -> (
+        Id,
+        Id,
+        Vec<neha::record::Event>,
+        McpLog,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        mcp_app_run_with(
+            running,
+            socket,
+            meta,
+            resource,
+            serde_json::json!({"content": [{"type": "text", "text": "the answer is token-1"}]}),
+            "token-1",
+        )
+        .await
+    }
+
+    /// Runs one MCP app call with a chosen answer and credential.
+    async fn mcp_app_run_with(
+        running: &Running,
+        socket: &mut Socket,
+        meta: Value,
+        resource: Value,
+        call_result: Value,
+        credential: &str,
+    ) -> (
+        Id,
+        Id,
+        Vec<neha::record::Event>,
+        McpLog,
+        std::sync::Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (url, log, server_task) = fake_mcp_app_server(meta, resource, call_result).await;
+        let server = add_mcp_server(socket, "docs", &url, Some(credential)).await;
+        let (base, provider_task, recorded) = scripted_provider_recording(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(socket, Id::new(), provider_add(base)).await;
+        command(socket, Id::new(), CommandCall::BotMcpEnable { bot, server }).await;
+        let queued = submit(socket, chat, "search", None).await;
+        let run = run_of(&queued);
+        wait_status(socket, run, "waiting").await;
+        let approvals = approvals_in(socket, Some(chat)).await;
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(socket, approval, true, true).await;
+        let finished = wait_run(socket, run).await;
+        assert_eq!(finished["status"], "succeeded", "{}", finished["error"]);
+        let events = running
+            .server
+            .store
+            .events_from(Seq::ZERO, 100_000)
+            .await
+            .unwrap()
+            .events;
+
+        (chat, run, events, log, recorded, server_task, provider_task)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_bot_calls_an_mcp_tool_after_one_answer() {
         let (_dir, running, invite) = running().await;
@@ -19772,6 +20412,829 @@ mod tests {
             .filter(|message| message["method"] == "tools/call")
             .count();
         assert_eq!(calls, 2, "the rule let the second call through");
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_app_tool_records_its_card_and_html() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let html = "<!doctype html><html><body><script>const token = 'token-1';</script>the app</body></html>";
+        let (chat, run, events, log, recorded, server_task, provider_task) = mcp_app_run(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": html,
+                }],
+            }),
+        )
+        .await;
+
+        // Exactly one File holds the HTML, and exactly one Bot Message carries
+        // the Card that shows it in the Chat.
+        let files: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| event.kind == EventKind::FileAdded)
+            .collect();
+        let carded: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::MessageAdded && event.data.get("card").is_some()
+            })
+            .collect();
+        assert_eq!(files.len(), 1, "the app's HTML is one File");
+        assert_eq!(carded.len(), 1, "exactly one Card is recorded");
+        let card = &carded[0].data["card"];
+        assert_eq!(card["kind"], "app");
+        let file: Id = serde_json::from_value(card["file"].clone()).unwrap();
+        assert_eq!(files[0].data["file"], json!(file));
+        assert_eq!(files[0].data["chat"], json!(chat));
+        assert_eq!(files[0].data["name"], json!("search-app.html"));
+        assert_eq!(
+            files[0].data["media_type"],
+            json!(crate::mcp::APP_MIME_TYPE)
+        );
+        assert_eq!(staged_blob_count(&running), 1, "only the HTML is stored");
+
+        // The Card names the arguments and the raw tool result, and the policy
+        // a client applies when the resource declares none.
+        assert_eq!(card["input"], json!({"query": "hi"}));
+        assert_eq!(
+            card["result"],
+            json!({"content": [{"type": "text", "text": "the answer is [redacted]"}]})
+        );
+        assert_eq!(card["csp"], json!(crate::mcp::DEFAULT_APP_CSP));
+
+        // The stored HTML is the resource's, passed through the same
+        // redaction as every other answer.
+        let sha256: String = serde_json::from_value(files[0].data["sha256"].clone()).unwrap();
+        let bytes = running.server.blobs.get(&sha256).await.unwrap();
+        assert_eq!(crate::blobs::digest(&bytes), sha256);
+        let stored = String::from_utf8(bytes).unwrap();
+        assert!(stored.contains("the app"));
+        assert!(!stored.contains("token-1"), "{stored}");
+        assert!(stored.contains("[redacted]"));
+        assert!(
+            !serde_json::to_string(card).unwrap().contains("token-1"),
+            "the Card never carries the credential"
+        );
+
+        // The client reads the Card on the Chat's Message.
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        let shown: Vec<&Value> = messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["card"].is_object())
+            .collect();
+        assert_eq!(shown.len(), 1, "the Chat lists the Card's Message");
+        assert_eq!(shown[0]["author"]["kind"], json!("bot"));
+        assert_eq!(shown[0]["text"], json!(""));
+        assert_eq!(shown[0]["card"], card.clone());
+        assert_eq!(shown[0]["card"]["file"], json!(file));
+
+        // The Model still reads the tool's text, and never sees the app.
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2, "the Model is asked again after the tool");
+            let body = requests[1].to_string();
+            assert!(
+                body.contains("the answer is [redacted]"),
+                "the model reads the plain text answer: {body}"
+            );
+            assert!(
+                !body.contains("<html"),
+                "the app's HTML never reaches the model"
+            );
+            assert!(!body.contains("token-1"));
+        }
+        // The app is read once, by the client the call used.
+        {
+            let seen = log.lock().unwrap();
+            let reads: Vec<&Value> = seen
+                .iter()
+                .filter(|message| message["method"] == "resources/read")
+                .collect();
+            assert_eq!(reads.len(), 1, "one app read per call");
+            assert_eq!(reads[0]["params"], json!({"uri": "ui://docs/search"}));
+            assert!(
+                finished_action_output(&events, run).contains("the answer is [redacted]"),
+                "the action result is the tool's text as before"
+            );
+        }
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    /// Returns what one finished action of a run answered.
+    fn finished_action_output(events: &[neha::record::Event], run: Id) -> String {
+        finished_action(events, run)["output"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// Returns the one finished action's data of a run.
+    fn finished_action(events: &[neha::record::Event], run: Id) -> &Value {
+        events
+            .iter()
+            .find(|event| {
+                event.kind == EventKind::ActionFinished && event.data["run"] == json!(run)
+            })
+            .map(|event| &event.data)
+            .expect("the run finished one action")
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_app_with_a_wrong_media_type_records_no_card() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        let (chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html",
+                    "text": "<html>not an MCP App</html>",
+                }],
+            }),
+        )
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "a resource of the wrong type stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "a resource of the wrong type records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "a refused app leaves no orphaned bytes"
+        );
+        // The Model reads the plain text result, unchanged: the presentation
+        // failure rides the action's non-model field instead.
+        let output = finished_action_output(&events, run);
+        assert_eq!(output, "the answer is [redacted]", "{output}");
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("succeeded"));
+        assert!(
+            action["error"]
+                .as_str()
+                .is_some_and(|error| error == "the MCP server's app is not an MCP App"),
+            "the presentation failure is reported separately: {}",
+            action["error"]
+        );
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert!(
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| !message["card"].is_object())
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_oversized_mcp_app_records_no_card() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        // An answer over the cap never becomes a File or a Card.
+        let padding = "a".repeat(crate::mcp::MAX_ANSWER_BYTES + 1);
+        let (_chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": padding,
+                }],
+            }),
+        )
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "an oversized app stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "an oversized app records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "an oversized app leaves no orphaned bytes"
+        );
+        // The Model reads the plain text result; the refused app is reported
+        // on the action's non-model field.
+        let output = finished_action_output(&events, run);
+        assert_eq!(output, "the answer is [redacted]", "{output}");
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("succeeded"));
+        assert!(
+            action["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("the server's answer is too large")),
+            "the action reports the refused app separately: {}",
+            action["error"]
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_app_is_not_staged_when_the_answer_is_refused() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        // A decoded image carries the credential, so the call refuses the
+        // whole answer. The tool declares a perfectly good app: a Card staged
+        // before the refusal would enter the record with the refused result.
+        let image = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+        let (chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": "<html>the app</html>",
+                }],
+            }),
+            json!({"content": [{
+                "type": "image",
+                "mimeType": "image/png",
+                "data": image,
+            }]}),
+            "token-1",
+        )
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "a refused answer stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "a refused answer records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "a refused answer leaves no orphaned app bytes"
+        );
+        // The record holds no base64 of the image, nor the credential.
+        let record = serde_json::to_string(
+            &events
+                .iter()
+                .map(|event| event.data.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            !record.contains(&image),
+            "the image bytes never enter the record"
+        );
+        assert!(
+            !record.contains("token-1"),
+            "the credential never enters the record"
+        );
+        // The action itself failed with the refusal the Model reads.
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("failed"));
+        assert!(
+            action["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("carried its credential")),
+            "{}",
+            action["output"]
+        );
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert!(
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| !message["card"].is_object())
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_resource_blob_that_hides_the_credential_records_nothing() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        // The answer embeds a resource whose base64 payload decodes to the
+        // credential. The literal token does not appear in the block, so only
+        // decoding the blob can find it: the answer must be refused before any
+        // File or Card is staged.
+        let blob = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+        let (chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": "<html>the app</html>",
+                }],
+            }),
+            json!({"content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///data.bin",
+                    "mimeType": "application/octet-stream",
+                    "blob": blob,
+                },
+            }]}),
+            "token-1",
+        )
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "a refused answer stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "a refused answer records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "a refused answer leaves no orphaned app bytes"
+        );
+        // Neither the encoded blob nor the credential reaches the record.
+        let record = serde_json::to_string(
+            &events
+                .iter()
+                .map(|event| event.data.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!record.contains(&blob), "the blob never enters the record");
+        assert!(
+            !record.contains("token-1"),
+            "the credential never enters the record"
+        );
+        // The action itself failed with the refusal the Model reads.
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("failed"));
+        assert!(
+            action["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("carried its credential")),
+            "{}",
+            action["output"]
+        );
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert!(
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| !message["card"].is_object())
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_audio_block_that_hides_the_credential_records_nothing() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        // An audio block's base64 payload spells nothing the literal redaction
+        // could see: only decoding it finds the credential. The answer must be
+        // refused before the app's File, the Card, or the action's output is
+        // staged, and neither the payload nor the credential may reach the
+        // record or the Model.
+        let audio = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+        let (chat, run, events, _log, recorded, server_task, provider_task) = mcp_app_run_with(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": "<html>the app</html>",
+                }],
+            }),
+            json!({"content": [{
+                "type": "audio",
+                "mimeType": "audio/wav",
+                "data": audio,
+            }]}),
+            "token-1",
+        )
+        .await;
+
+        // The refused answer stages no File, no Card, and no audio File.
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "a refused answer stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "a refused answer records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "a refused answer leaves no orphaned app bytes"
+        );
+        // Neither the base64 audio nor the credential reaches the record.
+        let record = serde_json::to_string(
+            &events
+                .iter()
+                .map(|event| event.data.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            !record.contains(&audio),
+            "the audio bytes never enter the record"
+        );
+        assert!(
+            !record.contains("token-1"),
+            "the credential never enters the record"
+        );
+        // The action failed with the one refusal the Model reads, and the
+        // Model reads neither the audio nor the credential.
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("failed"));
+        assert!(
+            action["output"]
+                .as_str()
+                .is_some_and(|output| output.contains("carried its credential")),
+            "{}",
+            action["output"]
+        );
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2, "the Model is asked again after the tool");
+            let body = requests[1].to_string();
+            assert!(!body.contains(&audio), "the audio never reaches the Model");
+            assert!(
+                !body.contains("token-1"),
+                "the credential never reaches the Model"
+            );
+            assert!(body.contains("carried its credential"), "{body}");
+        }
+        let messages = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ChatRead { chat, from: None },
+        )
+        .await;
+        assert!(
+            messages
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|message| !message["card"].is_object())
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_app_card_refuses_a_credential_hidden_in_its_result() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        // The visible answer is redacted, but the raw result hides the
+        // credential in a base64 payload. The action's own result may stand;
+        // the Card that would carry the raw result must not.
+        let hidden = base64::engine::general_purpose::STANDARD.encode(b"token-1");
+        let (_chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": "<html>the app</html>",
+                }],
+            }),
+            json!({
+                "content": [{"type": "text", "text": "the answer is token-1"}],
+                "structuredContent": {"payload": hidden},
+            }),
+            "token-1",
+        )
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "a Card that cannot keep the credential out stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "a Card that cannot keep the credential out records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "the refused Card leaves no orphaned app bytes"
+        );
+        let record = serde_json::to_string(
+            &events
+                .iter()
+                .map(|event| event.data.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            !record.contains(&hidden),
+            "the hidden payload never enters the record"
+        );
+        assert!(
+            !record.contains("token-1"),
+            "the credential never enters the record"
+        );
+        // The action result survives; the refused Card is reported separately.
+        assert_eq!(
+            finished_action_output(&events, run),
+            "the answer is [redacted]"
+        );
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("succeeded"));
+        assert!(
+            action["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("cannot keep its credential out of a Card")),
+            "the refused Card is reported separately: {}",
+            action["error"]
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_apps_policy_never_stores_the_credential() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        // The credential appears inside a declared hostname. The composed
+        // policy is stored in the record, so that origin must be dropped.
+        let (_chat, _run, events, _log, _recorded, server_task, provider_task) = mcp_app_run(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": "<html>the app</html>",
+                    "_meta": {"ui": {"csp": {
+                        "connectDomains": [
+                            "https://token-1.example",
+                            "https://good.example",
+                        ],
+                    }}},
+                }],
+            }),
+        )
+        .await;
+
+        let carded: Vec<&neha::record::Event> = events
+            .iter()
+            .filter(|event| {
+                event.kind == EventKind::MessageAdded && event.data.get("card").is_some()
+            })
+            .collect();
+        assert_eq!(carded.len(), 1, "the app is recorded");
+        let csp = carded[0].data["card"]["csp"]
+            .as_str()
+            .expect("the Card carries its policy");
+        assert!(csp.contains("https://good.example"), "{csp}");
+        assert!(!csp.contains("token-1"), "{csp}");
+        let record = serde_json::to_string(
+            &events
+                .iter()
+                .map(|event| event.data.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            !record.contains("token-1"),
+            "the record never holds the credential"
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_app_whose_redaction_outgrows_a_file_records_no_card() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let before = staged_blob_count(&running);
+        // A short credential repeated often enough grows past the File bound
+        // when it is redacted. The Space must bound the redacted bytes, not
+        // the server's: a File the record would refuse must never be staged.
+        let html = "xy".repeat(3_500_000);
+        let (_chat, run, events, _log, _recorded, server_task, provider_task) = mcp_app_run_with(
+            &running,
+            &mut socket,
+            json!({"ui": {"resourceUri": "ui://docs/search"}}),
+            json!({
+                "contents": [{
+                    "uri": "ui://docs/search",
+                    "mimeType": "text/html;profile=mcp-app",
+                    "text": html,
+                }],
+            }),
+            json!({"content": [{"type": "text", "text": "the answer"}]}),
+            "xy",
+        )
+        .await;
+
+        assert!(
+            events
+                .iter()
+                .all(|event| event.kind != EventKind::FileAdded),
+            "an app whose redacted HTML outgrows a File stores no File"
+        );
+        assert!(
+            events.iter().all(|event| {
+                event.kind != EventKind::MessageAdded || event.data.get("card").is_none()
+            }),
+            "an app whose redacted HTML outgrows a File records no Card"
+        );
+        assert_eq!(
+            staged_blob_count(&running),
+            before,
+            "the over-bound app is never stored"
+        );
+        // The action result survives, and the presentation failure is
+        // reported outside the Model's text.
+        assert_eq!(finished_action_output(&events, run), "the answer");
+        let action = finished_action(&events, run);
+        assert_eq!(action["status"], json!("succeeded"));
+        assert!(
+            action["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("too large")),
+            "the over-bound app is reported separately: {}",
+            action["error"]
+        );
+
+        socket.close(None).await.unwrap();
+        provider_task.abort();
+        server_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_mcp_resource_block_reaches_the_model_with_its_metadata() {
+        let (_dir, running, invite) = running().await;
+        let (mut socket, _token) = admin(&running, &invite).await;
+        let (url, _log, server_task) = fake_mcp_server(|_call| {
+            json!({"content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///report.txt",
+                    "mimeType": "text/plain",
+                    "text": "report body",
+                    "annotations": [{"audience": ["user"], "priority": 0.5}],
+                    "_meta": {"ui": {"annotations": {"audience": ["user"]}}},
+                },
+            }]})
+        })
+        .await;
+        let server = add_mcp_server(&mut socket, "docs", &url, Some("token-1")).await;
+        let (base, provider_task, recorded) = scripted_provider_recording(vec![
+            tool("mcp__docs__search", json!({"query": "hi"})),
+            text("done"),
+        ])
+        .await;
+        let created = command(&mut socket, Id::new(), add_bot("Scout", None)).await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMcpEnable { bot, server },
+        )
+        .await;
+        let queued = submit(&mut socket, chat, "search", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "waiting").await;
+        let approvals = approvals_in(&mut socket, Some(chat)).await;
+        let approval: Id = serde_json::from_value(approvals[0]["approval"].clone()).unwrap();
+        decide_approval(&mut socket, approval, true, false).await;
+        assert_eq!(wait_run(&mut socket, run).await["status"], "succeeded");
+
+        // The Model reads the block the server sent, annotations and `_meta`
+        // included, rather than a reduced object this Space rebuilt.
+        {
+            let requests = recorded.lock().unwrap();
+            assert_eq!(requests.len(), 2, "the Model is asked again after the tool");
+            let body = requests[1].to_string();
+            assert!(body.contains("report body"), "{body}");
+            assert!(
+                body.contains("annotations") && body.contains("priority"),
+                "the block's annotations reach the Model: {body}"
+            );
+            assert!(
+                body.contains("_meta"),
+                "the block's metadata reaches the Model: {body}"
+            );
+        }
+
         socket.close(None).await.unwrap();
         provider_task.abort();
         server_task.abort();

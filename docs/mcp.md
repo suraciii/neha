@@ -87,3 +87,11 @@ Text enters the answer as text, an image as a File in the Chat, and anything
 else as JSON text. A server that fails to answer leaves its tools out of the
 run and the other servers and skills usable; a call to a server with no
 credential answers that it is not connected and sends no request.
+
+A tool may declare an MCP App: a `ui://` resource that the Space reads when
+the tool runs, stores as a File in the Chat, and records as an `app` card on
+the Bot's message. The browser renders it in a frame that shares no origin
+with the Space, under the server's content-security policy (or a restrictive
+default when it declares none), and relays the app's messages into the Chat
+and its links through the browser. The app cannot reach the Space's session
+or a credential, and the Model still receives the tool's text result.

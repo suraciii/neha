@@ -341,9 +341,9 @@ pub struct Event {
 #[cfg(test)]
 mod tests {
     use super::{
-        Author, BotMoved, ComputerKind, EventData, EventDataError, EventDraft, EventKind,
-        FileAdded, FileError, McpScope, McpServerAdded, RunAccess, RunQueued, SkillAdded,
-        SkillLibrary, SkillScript,
+        APP_CARD_KIND, Author, BotMoved, CardData, ComputerKind, EventData, EventDataError,
+        EventDraft, EventKind, FileAdded, FileError, MAX_CARD_CSP_BYTES, MAX_CARD_VALUE_BYTES,
+        McpScope, McpServerAdded, RunAccess, RunQueued, SkillAdded, SkillLibrary, SkillScript,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
@@ -897,12 +897,184 @@ mod tests {
         };
         assert_eq!(data.file, Some(file));
 
+        // A record written before a Message could carry a Card still decodes.
         let plain = serde_json::json!({"message": Id::new(), "chat": chat, "text": "hi"});
         let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&plain).unwrap() else {
             panic!("expected a Message");
         };
         assert_eq!(data.file, None);
+        assert_eq!(data.card, None);
     }
+
+    fn app_card(file: Id) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "app",
+            "file": file,
+            "input": {"query": "hi"},
+            "result": {"content": [{"type": "text", "text": "the answer"}]},
+            "csp": "default-src 'none'; connect-src https://example.com",
+        })
+    }
+
+    #[test]
+    fn a_message_may_carry_an_app_card() {
+        let chat = Id::new();
+        let file = Id::new();
+        let value = serde_json::json!({
+            "message": Id::new(),
+            "chat": chat,
+            "text": "",
+            "card": app_card(file),
+        });
+
+        let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&value).unwrap() else {
+            panic!("expected a Message");
+        };
+        let card = data.card.as_ref().expect("the Message carries its Card");
+        assert_eq!(card.kind, APP_CARD_KIND);
+        assert_eq!(card.file, Some(file));
+        assert_eq!(card.input, Some(serde_json::json!({"query": "hi"})));
+        assert_eq!(
+            card.result,
+            Some(serde_json::json!({"content": [{"type": "text", "text": "the answer"}]}))
+        );
+        assert!(card.csp.is_some());
+        // A Card of a kind this build does not know still decodes with its
+        // fields, so a newer Space's Card replays instead of corrupting the
+        // record; a client shows a placeholder.
+        let unknown = serde_json::json!({
+            "message": Id::new(),
+            "chat": chat,
+            "text": "",
+            "card": {
+                "kind": "future",
+                "file": Id::new(),
+                "input": {"query": "hi"},
+                "result": [1, 2],
+                "csp": "default-src 'none'",
+            },
+        });
+        let EventData::MessageAdded(data) = EventKind::MessageAdded.decode(&unknown).unwrap()
+        else {
+            panic!("expected a Message");
+        };
+        let card = data.card.as_ref().expect("the Message carries its Card");
+        assert_eq!(card.kind, "future");
+        assert_eq!(card.input, Some(serde_json::json!({"query": "hi"})));
+    }
+
+    #[test]
+    fn a_card_keeps_the_bounds_a_space_accepts() {
+        let file = Id::new();
+        let decoded = |card: serde_json::Value| {
+            EventKind::MessageAdded.decode(&serde_json::json!({
+                "message": Id::new(),
+                "chat": Id::new(),
+                "text": "",
+                "card": card,
+            }))
+        };
+
+        let fit = CardData {
+            kind: APP_CARD_KIND.to_owned(),
+            file: Some(file),
+            input: Some(serde_json::json!([1, 2])),
+            result: Some(serde_json::Value::Null),
+            csp: Some("default-src 'none'".to_owned()),
+        };
+        assert!(fit.validate().is_ok());
+
+        // An app Card names the File that holds its HTML.
+        let mut no_file = fit.clone();
+        no_file.file = None;
+        assert!(no_file.validate().is_err());
+
+        // A kind this build does not know keeps its fields as bounded opaque
+        // data, so a newer Space's Card replays instead of a reader reporting
+        // the record corrupt. The same bounds apply to those fields.
+        let future = serde_json::json!({
+            "kind": "future",
+            "file": file,
+            "input": {"query": "hi"},
+            "result": [1, 2],
+            "csp": "default-src 'none'",
+        });
+        let EventData::MessageAdded(data) = decoded(future).unwrap() else {
+            panic!("expected a Message");
+        };
+        let card = data.card.as_ref().expect("the Message carries its Card");
+        assert_eq!(card.kind, "future");
+        assert_eq!(card.file, Some(file));
+        assert_eq!(card.csp.as_deref(), Some("default-src 'none'"));
+        assert!(
+            decoded(serde_json::json!({"kind": "future", "input": "text"})).is_err(),
+            "a Card's input is an object, an array, or null whatever its kind"
+        );
+        assert!(
+            decoded(serde_json::json!({
+                "kind": "future",
+                "result": {"padding": "a".repeat(MAX_CARD_VALUE_BYTES)},
+            }))
+            .is_err(),
+            "an unknown kind's payload is bounded"
+        );
+        assert!(
+            decoded(serde_json::json!({
+                "kind": "future",
+                "csp": "a".repeat(MAX_CARD_CSP_BYTES + 1),
+            }))
+            .is_err(),
+            "an unknown kind's policy is bounded"
+        );
+
+        // An input or result is an object, an array, or null.
+        for value in [
+            serde_json::json!("text"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+        ] {
+            let mut card = fit.clone();
+            card.input = Some(value.clone());
+            assert!(card.validate().is_err(), "{value}");
+            let mut card = fit.clone();
+            card.result = Some(value);
+            assert!(card.validate().is_err());
+        }
+
+        // A value over the bound is refused.
+        let large = serde_json::json!({"padding": "a".repeat(MAX_CARD_VALUE_BYTES)});
+        let mut card = fit.clone();
+        card.result = Some(large.clone());
+        assert!(card.validate().is_err());
+        assert!(
+            decoded(serde_json::json!({
+                "kind": "app",
+                "file": file,
+                "result": large,
+            }))
+            .is_err()
+        );
+
+        // A policy is printable ASCII within the bound.
+        for csp in [
+            "a\nb".to_owned(),
+            "é".to_owned(),
+            "a".repeat(MAX_CARD_CSP_BYTES + 1),
+        ] {
+            let mut card = fit.clone();
+            card.csp = Some(csp.clone());
+            assert!(card.validate().is_err(), "{csp:?}");
+        }
+        let mut edge = fit.clone();
+        edge.csp = Some("a".repeat(MAX_CARD_CSP_BYTES));
+        assert!(edge.validate().is_ok());
+
+        // An unknown field on the card itself is refused.
+        let mut extra = app_card(file);
+        extra["text"] = serde_json::json!("no");
+        assert!(decoded(extra).is_err());
+    }
+
     fn computer_created_data(kind: &str) -> serde_json::Value {
         serde_json::json!({
             "computer": Id::new(),
@@ -1251,7 +1423,11 @@ impl EventKind {
             Self::BotUpdated => EventData::BotUpdated(decode(data)?),
             Self::ComputerCreated => EventData::ComputerCreated(decode(data)?),
             Self::ChatCreated => EventData::ChatCreated(decode(data)?),
-            Self::MessageAdded => EventData::MessageAdded(decode(data)?),
+            Self::MessageAdded => {
+                let data: MessageAdded = decode(data)?;
+                data.validate()?;
+                EventData::MessageAdded(data)
+            }
             Self::FileAdded => {
                 let data: FileAdded = decode(data)?;
                 data.validate()?;
@@ -1630,10 +1806,110 @@ pub struct MessageAdded {
     /// The run it belongs to.
     #[serde(default)]
     pub run: Option<Id>,
+    /// The Card it carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardData>,
+}
+
+impl MessageAdded {
+    /// Checks the Card a Message carries fits what a Space accepts.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if let Some(card) = &self.card {
+            card.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+/// The kind of Card an MCP tool's app makes.
+pub const APP_CARD_KIND: &str = "app";
+
+/// The largest JSON a Card carries for its input or its result.
+pub const MAX_CARD_VALUE_BYTES: usize = 64 * 1024;
+
+/// The largest Content Security Policy a Card carries.
+pub const MAX_CARD_CSP_BYTES: usize = 2 * 1024;
+
+/// A Card a Message shows after its text.
+///
+/// A Card's kind picks the fields it takes: an `app` Card names the File that
+/// holds its HTML and carries the tool's input and result, while a kind this
+/// build does not know keeps its fields as bounded opaque data, so a client
+/// shows a placeholder and a reader still replays the record.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CardData {
+    /// The Card's kind.
+    pub kind: String,
+    /// The File that holds an `app` Card's HTML.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<Id>,
+    /// The tool arguments an `app` Card shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    /// The tool result an `app` Card shows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// The Content Security Policy a client applies to an `app` Card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub csp: Option<String>,
+}
+
+impl CardData {
+    /// Checks the fields a Card's kind takes before the record holds them.
+    ///
+    /// An `app` Card must name the File that holds its HTML. A kind this build
+    /// does not know is kept as opaque bounded data, so a reader replays a Card
+    /// a newer Space wrote instead of reporting the whole record corrupt.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        if self.kind == APP_CARD_KIND && self.file.is_none() {
+            return Err(EventDataError::Data(
+                "an app Card must carry the File that holds its HTML".to_owned(),
+            ));
+        }
+        for (what, value) in [("input", &self.input), ("result", &self.result)] {
+            let Some(value) = value else {
+                continue;
+            };
+            if !matches!(
+                value,
+                serde_json::Value::Object(_)
+                    | serde_json::Value::Array(_)
+                    | serde_json::Value::Null
+            ) {
+                return Err(EventDataError::Data(format!(
+                    "a Card's {what} must be an object, an array, or null"
+                )));
+            }
+            let length = serde_json::to_vec(value)
+                .map_err(|error| EventDataError::Data(error.to_string()))?
+                .len();
+            if length > MAX_CARD_VALUE_BYTES {
+                return Err(EventDataError::Data(format!(
+                    "a Card's {what} must be at most {} KiB",
+                    MAX_CARD_VALUE_BYTES / 1024
+                )));
+            }
+        }
+        if let Some(csp) = &self.csp
+            && (csp.len() > MAX_CARD_CSP_BYTES
+                || !csp
+                    .bytes()
+                    .all(|byte| byte.is_ascii_graphic() || byte == b' '))
+        {
+            return Err(EventDataError::Data(format!(
+                "a Card's policy must be at most {} KiB of printable ASCII",
+                MAX_CARD_CSP_BYTES / 1024
+            )));
+        }
+
+        Ok(())
+    }
 }
 
 /// The largest name a File carries.
-const MAX_FILE_NAME_BYTES: usize = 255;
+pub const MAX_FILE_NAME_BYTES: usize = 255;
 /// The largest media type a File carries.
 const MAX_MEDIA_TYPE_BYTES: usize = 127;
 

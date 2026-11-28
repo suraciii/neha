@@ -124,6 +124,21 @@ export interface Author {
   id: string;
 }
 
+// An interactive Card a tool's result carries, as the Space records it. The
+// client renders a Card of kind "app" in a frame that shares no origin with
+// the Space; a Card of any other kind shows a placeholder.
+export interface Card {
+  kind: string;
+  // The File that holds the Card's HTML.
+  file?: string | null;
+  // What the tool was called with.
+  input?: unknown;
+  // What the tool answered.
+  result?: unknown;
+  // The Content-Security-Policy the Card asks for; absent uses the client's.
+  csp?: string | null;
+}
+
 export interface Message {
   id: string;
   chat: string;
@@ -134,6 +149,8 @@ export interface Message {
   seq: string;
   run: string | null;
   file: string | null;
+  // The Card the Message shows after its text, when a tool's result carried one.
+  card?: Card | null;
 }
 
 // One File as the client reads it.
@@ -309,7 +326,7 @@ export interface RunActivity {
   error: string | null;
 }
 
-export type Preview = { text: string; file: boolean } | { error: true } | null;
+export type Preview = { text: string; file: boolean; card?: boolean } | { error: true } | null;
 
 // One recorded event as the subscription carries it.
 export interface RecordEvent {

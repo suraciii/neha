@@ -13,8 +13,8 @@ use rand::Rng as _;
 
 use neha::id::Id;
 use neha::record::{
-    ActionStatus, ApprovalReason, Author, Event, EventData, FULL_ACCESS_CONSENT_VERSION, McpScope,
-    RuleEffect, RunReply, SkillLibrary, Undoability,
+    ActionStatus, ApprovalReason, Author, CardData, Event, EventData, FULL_ACCESS_CONSENT_VERSION,
+    McpScope, RuleEffect, RunReply, SkillLibrary, Undoability,
 };
 use neha::seq::Seq;
 use neha::time::Timestamp;
@@ -343,6 +343,9 @@ pub struct MessageView {
     pub text: String,
     /// The File it carries.
     pub file: Option<Id>,
+    /// The Card it shows after its text, when a tool's answer carried one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub card: Option<CardData>,
     /// When the Space recorded it.
     pub at: Timestamp,
     /// Its cursor.
@@ -1038,6 +1041,7 @@ impl State {
         self.messages
             .iter()
             .filter(|message| message.chat == chat && message.seq <= until)
+            .filter(|message| speaks_to_the_model(message))
             .map(|message| (message.author, self.model_text(message)))
             .collect()
     }
@@ -1045,12 +1049,14 @@ impl State {
     /// Builds the Model history for a Chat, oldest first.
     ///
     /// A Message that carries a File ends with a line that names the File, so
-    /// the Model can take it into its Workspace.
+    /// the Model can take it into its Workspace. A Message that carries only
+    /// a Card says nothing the Model could read, so it is left out.
     #[must_use]
     pub fn history(&self, chat: Id) -> Vec<(Author, String)> {
         self.messages
             .iter()
             .filter(|message| message.chat == chat)
+            .filter(|message| speaks_to_the_model(message))
             .map(|message| (message.author, self.model_text(message)))
             .collect()
     }
@@ -1073,6 +1079,15 @@ impl State {
             format!("{}\n\n{line}", message.text)
         }
     }
+}
+
+/// Whether a Message says anything the Model could read.
+///
+/// A Card is presentation. A Message that carries only a Card would become an
+/// empty turn in the Model's history, so the history leaves it out; a Message
+/// with text or a File beside its Card is kept.
+fn speaks_to_the_model(message: &MessageView) -> bool {
+    message.file.is_some() || !message.text.trim().is_empty() || message.card.is_none()
 }
 
 impl Projection for State {
@@ -1285,6 +1300,14 @@ impl Projection for State {
                 {
                     return Err("a Message's File must belong to its Chat".to_owned());
                 }
+                if data
+                    .card
+                    .as_ref()
+                    .and_then(|card| card.file)
+                    .is_some_and(|file| self.file_of(data.chat, file).is_none())
+                {
+                    return Err("a Card's File must belong to its Message's Chat".to_owned());
+                }
                 self.messages.push(MessageView {
                     id: data.message,
                     chat: data.chat,
@@ -1292,6 +1315,7 @@ impl Projection for State {
                     acting: event.acting,
                     text: data.text,
                     file: data.file,
+                    card: data.card,
                     at: event.at,
                     seq: event.seq,
                     run: data.run,
@@ -2573,6 +2597,74 @@ mod tests {
     }
 
     #[test]
+    fn a_card_file_belongs_to_the_message_chat() {
+        let owner = Id::new();
+        let user = Author::User(owner);
+        let (first, second) = (Id::new(), Id::new());
+        let file = Id::new();
+        let mut state = State::default();
+        for (seq, chat) in [(1, first), (2, second)] {
+            state
+                .apply(&event(
+                    EventKind::ChatCreated,
+                    user,
+                    chat_created(chat, owner),
+                    seq,
+                ))
+                .unwrap();
+        }
+        state
+            .apply(&event(
+                EventKind::FileAdded,
+                user,
+                file_added(file, first),
+                3,
+            ))
+            .unwrap();
+        let carded = |seq, chat, card: serde_json::Value| {
+            event(
+                EventKind::MessageAdded,
+                user,
+                serde_json::json!({
+                    "message": Id::new(),
+                    "chat": chat,
+                    "text": "",
+                    "card": card,
+                }),
+                seq,
+            )
+        };
+        let app = |file: Id| serde_json::json!({"kind": "app", "file": file});
+
+        // The File a Card shows belongs to the Chat the Message is in.
+        assert!(state.apply(&carded(4, second, app(file))).is_err());
+        assert!(state.apply(&carded(4, first, app(Id::new()))).is_err());
+        // A kind this build does not know replays with its fields as they
+        // were: the projection renders nothing for it, and a client shows a
+        // placeholder.
+        let future = serde_json::json!({
+            "kind": "future",
+            "file": file,
+            "input": {"query": "hi"},
+            "result": [1, 2],
+            "csp": "default-src 'none'",
+        });
+        state.apply(&carded(4, first, future)).unwrap();
+        state.apply(&carded(5, first, app(file))).unwrap();
+
+        let messages = state.messages_of(first, None);
+        assert_eq!(messages.len(), 2);
+        let future = messages[0].card.as_ref().unwrap();
+        assert_eq!(future.kind, "future");
+        assert_eq!(future.file, Some(file));
+        assert_eq!(future.input, Some(serde_json::json!({"query": "hi"})));
+        assert_eq!(future.result, Some(serde_json::json!([1, 2])));
+        assert_eq!(future.csp.as_deref(), Some("default-src 'none'"));
+        assert_eq!(messages[1].card.as_ref().unwrap().kind, "app");
+        assert_eq!(messages[1].card.as_ref().unwrap().file, Some(file));
+    }
+
+    #[test]
     fn a_file_message_names_the_file_for_the_model() {
         let owner = Id::new();
         let user = Author::User(owner);
@@ -2622,6 +2714,51 @@ mod tests {
                 ),
                 (user, "plain".to_owned()),
             ]
+        );
+    }
+
+    #[test]
+    fn a_card_only_message_is_no_model_turn() {
+        let owner = Id::new();
+        let user = Author::User(owner);
+        let bot = Author::Bot(Id::new());
+        let chat = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                user,
+                chat_created(chat, owner),
+                1,
+            ))
+            .unwrap();
+        let carded = |seq, text: &str| {
+            event(
+                EventKind::MessageAdded,
+                bot,
+                serde_json::json!({
+                    "message": Id::new(),
+                    "chat": chat,
+                    "text": text,
+                    "card": {"kind": "future"},
+                }),
+                seq,
+            )
+        };
+        // The Bot's Card Message is presentation: it would be an empty turn.
+        state.apply(&carded(2, "")).unwrap();
+        // A Message with text beside its Card is a turn like any other.
+        state.apply(&carded(3, "here it is")).unwrap();
+
+        assert_eq!(
+            state.history(chat),
+            vec![(bot, "here it is".to_owned())],
+            "a Card-only Message is no turn the Model reads"
+        );
+        assert_eq!(
+            state.history_until(chat, Seq::from_i64(2).unwrap()),
+            Vec::new(),
+            "a resumed run's history leaves the Card-only Message out too"
         );
     }
 

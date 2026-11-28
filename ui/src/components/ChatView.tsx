@@ -1,6 +1,7 @@
-import { For, Show, createEffect, createSignal } from "solid-js";
+import { For, Show, createEffect, createMemo, createSignal } from "solid-js";
 
 import { locale, t } from "../i18n";
+import { cardFile } from "../lib/cards";
 import { dayLabel, timeOfDay } from "../lib/format";
 import { formatBytes } from "../lib/files";
 import type {
@@ -15,8 +16,10 @@ import type {
   RunProgress,
 } from "../types";
 import ActivityCard from "./ActivityCard";
+import AppCard from "./AppCard";
 import ApprovalCard from "./ApprovalCard";
 import Avatar from "./Avatar";
+import CardPlaceholder from "./CardPlaceholder";
 import FileCard from "./FileCard";
 import Icon from "./Icon";
 
@@ -51,9 +54,76 @@ interface ChatViewProps {
   onSend: (text: string, file: File | null) => Promise<boolean>;
   onDecide: (approval: Approval, allow: boolean, lasting: boolean) => void;
   onBack: () => void;
+  // The reader left this Chat: the view is kept mounted, hidden by the page,
+  // until every app in it answered the host's teardown request (or the page's
+  // bounded wait ends). Its card rows close through the same `closing` path a
+  // Message the Chat retired uses, so no frame is removed before it answers.
+  retiring?: boolean;
+  // The leaving view has no app row left to wait for, so the page may take it —
+  // and the frames inside it — away.
+  onRetired?: () => void;
 }
 
 const suggestions = ["chat.suggestion.hello", "chat.suggestion.work", "chat.suggestion.plan"] as const;
+
+// One row of the Chat's stream. The Message keeps the identity the reads gave
+// it, so a refresh that answers with the same record keeps the row — and the
+// open app's frame inside it — mounted. An app Card's row outlives its Message
+// for the moment the app needs to answer the host's teardown request: the Chat
+// cannot remove the frame's DOM without killing the document, so the row stays
+// in place, hidden, until the app answers or the bounded wait ends.
+interface ChatRow {
+  message: Message;
+  // Plain copies of what the row's bookkeeping needs. The effect phase must not
+  // read a store proxy: a reactive read there is untracked and would never
+  // update, and the Message object is the identity the row renders.
+  id: string;
+  // Whether the row holds an app: only that row has a document whose teardown
+  // the Chat must let finish before the row leaves.
+  app: boolean;
+}
+
+// One Message a snapshot lists, as the stream must show it.
+interface ChatRowSource {
+  message: Message;
+  id: string;
+  app: boolean;
+}
+
+// The rows the stream renders for a snapshot of Messages, reusing the row — and
+// with it the AppCard and the app's document — by Message id. The snapshot's
+// order always wins: a live event may show a later Message before a read
+// supplies an earlier one, and once the authoritative read arrives the earlier
+// Message belongs above the later one, not after it. A row whose Message is gone
+// but whose app has not answered the host's teardown request keeps its place in
+// the stream (or waits after the snapshot's rows), because its frame must stay
+// attached to answer.
+function orderRows(previous: ChatRow[], snapshot: ChatRowSource[]): ChatRow[] {
+  const known = new Map(previous.map((row) => [row.id, row]));
+  const listed = new Set(snapshot.map((entry) => entry.id));
+  const rows = snapshot.map((entry) => {
+    const row = known.get(entry.id);
+    return row && row.message === entry.message && row.app === entry.app
+      ? row
+      : { message: entry.message, id: entry.id, app: entry.app };
+  });
+  const retired = previous.filter((row) => row.app && !listed.has(row.id));
+  if (retired.length === 0) return rows;
+  for (const row of retired) {
+    const at = previous.indexOf(row);
+    let anchor: string | null = null;
+    for (let index = at + 1; index < previous.length; index += 1) {
+      const candidate = previous[index];
+      if (candidate && listed.has(candidate.id)) {
+        anchor = candidate.id;
+        break;
+      }
+    }
+    const position = anchor === null ? -1 : rows.findIndex((entry) => entry.id === anchor);
+    rows.splice(position === -1 ? rows.length : position, 0, row);
+  }
+  return rows;
+}
 
 export default function ChatView(props: ChatViewProps) {
   const [draft, setDraft] = createSignal("");
@@ -61,6 +131,50 @@ export default function ChatView(props: ChatViewProps) {
   let stream: HTMLDivElement | undefined;
   let composer: HTMLTextAreaElement | undefined;
   let picker: HTMLInputElement | undefined;
+
+  // The rows the stream renders. A row follows its Message object: a refresh
+  // that answers with the same record keeps the object, so the row — and the
+  // open app's frame inside it — is not remounted; a changed Message gets a new
+  // row, as it did before. An app Card's row whose Message left the list stays
+  // here until its app answers the host's teardown request (or the bounded wait
+  // ends), hidden and in its place.
+  const [rows, setRows] = createSignal<ChatRow[]>([]);
+  // The Message ids the Chat holds now. A row whose id is gone is being retired:
+  // its app is asked to tear down, and only its own answer lets the row leave.
+  const present = createMemo(() => new Set(props.messages.map((message) => message.id)));
+  const retiring = (row: ChatRow) => row.app && !present().has(row.id);
+
+  createEffect(
+    // The compute phase reads the store's list inside tracking and hands the
+    // effect phase plain values, so the row bookkeeping never touches a proxy.
+    () =>
+      props.messages.map((message) => ({
+        message,
+        id: message.id,
+        app: message.card?.kind === "app",
+      })),
+    (messages) => {
+      // The snapshot's order is the stream's order, while a row that already
+      // shows the same Message keeps its identity — and so does the app's frame
+      // inside it.
+      setRows((previous) => orderRows(previous, messages));
+    },
+  );
+
+  // The app answered the teardown request (or the bounded wait ended), so its
+  // hidden row may finally leave the stream.
+  function removeRow(row: ChatRow) {
+    setRows((previous) => previous.filter((entry) => entry !== row));
+  }
+
+  // A view the page is retiring tells the page once its last app closed: only
+  // then may the view, and the frames inside it, go.
+  createEffect(
+    () => props.retiring === true && !rows().some((row) => row.app),
+    (settled) => {
+      if (settled) props.onRetired?.();
+    },
+  );
 
   createEffect(
     () => ({ count: props.messages.length, status: props.status }),
@@ -210,7 +324,9 @@ export default function ChatView(props: ChatViewProps) {
 
       <div class="chat__stream" ref={stream}>
         <Show
-          when={props.messages.length > 0 || props.approvals.length > 0}
+          // A retired Card's hidden row is still a row: the stream stays while
+          // the app answers the host's teardown request.
+          when={rows().length > 0 || props.approvals.length > 0}
           fallback={
             <div class="chat__empty">
               <Show when={props.bot}>
@@ -239,14 +355,24 @@ export default function ChatView(props: ChatViewProps) {
             </div>
           }
         >
-          <For each={props.messages}>
-            {(message, index) => {
-              const previous = () => props.messages[index() - 1];
+          <For each={rows()}>
+            {(row, index) => {
+              const message = row.message;
+              const previous = () => rows()[index() - 1]?.message;
               const newDay = () =>
                 !previous() || dayLabel(previous()!.at, locale()) !== dayLabel(message.at, locale());
               const isBot = () => message.author.kind === "bot";
+              // The row is kept attached, in its place, while its app answers
+              // the teardown request; it is only hidden, never moved, because a
+              // moved iframe resets the document the app is running in. A view
+              // the page is retiring hides and closes every app row the same
+              // way: the page keeps the frame alive until the app answers.
+              const hidden = () => props.retiring === true || retiring(row);
               return (
-                <>
+                <div
+                  class={hidden() ? "chat-row chat-row--closing" : "chat-row"}
+                  aria-hidden={hidden() ? "true" : undefined}
+                >
                   <Show when={newDay()}>
                     <div class="dayline">
                       <span>{dayLabel(message.at, locale())}</span>
@@ -270,9 +396,27 @@ export default function ChatView(props: ChatViewProps) {
                       <Show when={message.file}>
                         {(id) => <FileCard id={id()} file={props.files[id()] ?? null} />}
                       </Show>
+                      {/* A Message shows its File and its Card side by side;
+                          neither is nested in the other. */}
+                      <Show when={message.card}>
+                        {(card) => (
+                          <Show
+                            when={card().kind === "app"}
+                            fallback={<CardPlaceholder kind={card().kind} />}
+                          >
+                            <AppCard
+                              card={card()}
+                              file={cardFile(props.files, card().file)}
+                              onSend={(text) => props.onSend(text, null)}
+                              closing={hidden()}
+                              onClosed={() => removeRow(row)}
+                            />
+                          </Show>
+                        )}
+                      </Show>
                     </div>
                   </article>
-                </>
+                </div>
               );
             }}
           </For>

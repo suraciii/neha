@@ -50,6 +50,7 @@ export default function Sidebar(props: SidebarProps) {
     const recorded = props.previews[chat.id];
     if (recorded && "text" in recorded) {
       if (recorded.text) return recorded.text;
+      if (recorded.card) return t("sidebar.app");
       return recorded.file ? t("sidebar.file") : "";
     }
     if (recorded && "error" in recorded) return t("sidebar.openChat");
