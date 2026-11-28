@@ -147,7 +147,7 @@ jobs:
         run: cargo check --locked --workspace
 
       - name: Test the Windows runtime
-        run: cargo test --locked -p neha-computer --test windows_shell
+        run: cargo test --locked -p neha-computer --test it
 
   # The workspace promises rust-version 1.94 in Cargo.toml. This job checks that
   # promise with the oldest toolchain the manifest names.

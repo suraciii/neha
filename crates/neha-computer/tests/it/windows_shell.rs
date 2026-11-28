@@ -1,5 +1,4 @@
 //! Native Windows behaviour that the Unix fence tests cannot cover.
-#![cfg(windows)]
 
 use neha_computer::{Action, ActionStatus, ComputerRuntime, LocalRuntime};
 
