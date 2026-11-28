@@ -57,7 +57,7 @@ A caller that names no Presentation kinds reads every kind its protocol version 
 
 A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory and compaction kinds change no right to read, write, act, or approve.
 
-A caller names the capability that admits a later kind, such as `memory`; the command surface defines the capability names and the fixed set of kinds each one admits, as [CLI](../cli/design.md#versions) states. A capability admits no kind added after it was published; a later kind needs a new capability name.
+A caller names the capability that admits a later kind; the command surface defines the capability names and the fixed set of kinds each one admits, as [CLI](../cli/design.md#versions) states. A capability admits no kind added after it was published; a later kind needs a new capability name.
 
 A capable caller still receives only the events its account can see.
 
@@ -122,13 +122,19 @@ The record holds this kind for a compacted conversation:
 
 | Kind | What it records |
 | --- | --- |
-| `neha.chat.compacted` | The Chat or Group, `up_to_seq`, the summary, and the Bot that wrote it |
+| `neha.chat.compacted` | The Chat or Group, `up_to_seq`, the summary text, and the Bot that wrote it |
 
 It is a Presentation event: a reader that does not know the kind skips it and asks for no upgrade.
 
 The event is authored by the Bot with the acting User.
 
-The event marks the span up to `up_to_seq` as compacted, and the record keeps every original Message.
+The event marks the span up to `up_to_seq` as compacted, where `up_to_seq` is the sequence of the last Message the summary includes. The record keeps every original Message.
+
+A Chat's read still returns an array of Messages; the Message at `up_to_seq` carries an optional `compacted` field that defaults to false and is true only there. A reader that does not know the field ignores it and still reads every original Message, and no extra read command is needed.
+
+Each Chat or Group and Bot has zero or one current boundary. A new boundary's `up_to_seq` is greater than the current one's, the projection uses the latest boundary, and the record keeps every compaction event.
+
+A full read, a reload, and a live update show the one mark after the current boundary Message. A read that starts after `up_to_seq` has no boundary Message in its page, so the page carries no mark.
 
 ## Event visibility
 

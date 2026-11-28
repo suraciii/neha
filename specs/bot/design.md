@@ -164,11 +164,13 @@ The system prompt is rebuilt for every request from the entries that apply to th
 
 The prompt states the Bot's job first when the Bot has one, then the other `rule` entries, then the `note` entries under a label that marks them as data, then the skills, then the tool instructions. A Chat where the owner's entries do not apply, and a Group, get no job section.
 
-The Model sees a projection of the record, and the record keeps every original Message. The projection prunes and compacts, and neither writes a Message.
+Before each ordinary run step request, the loop prunes a copy of the request, including its current and replayed tool results. Compaction changes only the projection the Model sees, and the record keeps every original Message. The projection prunes and compacts, and neither writes a Message.
 
 Pruning is a projection step separate from compaction. It treats a tool result as one unit and removes the oldest results from the context first, but the three most recent always stay.
 
-A result beyond the budget becomes a placeholder that names the tool call's id; the body stays in the record, and no File is created for it. A conversation that fits after pruning gets no summary.
+A result beyond the budget becomes a placeholder that names the tool call's id; the body stays in the record, and no File is created for it.
+
+The budget is the input budget of the Model, and the threshold is the estimate that triggers a summary. After pruning, the run checks the threshold; if the post-pruning estimate is below the threshold, the run skips threshold-triggered compaction.
 
 Neha compacts a conversation on one path of its own and does not use a Provider's native compaction. A conversation compacts when its estimate reaches its threshold.
 
@@ -176,15 +178,27 @@ When `window <= max_output + 65536`, the window holds no headroom and the thresh
 
 Otherwise, the threshold is the smaller of 0.8 × the Model's context window and the window minus its maximum output minus 65536 tokens. A Model MAY carry its own threshold.
 
-The estimate starts at the usage the Provider last reported, or at 0 when it reported none. It counts the projection the request will send, so text that pruning or compaction leaves out does not count.
+The estimate starts at the normalized usage of the last ordinary run step request, or at 0 when none applies, plus one token for every four characters added since. Only uncached input, cache reads, and cache writes count, never output.
 
-A Provider error that says the input is too long compacts at most once and retries the request at most once. A conversation with no span to compact is not compacted. A retry that reports the same error ends the run with that error and makes no further attempt.
+When pruning or a summary replaces text that usage covered, the estimate starts over at 0 and counts the whole projection. A flush or a summary request reports usage that never becomes the base.
 
-One silent turn comes before a compaction and writes what the Bot has not written down as `note` entries. The turn uses a private copy of the conversation, writes only `note` entries, posts nothing in the conversation, and is skipped when it fails. A compaction makes at most one such turn.
+A Provider error that says the input is too long compacts the conversation only when a cut is eligible, and at most once. It retries the request at most once, and only when the compaction shortened the input; if the retry reports the same error, the run ends with that error and makes no further attempt.
 
-The cut falls on the oldest balanced span that keeps the most recent 16% of the original text raw, and every tool call stays paired with its result. A conversation with no such cut, or one whose Bot has not replied since the previous summary, does not compact.
+The flush and the summary request never take this recovery path.
 
-The compaction state belongs to one Chat or Group and one Bot. The summary is one separate request to the same Model, with a handoff prompt that adds no instruction to the summary and an output cap of 8192 tokens.
+One silent turn comes before a compaction when a cut is eligible and writes what the Bot has not written down as `note` entries. The turn uses a private copy of the conversation, writes only `note` entries, posts nothing in the conversation, and is skipped when it fails. A compaction makes at most one such turn.
+
+A `note` the flush writes follows the byte limits in [product](product.md#memory) and the same no-change rule for identical text. A capacity refusal to a flush `note` stays in the private turn, adds no Message to the Chat, and consumes the one flush turn; the compaction continues.
+
+The cut falls on the oldest balanced span that keeps the most recent 16% of the original text raw, and every tool call stays paired with its result.
+
+A conversation with no such cut, or one whose Bot has not replied since the previous summary, has no eligible cut. It skips the flush and the summary, and it does not compact.
+
+Before its first ordinary run step request, a run checks the threshold, and the threshold check and the recovery from a too-long error use the same eligible cut.
+
+A run compacts its starting history before that request when the estimate reaches the threshold. The compaction state belongs to one Chat or Group and one Bot.
+
+The summary is one separate request to the same Model, with a handoff prompt that adds no instruction to the summary and an output cap of 8192 tokens.
 
 The summary becomes the record event `neha.chat.compacted`, whose data [Space](../space/design.md#chat-events) owns. It is no Message in the conversation, and the Model sees it and the original text after the cut.
 
