@@ -41,7 +41,7 @@ p256 = { version = "0.14", features = ["ecdh", "ecdsa"] }
 hkdf = "0.12"
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 
 [lints]
 workspace = true
