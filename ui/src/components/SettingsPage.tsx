@@ -1,16 +1,22 @@
-import { createSignal, For, Show } from "solid-js";
+import qrcode from "qrcode-generator";
+import { createMemo, createSignal, For, Show } from "solid-js";
 
 import { locale, type MessageKey, t } from "../i18n";
-import { dayLabel } from "../lib/format";
+import { dayLabel, timeOfDay } from "../lib/format";
+import { reachesOnlyLocally } from "../lib/reach";
 import type {
   Account,
   Bot,
   CatalogStatus,
   CatalogVendor,
   Computer,
+  CreatedInvitation,
+  Invitation,
   Model,
   Provider,
+  Role,
   ThinkingLevel,
+  User,
 } from "../types";
 import Icon from "./Icon";
 import type { SettingsSection } from "./Sidebar";
@@ -28,6 +34,13 @@ const PROTOCOL_LABEL: Record<string, MessageKey> = {
 // How much thought a Model can give, cheapest first.
 const LEVELS: ThinkingLevel[] = ["minimal", "low", "medium", "high", "max"];
 
+// What each role is called in the User's words.
+const ROLE_LABEL: Record<Role, MessageKey> = {
+  owner: "settings.people.role.owner",
+  admin: "settings.people.role.admin",
+  member: "settings.people.role.member",
+};
+
 interface SettingsPageProps {
   account: Account;
   providers: Provider[];
@@ -39,6 +52,11 @@ interface SettingsPageProps {
   // Every vendor the catalog knows that this Space can connect.
   vendors: CatalogVendor[];
   catalog: CatalogStatus | null;
+  // The Space's Users, in the order they joined, and the one invitation that
+  // still admits a User. A Member reads the Users; only the Space Owner and the
+  // Admins read the invitation.
+  users: User[];
+  invitation: Invitation | null;
   section: SettingsSection;
   // A write is on its way to the Space.
   busy: boolean;
@@ -50,6 +68,12 @@ interface SettingsPageProps {
   onShare: (computer: string) => Promise<boolean>;
   // Clears a Hosted Computer's Workspace, once the Admin confirms it.
   onReset: (computer: string) => Promise<boolean>;
+  // Adds a Local Computer whose machine printed a pairing code.
+  onAdd: (code: string) => Promise<boolean>;
+  // Revokes a Local Computer's credential and disconnects its daemon.
+  onRevoke: (computer: string) => Promise<boolean>;
+  // Approves a CLI's device code, signing that terminal in as this account.
+  onApproveDevice: (code: string) => Promise<boolean>;
   // Opens one Bot's page from a Computer that has Bots on it.
   onOpenBot: (bot: Bot) => void;
   onConnect: (input: {
@@ -62,6 +86,56 @@ interface SettingsPageProps {
   onRefresh: (provider: string) => Promise<boolean>;
   onDefault: (model: string) => Promise<boolean>;
   onCatalog: () => Promise<boolean>;
+  // Makes an invitation and answers it once, so its link and QR code show in
+  // the panel that creates them. The Space never reads the link back.
+  onInvite: () => Promise<CreatedInvitation | null>;
+  // Revokes the pending invitation.
+  onRevokeInvitation: (invitation: string) => Promise<boolean>;
+  // Changes another User's role; only the Space Owner may.
+  onSetRole: (user: string, role: "admin" | "member") => Promise<boolean>;
+  // Gives the Space to another User; only the Space Owner may.
+  onTransfer: (user: string) => Promise<boolean>;
+}
+
+// What each role is called in the User's words.
+function roleLabel(role: Role): string {
+  return t(ROLE_LABEL[role]);
+}
+
+// The invitation link as a QR code, drawn from the code's own module grid. The
+// SVG keeps the light ground and the quiet zone a scanner expects, and the
+// modules stay crisp at any size.
+function InvitationQr(props: { link: string }) {
+  const code = createMemo(() => {
+    const qr = qrcode(0, "M");
+    qr.addData(props.link);
+    qr.make();
+    const count = qr.getModuleCount();
+    // The quiet zone around the grid, in modules, keeps a camera's finder
+    // pattern clear of the page behind the code.
+    const quiet = 4;
+    const modules: string[] = [];
+    for (let row = 0; row < count; row += 1) {
+      for (let col = 0; col < count; col += 1) {
+        if (qr.isDark(row, col)) modules.push(`M${col + quiet} ${row + quiet}h1v1h-1z`);
+      }
+    }
+    return { size: count + quiet * 2, path: modules.join("") };
+  });
+  return (
+    <svg
+      class="invite__qr"
+      role="img"
+      aria-label={t("settings.people.qr")}
+      viewBox={`0 0 ${code().size} ${code().size}`}
+      width="200"
+      height="200"
+      shape-rendering="crispEdges"
+    >
+      <rect class="invite__qr-ground" width={code().size} height={code().size} />
+      <path class="invite__qr-modules" d={code().path} />
+    </svg>
+  );
 }
 
 // Where a Model comes from, which is the base URL of its Provider.
@@ -149,6 +223,16 @@ export default function SettingsPage(props: SettingsPageProps) {
   const [advanced, setAdvanced] = createSignal(false);
   // What the last accepted change did, so a quiet write still answers.
   const [note, setNote] = createSignal<string | null>(null);
+  // The invitation this page last made, with the secret it showed. The Space
+  // answers a create once, so the page keeps the link only until a reload or
+  // the next create, which replaces it.
+  const [created, setCreated] = createSignal<CreatedInvitation | null>(null);
+  const [copied, setCopied] = createSignal(false);
+  // The invitation whose revoke the Owner or an Admin armed with a first press,
+  // and the User a transfer was armed for. Deleting and transferring change who
+  // the Space is, so both ask twice.
+  const [armedRevoke, setArmedRevoke] = createSignal<string | null>(null);
+  const [armedTransfer, setArmedTransfer] = createSignal<string | null>(null);
 
   const canConnect = () =>
     props.account.is_admin && !props.busy && vendor() !== "" && apiKey() !== "";
@@ -203,6 +287,95 @@ export default function SettingsPage(props: SettingsPageProps) {
     if (await props.onCatalog()) setNote(t("settings.catalog.updated"));
   }
 
+  async function approveDevice() {
+    if (props.busy || deviceCode().trim() === "") return;
+    setNote(null);
+    if (await props.onApproveDevice(deviceCode().trim())) {
+      setDeviceCode("");
+      setNote(t("settings.devices.approved"));
+    }
+  }
+
+  // What the signed-in account may do here: the Space Owner and the Admins make
+  // and revoke invitations, and only the Space Owner changes a role or
+  // transfers the Space.
+  const administers = () => props.account.is_admin;
+  const owns = () => props.account.role === "owner";
+  // The one-time link the page last created. A second create replaces it, a
+  // reload forgets it, and a revoke or a used invitation takes it away: the
+  // link only lives while it is the pending invitation.
+  const createdLink = () => {
+    const answer = created();
+    if (answer === null || typeof answer.secret !== "string") return null;
+    if (props.invitation?.id !== answer.invitation.id) return null;
+    return `${location.origin}/invite#${answer.secret}`;
+  };
+  // A Local Space's link reaches only the devices that can reach this machine.
+  const localReach = () => reachesOnlyLocally(location.hostname);
+  // When the pending invitation stops working, in the reader's words. An
+  // invitation lasts a week, so the day and the time are enough.
+  const expiry = (invitation: Invitation) =>
+    `${dayLabel(invitation.expires_at, locale())} · ${timeOfDay(invitation.expires_at)}`;
+
+  async function invite() {
+    if (props.busy) return;
+    // A second create replaces the first answer, so the link it showed leaves
+    // with it.
+    setCreated(null);
+    setCopied(false);
+    setNote(null);
+    const answer = await props.onInvite();
+    if (answer === null) return;
+    if (typeof answer.secret !== "string") {
+      // The Space answered from a recorded command, which keeps no secret; a
+      // new link is the only way to show one.
+      setNote(t("settings.people.invite.again"));
+      return;
+    }
+    setCreated(answer);
+  }
+
+  async function copy() {
+    const link = createdLink();
+    if (link === null) return;
+    try {
+      await navigator.clipboard.writeText(link);
+      setCopied(true);
+    } catch {
+      // A browser that refuses the clipboard still shows the link; the reader
+      // selects it from the field.
+      setNote(t("settings.people.copy.failed"));
+    }
+  }
+
+  async function revoke(invitation: string) {
+    if (props.busy) return;
+    if (armedRevoke() !== invitation) {
+      setArmedRevoke(invitation);
+      return;
+    }
+    setArmedRevoke(null);
+    setNote(null);
+    if (await props.onRevokeInvitation(invitation)) setNote(t("settings.people.revoke.done"));
+  }
+
+  async function changeRole(user: User, role: "admin" | "member") {
+    if (props.busy) return;
+    setNote(null);
+    if (await props.onSetRole(user.id, role)) setNote(t("settings.people.role.done"));
+  }
+
+  async function transfer(user: User) {
+    if (props.busy) return;
+    if (armedTransfer() !== user.id) {
+      setArmedTransfer(user.id);
+      return;
+    }
+    setArmedTransfer(null);
+    setNote(null);
+    if (await props.onTransfer(user.id)) setNote(t("settings.people.transfer.done"));
+  }
+
   const title = () =>
     props.section === "providers"
       ? t("sidebar.settings.providers")
@@ -210,7 +383,11 @@ export default function SettingsPage(props: SettingsPageProps) {
         ? t("sidebar.settings.models")
         : props.section === "computers"
           ? t("sidebar.settings.computers")
-          : t("sidebar.settings.catalog");
+          : props.section === "devices"
+            ? t("sidebar.settings.devices")
+            : props.section === "people"
+              ? t("sidebar.settings.people")
+              : t("sidebar.settings.catalog");
 
   // The Bots that work on one Computer, and what each of them may write. A
   // Local Computer's access belongs to its Bots, so this is where the summary
@@ -243,6 +420,13 @@ export default function SettingsPage(props: SettingsPageProps) {
   // exclusive, like the CLI's default, and can be made shared in the list.
   const [computerName, setComputerName] = createSignal("");
   const [computerSharing, setComputerSharing] = createSignal<Computer["sharing"]>("exclusive");
+  // The code a machine on another machine showed. It is entered on any
+  // signed-in client, which approves and records that machine.
+  const [pairingCode, setPairingCode] = createSignal("");
+  // Revoking access disconnects a machine, so it asks twice.
+  const [armedComputerRevoke, setArmedComputerRevoke] = createSignal<string | null>(null);
+  // The code a terminal without a session shows.
+  const [deviceCode, setDeviceCode] = createSignal("");
 
   async function createComputer() {
     const name = computerName().trim();
@@ -261,6 +445,27 @@ export default function SettingsPage(props: SettingsPageProps) {
     if (props.busy) return;
     setNote(null);
     if (await props.onShare(computer)) setNote(t("settings.computers.share.done"));
+  }
+
+  async function addComputer() {
+    const code = pairingCode().trim();
+    if (code === "" || props.busy) return;
+    setNote(null);
+    if (await props.onAdd(code)) {
+      setPairingCode("");
+      setNote(t("settings.computers.add.done"));
+    }
+  }
+
+  async function revokeComputer(computer: string) {
+    if (props.busy) return;
+    if (armedComputerRevoke() !== computer) {
+      setArmedComputerRevoke(computer);
+      return;
+    }
+    setArmedComputerRevoke(null);
+    setNote(null);
+    if (await props.onRevoke(computer)) setNote(t("settings.computers.revoke.done"));
   }
 
   async function reset(computer: string) {
@@ -654,6 +859,26 @@ export default function SettingsPage(props: SettingsPageProps) {
                             {t("settings.computers.share")}
                           </button>
                         </Show>
+                        {/* Revoking access disconnects a machine; only a
+                            Local Computer holds a credential to revoke. */}
+                        <Show when={computer.kind === "local"}>
+                          <button
+                            class={`btn ${
+                              armedComputerRevoke() === computer.id ? "btn--danger" : "btn--quiet"
+                            }`}
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() => void revokeComputer(computer.id)}
+                          >
+                            <Icon name="x" size="sm" />
+                            {armedComputerRevoke() === computer.id
+                              ? t("settings.computers.revoke.armed", { name: computer.name })
+                              : t("settings.computers.revoke")}
+                          </button>
+                          <Show when={armedComputerRevoke() === computer.id}>
+                            <span class="field__hint">{t("settings.computers.revoke.hint")}</span>
+                          </Show>
+                        </Show>
                         {/* A reset clears a Hosted Workspace's files, and only a
                             Hosted Computer can be reset. */}
                         <Show when={computer.kind === "hosted"}>
@@ -725,6 +950,244 @@ export default function SettingsPage(props: SettingsPageProps) {
                 </div>
                 <span class="field__hint">{t("settings.computers.create.hint")}</span>
               </form>
+
+              <form
+                class="panel__form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void addComputer();
+                }}
+              >
+                <h3 class="panel__subtitle">{t("settings.computers.add.title")}</h3>
+                <p class="panel__note">{t("settings.computers.add.hint")}</p>
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field__label">{t("settings.computers.add.code")}</span>
+                    <input
+                      class="input mono"
+                      name="pairing_code"
+                      autocomplete="off"
+                      spellcheck={false}
+                      maxlength={16}
+                      placeholder={t("settings.computers.add.placeholder")}
+                      value={pairingCode()}
+                      onInput={(event) => setPairingCode(event.currentTarget.value)}
+                    />
+                  </label>
+                </div>
+                <div class="panel__foot panel__foot--end">
+                  <button
+                    class="btn btn--primary"
+                    type="submit"
+                    disabled={props.busy || pairingCode().trim() === ""}
+                  >
+                    {props.busy
+                      ? t("settings.computers.add.adding")
+                      : t("settings.computers.add.action")}
+                    <Icon name="arrow-right" size="sm" />
+                  </button>
+                </div>
+              </form>
+            </div>
+          </section>
+        </Show>
+
+        <Show when={props.section === "devices"}>
+          <section class="panel">
+            <div class="panel__head">
+              <div>
+                <h2>{t("sidebar.settings.devices")}</h2>
+              </div>
+            </div>
+            <div class="panel__body">
+              <p class="panel__note">{t("settings.devices.hint")}</p>
+              <form
+                class="panel__form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void approveDevice();
+                }}
+              >
+                <div class="field-row">
+                  <label class="field">
+                    <span class="field__label">{t("settings.devices.code")}</span>
+                    <input
+                      class="input mono"
+                      name="device_code"
+                      autocomplete="off"
+                      spellcheck={false}
+                      maxlength={16}
+                      placeholder={t("settings.devices.placeholder")}
+                      value={deviceCode()}
+                      onInput={(event) => setDeviceCode(event.currentTarget.value)}
+                    />
+                  </label>
+                </div>
+                <div class="panel__foot panel__foot--end">
+                  <button
+                    class="btn btn--primary"
+                    type="submit"
+                    disabled={props.busy || deviceCode().trim() === ""}
+                  >
+                    {props.busy ? t("settings.devices.approving") : t("settings.devices.action")}
+                    <Icon name="arrow-right" size="sm" />
+                  </button>
+                </div>
+                <span class="field__hint">{t("settings.devices.warning")}</span>
+              </form>
+            </div>
+          </section>
+        </Show>
+
+        <Show when={props.section === "people"}>
+          <section class="panel">
+            <div class="panel__head">
+              <div>
+                <h2>{t("sidebar.settings.people")}</h2>
+              </div>
+              <span class="badge">{props.users.length}</span>
+            </div>
+            <div class="panel__body">
+              <p class="panel__note">{t("settings.people.hint")}</p>
+              <Show
+                when={props.users.length > 0}
+                fallback={<p class="rows__empty">{t("common.loading")}</p>}
+              >
+                <div class="rows">
+                  <For each={props.users}>
+                    {(user) => (
+                      <div class="row">
+                        <span class="row__text">
+                          <span class="row__name">
+                            {user.display_name}
+                            <Show when={user.id === props.account.id}>
+                              <span class="row__meta"> {t("settings.people.you")}</span>
+                            </Show>
+                          </span>
+                          <span class="row__meta">{roleLabel(user.role)}</span>
+                        </span>
+                        {/* The Space Owner's role changes only by transfer, and
+                            a User never changes its own: both controls stay off
+                            the Owner's row and the reader's own. */}
+                        <Show
+                          when={owns() && user.role !== "owner" && user.id !== props.account.id}
+                        >
+                          <button
+                            class="btn btn--quiet"
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() =>
+                              void changeRole(user, user.role === "admin" ? "member" : "admin")
+                            }
+                          >
+                            {user.role === "admin"
+                              ? t("settings.people.role.makeMember")
+                              : t("settings.people.role.makeAdmin")}
+                          </button>
+                          <button
+                            class={`btn ${
+                              armedTransfer() === user.id ? "btn--danger" : "btn--quiet"
+                            }`}
+                            type="button"
+                            disabled={props.busy}
+                            onClick={() => void transfer(user)}
+                          >
+                            <Icon name="arrow-right" size="sm" />
+                            {armedTransfer() === user.id
+                              ? t("settings.people.transfer.armed", { name: user.display_name })
+                              : t("settings.people.transfer")}
+                          </button>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
+                </div>
+              </Show>
+
+              <Show when={administers()}>
+                {/* The invitation that still admits a User, and the way to take
+                    it back. A Member reads the Users list alone. */}
+                <Show when={props.invitation}>
+                  {(invitation) => (
+                    <div class="row">
+                      <span class="row__text">
+                        <span class="row__name">{t("settings.people.pending")}</span>
+                        <span class="row__meta">
+                          {t("settings.people.pending.expires", {
+                            time: expiry(invitation()),
+                          })}
+                        </span>
+                      </span>
+                      <button
+                        class={`btn ${
+                          armedRevoke() === invitation().id ? "btn--danger" : "btn--quiet"
+                        }`}
+                        type="button"
+                        disabled={props.busy}
+                        onClick={() => void revoke(invitation().id)}
+                      >
+                        <Icon name="trash" size="sm" />
+                        {armedRevoke() === invitation().id
+                          ? t("settings.people.revoke.armed")
+                          : t("settings.people.revoke")}
+                      </button>
+                    </div>
+                  )}
+                </Show>
+
+                {/* The one answer a create gives: the link, the way to copy it,
+                    and the code a phone scans. It leaves on the next create or
+                    on a reload. */}
+                <Show when={createdLink()}>
+                  {(link) => (
+                    <section class="invite" aria-label={t("settings.people.invite.link")}>
+                      <div class="invite__details">
+                        <div class="field">
+                          <span class="field__label">{t("settings.people.invite.link")}</span>
+                          {/* The whole link stays readable: it wraps rather
+                              than scrolling out of view, and one press selects
+                              it for a browser that refuses the clipboard. */}
+                          <code class="invite__link mono">{link()}</code>
+                        </div>
+                        <p class="panel__note">{t("settings.people.invite.once")}</p>
+                        <p class="panel__note">{t("settings.people.invite.member")}</p>
+                        <Show when={localReach()}>
+                          <p class="panel__note">{t("settings.people.invite.local")}</p>
+                        </Show>
+                        <div class="invite__actions">
+                          <button
+                            class="btn btn--primary"
+                            type="button"
+                            onClick={() => void copy()}
+                          >
+                            <Icon name="copy" size="sm" />
+                            {copied() ? t("settings.people.copied") : t("settings.people.copy")}
+                          </button>
+                        </div>
+                      </div>
+                      <InvitationQr link={link()} />
+                    </section>
+                  )}
+                </Show>
+
+                <div class="panel__foot panel__foot--end">
+                  <button
+                    class="btn btn--primary"
+                    type="button"
+                    disabled={props.busy}
+                    onClick={() => void invite()}
+                  >
+                    <Icon name="plus" size="sm" />
+                    {props.busy
+                      ? t("settings.people.invite.creating")
+                      : t("settings.people.invite")}
+                  </button>
+                </div>
+                <p class="panel__note">{t("settings.people.invite.hint")}</p>
+                <Show when={localReach()}>
+                  <p class="panel__note">{t("settings.people.invite.local")}</p>
+                </Show>
+              </Show>
             </div>
           </section>
         </Show>

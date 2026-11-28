@@ -5,7 +5,7 @@ import { uuidv7 } from "./uuid";
  * The protocol version this client speaks. It states the version in its hello
  * frame, and the Space refuses a session that greets with another version.
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 export class ProtocolError extends Error {
   readonly code: string;
@@ -71,6 +71,9 @@ const UNIT_COMMAND_NAMES = [
   "chat_list",
   "mcp_list",
   "plugin_list",
+  "user_list",
+  "invitation_create",
+  "invitation_list",
 ] as const;
 
 const ARGUMENT_COMMAND_NAMES = [
@@ -79,7 +82,9 @@ const ARGUMENT_COMMAND_NAMES = [
   "provider_refresh",
   "computer_add",
   "computer_reset",
+  "computer_revoke",
   "computer_create",
+  "device_approve",
   "computer_update",
   "bot_create",
   "bot_update",
@@ -114,6 +119,9 @@ const ARGUMENT_COMMAND_NAMES = [
   "plugin_remove",
   "plugin_enable",
   "plugin_disable",
+  "invitation_revoke",
+  "user_set_role",
+  "user_transfer",
 ] as const;
 
 /** A command whose frame carries no `args` object. */
@@ -287,14 +295,14 @@ export class Commands {
         }
         if (this.following) this.following.frameSent = false;
         // The client states the Presentation kinds it reads. A Space sends the
-        // memory and compaction events only to a client that names their
+        // memory, compaction, and plan events only to a client that names their
         // capabilities, so an older client that stays silent never receives
         // them.
         socket.send(
           JSON.stringify({
             type: "hello",
             version: PROTOCOL_VERSION,
-            capabilities: ["memory", "compaction"],
+            capabilities: ["memory", "compaction", "plan"],
           }),
         );
         this.hello = new Promise<void>((helloResolve, helloReject) => {

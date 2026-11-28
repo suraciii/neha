@@ -877,6 +877,7 @@ mod tests {
                 bot,
                 status: crate::state::ChatStatus::Idle,
                 active_run: None,
+                plan: None,
             },
         );
         state.runs.insert(
@@ -902,6 +903,7 @@ mod tests {
                 access: None,
                 steps: Vec::new(),
                 actions: Vec::new(),
+                plan: Vec::new(),
             },
         );
         (state, user, bot, chat, run)

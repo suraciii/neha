@@ -15,6 +15,24 @@ Owned by space. Every other topic depends on a Space to hold its record.
 5. A listener beyond the Space's own machine requires TLS or a trusted proxy that terminates it, and the Space refuses to start without either.
 6. The Space checks `Host` and `Origin` before it authenticates a request, except that a request that carries a bearer token skips the `Origin` check.
 
+## The listener
+
+A Space listens on the loopback address of the machine that runs it, unless its operator binds it to a private address behind a TLS proxy. A listener beyond the machine requires a public https origin, and a Space refuses to start without one.
+
+A public origin names the TLS proxy in front; the operator keeps the Space's listener off the public network.
+
+A loopback peer is trusted as the Space's own machine. An operator MAY name other proxies. The Space reads a forwarded client address only from a trusted peer, and only from the last value of the request's `X-Forwarded-For`.
+
+It counts sign-in limits for that address; a request from any other peer is counted by its own address.
+
+## Pairing
+
+A machine pairs with a Space by polling it: the machine starts a pairing and shows a code, and a signed-in User enters that code on any client. The Space bounds how many pairings wait and how many one source starts; a full queue refuses a new start.
+
+A Computer the Space creates from a pairing takes the machine name the pairing carried and belongs to the User who approved it. The Space publishes the Computer only after the machine's token is final, so a crash between the two is reconciled on the next start rather than publishing a pairing the machine cannot use.
+
+A local ticket route answers only a direct loopback request with no forwarded header, so a public origin does not expose it.
+
 ## Storage
 
 A Space keeps its record in one SQLite database on the Space's machine.
@@ -55,11 +73,36 @@ A reader keeps every event. A kind it does not know that decides who can read or
 
 A caller that names no Presentation kinds reads every kind its protocol version already carries; a later Presentation kind reaches only a caller that names it.
 
-A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory and compaction kinds change no right to read, write, act, or approve.
+A caller that does not name a later kind receives no frame for it, and its cursor advances past it, so the new kind does not break a same-major client. The memory, compaction, and plan kinds change no right to read, write, act, or approve.
 
 A caller names the capability that admits a later kind; the command surface defines the capability names and the fixed set of kinds each one admits, as [CLI](../cli/design.md#versions) states. A capability admits no kind added after it was published; a later kind needs a new capability name.
 
 A capable caller still receives only the events its account can see.
+
+## User events
+
+The record holds these kinds for a User's role:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.user.updated` | The User and the role it now holds |
+| `neha.user.transferred` | The User who receives the Space |
+
+Each is an Authority event, so a reader that does not know one stops and asks for an upgrade.
+
+A role change names an Admin or Member role, never the Space Owner. The Space Owner authors a role change and a transfer; a transfer makes the receiving User the Space Owner and the transferring User an Admin.
+
+## Invitation events
+
+The record holds one kind for a change to the invitation the Space offers:
+
+| Kind | What it records |
+| --- | --- |
+| `neha.invitation.changed` | That the pending invitation moved: it was made, replaced, or revoked |
+
+The event is a Presentation event and carries no invitation, digest, or secret. The invitation lives in the identity tables, and the event only tells an authorized client to read the pending invitation again.
+
+A reader that does not know the kind skips it, as it skips any Presentation event, so an older client still reads the record.
 
 ## Approval events
 
@@ -138,7 +181,9 @@ A full read, a reload, and a live update show the one mark after the current bou
 
 ## Event visibility
 
-Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.provider.added`, `neha.provider.models_updated`) go to every account, because each one's data is already readable through `provider list` or `model list`. An event the account cannot see still advances its cursor.
+Realtime events and snapshots go only to the User whose account is the event's author or acting User. Space-level events (`neha.user.joined`, `neha.user.updated`, `neha.user.transferred`, `neha.provider.added`, `neha.provider.models_updated`) go to every account, because each one's data is already readable through the user list, `provider list`, or `model list`.
+
+A `neha.invitation.changed` event goes only to the Space Owner and the Admins, the accounts that can read the pending invitation. An event the account cannot see still advances its cursor.
 
 A `neha.chat.compacted` frame goes to every User who reads its Chat, because the compacted span belongs to the Chat.
 
@@ -153,6 +198,8 @@ The Space projects one state for each Chat: working, waiting, failed, or idle. T
 A queued, running, or resumed run projects working, and a run that waits for an Approval or an answer projects waiting. A run that ended in failure projects failed, and that state stays until the next run for the Chat starts. A Chat whose record holds no such run projects idle, including a record written before the projection existed.
 
 The projection names one `active_run`: the waiting run when one waits, otherwise the working run with the earliest sequence, and none when the state is failed or idle. None does not mean idle, because a failed state also names no active run.
+
+The view also carries the followed run's plan progress, `done` and `total`, when the run holds a plan. A view with no plan, a Chat that follows no run, or a plan the Bot cleared names no progress.
 
 An old `ChatView` with no `status` reads as idle, and with no `active_run` reads as null. Replaying the record builds the same projection from the run and approval events: a `RunStarted` with no end in the record reads as working, and several waiting runs name the one with the earliest sequence.
 

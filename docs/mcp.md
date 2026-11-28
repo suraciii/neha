@@ -18,15 +18,15 @@ target/debug/neha mcp list
 The name is unique in the Space, and holds letters, digits, and `-` only. An
 HTTP address is `https`, or `http` on the Space's own loopback.
 
-Only the Admin connects a server for the Space. `--scope user` connects it for
+Only an Admin connects a server for the Space. `--scope user` connects it for
 the signed-in User alone: a Bot owner may add one for themselves, or connect an
 existing Space server with their own credential.
 
 `mcp add` with an address connects an HTTP server. With no address it attaches
 the Space's credential to an existing package's `stdio` server of that name,
-which only the Admin may do; the command asks for the token when
+which only an Admin may do; the command asks for the token when
 `NEHA_MCP_TOKEN` is unset, because a stdio server has no address to sign in to.
-The Admin adds a Space-wide credential to an HTTP server a package brought by
+An Admin adds a Space-wide credential to an HTTP server a package brought by
 naming that server again with `--scope space` (the default) and its address.
 The credential comes from `NEHA_MCP_TOKEN`, a sign-in the command opens in the
 browser, or — for a stdio attach — the terminal prompt; it never comes from the
@@ -53,7 +53,7 @@ directory is expanded before it starts.
 
 The Space launches the server when it discovers the server's tools and when it
 calls one of them, and stops it after: it is not a daemon between calls. A
-credential attached to it — by the Admin with `neha mcp add <name>` for the
+credential attached to it — by an Admin with `neha mcp add <name>` for the
 Space, or in the Integrations view for a User — reaches the process as
 `NEHA_MCP_TOKEN`; the package's own environment is data and never holds one. A
 command the package writes as `./path` names a file the package carries, and
@@ -83,12 +83,12 @@ offers is not offered to the run.
 ## In the browser client
 
 The Integrations view lists the MCP servers the Space and you hold, the packages
-the Admin installed, and the Bots that use each server. A server row says
+an Admin installed, and the Bots that use each server. A server row says
 whether it is connected, who connected it, and where it comes from: an HTTP
 server's address, or a stdio server's command line and working directory; a
 package row says what it brought and whether the Space offers it.
 
-The Admin adds an HTTP server for the Space, and a User adds one for themselves
+An Admin adds an HTTP server for the Space, and a User adds one for themselves
 or connects a Space server with their own credential, by naming it, its
 address, and an access token. The token goes to the Space in that one command:
 the page clears the field, never shows the token again, and says whether the
@@ -98,7 +98,7 @@ waits for the Space to report the sign-in finished or failed. A stdio server
 has no address to sign in to; a token attached to it reaches the process as
 `NEHA_MCP_TOKEN`.
 
-Only the Admin sees the packages and enables or disables one. A Bot uses a
+Only an Admin sees the packages and enables or disables one. A Bot uses a
 server only when its owner enables it, so every server row carries a switch for
 each of the reader's Bots.
 

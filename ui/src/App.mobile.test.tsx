@@ -115,7 +115,7 @@ describe("the mobile client", () => {
     // And the step the entry holds returns to the Settings list.
     history.back();
     await waitFor(() => expect(element(view, ".app").className).not.toContain("app--detail"));
-    expect(view.container.querySelectorAll(".conv")).toHaveLength(4);
+    expect(view.container.querySelectorAll(".conv")).toHaveLength(6);
   });
 
   it("restores a Chat from an entry the client before this one wrote", async () => {
@@ -186,7 +186,7 @@ describe("the mobile client", () => {
     // page's own Back does.
     history.back();
     await waitFor(() => expect(element(view, ".app").className).not.toContain("app--detail"));
-    expect(view.container.querySelectorAll(".conv")).toHaveLength(4);
+    expect(view.container.querySelectorAll(".conv")).toHaveLength(6);
 
     // The next Back returns to the Chat the surface was opened from.
     history.back();
@@ -288,7 +288,7 @@ describe("the mobile client", () => {
     await waitFor(() => expect(view.container.querySelector(".app--detail")).toBeTruthy());
 
     flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-    await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+    await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
     flush(() => fireEvent.click(button(view, "Computers")));
     await waitFor(() => expect(element(view, ".app").className).toContain("app--detail"));
     expect(panelText(view, "Computers")).toBeTruthy();

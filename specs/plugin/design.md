@@ -10,7 +10,7 @@ Owned by plugin. Every topic depends on this one for what a Plugin can replace.
 
 1. A Plugin contributes to Neha only by registering on a seam.
 2. Every registration is reversible, and removing a Plugin removes all that it registered.
-3. Code that is not built in runs in a process of its own, and that process cannot read the Space's files, except a server the Admin allowed on a Windows Space, which has no sandbox.
+3. Code that is not built in runs in a process of its own, and that process cannot read the Space's files, except a server an Admin allowed on a Windows Space, which has no sandbox.
 4. Neha loads no dynamic library and hot-reloads no Plugin.
 5. An installed Plugin is pinned to one content digest, and to one commit when it comes from a repository.
 6. Installing a Plugin never executes code from its source.
@@ -62,7 +62,7 @@ A `streamable-http` server runs elsewhere; the Space calls it over HTTPS, or ove
 
 A `stdio` server runs on the Space's machine in a sandbox that mounts the system read-only and the server's data directory read-write. On Linux that sandbox is bubblewrap.
 
-On Windows the Admin allows an unsandboxed server with `NEHA_ALLOW_UNSANDBOXED_MCP=1`. Without it, Neha skips the server and reports why.
+On Windows an Admin allows an unsandboxed server with `NEHA_ALLOW_UNSANDBOXED_MCP=1`. Without it, Neha skips the server and reports why.
 
 ## Tools
 
@@ -80,7 +80,7 @@ A tool's result enters the record as an action's result: text as text, an image 
 
 ## Credentials
 
-An MCP server's credential belongs to the Space or to one User. The Admin connects a server for the Space; a User connects it with their own credential.
+An MCP server's credential belongs to the Space or to one User. An Admin connects a server for the Space; a User connects it with their own credential.
 
 A call finds the credential by the server's id: the acting User's when one exists, and otherwise the Space's. With neither, the tool returns that the server is not connected and the call sends no request; a `stdio` server's call launches without a credential instead, and a credential attached to it reaches the process as `NEHA_MCP_TOKEN`.
 

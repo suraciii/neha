@@ -82,7 +82,7 @@ request, including discovery.
 
 An HTTP server without a credential is still discovered, so its tools are
 offered; a call to an HTTP server made without a credential answers that it is
-not connected and sends no request. The Admin attaches a Space-wide token with
+not connected and sends no request. An Admin attaches a Space-wide token with
 `NEHA_MCP_TOKEN=… target/debug/neha mcp add <server-name> <server-url>`, or
 signs in from the Integrations view in the browser; once it is attached, the
 token reaches the server with the configured headers. The token never comes

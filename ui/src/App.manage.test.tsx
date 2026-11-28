@@ -144,13 +144,13 @@ async function openBotLoading(): Promise<View> {
 }
 
 // Opens the Settings surface on the section the test names: Providers, Models,
-// Computers, or the catalog.
+// Computers, Devices, or the catalog.
 async function openSettings(section = "Providers"): Promise<View> {
   const view = renderApp();
   await waitFor(() => expect(element(view, ".rail__item:nth-of-type(4)")).toBeTruthy());
   flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
   // The sidebar lists every section the Settings surface opens.
-  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+  await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
   flush(() => fireEvent.click(button(view, section)));
   await waitFor(() => expect(element(view, ".page__body")).toBeTruthy());
   return view;
@@ -1213,6 +1213,39 @@ describe("App management", () => {
     await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Workspace cleared"));
   });
 
+  it("revokes a Local Computer from the Computers list, asking twice", async () => {
+    const view = await openSettings("Computers");
+
+    const rows = view.container.querySelectorAll(".rows .row");
+    // Only a Local Computer has a credential to revoke.
+    expect(rows[0]?.textContent).toContain("Revoke access");
+    expect(rows[1]?.textContent).toContain("Revoke access");
+    expect(rows[2]?.textContent).not.toContain("Revoke access");
+
+    flush(() => fireEvent.click(button(view, "Revoke access")));
+    expect(space.revoked).toHaveLength(0);
+    await waitFor(() => expect(button(view, "Revoke Workstation?")).toBeTruthy());
+
+    press(view, "Revoke Workstation?");
+    await waitFor(() => expect(space.revoked).toEqual(["p1"]));
+    await waitFor(() => expect(element(view, ".page__note").textContent).toBe("Access revoked"));
+  });
+
+  it("approves a terminal's device code from the Devices section", async () => {
+    const view = await openSettings("Devices");
+
+    const code = view.container.querySelector<HTMLInputElement>('input[name="device_code"]');
+    expect(code).toBeTruthy();
+    flush(() => {
+      fireEvent.input(code!, { target: { value: "ABCD-2345" } });
+    });
+    press(view, "Approve sign-in");
+    await waitFor(() => expect(space.deviceApprovals).toEqual(["ABCD-2345"]));
+    await waitFor(() =>
+      expect(element(view, ".page__note").textContent).toBe("Terminal signed in"),
+    );
+  });
+
   it("says when one Provider offers no Models", async () => {
     space.providers = [
       { id: "v1", protocol: "chat_completions", base_url: "http://one", vendor: null },
@@ -1549,7 +1582,7 @@ describe("App management", () => {
       // reads to hide the sidebar is not on the shell, so the section buttons
       // are the ones on screen.
       flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
       expect(element(view, ".app").className).not.toContain("app--detail");
 
       // A section opens its detail, and Back returns to the list.
@@ -1558,7 +1591,7 @@ describe("App management", () => {
       expect(panelText(view, "Computers")).toBeTruthy();
       flush(() => fireEvent.click(element(view, ".page__back")));
       await waitFor(() => expect(element(view, ".app").className).not.toContain("app--detail"));
-      expect(view.container.querySelectorAll(".conv")).toHaveLength(4);
+      expect(view.container.querySelectorAll(".conv")).toHaveLength(6);
 
       // The stylesheet the class is read from hides the sidebar beside a detail,
       // so the class is what decides which of the two a narrow viewport shows.
@@ -1594,7 +1627,7 @@ describe("App management", () => {
       // The rail opens the Settings surface, and its list of sections is the
       // surface on screen.
       flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
       expect(element(view, ".app").className).not.toContain("app--setup");
       expect(element(view, ".app").className).not.toContain("app--detail");
     } finally {
@@ -1606,7 +1639,7 @@ describe("App management", () => {
     // A narrow viewport shows one surface at a time, and the Chat left open
     // behind the Settings surface must not be the one that decides: the rail
     // view does. Otherwise the list of sections is the hidden surface and three
-    // of the four sections cannot be reached.
+    // of the five sections cannot be reached.
     const wide = window.matchMedia;
     try {
       Object.defineProperty(window, "matchMedia", {
@@ -1628,7 +1661,7 @@ describe("App management", () => {
       // The rail opens the Settings surface, and its list of sections is the
       // surface on screen.
       flush(() => fireEvent.click(element(view, ".rail__item:nth-of-type(4)")));
-      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(4));
+      await waitFor(() => expect(view.container.querySelectorAll(".conv")).toHaveLength(6));
       expect(element(view, ".app").className).not.toContain("app--detail");
 
       // The Bots surface is reachable the same way.

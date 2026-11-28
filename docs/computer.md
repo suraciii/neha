@@ -4,18 +4,18 @@ A Computer is the machine a Bot's actions run on: a Hosted Computer the Space pr
 
 This guide creates and shares Hosted Computers, and pairs the machine that runs a Space as a Local Computer. It follows [Quick start](quickstart.md), so the Space, its Admin, a Provider, and a Chat already exist.
 
-This milestone pairs the machine that runs the Space, because the Space listens only on loopback. [What this milestone does not do](#what-this-milestone-does-not-do) names that and the other limits.
+This guide pairs the machine that runs the Space through its local ticket, and a machine on another network through a pairing code. A public Space needs a public https origin and a proxy in front of it; [Deploying a Space](deploying.md) covers that.
 
 ## What you need
 
 - A Linux machine with the Neha CLI. [Building and verification](building.md) covers the build; the examples use `target/debug/neha`.
 - `bubblewrap` on that machine. A Local Computer runs each shell command in a sandbox it starts, unless the Bot has full access, and a Local Space needs it for a process-local Hosted Computer too; the file tools check their own paths. A containerized Hosted Space uses its worker containers instead. [Building and verification](building.md#a-computer-sandbox) covers the install.
-- A Space running on the same machine, at an address the Local Computer can reach; in this milestone that is the host that runs the Space.
-- A CLI signed in to the Space for commands such as `computer list`, `computer create`, and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-admin-from-the-cli) covers `neha join`.
+- A Space the machine can reach: `http://127.0.0.1:7337` when the Space runs on the same machine, or the Space's public `https://` origin when it runs elsewhere.
+- A CLI signed in to the Space for commands such as `computer list`, `computer create`, and `bot create`, and for the HTTP fallback that asks for a ticket; pairing from a startup ticket file needs no sign-in. [Quick start](quickstart.md#join-as-the-space-owner-from-the-cli) covers `neha join`.
 
 ## Pair the machine
 
-Start the Space with `neha serve` and keep it running. A Space that had an Admin when it started also prints the command that pairs this machine:
+Start the Space with `neha serve` and keep it running. A Space that has a Space Owner already prints the command that pairs this machine:
 
 ```text
 Pair this PC: neha computer pair
@@ -47,15 +47,49 @@ target/debug/neha computer run
 
 Keep that terminal open. The Space shows the Computer as online while the daemon runs, and the run prints the Workspace root it serves.
 
-The ticket admits one pairing for one Space start and expires after 10 minutes. A Space that started with an Admin writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, which granted mode hides from Bots.
+The ticket admits one pairing for one Space start and expires after 10 minutes. A Space with a Space Owner writes its startup ticket as one file per Space under the machine's Neha configuration directory, with mode 0600, which granted mode hides from Bots.
 
 Each Space's ticket sits at `$XDG_CONFIG_HOME/neha/spaces/<space-key>/local-computer.ticket`, or `~/.config/neha/spaces/<space-key>/local-computer.ticket` when `XDG_CONFIG_HOME` is not set; on Windows it is under `%LOCALAPPDATA%\Neha\spaces`. `computer pair` scans `spaces/` and pairs the Space whose URL its ticket names; `--ticket-file` names another file. When no ticket file exists, a signed-in CLI asks the Space that saved its session for one, so only that fallback needs a signed-in CLI.
 
-The Computer belongs to the User the ticket names: the Admin for a startup ticket, or the signed-in User who asked for one.
+The Computer belongs to the User the ticket names: the Space Owner for a startup ticket, or the signed-in User who asked for one.
 
-Run `neha computer pair` again if the ticket expired or was used, and restart the Space first if it wrote the old one. Pass `--yes` to skip the confirmation, `--space <url>` to name the Space address, and `--ticket-file <path>` to name another ticket file. `--space` accepts only a loopback address in this milestone, and the fallback calls only the Space that saved the CLI session.
+Run `neha computer pair` again if the ticket expired or was used, and restart the Space first if it wrote the old one. Pass `--yes` to skip the confirmation, `--space <url>` to name the Space address, and `--ticket-file <path>` to name another ticket file. A local ticket names this machine's Space, and the fallback calls only the Space that saved the CLI session.
+
+## Pair another machine
+
+A Space with a public `https://` origin pairs a machine on another network through a code. On that machine, name the Space:
+
+```bash
+target/debug/neha computer pair --space https://neha.example.com
+```
+
+The command shows the Space and, after confirmation, a pairing code:
+
+```text
+To pair this Computer, sign in to https://neha.example.com and enter code 7K3M-9Q2X (expires in 15 minutes).
+Waiting for approval...
+```
+
+Sign in to the Space on any client and enter the code. The browser client offers the field under Settings, Computers, Add a Computer; the CLI does it with `neha computer add <code>`. The machine polls the Space and saves the pairing when a signed-in User approves it, then prints the new Computer:
+
+```text
+Paired Computer <computer-id> with https://neha.example.com.
+```
+
+The Computer belongs to the User who entered the code. The code is shown as `XXXX-XXXX`, expires after fifteen minutes, and can be entered with or without the dash. Only a Space with a public https origin is accepted for this path; a remote `http://` origin is refused before any secret leaves the machine. A local ticket is never used, and no saved session token is sent to that origin.
+
+Start the daemon with `neha computer run` after the pairing. It connects to the Space's public origin over `wss://`, and the Space gives a Bot's shell commands that same origin, so `neha file get` and `neha chat send --file` work from the Bot's machine.
+
+Run `neha computer pair --space <origin>` again if the code expired, or approve a fresh code from another client. A used or expired code answers no poll.
+
 
 The machine keeps its configuration in `~/.config/neha/computer.json` with mode 0600. `$XDG_CONFIG_HOME/neha` replaces that directory when `XDG_CONFIG_HOME` is set, and `NEHA_COMPUTER_HOME` replaces both. Each Bot works in a directory of its own under `~/.neha/workspaces` by default; pass `--workspace <directory>` to `computer pair` to put those directories under another root, and a root inside the configuration directory is refused.
+
+## Revoke a machine
+
+`neha computer revoke <computer-id>` withdraws a Local Computer's access. The owner runs it from any signed-in client; the machine's daemon drops its connection and its next reconnect is refused, so it exits instead of retrying. The Computer stays listed as offline, and its Bots wait.
+
+Revocation is not deletion: the Computer record and its Workspace stay. Pair the machine again to use it, which creates a new Computer; move Bots to it with `neha bot move`.
 
 An older Neha kept its pairing in `~/.neha/computer.json` and its Workspaces in `~/Neha`. While that file exists, `computer pair` and `computer run` refuse; the old file and the old Workspaces are not read or moved. Delete the old file, or move it into storage that the machine's Bots cannot read, then pair again; the old Workspaces stay where they are. Storage outside the machine is the safe place for a copy.
 
@@ -197,7 +231,7 @@ A Local Computer is online while its daemon holds the channel to the Space. A pr
 
 A worker-backed Hosted Computer wakes when it has queued work and stops after an idle period. The operator chooses the idle period and whether a Computer stays awake; [Run a Space in containers](container.md#hosted-computers) covers the settings. A run already in flight when the worker stops is recorded as failed or unknown, as for any Computer whose channel goes away.
 
-The Space and the daemon must come from the same release. The channel speaks version 3, and the Space refuses a daemon whose channel version does not match. A daemon left on an older release connects and is refused; restart it with the `neha computer run` of this release.
+The Space and the daemon must come from the same release. The channel speaks version 4, and the Space refuses a daemon whose channel version does not match. A daemon left on an older release connects and is refused; restart it with the `neha computer run` of this release.
 
 `neha chat send` waits up to 180 seconds for the run to end. If the run is still queued, the command stops with `the run did not end within 180s`, and the Message and its run stay in the record.
 
@@ -239,8 +273,7 @@ The machine ends the command it was running when the channel drops, so no action
 
 ## What this milestone does not do
 
-- The Space listens on loopback only, so this milestone pairs the machine that runs the Space. A Computer on another machine is not available; `neha computer add` stays for that future flow.
-- There is no command yet to revoke or replace a Computer's credential.
+- A Local Computer can be revoked but not deleted; re-pairing creates a new Computer and leaves the old record offline.
 - Moving a Bot does not carry its files: the old Computer keeps its Workspace, and the new one gives the Bot a directory of its own. Saving and restoring a Workspace are not available.
 - A Hosted Computer in a Local Space still runs only in the Space process. The containerized Hosted Space runs it in a worker container; a Local Computer never does.
 - There is no client command to start, stop, or delete a Hosted Computer, and no on-demand stop for a process-local one. A worker-backed Hosted Computer wakes and stops from its work and idle settings; the Supervisor is internal. A provider-backed Hosted machine is not specified yet.
@@ -268,7 +301,7 @@ neha bot full-access "$BOT_ID" on
 neha bot full-access "$BOT_ID" off
 ```
 
-`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must already exist on this machine. The path is trimmed once where you type it, and a folder name that ends in a space is its own folder: `logs` and `logs ` are different. `neha bot revoke <bot-id> <path>` takes one away, and it also takes away a grant whose folder is gone, matching the path `neha bot access <bot-id>` shows. A revoke compares the path exactly as you spell it first, so keep a trailing space by quoting the path: `neha bot revoke <bot-id> '/data/logs '` takes the grant for `/data/logs ` and leaves `/data/logs` alone. `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this. Each run fixes the access when it starts, so a change made while a run works applies to the next run.
+`neha bot grant <bot-id> <path>` adds one extra folder the Bot may write; repeat the command for more. The folder must exist on the Computer that runs the Bot: the client sends the absolute path without checking it, so you can grant a folder from another machine, and the Computer resolves it when it opens the write root. Grant the real folder, not a symlink: the Computer opens a write root without following one. The path is trimmed once where you type it, and a folder name that ends in a space is its own folder: `logs` and `logs ` are different. `neha bot revoke <bot-id> <path>` takes one away, and it also takes away a grant whose folder is gone, matching the path `neha bot access <bot-id>` shows. A revoke compares the path exactly as you spell it first, so keep a trailing space by quoting the path: `neha bot revoke <bot-id> '/data/logs '` takes the grant for `/data/logs ` and leaves `/data/logs` alone. `neha bot access <bot-id>` shows what is in effect: `full access: on` or `full access: off`, then one `grant` line per folder, or `grants: none`. Only the Bot's owner can change this. Each run fixes the access when it starts, so a change made while a run works applies to the next run.
 
 `neha bot full-access <bot-id> on` gives the Bot the daemon process's own file rights and starts no sandbox for it, so the Bot writes and deletes what the machine's user can and its shell sees the machine's own `/tmp`, `/dev`, and process view. The risk it prints names what that reaches: the Bot can read the Computer's configuration directory, `~/.config/neha` by default, which holds the saved pairing, the machine's token, and the CLI's session credential. Turn full access on only when the Bot needs that range; `off` restores the fence. `on` asks for confirmation at a terminal and needs `--yes` without one; `off` asks for nothing.
 

@@ -56,15 +56,34 @@ enum Top {
     },
     /// Sign in to a Space you already joined.
     Login {
-        /// Your display name in the Space.
+        /// Your display name in the Space; required for password sign-in.
         #[arg(long)]
-        name: String,
+        name: Option<String>,
         /// The Space URL; defaults to the saved one.
         #[arg(long)]
         server: Option<String>,
+        /// Sign in from a terminal without a password, by approving a code on
+        /// a client that is already signed in.
+        #[arg(long)]
+        device_code: bool,
     },
     /// Show the account and Space this CLI uses.
     Whoami,
+    /// Approve a CLI's device code from this signed-in client.
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+    /// List the Space's Users and their roles.
+    User {
+        #[command(subcommand)]
+        command: UserCommand,
+    },
+    /// Make or manage invitations.
+    Invitation {
+        #[command(subcommand)]
+        command: InvitationCommand,
+    },
     /// Connect or list Providers.
     Provider {
         #[command(subcommand)]
@@ -129,6 +148,44 @@ enum Top {
     Plugin {
         #[command(subcommand)]
         command: PluginCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserCommand {
+    /// List the Space's Users and their roles.
+    List,
+    /// Change a User's role; only the Space Owner may.
+    Role {
+        /// The User's display name, or their identifier with --id.
+        user: String,
+        /// The role to give: admin or member.
+        role: String,
+        /// Read `user` as an identifier, not a display name.
+        #[arg(long)]
+        id: bool,
+    },
+    /// Transfer the Space to another User; only the Space Owner may.
+    Transfer {
+        /// The display name, or the identifier with --id, of the User who
+        /// becomes the Owner.
+        user: String,
+        /// Read `user` as an identifier, not a display name.
+        #[arg(long)]
+        id: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum InvitationCommand {
+    /// Make an invitation link; the link appears once.
+    Create,
+    /// List the invitations that still admit one User.
+    List,
+    /// Revoke a pending invitation.
+    Revoke {
+        /// The invitation identifier.
+        invitation: String,
     },
 }
 
@@ -335,9 +392,9 @@ enum MemoryCommand {
 
 #[derive(Subcommand)]
 enum ComputerCommand {
-    /// Pair this machine with the Space on this machine.
+    /// Pair this machine with a Space, on this machine or another.
     Pair {
-        /// The Space URL; defaults to the ticket file's or the saved Space's.
+        /// The Space URL; a remote https origin pairs with a device code.
         #[arg(long)]
         space: Option<String>,
         /// The ticket file; defaults to a Space ticket under the Neha
@@ -390,6 +447,11 @@ enum ComputerCommand {
     /// Clear a Hosted Computer's Workspace.
     Reset {
         /// The Hosted Computer identifier.
+        computer: Id,
+    },
+    /// Revoke a Local Computer's credential and disconnect its daemon.
+    Revoke {
+        /// The Local Computer identifier.
         computer: Id,
     },
     /// List the Computers you own.
@@ -446,6 +508,16 @@ enum ChatCommand {
 }
 
 #[derive(Subcommand)]
+enum DeviceCommand {
+    /// Approve a CLI waiting to sign in.
+    Approve {
+        /// The code the CLI showed; omit it to type the code without leaving
+        /// it in shell history.
+        code: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum FileCommand {
     /// Download a File.
     Get {
@@ -461,6 +533,11 @@ enum FileCommand {
 enum RunCommand {
     /// Show one run.
     Show {
+        /// The run identifier.
+        run: Id,
+    },
+    /// Print the plan one run kept.
+    Plan {
         /// The run identifier.
         run: Id,
     },
@@ -721,8 +798,15 @@ pub async fn run() -> Result<()> {
     let result = match cli.command {
         Top::Serve { port, ui, domain } => serve(port, ui, domain).await,
         Top::Join { link, name } => join(&link, &name).await,
-        Top::Login { name, server } => login(&name, server).await,
-        Top::Whoami => whoami(),
+        Top::Login {
+            name,
+            server,
+            device_code,
+        } => login(name, server, device_code).await,
+        Top::Whoami => whoami().await,
+        Top::Device { command } => device_command(command).await,
+        Top::User { command } => user(command).await,
+        Top::Invitation { command } => invitation(command).await,
         Top::Provider { command } => provider(command).await,
         Top::Catalog { command } => catalog(command).await,
         Top::Model { command } => model(command).await,
@@ -756,6 +840,82 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
     // Register before the home opens or the listener binds: a service manager
     // that reads readiness and stops at once must still reach this handler.
     let mut stop = signals::Stop::install().context("cannot listen for a stop signal")?;
+    let ui = ui
+        .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
+        .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
+    if let Some(path) = &ui
+        && !path.join("index.html").is_file()
+    {
+        tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase = "ui",
+            error_kind = "ui",
+            error_message = "the browser client has no index.html",
+            "the Space could not start"
+        );
+        bail!("the browser client at {} has no index.html", path.display());
+    }
+    let domain = match domain.or_else(|| std::env::var("NEHA_DOMAIN").ok()) {
+        Some(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                tracing::error!(
+                    target: "neha::space",
+                    event = "space.start.failed",
+                    phase = "config",
+                    error_kind = "public_url",
+                    error_message = "the public domain is empty",
+                    "the Space could not start"
+                );
+                bail!("--domain needs a host");
+            }
+            Some(value)
+        }
+        None => None,
+    };
+    if let Some(domain) = &domain
+        && (domain.contains("://")
+            || domain.contains('/')
+            || domain.contains('?')
+            || domain.contains('#'))
+    {
+        tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase = "config",
+            error_kind = "public_url",
+            error_message = "the public domain is not a host",
+            "the Space could not start"
+        );
+        bail!("--domain takes a host[:port], not a URL or path");
+    }
+    let public_url = match domain {
+        Some(domain) => Some(format!("https://{domain}")),
+        None => match std::env::var("NEHA_PUBLIC_URL") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => bail!("NEHA_PUBLIC_URL is not usable: {error}"),
+        },
+    };
+    // Validate the origin, proxy list, and listener before opening the home:
+    // a start that may not serve must not rename a database or clear temporary
+    // files. The bound listener is the one this start uses.
+    let startup = match neha_space::prepare_start(port, public_url).await {
+        Ok(startup) => startup,
+        Err(error) => {
+            let (phase, error_kind, message) = diag::startup_failure(&error);
+            tracing::error!(
+                target: "neha::space",
+                event = "space.start.failed",
+                phase,
+                error_kind,
+                error_message = message.as_str(),
+                "the Space could not start"
+            );
+            return Err(error).context("the Space cannot start");
+        }
+    };
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(error) => {
@@ -772,50 +932,9 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
                 .context("NEHA_HOME is not set; set it to the directory that holds this Space");
         }
     };
-    let ui = ui
-        .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
-        .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
-    if let Some(path) = &ui
-        && !path.join("index.html").is_file()
-    {
-        report_start_failure(&home, "ui", "ui", "the browser client has no index.html");
-        bail!("the browser client at {} has no index.html", path.display());
-    }
-    let domain = match domain.or_else(|| std::env::var("NEHA_DOMAIN").ok()) {
-        Some(value) => {
-            let value = value.trim().to_owned();
-            if value.is_empty() {
-                report_start_failure(&home, "config", "public_url", "the public domain is empty");
-                bail!("--domain needs a host");
-            }
-            Some(value)
-        }
-        None => None,
-    };
-    if let Some(domain) = &domain
-        && (domain.contains("://")
-            || domain.contains('/')
-            || domain.contains('?')
-            || domain.contains('#'))
-    {
-        report_start_failure(
-            &home,
-            "config",
-            "public_url",
-            "the public domain is not a host",
-        );
-        bail!("--domain takes a host[:port], not a URL or path");
-    }
-    let public_url = domain.map(|domain| format!("https://{domain}"));
     let has_ui = ui.is_some();
     let failure_home = home.clone();
-    let started = match public_url {
-        Some(public_url) => {
-            neha_space::start_with_ui_public(home, port, ui, Some(public_url)).await
-        }
-        None => neha_space::start_with_ui(home, port, ui).await,
-    };
-    let running = match started {
+    let running = match neha_space::start_with_ui_prepared(home, ui, startup).await {
         Ok(running) => running,
         Err(error) => {
             let (phase, error_kind, message) = diag::startup_failure(&error);
@@ -905,30 +1024,33 @@ async fn join(link: &str, name: &str) -> Result<()> {
     let credential = client::join(link, name, &password).await?;
     credential.save()?;
     println!(
-        "Joined {} as {} (Admin: {}).",
+        "Joined {} as {} ({}).",
         credential.url,
         credential.account.display_name,
-        if credential.account.is_admin {
-            "yes"
-        } else {
-            "no"
-        }
+        role_of(&credential.account)
     );
 
     Ok(())
 }
 
-async fn login(name: &str, server: Option<String>) -> Result<()> {
+async fn login(name: Option<String>, server: Option<String>, device_code: bool) -> Result<()> {
     let server = match server {
-        Some(server) => server,
+        Some(server) => computer::normalized_any_space_url(&server)?,
         None => {
-            Credential::load()
-                .context("pass --server when this machine has no saved Space")?
-                .url
+            let saved =
+                Credential::load().context("pass --server when this machine has no saved Space")?;
+            computer::normalized_any_space_url(&saved.url)?
         }
     };
+    if device_code {
+        if name.is_some() {
+            bail!("--name signs in with a password; leave it out with --device-code");
+        }
+        return login_with_device_code(server).await;
+    }
+    let name = name.context("pass --name (or --device-code) to sign in")?;
     let password = read_password()?;
-    let credential = client::login(&server, name, &password).await?;
+    let credential = client::login(&server, &name, &password).await?;
     credential.save()?;
     println!(
         "Signed in to {} as {}.",
@@ -938,19 +1060,295 @@ async fn login(name: &str, server: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn whoami() -> Result<()> {
-    let credential = Credential::load()?;
-    println!("Space: {}", credential.url);
-    println!("Account: {}", credential.account.display_name);
-    println!("Id: {}", credential.account.id);
+/// Signs in from a terminal that has no password prompt, through a code.
+///
+/// The token is kept only after a User approves the code and the Space accepts
+/// it for an authenticated command. A failed or cancelled login leaves any
+/// saved credential untouched.
+async fn login_with_device_code(server: String) -> Result<()> {
+    let token = client::random_secret();
+    let poll_secret = client::random_secret();
+    let started =
+        client::start_device_login(&server, &computer::machine_name(), &token, &poll_secret)
+            .await
+            .context("the device login could not start")?;
+    let minutes = (started.expires_in / 60).max(1);
     println!(
-        "Admin: {}",
-        if credential.account.is_admin {
-            "yes"
-        } else {
-            "no"
-        }
+        "To sign in, open {server} and enter code {} under Settings, Devices (expires in {minutes} minutes).",
+        computer::display_pairing_code(&started.code)
     );
+    println!("Waiting for approval...");
+
+    let account =
+        wait_for_device_approval(&server, &started.device, &poll_secret, &started).await?;
+    let credential = Credential {
+        url: server,
+        token,
+        account,
+    };
+    // The poll says a User approved this token; one authenticated command says
+    // the Space accepts it. Only then replace the saved credential.
+    client::command(&credential, CommandCall::ComputerList)
+        .await
+        .context("the approved session cannot reach the Space")?;
+    credential.save()?;
+    println!(
+        "Signed in to {} as {}.",
+        credential.url, credential.account.display_name
+    );
+
+    Ok(())
+}
+
+/// Waits for a User to approve one device login.
+///
+/// A transient poll failure backs off rather than failing the terminal: a
+/// connection reset after approval must not leave an approved session unsaved.
+/// Every request and sleep shares the code's one deadline.
+async fn wait_for_device_approval(
+    server: &str,
+    device: &str,
+    poll_secret: &str,
+    started: &client::StartedDeviceLogin,
+) -> Result<client::SignedIn> {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(started.expires_in))
+        .context("the Space announced an unusable device-login lifetime")?;
+    let interval = Duration::from_secs(started.interval);
+    let mut retry = Duration::from_secs(1);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "the device code expired before a User approved it; run \
+                 `neha login --server {server} --device-code` again"
+            );
+        }
+        let outcome = tokio::time::timeout(
+            remaining.min(Duration::from_secs(30)),
+            client::poll_device_login(server, device, poll_secret),
+        )
+        .await;
+        let wait = match outcome {
+            Ok(Ok(client::DeviceLoginPoll::Pending)) => interval,
+            Ok(Ok(client::DeviceLoginPoll::Approved { account })) => return Ok(account),
+            Ok(Ok(client::DeviceLoginPoll::Gone)) => bail!(
+                "the device code expired or was replaced before a User approved it; run \
+                 `neha login --server {server} --device-code` again"
+            ),
+            Ok(Err(error)) => {
+                eprintln!("warning: a device-login poll failed; retrying: {error:#}");
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                wait
+            }
+            Err(_) => {
+                eprintln!("warning: a device-login poll timed out; retrying");
+                let wait = retry;
+                retry = (retry * 2).min(Duration::from_secs(30));
+                wait
+            }
+        };
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            continue;
+        }
+        tokio::time::sleep(wait.min(remaining)).await;
+    }
+}
+
+async fn whoami() -> Result<()> {
+    let credential = Credential::load()?;
+    // A role can change while the CLI keeps its credential, so the Space
+    // answers this rather than the account saved at sign-in.
+    let account = client::me(&credential).await?;
+    println!("Space: {}", credential.url);
+    println!("Account: {}", account.display_name);
+    println!("Id: {}", account.id);
+    println!("Role: {}", role_of(&account));
+
+    Ok(())
+}
+
+/// Prints the role an account holds in the Space.
+fn role_of(account: &crate::client::SignedIn) -> &'static str {
+    account.role().as_str()
+}
+
+/// Parses the role a `user role` command names.
+fn parse_role(text: &str) -> Result<neha::role::Role> {
+    match text.parse::<neha::role::Role>() {
+        Ok(neha::role::Role::Owner) => {
+            bail!("the Space Owner role moves only by transfer; run `neha user transfer <user>`")
+        }
+        Ok(role) => Ok(role),
+        Err(_) => bail!("a role is `admin` or `member`"),
+    }
+}
+
+/// Resolves the User a command names by display name or identifier.
+///
+/// A display name may itself look like an identifier, so the directory is read
+/// first: an exact name wins, and only a name the directory does not hold is
+/// read as the identifier of a User it lists. An argument that is both a
+/// display name and another User's identifier is refused: the command names
+/// the identifier with `--id` instead of guessing.
+async fn resolve_user(credential: &Credential, user: &str, by_id: bool) -> Result<Id> {
+    let result = client::command(credential, CommandCall::UserList).await?;
+    let users = result
+        .as_array()
+        .with_context(|| "the answer carries no User list")?;
+    let named = users
+        .iter()
+        .find(|entry| entry["display_name"].as_str() == Some(user));
+    let parsed = user.parse::<Id>().ok();
+    let identified = parsed.and_then(|id| {
+        users
+            .iter()
+            .find(|entry| entry["id"].as_str() == Some(id.to_string().as_str()))
+    });
+    let id_of = |entry: &Value| -> Result<Id> {
+        entry["id"]
+            .as_str()
+            .with_context(|| "the answer's User has no Id")?
+            .parse()
+            .context("the answer's User has an invalid Id")
+    };
+
+    if by_id {
+        let id = parsed.context("an identifier looks like an Id")?;
+        if identified.is_some() {
+            return Ok(id);
+        }
+        bail!("no User has the identifier {user}");
+    }
+    match (named, identified) {
+        (Some(named), Some(identified)) if named["id"] != identified["id"] => bail!(
+            "{user} is both a display name and another User's identifier; pass --id to name the identifier"
+        ),
+        (Some(entry), _) | (None, Some(entry)) => id_of(entry),
+        (None, None) => bail!("no User is named {user}"),
+    }
+}
+
+/// Prints the User list an answer carries.
+fn print_users(result: &Value) -> Result<()> {
+    let users = result
+        .as_array()
+        .with_context(|| "the answer carries no User list")?;
+    for user in users {
+        println!(
+            "{:<7} {}",
+            user["role"].as_str().unwrap_or("member"),
+            user["display_name"].as_str().unwrap_or("-")
+        );
+    }
+
+    Ok(())
+}
+
+async fn user(command: UserCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        UserCommand::List => {
+            let result = client::command(&credential, CommandCall::UserList).await?;
+            print_users(&result)?;
+        }
+        UserCommand::Role { user, role, id } => {
+            let role = parse_role(&role)?;
+            let user = resolve_user(&credential, &user, id).await?;
+            let result =
+                client::command(&credential, CommandCall::UserSetRole { user, role }).await?;
+            println!("Changed the role. The Space's Users now are:");
+            print_users(&result["users"])?;
+        }
+        UserCommand::Transfer { user, id } => {
+            let user = resolve_user(&credential, &user, id).await?;
+            let result = client::command(&credential, CommandCall::UserTransfer { user }).await?;
+            println!("Transferred the Space. The Space's Users now are:");
+            print_users(&result["users"])?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn invitation(command: InvitationCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        InvitationCommand::Create => {
+            let result = client::command(&credential, CommandCall::InvitationCreate).await?;
+            let secret = result["secret"]
+                .as_str()
+                .with_context(|| "the answer carries no invitation secret")?;
+            let base = credential.url.trim_end_matches('/');
+            println!("Invitation: {base}/invite#{secret}");
+            println!(
+                "Expires: {}",
+                result["invitation"]["expires_at"]
+                    .as_str()
+                    .unwrap_or("unknown")
+            );
+            println!("The link admits one new User as a Member and is shown only once.");
+        }
+        InvitationCommand::List => {
+            let result = client::command(&credential, CommandCall::InvitationList).await?;
+            let invitations = result
+                .as_array()
+                .with_context(|| "the answer carries no invitation list")?;
+            for invitation in invitations {
+                println!(
+                    "{} expires {}",
+                    invitation["id"].as_str().unwrap_or("-"),
+                    invitation["expires_at"].as_str().unwrap_or("-")
+                );
+            }
+        }
+        InvitationCommand::Revoke { invitation } => {
+            let invitation: Id = invitation
+                .parse()
+                .with_context(|| "an invitation identifier looks like an Id")?;
+            client::command(&credential, CommandCall::InvitationRevoke { invitation }).await?;
+            println!("Revoked the invitation {invitation}.");
+        }
+    }
+
+    Ok(())
+}
+
+async fn device_command(command: DeviceCommand) -> Result<()> {
+    let credential = Credential::load()?;
+    match command {
+        DeviceCommand::Approve { code } => {
+            let code = match code {
+                Some(code) => code,
+                None => {
+                    print!("Enter the code the CLI showed: ");
+                    std::io::stdout()
+                        .flush()
+                        .context("cannot write the prompt")?;
+                    let mut line = String::new();
+                    std::io::stdin()
+                        .lock()
+                        .read_line(&mut line)
+                        .context("cannot read the code")?;
+                    line.trim().to_owned()
+                }
+            };
+            println!(
+                "This approves a terminal to act as {} on {}.",
+                credential.account.display_name, credential.url
+            );
+            println!(
+                "Only approve a terminal you just started. Its session lasts until it signs out; closing the terminal does not end it, and this milestone has no device list to remove it."
+            );
+            let result = client::command(&credential, CommandCall::DeviceApprove { code }).await?;
+            let account = result["account"]["display_name"]
+                .as_str()
+                .unwrap_or(&credential.account.display_name);
+            println!("Approved a sign-in for {} on {}.", account, credential.url);
+        }
+    }
 
     Ok(())
 }
@@ -1267,29 +1665,24 @@ fn normalized_grant(path: &std::path::Path) -> Result<String> {
     })
 }
 
-/// Checks one grant path and returns the canonical path to store.
+/// Checks one grant path and returns it in the form the Space records.
 ///
-/// The folder must exist: the Computer opens it as a write root, and a grant
-/// for a folder nobody can see would silently write nowhere.
+/// The folder may be on another machine, so this client checks only the
+/// syntax: it cannot see whether the path exists or what it resolves to. The
+/// Computer resolves the folder when it opens the write root, and a grant for
+/// a folder that is not there fails the action that uses it.
 fn checked_grant(path: &std::path::Path) -> Result<String> {
-    let granted = normalized_grant(path)?;
-    let folder = std::fs::canonicalize(&granted)
-        .with_context(|| format!("the grant folder does not exist: {granted}"))?;
-    if !folder.is_dir() {
-        bail!("a grant must be a folder: {}", folder.display());
-    }
-
-    Ok(folder.to_string_lossy().into_owned())
+    normalized_grant(path)
 }
 
 /// Returns the folder a revoke names, preferring the path the record shows.
 ///
-/// A grant stores a folder's canonical path. The argument is compared as the
-/// User spelled it first, without trimming anything: a directory name that
-/// ends in a space keeps it, so `logs ` cannot take the grant for `logs`. Only
-/// after that does the raw path get normalized at the edge and resolved as a
-/// live alias — the same argument then removes the grant a symlink path added
-/// — and a path that is gone is matched by the value the record holds.
+/// A grant may name a folder on another machine, so this client compares the
+/// argument with the record's paths and never resolves it against this
+/// machine's filesystem. The argument is compared as the User spelled it
+/// first, without trimming anything: a directory name that ends in a space
+/// keeps it, so `logs ` cannot take the grant for `logs`. Only after that does
+/// the raw path get normalized at the edge.
 fn revocable_grant(path: &std::path::Path, shown: &[String]) -> Result<String> {
     let spelled = path.to_string_lossy();
     // The exact spelling, keeping every component. A path that is not a
@@ -1303,15 +1696,8 @@ fn revocable_grant(path: &std::path::Path, shown: &[String]) -> Result<String> {
     if let Some(recorded) = recorded_grant(shown, &normalized) {
         return Ok(recorded);
     }
-    let Ok(alias) = std::fs::canonicalize(&normalized) else {
-        return Ok(normalized);
-    };
-    let alias = alias.to_string_lossy().into_owned();
-    if let Some(recorded) = recorded_grant(shown, &alias) {
-        return Ok(recorded);
-    }
 
-    Ok(alias)
+    Ok(normalized)
 }
 
 /// Returns the recorded grant that names one folder, if the Bot has it.
@@ -1433,6 +1819,10 @@ fn visible_text(text: &str) -> String {
             '\n' => shown.push_str("\\n"),
             '\r' => shown.push_str("\\r"),
             '\t' => shown.push_str("\\t"),
+            // A line or paragraph separator ends a line the same way a
+            // newline does.
+            '\u{2028}' => shown.push_str("\\u{2028}"),
+            '\u{2029}' => shown.push_str("\\u{2029}"),
             ch if ch.is_control() => {
                 shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
             }
@@ -1858,6 +2248,15 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
             let id = id_of(&result, "computer")?;
             println!("Reset Computer {id} ({}).", text_of(&result, "kind")?);
         }
+        ComputerCommand::Revoke { computer } => {
+            let credential = Credential::load()?;
+            let result =
+                client::command(&credential, CommandCall::ComputerRevoke { computer }).await?;
+            let id = id_of(&result, "id")?;
+            println!(
+                "Revoked Computer {id}. Its daemon stops and the record stays offline; pair it again to use it."
+            );
+        }
         ComputerCommand::List => {
             let credential = Credential::load()?;
             let result = client::command(&credential, CommandCall::ComputerList).await?;
@@ -2117,6 +2516,33 @@ async fn file(command: FileCommand) -> Result<()> {
     Ok(())
 }
 
+/// Prints one run's plan the way `run plan` reports it.
+fn write_plan(out: &mut impl Write, result: &Value) -> Result<()> {
+    let run = id_of(result, "id")?;
+    let entries = result["plan"].as_array().cloned().unwrap_or_default();
+    if entries.is_empty() {
+        writeln!(out, "Plan for run {run}: no plan")?;
+        return Ok(());
+    }
+    let done = entries
+        .iter()
+        .filter(|entry| entry["state"].as_str() == Some("done"))
+        .count();
+    writeln!(out, "Plan for run {run}: {done} of {} done", entries.len())?;
+    for entry in &entries {
+        // A title is the Bot's own text: escaping its breaks and controls
+        // keeps one entry on one line and the terminal's state out of it.
+        writeln!(
+            out,
+            "  [{}] {}",
+            entry["state"].as_str().unwrap_or("?"),
+            visible_text(entry["title"].as_str().unwrap_or(""))
+        )?;
+    }
+
+    Ok(())
+}
+
 /// Reads the name the Space gave a File, as one path component.
 ///
 /// Only an implicit destination, or a `--out` directory, needs this name.
@@ -2145,6 +2571,11 @@ async fn run_command(command: RunCommand) -> Result<()> {
             let result = client::command(&credential, CommandCall::RunShow { run }).await?;
             let stdout = std::io::stdout();
             write_run(&mut stdout.lock(), &result)?;
+        }
+        RunCommand::Plan { run } => {
+            let result = client::command(&credential, CommandCall::RunShow { run }).await?;
+            let stdout = std::io::stdout();
+            write_plan(&mut stdout.lock(), &result)?;
         }
     }
 
@@ -4690,14 +5121,14 @@ mod tests {
 
     use crate::client::{Credential, SignedIn};
 
-    use super::{space_file_name, write_run};
+    use super::{space_file_name, write_plan, write_run};
 
     use clap::CommandFactory as _;
     use clap::Parser as _;
 
     use super::{
-        Cli, ComputerCommand, Top, computer_kind_label, pairing_hint, parse_bot_computer,
-        parse_protocol, parse_thinking,
+        Cli, ComputerCommand, RunCommand, Top, computer_kind_label, pairing_hint,
+        parse_bot_computer, parse_protocol, parse_thinking,
     };
 
     use super::{
@@ -5066,6 +5497,7 @@ mod tests {
             "usage": null,
             "steps": [],
             "actions": [],
+            "plan": [],
         });
         if let Some(position) = position {
             view["position"] = position.into();
@@ -5087,6 +5519,60 @@ mod tests {
         write_run(&mut shown, &running).unwrap();
         let shown = String::from_utf8(shown).unwrap();
         assert!(!shown.contains("position"), "{shown}");
+    }
+
+    #[test]
+    fn a_run_plan_prints_each_line_and_its_done_count() {
+        let mut view = run_view("succeeded", None);
+        view["plan"] = json!([
+            {"title": "Read the receipts", "state": "done"},
+            {"title": "Buy the pass", "state": "doing"},
+            {"title": "Email finance", "state": "pending"},
+        ]);
+        let mut shown = Vec::new();
+        write_plan(&mut shown, &view).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        let run = view["id"].as_str().unwrap();
+        assert!(
+            shown.starts_with(&format!("Plan for run {run}: 1 of 3 done\n")),
+            "{shown}"
+        );
+        assert!(shown.contains("  [done] Read the receipts"), "{shown}");
+        assert!(shown.contains("  [doing] Buy the pass"), "{shown}");
+        assert!(shown.contains("  [pending] Email finance"), "{shown}");
+
+        let empty = run_view("succeeded", None);
+        let mut shown = Vec::new();
+        write_plan(&mut shown, &empty).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(shown.contains(": no plan"), "{shown}");
+    }
+
+    #[test]
+    fn a_run_plan_title_prints_on_one_line() {
+        let mut view = run_view("succeeded", None);
+        view["plan"] = json!([
+            {"title": "a\nforged \u{1b}[31mred", "state": "doing"},
+        ]);
+        let mut shown = Vec::new();
+        write_plan(&mut shown, &view).unwrap();
+        let shown = String::from_utf8(shown).unwrap();
+        assert!(
+            shown.contains("  [doing] a\\nforged \\u{1b}[31mred\n"),
+            "{shown}"
+        );
+        assert_eq!(shown.lines().count(), 2, "{shown}");
+    }
+
+    #[test]
+    fn the_run_plan_command_parses() {
+        let id = Id::new();
+        match parse(&["run", "plan", id.to_string().as_str()]) {
+            Top::Run {
+                command: RunCommand::Plan { run },
+            } => assert_eq!(run, id),
+            _ => panic!("run plan did not parse"),
+        }
     }
 
     #[test]
@@ -7211,6 +7697,7 @@ mod tests {
                 id: Id::new(),
                 display_name: "Ada".to_owned(),
                 is_admin: false,
+                role: None,
             },
         }
     }
@@ -7917,6 +8404,7 @@ mod tests {
         assert_eq!(visible_text("one\ntwo"), r"one\ntwo");
         assert_eq!(visible_text("one\ttwo"), r"one\ttwo");
         assert_eq!(visible_text("one\rtwo"), r"one\rtwo");
+        assert_eq!(visible_text("one\u{2028}two"), r"one\u{2028}two");
         // Every other control character, including the C1 block, is named.
         assert_eq!(
             visible_text("\u{0}\u{7}\u{1b}\u{7f}\u{85}"),

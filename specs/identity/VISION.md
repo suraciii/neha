@@ -4,17 +4,17 @@
 
 A friend opens a link, picks a name and a passkey, and is in. Another user runs Neha on a home server at an IP address and sets a password instead. A third pairs a laptop by typing a code into the app.
 
-Identity has to disappear for a user alone, work on whatever the Space runs on, and never make the Admin configure email.
+Identity has to disappear for a user alone, work on whatever the Space runs on, and never make an Admin configure email.
 
 ## What
 
 A User's identity is an account on the Space: a display name and a way to sign in.
 
-A Local Space signs its first user in without a prompt; that user is its Admin.
+A Local Space signs its first user in without a prompt; that user is its Space Owner.
 
 A Space reached over the network signs a User in with a passkey, with a password, or with an external provider added as a Plugin.
 
-The Admin invites a User with a link. The invited User sets a name and a way to sign in, and joins.
+An Admin invites a User with a link. The invited User sets a name and a way to sign in, and joins.
 
 A device joins by showing a code that a signed-in User enters in an app. A Local Computer on the Space's own machine joins without one, through a local ticket.
 
@@ -33,9 +33,9 @@ Sign-in methods are Plugins because a Space that already has an identity provide
 ## Principles
 
 - **Accounts live on the Space.** A User is known to a Space by an account on it, with a display name and a way to sign in.
-- **No sign-in step when alone.** A Local Space signs its first user in without a prompt, and that user is its Admin.
+- **No sign-in step when alone.** A Local Space signs its first user in without a prompt, and that user is its Space Owner.
 - **Passkey when the Space can, password always.** A Space with a domain and HTTPS offers a passkey; every Space reached over the network offers a password.
-- **Invite by link.** The Admin makes an invitation link; the invited User sets up their own account.
+- **Invite by link.** An Admin makes an invitation link; the invited User sets up their own account.
 - **Devices join by code; a same-machine Computer by ticket.** A CLI shows a code, and a signed-in User enters it; a Local Computer on the Space's own machine joins through a local ticket.
 - **Sign-in methods are Plugins.** An external provider is added to a Space as a Plugin and shows up on its sign-in page.
 

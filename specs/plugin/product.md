@@ -36,13 +36,13 @@ A Plugin reads and writes the Space's record like a member. Removing a Plugin le
 
 ## Adding tools directly
 
-The Admin adds an MCP server for the Space under a name, and a User adds one for themselves or connects a Space's server with their own credential. The one who connects it supplies the credential: an access token, or a sign-in the browser completes.
+An Admin adds an MCP server for the Space under a name, and a User adds one for themselves or connects a Space's server with their own credential. The one who connects it supplies the credential: an access token, or a sign-in the browser completes.
 
 The Bot never sees the credential. A server the Space cannot reach stays listed and shows as not connected; a Bot that calls its tool gets that answer and says so.
 
 ## Installing a package
 
-The Admin installs a package from a source the Admin allows. The install pins the package's content and, for a repository, one commit, and shows what the package brings: its servers, its skills, and the parts it skipped.
+An Admin installs a package from a source an Admin allows. The install pins the package's content and, for a repository, one commit, and shows what the package brings: its servers, its skills, and the parts it skipped.
 
 Installing runs no code. Removing a package removes the servers and skills it brought, and leaves the record as it was.
 
@@ -60,11 +60,11 @@ A skill adds no authority: its instructions carry only what the Bot was already 
 
 A package can carry skills; installing it creates their entries in the Space's library.
 
-The Admin adds a skill to the Space's library; a Bot's owner adds one to that Bot's library and enables skills for the Bot. A skill that a Bot wrote itself is not installed; [Bot](../bot/product.md) covers it.
+An Admin adds a skill to the Space's library; a Bot's owner adds one to that Bot's library and enables skills for the Bot. A skill that a Bot wrote itself is not installed; [Bot](../bot/product.md) covers it.
 
 A script that a skill carries runs only as one of the Bot's actions, and its first run for the Bot and the acting User asks before it proceeds.
 
-The Admin can set a Space to treat skills as instructions only; then the scripts of a skill never reach a Computer.
+An Admin can set a Space to treat skills as instructions only; then the scripts of a skill never reach a Computer.
 
 ## Gaps
 
