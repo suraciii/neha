@@ -936,6 +936,8 @@ enum ScriptedReply {
         prompt: u64,
         completion: u64,
     },
+    /// The Provider refuses the request as larger than its context.
+    TooLarge,
 }
 
 /// A scripted Provider whose replies run in order; a `Hold` reply waits
@@ -988,6 +990,13 @@ async fn gated_provider(
                 let chosen = index.min(script.len().saturating_sub(1));
                 let reply = script.get(chosen).cloned().expect("a scripted reply");
                 let body = match reply {
+                    ScriptedReply::TooLarge => {
+                        return Response::builder()
+                            .status(axum::http::StatusCode::PAYLOAD_TOO_LARGE)
+                            .header(CONTENT_TYPE, "application/json")
+                            .body(Body::from("{\"error\":\"context length exceeded\"}"))
+                            .unwrap();
+                    }
                     ScriptedReply::Text(text) => {
                         let chunk = json!({"choices":[{"delta":{"content":text}}]});
                         format!("data: {chunk}\n\ndata: [DONE]\n\n")
@@ -4551,6 +4560,28 @@ fn chat_text_reply(text: &str) -> String {
 }
 
 /// A provider with two Models: one plain and one that thinks.
+/// The `ProviderAdd` that connects one Model with the given limits.
+fn provider_add_limits(base_url: String, context_limit: u32, max_output: u32) -> CommandCall {
+    CommandCall::ProviderAdd(ProviderAdd {
+        protocol: ProviderProtocol::ChatCompletions,
+        base_url,
+        api_key: "sk-test".to_owned(),
+        models: vec![ModelSpec {
+            name: "test-model".to_owned(),
+            context_limit,
+            max_output,
+            reads_images: false,
+            thinks: false,
+            tools: true,
+            thinking_levels: Vec::new(),
+        }],
+        default_model: Some("test-model".to_owned()),
+        thinking: None,
+        vendor: None,
+        discover: false,
+    })
+}
+
 fn provider_add_models(base_url: String, models: Vec<ModelSpec>) -> CommandCall {
     CommandCall::ProviderAdd(ProviderAdd {
         protocol: ProviderProtocol::ChatCompletions,
@@ -27208,5 +27239,288 @@ async fn a_rule_list_names_the_identity_each_rule_covers() {
 
     socket.close(None).await.unwrap();
     server_task.abort();
+    running.shutdown().await;
+}
+
+// ---- Context pruning and compaction ----
+
+/// A text of exactly `chars` characters that starts with `prefix`.
+fn long_text(prefix: &str, chars: usize) -> String {
+    format!("{prefix}{}", "x".repeat(chars.saturating_sub(prefix.len())))
+}
+
+fn bot_create() -> CommandCall {
+    CommandCall::BotCreate(BotCreate {
+        name: "Scout".to_owned(),
+        computer: None,
+        thinking: None,
+        model: None,
+    })
+}
+
+fn compacted_flags(messages: &[serde_json::Value]) -> Vec<bool> {
+    messages
+        .iter()
+        .map(|message| message["compacted"].as_bool().unwrap_or(false))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_chat_compacts_before_the_run() {
+    let (dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let rule = "Keep the deploy notes current.";
+    let long_reply = "y".repeat(3_500);
+    let summary = "Earlier the owner asked to keep the deploy notes current.";
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        tool(
+            "remember",
+            json!({"kind": "rule", "scope": "owner", "text": rule}),
+        ),
+        text(&long_reply),
+        text(&long_reply),
+        text("[{\"text\": \"the deploy notes live in eng/deploy.md\"}]"),
+        text(summary),
+        text("done after compaction"),
+    ])
+    .await;
+    command(
+        &mut socket,
+        Id::new(),
+        provider_add_limits(base, 6_000, 100),
+    )
+    .await;
+    let created = command(&mut socket, Id::new(), bot_create()).await;
+    let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+
+    let mut sent = Vec::new();
+    for index in 0..3 {
+        let message = long_text(&format!("note {index}: "), 5_000);
+        let result = send(&mut socket, chat, &message).await;
+        assert_eq!(result["status"], "succeeded", "{result}");
+        sent.push(message);
+    }
+
+    // The compacting run asked the Model for a flush, a summary, then its
+    // answer; both extra calls are separate requests to the same Model.
+    let requests = recorded.lock().unwrap().clone();
+    assert_eq!(requests.len(), 6, "two seed runs and the compacted run");
+    assert_eq!(requests[3]["max_tokens"], 4096, "the flush turn's cap");
+    assert_eq!(requests[4]["max_tokens"], 8192, "the summary's cap");
+    let main = &requests[5];
+    let system = main["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains(rule),
+        "the rule stays in the prompt: {system}"
+    );
+    assert!(system.contains("Your job"), "{system}");
+    let history = main["messages"].as_array().unwrap();
+    assert_eq!(
+        history.len(),
+        3,
+        "the request reads the summary and the text after the cut: {history:?}"
+    );
+    let summary_message = history[1]["content"].as_str().unwrap();
+    assert!(
+        summary_message.starts_with("Summary of earlier messages (data):"),
+        "{summary_message}"
+    );
+    assert!(summary_message.contains(summary), "{summary_message}");
+    assert_eq!(history[2]["content"].as_str().unwrap(), sent[2]);
+    assert!(
+        !main["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("note 0:")),
+        "the compacted text is not sent again"
+    );
+
+    // The Chat keeps every Message; only the boundary is marked, and the
+    // flush note is a record entry rather than a Message.
+    let chat_messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    let chat_messages = chat_messages.as_array().unwrap().clone();
+    assert_eq!(chat_messages.len(), 6);
+    assert_eq!(
+        compacted_flags(&chat_messages),
+        [false, false, false, true, false, false]
+    );
+    let boundary_seq = chat_messages[3]["seq"].clone();
+    let listed = command(&mut socket, Id::new(), CommandCall::MemoryList { bot }).await;
+    assert!(
+        listed["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["kind"] == "note" && entry["text"] == "the deploy notes live in eng/deploy.md"
+        }),
+        "{listed}"
+    );
+
+    // A caller that names the capability replays the compaction; one that
+    // does not skips it.
+    let mut capable =
+        open_socket_with(&running, &token, &[neha::surface::COMPACTION_CAPABILITY]).await;
+    let (_, events) = snapshot_events(&mut capable).await;
+    let compacted = events
+        .iter()
+        .find(|event| event.kind == neha::record::EventKind::ChatCompacted)
+        .expect("the record keeps the summary");
+    assert_eq!(compacted.data["up_to_seq"], boundary_seq);
+    assert_eq!(compacted.data["summary"], json!(summary));
+    let mut old = open_socket(&running, &token).await;
+    let (_, old_events) = snapshot_events(&mut old).await;
+    assert!(
+        !old_events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::ChatCompacted),
+        "an older reader skips the kind"
+    );
+
+    // A restart replays the same projection.
+    capable.close(None).await.unwrap();
+    old.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    running.shutdown().await;
+    let restarted = start(test_home(dir.path()), 0).await.unwrap();
+    let mut socket = open_socket(&restarted, &token).await;
+    let replayed = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    let replayed = replayed.as_array().unwrap().clone();
+    assert_eq!(replayed.len(), 6);
+    assert_eq!(
+        compacted_flags(&replayed),
+        [false, false, false, true, false, false]
+    );
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_that_says_the_input_is_too_long_compacts_and_retries() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, _token) = admin(&running, &invite).await;
+    let summary = "Earlier the owner sent two short notes.";
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![
+        text("first done"),
+        text("second done"),
+        ScriptedReply::TooLarge,
+        text("[{\"text\": \"the owner sent two notes\"}]"),
+        text(summary),
+        text("done after the retry"),
+    ])
+    .await;
+    let (_bot, chat, _computer) = tool_bot(&mut socket, base).await;
+    for message in ["first", "second"] {
+        let result = send(&mut socket, chat, message).await;
+        assert_eq!(result["status"], "succeeded", "{result}");
+    }
+
+    let third = send(&mut socket, chat, "third").await;
+    assert_eq!(third["status"], "succeeded", "{third}");
+    assert_eq!(third["text"], "done after the retry");
+    let requests = recorded.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        6,
+        "the refused request, the flush, the summary, and the retried request"
+    );
+    assert!(
+        requests[2]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["content"] == "third"),
+        "the first request held the whole Chat"
+    );
+    assert_eq!(requests[3]["max_tokens"], 4096);
+    assert_eq!(requests[4]["max_tokens"], 8192);
+    let retried = requests[5]["messages"].as_array().unwrap();
+    assert_eq!(retried.len(), 3, "{retried:?}");
+    assert!(
+        retried[1]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Summary of earlier messages (data):"),
+        "{retried:?}"
+    );
+
+    let chat_messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    let chat_messages = chat_messages.as_array().unwrap().clone();
+    assert_eq!(chat_messages.len(), 6, "every Message stays in the Chat");
+    assert_eq!(
+        compacted_flags(&chat_messages)
+            .iter()
+            .filter(|compacted| **compacted)
+            .count(),
+        1,
+        "the span ends at one Message"
+    );
+
+    socket.close(None).await.unwrap();
+    provider_task.abort();
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_with_no_span_to_compact_sends_only_the_run() {
+    let (_dir, running, invite) = running().await;
+    let (mut socket, token) = admin(&running, &invite).await;
+    let (base, provider_task, _gates, recorded) = gated_provider(vec![text("hello")]).await;
+    // A window this small makes every projection exceed the threshold; the
+    // conversation still has no span to summarize.
+    command(&mut socket, Id::new(), provider_add_limits(base, 100, 90)).await;
+    let created = command(&mut socket, Id::new(), bot_create()).await;
+    let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+
+    let result = send(&mut socket, chat, "hi").await;
+    assert_eq!(result["status"], "succeeded", "{result}");
+    assert_eq!(
+        recorded.lock().unwrap().len(),
+        1,
+        "a Chat with no span sends no flush and no summary request"
+    );
+
+    let mut capable =
+        open_socket_with(&running, &token, &[neha::surface::COMPACTION_CAPABILITY]).await;
+    let (_, events) = snapshot_events(&mut capable).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.kind == neha::record::EventKind::ChatCompacted)
+    );
+    let chat_messages = command(
+        &mut socket,
+        Id::new(),
+        CommandCall::ChatRead { chat, from: None },
+    )
+    .await;
+    assert!(
+        chat_messages
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["compacted"] == false)
+    );
+
+    capable.close(None).await.unwrap();
+    socket.close(None).await.unwrap();
+    provider_task.abort();
     running.shutdown().await;
 }

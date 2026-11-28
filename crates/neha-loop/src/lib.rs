@@ -16,6 +16,7 @@ pub use model::{
 };
 pub use run::{
     Authorization, Decision, Dispatched, LoopError, McpIdentity, RecordedCall, Recorder, Resume,
-    RunOutcome, RunRequest, Runtime, ScriptIdentity, WaitingApproval, call_id, run,
+    RunOutcome, RunRequest, Runtime, ScriptIdentity, WaitingApproval, call_id, chars_of,
+    context_threshold, estimate_tokens, message_chars, run,
 };
 pub use tools::SpaceCall;

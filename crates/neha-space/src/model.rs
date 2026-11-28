@@ -1459,6 +1459,7 @@ impl neha_loop::Model for SpaceModel<'_> {
                     code: error.code(),
                     detail: error.to_string(),
                     usage: error.usage().unwrap_or_default(),
+                    context_too_large: error.context_too_large(),
                 })?;
 
             Ok(neha_loop::ModelReply {
@@ -1759,6 +1760,17 @@ impl ModelError {
             | Self::ProviderStream { usage, .. }
             | Self::Retried { usage, .. } => Some(*usage),
             _ => None,
+        }
+    }
+
+    /// Returns whether the Provider said the request was larger than the
+    /// Model's context.
+    #[must_use]
+    pub fn context_too_large(&self) -> bool {
+        match self {
+            Self::ContextTooLarge => true,
+            Self::Retried { source, .. } => source.context_too_large(),
+            _ => false,
         }
     }
 

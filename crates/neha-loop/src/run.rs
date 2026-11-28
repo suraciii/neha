@@ -16,7 +16,9 @@ use neha_computer::{ActionResult, ActionStatus, ComputerRuntime, ToolOutput};
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::model::{Continuation, Message, Model, ModelFailure, ModelRequest, ToolCall, ToolSpec};
+use crate::model::{
+    Continuation, Message, Model, ModelFailure, ModelRequest, Role, ToolCall, ToolSpec,
+};
 use crate::tools::{self, SpaceCall};
 
 /// The largest raw tool-call arguments string a step event keeps whole.
@@ -30,6 +32,9 @@ pub struct RunRequest {
     pub history: Vec<Message>,
     /// The largest Model reply in tokens.
     pub max_output: u32,
+    /// The Model's context window in tokens; zero means unknown, so the run
+    /// neither prunes the projection nor compacts the conversation.
+    pub context_window: u32,
     /// How much thought the Model should give each reply.
     pub thinking: Option<neha::surface::ThinkingLevel>,
     /// Provider-native state from the step before this request, when resuming.
@@ -55,6 +60,7 @@ impl RunRequest {
             system: system.into(),
             history,
             max_output,
+            context_window: 0,
             thinking: None,
             continuation: None,
             max_steps: 8,
@@ -62,6 +68,13 @@ impl RunRequest {
             start_step: 1,
             tools: tools::specs(),
         }
+    }
+
+    /// Sets the Model's context window in tokens; zero means unknown.
+    #[must_use]
+    pub fn with_context_window(mut self, context_window: u32) -> Self {
+        self.context_window = context_window;
+        self
     }
 
     /// Names the tools the Model may call, in place of the built-in tools.
@@ -288,6 +301,19 @@ pub trait Recorder {
         call: &RecordedCall,
         answer: String,
     ) -> impl Future<Output = Result<ToolOutput, LoopError>> + Send;
+
+    /// Compacts the conversation into a projection the next request sends.
+    ///
+    /// The record keeps every Message; the returned projection is a summary of
+    /// the earlier span as a User Message, followed by the original text after
+    /// the cut. It carries no system Message: the loop keeps the one it was
+    /// given. `None` means the conversation has no span a summary can replace,
+    /// so the loop sends the request it would have sent.
+    fn compact(
+        &mut self,
+        step: u32,
+        messages: &[Message],
+    ) -> impl Future<Output = Result<Option<Vec<Message>>, LoopError>> + Send;
 }
 
 /// The skill and script one action runs, resolved before the action starts.
@@ -366,6 +392,7 @@ where
         system,
         history,
         max_output,
+        context_window,
         thinking,
         continuation,
         max_steps,
@@ -388,6 +415,12 @@ where
     let mut usage = resume
         .as_ref()
         .map_or(Usage::default(), |resume| resume.usage);
+    // The usage the Provider last reported for a plain step, with the number of
+    // Messages the request held: the estimate then counts only what the
+    // request added. A compaction replaces the projection and drops it.
+    let mut anchor: Option<(u32, usize)> = None;
+    // A run compacts at most once, whichever path asks for it.
+    let mut compacted = false;
 
     for step in first_step..=max_steps {
         let (calls, reply_usage, from, approved, all_done) = match resume.take() {
@@ -427,21 +460,52 @@ where
                 (calls, usage, from, approved_action, all_done)
             }
             None => {
-                let reply = match model
-                    .complete(ModelRequest {
-                        messages: messages.clone(),
-                        tools: tools.clone(),
-                        max_output,
-                        thinking,
-                        continuation: continuation.clone(),
-                    })
-                    .await
+                let schemas = tools.clone();
+                // The request is a projection: old tool results become
+                // placeholders, and a conversation that still does not fit is
+                // compacted once. The loop's own Messages keep the original
+                // text; only the copy sent to the Model is trimmed.
+                let mut request_messages =
+                    projected(&messages, &schemas, anchor, context_window, max_output);
+                if context_window != 0
+                    && !compacted
+                    && estimate_tokens(&request_messages, &schemas)
+                        >= context_threshold(context_window, max_output)
+                    && let Some(projection) = recorder.compact(step, &messages).await?
                 {
-                    Ok(reply) => reply,
-                    Err(failure) => {
-                        return Ok(failure_outcome(&failure, usage));
+                    compacted = true;
+                    messages = with_system(&messages, projection);
+                    request_messages = messages.clone();
+                }
+                let reply = loop {
+                    match model
+                        .complete(ModelRequest {
+                            messages: request_messages.clone(),
+                            tools: schemas.clone(),
+                            max_output,
+                            thinking,
+                            continuation: continuation.clone(),
+                        })
+                        .await
+                    {
+                        Ok(reply) => break reply,
+                        Err(failure) => {
+                            // A Provider that reports the input as too long
+                            // gets one compaction and one retry; the same
+                            // answer again ends the run with its error.
+                            if failure.context_too_large && context_window != 0 && !compacted {
+                                compacted = true;
+                                if let Some(projection) = recorder.compact(step, &messages).await? {
+                                    messages = with_system(&messages, projection);
+                                    request_messages = messages.clone();
+                                    continue;
+                                }
+                            }
+                            return Ok(failure_outcome(&failure, usage));
+                        }
                     }
                 };
+                anchor = Some((prompt_tokens(reply.usage), messages.len()));
                 usage += reply.usage;
                 if reply.tool_calls.is_empty() {
                     // A step with no actions completes when the Model answers,
@@ -631,6 +695,155 @@ where
         usage,
         succeeded: false,
     })
+}
+
+/// Returns the tokens a Provider counts as input: everything but the reply.
+fn prompt_tokens(usage: Usage) -> u32 {
+    let tokens = usage
+        .uncached_input
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
+
+    u32::try_from(tokens).unwrap_or(u32::MAX)
+}
+
+/// The characters of one Message as the Model reads it.
+pub fn message_chars(message: &Message) -> u64 {
+    let mut chars = message
+        .content
+        .as_deref()
+        .map_or(0, |text| text.len() as u64);
+    chars = chars.saturating_add(
+        message
+            .tool_call_id
+            .as_deref()
+            .map_or(0, |id| id.len() as u64),
+    );
+    for call in &message.tool_calls {
+        chars = chars
+            .saturating_add(call.id.len() as u64)
+            .saturating_add(call.name.len() as u64)
+            .saturating_add(call.arguments.len() as u64);
+    }
+
+    chars
+}
+
+/// The characters of some Messages as the Model reads them.
+pub fn chars_of(messages: &[Message]) -> u64 {
+    messages.iter().map(message_chars).sum()
+}
+
+/// The characters of the tool schemas a request carries.
+fn tool_chars(tools: &[ToolSpec]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| {
+            (tool.name.len() + tool.description.len() + tool.parameters.to_string().len()) as u64
+        })
+        .sum()
+}
+
+/// Estimates the tokens a request costs, at four characters per token.
+///
+/// With an anchor, the Provider's own count of the previous request covers
+/// the system Message, the tool schemas, and the Messages before the anchor;
+/// only what the request added is counted again.
+#[must_use]
+pub fn estimate_tokens(messages: &[Message], tools: &[ToolSpec]) -> u32 {
+    let chars = chars_of(messages).saturating_add(tool_chars(tools));
+
+    u32::try_from(chars / 4).unwrap_or(u32::MAX)
+}
+
+fn estimate_with_anchor(
+    messages: &[Message],
+    tools: &[ToolSpec],
+    anchor: Option<(u32, usize)>,
+) -> u32 {
+    match anchor {
+        Some((tokens, index)) if index <= messages.len() => {
+            let added = u32::try_from(chars_of(&messages[index..]) / 4).unwrap_or(u32::MAX);
+            tokens.saturating_add(added)
+        }
+        _ => estimate_tokens(messages, tools),
+    }
+}
+
+/// The token budget above which a conversation compacts.
+///
+/// A window with no headroom over its own maximum output keeps the smaller
+/// budget; otherwise the budget is the smaller of 80% of the window and the
+/// window minus the maximum output minus the 65536-token reserve. A window
+/// that cannot hold its own maximum output leaves a budget of one.
+#[must_use]
+pub fn context_threshold(context_window: u32, max_output: u32) -> u32 {
+    let headroom = max_output.saturating_add(65_536);
+    if context_window <= headroom {
+        return context_window.saturating_sub(max_output).max(1);
+    }
+    let eighty_percent = u32::try_from(u64::from(context_window) * 4 / 5).unwrap_or(u32::MAX);
+
+    eighty_percent.min(context_window - headroom)
+}
+
+/// The largest number of tool results a projection keeps raw.
+const KEPT_TOOL_RESULTS: usize = 3;
+
+/// The text a pruned tool result carries; it names the call it answered.
+const PRUNED_TOOL_RESULT: &str = "[tool result removed from context; call ";
+
+/// The Messages one request sends: the loop's own, with old tool results
+/// replaced until the estimate fits the Model's window.
+fn projected(
+    messages: &[Message],
+    tools: &[ToolSpec],
+    anchor: Option<(u32, usize)>,
+    context_window: u32,
+    max_output: u32,
+) -> Vec<Message> {
+    if context_window == 0 {
+        return messages.to_vec();
+    }
+    let threshold = context_threshold(context_window, max_output);
+    if estimate_with_anchor(messages, tools, anchor) < threshold {
+        return messages.to_vec();
+    }
+    // The three most recent results always stay; the older ones become
+    // placeholders, oldest first, until the estimate fits.
+    let results: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == Role::Tool)
+        .map(|(index, _)| index)
+        .collect();
+    let mut projection = messages.to_vec();
+    let Some(removable) = results.len().checked_sub(KEPT_TOOL_RESULTS) else {
+        return projection;
+    };
+    for &index in &results[..removable] {
+        let call = projection[index].tool_call_id.clone().unwrap_or_default();
+        projection[index].content = Some(format!("{PRUNED_TOOL_RESULT}{call}]"));
+        if estimate_tokens(&projection, tools) < threshold {
+            break;
+        }
+    }
+
+    projection
+}
+
+/// Puts a compaction projection after the loop's system Message.
+fn with_system(messages: &[Message], projection: Vec<Message>) -> Vec<Message> {
+    let mut kept = Vec::with_capacity(projection.len() + 1);
+    if messages
+        .first()
+        .is_some_and(|message| message.role == Role::System)
+    {
+        kept.push(messages[0].clone());
+    }
+    kept.extend(projection);
+
+    kept
 }
 
 /// Runs one memory call and returns what the Model reads.
@@ -862,8 +1075,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        Authorization, Dispatched, LoopError, RecordedCall, Recorder, Resume, RunOutcome,
-        RunRequest, Runtime, WaitingApproval, call_id, run,
+        Authorization, Decision, Dispatched, LoopError, RecordedCall, Recorder, Resume, RunOutcome,
+        RunRequest, Runtime, WaitingApproval, call_id, context_threshold, estimate_tokens, run,
     };
     use crate::model::{
         Continuation, Message, Model, ModelFailure, ModelReply, ModelRequest, Role, ToolCall,
@@ -1003,6 +1216,10 @@ mod tests {
         finished: Vec<(u32, ActionStatus)>,
         memories: Vec<(u32, tools::MemoryCall)>,
         refusals: Vec<(u32, String, String)>,
+        /// The projections `compact` returns, in order; `None` once it runs out.
+        compactions: VecDeque<Option<Vec<Message>>>,
+        /// The steps and Messages `compact` was asked about.
+        compacted: Vec<(u32, Vec<Message>)>,
         /// The method that fails, named by its entry in `order`.
         fail_at: Option<&'static str>,
         order: Vec<&'static str>,
@@ -1118,6 +1335,17 @@ mod tests {
                 .push((step, call.call.clone(), answer.clone()));
 
             Ok(ToolOutput::full(answer))
+        }
+
+        async fn compact(
+            &mut self,
+            step: u32,
+            messages: &[Message],
+        ) -> Result<Option<Vec<Message>>, LoopError> {
+            self.record("compact")?;
+            self.compacted.push((step, messages.to_vec()));
+
+            Ok(self.compactions.pop_front().unwrap_or(None))
         }
     }
 
@@ -2245,6 +2473,7 @@ mod tests {
                 output: 12,
                 ..Usage::default()
             },
+            context_too_large: false,
         })]);
         let runtime = FakeRuntime::default();
         let mut recorder = TestRecorder::default();
@@ -2522,6 +2751,191 @@ mod tests {
         assert_eq!(
             tool_messages(&requests[1]),
             [("call-1".to_owned(), refusal)]
+        );
+    }
+
+    fn too_large() -> Result<ModelReply, ModelFailure> {
+        Err(ModelFailure {
+            code: neha::error::ErrorCode::InvalidArgument,
+            detail: "the request is larger than the Model's context".to_owned(),
+            usage: Usage::default(),
+            context_too_large: true,
+        })
+    }
+
+    #[test]
+    fn the_context_threshold_keeps_the_output_and_reserve_it_needs() {
+        // A large window compacts at 80% or at the window minus its output and
+        // the 65536-token reserve, whichever is smaller.
+        assert_eq!(context_threshold(200_000, 8_192), 126_272);
+        assert_eq!(context_threshold(1_000_000, 8_192), 800_000);
+        // A window that cannot hold its own maximum output leaves one token.
+        assert_eq!(context_threshold(100, 200), 1);
+        // A window with no headroom over the reserve compacts at being full.
+        assert_eq!(context_threshold(1_000, 100), 900);
+    }
+
+    #[test]
+    fn an_estimate_counts_text_and_tool_schemas_at_four_characters_a_token() {
+        let messages = vec![Message::system("ab"), Message::user("cdef")];
+        let tools = vec![ToolSpec {
+            name: "shell".to_owned(),
+            description: "run".to_owned(),
+            parameters: json!({}),
+        }];
+
+        assert_eq!(estimate_tokens(&messages, &tools), 4);
+        assert_eq!(estimate_tokens(&messages, &[]), 1);
+    }
+
+    #[tokio::test]
+    async fn the_projection_keeps_the_three_newest_tool_results_raw() {
+        let history = vec![
+            Message::user("go"),
+            Message::tool_result("old", "a".repeat(4_000)),
+            Message::tool_result("older", "b".repeat(4_000)),
+            Message::tool_result("newest", "c".repeat(4_000)),
+            Message::tool_result("newer", "d".repeat(4_000)),
+        ];
+        let model = FakeModel::with(vec![Err(ModelFailure {
+            code: neha::error::ErrorCode::InvalidArgument,
+            detail: "unused".to_owned(),
+            usage: Usage::default(),
+            context_too_large: false,
+        })]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+        let request = RunRequest::new("system", history, 100)
+            .with_context_window(4_000)
+            .with_max_steps(1);
+
+        let _ = run(&runtime, &model, &mut recorder, request).await;
+
+        let requests = model.requests.lock().unwrap();
+        let results = tool_messages(&requests[0]);
+        assert_eq!(results.len(), 4, "every result still answers its call");
+        assert!(
+            results[0].1.contains("call old"),
+            "the oldest result becomes a placeholder naming its call: {}",
+            results[0].1
+        );
+        for expected in ["b".repeat(4_000), "c".repeat(4_000), "d".repeat(4_000)] {
+            assert!(
+                results.iter().any(|(_, content)| *content == expected),
+                "the three newest results stay raw"
+            );
+        }
+        assert_eq!(
+            recorder.compacted.len(),
+            0,
+            "a projection that fits after pruning takes no summary"
+        );
+        assert!(recorder.compactions.is_empty(), "the fake never compacted");
+    }
+
+    #[tokio::test]
+    async fn an_over_budget_projection_compacts_once_and_retries_the_step() {
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder {
+            compactions: VecDeque::from([Some(vec![Message::user("summary")])]),
+            ..TestRecorder::default()
+        };
+        let request =
+            RunRequest::new("system", vec![Message::user("go")], 100).with_context_window(100);
+
+        let (text, _, succeeded) =
+            reply_outcome(run(&runtime, &model, &mut recorder, request).await);
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(recorder.compacted.len(), 1, "the step compacted once");
+        assert_eq!(recorder.compacted[0].0, 1);
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the retried step asked the Model once");
+        assert_eq!(requests[0].messages[0], Message::system("system"));
+        assert_eq!(requests[0].messages[1], Message::user("summary"));
+    }
+
+    #[tokio::test]
+    async fn a_context_too_large_failure_compacts_once_and_retries() {
+        let model = FakeModel::with(vec![too_large(), reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder {
+            compactions: VecDeque::from([Some(vec![Message::user("summary")])]),
+            ..TestRecorder::default()
+        };
+        let request = RunRequest::new("system", vec![Message::user("go")], 100)
+            .with_context_window(1_000_000);
+
+        let (text, _, succeeded) =
+            reply_outcome(run(&runtime, &model, &mut recorder, request).await);
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert_eq!(recorder.compacted.len(), 1, "the failure compacted once");
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "the request was retried once");
+        assert_eq!(requests[1].messages[1], Message::user("summary"));
+    }
+
+    #[tokio::test]
+    async fn a_context_too_large_failure_without_a_cut_ends_the_run() {
+        let model = FakeModel::with(vec![too_large()]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder::default();
+        let request = RunRequest::new("system", vec![Message::user("go")], 100)
+            .with_context_window(1_000_000);
+
+        let (text, _, succeeded) =
+            reply_outcome(run(&runtime, &model, &mut recorder, request).await);
+
+        assert!(!succeeded);
+        assert!(text.contains("larger than the Model's context"), "{text}");
+        assert_eq!(recorder.compacted.len(), 1, "the loop asked once");
+        assert_eq!(model.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_context_too_large_failure_ends_the_run() {
+        let model = FakeModel::with(vec![too_large(), too_large()]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder {
+            compactions: VecDeque::from([Some(vec![Message::user("summary")])]),
+            ..TestRecorder::default()
+        };
+        let request = RunRequest::new("system", vec![Message::user("go")], 100)
+            .with_context_window(1_000_000);
+
+        let (_, _, succeeded) = reply_outcome(run(&runtime, &model, &mut recorder, request).await);
+
+        assert!(!succeeded);
+        assert_eq!(recorder.compacted.len(), 1, "only one compaction and retry");
+        assert_eq!(model.requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_window_neither_prunes_nor_compacts() {
+        let mut long = "x".repeat(40_000);
+        let history = vec![Message::user(std::mem::take(&mut long))];
+        let model = FakeModel::with(vec![reply("done")]);
+        let runtime = FakeRuntime::default();
+        let mut recorder = TestRecorder {
+            compactions: VecDeque::from([Some(vec![Message::user("summary")])]),
+            ..TestRecorder::default()
+        };
+        let request = RunRequest::new("system", history, 100);
+
+        let (text, _, succeeded) =
+            reply_outcome(run(&runtime, &model, &mut recorder, request).await);
+
+        assert_eq!(text, "done");
+        assert!(succeeded);
+        assert!(recorder.compacted.is_empty());
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(
+            requests[0].messages[1].content.as_deref(),
+            Some("x".repeat(40_000).as_str())
         );
     }
 }

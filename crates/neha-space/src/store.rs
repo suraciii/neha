@@ -1281,6 +1281,17 @@ mod tests {
                 }),
             )
             .acting(user),
+            EventKind::ChatCompacted => EventDraft::new(
+                kind,
+                Author::Bot(Id::new()),
+                serde_json::json!({
+                    "chat": Id::new(),
+                    "bot": Id::new(),
+                    "up_to_seq": 1,
+                    "summary": "earlier messages",
+                }),
+            )
+            .acting(user),
         }
     }
 

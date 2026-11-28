@@ -22,18 +22,22 @@ pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// The capability a caller names to receive the memory event kinds.
 pub const MEMORY_CAPABILITY: &str = "memory";
 
+/// The capability a caller names to receive the compaction event kind.
+pub const COMPACTION_CAPABILITY: &str = "compaction";
+
 /// Returns the capability a caller must name to read one event kind the
 /// protocol version does not already carry.
 ///
 /// A kind this function does not name is one every caller of the current
-/// protocol version reads; the memory kinds are the later Presentation kinds
-/// a capability admits.
+/// protocol version reads; the memory and compaction kinds are the later
+/// Presentation kinds a capability admits.
 #[must_use]
 pub const fn event_capability(kind: crate::record::EventKind) -> Option<&'static str> {
     match kind {
         crate::record::EventKind::MemoryAdded
         | crate::record::EventKind::MemoryRemoved
         | crate::record::EventKind::MemoryAnswered => Some(MEMORY_CAPABILITY),
+        crate::record::EventKind::ChatCompacted => Some(COMPACTION_CAPABILITY),
         _ => None,
     }
 }
@@ -754,9 +758,9 @@ pub enum ServerFrame {
 #[cfg(test)]
 mod tests {
     use super::{
-        BotComputer, BotCreate, BotUpdate, ClientFrame, CommandCall, MEMORY_CAPABILITY,
-        McpSignInStart, MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd, ProviderConnect,
-        ProviderProtocol, ServerFrame, ThinkingLevel, event_capability,
+        BotComputer, BotCreate, BotUpdate, COMPACTION_CAPABILITY, ClientFrame, CommandCall,
+        MEMORY_CAPABILITY, McpSignInStart, MessageSend, ModelSpec, PROTOCOL_VERSION, ProviderAdd,
+        ProviderConnect, ProviderProtocol, ServerFrame, ThinkingLevel, event_capability,
     };
     use crate::error::ErrorCode;
     use crate::id::Id;
@@ -1408,6 +1412,10 @@ mod tests {
         for kind in memory_kinds {
             assert_eq!(event_capability(kind), Some(MEMORY_CAPABILITY));
         }
+        assert_eq!(
+            event_capability(crate::record::EventKind::ChatCompacted),
+            Some(COMPACTION_CAPABILITY)
+        );
         for kind in [
             crate::record::EventKind::MessageAdded,
             crate::record::EventKind::RunReply,
