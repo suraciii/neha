@@ -16,7 +16,7 @@ ts-rs.workspace = true
 aes-gcm = "0.10"
 argon2 = { version = "0.5", features = ["std"] }
 axum = { version = "0.8", features = ["http1", "json", "tokio", "ws"] }
-base64 = "0.22"
+base64 = "0.23"
 eventsource-stream = "0.2"
 flate2 = "1"
 futures-util.workspace = true
