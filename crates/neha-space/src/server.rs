@@ -5,7 +5,7 @@
 //! HTTP. The server listens on loopback until a remote Space is configured.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -55,6 +55,7 @@ use crate::config::{Config, ConfigError, Storage};
 use crate::home::Home;
 use crate::identity::{Account, Identity, IdentityError, PairingState};
 use crate::model::{ModelClient, ModelError};
+use crate::proxy::{self, TrustedProxies};
 use crate::runs::RunQueue;
 use crate::secrets::{Secrets, SecretsError};
 use crate::state::State as SpaceState;
@@ -219,6 +220,8 @@ pub struct SpaceServer {
     browser_authority: Mutex<Option<String>>,
     /// The public https origin a trusted TLS proxy forwards to this Space.
     public_url: Option<String>,
+    /// The peers whose forwarded client address this Space reads.
+    trusted_proxies: Option<TrustedProxies>,
     /// The installed browser clients' push subscriptions.
     pub(crate) push: std::sync::Arc<crate::push::Push>,
     /// The browser sign-ins the Space is waiting on, by sign-in.
@@ -445,6 +448,7 @@ impl SpaceServer {
             browser_host,
             browser_authority: Mutex::new(None),
             public_url,
+            trusted_proxies: None,
             push,
             signins: tokio::sync::Mutex::new(HashMap::new()),
             signin_start: tokio::sync::Mutex::new(()),
@@ -759,6 +763,92 @@ pub async fn start_with_worker_config(
     .await
 }
 
+/// A validated start with its listener already bound.
+///
+/// Prepare it before opening a home: an invalid public origin, proxy list, or
+/// plaintext listener must fail without clearing a home or touching a record.
+/// The prepared listener is the one the start uses, so the address that was
+/// checked is the address that serves.
+pub struct Startup {
+    listener: TcpListener,
+    addr: SocketAddr,
+    public_url: Option<String>,
+    trusted_proxies: Option<TrustedProxies>,
+    worker_config: Option<crate::workers::WorkerConfig>,
+}
+
+/// Validates the startup configuration and binds its listener.
+///
+/// Resolve the configuration in one place before the caller opens its home.
+/// A hostname is resolved once here and every address is checked; the bound
+/// address is checked again so a wildcard listener cannot pass by name. This
+/// is the production entry, so it also reads the deployment's worker
+/// configuration.
+pub async fn prepare_start(port: u16, public_url: Option<String>) -> Result<Startup, ServerError> {
+    prepare_start_with(port, public_url, crate::workers::WorkerConfig::from_env()).await
+}
+
+async fn prepare_start_with(
+    port: u16,
+    public_url: Option<String>,
+    worker_config: Option<crate::workers::WorkerConfig>,
+) -> Result<Startup, ServerError> {
+    let public_url = normalize_public_url(public_url)?;
+    let trusted_proxies = TrustedProxies::from_env().map_err(ServerError::TrustedProxies)?;
+    // A containerized Space listens on its private network so Caddy and its
+    // workers can reach it; a Local Space keeps the loopback default. A
+    // listener beyond this machine needs the TLS proxy its public origin names.
+    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
+    let addresses = (bind.as_str(), port)
+        .to_socket_addrs()
+        .map_err(ServerError::Io)?
+        .collect::<Vec<_>>();
+    if addresses.is_empty() {
+        return Err(ServerError::Io(std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            format!("{bind}:{port} resolves to no address"),
+        )));
+    }
+    for address in &addresses {
+        refuse_unencrypted_listener(*address, public_url.as_deref())?;
+    }
+    let mut last_error = None;
+    let mut listener = None;
+    for address in addresses {
+        match TcpListener::bind(address).await {
+            Ok(bound) => {
+                listener = Some(bound);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let listener = listener.ok_or_else(|| {
+        ServerError::Io(last_error.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "no address to bind")
+        }))
+    })?;
+    let addr = listener.local_addr()?;
+    refuse_unencrypted_listener(addr, public_url.as_deref())?;
+
+    Ok(Startup {
+        listener,
+        addr,
+        public_url,
+        trusted_proxies,
+        worker_config,
+    })
+}
+
+/// Starts a UI-serving Space from a prepared start.
+pub async fn start_with_ui_prepared(
+    home: Home,
+    ui: Option<PathBuf>,
+    startup: Startup,
+) -> Result<Running, ServerError> {
+    start_prepared(home, ui, neha_computer::local::DEFAULT_TIMEOUT, startup).await
+}
+
 async fn start_with_workers(
     home: Home,
     port: u16,
@@ -767,23 +857,34 @@ async fn start_with_workers(
     public_url: Option<String>,
     worker_config: Option<crate::workers::WorkerConfig>,
 ) -> Result<Running, ServerError> {
+    let startup = prepare_start_with(port, public_url, worker_config).await?;
+    start_prepared(home, ui, tool_timeout, startup).await
+}
+
+async fn start_prepared(
+    home: Home,
+    ui: Option<PathBuf>,
+    tool_timeout: Duration,
+    startup: Startup,
+) -> Result<Running, ServerError> {
     if let Some(dir) = &ui
         && !dir.join("index.html").is_file()
     {
         return Err(ServerError::Ui(dir.clone()));
     }
-    let server = Arc::new(
+    let Startup {
+        listener,
+        addr,
+        public_url,
+        trusted_proxies,
+        worker_config,
+    } = startup;
+    let mut server =
         SpaceServer::open_with_ui_workers(home, ui, tool_timeout, public_url, worker_config)
-            .await?,
-    );
+            .await?;
+    server.trusted_proxies = trusted_proxies;
+    let server = Arc::new(server);
     validate_client_directory(&server).await?;
-    // The port is bound before anything is written or woken: a start that
-    // cannot listen must not make a run, reach a Provider, or record a failure.
-    // A containerized Space listens on its private network so Caddy and its
-    // workers can reach it; a Local Space keeps the loopback default.
-    let bind = std::env::var("NEHA_BIND").unwrap_or_else(|_| "127.0.0.1".to_owned());
-    let listener = TcpListener::bind((bind.as_str(), port)).await?;
-    let addr = listener.local_addr()?;
     let browser_authority = match &server.public_url {
         Some(public) => public.strip_prefix("https://").unwrap_or(public).to_owned(),
         None => format!("{}:{}", server.browser_host, addr.port()),
@@ -1065,37 +1166,24 @@ fn loopback_host(value: &str) -> bool {
             .is_ok_and(|address| address.is_loopback())
 }
 
-/// Returns the client address, trusting a forwarded one only from loopback.
+/// Refuses a listener beyond this machine without a public origin.
 ///
-/// A TLS proxy on the Space's machine connects from loopback and appends the
-/// client to `X-Forwarded-For`; a proxy on another machine does not get to
-/// name the client. Only the final appended value counts.
-fn client_ip(peer: IpAddr, headers: &HeaderMap) -> IpAddr {
-    if !peer.is_loopback() {
-        return peer;
+/// A TLS proxy terminates the public connection and forwards to a Space that
+/// listens on a private address. Without a configured public origin there is
+/// no such proxy, so serving the private address would offer the Space in
+/// plaintext to everything that can reach it.
+fn refuse_unencrypted_listener(
+    addr: SocketAddr,
+    public_url: Option<&str>,
+) -> Result<(), ServerError> {
+    if addr.ip().is_loopback() || public_url.is_some() {
+        return Ok(());
     }
-    // Select the final raw field first. A malformed field must fail closed to
-    // the peer, not expose an earlier client-supplied field.
-    let Some(value) = headers.get_all("x-forwarded-for").iter().next_back() else {
-        return peer;
-    };
-    let Some(value) = value.to_str().ok() else {
-        return peer;
-    };
-    forwarded_ip(value)
-        .filter(|address| !address.is_loopback())
-        .unwrap_or(peer)
-}
 
-/// Returns the final address in one forwarded field, or `None` when it is not
-/// an address. Earlier values are the client's claim, not the proxy's.
-fn forwarded_ip(value: &str) -> Option<IpAddr> {
-    let last = value.split(',').next_back()?.trim().trim_matches('"');
-    let last = last
-        .strip_prefix('[')
-        .and_then(|last| last.strip_suffix(']'))
-        .unwrap_or(last);
-    last.parse().ok()
+    Err(ServerError::UnencryptedListener(format!(
+        "a Space that listens beyond this machine needs a TLS proxy: pass --domain or set \
+         NEHA_PUBLIC_URL, or keep NEHA_BIND on loopback (it names {addr})"
+    )))
 }
 
 fn split_authority(value: &str) -> Option<(&str, Option<&str>)> {
@@ -2163,7 +2251,7 @@ async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
-    let source = client_ip(source.ip(), &headers);
+    let source = proxy::client_ip(source.ip(), &headers, server.trusted_proxies.as_ref());
     if !server
         .login
         .lock()
@@ -2774,6 +2862,8 @@ async fn computer_pair(
     ConnectInfo(source): ConnectInfo<SocketAddr>,
     Json(request): Json<PairTicketRequest>,
 ) -> Result<Json<PairedComputerBody>, ApiError> {
+    // The ticket belongs to the Space's own machine: this route counts its
+    // attempts by the direct TCP peer and never reads a forwarded header.
     if !server.pairs.lock().expect("pair lock").allows(source.ip()) {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -4167,6 +4257,12 @@ pub enum ServerError {
     /// The public URL for a Space behind a trusted TLS proxy is invalid.
     #[error("public URL error: {0}")]
     PublicUrl(String),
+    /// The trusted proxy list cannot be used.
+    #[error("trusted proxy error: {0}")]
+    TrustedProxies(String),
+    /// A listener beyond this machine has no TLS proxy in front.
+    #[error("listener error: {0}")]
+    UnencryptedListener(String),
 }
 
 /// What the integration tests need from inside this module.
@@ -4581,43 +4677,17 @@ mod tests {
     }
 
     #[test]
-    fn a_forwarded_address_is_used_only_from_a_loopback_proxy() {
-        use axum::http::{HeaderMap, HeaderValue};
+    fn a_listener_beyond_the_machine_needs_a_public_origin() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:7337".parse().unwrap();
+        let ipv6_loopback: std::net::SocketAddr = "[::1]:7337".parse().unwrap();
+        let beyond: std::net::SocketAddr = "0.0.0.0:7337".parse().unwrap();
+        let public = "https://space.example.com";
 
-        let headers = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("x-forwarded-for", HeaderValue::from_str(value).unwrap());
-            headers
-        };
-        let proxy = std::net::IpAddr::from([127, 0, 0, 1]);
-        let client = std::net::IpAddr::from([203, 0, 113, 7]);
-        let remote = std::net::IpAddr::from([192, 0, 2, 1]);
-        assert_eq!(
-            super::client_ip(proxy, &headers("10.0.0.4, 203.0.113.7")),
-            client
-        );
-        assert_eq!(super::client_ip(remote, &headers("203.0.113.7")), remote);
-        assert_eq!(super::client_ip(proxy, &headers("garbage")), proxy);
-        assert_eq!(
-            super::client_ip(proxy, &headers("203.0.113.7, 127.0.0.1")),
-            proxy
-        );
-        assert_eq!(super::forwarded_ip("10.0.0.4, 203.0.113.7"), Some(client));
-        assert_eq!(super::forwarded_ip("203.0.113.7, garbage"), None);
-        assert_eq!(super::forwarded_ip("127.0.0.1"), Some(proxy));
-
-        let mut fields = HeaderMap::new();
-        fields.append("x-forwarded-for", HeaderValue::from_static("198.51.100.9"));
-        fields.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
-        assert_eq!(super::client_ip(proxy, &fields), client);
-
-        let mut invalid = HeaderMap::new();
-        invalid.append("x-forwarded-for", HeaderValue::from_static("203.0.113.7"));
-        invalid.append(
-            "x-forwarded-for",
-            HeaderValue::from_bytes(&[0xFF]).expect("obs-text is a header value"),
-        );
-        assert_eq!(super::client_ip(proxy, &invalid), proxy);
+        assert!(super::refuse_unencrypted_listener(loopback, None).is_ok());
+        assert!(super::refuse_unencrypted_listener(ipv6_loopback, None).is_ok());
+        assert!(super::refuse_unencrypted_listener(beyond, Some(public)).is_ok());
+        let error = super::refuse_unencrypted_listener(beyond, None).unwrap_err();
+        assert!(error.to_string().contains("TLS proxy"));
     }
 
     #[test]

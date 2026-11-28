@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod model;
 pub mod oauth;
 pub mod plugins;
+mod proxy;
 mod push;
 pub mod remote;
 pub mod runs;
@@ -36,7 +37,10 @@ pub use model::{ChatMessage, ChatReply, ChatRole, ModelClient, ModelError, Usage
 pub use secrets::{Secrets, SecretsError};
 #[cfg(feature = "test-support")]
 pub use server::start_with_worker_config;
-pub use server::{Running, ServerError, SpaceServer, start, start_with_ui, start_with_ui_public};
+pub use server::{
+    Running, ServerError, SpaceServer, Startup, prepare_start, start, start_with_ui,
+    start_with_ui_prepared, start_with_ui_public,
+};
 pub use skills::{SkillDocument, SkillError};
 pub use state::{
     BotView, ChatStatus, ChatView, ComputerView, FileView, MessageView, ModelView, ProviderView,
