@@ -107,7 +107,7 @@ Unread is the client's own memory of a Message that landed while the User was no
 
 A Chat shows its Messages oldest first, grouped by day. A User Message aligns to the end of the stream; a Bot Message aligns to the start.
 
-Every User who reads the Chat sees a marker where a compacted part ends, and it says that earlier Messages were compacted. The marker has no action, the Chat still shows every Message, and no summary appears to the User.
+Every User who reads the Chat sees a marker where a compacted part ends, and it says that earlier Messages were compacted. The marker has no action, the Chat still shows every Message, and no summary appears to the User. The marker comes from the record, so a reload shows it again in the same place.
 
 A Message that carries a File shows a file card with the File's name and size. Choosing the card downloads the File, and the browser opens no File itself. [Message](../messaging/message/product.md#files) owns what a File is and where its bytes live.
 

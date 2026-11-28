@@ -117,6 +117,10 @@ The directory is that run's write root, is recorded with the run and shown on an
 
 The directory MUST exist and be a folder. In granted mode a directory inside a hidden root, or one that holds a hidden path, is refused. The shell mounts an external write root read-write only when its tree holds no link or special file and stays inside the Computer's scan limits; the file tools check every write path.
 
+## Chat
+
+`neha chat read <chat>` prints the Chat's Messages oldest first. Where a compacted span ends, it marks that earlier Messages were compacted and prints no summary.
+
 ## Memory
 
 The Bot's owner and a User allowed to use the Bot read its memory from the CLI. [Bot](../bot/product.md#memory) owns what a memory entry is, its kinds and scopes, and who reads and clears one.
