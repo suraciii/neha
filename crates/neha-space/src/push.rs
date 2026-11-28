@@ -149,21 +149,39 @@ impl Push {
                 Ok(store) => (store, None),
                 Err(error) => {
                     let message = format!("the push subscriptions are not readable: {error}");
-                    eprintln!("neha: {message}");
+                    tracing::warn!(
+                        target: "neha::push",
+                        event = "push.disabled",
+                        reason = "subscriptions_unreadable",
+                        error_kind = "parse",
+                        "web push is disabled for this start"
+                    );
                     (Store::default(), Some(message))
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Store::default(), None),
             Err(error) => {
                 let message = format!("the push subscriptions could not be read: {error}");
-                eprintln!("neha: {message}");
+                tracing::warn!(
+                    target: "neha::push",
+                    event = "push.disabled",
+                    reason = "subscriptions_read_failed",
+                    error_kind = "io",
+                    "web push is disabled for this start"
+                );
                 (Store::default(), Some(message))
             }
         };
         let key = match secrets.vapid_private_key() {
             Ok(key) => Some(key),
-            Err(error) => {
-                eprintln!("neha: web push is disabled: {error}");
+            Err(_) => {
+                tracing::warn!(
+                    target: "neha::push",
+                    event = "push.disabled",
+                    reason = "vapid_key",
+                    error_kind = "secrets",
+                    "web push is disabled for this start"
+                );
                 None
             }
         };
@@ -529,7 +547,13 @@ async fn process(server: &Arc<SpaceServer>, event: Event, cursor: &mut Seq) {
             Delivery::Gone => server.push.remove(&subscription),
             Delivery::Failed(status) => {
                 let host = endpoint_host(&subscription.endpoint);
-                eprintln!("neha: a push to {host} failed ({status})");
+                tracing::warn!(
+                    target: "neha::push",
+                    event = "push.fail",
+                    endpoint_host = %host,
+                    status = %status,
+                    "a push could not be delivered"
+                );
             }
         }
     }

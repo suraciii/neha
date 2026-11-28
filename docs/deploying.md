@@ -123,7 +123,7 @@ Notifications are available in an installed client on the public HTTPS origin. O
 - **Upgrade.** Replace the binary and the built client, then restart the Space. [Upgrade a Space](upgrading.md) covers the backup, the schema migration, and the version check. Open clients load the new build on their next open.
 - **Backup.** Back up the Space's home directory, and keep the Vault's master key with it; [Storage](storage.md) covers the File store. The same home holds sealed notification keys and device subscriptions, so a backup restores notifications too.
 - **Notifications.** The Space reaches each browser's push service directly over outbound HTTPS; it does not use HTTP proxy environment variables. A phone must install the client from the public origin; on iOS and iPadOS, Web Push works only from the Home Screen. See [Notifications](notifications.md).
-- **Logs.** Read the Space's output from the service manager, for example `journalctl -u neha`.
+- **Logs.** The Space writes JSON diagnostics to stderr; read them from the service manager, for example `journalctl -u neha -o cat | jq .`. [Diagnostics](diagnostics.md) covers `NEHA_LOG`, the fields, and the report a failed start leaves.
 
 ## Limits
 

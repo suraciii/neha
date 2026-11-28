@@ -29,6 +29,12 @@ thiserror = "2"
 ts-rs = { version = "12.0.1", features = ["no-serde-warnings"] }
 tokio = "1"
 toml = "1.2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "registry", "std", "tracing-log"] }
+json-subscriber = { version = "0.3.1", features = ["tracing-log", "tracing-opentelemetry-0-34"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+tracing-opentelemetry = { version = "0.34", default-features = false, features = ["tracing-log"] }
 
 # Workspace-wide lints. `cargo clippy -- -D warnings` turns every warning into a
 # failure, so a crate that needs an exception narrows it locally and states why.

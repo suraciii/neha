@@ -56,6 +56,9 @@ services:
       NEHA_WORKER_SUPERVISOR_TOKEN: ${NEHA_SUPERVISOR_TOKEN:?set NEHA_SUPERVISOR_TOKEN in .env}
       NEHA_WORKER_ALWAYS_ON: ${NEHA_WORKER_ALWAYS_ON:-0}
       NEHA_WORKER_IDLE_SECONDS: ${NEHA_WORKER_IDLE_SECONDS:-600}
+      NEHA_LOG: ${NEHA_LOG:-info}
+      NEHA_LOG_FORMAT: ${NEHA_LOG_FORMAT:-json}
+      NEHA_ENV: ${NEHA_ENV:-production}
     volumes:
       - ./data:/data
     networks:

@@ -7,6 +7,8 @@
 pub mod cli;
 pub mod client;
 pub mod computer;
+pub(crate) mod diag;
+pub(crate) mod signals;
 
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

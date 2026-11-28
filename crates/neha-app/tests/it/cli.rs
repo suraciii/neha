@@ -6653,6 +6653,52 @@ async fn a_skill_runs_its_script_after_one_answer() {
     provider_task.abort();
 }
 
+/// At `trace`, a dependency's own request and message logs must stay off: the
+/// CLI sends its bearer token in the WebSocket handshake, and Tungstenite would
+/// print the whole request. Only Neha's allowlisted targets are enabled.
+#[test]
+fn a_trace_level_never_logs_the_saved_bearer_token() {
+    let directory = tempfile::tempdir().expect("directory");
+    let (_server, _url) = space_with_admin(directory.path(), None);
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&credential).expect("the credential file"))
+            .expect("the credential is JSON");
+    let token = saved["token"].as_str().expect("a device token").to_owned();
+    assert!(!token.is_empty());
+
+    let output = Command::new(BIN)
+        .args(["bot", "list"])
+        .env("NEHA_HOME", &home)
+        .env("NEHA_CREDENTIAL", &credential)
+        .env("NEHA_PASSWORD", PASSWORD)
+        .env("NEHA_LOG", "trace")
+        .output()
+        .expect("neha runs");
+    assert!(
+        output.status.success(),
+        "`neha bot list` failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains(&token),
+        "the bearer token appeared in trace logs"
+    );
+    assert!(!stderr.is_empty(), "the trace run wrote no diagnostic");
+    for line in stderr.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("a dependency wrote a non-diagnostic line: {line}: {error}")
+        });
+        assert!(
+            value["event"].is_string(),
+            "a line without an event: {line}"
+        );
+    }
+}
+
 #[test]
 fn a_cli_signs_in_with_a_device_code_from_another_terminal() {
     let directory = tempfile::tempdir().unwrap();

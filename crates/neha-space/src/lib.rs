@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod commands;
 pub mod computer_link;
 pub mod config;
+pub mod diagnostics;
 pub mod home;
 pub mod identity;
 pub mod mcp;

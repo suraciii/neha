@@ -274,6 +274,17 @@ pub enum BlobsError {
 }
 
 impl BlobsError {
+    /// Names the stage that failed, for logs; the display text can carry a
+    /// remote response body and must not.
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Open(_) => "open",
+            Self::Backend(_) => "backend",
+            Self::Local(_) => "local",
+            Self::MalformedDigest(_) => "digest",
+        }
+    }
+
     /// Returns whether the dependency may recover: a temporary network or
     /// service failure or a rate limit answers `503 Unavailable`, while a
     /// configuration error or bytes missing under a recorded digest answers

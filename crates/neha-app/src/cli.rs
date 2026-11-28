@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal as _, Write};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
@@ -20,7 +20,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::client::Credential;
-use crate::{client, computer};
+use crate::{client, computer, diag, signals};
 
 /// Run a Space and talk to its Bots.
 #[derive(Parser)]
@@ -793,7 +793,9 @@ pub async fn run() -> Result<()> {
     // by reqwest's `rustls` feature). The command socket chooses it explicitly
     // before it connects.
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    diag::init(mode_of(&cli.command))?;
+    let result = match cli.command {
         Top::Serve { port, ui, domain } => serve(port, ui, domain).await,
         Top::Join { link, name } => join(&link, &name).await,
         Top::Login {
@@ -818,22 +820,54 @@ pub async fn run() -> Result<()> {
         Top::Skill { command } => skill_command(command).await,
         Top::Mcp { command } => mcp_command(command).await,
         Top::Plugin { command } => plugin_command(command).await,
+    };
+    diag::shutdown();
+    result
+}
+
+/// The service and default level a command runs under.
+fn mode_of(command: &Top) -> diag::Mode {
+    match command {
+        Top::Serve { .. } => diag::Mode::Serve,
+        Top::Computer {
+            command: ComputerCommand::Run { .. } | ComputerCommand::Worker,
+        } => diag::Mode::Computer,
+        _ => diag::Mode::Cli,
     }
 }
 
 async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>) -> Result<()> {
+    // Register before the home opens or the listener binds: a service manager
+    // that reads readiness and stops at once must still reach this handler.
+    let mut stop = signals::Stop::install().context("cannot listen for a stop signal")?;
     let ui = ui
         .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
         .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
     if let Some(path) = &ui
         && !path.join("index.html").is_file()
     {
+        tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase = "ui",
+            error_kind = "ui",
+            error_message = "the browser client has no index.html",
+            "the Space could not start"
+        );
         bail!("the browser client at {} has no index.html", path.display());
     }
     let domain = match domain.or_else(|| std::env::var("NEHA_DOMAIN").ok()) {
         Some(value) => {
             let value = value.trim().to_owned();
             if value.is_empty() {
+                tracing::error!(
+                    target: "neha::space",
+                    event = "space.start.failed",
+                    phase = "config",
+                    error_kind = "public_url",
+                    error_message = "the public domain is empty",
+                    "the Space could not start"
+                );
                 bail!("--domain needs a host");
             }
             Some(value)
@@ -846,6 +880,14 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
             || domain.contains('?')
             || domain.contains('#'))
     {
+        tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase = "config",
+            error_kind = "public_url",
+            error_message = "the public domain is not a host",
+            "the Space could not start"
+        );
         bail!("--domain takes a host[:port], not a URL or path");
     }
     let public_url = match domain {
@@ -859,15 +901,48 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
     // Validate the origin, proxy list, and listener before opening the home:
     // a start that may not serve must not rename a database or clear temporary
     // files. The bound listener is the one this start uses.
-    let startup = neha_space::prepare_start(port, public_url)
-        .await
-        .context("the Space cannot start")?;
-    let home = Home::from_env()
-        .context("NEHA_HOME is not set; set it to the directory that holds this Space")?;
+    let startup = match neha_space::prepare_start(port, public_url).await {
+        Ok(startup) => startup,
+        Err(error) => {
+            let (phase, error_kind, message) = diag::startup_failure(&error);
+            tracing::error!(
+                target: "neha::space",
+                event = "space.start.failed",
+                phase,
+                error_kind,
+                error_message = message.as_str(),
+                "the Space could not start"
+            );
+            return Err(error).context("the Space cannot start");
+        }
+    };
+    let home = match Home::from_env() {
+        Ok(home) => home,
+        Err(error) => {
+            let (error_kind, message) = diag::home_failure(&error);
+            tracing::error!(
+                target: "neha::space",
+                event = "space.start.failed",
+                phase = "home",
+                error_kind,
+                error_message = message.as_str(),
+                "the Space could not start"
+            );
+            return Err(error)
+                .context("NEHA_HOME is not set; set it to the directory that holds this Space");
+        }
+    };
     let has_ui = ui.is_some();
-    let running = neha_space::start_with_ui_prepared(home, ui, startup)
-        .await
-        .context("the Space cannot start")?;
+    let failure_home = home.clone();
+    let running = match neha_space::start_with_ui_prepared(home, ui, startup).await {
+        Ok(running) => running,
+        Err(error) => {
+            let (phase, error_kind, message) = diag::startup_failure(&error);
+            report_start_failure(&failure_home, phase, error_kind, &message);
+            return Err(error).context("the Space cannot start");
+        }
+    };
+    let running_since = Instant::now();
     let public = running.public_url();
     let cli_server = public.clone().unwrap_or_else(|| running.url());
 
@@ -899,12 +974,48 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
     }
     println!("Press Ctrl-C to stop.");
 
-    tokio::signal::ctrl_c()
+    let reason = stop
+        .wait()
         .await
-        .context("cannot listen for Ctrl-C")?;
+        .context("cannot listen for a stop signal")?;
+    tracing::info!(
+        target: "neha::space",
+        event = "space.stop",
+        reason = %reason,
+        uptime_s = running_since.elapsed().as_secs(),
+        "the Space is stopping"
+    );
     running.shutdown().await;
 
     Ok(())
+}
+
+/// Records a failed start in the log and leaves a private report under the home.
+///
+/// The message is a typed summary, never a raw error display: a configuration
+/// or remote error can quote a value, a path, or a response. The caller's own
+/// exit message keeps the original text.
+fn report_start_failure(home: &Home, phase: &str, error_kind: &str, message: &str) {
+    match diag::write_startup_failure(home.root(), phase, error_kind, message) {
+        Ok(path) => tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase,
+            error_kind,
+            error_message = message,
+            file = path.display().to_string().as_str(),
+            "the Space could not start; a private report was saved"
+        ),
+        Err(write) => tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase,
+            error_kind,
+            error_message = message,
+            write_error = neha_space::diagnostics::scrub_error(&write.to_string()).as_str(),
+            "the Space could not start; the report could not be saved"
+        ),
+    }
 }
 
 async fn join(link: &str, name: &str) -> Result<()> {
