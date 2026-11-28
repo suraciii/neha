@@ -28,6 +28,11 @@ serde_json.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+# The integration tests live in one binary and need the `test-support` feature.
+[[test]]
+name = "it"
+required-features = ["test-support"]
+
 # The workspace forbids unsafe code; this crate narrows that to the libc calls
 # a Computer needs: killing a shell's whole process group, writing through
 # directory file descriptors so no symlink or hard link is followed, and
