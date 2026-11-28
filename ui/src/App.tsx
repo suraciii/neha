@@ -27,6 +27,7 @@ import type {
   Computer,
   Decision,
   FileSummary,
+  MemoryList,
   Message,
   Model,
   Preview,
@@ -137,6 +138,12 @@ function failActivity(current: RunActivity | null, run: string, error: string | 
   };
 }
 
+// A Bot's memory before a page reads one: no entry, and no room to show. A page
+// reads the entries and the limits together, so it never renders this.
+function emptyMemories(): MemoryList {
+  return { entries: [], used: { rule: 0, note: 0 }, limits: { rule: 0, note: 0 } };
+}
+
 interface State {
   account: Account | null;
   providers: Provider[];
@@ -169,11 +176,12 @@ interface State {
   busy: boolean;
   error: unknown | null;
   // The Bot page: the Bot on screen, the Computer it works on, the Computers it
-  // may move to, and the rules that hold it.
+  // may move to, the rules that hold it, and the memory it keeps.
   pageBot: Bot | null;
   pageComputer: Computer | null;
   computers: Computer[];
   rules: Rule[];
+  memories: MemoryList;
   // The Settings surface: every vendor the catalog knows, and the cache state.
   vendors: CatalogVendor[];
   catalog: CatalogStatus | null;
@@ -211,6 +219,7 @@ function emptyState(): State {
     pageComputer: null,
     computers: [],
     rules: [],
+    memories: emptyMemories(),
     vendors: [],
     catalog: null,
     managing: false,
@@ -884,6 +893,10 @@ export default function App() {
     }
     if (event.kind === "neha.rule.added" || event.kind === "neha.rule.removed") {
       void refreshRules();
+      return;
+    }
+    if (event.kind === "neha.memory.added" || event.kind === "neha.memory.removed") {
+      void refreshMemories();
       return;
     }
     if (event.kind === "neha.provider.models_updated") {
@@ -1643,7 +1656,13 @@ export default function App() {
       if (pageBotId() !== null) {
         pageGen += 1;
         setPageBotId(null);
-        update({ pageBot: null, pageComputer: null, rules: [], manageError: null });
+        update({
+          pageBot: null,
+          pageComputer: null,
+          rules: [],
+          memories: emptyMemories(),
+          manageError: null,
+        });
       }
     } else if (shown.bot !== pageBotId()) {
       const bot = state.bots.find((known) => known.id === shown.bot);
@@ -1692,19 +1711,27 @@ export default function App() {
     pushTrail(view());
     pageGen += 1;
     setPageBotId(bot.id);
-    update({ pageBot: null, pageComputer: null, rules: [], manageError: null, managing: true });
+    update({
+      pageBot: null,
+      pageComputer: null,
+      rules: [],
+      memories: emptyMemories(),
+      manageError: null,
+      managing: true,
+    });
     await reloadPageBot(bot.id);
   }
 
   // Everything one Bot's page shows, read together so the Bot, its Computer,
-  // the Computers it may move to, its Models, and its rules are one answer
-  // rather than reads that can disagree with each other.
+  // the Computers it may move to, its Models, its rules, and its memory are one
+  // answer rather than reads that can disagree with each other.
   async function readBotPage(id: string) {
-    const [shown, computers, models, rules] = await Promise.all([
+    const [shown, computers, models, rules, memories] = await Promise.all([
       commands.command<BotResult>("bot_show", { bot: id }),
       commands.command<Computer[]>("computer_list"),
       commands.command<Model[]>("model_list"),
       commands.command<Rule[]>("rule_list", { bot: id }),
+      commands.command<MemoryList>("memory_list", { bot: id }),
     ]);
     return {
       pageBot: shown.bot,
@@ -1712,6 +1739,7 @@ export default function App() {
       computers,
       models,
       rules,
+      memories,
     };
   }
 
@@ -1954,6 +1982,42 @@ export default function App() {
     const id = state.pageBot?.id;
     if (!id) return;
     await writeRule(id, "rule_remove", { rule });
+  }
+
+  // Reads one Bot's memory again, so a write shows without a page reload. A
+  // read that lands after the User opened another Bot is dropped.
+  async function refreshMemories() {
+    const id = state.pageBot?.id;
+    if (!id) return;
+    const gen = pageGen;
+    try {
+      const memories = await commands.command<MemoryList>("memory_list", { bot: id });
+      if (gen !== pageGen) return;
+      update({ memories });
+    } catch {
+      // A failed read keeps the memory the page already shows.
+    }
+  }
+
+  // Clears one memory entry and reads the Bot's memory again, so the list and
+  // the room each kind has left follow. A write that lands after the User
+  // opened another Bot is dropped: the entry it would clear belongs to a Bot
+  // the User is no longer reading.
+  async function removeMemory(memory: string) {
+    const id = state.pageBot?.id;
+    if (!id) return;
+    const gen = pageGen;
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("memory_remove", { bot: id, memory });
+      if (gen !== pageGen) return;
+      const memories = await commands.command<MemoryList>("memory_list", { bot: id });
+      if (gen !== pageGen) return;
+      update({ memories, managing: false });
+    } catch (reason) {
+      if (gen !== pageGen) return;
+      update({ manageError: reason, managing: false });
+    }
   }
 
   // Reads the catalog's vendors and its cache state, which is what the Settings
@@ -2289,6 +2353,7 @@ export default function App() {
                           computers={state.computers}
                           models={state.models}
                           rules={state.rules}
+                          memories={state.memories}
                           busy={state.managing}
                           error={manageErrorText()}
                           onBack={closeManage}
@@ -2301,6 +2366,7 @@ export default function App() {
                           onReset={() => resetWorkspace()}
                           onRuleAdd={(rule) => addRule(rule)}
                           onRuleRemove={(rule) => removeRule(rule)}
+                          onMemoryRemove={(memory) => removeMemory(memory)}
                         />
                       )}
                     </Show>

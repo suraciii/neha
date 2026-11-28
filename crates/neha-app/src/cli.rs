@@ -6,6 +6,7 @@ use std::io::{BufRead, IsTerminal as _, Write};
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{ArgGroup, Parser, Subcommand};
 use neha::id::Id;
+use neha::memory::MemoryKind;
 use neha::record::{ComputerSharing, RuleEffect};
 use neha::seq::Seq;
 use neha::surface::{
@@ -282,8 +283,26 @@ enum BotCommand {
         /// The Bot identifier.
         bot: Id,
     },
+    /// Show your Bot's memory, or remove one of its entries.
+    Memory {
+        /// The Bot identifier; `remove` names the Bot instead.
+        bot: Option<Id>,
+        #[command(subcommand)]
+        command: Option<MemoryCommand>,
+    },
     /// List your Bots.
     List,
+}
+
+#[derive(Subcommand)]
+enum MemoryCommand {
+    /// Remove one memory entry.
+    Remove {
+        /// The Bot whose memory holds the entry.
+        bot: Id,
+        /// The memory entry identifier.
+        entry: Id,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1073,6 +1092,102 @@ fn write_access(out: &mut impl Write, bot: &Value) -> Result<()> {
     Ok(())
 }
 
+/// The line that says how a Bot gets its first memory entry.
+const EMPTY_MEMORY: &str = "No memory entries. Ask the Bot in a Chat to remember something.";
+
+/// Formats a memory list: one line per entry, then the room each kind has.
+fn memory_rows(list: &Value) -> Result<Vec<String>> {
+    let entries = list["entries"]
+        .as_array()
+        .context("no memory entries in the answer")?;
+    let mut rows: Vec<String> = entries.iter().map(memory_row).collect::<Result<_>>()?;
+    if entries.is_empty() {
+        rows.push(EMPTY_MEMORY.to_owned());
+    }
+    rows.extend(memory_usage_rows(list)?);
+
+    Ok(rows)
+}
+
+/// Formats one memory entry as a single line.
+///
+/// An entry the caller does not read prints its metadata and `(metadata only)`
+/// in place of the text the Space withheld.
+fn memory_row(entry: &Value) -> Result<String> {
+    let content = if entry["readable"].as_bool().unwrap_or(false) {
+        text_of(entry, "text")?.to_owned()
+    } else {
+        "(metadata only)".to_owned()
+    };
+
+    Ok(format!(
+        "{}  {}  {}  author {}  source {} {}  {}  {}",
+        id_of(entry, "memory")?,
+        text_of(entry, "kind")?,
+        text_of(entry, "scope")?,
+        text_of(entry, "author")?,
+        text_of(entry, "source_kind")?,
+        text_of(entry, "source")?,
+        byte_size(size_of(entry, "size")?),
+        content,
+    ))
+}
+
+/// The room each memory kind has: its used size and its limit.
+fn memory_usage_rows(list: &Value) -> Result<Vec<String>> {
+    let used = list["used"]
+        .as_object()
+        .context("the answer has no memory usage")?;
+    let limits = list["limits"]
+        .as_object()
+        .context("the answer has no memory limits")?;
+    let mut rows = Vec::new();
+    for kind in MemoryKind::ALL {
+        let name = kind.as_str();
+        let used = used
+            .get(name)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("the answer has no {name} memory usage"))?;
+        let limit = limits
+            .get(name)
+            .and_then(Value::as_u64)
+            .with_context(|| format!("the answer has no {name} memory limit"))?;
+        rows.push(format!(
+            "{name}: {} used / {} limit",
+            byte_size(used),
+            byte_size(limit)
+        ));
+    }
+
+    Ok(rows)
+}
+
+/// Returns the number in one of a list's fields.
+fn size_of(value: &Value, field: &str) -> Result<u64> {
+    value[field]
+        .as_u64()
+        .with_context(|| format!("the answer has no numeric {field}"))
+}
+
+/// A byte count for a reader: `62 B`, `1.5 KiB`, `4.0 KiB`, `16 KiB`.
+fn byte_size(bytes: u64) -> String {
+    const UNITS: [&str; 3] = ["KiB", "MiB", "GiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
 /// Prints the risk full access takes and asks the User to confirm it.
 ///
 /// `--yes` answers the prompt; a non-interactive run without it is an error,
@@ -1310,6 +1425,33 @@ async fn bot(command: BotCommand) -> Result<()> {
                 println!("  thinking: {thinking}");
             }
         }
+        BotCommand::Memory { bot, command } => match command {
+            None => {
+                let Some(bot) = bot else {
+                    bail!(
+                        "`neha bot memory` needs a Bot: run `neha bot memory <bot>` to list \
+                         its memory, or `neha bot memory remove <bot> <entry>` to remove one"
+                    );
+                };
+                let list = client::command(&credential, CommandCall::MemoryList { bot }).await?;
+                for row in memory_rows(&list)? {
+                    println!("{row}");
+                }
+            }
+            Some(MemoryCommand::Remove { bot, entry }) => {
+                // The Space refuses an entry that belongs to another Bot.
+                let result = client::command(
+                    &credential,
+                    CommandCall::MemoryRemove { bot, memory: entry },
+                )
+                .await?;
+                let shown = result
+                    .get("memory")
+                    .and_then(Value::as_str)
+                    .map_or_else(|| entry.to_string(), str::to_owned);
+                println!("Removed memory {shown}.");
+            }
+        },
         BotCommand::List => {
             let result = client::command(&credential, CommandCall::BotList).await?;
             for bot in result.as_array().context("no Bots in the answer")? {
@@ -2585,7 +2727,10 @@ mod tests {
         write_approval_details,
     };
 
-    use super::{BotCommand, confirm_full_access, normalized_grant, write_access};
+    use super::{
+        BotCommand, MemoryCommand, byte_size, confirm_full_access, memory_rows, normalized_grant,
+        write_access,
+    };
 
     /// Parses a CLI command line.
     fn parse(args: &[&str]) -> Top {
@@ -3068,6 +3213,61 @@ mod tests {
             ])
             .is_err(),
             "an unknown effect is refused"
+        );
+    }
+
+    #[test]
+    fn the_bot_memory_commands_parse_their_contract_shapes() {
+        let bot = Id::new();
+        let bot_text = bot.to_string();
+        let entry = Id::new();
+        let entry_text = entry.to_string();
+
+        // `neha bot memory <bot>` lists one Bot's memory.
+        match parse(&["bot", "memory", bot_text.as_str()]) {
+            Top::Bot {
+                command:
+                    BotCommand::Memory {
+                        bot: shown,
+                        command,
+                    },
+            } => {
+                assert_eq!(shown, Some(bot));
+                assert!(command.is_none(), "the list shape names no subcommand");
+            }
+            _ => panic!("bot memory did not parse"),
+        }
+
+        // `neha bot memory remove <bot> <entry>` removes one entry.
+        match parse(&[
+            "bot",
+            "memory",
+            "remove",
+            bot_text.as_str(),
+            entry_text.as_str(),
+        ]) {
+            Top::Bot {
+                command:
+                    BotCommand::Memory {
+                        bot: listed,
+                        command:
+                            Some(MemoryCommand::Remove {
+                                bot: shown,
+                                entry: removed,
+                            }),
+                    },
+            } => {
+                assert_eq!(listed, None, "the nested shape names the Bot after remove");
+                assert_eq!(shown, bot);
+                assert_eq!(removed, entry);
+            }
+            _ => panic!("bot memory remove did not parse"),
+        }
+
+        // `remove` needs both ids; a missing one is refused by the parser.
+        assert!(Cli::try_parse_from(["neha", "bot", "memory", "remove"]).is_err());
+        assert!(
+            Cli::try_parse_from(["neha", "bot", "memory", "remove", bot_text.as_str()]).is_err()
         );
     }
 
@@ -3686,6 +3886,85 @@ mod tests {
             decision_line(false, approval, None),
             format!("Denied {approval}.")
         );
+    }
+
+    #[test]
+    fn memory_rows_print_the_pinned_columns_and_metadata_only() {
+        let memory = Id::new();
+        let bot = Id::new();
+        let user = Id::new();
+        let source = Id::new();
+        let list = json!({
+            "entries": [
+                {
+                    "memory": memory,
+                    "kind": "rule",
+                    "scope": "owner",
+                    "author": user,
+                    "author_bot": false,
+                    "source": source,
+                    "source_kind": "message",
+                    "size": 30,
+                    "readable": true,
+                    "text": "Keep the deploy notes current.",
+                },
+                {
+                    "memory": Id::new(),
+                    "kind": "note",
+                    "scope": "user",
+                    "author": bot,
+                    "author_bot": true,
+                    "source": Id::new(),
+                    "source_kind": "run",
+                    "size": 1536,
+                    "readable": false,
+                },
+            ],
+            "used": {"rule": 30, "note": 1536},
+            "limits": {"rule": 4096, "note": 16384},
+        });
+
+        let rows = memory_rows(&list).unwrap();
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert_eq!(
+            rows[0],
+            format!(
+                "{memory}  rule  owner  author {user}  source message {source}  30 B  Keep the deploy notes current."
+            )
+        );
+        // The owner sees an entry the owner does not read as metadata only.
+        assert!(rows[1].contains("note  user  author "), "{rows:?}");
+        assert!(rows[1].ends_with("1.5 KiB  (metadata only)"), "{rows:?}");
+        assert_eq!(rows[2], "rule: 30 B used / 4.0 KiB limit");
+        assert_eq!(rows[3], "note: 1.5 KiB used / 16 KiB limit");
+    }
+
+    #[test]
+    fn an_empty_memory_says_how_to_write_one() {
+        let list = json!({
+            "entries": [],
+            "used": {"rule": 0, "note": 0},
+            "limits": {"rule": 4096, "note": 16384},
+        });
+
+        assert_eq!(
+            memory_rows(&list).unwrap(),
+            vec![
+                "No memory entries. Ask the Bot in a Chat to remember something.".to_owned(),
+                "rule: 0 B used / 4.0 KiB limit".to_owned(),
+                "note: 0 B used / 16 KiB limit".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_memory_size_is_human_readable() {
+        assert_eq!(byte_size(0), "0 B");
+        assert_eq!(byte_size(20), "20 B");
+        assert_eq!(byte_size(1536), "1.5 KiB");
+        assert_eq!(byte_size(4096), "4.0 KiB");
+        assert_eq!(byte_size(16384), "16 KiB");
+        assert_eq!(byte_size(32 * 1024 * 1024), "32 MiB");
     }
 
     #[test]

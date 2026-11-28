@@ -38,6 +38,9 @@ describe("i18n", () => {
     expect(t("bots.new.computer")).toBe("Computer");
     expect(t("bots.new.computer.offline")).toContain("离线");
     expect(t("bots.new.noProvider")).toContain("Provider");
+    // A Bot's memory copy names the Chat and the Bot with the catalog's spacing.
+    expect(t("bot.memory.empty")).toBe("在 Chat 里让 Bot 记住一些事情。");
+    expect(t("bot.memory.scope.owner")).toBe("所有者");
   });
 
   it("names what a Chat waits for, in the reader's language", () => {

@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::event::EventClass;
 use crate::file::{MAX_FILE_BYTES, is_sha256};
 use crate::id::Id;
+use crate::memory::{MemoryKind, MemoryScope, MemorySourceKind};
 use crate::seq::Seq;
 use crate::time::Timestamp;
 use crate::usage::Usage;
@@ -106,6 +107,12 @@ pub enum EventKind {
     /// A lasting rule was removed.
     #[serde(rename = "neha.rule.removed")]
     RuleRemoved,
+    /// A Bot learned a memory entry.
+    #[serde(rename = "neha.memory.added")]
+    MemoryAdded,
+    /// A Bot's memory entry was removed.
+    #[serde(rename = "neha.memory.removed")]
+    MemoryRemoved,
 }
 
 impl EventKind {
@@ -138,6 +145,8 @@ impl EventKind {
             Self::ApprovalDecided => "neha.approval.decided",
             Self::RuleAdded => "neha.rule.added",
             Self::RuleRemoved => "neha.rule.removed",
+            Self::MemoryAdded => "neha.memory.added",
+            Self::MemoryRemoved => "neha.memory.removed",
         }
     }
 
@@ -153,6 +162,9 @@ impl EventKind {
             // A rename decides nothing about access or work: a reader that
             // does not know it keeps the name it has and reads on.
             Self::BotRenamed => EventClass::Presentation,
+            // Memory decides nothing about access or work either: a reader
+            // that does not know an entry skips it and reads on.
+            Self::MemoryAdded | Self::MemoryRemoved => EventClass::Presentation,
             // Steps and actions decide which work may run again and what a
             // budget counted: a reader that does not know them must stop.
             Self::RunContext
@@ -208,6 +220,8 @@ impl FromStr for EventKind {
             "neha.approval.decided" => Ok(Self::ApprovalDecided),
             "neha.rule.added" => Ok(Self::RuleAdded),
             "neha.rule.removed" => Ok(Self::RuleRemoved),
+            "neha.memory.added" => Ok(Self::MemoryAdded),
+            "neha.memory.removed" => Ok(Self::MemoryRemoved),
             _ => Err(UnknownEventKind(text.to_owned())),
         }
     }
@@ -283,12 +297,13 @@ pub struct Event {
 mod tests {
     use super::{
         Author, BotMoved, BotRenamed, BotUpdated, ComputerKind, ComputerSharing, ComputerUpdated,
-        EventData, EventDataError, EventDraft, EventKind, FileAdded, FileError, RunAccess,
-        RunQueued,
+        EventData, EventDataError, EventDraft, EventKind, FileAdded, FileError, MemoryAdded,
+        MemoryRemoved, RunAccess, RunQueued,
     };
     use crate::event::EventClass;
     use crate::file::MAX_FILE_BYTES;
     use crate::id::Id;
+    use crate::memory::{MemoryKind, MemoryScope, MemorySourceKind};
 
     #[test]
     fn wire_names_round_trip() {
@@ -317,6 +332,8 @@ mod tests {
             EventKind::ApprovalDecided,
             EventKind::RuleAdded,
             EventKind::RuleRemoved,
+            EventKind::MemoryAdded,
+            EventKind::MemoryRemoved,
         ];
 
         for kind in kinds {
@@ -344,6 +361,8 @@ mod tests {
         assert_eq!(EventKind::ApprovalDecided.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleAdded.class(), EventClass::Authority);
         assert_eq!(EventKind::RuleRemoved.class(), EventClass::Authority);
+        assert_eq!(EventKind::MemoryAdded.class(), EventClass::Presentation);
+        assert_eq!(EventKind::MemoryRemoved.class(), EventClass::Presentation);
     }
 
     #[test]
@@ -969,6 +988,154 @@ mod tests {
             assert!(kind.validate_author(bot, Some(owner)).is_err());
         }
     }
+
+    fn memory_added(kind: MemoryKind, scope: MemoryScope, author_bot: bool) -> MemoryAdded {
+        let bot = Id::new();
+        let acting = Id::new();
+        MemoryAdded {
+            memory: Id::new(),
+            bot,
+            kind,
+            scope,
+            scope_id: match scope {
+                MemoryScope::Owner => None,
+                MemoryScope::User | MemoryScope::Group => Some(Id::new()),
+            },
+            author: if author_bot { bot } else { acting },
+            author_bot,
+            acting,
+            source: Id::new(),
+            source_kind: MemorySourceKind::Run,
+            text: "the deploy notes live in eng/deploy.md".to_owned(),
+            replaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_memory_added_round_trips() {
+        let mut data = memory_added(MemoryKind::Rule, MemoryScope::User, false);
+        data.replaces = vec![Id::new()];
+        let value = serde_json::json!({
+            "memory": data.memory,
+            "bot": data.bot,
+            "kind": "rule",
+            "scope": "user",
+            "scope_id": data.scope_id,
+            "author": data.author,
+            "author_bot": false,
+            "acting": data.acting,
+            "source": data.source,
+            "source_kind": "run",
+            "text": data.text,
+            "replaces": data.replaces,
+        });
+
+        assert_eq!(
+            EventKind::MemoryAdded.decode(&value).unwrap(),
+            EventData::MemoryAdded(data.clone())
+        );
+        assert_eq!(
+            serde_json::from_value::<MemoryAdded>(value.clone()).unwrap(),
+            data
+        );
+
+        let mut unknown = value;
+        unknown["weight"] = serde_json::json!(1);
+        assert!(
+            EventKind::MemoryAdded.decode(&unknown).is_err(),
+            "an entry carries exactly its fields"
+        );
+    }
+
+    #[test]
+    fn a_memory_entry_names_the_scope_it_applies_in() {
+        // An owner entry applies in every Chat, so it names none.
+        let mut owner = memory_added(MemoryKind::Rule, MemoryScope::Owner, false);
+        owner.scope_id = Some(Id::new());
+        assert!(owner.validate().is_err());
+
+        // A user entry names the Chat it was written in.
+        let mut user = memory_added(MemoryKind::Note, MemoryScope::User, true);
+        user.scope_id = None;
+        assert!(user.validate().is_err());
+    }
+
+    #[test]
+    fn a_memory_entrys_author_follows_its_kind() {
+        // A rule is the User's words and a note is the Bot's.
+        let mut rule = memory_added(MemoryKind::Rule, MemoryScope::Owner, false);
+        rule.author_bot = true;
+        assert!(rule.validate().is_err());
+
+        let mut note = memory_added(MemoryKind::Note, MemoryScope::Owner, true);
+        note.author_bot = false;
+        assert!(note.validate().is_err());
+    }
+
+    #[test]
+    fn a_memory_write_replaces_an_entry_once() {
+        let mut data = memory_added(MemoryKind::Note, MemoryScope::Owner, true);
+        let target = Id::new();
+        data.replaces = vec![target, target];
+        assert!(data.validate().is_err());
+    }
+
+    #[test]
+    fn a_memory_removed_round_trips() {
+        let memory = Id::new();
+        let value = serde_json::json!({"memory": memory});
+
+        assert_eq!(
+            EventKind::MemoryRemoved.decode(&value).unwrap(),
+            EventData::MemoryRemoved(MemoryRemoved { memory })
+        );
+
+        let mut unknown = value;
+        unknown["bot"] = serde_json::json!(Id::new());
+        assert!(EventKind::MemoryRemoved.decode(&unknown).is_err());
+    }
+
+    #[test]
+    fn memory_events_take_their_authors() {
+        let bot = Author::Bot(Id::new());
+        let user = Author::User(Id::new());
+        let acting = Id::new();
+
+        // A write is the Bot's record operation, acting for a User.
+        assert!(
+            EventKind::MemoryAdded
+                .validate_author(bot, Some(acting))
+                .is_ok()
+        );
+        assert!(EventKind::MemoryAdded.validate_author(bot, None).is_err());
+        assert!(
+            EventKind::MemoryAdded
+                .validate_author(user, Some(acting))
+                .is_err()
+        );
+
+        // A removal is the removing User's, or the Bot's when it removes a
+        // note for that User.
+        assert!(EventKind::MemoryRemoved.validate_author(user, None).is_ok());
+        assert!(
+            EventKind::MemoryRemoved
+                .validate_author(user, Some(acting))
+                .is_err(),
+            "a User removal's acting User is the User"
+        );
+        let removing = Author::User(acting);
+        assert!(
+            EventKind::MemoryRemoved
+                .validate_author(removing, Some(acting))
+                .is_ok()
+        );
+        assert!(
+            EventKind::MemoryRemoved
+                .validate_author(bot, Some(acting))
+                .is_ok()
+        );
+        assert!(EventKind::MemoryRemoved.validate_author(bot, None).is_err());
+    }
 }
 
 /// Where a run is: waiting, working, or how it ended.
@@ -1041,6 +1208,10 @@ pub enum EventData {
     RuleAdded(RuleAdded),
     /// A lasting rule was removed.
     RuleRemoved(RuleRemoved),
+    /// A memory entry was added.
+    MemoryAdded(MemoryAdded),
+    /// A memory entry was removed.
+    MemoryRemoved(MemoryRemoved),
 }
 
 /// The first version of every event kind.
@@ -1104,6 +1275,13 @@ impl EventKind {
             Self::ApprovalDecided => EventData::ApprovalDecided(decode(data)?),
             Self::RuleAdded => EventData::RuleAdded(decode(data)?),
             Self::RuleRemoved => EventData::RuleRemoved(decode(data)?),
+            Self::MemoryAdded => {
+                let data: MemoryAdded = decode(data)?;
+                data.validate()?;
+
+                EventData::MemoryAdded(data)
+            }
+            Self::MemoryRemoved => EventData::MemoryRemoved(decode(data)?),
         };
 
         Ok(decoded)
@@ -1149,6 +1327,21 @@ impl EventKind {
                     return Err(EventDataError::Author);
                 }
             }
+            // A memory write is a record operation the Bot runs: it is
+            // authored by the Bot with the User it acts for.
+            Self::MemoryAdded => {
+                if !matches!(author, Author::Bot(_)) || acting.is_none() {
+                    return Err(EventDataError::Author);
+                }
+            }
+            // A removal is authored by the User who removes the entry; the
+            // Bot authors it, acting for that User, when it removes a note.
+            Self::MemoryRemoved => match (author, acting) {
+                (Author::User(_), None) => {}
+                (Author::User(user), Some(acting)) if user == acting => {}
+                (Author::Bot(_), Some(_)) => {}
+                _ => return Err(EventDataError::Author),
+            },
         }
 
         Ok(())
@@ -1930,4 +2123,102 @@ pub struct RuleRemoved {
     /// The User who removed it; the Bot's owner may remove another User's
     /// rule, so this is not necessarily the rule's maker.
     pub user: Id,
+}
+
+/// The data of `neha.memory.added`.
+///
+/// One entry of a Bot's memory: an id, a kind, a scope, the author whose
+/// words made it (a User for a `rule`, the Bot for a `note`), the User the Bot
+/// acted for, the Message, run, or command that wrote it, its text, and the
+/// entries it replaces.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct MemoryAdded {
+    /// The entry.
+    pub memory: Id,
+    /// The Bot whose memory holds it.
+    pub bot: Id,
+    /// Its kind.
+    pub kind: MemoryKind,
+    /// Where it applies.
+    pub scope: MemoryScope,
+    /// The Chat or Group it applies in; absent for an owner entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<Id>,
+    /// The entry's author: the User whose words gave a `rule`, or the Bot for
+    /// a `note`.
+    pub author: Id,
+    /// Whether the author is the Bot.
+    pub author_bot: bool,
+    /// The User the Bot acted for when it wrote the entry.
+    pub acting: Id,
+    /// The Message, run, or command that wrote it.
+    pub source: Id,
+    /// What kind of thing wrote it.
+    pub source_kind: MemorySourceKind,
+    /// Its text.
+    pub text: String,
+    /// The entries this write replaces; they stop applying.
+    #[serde(default)]
+    pub replaces: Vec<Id>,
+}
+
+impl MemoryAdded {
+    /// Checks the parts of one entry that its fields alone decide.
+    ///
+    /// The projection checks the rest: that the Bot exists, that a replacement
+    /// target is one the acting User may remove, and that no entry repeats.
+    pub fn validate(&self) -> Result<(), EventDataError> {
+        match self.scope {
+            MemoryScope::Owner => {
+                if self.scope_id.is_some() {
+                    return Err(EventDataError::Data(
+                        "an owner entry names no Chat or Group".to_owned(),
+                    ));
+                }
+            }
+            MemoryScope::User | MemoryScope::Group => {
+                if self.scope_id.is_none() {
+                    return Err(EventDataError::Data(
+                        "a user or group entry names its Chat or Group".to_owned(),
+                    ));
+                }
+            }
+        }
+
+        // A rule is the User's words and a note is the Bot's own: the author
+        // each entry records follows from its kind.
+        if self.author_bot {
+            if self.kind != MemoryKind::Note || self.author != self.bot {
+                return Err(EventDataError::Data(
+                    "a note is authored by the Bot that keeps it".to_owned(),
+                ));
+            }
+        } else if self.kind != MemoryKind::Rule || self.author != self.acting {
+            return Err(EventDataError::Data(
+                "a rule is authored by the User whose words gave it".to_owned(),
+            ));
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for replaced in &self.replaces {
+            if !seen.insert(replaced) {
+                return Err(EventDataError::Data(
+                    "a write names a replaced entry once".to_owned(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// The data of `neha.memory.removed`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "record.ts")]
+#[serde(deny_unknown_fields)]
+pub struct MemoryRemoved {
+    /// The entry.
+    pub memory: Id,
 }

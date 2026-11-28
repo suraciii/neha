@@ -12,6 +12,9 @@ import type {
   Computer,
   EventKind,
   FileSummary,
+  MemoryEntry,
+  MemoryKind,
+  MemoryList,
   Message,
   Model,
   Provider,
@@ -22,6 +25,10 @@ import type {
 } from "../types";
 
 const account = { id: "u1", display_name: "Ada", is_admin: true };
+
+// The bytes each kind of memory one Bot may hold, as the Space counts them. A
+// test may choose the entries, and the room a kind uses follows from them.
+const MEMORY_LIMITS: Record<MemoryKind, number> = { rule: 4 * 1024, note: 16 * 1024 };
 const bot = {
   id: "b1",
   owner: "u1",
@@ -222,6 +229,12 @@ export const space = {
   computers: computers,
   // The rules each Bot holds, like rule_list answers.
   rules: [] as Rule[],
+  // The memory each Bot holds, by Bot, like memory_list answers. The command's
+  // rows name no Bot, so the fake keeps the entries under the Bot they belong
+  // to. A test sets them directly; a removal takes one away.
+  memories: {} as Record<string, MemoryEntry[]>,
+  // The room each kind of memory one Bot has, like memory_list answers.
+  memoryLimits: { ...MEMORY_LIMITS } as Record<MemoryKind, number>,
   // Every vendor the catalog knows, like catalog_list answers.
   vendors: [] as CatalogVendor[],
   // What the catalog's cache holds, like catalog_status answers.
@@ -240,6 +253,9 @@ export const space = {
   // The rules the Space was asked to add and to remove.
   ruleAdds: [] as unknown[],
   ruleRemoves: [] as string[],
+  // The memory removals the Space was asked for, in order: the Bot the entry
+  // must belong to, and the entry.
+  memoryRemoves: [] as { bot: string; memory: string }[],
   // The Providers the Space connected and refreshed, and the Models made default.
   connects: [] as unknown[],
   refreshes: [] as string[],
@@ -314,6 +330,8 @@ export const space = {
     ];
     space.models = [];
     space.rules = [];
+    space.memories = {};
+    space.memoryLimits = { ...MEMORY_LIMITS };
     space.vendors = [];
     space.catalog = null;
     space.updates = [];
@@ -326,6 +344,7 @@ export const space = {
     space.computerUpdates = [];
     space.ruleAdds = [];
     space.ruleRemoves = [];
+    space.memoryRemoves = [];
     space.connects = [];
     space.refreshes = [];
     space.defaults = [];
@@ -687,6 +706,31 @@ export class FakeCommands {
         space.rules = space.rules.filter((known) => known.rule !== asked.rule);
         emit("neha.rule.removed", { rule: asked.rule });
         return { rule: asked.rule } as T;
+      }
+      case "memory_list": {
+        const asked = args as { bot: string };
+        const entries = (space.memories[asked.bot] ?? []).map((entry) => ({ ...entry }));
+        // The room a kind uses is the size of its entries, as the Space counts
+        // it, so removing one entry moves both the list and the capacity.
+        const used: Record<MemoryKind, number> = { rule: 0, note: 0 };
+        for (const entry of entries) used[entry.kind] += entry.size;
+        const answer: MemoryList = { entries, used, limits: { ...space.memoryLimits } };
+        return answer as T;
+      }
+      case "memory_remove": {
+        const asked = args as { bot: string; memory: string };
+        // The Space refuses an entry that belongs to another Bot, and names the
+        // Bot the removal must fall under.
+        const entries = space.memories[asked.bot] ?? [];
+        if (!entries.some((entry) => entry.memory === asked.memory)) {
+          throw new Error("no such memory entry");
+        }
+        space.memoryRemoves.push(asked);
+        space.memories[asked.bot] = entries.filter((entry) => entry.memory !== asked.memory);
+        // The Space writes the removal to the record, so the page hears about
+        // its own answer the way it hears about another client's.
+        emit("neha.memory.removed", { memory: asked.memory });
+        return { memory: asked.memory, user: "u1" } as T;
       }
       case "catalog_list":
         return space.vendors.map((known) => ({ ...known })) as T;

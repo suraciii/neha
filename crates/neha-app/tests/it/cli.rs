@@ -5523,6 +5523,111 @@ fn a_bot_owner_renames_it_from_the_cli() {
     assert!(shown.contains("Pathfinder"), "{shown}");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bot_owner_reads_and_removes_memory_from_the_cli() {
+    let directory = tempfile::tempdir().unwrap();
+    let home = directory.path().join("home");
+    let credential = directory.path().join("session").join("credential.json");
+    let (server, _url, invite) = serve(&home);
+    let invite = invite.expect("a fresh Space prints an invitation");
+    run(&home, &credential, &["join", &invite, "--name", "Ada"]);
+    let (base, script, provider_task) = scripted_provider().await;
+    run(
+        &home,
+        &credential,
+        &[
+            "provider",
+            "add",
+            "--base-url",
+            &base,
+            "--model",
+            "test-model",
+        ],
+    );
+    let created = run(&home, &credential, &["bot", "create", "Scout"]);
+    let bot = first_word(&field(&created, "Created Bot "));
+    let chat = field(&created, "Chat:");
+    let user = field(&run(&home, &credential, &["whoami"]), "Id: ");
+
+    // A Bot with no memory says how a User writes one, and how much room each
+    // kind has.
+    let empty = run(&home, &credential, &["bot", "memory", &bot]);
+    assert!(
+        empty.contains("No memory entries. Ask the Bot in a Chat to remember something."),
+        "{empty}"
+    );
+    assert!(empty.contains("rule: 0 B used / 4.0 KiB limit"), "{empty}");
+    assert!(empty.contains("note: 0 B used / 16 KiB limit"), "{empty}");
+
+    // The list shape names no Bot, so the CLI refuses it instead of reading
+    // some other Bot's memory.
+    let missing = cli(&home, &credential, &["bot", "memory"]);
+    assert!(!missing.status.success(), "`bot memory` needs a Bot");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("needs a Bot"), "{stderr}");
+
+    // A run the owner starts writes a rule; the CLI shows its id, kind, scope,
+    // author, source, size, and content.
+    let rule = "Keep the deploy notes current.";
+    script.call(
+        "remember",
+        serde_json::json!({"kind": "rule", "scope": "owner", "text": rule}),
+    );
+    script.say("I will remember.");
+    let sent = run(
+        &home,
+        &credential,
+        &["chat", "send", "--chat", &chat, "remember the deploy notes"],
+    );
+    assert!(sent.contains("I will remember."), "{sent}");
+
+    let listed = run(&home, &credential, &["bot", "memory", &bot]);
+    let row = listed.lines().next().expect("the memory entry line");
+    let memory = first_word(row);
+    assert!(row.contains("  rule  owner  "), "{listed}");
+    assert!(row.contains(&format!("author {user}")), "{listed}");
+    assert!(row.contains("source run "), "{listed}");
+    assert!(row.ends_with(rule), "{listed}");
+    assert!(
+        listed.contains(&format!("rule: {} B used / 4.0 KiB limit", rule.len())),
+        "{listed}"
+    );
+    assert!(listed.contains("note: 0 B used / 16 KiB limit"), "{listed}");
+
+    // The owner removes the entry by the id the listing printed.
+    let removed = run(
+        &home,
+        &credential,
+        &["bot", "memory", "remove", &bot, &memory],
+    );
+    assert!(
+        removed.contains(&format!("Removed memory {memory}.")),
+        "{removed}"
+    );
+    let empty_again = run(&home, &credential, &["bot", "memory", &bot]);
+    assert!(
+        empty_again.contains("Ask the Bot in a Chat to remember something."),
+        "{empty_again}"
+    );
+    assert!(
+        empty_again.contains("rule: 0 B used / 4.0 KiB limit"),
+        "{empty_again}"
+    );
+
+    // A removal the Space refuses exits non-zero with its reason.
+    let refused = cli(
+        &home,
+        &credential,
+        &["bot", "memory", "remove", &bot, &memory],
+    );
+    assert!(!refused.status.success(), "a removed entry is gone");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("no such memory entry"), "{stderr}");
+
+    provider_task.abort();
+    drop(server);
+}
+
 #[test]
 fn the_admin_changes_the_default_model_from_the_cli() {
     let directory = tempfile::tempdir().unwrap();

@@ -142,7 +142,9 @@ The CLI prints the Bot's reply and the run that produced it. Read the whole Chat
 target/debug/neha chat read "$CHAT_ID"
 ```
 
-A Bot can also write files, read them back, and run shell commands in its own directory inside its Computer's Workspace. [Let a Bot work on its Computer](tools.md) shows how.
+Tell the Bot what to remember: ask it in the Chat to remember a preference, and it keeps the preference as a lasting rule for your Chats. [Memory](memory.md) covers the rules and notes it keeps, and how to read or clear them.
+
+A Bot can also write files, read them back, and run shell commands in its Computer's workspace. [Let a Bot work on its Computer](tools.md) shows how.
 
 ## A Bot does one thing at a time
 

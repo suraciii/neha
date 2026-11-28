@@ -178,6 +178,19 @@ pub enum CommandCall {
         /// The rule.
         rule: Id,
     },
+    /// Lists a Bot's memory entries and the room each kind has left.
+    MemoryList {
+        /// The Bot.
+        bot: Id,
+    },
+    /// Removes one memory entry of a Bot.
+    MemoryRemove {
+        /// The Bot the entry must belong to; the removal is refused when the
+        /// entry belongs to another Bot.
+        bot: Id,
+        /// The entry.
+        memory: Id,
+    },
 }
 
 /// The parameters of `provider_add`.
@@ -1021,6 +1034,24 @@ mod tests {
         let remove = CommandCall::RuleRemove { rule: Id::new() };
         let text = serde_json::to_string(&remove).unwrap();
         assert!(text.contains("\"name\":\"rule_remove\""), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), remove);
+    }
+
+    #[test]
+    fn memory_commands_round_trip() {
+        let bot = Id::new();
+        let list = CommandCall::MemoryList { bot };
+        let text = serde_json::to_string(&list).unwrap();
+        assert!(text.contains("\"name\":\"memory_list\""), "{text}");
+        assert!(text.contains(&format!("\"bot\":\"{bot}\"")), "{text}");
+        assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), list);
+
+        let memory = Id::new();
+        let remove = CommandCall::MemoryRemove { bot, memory };
+        let text = serde_json::to_string(&remove).unwrap();
+        assert!(text.contains("\"name\":\"memory_remove\""), "{text}");
+        assert!(text.contains(&format!("\"bot\":\"{bot}\"")), "{text}");
+        assert!(text.contains(&format!("\"memory\":\"{memory}\"")), "{text}");
         assert_eq!(serde_json::from_str::<CommandCall>(&text).unwrap(), remove);
     }
 }

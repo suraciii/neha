@@ -1168,6 +1168,33 @@ mod tests {
                 serde_json::json!({"rule": Id::new(), "bot": Id::new(), "user": user}),
             )
             .acting(user),
+            EventKind::MemoryAdded => {
+                let bot = Id::new();
+                EventDraft::new(
+                    kind,
+                    Author::Bot(bot),
+                    serde_json::json!({
+                        "memory": Id::new(),
+                        "bot": bot,
+                        "kind": "note",
+                        "scope": "owner",
+                        "author": bot,
+                        "author_bot": true,
+                        "acting": user,
+                        "source": Id::new(),
+                        "source_kind": "run",
+                        "text": "note",
+                        "replaces": [],
+                    }),
+                )
+                .acting(user)
+            }
+            EventKind::MemoryRemoved => EventDraft::new(
+                kind,
+                Author::User(user),
+                serde_json::json!({"memory": Id::new()}),
+            )
+            .acting(user),
         }
     }
 

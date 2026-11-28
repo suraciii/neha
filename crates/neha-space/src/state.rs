@@ -13,6 +13,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use rand::RngExt as _;
 
 use neha::id::Id;
+use neha::memory::{MemoryKind, MemoryScope, MemorySourceKind};
 use neha::record::{
     ActionStatus, ApprovalReason, Author, ComputerSharing, Event, EventData,
     FULL_ACCESS_CONSENT_VERSION, RuleEffect, RunReply, Undoability,
@@ -473,6 +474,51 @@ pub struct RuleView {
     pub seq: Seq,
 }
 
+/// One entry of a Bot's memory.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export_to = "state.ts")]
+pub struct MemoryView {
+    /// The entry.
+    pub memory: Id,
+    /// The Bot whose memory holds it.
+    pub bot: Id,
+    /// Its kind.
+    pub kind: MemoryKind,
+    /// Where it applies.
+    pub scope: MemoryScope,
+    /// The Chat or Group it applies in; absent for an owner entry.
+    pub scope_id: Option<Id>,
+    /// The entry's author: the User for a rule, the Bot for a note.
+    pub author: Id,
+    /// Whether the author is the Bot.
+    pub author_bot: bool,
+    /// The User the Bot acted for when it wrote the entry.
+    pub acting: Id,
+    /// The Message, run, or command that wrote it.
+    pub source: Id,
+    /// What kind of thing wrote it.
+    pub source_kind: MemorySourceKind,
+    /// Its text.
+    pub text: String,
+    /// The cursor of `memory.added`.
+    pub seq: Seq,
+    /// Whether a later entry replaced it; a replaced entry applies to nothing.
+    pub superseded: bool,
+    /// The entry that replaced it, when one did.
+    pub superseded_by: Option<Id>,
+}
+
+impl MemoryView {
+    /// Returns whether a User may remove this entry.
+    ///
+    /// The owner removes any entry; another User removes the entries their
+    /// words gave and the notes the Bot wrote while acting for them.
+    #[must_use]
+    pub fn removable_by(&self, acting: Id, owner: Id) -> bool {
+        acting == owner || self.author == acting || (self.author_bot && self.acting == acting)
+    }
+}
+
 /// What a Bot's shell may do with its short-lived token.
 #[derive(Clone, Debug)]
 pub struct BotToken {
@@ -544,6 +590,9 @@ pub struct State {
     pub approvals: Vec<ApprovalView>,
     /// The lasting rules in the order the record added them.
     pub rules: Vec<RuleView>,
+    /// The memory entries in the order the record added them; a removed entry
+    /// is gone and a replaced one keeps its record but no longer applies.
+    pub memories: Vec<MemoryView>,
     /// The (Bot, acting User, Computer) triples whose first Local use a User
     /// allowed. A Bot moved to another machine asks again there.
     pub first_use_allowed: HashSet<(Id, Id, Id)>,
@@ -606,6 +655,59 @@ impl State {
     #[must_use]
     pub fn rules_of(&self, bot: Id) -> Vec<&RuleView> {
         self.rules.iter().filter(|rule| rule.bot == bot).collect()
+    }
+
+    /// Returns every memory entry of one Bot, a replaced entry included.
+    #[must_use]
+    pub fn memories_of(&self, bot: Id) -> Vec<&MemoryView> {
+        self.memories
+            .iter()
+            .filter(|entry| entry.bot == bot)
+            .collect()
+    }
+
+    /// Returns the memory entries of one Bot that still apply.
+    #[must_use]
+    pub fn active_memories_of(&self, bot: Id) -> Vec<&MemoryView> {
+        self.memories
+            .iter()
+            .filter(|entry| entry.bot == bot && !entry.superseded)
+            .collect()
+    }
+
+    /// Returns the bytes of one kind one Bot's memory holds.
+    #[must_use]
+    pub fn memory_used(&self, bot: Id, kind: MemoryKind) -> usize {
+        self.memories
+            .iter()
+            .filter(|entry| entry.bot == bot && !entry.superseded && entry.kind == kind)
+            .map(|entry| entry.text.len())
+            .sum()
+    }
+
+    /// Returns whether a User reads a memory entry's text.
+    ///
+    /// The owner reads the entries of the owner's Chats; another User reads
+    /// the entries that are theirs, including the notes the Bot wrote while
+    /// acting for them. Everyone who may remove an entry reads it.
+    #[must_use]
+    pub fn reads_memory(&self, entry: &MemoryView, viewer: Id) -> bool {
+        let Some(bot) = self.bots.get(&entry.bot) else {
+            return false;
+        };
+        if entry.author == viewer || (entry.author_bot && entry.acting == viewer) {
+            return true;
+        }
+        match entry.scope {
+            MemoryScope::Owner => viewer == bot.owner,
+            MemoryScope::User => entry
+                .scope_id
+                .and_then(|scope| self.chats.get(&scope))
+                .is_some_and(|chat| chat.owner == viewer),
+            // A Group is not part of this build's state: only the entry's
+            // author reads it.
+            MemoryScope::Group => false,
+        }
     }
 
     /// Returns the replies the record holds for one run.
@@ -1506,6 +1608,120 @@ impl Projection for State {
                 }
                 self.rules.remove(position);
             }
+            EventData::MemoryAdded(data) => {
+                let owner = self
+                    .bots
+                    .get(&data.bot)
+                    .map(|bot| bot.owner)
+                    .ok_or("a memory entry must belong to an existing Bot")?;
+                if !matches!(event.author, Author::Bot(author) if author == data.bot) {
+                    return Err("a memory entry is written by its Bot".to_owned());
+                }
+                if event.acting != Some(data.acting) {
+                    return Err("a memory entry names the User the Bot acts for".to_owned());
+                }
+                if let MemoryScope::User = data.scope {
+                    let Some(scope) = data.scope_id else {
+                        return Err("a user entry names its Chat".to_owned());
+                    };
+                    if self
+                        .chats
+                        .get(&scope)
+                        .is_none_or(|chat| chat.bot != data.bot)
+                    {
+                        return Err("a user entry belongs to one of the Bot's Chats".to_owned());
+                    }
+                }
+                if self
+                    .memories
+                    .iter()
+                    .any(|entry| entry.memory == data.memory)
+                {
+                    return Err("a memory entry is recorded once".to_owned());
+                }
+                // The write replaces only entries the acting User may remove,
+                // so a rule cannot be replaced by someone it does not bind.
+                for replaced in &data.replaces {
+                    let target = self
+                        .memories
+                        .iter()
+                        .find(|entry| entry.memory == *replaced && entry.bot == data.bot)
+                        .ok_or("a replaced entry must belong to the Bot's memory")?;
+                    if target.superseded {
+                        return Err("a replaced entry must still apply".to_owned());
+                    }
+                    if !target.removable_by(data.acting, owner) {
+                        return Err("only the acting User's entries can be replaced".to_owned());
+                    }
+                }
+                for replaced in &data.replaces {
+                    if let Some(target) = self
+                        .memories
+                        .iter_mut()
+                        .find(|entry| entry.memory == *replaced)
+                    {
+                        target.superseded = true;
+                        target.superseded_by = Some(data.memory);
+                    }
+                }
+                self.memories.push(MemoryView {
+                    memory: data.memory,
+                    bot: data.bot,
+                    kind: data.kind,
+                    scope: data.scope,
+                    scope_id: data.scope_id,
+                    author: data.author,
+                    author_bot: data.author_bot,
+                    acting: data.acting,
+                    source: data.source,
+                    source_kind: data.source_kind,
+                    text: data.text,
+                    seq: event.seq,
+                    superseded: false,
+                    superseded_by: None,
+                });
+            }
+            EventData::MemoryRemoved(data) => {
+                let position = self
+                    .memories
+                    .iter()
+                    .position(|entry| entry.memory == data.memory)
+                    .ok_or("a removed memory entry must exist")?;
+                if self.memories[position].superseded {
+                    return Err("a removed memory entry must still apply".to_owned());
+                }
+                let entry = self.memories[position].clone();
+                let owner = self
+                    .bots
+                    .get(&entry.bot)
+                    .map(|bot| bot.owner)
+                    .ok_or("a memory entry must belong to an existing Bot")?;
+                match event.author {
+                    // The Bot removes a note it wrote for the User it acts
+                    // for; it never removes a rule on its own.
+                    Author::Bot(bot) => {
+                        if bot != entry.bot {
+                            return Err("the Bot removes only its own memory".to_owned());
+                        }
+                        let acting = event
+                            .acting
+                            .ok_or("a Bot's removal names the User it acts for")?;
+                        if entry.kind != MemoryKind::Note
+                            || !entry.author_bot
+                            || entry.acting != acting
+                        {
+                            return Err("a Bot removes only its own note".to_owned());
+                        }
+                    }
+                    Author::User(user) => {
+                        let acting = event.acting.unwrap_or(user);
+                        if !entry.removable_by(acting, owner) {
+                            return Err("only an entry its remover may clear".to_owned());
+                        }
+                    }
+                }
+                self.memories.remove(position);
+            }
         }
 
         Ok(())
@@ -1515,6 +1731,7 @@ impl Projection for State {
 #[cfg(test)]
 mod tests {
     use neha::id::Id;
+    use neha::memory::MemoryKind;
     use neha::record::{ActionStatus, Author, ComputerSharing, Event, EventKind, KIND_VERSION};
     use neha::seq::Seq;
     use neha::time::Timestamp;
@@ -3776,5 +3993,457 @@ mod tests {
                 .unwrap();
             assert_eq!(state.computers[&computer].kind, expected, "{recorded}");
         }
+    }
+
+    /// A Space with one owner, one Bot, and its Chat with the owner.
+    fn bot_state(seq: i64) -> (State, Id, Id, Id) {
+        let owner = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let mut state = State::default();
+        state
+            .apply(&event(
+                EventKind::ComputerCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "computer": computer,
+                    "owner": owner,
+                    "kind": "hosted",
+                    "workspace": "/tmp/workspace",
+                }),
+                seq,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::BotCreated,
+                Author::User(owner),
+                serde_json::json!({
+                    "bot": bot,
+                    "owner": owner,
+                    "name": "Scout",
+                    "computer": computer,
+                    "chat": chat,
+                }),
+                seq + 1,
+            ))
+            .unwrap();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                Author::User(owner),
+                serde_json::json!({"chat": chat, "owner": owner, "bot": bot}),
+                seq + 2,
+            ))
+            .unwrap();
+
+        (state, owner, bot, chat)
+    }
+
+    /// One memory write as the record keeps it.
+    #[allow(clippy::too_many_arguments)]
+    fn memory_added(
+        memory: Id,
+        bot: Id,
+        kind: &str,
+        scope: &str,
+        scope_id: Option<Id>,
+        author: Id,
+        author_bot: bool,
+        acting: Id,
+        text: &str,
+        replaces: &[Id],
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "memory": memory,
+            "bot": bot,
+            "kind": kind,
+            "scope": scope,
+            "scope_id": scope_id,
+            "author": author,
+            "author_bot": author_bot,
+            "acting": acting,
+            "source": Id::new(),
+            "source_kind": "run",
+            "text": text,
+            "replaces": replaces,
+        })
+    }
+
+    #[test]
+    fn a_memory_entry_projects_and_a_write_supersedes_what_it_replaces() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        let rule = Id::new();
+        let note = Id::new();
+        // The owner's words gave a rule; the Bot wrote a note acting for the
+        // owner. The note replaces the rule.
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    rule,
+                    bot,
+                    "rule",
+                    "owner",
+                    None,
+                    owner,
+                    false,
+                    owner,
+                    "Keep the deploy notes current.",
+                    &[],
+                ),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    note,
+                    bot,
+                    "note",
+                    "user",
+                    Some(chat),
+                    bot,
+                    true,
+                    owner,
+                    "The deploy lives in eng/deploy.md.",
+                    &[rule],
+                ),
+                5,
+            ))
+            .unwrap();
+
+        let memories = state.memories_of(bot);
+        assert_eq!(memories.len(), 2);
+        assert!(
+            memories[0].superseded,
+            "the replaced rule no longer applies"
+        );
+        assert_eq!(memories[0].superseded_by, Some(note));
+        assert!(memories[1].superseded_by.is_none());
+        assert_eq!(
+            state.active_memories_of(bot).len(),
+            1,
+            "a replaced entry applies to nothing"
+        );
+        assert_eq!(
+            state.memory_used(bot, MemoryKind::Note),
+            "The deploy lives in eng/deploy.md.".len()
+        );
+        assert_eq!(state.memory_used(bot, MemoryKind::Rule), 0);
+    }
+
+    #[test]
+    fn a_memory_entry_removal_leaves_no_entry_behind() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        let memory = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    memory,
+                    bot,
+                    "note",
+                    "user",
+                    Some(chat),
+                    bot,
+                    true,
+                    owner,
+                    "note",
+                    &[],
+                ),
+                4,
+            ))
+            .unwrap();
+        // The owner removes any entry; the removal event is the owner's.
+        state
+            .apply(&acted_event(
+                EventKind::MemoryRemoved,
+                Author::User(owner),
+                owner,
+                serde_json::json!({"memory": memory}),
+                5,
+            ))
+            .unwrap();
+
+        assert!(state.memories.is_empty());
+        assert!(state.active_memories_of(bot).is_empty());
+    }
+
+    #[test]
+    fn a_memory_write_replaces_only_entries_the_acting_user_can_remove() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        let alice = Id::new();
+        let bob = Id::new();
+        // A User's rule in that User's Chat; Bob acts for nobody.
+        let rule = Id::new();
+        state
+            .apply(&event(
+                EventKind::ChatCreated,
+                Author::User(alice),
+                serde_json::json!({"chat": chat, "owner": alice, "bot": bot}),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                alice,
+                memory_added(
+                    rule,
+                    bot,
+                    "rule",
+                    "user",
+                    Some(chat),
+                    alice,
+                    false,
+                    alice,
+                    "Alice's rule",
+                    &[],
+                ),
+                5,
+            ))
+            .unwrap();
+
+        // Bob may not replace Alice's rule; the owner may. A refused write
+        // leaves the projection as it was.
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryAdded,
+                    Author::Bot(bot),
+                    bob,
+                    memory_added(
+                        Id::new(),
+                        bot,
+                        "note",
+                        "user",
+                        Some(chat),
+                        bot,
+                        true,
+                        bob,
+                        "replacement",
+                        &[rule]
+                    ),
+                    6,
+                ))
+                .is_err()
+        );
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    Id::new(),
+                    bot,
+                    "note",
+                    "user",
+                    Some(chat),
+                    bot,
+                    true,
+                    owner,
+                    "replacement",
+                    &[rule],
+                ),
+                7,
+            ))
+            .unwrap();
+        assert!(
+            state
+                .memories
+                .iter()
+                .any(|entry| entry.memory == rule && entry.superseded),
+            "the owner's write replaced the rule"
+        );
+    }
+
+    #[test]
+    fn a_bot_removes_its_notes_but_never_a_rule() {
+        let (mut state, owner, bot, _chat) = bot_state(1);
+        let rule = Id::new();
+        let note = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    rule,
+                    bot,
+                    "rule",
+                    "owner",
+                    None,
+                    owner,
+                    false,
+                    owner,
+                    "rule",
+                    &[],
+                ),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    note,
+                    bot,
+                    "note",
+                    "owner",
+                    None,
+                    bot,
+                    true,
+                    owner,
+                    "note",
+                    &[],
+                ),
+                5,
+            ))
+            .unwrap();
+
+        // A Bot's removal of a rule is refused, even for its owner.
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryRemoved,
+                    Author::Bot(bot),
+                    owner,
+                    serde_json::json!({"memory": rule}),
+                    6,
+                ))
+                .is_err()
+        );
+        // The Bot removes its own note for the User it acts for.
+        state
+            .apply(&acted_event(
+                EventKind::MemoryRemoved,
+                Author::Bot(bot),
+                owner,
+                serde_json::json!({"memory": note}),
+                7,
+            ))
+            .unwrap();
+        assert!(state.memories.iter().all(|entry| entry.memory != note));
+    }
+
+    #[test]
+    fn a_memory_removal_belongs_to_a_user_who_may_clear_it() {
+        let (mut state, owner, bot, chat) = bot_state(1);
+        let memory = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    memory,
+                    bot,
+                    "note",
+                    "user",
+                    Some(chat),
+                    bot,
+                    true,
+                    owner,
+                    "owner's note",
+                    &[],
+                ),
+                4,
+            ))
+            .unwrap();
+
+        let stranger = Id::new();
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryRemoved,
+                    Author::User(stranger),
+                    stranger,
+                    serde_json::json!({"memory": memory}),
+                    5,
+                ))
+                .is_err(),
+            "a stranger never removes another User's note"
+        );
+        state
+            .apply(&acted_event(
+                EventKind::MemoryRemoved,
+                Author::User(owner),
+                owner,
+                serde_json::json!({"memory": memory}),
+                6,
+            ))
+            .unwrap();
+        assert!(state.memories.is_empty());
+    }
+
+    #[test]
+    fn a_replaced_memory_entry_cannot_be_removed() {
+        let (mut state, owner, bot, _chat) = bot_state(1);
+        let first = Id::new();
+        let second = Id::new();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    first,
+                    bot,
+                    "note",
+                    "owner",
+                    None,
+                    bot,
+                    true,
+                    owner,
+                    "first",
+                    &[],
+                ),
+                4,
+            ))
+            .unwrap();
+        state
+            .apply(&acted_event(
+                EventKind::MemoryAdded,
+                Author::Bot(bot),
+                owner,
+                memory_added(
+                    second,
+                    bot,
+                    "note",
+                    "owner",
+                    None,
+                    bot,
+                    true,
+                    owner,
+                    "second",
+                    &[first],
+                ),
+                5,
+            ))
+            .unwrap();
+        assert!(
+            state
+                .apply(&acted_event(
+                    EventKind::MemoryRemoved,
+                    Author::User(owner),
+                    owner,
+                    serde_json::json!({"memory": first}),
+                    6,
+                ))
+                .is_err(),
+            "an entry that no longer applies cannot be removed"
+        );
     }
 }

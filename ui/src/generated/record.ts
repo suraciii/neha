@@ -415,7 +415,7 @@ data: Record<string, unknown>, };
 /**
  * The kinds of event the record carries.
  */
-export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed";
+export type EventKind = "neha.user.joined" | "neha.provider.added" | "neha.provider.models_updated" | "neha.bot.created" | "neha.bot.moved" | "neha.bot.updated" | "neha.bot.renamed" | "neha.computer.created" | "neha.computer.updated" | "neha.chat.created" | "neha.message.added" | "neha.file.added" | "neha.run.queued" | "neha.run.started" | "neha.run.context" | "neha.run.access" | "neha.run.finished" | "neha.run.step" | "neha.action.started" | "neha.action.finished" | "neha.run.reply" | "neha.approval.requested" | "neha.approval.decided" | "neha.rule.added" | "neha.rule.removed" | "neha.memory.added" | "neha.memory.removed";
 
 /**
  * The data of `neha.file.added`.
@@ -445,6 +445,89 @@ size: number,
  * Its lowercase hex SHA-256.
  */
 sha256: string, };
+
+/**
+ * The data of `neha.memory.added`.
+ *
+ * One entry of a Bot's memory: an id, a kind, a scope, the author whose
+ * words made it (a User for a `rule`, the Bot for a `note`), the User the Bot
+ * acted for, the Message, run, or command that wrote it, its text, and the
+ * entries it replaces.
+ */
+export type MemoryAdded = { 
+/**
+ * The entry.
+ */
+memory: string, 
+/**
+ * The Bot whose memory holds it.
+ */
+bot: string, 
+/**
+ * Its kind.
+ */
+kind: MemoryKind, 
+/**
+ * Where it applies.
+ */
+scope: MemoryScope, 
+/**
+ * The Chat or Group it applies in; absent for an owner entry.
+ */
+scope_id?: string | null, 
+/**
+ * The entry's author: the User whose words gave a `rule`, or the Bot for
+ * a `note`.
+ */
+author: string, 
+/**
+ * Whether the author is the Bot.
+ */
+author_bot: boolean, 
+/**
+ * The User the Bot acted for when it wrote the entry.
+ */
+acting: string, 
+/**
+ * The Message, run, or command that wrote it.
+ */
+source: string, 
+/**
+ * What kind of thing wrote it.
+ */
+source_kind: MemorySourceKind, 
+/**
+ * Its text.
+ */
+text: string, 
+/**
+ * The entries this write replaces; they stop applying.
+ */
+replaces: Array<string>, };
+
+/**
+ * What a memory entry is for.
+ */
+export type MemoryKind = "rule" | "note";
+
+/**
+ * The data of `neha.memory.removed`.
+ */
+export type MemoryRemoved = { 
+/**
+ * The entry.
+ */
+memory: string, };
+
+/**
+ * Where a memory entry applies.
+ */
+export type MemoryScope = "owner" | "user" | "group";
+
+/**
+ * What wrote a memory entry.
+ */
+export type MemorySourceKind = "message" | "run" | "command";
 
 /**
  * The data of `neha.message.added`.

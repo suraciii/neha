@@ -13,6 +13,7 @@ Contracts live in [../specs/](../specs/). Domain terms live in [../CONTEXT.md](.
 - [Computers](computer.md) — the Space Computer a new Bot starts on, extra Hosted Computers and their sharing, pairing the machine that runs the Space, and each write fence.
 - [Let a Bot work on its Computer](tools.md) — the shell and file tools, the Bot's directory inside its Workspace, and their limits.
 - [Approvals](approvals.md) — when a Bot asks before an action, how to answer, and lasting Ask and Allow rules.
+- [Memory](memory.md) — what a Bot keeps as rules and notes, the scope each entry applies in, and how to read or clear one.
 - [Send and receive Files](files.md) — send a file in a Chat, download a File, and let a Bot take and deliver Files.
 - [Storage](storage.md) — where a Space keeps the bytes of its Files, and how to use an S3-compatible bucket.
 - [Upgrade a Space](upgrading.md) — back up the Space's home, replace the binary and the client, and read what the schema migration and the version check do.
