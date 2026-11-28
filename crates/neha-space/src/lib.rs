@@ -15,6 +15,7 @@ pub mod mcp;
 pub mod model;
 pub mod oauth;
 pub mod plugins;
+mod proxy;
 mod push;
 pub mod remote;
 pub mod runs;

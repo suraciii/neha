@@ -15,6 +15,12 @@ Owned by space. Every other topic depends on a Space to hold its record.
 5. A listener beyond the Space's own machine requires TLS or a trusted proxy that terminates it, and the Space refuses to start without either.
 6. The Space checks `Host` and `Origin` before it authenticates a request, except that a request that carries a bearer token skips the `Origin` check.
 
+## The listener
+
+A Space listens on the loopback address of the machine that runs it, unless its operator binds it to a private address behind a TLS proxy. A listener beyond the machine requires a public https origin, and a Space refuses to start without one.
+
+An operator MAY name the proxies the Space believes. The Space reads a forwarded client address only from a named proxy, from the last value of the request's `X-Forwarded-For`, and counts sign-in and pairing limits for that address; a request from any other peer is counted by its own address.
+
 ## Storage
 
 A Space keeps its record in one SQLite database on the Space's machine.

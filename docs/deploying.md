@@ -78,7 +78,7 @@ proxy_set_header Upgrade $http_upgrade;
 proxy_set_header Connection "upgrade";
 ```
 
-Overwrite `X-Forwarded-For` with the client address at the proxy. The Space reads only the final value from a loopback peer, so an earlier client-supplied value is ignored.
+Overwrite `X-Forwarded-For` with the client address at the proxy. The Space reads the final value only from a proxy it trusts: a loopback peer, or an address named in `NEHA_TRUSTED_PROXIES`. Name a proxy on another machine or in another container there as a comma-separated list of addresses, CIDR ranges, or hostnames; a hostname is resolved once at start, so give the proxy a stable address or restart the Space after replacing it. The forwarded chain is single-hop: a proxy that forwards an earlier chain unchanged names itself last, and the Space falls back to the peer.
 
 Check the public origin:
 
@@ -129,7 +129,7 @@ Notifications are available in an installed client on the public HTTPS origin. O
 
 - The listener stays on loopback. Do not expose port 7337.
 - The Space has no built-in TLS listener; a proxy always terminates TLS.
-- A proxy on the same machine forwards the client address from the final `X-Forwarded-For` value. A proxy on another machine or in another container is counted as one client for sign-in limits.
+- A loopback proxy is trusted without configuration. A proxy on another machine or in another container must be named in `NEHA_TRUSTED_PROXIES`; otherwise every client is counted as that proxy's address for sign-in and pairing limits.
 - The proxy must preserve the public `Host`, including a non-default port, and pass WebSocket upgrades under the same authority.
 
 ## Troubleshooting
@@ -138,6 +138,6 @@ Notifications are available in an installed client on the public HTTPS origin. O
 | --- | --- |
 | `403` with `the Host header must name this Space` | The proxy changed `Host`; preserve the original header. |
 | `403` with `a browser Origin must name this Space` | The public origin names a different host, or the proxy forwards plain HTTP; use the same host over HTTPS. |
-| Sign-in reports too many attempts | The proxy does not set `X-Forwarded-For`, or runs on another machine. |
+| Sign-in reports too many attempts | The proxy does not set `X-Forwarded-For`, is not named in `NEHA_TRUSTED_PROXIES`, or forwards a chain instead of overwriting it with the client address. |
 | The WebSocket disconnects | The proxy does not pass the upgrade headers. |
 | The browser offers no install | The page is not HTTPS, or its origin does not match the public origin. |

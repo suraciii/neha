@@ -16,6 +16,8 @@ A **Local Space** is different: the desktop app starts it on your computer and i
 
 The Space creates one worker container per Hosted Computer. A Computer's Bots share its worker and its Workspace, each in a directory of its own. The worker mounts only that Computer's Workspace root at `/workspace`.
 
+The Space trusts the `caddy` service as its TLS proxy (`NEHA_TRUSTED_PROXIES=caddy` in `compose.yml`), so sign-in and pairing limits count each client's forwarded address. Caddy has a fixed address on the internal network, so a proxy container recreated on its own does not leave the Space naming a stale address; restart the Space if you replace the proxy outside this stack.
+
 ## Requirements
 
 - A Linux host with Docker Engine and the Compose plugin.
@@ -176,6 +178,8 @@ docker compose up -d --force-recreate space supervisor caddy
 ```
 
 Workers are not Compose services. Remove old `neha-worker-*` containers after the Space starts; the lifecycle manager creates workers from the new image for Computers that need them. A worker running an old channel version refuses to serve, so a mixed-version stack does not answer as if it worked.
+
+The internal network has a fixed subnet so the proxy's address survives a proxy-only restart. A stack created before that change recreates the network on the next `up`; if Compose reports that `neha-internal` already exists with a different configuration, stop the stack, run `docker network rm neha-internal` once, and start it again. Data lives on the host, not in the network.
 
 Back up the data directory before an upgrade. The schema migration runs when the Space starts; [Upgrade a Space](upgrading.md) covers the version check and rollback expectations.
 

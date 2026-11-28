@@ -61,6 +61,29 @@ fn serve_without_bwrap(home: &Path) -> (SpaceProcess, String, Option<String>) {
     serve_on_with(home, 0, Some(std::ffi::OsStr::new("/nonexistent")))
 }
 
+/// A listener beyond this machine refuses to start without a TLS proxy.
+#[test]
+fn a_listener_beyond_loopback_refuses_to_start_without_a_public_origin() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Command::new(BIN)
+        .args(["serve", "--port", "0"])
+        .env("NEHA_HOME", directory.path())
+        .env("XDG_CONFIG_HOME", directory.path().join("xdg"))
+        .env("NEHA_BIND", "0.0.0.0")
+        .env_remove("NEHA_PUBLIC_URL")
+        .env_remove("NEHA_DOMAIN")
+        .env_remove("NEHA_TRUSTED_PROXIES")
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("TLS proxy"),
+        "the refusal does not name the TLS proxy: {stderr}"
+    );
+}
+
 /// Starts `neha serve` on one loopback port with an optional `PATH` override.
 fn serve_on_with(
     home: &Path,

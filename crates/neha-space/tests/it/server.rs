@@ -1872,6 +1872,63 @@ async fn a_source_is_rate_limited_across_names() {
     running.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_source_keeps_its_own_login_bucket() {
+    let (_dir, running, invite) = running().await;
+    let _session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let client = reqwest::Client::new();
+    // Each attempt arrives from the loopback proxy with a different forwarded
+    // client, so no source bucket sees more than one failure.
+    for index in 0..20 {
+        let wrong = client
+            .post(format!("{}/api/login", running.url()))
+            .header("x-forwarded-for", format!("198.51.100.{index}"))
+            .json(&json!({"display_name": format!("name-{index}"), "password": "wrong password"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    // A fresh forwarded source is not the shared loopback bucket.
+    let accepted = client
+        .post(format!("{}/api/login", running.url()))
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), reqwest::StatusCode::OK);
+    running.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forwarded_source_does_not_reset_an_account_bucket() {
+    let (_dir, running, invite) = running().await;
+    let _session = join(&running, &invite, "Ada", "correct horse battery").await;
+    let client = reqwest::Client::new();
+    for index in 0..5 {
+        let wrong = client
+            .post(format!("{}/api/login", running.url()))
+            .header("x-forwarded-for", format!("198.51.100.{index}"))
+            .json(&json!({"display_name": "Ada", "password": "wrong password"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+    }
+
+    let limited = client
+        .post(format!("{}/api/login", running.url()))
+        .header("x-forwarded-for", "203.0.113.9")
+        .json(&json!({"display_name": "Ada", "password": "correct horse battery"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    running.shutdown().await;
+}
+
 async fn raw_socket(running: &Running, token: &str) -> Socket {
     let mut request = format!("ws://{}/api/socket", running.addr)
         .into_client_request()
