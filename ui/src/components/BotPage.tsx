@@ -81,6 +81,12 @@ function sharingOf(computer: Computer): string {
     : t("computer.sharing.shared");
 }
 
+// Two Computers can share a default name, so a move target always carries a
+// short id the User can tell apart.
+function targetLabel(computer: Computer): string {
+  return `${computer.name} · ${computer.id.slice(0, 8)}`;
+}
+
 function draftOf(bot: Bot | null, models: Model[]): Draft {
   const model = bot?.model ?? "";
   // A Bot that names no level follows the Space's, so the draft holds none too:
@@ -413,7 +419,7 @@ export default function BotPage(props: BotPageProps) {
                     >
                       <option value="">{t("bot.computer.move.choose")}</option>
                       <For each={targets()}>
-                        {(target) => <option value={target.id}>{target.name}</option>}
+                        {(target) => <option value={target.id}>{targetLabel(target)}</option>}
                       </For>
                     </select>
                     <button

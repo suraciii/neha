@@ -96,7 +96,7 @@ RUNNER_ID=$(target/debug/neha bot list | awk '$2 == "Runner" {print $1; exit}')
 | `hosted` | A new exclusive Hosted Computer for this Bot |
 | A Computer id | The Computer with that id that the owner owns; a shared Computer takes another Bot, and an exclusive one that already has a Bot is refused |
 
-A Local Computer's workspace column is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none, and `neha bot show` then omits its Workspace line. For a Hosted Computer, `neha bot show` prints the Computer's Workspace root, and the Bot works in a directory of its own inside it: `$NEHA_HOME/workspaces/<computer-id>/<bot-id>`. The root that `neha computer run` prints as `Workspace root:` is the one its actions use on a Local Computer.
+A Local Computer's workspace column is empty when the Space recorded no path for it; a Local Computer paired with `computer pair` records none, and `neha bot show` then omits its Workspace line. For a Hosted Computer, `neha bot show` prints the Computer's Workspace root, and the Bot starts in a directory of its own inside it: `$NEHA_HOME/workspaces/<computer-id>/<bot-id>`. The root that `neha computer run` prints as `Workspace root:` is the one its actions use on a Local Computer.
 
 Without `--computer`, a new Bot starts on its owner's Space Computer. `--computer hosted` creates a new exclusive Hosted Computer for this Bot. `--computer local` names your paired Local Computer, and a Computer id names any Computer you own.
 
@@ -123,7 +123,7 @@ A new Hosted Computer is exclusive unless `--shared` says otherwise, so it accep
 
 Its shell runs in a `bubblewrap` sandbox built from an empty root, with the machine's system directories mounted read-only.
 
-The sandbox mounts the Bot's own directory at `/workspace`, which is its working directory and `HOME`. That folder is the only place where files persist; the sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`.
+The sandbox mounts the Computer's Workspace root at `/workspace`; the run starts in the Bot's own directory inside it, which is `HOME`. The Workspace root is the only place where files persist, and Bots on the same Hosted Computer can reach each other's directories. The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`.
 
 The sandbox ends with the Space process. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace. The sandbox's network is the machine's, so it reaches the Space's loopback.
 
@@ -277,6 +277,6 @@ A run can start its actions in another directory with `neha chat send --cwd`:
 neha chat send --bot "$BOT_ID" --cwd /data/project "review the notes here"
 ```
 
-On a Local Computer, `--cwd` names the directory the run starts in; without it the run starts in the Bot's own directory inside the Computer's Workspace. A Hosted Computer runs only in the Bot's own directory, and a run that names another directory fails. The directory must be absolute, must already exist, and must be a folder. A directory whose name ends in a space is typed with a trailing `/.`, which folds away and keeps the space: `--cwd '/data/logs /.'` records `/data/logs `. A path that ends in the space itself is trimmed and names the folder next to it.
+On a Local Computer, `--cwd` names the directory the run starts in; without it the run starts in the Bot's own directory inside the Computer's Workspace. A Hosted Computer starts in the Bot's own directory and refuses `--cwd`; its shell can reach the rest of the Computer's Workspace. The directory must be absolute, must already exist, and must be a folder. A directory whose name ends in a space is typed with a trailing `/.`, which folds away and keeps the space: `--cwd '/data/logs /.'` records `/data/logs `. A path that ends in the space itself is trimmed and names the folder next to it.
 
 The directory is that run's write root: the Bot's shell and its file tools may write inside it for that run, and it grants nothing to a later run. The directory is recorded with the run and appears on an approval card. In granted mode the Computer refuses a run whose directory sits inside a hidden root or holds one. The shell mounts an outside write root as writable only when its tree holds no link or special file and stays inside the scan limits; the file tools check every write path. Reading still follows the machine user's rights, except in granted mode, where the Computer's configuration directory stays hidden.

@@ -109,6 +109,9 @@ pub struct SpaceServer {
     pub(crate) pairings: tokio::sync::Mutex<PairingAttempts>,
     /// Serializes approval answers and rule changes.
     pub(crate) approvals: tokio::sync::Mutex<()>,
+    /// Serializes Computer creation and Bot assignment, so an exclusive
+    /// Computer cannot take two Bots and a create cannot race a move.
+    pub(crate) computer_assignments: tokio::sync::Mutex<()>,
     /// Serializes Provider writes, so a refresh and a default change cannot
     /// each build their Model list from a read the other replaced.
     pub(crate) provider_writes: tokio::sync::Mutex<()>,
@@ -129,6 +132,71 @@ pub struct SpaceServer {
     public_url: Option<String>,
     /// The installed browser clients' push subscriptions.
     pub(crate) push: std::sync::Arc<crate::push::Push>,
+}
+
+/// Moves a Hosted Workspace written before one root per Computer into the
+/// current layout.
+///
+/// An old record names `<home>/computers/<computer>/workspace`; its Hosted
+/// Computer held one Bot. The new layout is
+/// `<home>/workspaces/<computer>/<bot>`. The move is idempotent: the old path
+/// is absent after the first start, and an existing new directory is never
+/// overwritten. Hosted views always name the derived root, even when no old
+/// directory exists.
+fn migrate_legacy_hosted_workspaces(
+    home: &Home,
+    state: &mut SpaceState,
+) -> Result<(), ServerError> {
+    for computer in state.computers.values_mut() {
+        if computer.kind != "hosted" {
+            continue;
+        }
+        computer.workspace = home
+            .workspace_dir(computer.id)
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    let legacy_root = home.root().join("computers");
+    let computers: Vec<Id> = state.computers.keys().copied().collect();
+    for computer in computers {
+        let legacy = legacy_root.join(computer.to_string()).join("workspace");
+        if !legacy.is_dir() {
+            continue;
+        }
+        let bots: Vec<Id> = state
+            .bots
+            .values()
+            .filter(|bot| bot.computer == computer)
+            .map(|bot| bot.id)
+            .collect();
+        // The old layout held one Bot per Hosted Computer. Anything else is
+        // not ours to guess at; leave the files where they are.
+        if bots.len() != 1 {
+            continue;
+        }
+        let target = home.bot_workspace_dir(computer, bots[0]);
+        if target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&legacy, &target)?;
+        if let Some(parent) = legacy.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
+
+    if legacy_root.is_dir()
+        && std::fs::read_dir(&legacy_root)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    {
+        let _ = std::fs::remove_dir(&legacy_root);
+    }
+
+    Ok(())
 }
 
 impl SpaceServer {
@@ -179,6 +247,7 @@ impl SpaceServer {
         };
         let mut state = SpaceState::default();
         store.replay(&mut state).await?;
+        migrate_legacy_hosted_workspaces(&home, &mut state)?;
         let secrets = Secrets::load(&home)?;
         let push_contact = public_url
             .clone()
@@ -204,6 +273,7 @@ impl SpaceServer {
             links: ComputerLinks::new(),
             pairings: tokio::sync::Mutex::new(PairingAttempts::default()),
             approvals: tokio::sync::Mutex::new(()),
+            computer_assignments: tokio::sync::Mutex::new(()),
             provider_writes: tokio::sync::Mutex::new(()),
             pairs: Mutex::new(PairLimiter::default()),
             start_ticket: Mutex::new(None),
@@ -2225,6 +2295,7 @@ async fn handle_socket(mut socket: WebSocket, server: Arc<SpaceServer>, account:
                             links: &server.links,
                             pairings: &server.pairings,
                             approvals: &server.approvals,
+                            computer_assignments: &server.computer_assignments,
                             provider_writes: &server.provider_writes,
                             runs: &server.runs,
                             events: &server.events,
@@ -10055,11 +10126,12 @@ mod tests {
         let (mut socket, _token) = admin(&running, &invite).await;
         let (base, provider_task) = scripted_provider(vec![text("unused")]).await;
         let (bot, chat, computer) = tool_bot(&mut socket, base).await;
+        // The runtime creates `.tmp` in the Computer's Workspace root; a file
+        // in its place makes the run fail instead of starting half-prepared.
         let workspace = hosted_workspace(&running, computer, bot);
-        std::fs::create_dir_all(&workspace).unwrap();
-        // The runtime creates `.tmp` in the Bot's directory; a file in its
-        // place makes the run fail instead of starting half-prepared.
-        std::fs::write(workspace.join(".tmp"), "not a directory").unwrap();
+        let root = workspace.parent().unwrap();
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(root.join(".tmp"), "not a directory").unwrap();
 
         let result = send(&mut socket, chat, "hello").await;
 
@@ -11830,6 +11902,12 @@ mod tests {
         let computer: Id = serde_json::from_value(created["computer"]["id"].clone()).unwrap();
         assert_eq!(created["computer"]["kind"], "hosted");
         assert_eq!(created["computer"]["sandboxed"], json!(true));
+        assert_eq!(
+            created["computer"]["supports_grants"],
+            json!(false),
+            "a Hosted Computer serves no granted folders"
+        );
+        assert_eq!(created["computer"]["supports_full_access"], json!(false));
 
         let listed = command(&mut socket, Id::new(), CommandCall::ComputerList).await;
         let listed = listed
@@ -14749,6 +14827,189 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_legacy_hosted_workspace_moves_to_the_current_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = Home::open(directory.path()).unwrap();
+        let store = Store::open(&home).await.unwrap();
+        let user = Id::new();
+        let computer = Id::new();
+        let bot = Id::new();
+        let chat = Id::new();
+        let legacy = home
+            .root()
+            .join("computers")
+            .join(computer.to_string())
+            .join("workspace");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("sentinel.txt"), "old work").unwrap();
+        store
+            .append(AppendRequest::new(
+                Id::new(),
+                "legacy",
+                vec![
+                    EventDraft::new(
+                        EventKind::UserJoined,
+                        Author::User(user),
+                        json!({"display_name": "Ada", "is_admin": true}),
+                    ),
+                    EventDraft::new(
+                        EventKind::ComputerCreated,
+                        Author::User(user),
+                        json!({
+                            "computer": computer,
+                            "owner": user,
+                            "kind": "hosted",
+                            "workspace": legacy.to_string_lossy(),
+                        }),
+                    ),
+                    EventDraft::new(
+                        EventKind::BotCreated,
+                        Author::User(user),
+                        json!({"bot": bot, "owner": user, "name": "Scout", "computer": computer, "chat": chat}),
+                    ),
+                    EventDraft::new(
+                        EventKind::ChatCreated,
+                        Author::User(user),
+                        json!({"chat": chat, "owner": user, "bot": bot}),
+                    ),
+                ],
+            ))
+            .await
+            .unwrap();
+        let mut state = crate::state::State::default();
+        store.replay(&mut state).await.unwrap();
+        store.close().await.unwrap();
+
+        super::migrate_legacy_hosted_workspaces(&home, &mut state).unwrap();
+
+        let target = home.bot_workspace_dir(computer, bot);
+        assert_eq!(
+            std::fs::read_to_string(target.join("sentinel.txt")).unwrap(),
+            "old work"
+        );
+        assert!(!legacy.exists());
+        assert_eq!(
+            state.computers[&computer].workspace,
+            home.workspace_dir(computer).to_string_lossy()
+        );
+
+        // A second start has nothing to move.
+        super::migrate_legacy_hosted_workspaces(&home, &mut state).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hosted_bots_share_the_computer_workspace() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        // Create the second Bot first so its identifier can name the file the
+        // first Bot writes. Both default to the same Space Computer.
+        let second = command(&mut socket, Id::new(), add_bot("Second", None)).await;
+        let second_id: Id = serde_json::from_value(second["bot"]["id"].clone()).unwrap();
+        let computer: Id = serde_json::from_value(second["computer"]["id"].clone()).unwrap();
+        let (base, provider_task) = scripted_provider(vec![
+            tool(
+                "shell",
+                json!({"command": "pwd > pwd.txt; mkdir -p ../".to_owned()
+                    + &second_id.to_string()
+                    + "; printf shared > ../"
+                    + &second_id.to_string()
+                    + "/from-first.txt"}),
+            ),
+            text("Shared."),
+        ])
+        .await;
+        let (first, chat, first_computer) = tool_bot(&mut socket, base).await;
+        assert_eq!(first_computer, computer);
+
+        let result = send(&mut socket, chat, "share a file").await;
+        assert_eq!(result["status"], "succeeded", "{result}");
+        let first_dir = hosted_workspace(&running, computer, first);
+        assert_eq!(
+            std::fs::read_to_string(first_dir.join("pwd.txt"))
+                .unwrap()
+                .trim(),
+            format!("/workspace/{first}")
+        );
+        let second_dir = hosted_workspace(&running, computer, second_id);
+        assert_eq!(
+            std::fs::read_to_string(second_dir.join("from-first.txt")).unwrap(),
+            "shared"
+        );
+
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reset_follows_the_run_not_the_bot() {
+        let (_dir, running, invite) = running().await;
+        let mut socket = admin_socket(&running, &invite).await;
+        let (base, provider_task, gates, _recorded) = gated_provider(vec![hold("done")]).await;
+        command(&mut socket, Id::new(), provider_add(base)).await;
+        let created = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotCreate(BotCreate {
+                name: "Scout".to_owned(),
+                computer: None,
+                thinking: None,
+                model: None,
+            }),
+        )
+        .await;
+        let bot: Id = serde_json::from_value(created["bot"]["id"].clone()).unwrap();
+        let chat: Id = serde_json::from_value(created["chat"]["id"].clone()).unwrap();
+        let source: Id = serde_json::from_value(created["computer"]["id"].clone()).unwrap();
+        let target = command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerCreate(ComputerCreate {
+                name: "Target".to_owned(),
+                sharing: ComputerSharing::Shared,
+            }),
+        )
+        .await;
+        let target: Id = serde_json::from_value(target["id"].clone()).unwrap();
+
+        let queued = submit(&mut socket, chat, "hold", None).await;
+        let run = run_of(&queued);
+        wait_status(&mut socket, run, "running").await;
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::BotMove {
+                bot,
+                computer: target,
+            },
+        )
+        .await;
+
+        // The run stays on the source Computer even though the Bot moved, so
+        // resetting the source must wait for it. The target has no run.
+        let refused = try_command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer: source },
+        )
+        .await;
+        assert!(
+            matches!(refused, Err((ErrorCode::Conflict, _))),
+            "a run on the old Computer blocks its reset: {refused:?}"
+        );
+        command(
+            &mut socket,
+            Id::new(),
+            CommandCall::ComputerReset { computer: target },
+        )
+        .await;
+
+        gates[0].open();
+        wait_status(&mut socket, run, "succeeded").await;
+        provider_task.abort();
+        running.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_hosted_computers_workspace_can_be_reset() {
         let (_dir, running, invite) = running().await;
         let mut socket = admin_socket(&running, &invite).await;
@@ -15676,6 +15937,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            computer_assignments: &server.computer_assignments,
             provider_writes: &server.provider_writes,
             runs: &server.runs,
             events: &server.events,
@@ -16206,6 +16468,7 @@ mod tests {
             links: &server.links,
             pairings: &server.pairings,
             approvals: &server.approvals,
+            computer_assignments: &server.computer_assignments,
             provider_writes: &server.provider_writes,
             runs: &server.runs,
             events: &server.events,

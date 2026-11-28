@@ -17,13 +17,13 @@ Files move through the Bot's shell with `neha file get` and `neha chat send --fi
 
 The loop offers these tools to the Model. When the Model asks for a tool, the Space records the action, runs it on the Bot's Computer, records the result, and gives the result back to the Model. The Bot can take several steps this way before it answers in the Chat.
 
-A Hosted Computer keeps its Workspace root in the Space's home, and the Bot works in its own directory inside it:
+A Hosted Computer keeps its Workspace root in the Space's home, and the Bot starts in its own directory inside it:
 
 ```text
 $NEHA_HOME/workspaces/<computer-id>/<bot-id>
 ```
 
-On a Hosted Computer, the shell sees this directory at `/workspace`; [Computers](computer.md#the-hosted-computer) covers the sandbox and the Workspace root it lives in.
+On a Hosted Computer, the sandbox mounts the Computer's Workspace root at `/workspace` and starts the shell in the Bot's directory inside it; [Computers](computer.md#the-hosted-computer) covers the sandbox and the Workspace root it lives in.
 
 ## Ask for work
 
@@ -74,7 +74,7 @@ The runtime enforces these limits, and an action that breaks one returns an erro
 - A path must stay inside the Bot's directory. Absolute paths outside it, `..` climbs, and any symlink in the path is refused, including a dangling symlink a write could follow.
 - A shell command has 30 seconds. When it runs past the limit, the Space kills the whole process group.
 - The shell starts with an empty environment plus `PATH`, `HOME`, `TMPDIR`, and the Bot's `NEHA_BOT_TOKEN`, `NEHA_SPACE_URL`, and `NEHA_CHAT`. `HOME` is the Bot's own directory, which the sandbox mounts at `/workspace`, and `TMPDIR` is the sandbox's own `/tmp`; Provider keys and other Space secrets are not in that environment.
-- On a Hosted Computer, the shell runs in a `bubblewrap` sandbox: the machine's system directories are read-only, the Bot's own directory is the only place where files persist, and the process list, `/dev`, `/proc`, and `/tmp` are the sandbox's own. The sandbox shares the machine's network and cannot see the Space's record, secrets, File store, or another Computer's Workspace. [Computers](computer.md#the-hosted-computer) covers the sandbox and the layouts it refuses.
+- On a Hosted Computer, the shell runs in a `bubblewrap` sandbox: the machine's system directories are read-only, the Computer's Workspace root is the only place where files persist, and the process list, `/dev`, `/proc`, and `/tmp` are the sandbox's own. Bots on the same Hosted Computer can reach each other's directories in that Workspace. The sandbox shares the machine's network and cannot see the Space's record, secrets, File store, or another Computer's Workspace. [Computers](computer.md#the-hosted-computer) covers the sandbox and the layouts it refuses.
 - On a Local Computer in granted mode, the shell runs in a sandbox that allows persistent writes only in the Bot's own directory, the folders its owner granted, and the run's `--cwd` directory; with full access the shell runs directly as the machine's user, with no sandbox. The file tools check their own write paths. Reading follows the machine user's rights, except the Computer's configuration directory in granted mode, so run only prompts you trust.
 - A tool result keeps its first 8 KiB and last 24 KiB and names the omitted byte count, including output beyond the capture limit. A write is limited to 64 KiB. A file read reads at most 8 MiB, then shows its first 8 KiB and last 24 KiB with the omitted count.
 - A run stops after 8 steps. If the Model keeps asking for tools, the Bot answers with a failure Message and the Space stays available.

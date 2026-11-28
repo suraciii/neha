@@ -325,6 +325,9 @@ enum ComputerCommand {
         /// Let more than one Bot use it.
         #[arg(long)]
         shared: bool,
+        /// Keep it to one Bot; this is the default.
+        #[arg(long)]
+        exclusive: bool,
     },
     /// Change who may use a Hosted Computer.
     Update {
@@ -1341,8 +1344,15 @@ async fn computer_command(command: ComputerCommand) -> Result<()> {
             println!("  Workspace: {}", text_of(&computer, "workspace")?);
             println!("Create a Bot on it with: neha bot create <name> --computer {id}");
         }
-        ComputerCommand::Create { name, shared } => {
+        ComputerCommand::Create {
+            name,
+            shared,
+            exclusive,
+        } => {
             let credential = Credential::load()?;
+            if shared && exclusive {
+                bail!("a Computer create names at most one of --shared or --exclusive");
+            }
             let sharing = if shared {
                 ComputerSharing::Shared
             } else {

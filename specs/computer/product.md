@@ -26,7 +26,7 @@ A Bot's loop and record live in its Space; its actions run on its Computer.
 
 A Computer keeps one Workspace. A Hosted Computer keeps its Workspace in the Space, and a restart of the Space keeps it.
 
-Each Bot works in its own directory inside its Computer's Workspace. A Bot on a Hosted Computer works only in that directory.
+Each Bot works in its own directory inside its Computer's Workspace. A Bot on a Hosted Computer starts in that directory; the sandbox mounts the whole Computer Workspace, so Bots on the same Hosted Computer can read and write each other's files.
 
 Resetting a Hosted Computer clears every Bot's directory in its Workspace: every file and folder inside it is deleted, and the Workspace root stays.
 
@@ -47,7 +47,7 @@ A User owns the Hosted Computers they create or receive. They can create a Hoste
 
 The owner creates a Bot on a Computer they own, and can move a Bot between their Computers. Moving works between Hosted and Local Computers in either direction. [Bot](../bot/product.md#moving-a-bot) covers what the Bot takes with it and what stays on the old Computer.
 
-Several Bots can be assigned the same shared Computer, and then share its files and logins. The Bots on one Computer are not isolated from each other.
+Several Bots can be assigned the same shared Computer, and then share its files and logins. On a Local Computer they also share the machine's processes; on a Hosted Computer each run's shell has its own process namespace, while the Computer Workspace is shared. The Bots on one Computer are not isolated from each other.
 
 ## Adding a Local Computer
 
@@ -83,7 +83,7 @@ A Bot can ask the User to take control, for example to sign in.
 
 A Bot runs commands, reads and writes files, and operates the screen of its Computer. On a Hosted Computer, a Bot operates the browser. Programs with windows of their own run only on a Local Computer.
 
-A Bot on a Hosted Computer works only in its own directory inside its Computer's Workspace.
+A Bot on a Hosted Computer starts in its own directory inside its Computer's Workspace, and its shell can reach the rest of that Workspace.
 
 On a Local Computer, a Bot starts in its own directory inside its Computer's Workspace, and its default write range is that directory. It reads what the machine's user can read. [Design](design.md#isolation) hides the Computer's own configuration directory from a Bot with granted folders.
 

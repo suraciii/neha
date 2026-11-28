@@ -61,7 +61,7 @@ A Computer assigned to one Bot. Another Bot may use it only after its owner make
 _Avoid_: private Computer, dedicated Computer, personal Computer
 
 **Workspace**:
-The durable file tree of one Computer. A Hosted Computer keeps its Workspace in the Space, and a Local Computer keeps it on the machine. Each Bot works in its own directory inside its Computer's Workspace.
+The durable file tree of one Computer. A Hosted Computer keeps its Workspace in the Space, and a Local Computer keeps it on the machine. Each Bot works in its own directory inside its Computer's Workspace. Bots on one Computer can reach each other's directories; the Space does not isolate them from each other.
 _Avoid_: home, volume, sandbox disk
 
 **Run**:

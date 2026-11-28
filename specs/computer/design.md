@@ -73,7 +73,7 @@ Working files do not migrate. The old Computer keeps them, and the new Computer 
 
 A Computer is the unit of isolation.
 
-Bots assigned to one Computer share its files, processes, and logins. The Space does not isolate them from each other.
+Bots assigned to one Computer share its files and logins. On a Local Computer they also share its processes; on a Hosted Computer each run's shell has its own process namespace. The Space does not isolate their files from each other.
 
 On a Local Computer with granted folders, a Bot's write range is its own directory inside the Computer's Workspace and the granted folders, and it reads with the machine user's rights. The file tools check every write path. On Linux, the shell runs in an operating-system sandbox that mounts the machine read-only except those write roots.
 
@@ -81,7 +81,7 @@ On Windows, an explicitly opted-in Local Computer has no operating-system sandbo
 
 On a Hosted Computer in the Space process, a Bot's shell runs in a sandbox that starts from an empty root. The sandbox mounts the Space machine's system directories read-only, and the Bot's directory at `/workspace` is the one place where files persist.
 
-On a Hosted Computer in a worker container, the shell runs in that container. The container starts no nested sandbox; the worker's container is the fence. The Computer's Workspace is the only persistent writable mount, and each Bot works in its own directory there.
+On a Hosted Computer in a worker container, the shell runs in that container. The container starts no nested sandbox; the worker's container is the fence. The Computer's Workspace is the only persistent writable mount, and each Bot starts in its own directory there.
 
 The sandbox has its own process list, `/dev`, `/proc`, a fresh `/tmp`, and `/dev/shm`, and it ends with the Space process. The Space's record, Vault, File store, and another Computer's Workspace are not mounted in it.
 

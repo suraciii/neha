@@ -3927,6 +3927,31 @@ fn a_user_creates_and_shares_a_hosted_computer() {
         "{listed}"
     );
 
+    let explicit = run(
+        &home,
+        &credential,
+        &["computer", "create", "--name", "Solo", "--exclusive"],
+    );
+    assert!(explicit.contains("Solo, exclusive"), "{explicit}");
+    let both = cli(
+        &home,
+        &credential,
+        &[
+            "computer",
+            "create",
+            "--name",
+            "Contradiction",
+            "--shared",
+            "--exclusive",
+        ],
+    );
+    assert!(!both.status.success());
+    assert!(
+        String::from_utf8_lossy(&both.stderr).contains("at most one of --shared or --exclusive"),
+        "stderr: {}",
+        String::from_utf8_lossy(&both.stderr)
+    );
+
     let updated = run(
         &home,
         &credential,

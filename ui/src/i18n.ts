@@ -278,7 +278,7 @@ const en = {
   "bot.computer.move.choose": "Choose a Computer",
   "bot.computer.move.none": "No other Computer is available.",
   "bot.computer.hostedNote":
-    "A Hosted Computer works only in its own directory inside the Computer's Workspace.",
+    "A Hosted Bot starts in its own directory inside the Computer's Workspace; its sandbox can reach the rest of that Workspace.",
   "bot.model.hint": "A Bot uses exactly one Model at a time.",
   "bot.model.default": "Space default",
   "bot.model.thinking": "Thinking",
@@ -658,7 +658,7 @@ const zh: Record<MessageKey, string> = {
   "bot.computer.move.armed": "再按一次确认移动",
   "bot.computer.move.choose": "选择 Computer",
   "bot.computer.move.none": "没有其他可用的 Computer。",
-  "bot.computer.hostedNote": "Hosted Computer 只能在自己的目录中工作，目录位于该 Computer 的 Workspace 内。",
+  "bot.computer.hostedNote": "Hosted Bot 从该 Computer Workspace 内自己的目录启动，sandbox 可以访问该 Workspace 的其余部分。",
   "bot.model.hint": "一个 Bot 同一时间只用一个 Model。",
   "bot.model.default": "Space 默认",
   "bot.model.thinking": "思考档位",

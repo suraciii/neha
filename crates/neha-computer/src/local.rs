@@ -1229,6 +1229,7 @@ impl LocalRuntime {
                 .args(hosted_sandbox_args(
                     bwrap,
                     &self.root,
+                    self.cwd.as_deref(),
                     self.cli_dir.as_deref(),
                 ))
                 .arg("/usr/bin/sh")
@@ -1384,13 +1385,23 @@ impl LocalRuntime {
             }
         };
         let (home, temporary) = if self.hosted.is_some() {
-            (Path::new(HOSTED_WORKSPACE), PathBuf::from(SANDBOX_TMPDIR))
+            let home = self
+                .cwd
+                .as_deref()
+                .and_then(|cwd| cwd.strip_prefix(&self.root).ok())
+                .map(|relative| {
+                    let mut path = PathBuf::from(HOSTED_WORKSPACE);
+                    path.push(relative);
+                    path
+                })
+                .unwrap_or_else(|| PathBuf::from(HOSTED_WORKSPACE));
+            (home, PathBuf::from(SANDBOX_TMPDIR))
         } else {
             let temporary = match &self.mode {
                 Mode::Managed => self.root.join(".tmp"),
                 Mode::Machine { .. } => PathBuf::from(SANDBOX_TMPDIR),
             };
-            (self.root.as_path(), temporary)
+            (self.root.clone(), temporary)
         };
         #[cfg(windows)]
         let path = {
@@ -1694,7 +1705,7 @@ fn probe_bwrap(bwrap: &Path, folder: &Path, hidden: &[PathBuf]) -> Result<(), St
 pub fn probe_hosted(bwrap: &Path, workspace: &Path) -> Result<(), RuntimeError> {
     check_bwrap_version(bwrap).map_err(RuntimeError::NoSandbox)?;
     let output = std::process::Command::new(bwrap)
-        .args(hosted_sandbox_args(bwrap, workspace, None))
+        .args(hosted_sandbox_args(bwrap, workspace, None, None))
         .arg("/usr/bin/sh")
         .arg("-c")
         .arg("true")
@@ -1848,7 +1859,12 @@ fn validate_hosted_mounts(hidden: &[PathBuf], cli_dir: Option<&Path>) -> Result<
 /// skill's `neha` commands work in the shell; the mount is skipped when the
 /// caller has no CLI directory. `_bwrap` is the binary that will run these
 /// arguments; they are the same for every bwrap path.
-fn hosted_sandbox_args(_bwrap: &Path, workspace: &Path, cli_dir: Option<&Path>) -> Vec<OsString> {
+fn hosted_sandbox_args(
+    _bwrap: &Path,
+    workspace: &Path,
+    cwd: Option<&Path>,
+    cli_dir: Option<&Path>,
+) -> Vec<OsString> {
     let mut arguments = Vec::new();
     // A system directory that does not exist is skipped, so the same rootfs
     // works on a distribution where it is missing.
@@ -1885,8 +1901,17 @@ fn hosted_sandbox_args(_bwrap: &Path, workspace: &Path, cli_dir: Option<&Path>) 
     arguments.push(OsString::from("--bind"));
     arguments.push(workspace.as_os_str().to_owned());
     arguments.push(OsString::from(HOSTED_WORKSPACE));
+    // The Computer's Workspace is mounted whole, so Bots on it can see each
+    // other's files. The run starts in its Bot's directory when the caller
+    // named one; a probe starts at the root.
+    let mut start = PathBuf::from(HOSTED_WORKSPACE);
+    if let Some(relative) = cwd.and_then(|cwd| cwd.strip_prefix(workspace).ok())
+        && !relative.as_os_str().is_empty()
+    {
+        start.push(relative);
+    }
     arguments.push(OsString::from("--chdir"));
-    arguments.push(OsString::from(HOSTED_WORKSPACE));
+    arguments.push(start.into_os_string());
     arguments.push(OsString::from("--"));
 
     arguments

@@ -169,6 +169,9 @@ pub struct CommandContext<'a> {
     /// Serializes answers and rule changes, so two clients cannot decide one
     /// approval or add one rule twice.
     pub approvals: &'a tokio::sync::Mutex<()>,
+    /// Serializes Computer creation and Bot assignment, so an exclusive
+    /// Computer cannot take two Bots and a create cannot race a move.
+    pub computer_assignments: &'a tokio::sync::Mutex<()>,
     /// Serializes Provider writes: a refresh reads the record's default before
     /// its HTTP call and writes after it, so nothing else may write a Provider
     /// in between.
@@ -488,16 +491,19 @@ async fn approval_decide(
             .computers
             .get(&bot.computer)
             .ok_or_else(|| ApiError::internal("the Bot has no Computer"))?;
-        if computer.kind == "local" {
-            let access = context
-                .links
-                .access_capabilities(computer.id)
-                .unwrap_or(AccessCapabilities::UNSUPPORTED);
-            if !access.grants {
-                return Err(ApiError::invalid_argument(
-                    "this Local Computer does not support granted folders, so the approval cannot become a lasting grant",
-                ));
-            }
+        if computer.kind != "local" {
+            return Err(ApiError::invalid_argument(
+                "a Hosted Computer serves no granted folders, so the approval cannot become a lasting grant",
+            ));
+        }
+        let access = context
+            .links
+            .access_capabilities(computer.id)
+            .unwrap_or(AccessCapabilities::UNSUPPORTED);
+        if !access.grants {
+            return Err(ApiError::invalid_argument(
+                "this Local Computer does not support granted folders, so the approval cannot become a lasting grant",
+            ));
         }
     }
     let lasting_rule = if lasting && view.reason != ApprovalReason::Grant {
@@ -1916,7 +1922,12 @@ async fn bot_update(
                 .computers
                 .get(&bot.computer)
                 .ok_or_else(|| ApiError::internal("the Bot has no Computer"))?;
-            if computer.kind == "local" {
+            if computer.kind != "local" {
+                return Err(ApiError::invalid_argument(
+                    "file access changes apply only to a Local Computer; a Hosted Computer works only in its Workspace",
+                ));
+            }
+            {
                 let access = context
                     .links
                     .access_capabilities(computer.id)
@@ -2105,8 +2116,9 @@ async fn bot_create(
         return Ok(outcome);
     }
     // A new Bot's inherited default Model and thinking level are checked
-    // below; the lock keeps the answer true through the event.
-    let _decisions = context.approvals.lock().await;
+    // below; the assignment lock keeps them true through the event and keeps
+    // two creates from making the same Space Computer twice.
+    let _assignment = context.computer_assignments.lock().await;
     if let Some(outcome) =
         replay_owned_bot_create(context.store, command_id, &fingerprint, account).await?
     {
@@ -2259,10 +2271,10 @@ async fn bot_create(
     })
 }
 
-/// Moves a Bot to another real Computer its owner paired.
+/// Moves a Bot to another Computer its owner owns.
 ///
 /// A move only writes the record: the Bot keeps its Chat, Messages, memory,
-/// and delivered Files, while its working files stay on the old machine. The
+/// and delivered Files, while its working files stay on the old Computer. The
 /// run queue is woken so runs that were waiting for the old Computer start on
 /// the new one; a run already working keeps the Computer it started on.
 async fn bot_move(
@@ -2275,7 +2287,7 @@ async fn bot_move(
 ) -> Result<Outcome, ApiError> {
     // One assignment runs at a time, so an exclusive Computer cannot take two
     // Bots through two concurrent moves.
-    let _assignment = context.approvals.lock().await;
+    let _assignment = context.computer_assignments.lock().await;
     // Authorization runs before any replay: the recorded result names the Bot
     // and both Computers, so an account that does not own them must not read
     // it. Both checks still hold after the Bot moved, so the owner's retry
@@ -2781,8 +2793,9 @@ fn new_hosted(
         name,
         sharing,
         space,
-        supports_grants: true,
-        supports_full_access: true,
+        // A Hosted Computer serves neither granted folders nor full access.
+        supports_grants: false,
+        supports_full_access: false,
         // A Hosted Computer always runs in the Space's own sandbox.
         sandboxed: Some(true),
     })
@@ -2868,20 +2881,31 @@ async fn computer_create(
         return Err(ApiError::invalid_argument("a Computer needs a name"));
     }
     let view = new_hosted(context, account, name, arguments.sharing, false)?;
+    let workspace = std::path::PathBuf::from(&view.workspace);
     let result = json!(viewed_computer(&view, context.links));
     let draft = computer_created(account.id, &view);
-    let appended = append(
+    let appended = match append(
         context.store,
         context.state,
         command_id,
-        fingerprint,
+        fingerprint.clone(),
         vec![draft],
         Some(result.clone()),
         None,
     )
-    .await?;
+    .await
+    {
+        Ok(appended) => appended,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&workspace);
+            return Err(error);
+        }
+    };
     if appended.existing {
-        return recorded_outcome(context.store, command_id).await;
+        let _ = std::fs::remove_dir_all(&workspace);
+        return replay_owned_computer(context.store, command_id, &fingerprint, account)
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such Computer"));
     }
 
     Ok(Outcome {
@@ -2905,7 +2929,12 @@ async fn computer_update(
     {
         return Ok(outcome);
     }
-    let _assignment = context.approvals.lock().await;
+    let _assignment = context.computer_assignments.lock().await;
+    if let Some(outcome) =
+        replay_owned_computer(context.store, command_id, &fingerprint, account).await?
+    {
+        return Ok(outcome);
+    }
     let current = {
         let state = context
             .state
@@ -2985,7 +3014,7 @@ async fn computer_reset(
 ) -> Result<Outcome, ApiError> {
     // Answer a recorded reset before the busy check: a client that lost the
     // first answer must get it even when the Bot has since started new work.
-    let (workspace, bots) = {
+    {
         let state = context
             .state
             .lock()
@@ -3003,18 +3032,11 @@ async fn computer_reset(
                 "only a Hosted Computer can be reset; a Local Computer belongs to its machine",
             ));
         }
-        let bots: Vec<Id> = state
-            .bots
-            .values()
-            .filter(|bot| bot.computer == computer)
-            .map(|bot| bot.id)
-            .collect();
-        (context.home.workspace_dir(computer), bots)
-    };
+    }
     if let Some(record) = existing(context.store, command_id, &fingerprint).await? {
         return reset_replayed(record, account, computer);
     }
-    let workspace = {
+    let (workspace, bots) = {
         let mut state = context
             .state
             .lock()
@@ -3034,27 +3056,38 @@ async fn computer_reset(
         if state.is_resetting(computer) {
             return Err(ApiError::conflict("this Computer is already being reset"));
         }
-        let busy = bots.iter().any(|bot| {
-            state.runs.values().any(|run| {
-                run.bot == *bot
-                    && matches!(
-                        run.status,
-                        RunStatus::Queued | RunStatus::Running | RunStatus::Waiting
-                    )
-            })
+        // A started run stays on the Computer it started on, even after its
+        // Bot moved. A queued run has no Computer yet, so its Bot's current
+        // Computer decides. Both cases must block the reset.
+        let busy = state.runs.values().any(|run| {
+            matches!(
+                run.status,
+                RunStatus::Queued | RunStatus::Running | RunStatus::Waiting
+            ) && (run.computer == Some(computer)
+                || (run.computer.is_none()
+                    && state
+                        .bots
+                        .get(&run.bot)
+                        .is_some_and(|bot| bot.computer == computer)))
         });
         if busy {
             return Err(ApiError::conflict(
                 "this Computer has a run in progress; wait for it to finish and reset again",
             ));
         }
+        let bots: Vec<Id> = state
+            .bots
+            .values()
+            .filter(|bot| bot.computer == computer)
+            .map(|bot| bot.id)
+            .collect();
         // From here the pump must not start a run on this Computer: the clear
         // would race the run's first write. The mark is dropped before return.
         state.begin_reset(computer);
         // The runtime and the reset both derive the folder from the Computer,
         // not from a recorded path a stale or edited record could redirect at
         // the Space's own data.
-        workspace
+        (context.home.workspace_dir(computer), bots)
     };
     let claimed = context.store.claim_command(command_id, &fingerprint).await;
     let claimed = match claimed {
@@ -4045,10 +4078,20 @@ async fn finish_run_with(
                 };
                 return finish_completion(store, state, pending, outcome).await;
             }
-            match LocalRuntime::hosted_with_hidden(
-                home.bot_workspace_dir(computer, pending.bot.id),
-                vec![home.root().to_path_buf()],
-            ) {
+            // The sandbox sees the whole Computer Workspace at /workspace,
+            // so Bots on the same Computer share its files. The run starts in
+            // its own Bot's directory inside that tree.
+            let workspace = home.workspace_dir(computer);
+            let bot_dir = home.bot_workspace_dir(computer, pending.bot.id);
+            let bot_path = bot_dir.to_string_lossy().into_owned();
+            let prepared = std::fs::create_dir_all(&bot_dir)
+                .map_err(|error| error.to_string())
+                .and_then(|()| {
+                    LocalRuntime::hosted_with_hidden(&workspace, vec![home.root().to_path_buf()])
+                        .and_then(|runtime| runtime.with_working_dir(&bot_path))
+                        .map_err(|error| error.to_string())
+                });
+            match prepared {
                 Ok(runtime) => {
                     RunRuntime::Managed(runtime.with_timeout(tool_timeout).with_env(bot_env))
                 }

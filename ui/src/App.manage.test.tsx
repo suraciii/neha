@@ -332,11 +332,11 @@ describe("App management", () => {
     // a Bot may move between Hosted and Local Computers in either direction.
     const target = field<HTMLSelectElement>(view, "move_target");
     expect(target.options).toHaveLength(3);
-    expect(Array.from(target.options).map((option) => option.textContent)).toEqual([
-      "Choose a Computer",
-      "Laptop",
-      "Space Computer",
-    ]);
+    const targetLabels = Array.from(target.options).map((option) => option.textContent ?? "");
+    expect(targetLabels).toHaveLength(3);
+    expect(targetLabels[0]).toBe("Choose a Computer");
+    expect(targetLabels[1]).toMatch(/^Laptop · /);
+    expect(targetLabels[2]).toMatch(/^Space Computer · /);
 
     choose(view, "move_target", "p9");
     press(view, "Move to another Computer");

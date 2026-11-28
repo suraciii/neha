@@ -288,7 +288,7 @@ When the Space has a new address, or the saved credential is gone, pass `--serve
 
 ## What this milestone does not do
 
-- The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Bot's own directory inside the Computer's Workspace as the only place where files persist; it has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
+- The Hosted Computer runs in a `bubblewrap` sandbox on the Space's machine. The sandbox mounts the machine's system directories read-only and the Computer's Workspace root as the only place where files persist; the run starts in the Bot's own directory inside it, and Bots on the same Computer can reach each other's directories. It has its own `/tmp` and process list, and it shares the machine's network. It cannot see the Space's record, its secrets, its File store, or another Computer's Workspace.
 - Hosted Computers run only in the Space process in this milestone. Starting, stopping, or deleting one on demand, and worker containers or a Supervisor, are not available.
 - A Hosted Computer has no screen, browser, Vault credential, or Take control yet, and it does not ask before an action. [Approvals](approvals.md) covers the gate on a Local Computer.
 - An unattended run's approval does not expire yet.
