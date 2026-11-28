@@ -1715,7 +1715,7 @@ dependencies = [
 name = "neha"
 version = "0.1.0"
 dependencies = [
- "jiff 0.2.46",
+ "jiff 1.0.3",
  "serde",
  "serde_json",
  "thiserror",
