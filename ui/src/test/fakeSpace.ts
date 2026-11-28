@@ -455,6 +455,7 @@ export const space = {
   // The Bots a test created, with what each was asked for.
   creates: [] as { name: string; computer?: string }[],
   resets: [] as string[],
+  revoked: [] as string[],
   // The Hosted Computers the Space was asked to create, and the sharing
   // changes it was asked to make.
   computerCreates: [] as { name: string; sharing: Computer["sharing"] }[],
@@ -570,6 +571,7 @@ export const space = {
     for (const key of Object.keys(made)) delete made[key];
     madeBots = 0;
     space.resets = [];
+    space.revoked = [];
     space.computerCreates = [];
     space.computerUpdates = [];
     space.ruleAdds = [];
@@ -1032,6 +1034,11 @@ export class FakeCommands {
         const asked = args as { computer: string };
         space.resets.push(asked.computer);
         return { computer: asked.computer } as T;
+      }
+      case "computer_revoke": {
+        const asked = args as { computer: string };
+        space.revoked.push(asked.computer);
+        return { id: asked.computer, kind: "local", online: false } as T;
       }
       case "rule_list": {
         const asked = args as { bot?: string };

@@ -21,6 +21,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use neha::id::Id;
 use neha_computer::channel::{DeviceFrame, HostFrame};
 use neha_computer::{Action, ActionResult, ActionStatus};
+#[cfg(feature = "test-support")]
+use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// Why a request failed because its Computer left.
@@ -40,6 +42,91 @@ pub const FRAME_TIMEOUT: Duration = if cfg!(any(test, feature = "test-support"))
 } else {
     Duration::from_secs(10)
 };
+
+/// One writer paused around an Action, for a revoke race test.
+#[cfg(feature = "test-support")]
+type WriterPause = (Arc<Notify>, Arc<Notify>);
+
+#[cfg(feature = "test-support")]
+static WRITER_PAUSES: Mutex<Option<HashMap<Id, WriterPause>>> = Mutex::new(None);
+#[cfg(feature = "test-support")]
+static WRITER_AFTER_FEED_PAUSES: Mutex<Option<HashMap<Id, WriterPause>>> = Mutex::new(None);
+#[cfg(feature = "test-support")]
+static WRITER_AFTER_FEED_STALLS: Mutex<Option<HashMap<Id, Duration>>> = Mutex::new(None);
+
+/// Installs a pause before the next Action is written; returns (reached, release).
+#[cfg(feature = "test-support")]
+pub(crate) fn pause_writer_for_test(computer: Id) -> WriterPause {
+    pause_for_test(&WRITER_PAUSES, computer)
+}
+
+/// Installs a pause after the sink buffers an Action but before its flush.
+#[cfg(feature = "test-support")]
+pub(crate) fn pause_writer_after_feed_for_test(computer: Id) -> WriterPause {
+    pause_for_test(&WRITER_AFTER_FEED_PAUSES, computer)
+}
+
+/// Makes the writer block its thread after buffering an Action, for a
+/// timeout-then-retry test that abort cannot interrupt.
+#[cfg(feature = "test-support")]
+pub(crate) fn stall_writer_after_feed_for_test(computer: Id, duration: Duration) {
+    WRITER_AFTER_FEED_STALLS
+        .lock()
+        .expect("writer stall lock")
+        .get_or_insert_with(HashMap::new)
+        .insert(computer, duration);
+}
+
+#[cfg(feature = "test-support")]
+fn pause_for_test(
+    pauses: &'static Mutex<Option<HashMap<Id, WriterPause>>>,
+    computer: Id,
+) -> WriterPause {
+    let pause = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+    let mut pauses = pauses.lock().expect("writer pause lock");
+    pauses
+        .get_or_insert_with(HashMap::new)
+        .insert(computer, pause.clone());
+    pause
+}
+
+/// Waits before one Action leaves the writer, when a test installed a pause.
+#[cfg(feature = "test-support")]
+pub(crate) async fn pause_writer(computer: Id) {
+    wait_for_test(&WRITER_PAUSES, computer).await;
+}
+
+/// Waits after the sink accepts an Action but before it flushes.
+#[cfg(feature = "test-support")]
+pub(crate) async fn pause_writer_after_feed(computer: Id) {
+    wait_for_test(&WRITER_AFTER_FEED_PAUSES, computer).await;
+}
+
+/// Blocks this worker thread once the sink has buffered an Action.
+#[cfg(feature = "test-support")]
+pub(crate) async fn stall_writer_after_feed(computer: Id) {
+    let duration = WRITER_AFTER_FEED_STALLS
+        .lock()
+        .expect("writer stall lock")
+        .as_mut()
+        .and_then(|stalls| stalls.remove(&computer));
+    if let Some(duration) = duration {
+        std::thread::sleep(duration);
+    }
+}
+
+#[cfg(feature = "test-support")]
+async fn wait_for_test(pauses: &'static Mutex<Option<HashMap<Id, WriterPause>>>, computer: Id) {
+    let pause = pauses
+        .lock()
+        .expect("writer pause lock")
+        .as_mut()
+        .and_then(|pauses| pauses.remove(&computer));
+    if let Some((reached, release)) = pause {
+        reached.notify_one();
+        release.notified().await;
+    }
+}
 
 /// What a Computer's greeting said its machine can serve.
 ///
@@ -105,12 +192,17 @@ pub struct ComputerLink {
     closed: AtomicBool,
     /// Tells the connection handler that the channel is going away.
     closer: watch::Sender<bool>,
+    /// Set once the writer has stopped dispatching frames.
+    writer_stopped: watch::Sender<bool>,
+    /// The writer's abort handle; the socket handler owns its join.
+    writer_abort: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
 impl ComputerLink {
     /// Builds a link over a frame writer.
     fn new(computer: Id, frames: mpsc::Sender<HostFrame>) -> Self {
         let (closer, _) = watch::channel(false);
+        let (writer_stopped, _) = watch::channel(false);
 
         Self {
             computer,
@@ -118,6 +210,8 @@ impl ComputerLink {
             pending: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
             closer,
+            writer_stopped,
+            writer_abort: Mutex::new(None),
         }
     }
 
@@ -275,6 +369,34 @@ impl ComputerLink {
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
+
+    /// Returns a signal that turns `true` once no frame can be dispatched.
+    #[must_use]
+    pub fn writer_stopped_signal(&self) -> watch::Receiver<bool> {
+        self.writer_stopped.subscribe()
+    }
+
+    /// Records that the writer has stopped dispatching frames.
+    pub fn mark_writer_stopped(&self) {
+        let _ = self.writer_stopped.send_replace(true);
+    }
+
+    /// Keeps an abort handle for a writer the connection handler joins.
+    pub fn set_writer_abort(&self, abort: tokio::task::AbortHandle) {
+        *self.writer_abort.lock().expect("computer writer lock") = Some(abort);
+    }
+
+    /// Forces a stalled writer to stop; the handler still awaits its join.
+    pub fn abort_writer(&self) {
+        if let Some(abort) = self
+            .writer_abort
+            .lock()
+            .expect("computer writer lock")
+            .take()
+        {
+            abort.abort();
+        }
+    }
 }
 
 /// Returns the request id and answer a Computer frame carries.
@@ -328,6 +450,15 @@ pub struct ComputerLinks {
     access: Mutex<HashMap<Id, AccessCapabilities>>,
     /// The origin each connected Local Computer reaches the Space through.
     origins: Mutex<HashMap<Id, String>>,
+    /// Serializes channel registration with a Local Computer revocation.
+    ///
+    /// A handshake holds this from its final token check through publishing
+    /// its link; a revoke holds it from deleting the token through closing the
+    /// link. A channel can therefore be before the revoke or after it, never
+    /// register behind its back.
+    revocations: tokio::sync::Mutex<()>,
+    /// Computers whose link is gone but whose writer has not confirmed stop.
+    stopping: Mutex<HashMap<Id, Arc<ComputerLink>>>,
     /// The Space-wide request counter; every request on every channel uses it.
     next_id: Arc<AtomicU64>,
 }
@@ -347,6 +478,8 @@ impl ComputerLinks {
             hosted_workers: false,
             access: Mutex::new(HashMap::new()),
             origins: Mutex::new(HashMap::new()),
+            revocations: tokio::sync::Mutex::new(()),
+            stopping: Mutex::new(HashMap::new()),
             next_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -471,6 +604,76 @@ impl ComputerLinks {
         link.close();
 
         current
+    }
+
+    /// Holds channel registration still while a Computer is revoked.
+    pub async fn lock_revocations(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.revocations.lock().await
+    }
+
+    /// Removes every channel and capability the Computer had.
+    ///
+    /// A revoked Computer owns no live link: its daemon is refused a new one,
+    /// and this closes the one it still had so in-flight requests fail as
+    /// unknown rather than succeed after the owner withdrew access. It waits
+    /// for the writer to stop dispatching, so the revoke's answer is not sent
+    /// while an Action can still leave the Space.
+    pub async fn forget(&self, computer: Id) -> bool {
+        // Keep the link discoverable by Computer id while its writer stops, so
+        // a retry after a timeout awaits the same completion instead of
+        // finding an empty table and claiming shutdown succeeded.
+        let link = {
+            let mut stopping = self.stopping.lock().expect("computer stopping lock");
+            if let Some(link) = stopping.get(&computer).cloned() {
+                Some(link)
+            } else {
+                let current = self
+                    .links
+                    .lock()
+                    .expect("computer links lock")
+                    .remove(&computer);
+                if let Some(link) = current {
+                    stopping.insert(computer, Arc::clone(&link));
+                    Some(link)
+                } else {
+                    None
+                }
+            }
+        };
+        self.access
+            .lock()
+            .expect("computer access lock")
+            .remove(&computer);
+        self.origins
+            .lock()
+            .expect("computer origins lock")
+            .remove(&computer);
+        let Some(link) = link else {
+            return true;
+        };
+        let mut stopped = link.writer_stopped_signal();
+        link.close();
+        if tokio::time::timeout(FRAME_TIMEOUT, stopped.wait_for(|stopped| *stopped))
+            .await
+            .is_err()
+        {
+            // The writer may be wedged on a partial frame. Abort it; the
+            // connection handler owns its join and marks completion only after
+            // the writer is gone, so wait for that same completion.
+            link.abort_writer();
+            if tokio::time::timeout(FRAME_TIMEOUT, stopped.wait_for(|stopped| *stopped))
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
+        self.stopping
+            .lock()
+            .expect("computer stopping lock")
+            .remove(&computer);
+
+        true
     }
 
     /// Returns the id for the next request on any channel.

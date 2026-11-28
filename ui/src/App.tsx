@@ -2842,6 +2842,21 @@ export default function App() {
     }
   }
 
+  // Revokes a Local Computer's credential. The machine's daemon stops on its
+  // next answer, and the record stays listed offline until it pairs again.
+  async function revokeComputer(computer: string): Promise<boolean> {
+    update({ managing: true, manageError: null });
+    try {
+      await commands.command("computer_revoke", { computer });
+      await refreshComputers();
+      update({ managing: false });
+      return true;
+    } catch (reason) {
+      update({ manageError: reason, managing: false });
+      return false;
+    }
+  }
+
   // Opens one Bot's page from a Computer in the Settings surface, leaving the
   // Settings where Back returns to.
   function openBotPage(bot: Bot) {
@@ -3399,6 +3414,7 @@ export default function App() {
                       onShare={(computer) => shareComputer(computer)}
                       onReset={(computer) => resetComputer(computer)}
                       onAdd={(code) => addComputer(code)}
+                      onRevoke={(computer) => revokeComputer(computer)}
                       onOpenBot={(bot) => openBotPage(bot)}
                       onConnect={(input) => connectVendor(input)}
                       onRefresh={(provider) => refreshProviderModels(provider)}

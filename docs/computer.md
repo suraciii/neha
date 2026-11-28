@@ -85,6 +85,12 @@ Run `neha computer pair --space <origin>` again if the code expired, or approve 
 
 The machine keeps its configuration in `~/.config/neha/computer.json` with mode 0600. `$XDG_CONFIG_HOME/neha` replaces that directory when `XDG_CONFIG_HOME` is set, and `NEHA_COMPUTER_HOME` replaces both. Each Bot works in a directory of its own under `~/.neha/workspaces` by default; pass `--workspace <directory>` to `computer pair` to put those directories under another root, and a root inside the configuration directory is refused.
 
+## Revoke a machine
+
+`neha computer revoke <computer-id>` withdraws a Local Computer's access. The owner runs it from any signed-in client; the machine's daemon drops its connection and its next reconnect is refused, so it exits instead of retrying. The Computer stays listed as offline, and its Bots wait.
+
+Revocation is not deletion: the Computer record and its Workspace stay. Pair the machine again to use it, which creates a new Computer; move Bots to it with `neha bot move`.
+
 An older Neha kept its pairing in `~/.neha/computer.json` and its Workspaces in `~/Neha`. While that file exists, `computer pair` and `computer run` refuse; the old file and the old Workspaces are not read or moved. Delete the old file, or move it into storage that the machine's Bots cannot read, then pair again; the old Workspaces stay where they are. Storage outside the machine is the safe place for a copy.
 
 The old file may still hold a valid credential. Renaming it in place does not hide it from the machine's Bots, so keep any copy private.
@@ -267,8 +273,7 @@ The machine ends the command it was running when the channel drops, so no action
 
 ## What this milestone does not do
 
-- A paired Local Computer cannot yet be revoked or replaced while the Space runs; re-pairing creates a new Computer and leaves the old one. Revocation is the next Local Computer change.
-- There is no command yet to revoke or replace a Computer's credential.
+- A Local Computer can be revoked but not deleted; re-pairing creates a new Computer and leaves the old record offline.
 - Moving a Bot does not carry its files: the old Computer keeps its Workspace, and the new one gives the Bot a directory of its own. Saving and restoring a Workspace are not available.
 - A Hosted Computer in a Local Space still runs only in the Space process. The containerized Hosted Space runs it in a worker container; a Local Computer never does.
 - There is no client command to start, stop, or delete a Hosted Computer, and no on-demand stop for a process-local one. A worker-backed Hosted Computer wakes and stops from its work and idle settings; the Supervisor is internal. A provider-backed Hosted machine is not specified yet.
