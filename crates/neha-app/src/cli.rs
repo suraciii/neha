@@ -840,6 +840,82 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
     // Register before the home opens or the listener binds: a service manager
     // that reads readiness and stops at once must still reach this handler.
     let mut stop = signals::Stop::install().context("cannot listen for a stop signal")?;
+    let ui = ui
+        .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
+        .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
+    if let Some(path) = &ui
+        && !path.join("index.html").is_file()
+    {
+        tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase = "ui",
+            error_kind = "ui",
+            error_message = "the browser client has no index.html",
+            "the Space could not start"
+        );
+        bail!("the browser client at {} has no index.html", path.display());
+    }
+    let domain = match domain.or_else(|| std::env::var("NEHA_DOMAIN").ok()) {
+        Some(value) => {
+            let value = value.trim().to_owned();
+            if value.is_empty() {
+                tracing::error!(
+                    target: "neha::space",
+                    event = "space.start.failed",
+                    phase = "config",
+                    error_kind = "public_url",
+                    error_message = "the public domain is empty",
+                    "the Space could not start"
+                );
+                bail!("--domain needs a host");
+            }
+            Some(value)
+        }
+        None => None,
+    };
+    if let Some(domain) = &domain
+        && (domain.contains("://")
+            || domain.contains('/')
+            || domain.contains('?')
+            || domain.contains('#'))
+    {
+        tracing::error!(
+            target: "neha::space",
+            event = "space.start.failed",
+            phase = "config",
+            error_kind = "public_url",
+            error_message = "the public domain is not a host",
+            "the Space could not start"
+        );
+        bail!("--domain takes a host[:port], not a URL or path");
+    }
+    let public_url = match domain {
+        Some(domain) => Some(format!("https://{domain}")),
+        None => match std::env::var("NEHA_PUBLIC_URL") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => bail!("NEHA_PUBLIC_URL is not usable: {error}"),
+        },
+    };
+    // Validate the origin, proxy list, and listener before opening the home:
+    // a start that may not serve must not rename a database or clear temporary
+    // files. The bound listener is the one this start uses.
+    let startup = match neha_space::prepare_start(port, public_url).await {
+        Ok(startup) => startup,
+        Err(error) => {
+            let (phase, error_kind, message) = diag::startup_failure(&error);
+            tracing::error!(
+                target: "neha::space",
+                event = "space.start.failed",
+                phase,
+                error_kind,
+                error_message = message.as_str(),
+                "the Space could not start"
+            );
+            return Err(error).context("the Space cannot start");
+        }
+    };
     let home = match Home::from_env() {
         Ok(home) => home,
         Err(error) => {
@@ -856,54 +932,6 @@ async fn serve(port: u16, ui: Option<std::path::PathBuf>, domain: Option<String>
                 .context("NEHA_HOME is not set; set it to the directory that holds this Space");
         }
     };
-    let ui = ui
-        .or_else(|| std::env::var_os("NEHA_UI_DIR").map(std::path::PathBuf::from))
-        .or_else(|| Some(std::path::PathBuf::from("ui/dist")).filter(|path| path.is_dir()));
-    if let Some(path) = &ui
-        && !path.join("index.html").is_file()
-    {
-        report_start_failure(&home, "ui", "ui", "the browser client has no index.html");
-        bail!("the browser client at {} has no index.html", path.display());
-    }
-    let domain = match domain.or_else(|| std::env::var("NEHA_DOMAIN").ok()) {
-        Some(value) => {
-            let value = value.trim().to_owned();
-            if value.is_empty() {
-                report_start_failure(&home, "config", "public_url", "the public domain is empty");
-                bail!("--domain needs a host");
-            }
-            Some(value)
-        }
-        None => None,
-    };
-    if let Some(domain) = &domain
-        && (domain.contains("://")
-            || domain.contains('/')
-            || domain.contains('?')
-            || domain.contains('#'))
-    {
-        report_start_failure(
-            &home,
-            "config",
-            "public_url",
-            "the public domain is not a host",
-        );
-        bail!("--domain takes a host[:port], not a URL or path");
-    }
-    let public_url = match domain {
-        Some(domain) => Some(format!("https://{domain}")),
-        None => match std::env::var("NEHA_PUBLIC_URL") {
-            Ok(value) => Some(value),
-            Err(std::env::VarError::NotPresent) => None,
-            Err(error) => bail!("NEHA_PUBLIC_URL is not usable: {error}"),
-        },
-    };
-    // Validate the origin, proxy list, and listener before opening the record:
-    // a start that may not serve must not rename a database or clear temporary
-    // files. The bound listener is the one this start uses.
-    let startup = neha_space::prepare_start(port, public_url)
-        .await
-        .context("the Space cannot start")?;
     let has_ui = ui.is_some();
     let failure_home = home.clone();
     let running = match neha_space::start_with_ui_prepared(home, ui, startup).await {
